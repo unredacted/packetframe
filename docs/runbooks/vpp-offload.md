@@ -404,6 +404,31 @@ the change was refused or withdrawn, **it is not in effect** — that is
 deliberate, so "the rollout step succeeded" and "the rollout step is
 pending" cannot look the same.
 
+"Withdrawn" is the answer when the supervision loop does not pick the
+request up within 3 s: a tick mid-convergence can take longer than
+that. It applies only to a reload that asks the loop for something. A
+reload that changes no steering input — an edit to fast-path's
+`dry-run`, say, with `allow-prefix` untouched — is answered without the
+loop unless re-sending would do something there: from `Ready` with a
+remembered want (the "ask now" retry), from `Steered` (the repair
+below), or with every port off while something is still steered or
+wanted. A want remembered during a convergence also goes to the loop
+while a loop pass is running, because that pass may be the one that
+ends the convergence and steers. And after any failed request the
+module no longer knows which target the loop holds, so the next reload
+goes to the loop whatever it changes. All of these can still be
+withdrawn; re-run once `packetframe status` shows the convergence
+finished.
+
+**A module failure does not roll the reload back.** The daemon
+publishes the allowlist and reconfigures every module in config order,
+recording failures and carrying on, so every module the error does not
+name is running the new config. `packetframe reconfigure` says so
+("every other module applied it, and nothing was rolled back") and
+exits 2. A fast-path edit alongside a withdrawn vpp-offload change is
+live; re-running the same config re-applies every module, which
+changes nothing for the ones that already landed.
+
 Not in effect is not the same as forgotten. A steer refused by either
 gate — the completeness verdict, or a FIB still holding withheld,
 unresolvable or in-flight routes — leaves the *ask* recorded, and the
@@ -1073,11 +1098,18 @@ steering  DEGRADED — 1 steering rule(s) ... a convergence re-applies
                      with the want remembered, and from there the module
                      re-attempts the steer by itself once both gates
                      permit. Until it converges there is nothing to ask:
-                     `packetframe reconfigure` answers "not converged"
-                     from here and changes no steering
+                     from here `packetframe reconfigure` changes no
+                     steering, and a reload that edits steering answers
+                     "not converged"
 ```
 
-That last sentence used to read *"`packetframe reconfigure` asks
+A reload that edits no steering input changes nothing here either, but
+its answer varies: usually OK without asking the loop, and "not
+converged" when it does ask — after a failed request, when the module no
+longer knows which target the loop holds, or while a loop pass is in
+flight.
+
+That closing part used to read *"`packetframe reconfigure` asks
 immediately rather than waiting"* — which contradicted the paragraph
 directly above it, and was wrong on every line it ever printed: the
 only states that reach this arm are the ones that refuse steering
@@ -1798,6 +1830,76 @@ sluggish ssh, `birdc` timeouts in the fast-path integrity row — check
 NIC queue IRQ affinity against the VPP cores first (see
 [IRQ affinity before attach](#irq-affinity-before-attach)); on builds
 carrying the check, attach refuses this shape before it can start.
+
+A socket timeout (`Resource temporarily unavailable`) or `binary API is
+not connected` during attach, resync or verify no longer restarts
+anything on current builds. The next section covers it. If a loop
+like that still shows `event=ConvergenceFailed`, the step was
+*refused*, and the error text says by what.
+
+### `binary API lost; VPP is not torn down for this` during a convergence
+
+A convergence step (attach, resync start, a resync drain, or verify)
+lost the binary API. Either a reply took longer than the socket
+deadline, which is `EAGAIN` on the API socket, or the socket closed.
+VPP is held as it is and the step is resumed on the same process. It
+is not killed, steering is not touched, and no failure is counted.
+The journal shows:
+
+```
+WARN supervised action failed action=AttachDevices error=socket I/O: Resource temporarily unavailable (os error 11) (binary API lost; VPP is not torn down for this — ...)
+WARN convergence step lost the binary API; holding VPP rather than tearing it down — ... step=Attach attempt=1 retry_in=500ms
+INFO binary API answering again; resuming the interrupted convergence step
+```
+
+A drain that loses the API mid-resync logs `resync drain lost the
+binary API; reconnecting, and resuming the drain on the same VPP once
+it answers a ping` instead. Those ops were requeued, so the retry is
+idempotent. It waits for the same backoff and post-loss ping as a
+resumed step, so a persistently starved VPP is not sent a full batch
+on every tick.
+
+**Why.** On a CPU-starved host (softirq around 60% during a daemon
+restart), an adopted VPP's route dump hit its socket deadline. The
+`EAGAIN` was treated as a failed pipeline, and the supervisor killed
+the adopted VPP. It then killed three fresh spawns whose attach timed
+out the same way, and the fourth re-converged about 1.09M routes from
+nothing. VPP was slow, not dead. A teardown is the most expensive
+recovery there is. On a steered adoptee it is also a dangerous one:
+steering has to come down first, and a respawn restarts the octeon port.
+
+**What resumes it.** The daemon reconnects, and the step is re-issued
+only after VPP has answered a ping sent *after* the loss. Reconnecting
+alone proves nothing about VPP's main thread. Resumes back off from
+500 ms, doubling to an 8 s ceiling. The resume restarts from the
+earliest step that did not finish. An attach that lost the API is
+re-run together with the resync queued behind it, and nothing is
+drained until the attach completes.
+
+**What still tears it down.** The same evidence as always:
+
+- the process exits (pidfd);
+- VPP stays silent past the wedge budget: **1.5 s while steered**,
+  which is the published bound and applies to a steered adoptee
+  exactly as before, or 10 s for an unsteered convergence;
+- the 120 s convergence deadline runs out. An interruption never
+  extends it, so a step that keeps losing the API while VPP answers
+  pings ends there;
+- a *refusal* (VPP answered and said no) is `ConvergenceFailed` at
+  once, as before.
+
+**A fresh VPP whose `dev_attach` had already landed** refuses the
+resumed `dev_attach`. That refusal is an ordinary `ConvergenceFailed`,
+so the fresh case ends where it did before, a few seconds later. An
+adopted VPP reuses its recorded interfaces and resumes cleanly.
+
+**The socket deadline during attach now matches the detector.** An
+unsteered attach and the adoption's route dump used to run under the
+steady 1.5 s deadline, while the wedge detector allowed 10 s for the
+same moment. That mismatch is how the dump above timed out: it streams
+for about 7 s at the reference table. Both now get the convergence
+budget. So a `stop` issued during an unsteered convergence can wait up
+to 10 s for a blocked request, the same as during a resync drain.
 
 ### A steer or unsteer that "cannot be confirmed"
 

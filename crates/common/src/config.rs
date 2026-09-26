@@ -417,6 +417,21 @@ pub enum ModuleDirective {
     /// Only meaningful under `forwarding-mode custom-fib`; parsed and
     /// inert otherwise (warned at apply time). SIGHUP-reconcilable.
     FibCache(bool),
+    /// `coalesce [rx-usecs <n>] [rx-frames <n>] [tx-usecs <n>]
+    /// [tx-frames <n>]` — NIC interrupt coalescing applied to every
+    /// interface this module attaches (never to one it does not), via
+    /// `SIOCETHTOOL` get → merge → set → read back. Unnamed parameters
+    /// keep the driver's value. The prior values are recorded in
+    /// `<state-dir>/coalesce.json` and written back by `detach`. A
+    /// driver that refuses is a WARN, never an attach failure: this is
+    /// a performance knob. **Restart-only** (applied at attach, like
+    /// `attach` itself); a reload that edits it is refused by name.
+    /// The numbers are platform-tuned — see the generic-mode
+    /// performance runbook for the measurement behind the example.
+    Coalesce {
+        spec: crate::ethtool::CoalesceSpec,
+        line: usize,
+    },
     /// `bridge-resolve auto|on|off` — bridge egress short-circuit
     /// (SPEC §4.7 extension). When the FIB resolves a nexthop whose
     /// egress device is a Linux bridge whose **single forwarding
@@ -790,27 +805,37 @@ pub enum IntegrityAuthoritySpec {
 /// Allowed range for `integrity-authority frr interval`.
 ///
 /// The floor is what one check costs. Every tick runs a `vtysh` per
-/// counted family plus the running-config and one per upstream, each
-/// with a 10 s timeout, and `show bgp <afi> unicast statistics` walks
-/// the whole table — cheap at the lab rig's 69k routes, unmeasured at a
-/// full one. Below ten seconds a slow tick simply runs back to back.
+/// counted family, one per upstream on each side of the running-config,
+/// and the running-config itself — each call with a 30 s timeout, the
+/// whole check inside a 150 s budget (the fast-path's `VTYSH_TIMEOUT`
+/// and `CHECK_BUDGET`) — and `show bgp <afi> unicast statistics` walks
+/// the whole table: cheap at the lab rig's 69k routes, past 10 s on a
+/// full-table box under refill load. Below ten seconds a slow tick
+/// simply runs back to back.
 ///
 /// The ceiling comes from the report-age limit the steering gate
 /// applies: a report older than `STEER_MAX_REPORT_AGE` (900 s) is
 /// `Stale` and refuses. **One failed check must not be able to age the
 /// retained report out**, and the arithmetic for that is not "interval
-/// below the limit". The checker sleeps a full interval after every
-/// attempt, failed or not, so from a report at t=0 the next attempt
-/// lands at about `interval + check time` and — if that one fails, which
-/// retains the old report — the one after it at twice that. That second
-/// attempt has to land before t=900.
+/// below the limit". Assume the checker sleeps a full interval after
+/// every attempt: from a report at t=0 the next attempt lands at about
+/// `interval + check time` and — if that one fails, which retains the
+/// old report — the one after it at twice that. That second attempt has
+/// to land before t=900, so at the 300 s ceiling each check gets 150 s —
+/// which is exactly the fast-path's `CHECK_BUDGET`, a deadline over all
+/// of a check's reads, so it holds however many upstreams are declared
+/// (review finding, PR #268: a per-call timeout alone grew the check by
+/// one timeout per upstream). An unreadable attempt is in fact retried
+/// sooner (from 10 s, doubling back up to the interval; the fast-path's
+/// `next_check_delay`), which only brings the second attempt earlier.
+/// The ceiling is deliberately not relaxed to rely on that.
 ///
 /// An earlier revision allowed two thirds of the limit (600 s) and said
 /// it left room for one failed check. It did not: attempt at ~600,
 /// failure, retry at ~1200, and a healthy box refused every steer from
 /// 900 to 1200 (review finding, PR #236). A third of the limit — 300 s,
-/// which is also the default — leaves 150 s for the two checks
-/// themselves. Slower than the default buys nothing anyway: it only
+/// which is also the default — leaves 300 s for the two checks
+/// themselves, 150 s each. Slower than the default buys nothing anyway: it only
 /// lengthens the flap cost and the staleness exposure together.
 pub const FRR_INTERVAL_SECS: std::ops::RangeInclusive<u64> =
     10..=(crate::fib::STEER_MAX_REPORT_AGE.as_secs() / 3);
@@ -2632,6 +2657,24 @@ fn parse(input: &str) -> Result<Config, ConfigError> {
                              feed is supported per module",
                         ));
                     }
+                    // One attach-time write per interface: two lines
+                    // would merge over each other in file order, and
+                    // "which value is on the NIC" should not depend on
+                    // reading the config bottom-up.
+                    if matches!(d, ModuleDirective::Coalesce { .. }) {
+                        if let Some(prev) = modules[i].directives.iter().find_map(|e| match e {
+                            ModuleDirective::Coalesce { line, .. } => Some(*line),
+                            _ => None,
+                        }) {
+                            return Err(ConfigError::parse(
+                                line,
+                                format!(
+                                    "duplicate `coalesce` (first on line {prev}); put every \
+                                     parameter on one line"
+                                ),
+                            ));
+                        }
+                    }
                     modules[i].directives.push(d);
                 }
             },
@@ -3193,6 +3236,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             };
             Ok(ModuleDirective::FibCache(on))
         }
+        "coalesce" => parse_coalesce(line, rest),
         "bridge-resolve" => parse_single_arg(line, rest, "bridge-resolve", |t| {
             let v: ToggleAutoOnOff = t.parse().map_err(|e: String| e)?;
             Ok(ModuleDirective::BridgeResolve(v))
@@ -3897,6 +3941,69 @@ where
         ));
     }
     f(tok).map_err(|e| ConfigError::parse(line, format!("{directive}: {e}")))
+}
+
+/// Upper bound on `coalesce` `*-usecs`. A 10 ms interrupt timer is
+/// already a latency fault on a forwarding path (the measured win is
+/// at 50 µs); past it is read as a typo, not a tuning.
+pub const COALESCE_MAX_USECS: u32 = 10_000;
+/// Upper bound on `coalesce` `*-frames`: the largest descriptor ring
+/// the generic-mode runbook sizes (`ethtool -G ... 32768`). A count
+/// threshold past the ring can never be reached.
+pub const COALESCE_MAX_FRAMES: u32 = 32_768;
+
+/// `coalesce <key> <n> [<key> <n>...]`: keyword/value pairs in any
+/// order, each key at most once, at least one pair.
+fn parse_coalesce<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    use crate::ethtool::{CoalesceField, CoalesceSpec};
+    const USAGE: &str =
+        "form: `coalesce [rx-usecs <n>] [rx-frames <n>] [tx-usecs <n>] [tx-frames <n>]`";
+    let mut spec = CoalesceSpec::default();
+    while let Some(key) = rest.next() {
+        let field = CoalesceField::from_keyword(key).ok_or_else(|| {
+            ConfigError::parse(
+                line,
+                format!("coalesce: unknown parameter `{key}` ({USAGE})"),
+            )
+        })?;
+        if spec.get(field).is_some() {
+            return Err(ConfigError::parse(
+                line,
+                format!("coalesce: `{key}` given twice"),
+            ));
+        }
+        let tok = rest.next().ok_or_else(|| {
+            ConfigError::parse(line, format!("coalesce: `{key}` requires a value"))
+        })?;
+        // A u32 parse refuses negatives and fractions outright.
+        let v: u32 = tok.parse().map_err(|_| {
+            ConfigError::parse(
+                line,
+                format!("coalesce: `{key}` expects a non-negative integer, got `{tok}`"),
+            )
+        })?;
+        let max = match field {
+            CoalesceField::RxUsecs | CoalesceField::TxUsecs => COALESCE_MAX_USECS,
+            CoalesceField::RxFrames | CoalesceField::TxFrames => COALESCE_MAX_FRAMES,
+        };
+        if v > max {
+            return Err(ConfigError::parse(
+                line,
+                format!("coalesce: `{key} {v}` out of range [0, {max}]"),
+            ));
+        }
+        spec.set(field, Some(v));
+    }
+    if spec.is_empty() {
+        return Err(ConfigError::parse(
+            line,
+            format!("coalesce requires at least one parameter ({USAGE})"),
+        ));
+    }
+    Ok(ModuleDirective::Coalesce { spec, line })
 }
 
 /// Helper: single-u32 argument variants (`fib-*-max-entries`).
@@ -5005,6 +5112,83 @@ module fast-path
         assert!(Config::parse("module fast-path\n  fib-cache auto\n").is_err());
         assert!(Config::parse("module fast-path\n  fib-cache\n").is_err());
         assert!(Config::parse("module fast-path\n  fib-cache on off\n").is_err());
+    }
+
+    fn coalesce_of(body: &str) -> Result<crate::ethtool::CoalesceSpec, String> {
+        let s = format!("module fast-path\n  {body}\n");
+        let c = Config::parse(&s).map_err(|e| e.to_string())?;
+        match &c.modules[0].directives[0] {
+            ModuleDirective::Coalesce { spec, line } => {
+                assert_eq!(*line, 2);
+                Ok(*spec)
+            }
+            other => panic!("expected Coalesce, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_full_form_parses() {
+        let spec = coalesce_of("coalesce rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32")
+            .expect("parse");
+        assert_eq!(
+            spec,
+            crate::ethtool::CoalesceSpec {
+                rx_usecs: Some(50),
+                rx_frames: Some(32),
+                tx_usecs: Some(50),
+                tx_frames: Some(32),
+            }
+        );
+    }
+
+    #[test]
+    fn coalesce_fields_are_optional_and_order_free() {
+        let spec = coalesce_of("coalesce tx-frames 16 rx-usecs 0").expect("parse");
+        assert_eq!(
+            spec,
+            crate::ethtool::CoalesceSpec {
+                rx_usecs: Some(0),
+                tx_frames: Some(16),
+                ..Default::default()
+            }
+        );
+        // Bounds are inclusive.
+        let spec = coalesce_of(&format!(
+            "coalesce rx-usecs {COALESCE_MAX_USECS} rx-frames {COALESCE_MAX_FRAMES}"
+        ))
+        .expect("parse");
+        assert_eq!(spec.rx_usecs, Some(COALESCE_MAX_USECS));
+        assert_eq!(spec.rx_frames, Some(COALESCE_MAX_FRAMES));
+    }
+
+    #[test]
+    fn coalesce_rejects_malformed_lines() {
+        for (body, needle) in [
+            ("coalesce", "at least one parameter"),
+            ("coalesce rx-usecs", "requires a value"),
+            ("coalesce rx-usecs -1", "non-negative integer"),
+            ("coalesce rx-usecs 2.5", "non-negative integer"),
+            ("coalesce rx-usecs fast", "non-negative integer"),
+            ("coalesce rx-usecs 10001", "out of range [0, 10000]"),
+            ("coalesce tx-frames 32769", "out of range [0, 32768]"),
+            ("coalesce rx-usecs 50 rx-usecs 60", "given twice"),
+            ("coalesce adaptive-rx on", "unknown parameter `adaptive-rx`"),
+            ("coalesce 50", "unknown parameter `50`"),
+        ] {
+            let e = coalesce_of(body).expect_err(body);
+            assert!(e.contains(needle), "{body}: {e}");
+        }
+    }
+
+    #[test]
+    fn coalesce_twice_in_one_section_is_refused() {
+        let e = Config::parse("module fast-path\n  coalesce rx-usecs 50\n  coalesce tx-usecs 50\n")
+            .expect_err("duplicate");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("line 3") && msg.contains("first on line 2"),
+            "{msg}"
+        );
     }
 
     #[test]

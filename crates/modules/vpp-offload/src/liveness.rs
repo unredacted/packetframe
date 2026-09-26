@@ -168,6 +168,18 @@ impl WedgeDetector {
     pub fn answered_last_probe(&self) -> bool {
         self.last_ok >= self.last_attempt
     }
+
+    /// Has the API answered strictly AFTER `t`?
+    ///
+    /// For a decision that needs evidence from after some event — the
+    /// resume of a convergence step that lost the API. The clock's
+    /// starting point counts as an answer everywhere else (it IS one:
+    /// the handshake), and strictness is what keeps a detector started
+    /// at the same instant as the event from passing for a pong that
+    /// never came.
+    pub fn answered_since(&self, t: Instant) -> bool {
+        self.last_ok > t
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +201,21 @@ mod tests {
             "worst case {:?} exceeds the published 2 s",
             worst_case_detection(PING_BUDGET)
         );
+    }
+
+    #[test]
+    fn only_an_answer_after_the_instant_counts_as_one_since_it() {
+        let t0 = Instant::now();
+        let mut d = WedgeDetector::started(t0);
+        assert!(
+            !d.answered_since(t0),
+            "the start is not evidence about itself"
+        );
+        d.on_ping_sent(at(t0, 500));
+        assert!(!d.answered_since(t0), "a ping is not an answer");
+        d.on_pong(at(t0, 520));
+        assert!(d.answered_since(t0));
+        assert!(!d.answered_since(at(t0, 520)));
     }
 
     #[test]

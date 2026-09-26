@@ -19,6 +19,7 @@ pub mod probe_authority;
 pub use probe_authority::run_frr_authority_probes;
 
 pub mod breaker;
+pub mod coalesce;
 pub mod fib;
 pub mod metrics;
 pub mod pin;
@@ -38,8 +39,8 @@ pub mod redirect_watch;
 
 #[cfg(target_os = "linux")]
 pub use linux_impl::{
-    fib_status_from_pin, stats_from_pin, tail_call_chain_from_pin, tc_attach_iface,
-    tc_detach_from_state_dir, trial_attach_native, FibStatusSnapshot, TrialResult,
+    coalesce_restore_from_state_dir, fib_status_from_pin, stats_from_pin, tail_call_chain_from_pin,
+    tc_attach_iface, tc_detach_from_state_dir, trial_attach_native, FibStatusSnapshot, TrialResult,
 };
 
 pub const MODULE_NAME: &str = "fast-path";

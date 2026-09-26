@@ -348,6 +348,14 @@ fn main() -> ExitCode {
                     tracing::error!(error = %msg, "reconfigure: daemon rejected the new config");
                     ExitCode::from(EXIT_RUNTIME_ERROR)
                 }
+                Err(loader::ReconfigureError::PartiallyApplied(msg)) => {
+                    tracing::error!(
+                        failed = %msg,
+                        "reconfigure: the module(s) named here failed to apply the new config; \
+                         every other module applied it, and nothing was rolled back"
+                    );
+                    ExitCode::from(EXIT_RUNTIME_ERROR)
+                }
                 Err(loader::ReconfigureError::Timeout) => {
                     tracing::error!(
                         "reconfigure: no acknowledgment from the daemon within 5s, \

@@ -392,6 +392,20 @@ impl Verdict {
 /// Which convergence step is in flight, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    /// Devices attaching, or attached with the resync not yet planned —
+    /// the adoption dump runs here, and an adopted resync deferred until
+    /// the fallback settles stays here until its diff is planned.
+    ///
+    /// A phase of its own because the supervisor counts all of it as
+    /// converging, and the socket deadline keys on this field. Without
+    /// it an UNSTEERED attach and the adoption's `ip_route_dump` (7 s at
+    /// the reference table, streamed) ran under the steady 1.5 s
+    /// deadline while the wedge detector allowed 10 s — the socket
+    /// vetoing a decision `op_timeout` says belongs to the detector. A
+    /// starved host (softirq ~60% during a restart) turned that into an
+    /// EAGAIN on the adoption's dump, and the teardown that followed
+    /// killed the VPP adoption exists to keep.
+    Attach,
     Resync,
     Verify,
 }
@@ -456,6 +470,32 @@ impl std::fmt::Display for EngineError {
                 "the attached route for local-route {prefix} could not be installed \
                  ({detail}); steered traffic to it would die at null-node"
             ),
+        }
+    }
+}
+
+impl EngineError {
+    /// Whether this failure is the binary API connection going away —
+    /// a reply that outran the socket deadline, a socket that closed, or
+    /// a transport an earlier failure already dropped — rather than VPP
+    /// answering and refusing.
+    ///
+    /// Says nothing about whether VPP is alive: that is the pidfd's word
+    /// (death) and the wedge detector's (silence), and the driver module
+    /// doc's rule is that a broken socket is a symptom, never the
+    /// verdict. So this is what makes a failed convergence step
+    /// resumable on the same VPP instead of a teardown.
+    ///
+    /// Socket I/O only. A malformed frame, a context mismatch on a fresh
+    /// connection or a CRC refusal would fail identically after a
+    /// reconnect, so those stay ordinary failures.
+    pub fn api_lost(&self) -> bool {
+        match self {
+            Self::NotConnected => true,
+            Self::Transport(e) | Self::Attach(AttachError::Transport(e)) => {
+                matches!(e, TransportError::Io(_) | TransportError::Connect { .. })
+            }
+            _ => false,
         }
     }
 }
@@ -1748,6 +1788,9 @@ impl ConvergenceEngine {
     /// every single route — which the drainer handles correctly but
     /// which would burn a whole convergence cycle doing nothing.
     pub fn attach_devices(&mut self, mode: AttachMode) -> Result<(), EngineError> {
+        // Converging from here, not from `begin_resync`: see
+        // `Phase::Attach` for the deadline this sets.
+        self.phase = Some(Phase::Attach);
         self.arm_timeout();
         let mut ports = std::mem::take(&mut self.ports);
         // The MTU as the kernel has it now, not as it was at bring-up:
@@ -2265,7 +2308,15 @@ impl ConvergenceEngine {
             return Err(EngineError::NotConnected);
         }
 
-        let mut adopted = 0u64;
+        // Every family is read before ANY is adopted. Adopting as it
+        // went, a dump that failed after the v4 half left v4 in the
+        // ledger, and the early return above would turn a resumed
+        // `StartResync` into a no-op reporting `0` — which the caller
+        // reads as "nothing to adopt" and answers with an immediate,
+        // undeferred diff: v4 withdrawn against a source that may still
+        // be loading, v6 never adopted at all. All or nothing makes the
+        // resumed step exactly the first attempt again.
+        let mut found = Vec::new();
         for &is_ip6 in self.drainer.families().dump_families() {
             let t = self.transport.as_mut().expect("checked just above");
             let details: Vec<IpRouteDetails> = match t.dump(IpRouteDump {
@@ -2282,6 +2333,8 @@ impl ConvergenceEngine {
                     return Err(EngineError::Transport(e));
                 }
             };
+            // Reduced to prefixes per family, so the peak is still one
+            // family's details rather than the whole FIB's.
             for d in details {
                 let Some(prefix) = from_prefix(&d.route.prefix) else {
                     continue;
@@ -2292,11 +2345,13 @@ impl ConvergenceEngine {
                 if !self.looks_self_installed(&d.route) {
                     continue;
                 }
-                self.ledger.adopt_installed(prefix);
-                adopted += 1;
+                found.push(prefix);
             }
         }
-        Ok(adopted)
+        for &prefix in &found {
+            self.ledger.adopt_installed(prefix);
+        }
+        Ok(found.len() as u64)
     }
 
     /// Whether a route read back from VPP is one this module installed.
@@ -2723,7 +2778,15 @@ impl ConvergenceEngine {
                 // transport failure is not a verdict on the FIB, and
                 // storing it as a failed verify would report "FIB is
                 // wrong" for what is actually "we could not ask".
-                self.phase = None;
+                //
+                // The phase is KEPT. The supervisor is still converging —
+                // a lost connection resumes the verify, a protocol fault
+                // aborts it (`abort_convergence` clears this) — and the
+                // socket deadline keys on the phase. Cleared here, the
+                // reconnect and the post-loss probe of an unsteered
+                // verify ran under the steady 1.5 s while the detector
+                // allowed 10 s: the mismatch `Phase::Attach` removes,
+                // recreated one step later (review finding, PR #272).
                 Err(EngineError::Transport(e))
             }
         }
@@ -3167,6 +3230,42 @@ mod tests {
             e.attach_devices(AttachMode::Fresh),
             Err(EngineError::NotConnected)
         ));
+    }
+
+    /// Only a lost connection is resumable. A refusal is VPP answering,
+    /// and a protocol fault would fail the same way on a new socket, so
+    /// resuming either would retry into the same answer until the
+    /// convergence deadline — two minutes of waiting for something
+    /// already known.
+    #[test]
+    fn only_a_lost_connection_counts_as_the_api_lost() {
+        let timeout = || {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Resource temporarily unavailable",
+            ))
+        };
+        assert!(EngineError::NotConnected.api_lost());
+        assert!(EngineError::Transport(timeout()).api_lost());
+        assert!(EngineError::Attach(AttachError::Transport(timeout())).api_lost());
+
+        assert!(!EngineError::Attach(AttachError::Refused {
+            step: "dev_attach",
+            port: "eth4".into(),
+            retval: -1,
+            detail: String::new(),
+        })
+        .api_lost());
+        assert!(!EngineError::Transport(TransportError::ContextMismatch {
+            expected: 1,
+            got: 2
+        })
+        .api_lost());
+        assert!(!EngineError::NeighbourRefused {
+            nexthop: "192.0.2.1".parse().unwrap(),
+            retval: -1,
+        }
+        .api_lost());
     }
 
     /// A transport failure during verify is not a verdict on the FIB.

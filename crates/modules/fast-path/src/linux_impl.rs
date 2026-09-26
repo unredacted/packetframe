@@ -755,6 +755,11 @@ pub struct ActiveState {
     /// accepted config contradicting live kernel state (review
     /// finding, PR #196).
     pub route_source_spec: Option<packetframe_common::config::RouteSourceSpec>,
+    /// The `coalesce` directive in force at attach (`None` when absent).
+    /// Retained for the same reason as `route_source_spec`: it is applied
+    /// once, so a reload that edits it must be refused by name rather
+    /// than accepted with the NICs still on the old values.
+    pub coalesce: Option<packetframe_common::ethtool::CoalesceSpec>,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
@@ -876,7 +881,33 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         attach_settle_time: cfg.global.attach_settle_time,
         integrity_authority: integrity_authority_from_cfg(cfg),
         route_source_spec: route_source_spec_from_cfg(cfg),
+        coalesce: coalesce_spec_from_cfg(cfg),
     })
+}
+
+/// The `coalesce` directive, if any (the parser refuses a second one).
+/// One derivation for `load`, `attach` and `reconcile`, same rationale
+/// as [`integrity_authority_from_cfg`].
+pub(crate) fn coalesce_spec_from_cfg(
+    cfg: &ModuleConfig<'_>,
+) -> Option<packetframe_common::ethtool::CoalesceSpec> {
+    cfg.section.directives.iter().find_map(|d| match d {
+        ModuleDirective::Coalesce { spec, .. } => Some(*spec),
+        _ => None,
+    })
+}
+
+/// Write back what the `coalesce` directive changed, from
+/// `<state-dir>/coalesce.json`. Out-of-process half for
+/// `packetframe detach`; in-process `detach` calls the same thing.
+/// Never fails — see [`crate::coalesce`].
+pub fn coalesce_restore_from_state_dir(state_dir: &Path) -> crate::coalesce::RestoreSummary {
+    crate::coalesce::restore_from_state_dir(
+        &packetframe_common::ethtool::SiocEthtool,
+        state_dir,
+        &crate::coalesce::current_boot_id(),
+        &|iface| if_nametoindex(iface).ok(),
+    )
 }
 
 /// The anyip phantom address, when `route-source bgp ... anyip` is
@@ -2101,6 +2132,25 @@ pub fn attach(
         );
     }
 
+    // NIC interrupt coalescing, LAST: every step above that can fail
+    // the attach has already succeeded, so a refused start never leaves
+    // a NIC retuned. Scoped to `state.links` — what this attach actually
+    // attached — never the host's other interfaces. Warn-only inside.
+    if let Some(spec) = &state.coalesce {
+        let ifaces: Vec<(String, u32)> = state
+            .links
+            .iter()
+            .map(|l| (l.iface.clone(), l.ifindex))
+            .collect();
+        crate::coalesce::apply_on_attach(
+            &packetframe_common::ethtool::SiocEthtool,
+            &state.state_dir,
+            &crate::coalesce::current_boot_id(),
+            &ifaces,
+            spec,
+        );
+    }
+
     // Build Attachment records for the pin registry. `pinned_path`
     // points at the real link pin, when `packetframe detach` runs,
     // it unlinks this path, which is how the kernel-side attach tears
@@ -3136,8 +3186,17 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
     // ~1 ms (the pre-rc5 behavior) wedged the bridge stack on rvu-
     // nicpf with eth0/eth4/eth5 all bridged on switch0, kernel-
     // panicking the EFG during Phase 4 cutover testing.
-    pin::remove_all_paced(&state.bpffs_root, state.attach_settle_time)
-        .map_err(|e| ModuleError::other(MODULE_NAME, format!("remove pins: {e}")))?;
+    let pins = pin::remove_all_paced(&state.bpffs_root, state.attach_settle_time);
+
+    // Coalescing was applied last at attach, so it is reversed last —
+    // but unconditionally: a pin-removal failure above must not strand
+    // the NICs retuned (review finding), so its error is reported only
+    // after this has run. Driven by the state file, not
+    // `state.coalesce`: a record carried from an earlier failed restore
+    // needs reversing even if this run's config dropped the directive.
+    coalesce_restore_from_state_dir(&state.state_dir);
+
+    pins.map_err(|e| ModuleError::other(MODULE_NAME, format!("remove pins: {e}")))?;
     info!(
         settle_secs = state.attach_settle_time.as_secs_f64(),
         "fast-path pins removed; kernel detached"
@@ -3948,6 +4007,7 @@ mod tests {
                 path: None,
             },
             route_source_spec: None,
+            coalesce: None,
         };
 
         let bridge_idx = if_nametoindex(BRIDGE).unwrap();
