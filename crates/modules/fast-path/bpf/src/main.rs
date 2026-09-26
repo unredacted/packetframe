@@ -1,7 +1,8 @@
 //! PacketFrame fast-path BPF program (SPEC.md §4.4 + §4.7).
 //!
 //! Parses Ethernet (optionally one 802.1Q tag), IPv4 or IPv6, consults
-//! the allowlist (src-or-dst match, §4.2), calls `bpf_fib_lookup`,
+//! the allowlist (src-or-dst match, §4.2), passes any frame not
+//! addressed to one of the ingress port's receive MACs, calls `bpf_fib_lookup`,
 //! rewrites L2 + TTL, performs any required VLAN push / pop / rewrite
 //! per §4.7, and redirects via `bpf_redirect_map`. All counters in
 //! [`maps::StatIdx`] are bumped per SPEC.md §4.6. Dry-run mode
@@ -39,10 +40,10 @@ use datapath::{
     l4_ports,
 };
 use maps::{
-    bump, stats_base, StatIdx, StatsPtr, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG,
+    bump, stats_base, RxMacKey, StatIdx, StatsPtr, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG,
     FIB_LOOKUP_SCRATCH, FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_COMPARE_MODE,
     FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT, MUTATION_CTX,
-    MUTATION_PROGS, REDIRECT_DEVMAP, VLAN_RESOLVE,
+    MUTATION_PROGS, REDIRECT_DEVMAP, RX_MACS, VLAN_RESOLVE,
 };
 
 const AF_INET: u8 = 2;
@@ -265,6 +266,14 @@ fn handle_ipv4(
     bump(stats, StatIdx::MatchedV4);
     bump_match_subset(stats, src_hit, dst_hit);
 
+    // Only a frame addressed to the router is routed. Ahead of the
+    // bogon drop and dry-run: a frame the kernel is only bridging is
+    // neither ours to drop nor one the fast path would forward.
+    if !addressed_to_router(ctx, eth) {
+        bump(stats, StatIdx::PassNotForUs);
+        return Ok(xdp_action::XDP_PASS);
+    }
+
     // v0.2.1 issue #33: bogon block. After allowlist match (so we only
     // affect traffic we'd otherwise touch), check if dst falls in any
     // operator-declared `block-prefix`. If so, drop here, saves the
@@ -486,6 +495,12 @@ fn handle_ipv6(
     bump(stats, StatIdx::MatchedV6);
     bump_match_subset(stats, src_hit, dst_hit);
 
+    // See handle_ipv4.
+    if !addressed_to_router(ctx, eth) {
+        bump(stats, StatIdx::PassNotForUs);
+        return Ok(xdp_action::XDP_PASS);
+    }
+
     // v0.2.1 issue #33: bogon block (IPv6 side). Gated on
     // BLOCK_PRESENT, see handle_ipv4.
     if cfg_flags & FP_CFG_FLAG_BLOCK_PRESENT != 0 && BLOCK_V6.get(&dst_key).is_some() {
@@ -588,6 +603,26 @@ fn handle_ipv6(
         fib_ref,
         ingress_vid,
     )
+}
+
+/// Whether the frame's destination MAC is one the router receives on at
+/// its ingress port (`RX_MACS`, one hash lookup). A bridge member's XDP
+/// hook sees every frame the bridge receives on it, including frames
+/// between two hosts on one VLAN; routing one of those would decrement
+/// its TTL and rewrite its source MAC where the kernel would have
+/// bridged it untouched. Broadcast and multicast MACs are never in the
+/// map, so those frames — which the fast path must not route either —
+/// take the same exit. A port with no entries (not yet populated, or
+/// its MACs unreadable) passes everything: the kernel path, which is
+/// always correct.
+#[inline(always)]
+fn addressed_to_router(ctx: &XdpContext, eth: *const EthHdr) -> bool {
+    let key = RxMacKey {
+        ifindex: unsafe { (*ctx.ctx).ingress_ifindex },
+        mac: unsafe { (*eth).dst_addr },
+        _pad: 0,
+    };
+    unsafe { RX_MACS.get(&key) }.is_some()
 }
 
 #[inline(always)]

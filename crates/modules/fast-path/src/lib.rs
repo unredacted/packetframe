@@ -24,6 +24,7 @@ pub mod fib;
 pub mod metrics;
 pub mod pin;
 pub mod registry;
+pub mod rx_macs;
 pub mod softnet;
 pub mod tc_links;
 

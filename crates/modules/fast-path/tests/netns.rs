@@ -485,6 +485,17 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
         .expect("CFG set");
     }
 
+    // The frame is addressed to the ingress veth's own MAC, which attach
+    // would program as its receive MAC; without it the destination-MAC
+    // check passes the frame before the devmap pre-check under test.
+    {
+        let map = bpf.map_mut("RX_MACS").expect("RX_MACS map");
+        let mut rx: aya::maps::HashMap<_, common::RxMacKey, u8> =
+            aya::maps::HashMap::try_from(map).expect("HashMap::try_from RX_MACS");
+        rx.insert(common::RxMacKey::new(ifindex_a, mac_a), 1u8, 0)
+            .expect("RX_MACS insert");
+    }
+
     // REDIRECT_DEVMAP intentionally left empty, the dummy ifindex is
     // therefore NOT in it, which is what drives the pre-check miss.
 

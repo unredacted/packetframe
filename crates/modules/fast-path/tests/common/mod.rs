@@ -55,7 +55,7 @@ pub struct FpCfg {
 unsafe impl Pod for FpCfg {}
 
 pub const FP_CFG_VERSION_V2: u32 = 1;
-pub const STATS_COUNT: u32 = 50;
+pub const STATS_COUNT: u32 = 51;
 
 /// This mirror cannot drift from the library's count again.
 ///
@@ -78,6 +78,11 @@ const _: () = assert!(
     STATS_COUNT as usize == packetframe_fast_path::metrics::COUNTER_COUNT,
     "STATS_COUNT must equal metrics::COUNTER_COUNT — append to both, or the      harness types a map value size the BPF program did not write"
 );
+
+/// `RX_MACS` key: the library's mirror of `RxMacKey` in
+/// `bpf/src/maps.rs`, so the harness cannot drift from what attach
+/// writes.
+pub use packetframe_fast_path::rx_macs::RxMacKey;
 
 /// Flag bit constants mirrored from `bpf/src/maps.rs`. Test harness
 /// uses these to flip forwarding modes on the live BPF program.
@@ -147,7 +152,20 @@ pub enum StatIdx {
     ErrParseTcVlan = 47,
     ErrParseTcL3V4 = 48,
     ErrParseTcL3V6 = 49,
+    PassNotForUs = 50,
 }
+
+/// `ingress_ifindex` of every `BPF_PROG_TEST_RUN` XDP execution: with no
+/// `xdp_md` context passed in, the kernel runs the program on the
+/// current netns's loopback receive queue, and loopback is always
+/// ifindex 1.
+pub const TEST_RUN_INGRESS_IFINDEX: u32 = 1;
+
+/// Destination MAC the packet builders default to. [`Harness::new`]
+/// programs it as a receive MAC of [`TEST_RUN_INGRESS_IFINDEX`], so a
+/// builder-default frame is addressed to the router unless a test says
+/// otherwise.
+pub const BUILDER_DST_MAC: [u8; 6] = [0xbb, 0, 0, 0, 0, 2];
 
 /// Minimum XDP verdict constants. Pulled in locally to avoid a
 /// dev-dep on aya-ebpf (nightly-only).
@@ -280,7 +298,34 @@ impl Harness {
             mss_clamp_global: 0,
             version: FP_CFG_VERSION_V2,
         });
+        // The builders' frames are addressed to the router by default,
+        // as attach would program for a real port. Destination-MAC tests
+        // clear this or send elsewhere.
+        harness.add_rx_mac(TEST_RUN_INGRESS_IFINDEX, BUILDER_DST_MAC);
         harness
+    }
+
+    /// Program `mac` as a destination MAC the router receives on at
+    /// `ifindex` (`RX_MACS`).
+    pub fn add_rx_mac(&mut self, ifindex: u32, mac: [u8; 6]) {
+        self.rx_macs()
+            .insert(RxMacKey::new(ifindex, mac), 1u8, 0)
+            .expect("RX_MACS insert");
+    }
+
+    /// Empty `RX_MACS`: the state of a port before attach populates it,
+    /// or one whose MACs could not be read.
+    pub fn clear_rx_macs(&mut self) {
+        let mut map = self.rx_macs();
+        let keys: Vec<RxMacKey> = map.keys().map(|k| k.expect("RX_MACS key")).collect();
+        for k in keys {
+            map.remove(&k).expect("RX_MACS remove");
+        }
+    }
+
+    fn rx_macs(&mut self) -> aya::maps::HashMap<&mut aya::maps::MapData, RxMacKey, u8> {
+        let map = self.bpf.map_mut("RX_MACS").expect("RX_MACS map");
+        aya::maps::HashMap::try_from(map).expect("RX_MACS try_from")
     }
 
     pub fn set_cfg(&mut self, cfg: FpCfg) {

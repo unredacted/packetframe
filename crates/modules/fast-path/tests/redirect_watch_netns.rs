@@ -4,6 +4,9 @@
 //! VLAN sub-interface must get its `VLAN_RESOLVE` translation (and the
 //! `VLAN_PRESENT` gate) along with its admission.
 //!
+//! A second test follows `RX_MACS` through a port MAC change and a
+//! bridge enslavement, in the host namespace (see its doc for why).
+//!
 //! Needs CAP_NET_ADMIN + CAP_SYS_ADMIN (netns) and CAP_BPF + bpffs
 //! (pins); runs in the qemu-verifier job via `--ignored`.
 //!
@@ -29,7 +32,7 @@ use std::time::{Duration, Instant};
 use aya::maps::{xdp::DevMapHash, Array, HashMap as AyaHashMap, Map, MapData};
 use aya::Ebpf;
 use packetframe_fast_path::aligned_bpf_copy;
-use packetframe_fast_path::linux_impl::{FpCfg, VlanResolve, FP_CFG_FLAG_VLAN_PRESENT};
+use packetframe_fast_path::linux_impl::{FpCfg, RxMacKey, VlanResolve, FP_CFG_FLAG_VLAN_PRESENT};
 use packetframe_fast_path::pin;
 use packetframe_fast_path::redirect_watch::RedirectTargetWatcher;
 
@@ -87,8 +90,8 @@ struct Pins {
 }
 
 impl Pins {
-    fn setup() -> Self {
-        let root = PathBuf::from(BPFFS_ROOT).join(format!("pfrw-{}", std::process::id()));
+    fn setup(tag: &str) -> Self {
+        let root = PathBuf::from(BPFFS_ROOT).join(format!("pfrw{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(pin::maps_dir(&root)).expect("mkdir pin dirs");
         let bytes = aligned_bpf_copy();
@@ -134,6 +137,17 @@ impl Pins {
             .collect()
     }
 
+    /// `RX_MACS` as `(ifindex, mac)` pairs.
+    fn rx_macs(&self) -> HashSet<(u32, [u8; 6])> {
+        let rm = MapData::from_pin(pin::map_path(&self.root, "RX_MACS")).expect("pin");
+        let rx: AyaHashMap<MapData, RxMacKey, u8> =
+            AyaHashMap::try_from(Map::HashMap(rm)).expect("rx");
+        rx.keys()
+            .filter_map(Result::ok)
+            .map(|k| (k.ifindex, k.mac))
+            .collect()
+    }
+
     fn vlan_present_gate(&self) -> bool {
         let cm = MapData::from_pin(pin::map_path(&self.root, "CFG")).expect("pin");
         let cfg: Array<MapData, FpCfg> = Array::try_from(Map::Array(cm)).expect("cfg");
@@ -157,11 +171,13 @@ fn poll(pins: &Pins, what: &str, deadline: Duration, pred: impl Fn() -> bool) {
         }
         assert!(
             start.elapsed() < deadline,
-            "{what}: not satisfied within {deadline:?}; devmap={:?} tc={:?} vlan={:?} gate={}",
+            "{what}: not satisfied within {deadline:?}; devmap={:?} tc={:?} vlan={:?} gate={} \
+             rx_macs={:?}",
             pins.devmap_keys(),
             pins.tc_keys(),
             pins.vlan_entries(),
-            pins.vlan_present_gate()
+            pins.vlan_present_gate(),
+            pins.rx_macs()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -194,8 +210,9 @@ fn links_created_and_deleted_at_runtime_track_into_the_redirect_maps() {
     // everything below (pins, netlink subscription, events) is scoped
     // to it.
     let _ns_fd = enter_netns(&netns);
-    let pins = Pins::setup();
-    let watcher = RedirectTargetWatcher::start(&pins.root, Vec::new()).expect("watcher start");
+    let pins = Pins::setup("");
+    let watcher =
+        RedirectTargetWatcher::start(&pins.root, Vec::new(), Vec::new()).expect("watcher start");
 
     // Give the subscription a moment to come up; an event before it
     // is live would be a test race, not a product bug.
@@ -258,6 +275,109 @@ fn links_created_and_deleted_at_runtime_track_into_the_redirect_maps() {
         "vlan translation purged",
         Duration::from_secs(5),
         || !pins.vlan_entries().contains_key(&isub),
+    );
+
+    watcher.shutdown();
+}
+
+/// Deletes the named links on drop.
+struct LinksGuard(Vec<String>);
+
+impl Drop for LinksGuard {
+    fn drop(&mut self) {
+        for l in &self.0 {
+            let _ = Command::new("ip").args(["link", "del", l]).status();
+        }
+    }
+}
+
+/// `RX_MACS` follows the attached port's receive MACs at runtime: filled
+/// at watcher start, then moved by the `RTM_NEWLINK` a MAC change or a
+/// bridge enslavement emits — the port's own MAC while it is plain, its
+/// bridge's once it is a member.
+///
+/// Runs in the HOST namespace (of the qemu VM), unlike the test above:
+/// `receive_macs` reads `/sys/class/net`, which is not remounted
+/// per-netns, so only in the namespace sysfs was mounted in do the
+/// netlink events and the sysfs reads describe the same links. The two
+/// links it creates are removed on drop; the pins are its own.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn rx_macs_follow_a_port_mac_change_and_its_bridge() {
+    if !bpffs_present(Path::new(BPFFS_ROOT)) {
+        run(&["mount", "-t", "bpf", "bpf", BPFFS_ROOT]);
+    }
+    let port = format!("pfrxd{}", std::process::id() % 10000);
+    let bridge = format!("pfrxb{}", std::process::id() % 10000);
+    let _ = Command::new("ip").args(["link", "del", &port]).status();
+    let _ = Command::new("ip").args(["link", "del", &bridge]).status();
+    let _links = LinksGuard(vec![port.clone(), bridge.clone()]);
+    const FIRST: [u8; 6] = [0x02, 0, 0, 0, 0x5a, 0x01];
+    const SECOND: [u8; 6] = [0x02, 0, 0, 0, 0x5a, 0x02];
+    const BRIDGE: [u8; 6] = [0x02, 0, 0, 0, 0x5a, 0xb0];
+    run(&[
+        "ip",
+        "link",
+        "add",
+        &port,
+        "address",
+        "02:00:00:00:5a:01",
+        "type",
+        "dummy",
+    ]);
+    run(&["ip", "link", "set", &port, "up"]);
+    let ifindex = if_nametoindex(&port);
+
+    let pins = Pins::setup("rx");
+    assert!(
+        pins.rx_macs().is_empty(),
+        "precondition: RX_MACS starts empty"
+    );
+    let watcher =
+        RedirectTargetWatcher::start(&pins.root, Vec::new(), vec![(port.clone(), ifindex)])
+            .expect("watcher start");
+    let p = &pins;
+    let rx_is = |want: [u8; 6]| move || p.rx_macs() == HashSet::from([(ifindex, want)]);
+
+    poll(
+        &pins,
+        "filled at watcher start",
+        Duration::from_secs(5),
+        rx_is(FIRST),
+    );
+
+    run(&[
+        "ip",
+        "link",
+        "set",
+        "dev",
+        &port,
+        "address",
+        "02:00:00:00:5a:02",
+    ]);
+    poll(
+        &pins,
+        "a plain port's MAC change replaces its entry",
+        Duration::from_secs(5),
+        rx_is(SECOND),
+    );
+
+    run(&[
+        "ip",
+        "link",
+        "add",
+        &bridge,
+        "address",
+        "02:00:00:00:5a:b0",
+        "type",
+        "bridge",
+    ]);
+    run(&["ip", "link", "set", &port, "master", &bridge]);
+    poll(
+        &pins,
+        "a bridge member receives on its bridge's MAC",
+        Duration::from_secs(5),
+        rx_is(BRIDGE),
     );
 
     watcher.shutdown();

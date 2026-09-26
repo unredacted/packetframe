@@ -206,6 +206,7 @@ Different, deliberately:
 | tcpdump on ingress | blind (XDP runs before taps) | sees ingress traffic again |
 | VLAN ingress | inline tag parse | skb metadata first, inline fallback |
 | Attach persistence | bpffs-pinned bpf_link | netlink cls_bpf filter (qdisc lifetime), recorded in `<state-dir>/tc-links.json` |
+| Destination MAC | routed only if in the port's `RX_MACS`, else pristine pass (`pass_not_for_us`) | not checked (see Known gaps) |
 
 ## Canary rollout
 
@@ -291,3 +292,9 @@ breaker trip detaches everything explicitly.
   redirect); tracked as Phase T follow-up.
 - Migrating from netlink cls_bpf to pinned TCX links is future work
   once the fleet baseline is ≥ 6.6.
+- No destination-MAC check. The XDP datapath passes a matched frame
+  whose destination MAC is not one the router receives on at that port;
+  `tc_fast_path` does not. So on a tc-attached bridge member, host-to-host
+  frames the kernel is bridging are still routed when either address is
+  allowlisted, and on any port so are broadcast and multicast frames
+  that reach a FIB route. Keep tc off bridge members.
