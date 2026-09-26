@@ -13,6 +13,8 @@ pub mod fib;
 pub mod frr;
 pub mod module;
 pub mod probe;
+#[cfg(target_os = "linux")]
+pub mod statefile;
 
 pub use config::{Config, ConfigError, GlobalConfig, ModuleSection};
 pub use module::{

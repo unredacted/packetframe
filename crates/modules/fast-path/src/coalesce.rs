@@ -75,42 +75,74 @@ pub fn file_path(state_dir: &Path) -> PathBuf {
     state_dir.join(COALESCE_FILENAME)
 }
 
-/// Atomic write-then-rename, mirroring `tc_links::save`.
+// The daemon writing these is root and `state-dir` may be writable by
+// someone who is not, so on Linux every write, read and unlink goes
+// through `packetframe_common::statefile`'s no-follow directory walk: a
+// symlink planted at `coalesce.json`, `coalesce.json.tmp` or any
+// intermediate component cannot redirect it (review finding, P1). The
+// non-Linux arms exist for the macOS dev loop's unit tests only, the
+// same split as the CLI's `atomic::write`.
+
+/// Atomic write-then-rename.
 pub fn save(state_dir: &Path, file: &CoalesceFile) -> Result<(), CoalesceFileError> {
     let path = file_path(state_dir);
-    let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(file).map_err(|source| CoalesceFileError::Json {
         path: path.clone(),
         source,
     })?;
-    std::fs::create_dir_all(state_dir).map_err(|source| CoalesceFileError::Io {
-        path: state_dir.to_path_buf(),
-        source,
-    })?;
-    std::fs::write(&tmp, json).map_err(|source| CoalesceFileError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
-    std::fs::rename(&tmp, &path).map_err(|source| CoalesceFileError::Io { path, source })
+    write_record(&path, json.as_bytes()).map_err(|source| CoalesceFileError::Io { path, source })
+}
+
+#[cfg(target_os = "linux")]
+fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    packetframe_common::statefile::write_atomic(path, contents)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// `Ok(None)` when nothing is recorded.
 pub fn load(state_dir: &Path) -> Result<Option<CoalesceFile>, CoalesceFileError> {
     let path = file_path(state_dir);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let raw = match read_record(&path) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Ok(None),
         Err(source) => return Err(CoalesceFileError::Io { path, source }),
     };
-    serde_json::from_str(&raw)
+    serde_json::from_slice(&raw)
         .map(Some)
         .map_err(|source| CoalesceFileError::Json { path, source })
+}
+
+#[cfg(target_os = "linux")]
+fn read_record(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    packetframe_common::statefile::read_no_follow(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_record(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(r) => Ok(Some(r)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Missing file is fine (idempotent teardown).
 pub fn remove(state_dir: &Path) -> Result<(), CoalesceFileError> {
     let path = file_path(state_dir);
-    match std::fs::remove_file(&path) {
+    #[cfg(target_os = "linux")]
+    let r = packetframe_common::statefile::remove_state_record(&path);
+    #[cfg(not(target_os = "linux"))]
+    let r = std::fs::remove_file(&path);
+    match r {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(CoalesceFileError::Io { path, source }),
@@ -138,8 +170,9 @@ pub enum ApplyOutcome {
     /// wanted, got)`. Recorded like `Applied`; the read-back is the
     /// truth `detach` compares against.
     Clamped(Vec<(CoalesceField, u32, u32)>),
-    /// The NIC already held the requested values and PacketFrame had
-    /// changed nothing on it; nothing written, nothing to reverse.
+    /// The NIC already held the requested values; nothing written.
+    /// With no carried record there is nothing to reverse and nothing
+    /// is recorded; a carried record keeps its confirmation unchanged.
     AlreadySet,
     /// Written, but the read-back failed; `detach` restores the prior
     /// values unconditionally.
@@ -232,11 +265,23 @@ fn apply_one(
         .map(|o| o.prior.or(&spec.snapshot(&before)))
         .unwrap_or_else(|| spec.snapshot(&before));
     let carried_applied = old.as_ref().map(|o| o.applied).unwrap_or_default();
+    // A write makes the requested fields' confirmation unknown until the
+    // read-back lands, so they are cleared first. With no write (the NIC
+    // already holds the requested values under a carried record) nothing
+    // changes on the NIC, and clearing would turn a confirmed field into
+    // an unconfirmed one — which restore writes back unconditionally,
+    // over any operator change made since (review finding).
+    let wrote = want != before;
+    let pending_applied = if wrote {
+        carried_applied.without(spec)
+    } else {
+        carried_applied
+    };
     records.push(CoalesceRecord {
         iface: iface.to_string(),
         ifindex,
         prior,
-        applied: carried_applied.without(spec),
+        applied: pending_applied,
     });
     let revert = |records: &mut Vec<CoalesceRecord>| {
         records.pop();
@@ -257,17 +302,23 @@ fn apply_one(
         return ApplyOutcome::Skipped(format!("record: {e}"));
     }
 
-    if want != before {
-        if let Err(e) = io.set(iface, &want) {
-            warn!(
-                iface,
-                requested = %spec,
-                error = %e,
-                "coalesce: driver refused; attach continues with the driver's values"
-            );
-            revert(records);
-            return ApplyOutcome::Skipped(format!("set: {e}"));
-        }
+    if !wrote {
+        info!(
+            iface,
+            current = %spec.snapshot(&before),
+            "coalesce: already set; carried restore record kept as is"
+        );
+        return ApplyOutcome::AlreadySet;
+    }
+    if let Err(e) = io.set(iface, &want) {
+        warn!(
+            iface,
+            requested = %spec,
+            error = %e,
+            "coalesce: driver refused; attach continues with the driver's values"
+        );
+        revert(records);
+        return ApplyOutcome::Skipped(format!("set: {e}"));
     }
 
     let readback = match io.get(iface) {
@@ -318,7 +369,8 @@ pub struct RestoreSummary {
     /// Records dropped with nothing to write (device gone or
     /// recreated, every field moved by someone else, already at prior).
     pub dropped: usize,
-    /// Records kept for a later `detach` because the write failed.
+    /// Records kept for a later `detach`: the write failed, or landed
+    /// without the NIC holding the prior values afterwards.
     pub retained: usize,
 }
 
@@ -354,6 +406,7 @@ pub fn restore_from_state_dir(
             RestoreStep::Restored => summary.restored += 1,
             RestoreStep::Dropped => summary.dropped += 1,
             RestoreStep::Retain => retained.push(rec),
+            RestoreStep::RetainAs(updated) => retained.push(updated),
         }
     }
     summary.retained = retained.len();
@@ -381,7 +434,13 @@ pub fn restore_from_state_dir(
 enum RestoreStep {
     Restored,
     Dropped,
+    /// Keep the record as it was (nothing was written).
     Retain,
+    /// Keep an updated record: a restore write landed but the driver
+    /// does not hold the prior values, so `applied` now names what the
+    /// NIC holds after OUR write — otherwise the next detach would read
+    /// those fields as moved by someone else and never retry them.
+    RetainAs(CoalesceRecord),
 }
 
 fn restore_one(
@@ -432,18 +491,27 @@ fn restore_one(
         return RestoreStep::Retain;
     }
     match io.get(iface) {
-        Ok(rb) if !plan.mismatches(&rb).is_empty() => warn!(
-            iface,
-            wanted = %plan,
-            got = %plan.snapshot(&rb),
-            "coalesce: restored, but the driver holds different values"
-        ),
-        Ok(_) => info!(iface, restored = %plan, "coalesce restored"),
+        Ok(rb) if !plan.mismatches(&rb).is_empty() => {
+            warn!(
+                iface,
+                wanted = %plan,
+                got = %plan.snapshot(&rb),
+                "coalesce: restore written but the driver holds different values; \
+                 record kept for the next detach"
+            );
+            let mut updated = rec.clone();
+            updated.applied = plan.snapshot(&rb).or(&rec.applied);
+            RestoreStep::RetainAs(updated)
+        }
+        Ok(_) => {
+            info!(iface, restored = %plan, "coalesce restored");
+            RestoreStep::Restored
+        }
         Err(e) => {
-            info!(iface, restored = %plan, error = %e, "coalesce restored (read-back failed)")
+            info!(iface, restored = %plan, error = %e, "coalesce restored (read-back failed)");
+            RestoreStep::Restored
         }
     }
-    RestoreStep::Restored
 }
 
 #[cfg(test)]
@@ -455,12 +523,13 @@ mod tests {
 
     /// An in-memory NIC table. `refuse_set` makes SCOALESCE fail for an
     /// interface; `clamp_usecs` caps both timers the way a driver with
-    /// a hardware limit does.
+    /// a hardware limit does; `floor_usecs` raises them to a minimum.
     #[derive(Default)]
     struct FakeNic {
         nics: RefCell<HashMap<String, EthtoolCoalesce>>,
         refuse_set: RefCell<Vec<String>>,
         clamp_usecs: Option<u32>,
+        floor_usecs: RefCell<Option<u32>>,
         sets: RefCell<usize>,
     }
 
@@ -494,6 +563,10 @@ mod tests {
             if let Some(c) = self.clamp_usecs {
                 v.rx_coalesce_usecs = v.rx_coalesce_usecs.min(c);
                 v.tx_coalesce_usecs = v.tx_coalesce_usecs.min(c);
+            }
+            if let Some(f) = *self.floor_usecs.borrow() {
+                v.rx_coalesce_usecs = v.rx_coalesce_usecs.max(f);
+                v.tx_coalesce_usecs = v.tx_coalesce_usecs.max(f);
             }
             self.nics.borrow_mut().insert(iface.to_string(), v);
             Ok(())
@@ -777,6 +850,106 @@ mod tests {
         let s = restore_from_state_dir(&nic, &dir, "b", &index_of(&["eth0"]));
         assert_eq!(s.restored, 1);
         assert_eq!(nic.now("eth0").rx_coalesce_usecs, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restore the driver only partly honours is not a restore: the
+    /// record stays, naming what OUR write left on the NIC, so the next
+    /// detach retries those fields instead of reading them as someone
+    /// else's change.
+    #[test]
+    fn a_mismatched_restore_is_retained_and_retried() {
+        let dir = tmpdir("restore-mismatch");
+        let nic = FakeNic::with(&["eth0"]);
+        apply_on_attach(&nic, &dir, "b", &attached(&["eth0"]), &tuned());
+        *nic.floor_usecs.borrow_mut() = Some(10);
+        let s = restore_from_state_dir(&nic, &dir, "b", &index_of(&["eth0"]));
+        assert_eq!(s.retained, 1);
+        assert_eq!(s.restored, 0);
+        let f = load(&dir).unwrap().expect("record kept");
+        assert_eq!(
+            f.ifaces[0].applied.rx_usecs,
+            Some(10),
+            "what our write left"
+        );
+        assert_eq!(nic.now("eth0").rx_coalesce_usecs, 10);
+
+        *nic.floor_usecs.borrow_mut() = None;
+        let s = restore_from_state_dir(&nic, &dir, "b", &index_of(&["eth0"]));
+        assert_eq!(s.restored, 1);
+        assert_eq!(nic.now("eth0"), stock());
+        assert!(load(&dir).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A carried record meets a NIC already holding the requested
+    /// values: no write happens, so the record's confirmation must not
+    /// be cleared — a cleared field is restored unconditionally, over
+    /// an operator change made afterwards.
+    #[test]
+    fn no_write_keeps_the_carried_confirmation() {
+        let dir = tmpdir("no-write");
+        let nic = FakeNic::with(&["eth0"]);
+        apply_on_attach(&nic, &dir, "b", &attached(&["eth0"]), &tuned());
+        nic.refuse_set.borrow_mut().push("eth0".into());
+        restore_from_state_dir(&nic, &dir, "b", &index_of(&["eth0"]));
+        nic.refuse_set.borrow_mut().clear();
+        let confirmed = load(&dir).unwrap().unwrap().ifaces[0].applied;
+        assert_eq!(confirmed, tuned());
+
+        let sets = *nic.sets.borrow();
+        let out = apply_on_attach(&nic, &dir, "b", &attached(&["eth0"]), &tuned());
+        assert_eq!(out[0].1, ApplyOutcome::AlreadySet);
+        assert_eq!(*nic.sets.borrow(), sets, "nothing written");
+        let f = load(&dir).unwrap().unwrap();
+        assert_eq!(
+            f.ifaces[0].applied, confirmed,
+            "confirmation intact on disk"
+        );
+
+        // The operator retunes rx-usecs; detach restores the rest and
+        // leaves theirs alone.
+        nic.nics
+            .borrow_mut()
+            .get_mut("eth0")
+            .unwrap()
+            .rx_coalesce_usecs = 70;
+        restore_from_state_dir(&nic, &dir, "b", &index_of(&["eth0"]));
+        let now = nic.now("eth0");
+        assert_eq!(now.rx_coalesce_usecs, 70);
+        assert_eq!(now.rx_max_coalesced_frames, 10);
+        assert_eq!(now.tx_coalesce_usecs, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The root daemon writes `coalesce.json` into a state dir that may
+    /// be writable by someone else; a symlink planted at the record name
+    /// must be replaced, never written through, and never read through.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_planted_symlink_does_not_capture_coalesce_json() {
+        let dir = tmpdir("symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "do not truncate me").unwrap();
+        std::os::unix::fs::symlink(&victim, file_path(&dir)).unwrap();
+
+        assert!(
+            load(&dir).is_err(),
+            "a symlinked record is refused, not read"
+        );
+        let nic = FakeNic::with(&["eth0"]);
+        apply_on_attach(&nic, &dir, "b", &attached(&["eth0"]), &tuned());
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not truncate me"
+        );
+        let meta = std::fs::symlink_metadata(file_path(&dir)).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the rename replaced the symlink"
+        );
+        assert_eq!(load(&dir).unwrap().unwrap().ifaces[0].iface, "eth0");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

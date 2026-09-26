@@ -3063,18 +3063,21 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
     // ~1 ms (the pre-rc5 behavior) wedged the bridge stack on rvu-
     // nicpf with eth0/eth4/eth5 all bridged on switch0, kernel-
     // panicking the EFG during Phase 4 cutover testing.
-    pin::remove_all_paced(&state.bpffs_root, state.attach_settle_time)
-        .map_err(|e| ModuleError::other(MODULE_NAME, format!("remove pins: {e}")))?;
+    let pins = pin::remove_all_paced(&state.bpffs_root, state.attach_settle_time);
+
+    // Coalescing was applied last at attach, so it is reversed last —
+    // but unconditionally: a pin-removal failure above must not strand
+    // the NICs retuned (review finding), so its error is reported only
+    // after this has run. Driven by the state file, not
+    // `state.coalesce`: a record carried from an earlier failed restore
+    // needs reversing even if this run's config dropped the directive.
+    coalesce_restore_from_state_dir(&state.state_dir);
+
+    pins.map_err(|e| ModuleError::other(MODULE_NAME, format!("remove pins: {e}")))?;
     info!(
         settle_secs = state.attach_settle_time.as_secs_f64(),
         "fast-path pins removed; kernel detached"
     );
-
-    // Coalescing was applied last at attach, so it is reversed last.
-    // Driven by the state file, not `state.coalesce`: a record carried
-    // from an earlier failed restore needs reversing even if this run's
-    // config dropped the directive.
-    coalesce_restore_from_state_dir(&state.state_dir);
     Ok(())
 }
 
