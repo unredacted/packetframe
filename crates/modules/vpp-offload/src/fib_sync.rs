@@ -357,6 +357,23 @@ impl FamilyPolicy {
             FamilyPolicy::V4Only => matches!(prefix, IpPrefix::V4 { .. }),
         }
     }
+
+    /// Whether a neighbour at `addr` belongs in VPP: the neighbour-side
+    /// twin of [`Self::carries`].
+    ///
+    /// A neighbour of a family VPP does not carry serves no route there,
+    /// so programming it is pure cost — and not a small one: every static
+    /// add takes VPP's worker barrier for the dependent-FIB walk. It is
+    /// also a cost the resync paid over and over, because
+    /// [`Self::dump_families`] never asks about that family, so the
+    /// "already holds it" skip could never see the entry and re-added it
+    /// blind on every resync.
+    pub fn carries_address(self, addr: IpAddr) -> bool {
+        match self {
+            FamilyPolicy::Both => true,
+            FamilyPolicy::V4Only => addr.is_ipv4(),
+        }
+    }
 }
 
 /// Truncate a path set to what the wire can describe, reporting whether

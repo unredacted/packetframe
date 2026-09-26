@@ -20,7 +20,7 @@
 #[path = "common/fake_vpp.rs"]
 mod fake_vpp;
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use packetframe_common::fib::IpPrefix;
 use packetframe_vpp_offload::attach::{AttachMode, PortAttach};
@@ -2979,4 +2979,362 @@ fn a_verify_that_loses_the_api_keeps_the_convergence_deadline_for_its_retry() {
     let v = e.run_verify().expect("the resumed verify");
     assert!(v.outcome.passed(), "{}", v.outcome.summary());
     assert_eq!(e.phase(), None, "a verify that completes ends the phase");
+}
+
+/// What reached VPP in each phase of [`dual_stack_ix`]: the neighbour
+/// ops as `(address, is_add)`, the L2FIB messages, and what the placement
+/// refresh handed back for re-programming.
+struct DualStackRun {
+    resync: Vec<(IpAddr, bool)>,
+    resync_l2fib: Vec<String>,
+    unplaced: Vec<IpAddr>,
+    installed: u64,
+    unresolvable: u64,
+    placement: Vec<(IpAddr, bool)>,
+    requeued: Vec<IpAddr>,
+    delta: Vec<(IpAddr, bool)>,
+    delta_l2fib: Vec<String>,
+}
+
+const DS_A4: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50));
+const DS_A4_LATE: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 51));
+const DS_A4_DELTA: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 52));
+const DS_B4: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5));
+const DS_A6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x50));
+const DS_B6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x60));
+const DS_B6_DELTA: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x61));
+const DS_MAC_A4: [u8; 6] = [0x02, 0, 0, 0, 0, 0x88];
+const DS_MAC_A4_LATE: [u8; 6] = [0x02, 0, 0, 0, 0, 0x8a];
+const DS_MAC_A6: [u8; 6] = [0x02, 0, 0, 0, 0, 0x89];
+const DS_MAC_B4: [u8; 6] = [0x02, 0, 0, 0, 0, 0x55];
+/// A MAC only v6 neighbours use, so an L2FIB entry for it can only have
+/// been pinned on a v6 neighbour's behalf.
+const DS_MAC_V6_ONLY: [u8; 6] = [0x02, 0, 0, 0, 0, 0x77];
+
+/// One dual-stack IX box through every door a neighbour enters by: the
+/// resync walk, a placement refresh, and a delta batch.
+///
+/// One trunk, `eth4`, sends VLAN 1 untagged (`br0`: a neighbour there is
+/// reached through the VF once the FDB places it) and carries 3998 tagged
+/// with a BVI (`br3998`: neighbours sit on the BVI, and their MACs are
+/// L2FIB entries). Each VLAN has v4 and v6 neighbours, and every v6 path
+/// a neighbour send or an L2FIB pin can take is exercised:
+///
+/// - resync: `DS_B6` on the BVI (sent regardless of placement, and its
+///   v6-only MAC pinned);
+/// - placement: `DS_A6`, which the FDB first learns between the resync
+///   and the refresh, and so is programmed there for the first time
+///   (alongside its v4 twin `DS_A4_LATE`, the control);
+/// - delta: a MAC change for `DS_A6`, a new v6 neighbour on the BVI, and
+///   the loss of `DS_B6` (alongside a new v4 neighbour, the control).
+fn dual_stack_ix(tag: &str, families: FamilyPolicy) -> DualStackRun {
+    use packetframe_vpp_offload::engine::SourceChanges;
+    use std::cell::RefCell;
+
+    struct Ix {
+        deltas: RefCell<Vec<SourceChanges>>,
+        requeued: RefCell<Vec<IpAddr>>,
+    }
+    impl RouteSource for Ix {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            visit(
+                IpPrefix::V4 {
+                    addr: [203, 0, 113, 0],
+                    prefix_len: 25,
+                },
+                &[DS_A4],
+            );
+            visit(
+                IpPrefix::V4 {
+                    addr: [203, 0, 113, 128],
+                    prefix_len: 25,
+                },
+                &[DS_B4],
+            );
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(DS_A4, "br0", DS_MAC_A4);
+            visit(DS_A4_LATE, "br0", DS_MAC_A4_LATE);
+            visit(DS_A6, "br0", DS_MAC_A6);
+            visit(DS_B4, "br3998", DS_MAC_B4);
+            visit(DS_B6, "br3998", DS_MAC_V6_ONLY);
+        }
+        fn drain_changes(&self, _max: usize) -> SourceChanges {
+            self.deltas.borrow_mut().pop().unwrap_or_default()
+        }
+        fn requeue(&self, changes: SourceChanges) {
+            self.deltas.borrow_mut().push(changes);
+        }
+        fn requeue_via(&self, nexthops: &[IpAddr]) {
+            self.requeued.borrow_mut().extend_from_slice(nexthops);
+        }
+        fn route_count(&self) -> u64 {
+            2
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+
+    let neighbour_ops = |events: &[Event]| -> Vec<(IpAddr, bool)> {
+        events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::Neighbour { ip, is_add, .. } => Some((*ip, *is_add)),
+                _ => None,
+            })
+            .collect()
+    };
+    let l2fib = |events: &[Event]| -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::Msg(m) if m.starts_with("l2fib") => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let fdb = std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[
+        (1, DS_MAC_A4, "eth4"),
+        (3998, DS_MAC_B4, "eth4"),
+        (3998, DS_MAC_V6_ONLY, "eth4"),
+    ]))));
+    let fake = Fake::start(tag);
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            mtu: None,
+            vlans: vec![3998],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        families,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_topology(Box::new(Kernel {
+        kinds: vec![("br0", bridge_vlan(1)), ("br3998", bridge_vlan(3998))],
+        fdb: fdb.clone(),
+        vlans: std::sync::Arc::new(std::sync::Mutex::new(PortVlans::from_entries([
+            ("eth4".to_string(), 1, true),
+            ("eth4".to_string(), 3998, false),
+        ]))),
+        masters: vec![("eth4", "switch0")],
+        l3: vec![("switch0", 3998, BRIDGE_MAC)],
+    }));
+    let src = Ix {
+        deltas: RefCell::new(vec![SourceChanges {
+            neighbours: vec![
+                (DS_A6, Some(("br0".into(), [0x02, 0, 0, 0, 0, 0x8b]))),
+                (DS_B6_DELTA, Some(("br3998".into(), DS_MAC_V6_ONLY))),
+                (DS_B6, None),
+                (DS_A4_DELTA, Some(("br3998".into(), DS_MAC_B4))),
+            ],
+            routes: Vec::new(),
+        }]),
+        requeued: RefCell::new(Vec::new()),
+    };
+    assert!(e.api_ready(), "handshake");
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let _ = fake.drain_events();
+
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    let events = fake.drain_events();
+    let mut unplaced: Vec<IpAddr> = e.unplaced_neighbours().into_iter().map(|u| u.0).collect();
+    unplaced.sort();
+    let (installed, unresolvable) = (e.counts().installed, e.counts().unresolvable);
+    let (resync, resync_l2fib) = (neighbour_ops(&events), l2fib(&events));
+
+    // The FDB learns the two br0 hosts it had not seen.
+    *fdb.lock().unwrap() = Ok(fdb_with(&[
+        (1, DS_MAC_A4, "eth4"),
+        (1, DS_MAC_A4_LATE, "eth4"),
+        (1, DS_MAC_A6, "eth4"),
+        (3998, DS_MAC_B4, "eth4"),
+        (3998, DS_MAC_V6_ONLY, "eth4"),
+    ]));
+    e.refresh_placement(&src).expect("placement refresh");
+    let placement = neighbour_ops(&fake.drain_events());
+    let requeued = src.requeued.take();
+
+    e.apply_changes(&src, 64).expect("the delta batch applies");
+    let events = fake.drain_events();
+
+    DualStackRun {
+        resync,
+        resync_l2fib,
+        unplaced,
+        installed,
+        unresolvable,
+        placement,
+        requeued,
+        delta: neighbour_ops(&events),
+        delta_l2fib: l2fib(&events),
+    }
+}
+
+/// Under `V4Only`, no IPv6 neighbour reaches VPP — not at resync, not on
+/// a placement change, not as a delta — and none is pinned in the L2FIB.
+///
+/// VPP carries no v6 route and can be steered no v6 packet, so a v6
+/// adjacency there serves nothing, and it was worse than useless: the
+/// neighbour dump asks only about carried families, so the "VPP already
+/// holds it" skip never saw a v6 entry and every resync re-added all of
+/// them blind, each a worker-barrier walk. An IX LAN carries several
+/// hundred. A `detach --keep-vpp` restart over a steered, adopted VPP
+/// lost 15% of probes for about two minutes to exactly that.
+///
+/// The v4 twin of every v6 case is the control: v4 is unchanged.
+#[test]
+fn under_v4_only_no_v6_neighbour_reaches_vpp_through_any_door() {
+    let run = dual_stack_ix("ds-v4only", FamilyPolicy::V4Only);
+
+    assert_eq!(
+        run.resync,
+        vec![(DS_A4, true), (DS_B4, true)],
+        "the resync programs the v4 neighbours and only them (DS_A4_LATE is \
+         not placed yet)"
+    );
+    assert!(
+        run.resync_l2fib
+            .iter()
+            .any(|m| m.starts_with("l2fib add") && m.contains("mac=55")),
+        "the v4 peer's MAC is pinned: {:?}",
+        run.resync_l2fib
+    );
+    assert!(
+        !run.resync_l2fib.iter().any(|m| m.contains("mac=77")),
+        "a MAC only a v6 neighbour uses is never pinned: {:?}",
+        run.resync_l2fib
+    );
+    assert_eq!(
+        run.unplaced,
+        vec![DS_A4_LATE],
+        "the unplaced gauge counts the v4 host the FDB has not seen, and no v6 one"
+    );
+    assert_eq!((run.installed, run.unresolvable), (2, 0), "v4 converges");
+
+    assert_eq!(
+        run.placement,
+        vec![(DS_A4_LATE, true)],
+        "first placement programs the v4 host and not its v6 neighbour"
+    );
+    assert_eq!(
+        run.requeued,
+        vec![DS_A4_LATE],
+        "nor re-queues routes via it"
+    );
+
+    assert_eq!(
+        run.delta,
+        vec![(DS_A4_DELTA, true)],
+        "the delta programs its v4 neighbour; the v6 change, add and loss \
+         send nothing — the loss included, because nothing ever claimed it"
+    );
+    assert!(
+        !run.delta_l2fib.iter().any(|m| m.contains("mac=77")),
+        "{:?}",
+        run.delta_l2fib
+    );
+}
+
+/// Under `Both` — tests only today, the planned v6 work tomorrow — the
+/// very same run programs the v6 neighbours through every door: the
+/// filter follows the policy, it is not a hardcoded `is_ipv4()`.
+#[test]
+fn under_both_families_v6_neighbours_are_still_programmed() {
+    let run = dual_stack_ix("ds-both", FamilyPolicy::Both);
+
+    assert!(
+        run.resync.contains(&(DS_B6, true)),
+        "the v6 BVI neighbour at resync: {:?}",
+        run.resync
+    );
+    assert!(
+        run.resync_l2fib
+            .iter()
+            .any(|m| m.starts_with("l2fib add") && m.contains("mac=77")),
+        "and its MAC pinned: {:?}",
+        run.resync_l2fib
+    );
+    assert_eq!(run.unplaced, vec![DS_A4_LATE, DS_A6]);
+    assert_eq!((run.installed, run.unresolvable), (2, 0));
+    assert!(
+        run.placement.contains(&(DS_A6, true)) && run.requeued.contains(&DS_A6),
+        "the v6 host on first placement: {:?} / {:?}",
+        run.placement,
+        run.requeued
+    );
+    for op in [(DS_A6, true), (DS_B6_DELTA, true), (DS_B6, false)] {
+        assert!(run.delta.contains(&op), "{op:?} in {:?}", run.delta);
+    }
+}
+
+/// A v4 route through a v6 next hop (RFC 8950) under `V4Only` reads
+/// **unresolvable**, and nothing reaches VPP for it.
+///
+/// The production feed cannot produce one — the BGP listener's OPEN does
+/// not offer Extended Next Hop Encoding — so this pins what happens if
+/// some other source ever does: the v6 neighbour is filtered, so the
+/// route has no adjacency, and the honest classification is the loud one
+/// (it blocks a first steer). Never a route installed through an
+/// adjacency nobody programmed.
+#[test]
+fn a_v4_route_via_a_v6_next_hop_is_unresolvable_under_v4_only() {
+    const V6_NH: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+    struct Enhe;
+    impl RouteSource for Enhe {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            visit(v4(0, 1), &[nh()]);
+            visit(v4(0, 2), &[V6_NH]);
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(nh(), "eth4", MAC);
+            visit(V6_NH, "eth4", [0x02, 0, 0, 0, 0, 0x66]);
+        }
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("static source")
+        }
+        fn route_count(&self) -> u64 {
+            2
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+
+    let fake = Fake::start("enhe");
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready(), "handshake");
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    e.begin_resync(&Enhe);
+    assert_eq!(e.program_neighbours(&Enhe).expect("neighbours"), 1);
+    drain_to_empty(&mut e);
+
+    let events = fake.drain_events();
+    assert!(
+        events
+            .iter()
+            .all(|ev| !matches!(ev, Event::Neighbour { ip, .. } if ip.is_ipv6())),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev, Event::Route(r) if r.is_add && r.addr == [10, 0, 2, 0])),
+        "nothing reaches VPP's FIB for the v6-next-hop route: {events:?}"
+    );
+    assert_eq!((e.counts().installed, e.counts().unresolvable), (1, 1));
+    assert!(e.counts().blocks_first_steer(), "and it is loud");
 }

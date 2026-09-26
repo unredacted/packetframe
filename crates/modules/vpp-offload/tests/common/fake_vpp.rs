@@ -114,6 +114,10 @@ pub enum Event {
     Msg(String),
     Route(WireRoute),
     Neighbour {
+        /// The neighbour's address, decoded with the client's own
+        /// `from_address` — so a test can say which FAMILY reached VPP,
+        /// which the v4-only policy's whole point is to restrict.
+        ip: IpAddr,
         sw_if_index: u32,
         mac: [u8; 6],
         flags: u8,
@@ -687,6 +691,8 @@ fn serve(
                 let mut d = Decoder::new(&req);
                 let n = IpNeighborAddDel::decode(&mut d).expect("decodes as a neighbour op");
                 let _ = tx.send(Event::Neighbour {
+                    ip: packetframe_vpp_offload::fib_sync::from_address(&n.neighbor.ip_address)
+                        .expect("a neighbour op names a v4 or v6 address"),
                     sw_if_index: n.neighbor.sw_if_index,
                     mac: n.neighbor.mac_address,
                     flags: n.neighbor.flags,
@@ -699,8 +705,11 @@ fn serve(
                     0
                 };
                 // A real VPP applies the op before it answers, so the
-                // table moves even when the answer never arrives.
-                if retval == 0 {
+                // table moves even when the answer never arrives. Only
+                // v4 ops move it: the table is v4-keyed (and the dump
+                // answers v4 only), so a v6 address folded into four
+                // bytes would surface as a bogus v4 neighbour.
+                if retval == 0 && n.neighbor.ip_address.af == ADDRESS_IP4 {
                     let mut key = [0u8; 4];
                     key.copy_from_slice(&n.neighbor.ip_address.un.0[..4]);
                     neighbours

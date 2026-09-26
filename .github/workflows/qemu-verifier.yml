@@ -173,7 +173,7 @@ jobs:
           # (only the listed overlay paths are writable). Point
           # HOME/CARGO_HOME/RUSTUP_HOME at the /home overlay so rustup
           # can write its state without going read-only.
-          # --memory 6144 (1024 → 4096 → here): virtme-ng sizes the
+          # --memory 8192 (1024 → 4096 → 6144 → here): virtme-ng sizes the
           # in-VM tmpfs against RAM, and the in-VM incremental relink
           # of the test binaries is what fills it. 4 GB (~2 GB tmpfs)
           # was sized for the Option F dep graph; the v0.2.8 fib-cache
@@ -182,6 +182,9 @@ jobs:
           # signal 7 [Bus error]` twice in a row on the 6.6 leg, at
           # the same link. 6 GB ⇒ ~3 GB tmpfs restores the margin;
           # hosted runners have 16 GB, so TCG + 6 GB guest is fine.
+          # The 2026-09 test growth put the same probe relink over
+          # ~3 GB again, on both legs of every PR: 8 GB => ~4 GB
+          # tmpfs, still leaving the 16 GB host half.
           # PACKETFRAME_BENCH_SKIP=1: skip the fast-path bench tests
           # outright. bpf_test_run executes uninterruptibly, and under
           # TCG a bench stalls a vCPU past the soft-lockup watchdog;
@@ -203,7 +206,7 @@ jobs:
             virtme-ng \
               --run "${KERNEL_IMG}" \
               --pwd \
-              --memory 6144 \
+              --memory 8192 \
               --disable-kvm \
               --append "watchdog_thresh=60" \
               --verbose \

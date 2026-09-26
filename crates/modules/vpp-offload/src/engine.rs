@@ -963,6 +963,60 @@ impl ConvergenceEngine {
         self
     }
 
+    /// Whether `nh`'s neighbour belongs in VPP at all
+    /// ([`FamilyPolicy::carries_address`]).
+    ///
+    /// Asked at the two doors neighbours enter by — the full walk
+    /// ([`Self::carried_neighbours`]) and the delta batch
+    /// ([`Self::apply_changes`]) — so nothing downstream ever sees one it
+    /// should not program. That makes every downstream agree without
+    /// each needing its own check: a neighbour never let in is never
+    /// mapped to a device, so no route resolves through it and
+    /// [`NexthopMap::resolve`] answers `None`; never placed, so it never
+    /// holds an L2FIB share; never sent, so the acknowledged ledger never
+    /// claims it, and neither `settle_moves` nor the unacked
+    /// reconciliation has anything of its family to act on.
+    ///
+    /// Filtered where it enters rather than where it is sent because
+    /// "sent" is five places (the resync walk, deltas, placement moves,
+    /// same-port refreshes, L2FIB sync) and a filter at five places is
+    /// how one of them comes to disagree.
+    ///
+    /// Dropping v6 under `V4Only` costs no v4 route its next hop, because
+    /// no v4 route names a v6 one: the BGP listener's OPEN does not offer
+    /// Extended Next Hop Encoding (RFC 8950's capability 5), so a
+    /// compliant peer cannot send it v4 NLRI with a v6 next hop. If one
+    /// ever arrived anyway — a BMP emitter whose own sessions use it —
+    /// the route classifies **unresolvable**, which blocks a first steer
+    /// and shows in health: loud, never a route installed through an
+    /// adjacency nobody programmed.
+    fn carries_neighbour(&self, nh: IpAddr) -> bool {
+        self.drainer.families().carries_address(nh)
+    }
+
+    /// The source's neighbours, less the families VPP does not carry.
+    /// The only reader of [`RouteSource::for_each_neighbour`] — see
+    /// [`Self::carries_neighbour`] for why there must be one.
+    ///
+    /// Under [`FamilyPolicy::V4Only`] this drops every IPv6 neighbour:
+    /// an IX LAN carries several hundred, none of which can serve a route
+    /// in a VPP that holds no v6 routes and can be steered no v6 packet.
+    /// Programmed anyway, each resync re-added all of them blind — the
+    /// neighbour dump asks only about carried families, so the "VPP
+    /// already holds it" skip never saw them — and every add takes the
+    /// worker barrier for a dependent-FIB walk. A `detach --keep-vpp`
+    /// restart over a steered, adopted VPP lost 15% of probes for about
+    /// two minutes while VPP still held its old, complete FIB.
+    fn carried_neighbours(&self, src: &dyn RouteSource) -> Vec<(IpAddr, String, [u8; 6])> {
+        let mut out = Vec::new();
+        src.for_each_neighbour(&mut |nh, dev, mac| {
+            if self.carries_neighbour(nh) {
+                out.push((nh, dev.to_string(), mac));
+            }
+        });
+        out
+    }
+
     /// Classify `dev` on first sight. A failed read is NOT cached: the
     /// device stays unclassified, and the next sighting — every placement
     /// refresh walks the neighbours — asks again.
@@ -1068,10 +1122,8 @@ impl ConvergenceEngine {
         }
         self.read_fdb();
         self.reconcile_vlans()?;
-        let mut seen: Vec<(IpAddr, String, [u8; 6])> = Vec::new();
-        src.for_each_neighbour(&mut |ip, dev, mac| seen.push((ip, dev.to_string(), mac)));
         let mut changed = Vec::new();
-        for (ip, dev, mac) in seen {
+        for (ip, dev, mac) in self.carried_neighbours(src) {
             // Retries a classification an earlier read could not make.
             self.classify(&dev);
             if self.nexthops.bridge_vlan(&ip).is_none() {
@@ -2010,6 +2062,21 @@ impl ConvergenceEngine {
     /// Returns how many were programmed. Sized by the neighbour table
     /// (~129 nexthops on the reference fleet), not the route table, so
     /// this is not a batched pipeline like the drainer.
+    ///
+    /// Neighbours of a family the policy does not carry are not wanted
+    /// at all ([`Self::carried_neighbours`]). Static v6 neighbours an
+    /// earlier build programmed into a VPP that is now adopted are **left
+    /// in place**, deliberately. Nothing can use them: no v6 route is
+    /// installed (the drainer skips the family, and adoption dumps only
+    /// carried families), and no v6 packet can be steered in. They do
+    /// not age (static), are invisible to every ledger and gauge here
+    /// (none of which dumps the family), and die with the process at the
+    /// next VPP restart. Deleting them is the same message the filter
+    /// exists to stop sending — several hundred barrier walks on a VPP
+    /// that may already be steered — spent to reclaim a few hundred
+    /// entries of heap. And when the policy becomes `Both`, the dump
+    /// covers v6 and they are adopted like any other: kept if still
+    /// right, replaced if not.
     pub fn program_neighbours(&mut self, src: &dyn RouteSource) -> Result<u64, EngineError> {
         self.arm_timeout();
         if self.transport.is_none() {
@@ -2048,20 +2115,18 @@ impl ConvergenceEngine {
         // Those are corrected against the same dump.
         self.settle_unacked(&existing);
 
-        // Collect first: the visitor borrows `src` while the sends need
-        // `&mut self`.
-        let mut wanted: Vec<(IpAddr, u32, [u8; 6])> = Vec::new();
-        {
-            let nexthops = &self.nexthops;
-            let ports = &self.port_index;
-            src.for_each_neighbour(&mut |ip, _dev, mac| {
-                if let Some(target) = nexthops.resolve(&ip) {
-                    if let Some(idx) = ports.get(&target) {
-                        wanted.push((ip, idx, mac));
-                    }
-                }
-            });
-        }
+        // Only the carried families: the dump above asked about no
+        // others, so a neighbour of any other family would read as
+        // missing on every resync and be re-added blind
+        // ([`Self::carried_neighbours`]).
+        let seen = self.carried_neighbours(src);
+        let wanted: Vec<(IpAddr, u32, [u8; 6])> = seen
+            .iter()
+            .filter_map(|(ip, _dev, mac)| {
+                let idx = self.port_index.get(&self.nexthops.resolve(ip)?)?;
+                Some((*ip, idx, *mac))
+            })
+            .collect();
 
         // A neighbour VPP holds on one of our interfaces other than the
         // one it is placed behind now — it moved while nobody was
@@ -2089,9 +2154,10 @@ impl ConvergenceEngine {
         // Removed once the resync's routes are out, like any move.
         self.moved_from.extend(moved_away);
         // Bridged neighbours: their MACs' L2FIB entries, from placement.
-        let mut bridged: Vec<(IpAddr, String, [u8; 6])> = Vec::new();
-        src.for_each_neighbour(&mut |ip, dev, mac| bridged.push((ip, dev.to_string(), mac)));
-        for (ip, dev, mac) in bridged {
+        // The same carried set: a v6-only MAC is pinned for no traffic
+        // VPP can forward, and an entry an earlier build pinned for one
+        // is withdrawn below as stale, once.
+        for (ip, dev, mac) in seen {
             self.sync_l2fib(ip, &dev, mac)?;
         }
         self.withdraw_stale_l2fib()?;
@@ -2122,6 +2188,13 @@ impl ConvergenceEngine {
     /// verify — each paying the dependent-FIB walk this ledger exists to
     /// avoid (review finding). Under `V4Only` this is exactly the single
     /// dump it was before.
+    ///
+    /// That only holds if the senders agree about families too, and for
+    /// a while they did not: under `V4Only` every v6 neighbour was still
+    /// sent, so a dump that never asks about v6 read every one of them as
+    /// absent on every resync. [`Self::carried_neighbours`] is the other
+    /// half — both halves derive from the one policy, so the dump covers
+    /// exactly the families anything may send.
     fn dump_static_neighbours(&mut self) -> Result<HashSet<(u32, IpAddr, [u8; 6])>, EngineError> {
         let mut out = HashSet::new();
         for &is_ip6 in self.drainer.families().dump_families() {
@@ -2221,6 +2294,10 @@ impl ConvergenceEngine {
         mac_address: [u8; 6],
         is_add: bool,
     ) -> Result<(), EngineError> {
+        debug_assert!(
+            self.carries_neighbour(ip),
+            "{ip}: a neighbour of an uncarried family got past the filter at the door"
+        );
         let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
         let reply = match t.request::<IpNeighborAddDel, IpNeighborAddDelReply>(IpNeighborAddDel {
             context: 0,
@@ -2447,6 +2524,13 @@ impl ConvergenceEngine {
             return Ok(0);
         }
         let n = changes.len() as u64;
+        // The delta door's half of the family filter
+        // ([`Self::carries_neighbour`]). Dropped, not handed back: a
+        // requeue would only re-serve what this drops again, and the
+        // full walk filters the same family.
+        changes
+            .neighbours
+            .retain(|(nh, _)| self.carries_neighbour(*nh));
         // Popped from the back, which reorders nothing that has an order:
         // the feed holds neighbour deltas in a `HashMap`, so the batch
         // arrives in an arbitrary order already, and each entry names a
@@ -2619,9 +2703,10 @@ impl ConvergenceEngine {
         self.nexthops.forget_kinds();
         self.read_fdb();
         self.refresh_untagged();
-        let mut seen: Vec<(IpAddr, String, [u8; 6])> = Vec::new();
-        src.for_each_neighbour(&mut |nh, dev, mac| seen.push((nh, dev.to_string(), mac)));
-        for (nh, dev, mac) in seen {
+        // Carried families only, so an uncarried neighbour is never
+        // mapped: no route can resolve through an adjacency that is
+        // never programmed.
+        for (nh, dev, mac) in self.carried_neighbours(src) {
             self.classify(&dev);
             if let Some(port) = self.placement_for(nh, &dev, mac, false) {
                 self.nexthops.place(nh, port);
