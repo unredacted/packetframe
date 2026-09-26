@@ -790,11 +790,13 @@ pub enum IntegrityAuthoritySpec {
 /// Allowed range for `integrity-authority frr interval`.
 ///
 /// The floor is what one check costs. Every tick runs a `vtysh` per
-/// counted family plus one per upstream and the running-config, each
-/// with a 30 s timeout (the fast-path's `VTYSH_TIMEOUT`), and `show bgp
-/// <afi> unicast statistics` walks the whole table — cheap at the lab
-/// rig's 69k routes, and past 10 s on a full-table box under refill
-/// load. Below ten seconds a slow tick simply runs back to back.
+/// counted family, one per upstream on each side of the running-config,
+/// and the running-config itself — each call with a 30 s timeout, the
+/// whole check inside a 150 s budget (the fast-path's `VTYSH_TIMEOUT`
+/// and `CHECK_BUDGET`) — and `show bgp <afi> unicast statistics` walks
+/// the whole table: cheap at the lab rig's 69k routes, past 10 s on a
+/// full-table box under refill load. Below ten seconds a slow tick
+/// simply runs back to back.
 ///
 /// The ceiling comes from the report-age limit the steering gate
 /// applies: a report older than `STEER_MAX_REPORT_AGE` (900 s) is
@@ -804,8 +806,12 @@ pub enum IntegrityAuthoritySpec {
 /// every attempt: from a report at t=0 the next attempt lands at about
 /// `interval + check time` and — if that one fails, which retains the
 /// old report — the one after it at twice that. That second attempt has
-/// to land before t=900. An unreadable attempt is in fact retried sooner
-/// (from 10 s, doubling back up to the interval; the fast-path's
+/// to land before t=900, so at the 300 s ceiling each check gets 150 s —
+/// which is exactly the fast-path's `CHECK_BUDGET`, a deadline over all
+/// of a check's reads, so it holds however many upstreams are declared
+/// (review finding, PR #268: a per-call timeout alone grew the check by
+/// one timeout per upstream). An unreadable attempt is in fact retried
+/// sooner (from 10 s, doubling back up to the interval; the fast-path's
 /// `next_check_delay`), which only brings the second attempt earlier.
 /// The ceiling is deliberately not relaxed to rely on that.
 ///
@@ -813,8 +819,8 @@ pub enum IntegrityAuthoritySpec {
 /// it left room for one failed check. It did not: attempt at ~600,
 /// failure, retry at ~1200, and a healthy box refused every steer from
 /// 900 to 1200 (review finding, PR #236). A third of the limit — 300 s,
-/// which is also the default — leaves 150 s for the two checks
-/// themselves. Slower than the default buys nothing anyway: it only
+/// which is also the default — leaves 300 s for the two checks
+/// themselves, 150 s each. Slower than the default buys nothing anyway: it only
 /// lengthens the flap cost and the staleness exposure together.
 pub const FRR_INTERVAL_SECS: std::ops::RangeInclusive<u64> =
     10..=(crate::fib::STEER_MAX_REPORT_AGE.as_secs() / 3);

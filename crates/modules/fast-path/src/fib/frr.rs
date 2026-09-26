@@ -747,6 +747,91 @@ pub fn classify_eligibility(
     }
 }
 
+/// One upstream read twice in a check: right after the counts, and
+/// again after the running-config.
+#[derive(Debug, Clone)]
+pub struct UpstreamBracket {
+    pub peer: IpAddr,
+    /// The reading that describes the upstream when the counts were
+    /// taken.
+    pub before: Result<UpstreamState, String>,
+    /// The reading after the check's slowest read, which is what the
+    /// published observation has to still be true at.
+    pub after: Result<UpstreamState, String>,
+}
+
+/// [`classify_eligibility`] over a check that read every upstream on
+/// BOTH sides of the running-config.
+///
+/// One reading cannot be placed well. Taken before the running-config,
+/// an upstream that flaps during that read (the slowest one on a loaded
+/// box) goes unseen and the check publishes clean on the dead session's
+/// state (review finding, PR #268). Taken after it, End-of-RIB arriving
+/// during the read pairs a mid-fill count with readiness that came
+/// later — the vacuous gate. So both, and the check has to hold at each
+/// end:
+///
+/// - **Not ready in either reading is readiness loss.** Before: the
+///   counts were taken of a table still filling, whatever it says now.
+///   After: it is not ready now. Either is positive evidence, so it
+///   outranks a failed read of the other side.
+/// - **An epoch that moved between the two is readiness loss**, for the
+///   reason [`is_new_session`] exists: the counts describe a session
+///   that is gone. It is caught here even on the first sighting, when
+///   the previous-check comparison inside `classify_eligibility` has
+///   nothing to compare against.
+/// - **Anything unreadable on either side is `Unknown`**, including a
+///   `before` reading that is ready but carries no epoch — with no
+///   session identity at count time there is nothing to show the
+///   session held.
+///
+/// Classification then runs on the `after` readings, so the
+/// previous-check epochs are updated from the latest sample.
+pub fn classify_bracketed(
+    export: Result<ExportPolicy, String>,
+    brackets: &[UpstreamBracket],
+    seen_epochs: &mut HashMap<IpAddr, u64>,
+) -> Eligibility {
+    let mut moved: Option<String> = None;
+    let merged: Vec<(IpAddr, Result<UpstreamState, String>)> = brackets
+        .iter()
+        .map(|b| {
+            let peer = b.peer;
+            let state = match (&b.before, &b.after) {
+                (Ok(before), _) if !before.ready() => Ok(before.clone()),
+                (_, Ok(after)) if !after.ready() => Ok(after.clone()),
+                (Ok(before), Ok(after)) => {
+                    match (before.established_epoch, after.established_epoch) {
+                        (Some(e0), Some(e1)) => {
+                            if is_new_session(e0, e1) && moved.is_none() {
+                                moved = Some(format!(
+                                "upstream {peer} re-established during the check (epoch {e0} → \
+                                 {e1}), so the counts it took describe a session that no \
+                                 longer exists"
+                            ));
+                            }
+                            Ok(after.clone())
+                        }
+                        (None, _) => Err(format!(
+                            "upstream {peer} gave no `peerUptimeEstablishedEpoch` when the counts \
+                         were taken, so nothing shows its session held through the check"
+                        )),
+                        // `classify_eligibility` reports the missing epoch.
+                        (Some(_), None) => Ok(after.clone()),
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e.clone()),
+            };
+            (peer, state)
+        })
+        .collect();
+    match (classify_eligibility(export, &merged, seen_epochs), moved) {
+        (revoked @ Eligibility::Revoked(_), _) => revoked,
+        (_, Some(why)) => Eligibility::Revoked(Revocation::UpstreamNotReady(why)),
+        (other, None) => other,
+    }
+}
+
 /// Does the feed deliver a family no declared upstream carries?
 ///
 /// The two halves of the comparison must count the same thing. The
@@ -2107,6 +2192,139 @@ router bgp 65000
         fn a_long_streak_saturates_at_the_interval() {
             assert_eq!(next_check_delay(INTERVAL, 33), INTERVAL);
             assert_eq!(next_check_delay(INTERVAL, u32::MAX), INTERVAL);
+        }
+    }
+
+    mod bracketed {
+        use super::*;
+
+        const PEER: &str = "192.0.2.1";
+        const EPOCH: u64 = 1_790_000_000;
+
+        fn state(established: bool, eor: bool, epoch: Option<u64>) -> UpstreamState {
+            UpstreamState {
+                peer: PEER.to_string(),
+                established,
+                missing_eor: if eor {
+                    vec![]
+                } else {
+                    vec![AuthorityFamily::V4]
+                },
+                established_epoch: epoch,
+            }
+        }
+
+        fn ready(epoch: u64) -> Result<UpstreamState, String> {
+            Ok(state(true, true, Some(epoch)))
+        }
+
+        fn classify(
+            before: Result<UpstreamState, String>,
+            after: Result<UpstreamState, String>,
+        ) -> Eligibility {
+            classify_bracketed(
+                Ok(ExportPolicy::Unfiltered),
+                &[UpstreamBracket {
+                    peer: PEER.parse().expect("ip"),
+                    before,
+                    after,
+                }],
+                &mut HashMap::new(),
+            )
+        }
+
+        fn not_ready(e: &Eligibility) -> bool {
+            matches!(e, Eligibility::Revoked(Revocation::UpstreamNotReady(_)))
+        }
+
+        /// The session held and was loaded at both ends: clean. Epoch
+        /// jitter within the tolerance is the same session.
+        #[test]
+        fn a_steady_ready_session_is_ok() {
+            assert_eq!(classify(ready(EPOCH), ready(EPOCH)), Eligibility::Ok);
+            assert_eq!(classify(ready(EPOCH), ready(EPOCH - 1)), Eligibility::Ok);
+        }
+
+        /// The review finding: a flap during the running-config read.
+        /// On the FIRST check there is no previous epoch to compare
+        /// against, so only the two readings of this check can catch it.
+        #[test]
+        fn an_epoch_that_moves_during_the_check_revokes() {
+            let e = classify(ready(EPOCH), ready(EPOCH + 600));
+            assert!(not_ready(&e), "{e:?}");
+        }
+
+        /// End-of-RIB arriving during the check: the counts were taken
+        /// of a table still filling, and the later reading must not
+        /// launder them into a clean check.
+        #[test]
+        fn not_ready_when_the_counts_were_taken_revokes() {
+            let e = classify(Ok(state(true, false, Some(EPOCH))), ready(EPOCH));
+            assert!(not_ready(&e), "{e:?}");
+        }
+
+        #[test]
+        fn not_ready_afterwards_revokes_even_past_a_failed_first_read() {
+            let e = classify(Err("timed out".into()), Ok(state(false, false, None)));
+            assert!(not_ready(&e), "{e:?}");
+        }
+
+        /// A failed read on either side of a ready reading establishes
+        /// nothing — `Unknown`, which retains, never `Ok`.
+        #[test]
+        fn a_failed_read_on_either_side_is_unknown() {
+            let e = classify(Err("timed out".into()), ready(EPOCH));
+            assert!(matches!(e, Eligibility::Unknown(_)), "{e:?}");
+            let e = classify(ready(EPOCH), Err("timed out".into()));
+            assert!(matches!(e, Eligibility::Unknown(_)), "{e:?}");
+        }
+
+        /// No epoch at count time: nothing shows the session held.
+        #[test]
+        fn no_epoch_when_the_counts_were_taken_is_unknown() {
+            let e = classify(Ok(state(true, true, None)), ready(EPOCH));
+            assert!(matches!(e, Eligibility::Unknown(_)), "{e:?}");
+        }
+
+        /// A within-check flap is positive evidence and outranks a
+        /// failed running-config read.
+        #[test]
+        fn a_within_check_flap_outranks_a_failed_export_read() {
+            let e = classify_bracketed(
+                Err("vtysh running-config: timed out".into()),
+                &[UpstreamBracket {
+                    peer: PEER.parse().expect("ip"),
+                    before: ready(EPOCH),
+                    after: ready(EPOCH + 600),
+                }],
+                &mut HashMap::new(),
+            );
+            assert!(not_ready(&e), "{e:?}");
+        }
+
+        /// The previous-check comparison still runs, on the latest
+        /// reading, and records it for the next check.
+        #[test]
+        fn the_latest_reading_updates_the_seen_epochs() {
+            let peer: IpAddr = PEER.parse().expect("ip");
+            let mut seen = HashMap::new();
+            let b = |e0, e1| UpstreamBracket {
+                peer,
+                before: ready(e0),
+                after: ready(e1),
+            };
+            let ok =
+                classify_bracketed(Ok(ExportPolicy::Unfiltered), &[b(EPOCH, EPOCH)], &mut seen);
+            assert_eq!(ok, Eligibility::Ok);
+            assert_eq!(seen.get(&peer), Some(&EPOCH));
+            // A flap BETWEEN checks: both readings of this one agree, the
+            // previous check's does not.
+            let e = classify_bracketed(
+                Ok(ExportPolicy::Unfiltered),
+                &[b(EPOCH + 600, EPOCH + 600)],
+                &mut seen,
+            );
+            assert!(not_ready(&e), "{e:?}");
         }
     }
 }

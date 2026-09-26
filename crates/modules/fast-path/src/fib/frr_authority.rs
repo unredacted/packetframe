@@ -49,9 +49,9 @@ use packetframe_common::fib::{AuthorityObservation, TableCompleteness};
 use packetframe_common::frr::{RealVtysh, Vtysh};
 
 use crate::fib::frr::{
-    classify_eligibility, mirror_family_mismatch, next_check_delay, observation,
+    classify_bracketed, mirror_family_mismatch, next_check_delay, observation,
     parse_established_epoch, parse_export_policy, parse_total_prefixes, parse_upstream_state,
-    split_two_json, Eligibility, ExportPolicy, UpstreamState,
+    split_two_json, Eligibility, ExportPolicy, UpstreamBracket, UpstreamState,
 };
 use crate::fib::integrity::{Comparison, Drift, SharedSnapshot, DEFAULT_DRIFT_WARN_FRACTION};
 use crate::fib::programmer::FibProgrammerHandle;
@@ -79,11 +79,32 @@ use crate::fib::programmer::FibProgrammerHandle;
 /// [`crate::fib::frr::next_check_delay`]), so the daemon pays for the
 /// walk and the checker gets nothing for it.
 ///
-/// Why not longer: `FRR_INTERVAL_SECS`'s ceiling assumes a check fits in
-/// half of a 300 s interval, and a check is the counts, then one call
-/// per upstream, then the running-config — sequentially. At 30 s, one
-/// upstream's check is at most 90 s and two upstreams' 120 s.
+/// Why not longer: a check is four phases in sequence — the counts, the
+/// upstreams, the running-config, the upstreams again — each of which is
+/// one call or several concurrent ones, so 30 s per call is 120 s per
+/// check, inside [`CHECK_BUDGET`].
 pub const VTYSH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wall-clock budget for all of one check's `vtysh` reads together.
+///
+/// `FRR_INTERVAL_SECS`'s ceiling is derived from "one failed check must
+/// not age the retained report out": with a full interval after every
+/// attempt, the second attempt after a report lands at
+/// `2 × interval + 2 × check time`, which must stay under
+/// `STEER_MAX_REPORT_AGE`. At the 300 s ceiling that leaves 150 s per
+/// check, and a per-call timeout alone cannot promise it — the first
+/// revision of this change read upstreams one after another, so the
+/// check grew by 30 s per declared upstream and eight of them broke the
+/// arithmetic (review finding, PR #268). The upstream reads are
+/// concurrent now, and this deadline makes the bound hold for any
+/// config the parser accepts rather than for the configs somebody
+/// counted. A read the deadline cuts off is a failed read: an
+/// observation failure like any timeout.
+///
+/// The rest of a check — the mirror counts and the snapshot write — is
+/// in-process and not charged here.
+pub const CHECK_BUDGET: Duration =
+    Duration::from_secs(packetframe_common::fib::STEER_MAX_REPORT_AGE.as_secs() / 6);
 
 #[derive(Debug, Clone)]
 pub struct FrrAuthorityConfig {
@@ -177,6 +198,11 @@ pub struct FrrAuthorityChecker {
     /// instead would be 288 identical warnings a day, which is the same
     /// as not logging it.
     announced_revocation: Option<String>,
+    /// [`CHECK_BUDGET`], as a field so a test can shrink it.
+    check_budget: Duration,
+    /// When the running check's reads must be done by. Set at the start
+    /// of each check; every `vtysh` call goes through [`Self::ask`].
+    deadline: tokio::time::Instant,
 }
 
 impl FrrAuthorityChecker {
@@ -210,6 +236,8 @@ impl FrrAuthorityChecker {
             shutdown,
             seen_epochs: HashMap::new(),
             announced_revocation: None,
+            check_budget: CHECK_BUDGET,
+            deadline: tokio::time::Instant::now(),
         }
     }
 
@@ -271,6 +299,7 @@ impl FrrAuthorityChecker {
     /// `Disqualified` — which is all the loop needs to pace the next one
     /// ([`next_check_delay`]).
     async fn run_check(&mut self) -> bool {
+        self.deadline = tokio::time::Instant::now() + self.check_budget;
         // THE PAIR, CONCURRENTLY, for the same reason the birdc checker
         // does it: the gap between the two numbers is the report's error
         // bar, and whatever the mirror does while the other number is
@@ -497,38 +526,69 @@ impl FrrAuthorityChecker {
 
     async fn family_count(&self, family: AuthorityFamily) -> Result<usize, String> {
         let out = self
-            .vtysh
-            .run(&[format!("show bgp {} unicast statistics json", family.afi())])
+            .ask(&[format!("show bgp {} unicast statistics json", family.afi())])
             .await
             .map_err(|e| format!("vtysh statistics {}: {e}", family.afi()))?;
         Ok(parse_total_prefixes(&out, family)? as usize)
     }
 
+    /// Every `vtysh` call, bounded by the check's [`CHECK_BUDGET`] on top
+    /// of the per-call [`VTYSH_TIMEOUT`]. Dropping the call at the
+    /// deadline kills the child (`kill_on_drop`), exactly as a per-call
+    /// timeout does.
+    async fn ask(&self, commands: &[String]) -> Result<String, String> {
+        tokio::time::timeout_at(self.deadline, self.vtysh.run(commands))
+            .await
+            .map_err(|_| {
+                format!(
+                    "check budget of {:?} spent before vtysh answered",
+                    self.check_budget
+                )
+            })?
+    }
+
     /// Read everything eligibility depends on, then judge it.
     ///
-    /// The judging is [`classify_eligibility`], deliberately: the
+    /// The judging is [`classify_bracketed`], deliberately: the
     /// precedence between "disqualified", "could not read" and "fine" is
     /// the safety argument of this whole authority, and it belongs
     /// somewhere its tests do not need a NIC, a live FRR and a qemu job.
     /// This half is the subprocess calls and nothing else.
     ///
-    /// **Upstreams first, running-config last.** The End-of-RIB read is
-    /// the one with a timing relationship to the counts just taken: EoR
-    /// landing between a mid-fill count that agrees with an equally
-    /// partial mirror and the read that sees it would pair the two into
-    /// a clean check, so the gap between them should be as short as the
-    /// reads allow. The running-config is the slowest read on a loaded
-    /// box, has no such relationship, and used to sit in that gap — which
-    /// a longer [`VTYSH_TIMEOUT`] would have widened threefold.
-    /// [`classify_eligibility`] does not care which answer came first.
+    /// **Upstreams, running-config, upstreams again.** The first reading
+    /// follows the counts directly, because End-of-RIB has a timing
+    /// relationship to them; the second follows the running-config — the
+    /// slowest read on a loaded box — so a flap during it cannot slip
+    /// under a clean observation (review finding, PR #268).
+    /// [`classify_bracketed`] says why one reading on either side is not
+    /// enough.
     async fn eligibility(&mut self) -> Eligibility {
-        let mut upstreams = Vec::with_capacity(self.config.upstreams.len());
-        for u in self.config.upstreams.clone() {
-            let state = self.upstream(&u).await;
-            upstreams.push((u.addr, state));
-        }
+        let before = self.upstreams().await;
         let export = self.export_policy().await;
-        classify_eligibility(export, &upstreams, &mut self.seen_epochs)
+        let after = self.upstreams().await;
+        let brackets: Vec<UpstreamBracket> = self
+            .config
+            .upstreams
+            .iter()
+            .zip(before.into_iter().zip(after))
+            .map(|(u, (before, after))| UpstreamBracket {
+                peer: u.addr,
+                before,
+                after,
+            })
+            .collect();
+        classify_bracketed(export, &brackets, &mut self.seen_epochs)
+    }
+
+    /// Every declared upstream, one `vtysh` each, concurrently, in
+    /// config order.
+    ///
+    /// Concurrent so the phase costs one wait on bgpd rather than one per
+    /// upstream (see [`CHECK_BUDGET`]). One invocation each rather than
+    /// all of them batched into one, so an upstream whose read fails
+    /// fails alone and cannot erase another's positive evidence.
+    async fn upstreams(&self) -> Vec<Result<UpstreamState, String>> {
+        futures::future::join_all(self.config.upstreams.iter().map(|u| self.upstream(u))).await
     }
 
     /// One upstream's readiness and session generation.
@@ -553,8 +613,7 @@ impl FrrAuthorityChecker {
             .unwrap_or(AuthorityFamily::V4)
             .afi();
         let out = self
-            .vtysh
-            .run(&[
+            .ask(&[
                 format!("show bgp neighbor {peer} json"),
                 format!("show bgp {afi} unicast summary json"),
             ])
@@ -570,8 +629,7 @@ impl FrrAuthorityChecker {
 
     async fn export_policy(&self) -> Result<ExportPolicy, String> {
         let out = self
-            .vtysh
-            .run(&["show running-config".to_string()])
+            .ask(&["show running-config".to_string()])
             .await
             .map_err(|e| format!("vtysh running-config: {e}"))?;
         Ok(parse_export_policy(
@@ -708,6 +766,9 @@ mod tests {
         upstream_down: AtomicBool,
         stats_time_out: AtomicBool,
         config_times_out: AtomicBool,
+        flap_during_config: AtomicBool,
+        neighbor_hangs: AtomicBool,
+        epoch_offset: std::sync::atomic::AtomicU64,
         calls: std::sync::Mutex<Vec<String>>,
     }
 
@@ -720,16 +781,26 @@ mod tests {
                 let first = commands.first().cloned().unwrap_or_default();
                 self.calls.lock().expect("calls").push(first.clone());
                 if first.starts_with("show bgp neighbor") {
+                    if self.neighbor_hangs.load(Ordering::SeqCst) {
+                        return std::future::pending().await;
+                    }
                     let state = if self.upstream_down.load(Ordering::SeqCst) {
                         "Active"
                     } else {
                         "Established"
                     };
+                    let epoch = 1_790_000_000 + self.epoch_offset.load(Ordering::SeqCst);
                     return Ok(format!(
-                        r#"{{"192.0.2.1":{{"bgpState":"{state}","gracefulRestartInfo":{{"ipv4Unicast":{{"endOfRibStatus":{{"endOfRibRecv":true}}}}}}}}}}{{"peers":{{"192.0.2.1":{{"peerUptimeEstablishedEpoch":1790000000}}}}}}"#
+                        r#"{{"192.0.2.1":{{"bgpState":"{state}","gracefulRestartInfo":{{"ipv4Unicast":{{"endOfRibStatus":{{"endOfRibRecv":true}}}}}}}}}}{{"peers":{{"192.0.2.1":{{"peerUptimeEstablishedEpoch":{epoch}}}}}}}"#
                     ));
                 }
                 if first == "show running-config" {
+                    if self.flap_during_config.load(Ordering::SeqCst) {
+                        // The session is replaced while the slow read is
+                        // in flight; the new one is already loaded by
+                        // the time anything looks again.
+                        self.epoch_offset.fetch_add(600, Ordering::SeqCst);
+                    }
                     if self.config_times_out.load(Ordering::SeqCst) {
                         return Err(timed_out());
                     }
@@ -847,25 +918,135 @@ mod tests {
         );
     }
 
-    /// The End-of-RIB read follows the counts directly; the slow
-    /// running-config read goes last instead of sitting between them.
+    /// Upstream readiness is read on both sides of the running-config:
+    /// directly after the counts, and again after the slow read.
     #[tokio::test]
-    async fn upstream_readiness_is_read_before_the_running_config() {
+    async fn upstream_readiness_brackets_the_running_config() {
         let vtysh = Arc::new(Scripted::default());
         let (mut checker, _handle, _snapshot) = checker_with_handle(vtysh.clone());
         checker.run_check().await;
 
         let calls = vtysh.calls.lock().expect("calls").clone();
-        let at = |prefix: &str| {
+        let first = |prefix: &str| {
             calls
                 .iter()
                 .position(|c| c.starts_with(prefix))
                 .unwrap_or_else(|| panic!("no `{prefix}` call in {calls:?}"))
         };
-        assert!(at("show bgp ipv4 unicast statistics") < at("show bgp neighbor"));
+        let last = |prefix: &str| {
+            calls
+                .iter()
+                .rposition(|c| c.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no `{prefix}` call in {calls:?}"))
+        };
+        assert!(first("show bgp ipv4 unicast statistics") < first("show bgp neighbor"));
         assert!(
-            at("show bgp neighbor") < at("show running-config"),
+            first("show bgp neighbor") < first("show running-config"),
             "readiness must not wait behind the running-config: {calls:?}"
+        );
+        assert!(
+            last("show running-config") < last("show bgp neighbor"),
+            "and must be read again after it: {calls:?}"
+        );
+    }
+
+    fn not_ready(h: &TableCompleteness) -> bool {
+        matches!(
+            h.latest_verdict().1,
+            packetframe_common::fib::Completeness::Ineligible(
+                packetframe_common::fib::Revocation::UpstreamNotReady(_)
+            )
+        )
+    }
+
+    /// Review finding (PR #268): an upstream replaced while the slow
+    /// running-config read is in flight must revoke, not publish clean
+    /// on the dead session's state. The FIRST check, so no previous
+    /// epoch exists and only the two readings of this check can see it.
+    #[tokio::test]
+    async fn a_flap_during_the_running_config_revokes() {
+        let vtysh = Arc::new(Scripted::default());
+        vtysh.flap_during_config.store(true, Ordering::SeqCst);
+        let (mut checker, handle, _snapshot) = checker_with_handle(vtysh.clone());
+
+        assert!(checker.run_check().await, "a revocation is readable");
+        assert!(not_ready(&handle), "{:?}", handle.latest_verdict());
+        assert!(
+            handle.latest_verdict().0.is_none(),
+            "and nothing clean was published from the check"
+        );
+    }
+
+    /// The same session at both ends of the check stays clean.
+    #[tokio::test]
+    async fn an_unchanged_session_across_both_readings_is_clean() {
+        let vtysh = Arc::new(Scripted::default());
+        let (mut checker, handle, _snapshot) = checker_with_handle(vtysh.clone());
+
+        assert!(checker.run_check().await);
+        let (report, verdict) = handle.latest_verdict();
+        assert!(report.is_some(), "a clean check publishes its report");
+        assert!(
+            !matches!(
+                verdict,
+                packetframe_common::fib::Completeness::Ineligible(_)
+            ),
+            "{verdict:?}"
+        );
+    }
+
+    /// The whole check is bounded, however many upstreams there are and
+    /// however slowly each answers — the guarantee `FRR_INTERVAL_SECS`
+    /// is derived from (review finding, PR #268). Eight upstreams whose
+    /// reads never return: the check ends at the budget, unreadable,
+    /// with the budget named as the reason.
+    #[tokio::test]
+    async fn the_check_is_bounded_whatever_the_upstream_count() {
+        let vtysh = Arc::new(Scripted::default());
+        vtysh.neighbor_hangs.store(true, Ordering::SeqCst);
+        let mut cfg = config();
+        cfg.upstreams = (1..=8)
+            .map(|i| AuthorityUpstream {
+                addr: format!("192.0.2.{i}").parse().expect("ip"),
+                families: vec![AuthorityFamily::V4],
+            })
+            .collect();
+        let (prog, _log) = recording_handle();
+        let snapshot = shared_snapshot();
+        let mut checker = FrrAuthorityChecker::with_vtysh(
+            cfg,
+            vtysh,
+            snapshot.clone(),
+            prog,
+            CancellationToken::new(),
+        );
+        checker.check_budget = Duration::from_millis(200);
+
+        let started = Instant::now();
+        assert!(!checker.run_check().await, "a check cut off is unreadable");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        let err = snapshot.read().await.last_error.clone();
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("check budget")),
+            "{err:?}"
+        );
+    }
+
+    /// The arithmetic the budget exists for, pinned against the
+    /// constants it is derived from: four phases of one per-call timeout
+    /// fit the budget, and two checks at the interval ceiling still land
+    /// before the report-age limit.
+    #[test]
+    fn the_check_budget_fits_the_report_age_arithmetic() {
+        let max_interval =
+            Duration::from_secs(*packetframe_common::config::FRR_INTERVAL_SECS.end());
+        assert!(4 * VTYSH_TIMEOUT <= CHECK_BUDGET);
+        assert!(
+            2 * max_interval + 2 * CHECK_BUDGET <= packetframe_common::fib::STEER_MAX_REPORT_AGE
         );
     }
 }
