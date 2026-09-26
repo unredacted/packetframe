@@ -27,7 +27,53 @@ use std::time::Duration;
 
 use crate::process::Disposition;
 use crate::runtime::SteerOutcome;
-use crate::supervisor::{Action, Event};
+use crate::supervisor::{Action, ConvergenceStep, Event};
+
+/// Why a convergence step — attach, resync start, verify start — did
+/// not complete.
+///
+/// Two cases because they call for opposite responses, and a string
+/// cannot say which. A refusal is VPP answering: the same request will
+/// be refused again, so the pipeline has failed and the supervisor
+/// cycles. A lost connection is VPP *not* answering in time — or at all
+/// — and on its own that is a symptom, not a verdict: the pidfd decides
+/// death and the wedge detector decides silence. Collapsing the second
+/// into the first is what tore down an adopted VPP four times over one
+/// starved restart, each time for an `EAGAIN` from a socket deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepError {
+    /// The binary API connection went away under the step: a reply
+    /// outran the socket deadline, the socket closed, or an earlier
+    /// step in the same batch had already dropped it. VPP's state is
+    /// unknown rather than wrong, so the step is resumable on the same
+    /// process once VPP answers again.
+    ApiLost(String),
+    /// VPP answered and refused, or anything else a reconnect cannot
+    /// change.
+    Failed(String),
+}
+
+impl std::fmt::Display for StepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Says what happens next, because this lands in the journal
+            // beside "supervised action failed" and the next line an
+            // operator expects after that is a teardown.
+            Self::ApiLost(e) => write!(
+                f,
+                "{e} (binary API lost; VPP is not torn down for this — the step resumes \
+                 on the same process once it answers a ping)"
+            ),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<String> for StepError {
+    fn from(e: String) -> Self {
+        Self::Failed(e)
+    }
+}
 
 /// Everything the executor does to the world outside itself.
 ///
@@ -67,14 +113,17 @@ pub trait Effects {
     /// — see [`Disposition`].
     fn kill(&mut self) -> Disposition;
 
-    fn attach_devices(&mut self) -> Result<(), String>;
+    /// The three convergence steps say WHY they failed — see
+    /// [`StepError`] — because the answer decides between a teardown
+    /// and resuming the step on the same VPP.
+    fn attach_devices(&mut self) -> Result<(), StepError>;
 
     /// Begin (not complete) a FIB resync. The drain proceeds across
     /// ticks so the API ping and pidfd stay serviced; `SyncComplete`
     /// comes from the loop, not from here.
-    fn start_resync(&mut self) -> Result<(), String>;
+    fn start_resync(&mut self) -> Result<(), StepError>;
 
-    fn start_verify(&mut self) -> Result<(), String>;
+    fn start_verify(&mut self) -> Result<(), StepError>;
 
     /// Stop an in-flight resync/verify. Confirmation arrives later as
     /// `Event::ConvergenceStopped`, so this cannot fail meaningfully.
@@ -178,20 +227,17 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
             }),
             Action::AttachDevices => {
                 if let Err(e) = fx.attach_devices() {
-                    out.failures.push((*action, e));
-                    out.events.push(Event::ConvergenceFailed);
+                    step_failed(&mut out, *action, ConvergenceStep::Attach, e);
                 }
             }
             Action::StartResync => {
                 if let Err(e) = fx.start_resync() {
-                    out.failures.push((*action, e));
-                    out.events.push(Event::ConvergenceFailed);
+                    step_failed(&mut out, *action, ConvergenceStep::Resync, e);
                 }
             }
             Action::StartVerify => {
                 if let Err(e) = fx.start_verify() {
-                    out.failures.push((*action, e));
-                    out.events.push(Event::ConvergenceFailed);
+                    step_failed(&mut out, *action, ConvergenceStep::Verify, e);
                 }
             }
             Action::RestoreSteer => out.events.push(match fx.restore_steer() {
@@ -301,6 +347,23 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
     out
 }
 
+/// A convergence step failed: record it, and tell the supervisor which
+/// kind of failure it was.
+///
+/// Recorded either way — a lost connection is still a step that did not
+/// happen, and the journal is where a starved restart gets reconstructed
+/// — but only a refusal is `ConvergenceFailed`. A lost connection is
+/// `ConvergenceInterrupted`, which the supervisor holds rather than
+/// tears down; rule 3 stands, because the interruption is itself the
+/// event.
+fn step_failed(out: &mut Outcome, action: Action, step: ConvergenceStep, e: StepError) {
+    out.events.push(match e {
+        StepError::ApiLost(_) => Event::ConvergenceInterrupted { step },
+        StepError::Failed(_) => Event::ConvergenceFailed,
+    });
+    out.failures.push((action, e.to_string()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +379,10 @@ mod tests {
         fail_resync: bool,
         fail_verify: bool,
         fail_release: bool,
+        /// Attach loses the binary API — the socket-deadline `EAGAIN` a
+        /// starved host produces — and the resync behind it in the same
+        /// batch finds the transport dropped.
+        lose_api_on_attach: bool,
         kill_disposition: Option<Disposition>,
         /// What the steering ledger reports after a failed steer.
         rules_remain: bool,
@@ -363,17 +430,26 @@ mod tests {
             self.calls.push("kill");
             self.kill_disposition.unwrap_or(Disposition::SafeToRelease)
         }
-        fn attach_devices(&mut self) -> Result<(), String> {
+        fn attach_devices(&mut self) -> Result<(), StepError> {
             self.calls.push("attach");
-            err_if(self.fail_attach, "dev_attach refused")
+            if self.lose_api_on_attach {
+                return Err(StepError::ApiLost(
+                    "socket I/O: Resource temporarily unavailable".into(),
+                ));
+            }
+            err_if(self.fail_attach, "dev_attach refused").map_err(StepError::Failed)
         }
-        fn start_resync(&mut self) -> Result<(), String> {
+        fn start_resync(&mut self) -> Result<(), StepError> {
             self.calls.push("resync");
-            err_if(self.fail_resync, "socket closed")
+            if self.lose_api_on_attach {
+                // The same batch, after attach dropped the transport.
+                return Err(StepError::ApiLost("binary API is not connected".into()));
+            }
+            err_if(self.fail_resync, "neighbour refused").map_err(StepError::Failed)
         }
-        fn start_verify(&mut self) -> Result<(), String> {
+        fn start_verify(&mut self) -> Result<(), StepError> {
             self.calls.push("verify");
-            err_if(self.fail_verify, "socket closed")
+            err_if(self.fail_verify, "sample refused").map_err(StepError::Failed)
         }
         fn abort_convergence(&mut self) {
             self.calls.push("abort");
@@ -601,6 +677,35 @@ mod tests {
         // The batch still completes; the supervisor decides what the
         // events mean, not this loop.
         assert_eq!(r.calls, vec!["attach", "resync"]);
+    }
+
+    /// A lost API is reported as what it is. Both steps are recorded —
+    /// the journal is where a starved restart gets reconstructed — but
+    /// neither is `ConvergenceFailed`, which is what cycled the process.
+    #[test]
+    fn a_lost_api_reports_an_interruption_not_a_failure() {
+        let mut r = Recorder {
+            lose_api_on_attach: true,
+            ..Default::default()
+        };
+        let out = execute(&[Action::AttachDevices, Action::StartResync], &mut r);
+        assert_eq!(
+            out.events,
+            vec![
+                Event::ConvergenceInterrupted {
+                    step: ConvergenceStep::Attach
+                },
+                Event::ConvergenceInterrupted {
+                    step: ConvergenceStep::Resync
+                },
+            ]
+        );
+        assert_eq!(out.failures.len(), 2, "{:?}", out.failures);
+        assert!(
+            out.failures[0].1.contains("not torn down"),
+            "the journal line must say what happens next: {}",
+            out.failures[0].1
+        );
     }
 
     #[test]
@@ -854,6 +959,36 @@ mod tests {
         );
         step(&mut sup, &mut r, Event::ConvergenceStopped);
         assert!(sup.may_restart());
+    }
+
+    /// The seam for a lost API: the supervisor holds, and nothing in the
+    /// batch reaches the process or the NIC. The incident path from this
+    /// same batch was unsteer (had it been steered), abort, kill, backoff.
+    #[test]
+    fn a_lost_api_at_attach_holds_the_process_through_the_seam() {
+        let mut sup = Supervisor::new();
+        let mut r = Recorder {
+            lose_api_on_attach: true,
+            ..Default::default()
+        };
+
+        step(&mut sup, &mut r, Event::Adopted { steered: true });
+
+        assert_eq!(r.calls, vec!["attach", "resync"]);
+        assert_eq!(sup.state(), State::AdoptedResyncing);
+        assert!(sup.is_steered());
+        assert_eq!(sup.failures(), 0);
+
+        // VPP answers again: the pipeline resumes from the attach.
+        r.lose_api_on_attach = false;
+        r.calls.clear();
+        step(&mut sup, &mut r, Event::ApiRestored);
+        assert_eq!(r.calls, vec!["attach", "resync"]);
+        step(&mut sup, &mut r, Event::SyncComplete);
+        step(&mut sup, &mut r, Event::VerifyPassed);
+        assert_eq!(sup.state(), State::Steered);
+        assert!(!r.calls.contains(&"unsteer"), "{:?}", r.calls);
+        assert!(!r.calls.contains(&"kill"), "{:?}", r.calls);
     }
 
     /// The cross-batch hole. A failed `Unsteer` used to be forgotten

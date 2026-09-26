@@ -20,7 +20,7 @@
 //!
 //! | Field | Set by | Cleared by |
 //! |---|---|---|
-//! | `detector` | the API first answering, for **any** process — spawned or adopted | the state no longer having a process |
+//! | `detector` | the API first answering, for **any** process — spawned or adopted (for an adopted one, the attach wiring's handshake, which precedes the injection by contract) | the state no longer having a process |
 //!
 //! Both halves were wrong on the first attempt, in opposite directions.
 //! Setting it only on the `Starting → Syncing` transition meant an
@@ -76,7 +76,34 @@ pub const API_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// the next tick.
 pub const STEER_RETRY_EVERY: Duration = Duration::from_secs(30);
 
-use crate::executor::{execute, Effects, Outcome};
+/// First pause before resuming a convergence step that lost the API.
+///
+/// One ping interval, so a probe sent AFTER the interruption can land
+/// before the resume — the resume waits for one to be answered, because
+/// a reconnect alone proves only that VPP's socket server accepted us,
+/// not that its main thread is scheduling requests again.
+pub const RESUME_BASE: Duration = crate::liveness::PING_INTERVAL;
+
+/// Ceiling on the resume backoff.
+///
+/// The backoff is what stops a step that keeps losing the API from
+/// being re-issued as fast as the loop ticks — each attempt can hold
+/// the loop for a full socket deadline, and on a starved host that is
+/// load on the very CPU that is short. It does not bound the episode;
+/// the convergence budget does, since an interruption never extends
+/// the phase deadline. 8 s leaves room for many attempts inside
+/// `CONVERGENCE_BUDGET` while a starvation that clears is picked up
+/// within seconds.
+pub const RESUME_MAX: Duration = Duration::from_secs(8);
+
+fn resume_delay(attempts: u32) -> Duration {
+    RESUME_BASE
+        .checked_mul(1u32 << attempts.min(16))
+        .unwrap_or(RESUME_MAX)
+        .min(RESUME_MAX)
+}
+
+use crate::executor::{execute, Effects, Outcome, StepError};
 use crate::liveness::{budget_for, WedgeDetector};
 use crate::schedule::Schedule;
 use crate::supervisor::{Event, State, Supervisor};
@@ -165,7 +192,21 @@ pub trait Observe {
     /// the production loop caps sleeps at 50 ms for stop-responsiveness,
     /// so per-call growth shrinks with cadence and a per-call threshold
     /// would call a full-speed reload "quiet" (review finding).
-    fn drain_batch(&mut self, now: Instant) -> Result<Drain, String>;
+    ///
+    /// The error says whether the API was lost or VPP refused — see
+    /// [`StepError`] — because during a resync the first is resumed in
+    /// place and only the second fails the convergence.
+    fn drain_batch(&mut self, now: Instant) -> Result<Drain, StepError>;
+}
+
+/// A convergence step that lost the API, waiting to be resumed.
+#[derive(Debug, Clone, Copy)]
+struct Resume {
+    /// When the interruption was observed. The resume needs a pong
+    /// from AFTER this — one from before proves nothing about now.
+    interrupted_at: Instant,
+    /// The backoff: no resume before this.
+    not_before: Instant,
 }
 
 /// One tick's result.
@@ -210,6 +251,13 @@ pub struct Driver {
     /// a NIC that keeps refusing the removal is re-asked on
     /// [`STEER_RETRY_EVERY`], not every tick. See `poll_emptied`.
     last_empty_unsteer: Option<Instant>,
+    /// The pending resume of an interrupted convergence step, armed when
+    /// the supervisor records the interruption. See `poll_resume`.
+    resume: Option<Resume>,
+    /// Resumes armed during this convergence — the backoff exponent.
+    /// Reset when the convergence ends, however it ends, so one starved
+    /// restart does not tax the next convergence's first interruption.
+    resume_attempts: u32,
 }
 
 impl Default for Driver {
@@ -227,6 +275,8 @@ impl Driver {
             detector: None,
             last_steer_retry: None,
             last_empty_unsteer: None,
+            resume: None,
+            resume_attempts: 0,
         }
     }
 
@@ -256,7 +306,25 @@ impl Driver {
     /// adoption) and run its actions.
     pub fn inject(&mut self, now: Instant, event: Event, fx: &mut dyn Effects) -> Tick {
         let before = self.sup.state();
+        let adoption = matches!(event, Event::Adopted { .. });
         let mut tick = self.apply(now, vec![event], fx);
+        // An adoption is injected only after the attach wiring's handshake
+        // answered (see `bringup`), so it IS the API's first answer for
+        // this process and the liveness clock starts at `now` — the
+        // instant of that answer, not whenever `apply`'s synchronous
+        // attach returned.
+        //
+        // Left to the first tick's `api_ready`, as it was, the clock
+        // depended on the transport still being up by then — and an
+        // attach that loses the API drops it. A reconnect that then kept
+        // failing left a steered adoptee with no detector at all: no
+        // pings, no `Wedged`, nothing short of the 120 s convergence
+        // budget, against a published 2 s bound. Before interruptions
+        // were resumed, that window was unreachable only because the
+        // attach failure killed the adoptee first.
+        if adoption && self.sup.state().has_process() && self.detector.is_none() {
+            self.detector = Some(WedgeDetector::started(now));
+        }
         self.settle_after(now, before, false, &mut tick);
         tick
     }
@@ -355,7 +423,15 @@ impl Driver {
             // withholds the first batch for one tick — long enough for
             // the settled tick's sleep to run the resync phase deadline
             // out and fail a convergence that was fine.
-            if (resyncing || api_up_at_entry) && before != State::Verifying {
+            //
+            // Withheld while a pipeline step is interrupted: the step
+            // before the drain did not finish, so there may be no
+            // interfaces to resolve onto, no plan to drain, and — on a
+            // steered adoption — a deferral that would go on to unsteer
+            // and dump a VPP whose attach never completed. The resumed
+            // step starts all of that over.
+            let interrupted = self.sup.convergence_interrupted().is_some();
+            if (resyncing || api_up_at_entry) && before != State::Verifying && !interrupted {
                 match obs.drain_batch(now) {
                     // Empty means the resync is done — and only the
                     // drain can say so, which is why this is observed
@@ -400,9 +476,29 @@ impl Driver {
                     Ok(Drain::AwaitingSource { .. }) => {
                         self.sched.extend_phase(now, self.sup.phase());
                     }
-                    // Failing mid-resync is a convergence failure: the
-                    // table is known-incomplete and nothing is forwarding
-                    // through it yet.
+                    // Losing the API mid-resync is NOT a convergence
+                    // failure, for the reason `Event::ConvergenceInterrupted`
+                    // gives: it is a symptom, and a starved host produces
+                    // it from a socket deadline on a VPP that is only
+                    // slow. The drainer has requeued every op it holds no
+                    // acknowledgement for, so the retry is idempotent —
+                    // the same argument as the steady-state arm below,
+                    // which already made it. Death is the pidfd's call,
+                    // silence the detector's, and a resync that stops
+                    // moving stops extending the phase deadline (an
+                    // `Err` extends nothing), so the budget still ends a
+                    // convergence that never recovers.
+                    Err(StepError::ApiLost(e)) if resyncing => {
+                        tracing::warn!(
+                            error = %e,
+                            "resync drain lost the binary API; reconnecting and resuming \
+                             the drain on the same VPP — not a convergence failure"
+                        );
+                        self.reconnect_wanted = true;
+                    }
+                    // A refusal mid-resync is a convergence failure: VPP
+                    // answered, the table is known-incomplete, and the
+                    // same batch would be refused again.
                     //
                     // Logged HERE because this event produces no failed
                     // action for the executor to log — the shadow repro
@@ -443,6 +539,7 @@ impl Driver {
             }
 
             events.extend(self.poll_liveness(now, obs));
+            events.extend(self.poll_resume(now));
             events.extend(self.poll_emptied(now, obs));
             events.extend(self.poll_steer_retry(now, drain_proved_idle, obs));
         }
@@ -473,8 +570,17 @@ impl Driver {
         if !self.sup.state().has_process() {
             self.detector = None;
         }
+        self.track_resume(now);
 
         tick.sleep = self.sleep(now);
+        // An armed resume wakes the loop at its backoff, not a ping
+        // later. Only while that lies ahead: once it has passed, the
+        // resume waits on a pong, which the ping schedule in `sleep`
+        // already wakes for — capping at zero there would spin.
+        if let Some(r) = self.resume.filter(|r| r.not_before > now) {
+            let wait = r.not_before - now;
+            tick.sleep = Some(tick.sleep.map_or(wait, |s| s.min(wait)));
+        }
         // A process whose API has not answered yet has exactly one
         // source of progress: polling `api_ready`. Nothing wakes the
         // loop for that — no detector exists yet, and the only armed
@@ -509,6 +615,75 @@ impl Driver {
             self.detector.as_ref().map(|d| d.next_ping_at()),
             self.sup.may_restart(),
         )
+    }
+
+    /// Arm, or drop, the resume of an interrupted convergence step from
+    /// what the supervisor now records.
+    ///
+    /// Armed at the first sight of an interruption: the backoff starts,
+    /// and a reconnect is asked for, because every path that reports the
+    /// API lost has dropped the transport and nothing else on a converging
+    /// tick would reconnect it.
+    fn track_resume(&mut self, now: Instant) {
+        if !matches!(
+            self.sup.state(),
+            State::Syncing | State::AdoptedResyncing | State::Verifying
+        ) {
+            self.resume = None;
+            self.resume_attempts = 0;
+            return;
+        }
+        match (self.sup.convergence_interrupted(), self.resume) {
+            (Some(step), None) => {
+                let delay = resume_delay(self.resume_attempts);
+                self.resume_attempts = self.resume_attempts.saturating_add(1);
+                self.resume = Some(Resume {
+                    interrupted_at: now,
+                    not_before: now + delay,
+                });
+                self.reconnect_wanted = true;
+                tracing::warn!(
+                    step = ?step,
+                    attempt = self.resume_attempts,
+                    retry_in = ?delay,
+                    "convergence step lost the binary API; holding VPP rather than tearing it \
+                     down — reconnecting, and resuming once it answers a ping. Death (pidfd), \
+                     silence past the wedge budget, or the convergence deadline still end it"
+                );
+            }
+            (None, Some(_)) => self.resume = None,
+            _ => {}
+        }
+    }
+
+    /// Resume an interrupted convergence step once VPP demonstrably
+    /// answers again. See [`Event::ApiRestored`].
+    ///
+    /// Two proofs, both from the detector, read after `poll_liveness` has
+    /// run this tick: a pong received since the interruption — the
+    /// transport is back AND VPP's main thread is scheduling requests,
+    /// which a reconnect alone does not show — and the latest probe
+    /// answered, so a ping that has just failed again holds the resume.
+    /// No pong, no resume; and a VPP that stays silent is exactly what
+    /// the detector turns into `Wedged` on its own budget, which keeps
+    /// the published bound on a steered adoptee.
+    fn poll_resume(&mut self, now: Instant) -> Vec<Event> {
+        let Some(r) = self.resume else {
+            return Vec::new();
+        };
+        if now < r.not_before {
+            return Vec::new();
+        }
+        let answering = self
+            .detector
+            .as_ref()
+            .is_some_and(|d| d.answered_last_probe() && d.answered_since(r.interrupted_at));
+        if !answering {
+            return Vec::new();
+        }
+        self.resume = None;
+        tracing::info!("binary API answering again; resuming the interrupted convergence step");
+        vec![Event::ApiRestored]
     }
 
     /// Ping if due, and decide whether the silence has gone too far.
@@ -758,7 +933,7 @@ mod tests {
     use crate::liveness::{PING_BUDGET, PING_INTERVAL, SYNC_PING_BUDGET};
     use crate::process::Disposition;
     use crate::runtime::SteerOutcome;
-    use crate::supervisor::Action;
+    use crate::supervisor::{Action, ConvergenceStep, CONVERGENCE_BUDGET};
 
     fn at(base: Instant, ms: u64) -> Instant {
         base + Duration::from_millis(ms)
@@ -792,7 +967,14 @@ mod tests {
         /// Drain calls that report `AwaitingSource` before any batch
         /// moves — the deferred adopted resync.
         deferred_ticks: usize,
+        /// Every drain is refused — VPP answering, and saying no.
         drain_fails: bool,
+        /// Drains that lose the binary API before any succeeds — the
+        /// socket-deadline `EAGAIN` of a starved host.
+        drains_lose_api: usize,
+        /// The API never answers again: pings fail and reconnects are
+        /// refused — a VPP that is genuinely gone.
+        dead: bool,
         ping_fails: bool,
         pings: usize,
         drains: usize,
@@ -814,11 +996,11 @@ mod tests {
         }
         fn api_ready(&mut self) -> bool {
             self.api_readies += 1;
-            self.api
+            self.api && !self.dead
         }
         fn ping(&mut self) -> Result<(), String> {
             self.pings += 1;
-            if self.ping_fails {
+            if self.ping_fails || self.dead {
                 Err("no answer".into())
             } else {
                 Ok(())
@@ -831,10 +1013,21 @@ mod tests {
         fn fib_empty(&mut self) -> bool {
             self.fib_empty
         }
-        fn drain_batch(&mut self, _now: Instant) -> Result<Drain, String> {
+        fn drain_batch(&mut self, _now: Instant) -> Result<Drain, StepError> {
             self.drains += 1;
+            if self.dead {
+                return Err(StepError::ApiLost("binary API is not connected".into()));
+            }
+            if let Some(n) = self.drains_lose_api.checked_sub(1) {
+                self.drains_lose_api = n;
+                return Err(StepError::ApiLost(
+                    "socket I/O: Resource temporarily unavailable".into(),
+                ));
+            }
             if self.drain_fails {
-                return Err("socket closed".into());
+                return Err(StepError::Failed(
+                    "VPP refused the static neighbour for 192.0.2.1 (retval -1)".into(),
+                ));
             }
             if let Some(n) = self.deferred_ticks.checked_sub(1) {
                 self.deferred_ticks = n;
@@ -858,6 +1051,19 @@ mod tests {
         steer_fails: bool,
         /// How many upcoming unsteers the NIC refuses.
         unsteer_refusals: usize,
+        /// Upcoming attaches that lose the binary API. The resync behind
+        /// each in the same batch then finds the transport dropped, as
+        /// the engine's would.
+        attaches_lose_api: usize,
+        /// Upcoming resync starts that lose the binary API.
+        resyncs_lose_api: usize,
+        /// Upcoming verify starts that lose the binary API.
+        verifies_lose_api: usize,
+        /// Set by an attach that lost the API; the next step in the batch
+        /// sees no transport. Cleared by the next attach attempt.
+        transport_dropped: bool,
+        /// Every attach is refused — VPP answering, and saying no.
+        attach_refused: bool,
     }
 
     impl Effects for Fx {
@@ -893,16 +1099,42 @@ mod tests {
             self.calls.push("kill");
             self.kill_disposition.unwrap_or(Disposition::SafeToRelease)
         }
-        fn attach_devices(&mut self) -> Result<(), String> {
+        fn attach_devices(&mut self) -> Result<(), StepError> {
             self.calls.push("attach");
+            self.transport_dropped = false;
+            if let Some(n) = self.attaches_lose_api.checked_sub(1) {
+                self.attaches_lose_api = n;
+                self.transport_dropped = true;
+                return Err(StepError::ApiLost(
+                    "socket I/O: Resource temporarily unavailable (os error 11)".into(),
+                ));
+            }
+            if self.attach_refused {
+                return Err(StepError::Failed("dev_attach refused (retval -1)".into()));
+            }
             Ok(())
         }
-        fn start_resync(&mut self) -> Result<(), String> {
+        fn start_resync(&mut self) -> Result<(), StepError> {
             self.calls.push("resync");
+            if self.transport_dropped {
+                return Err(StepError::ApiLost("binary API is not connected".into()));
+            }
+            if let Some(n) = self.resyncs_lose_api.checked_sub(1) {
+                self.resyncs_lose_api = n;
+                return Err(StepError::ApiLost(
+                    "socket I/O: Resource temporarily unavailable (os error 11)".into(),
+                ));
+            }
             Ok(())
         }
-        fn start_verify(&mut self) -> Result<(), String> {
+        fn start_verify(&mut self) -> Result<(), StepError> {
             self.calls.push("verify");
+            if let Some(n) = self.verifies_lose_api.checked_sub(1) {
+                self.verifies_lose_api = n;
+                return Err(StepError::ApiLost(
+                    "socket I/O: Resource temporarily unavailable (os error 11)".into(),
+                ));
+            }
             Ok(())
         }
         fn abort_convergence(&mut self) {
@@ -1122,8 +1354,10 @@ mod tests {
         );
     }
 
+    /// A refusal: VPP answered and said no, so the same batch would be
+    /// refused again and the convergence has failed.
     #[test]
-    fn a_drain_failure_reports_convergence_failed() {
+    fn a_refused_resync_drain_reports_convergence_failed() {
         let t0 = Instant::now();
         let mut d = Driver::new();
         let mut fx = Fx::default();
@@ -1136,6 +1370,304 @@ mod tests {
         d.inject(t0, Event::StartRequested, &mut fx);
         let seen = settle(&mut d, t0, &mut w, &mut fx);
         assert!(seen.contains(&Event::ConvergenceFailed), "{seen:?}");
+        assert_eq!(d.state(), State::Backoff);
+    }
+
+    // ---- A lost API mid-convergence is resumed, not torn down ----
+
+    /// The incident, at the driver: an adopted, steered VPP whose attach
+    /// loses the API (`EAGAIN` from the socket deadline on a starved
+    /// host). It must be held — steering untouched, no kill — resumed
+    /// from the attach once VPP answers a ping sent after the loss, and
+    /// then converge and keep its traffic.
+    #[test]
+    fn an_attach_that_loses_the_api_on_a_steered_adoptee_is_resumed_in_place() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx {
+            attaches_lose_api: 1,
+            ..Default::default()
+        };
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+
+        let t = d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+        assert!(
+            t.outcome.events.contains(&Event::ConvergenceInterrupted {
+                step: ConvergenceStep::Attach
+            }),
+            "{:?}",
+            t.outcome
+        );
+        assert_eq!(d.state(), State::AdoptedResyncing);
+        assert_eq!(fx.calls, vec!["attach", "resync"]);
+
+        // Before a ping has been answered since the loss: no resume, and
+        // no drain on top of an unfinished attach.
+        let t = d.tick(t0, &mut w, &mut fx);
+        assert!(!t.events.contains(&Event::ApiRestored), "{:?}", t.events);
+        assert_eq!(
+            t.sleep,
+            Some(RESUME_BASE),
+            "waiting out the resume backoff must neither spin nor oversleep it"
+        );
+        assert_eq!(w.drains, 0, "nothing drains over an unfinished attach");
+        assert!(w.api_readies > 0, "the dropped transport is reconnected");
+
+        let seen = settle(&mut d, t0 + RESUME_BASE, &mut w, &mut fx);
+        assert!(seen.contains(&Event::ApiRestored), "{seen:?}");
+        assert_eq!(fx.calls, vec!["attach", "resync", "attach", "resync"]);
+
+        let seen = settle(&mut d, t0 + 2 * RESUME_BASE, &mut w, &mut fx);
+        assert!(seen.contains(&Event::SyncComplete), "{seen:?}");
+        d.inject(t0 + 2 * RESUME_BASE, Event::VerifyPassed, &mut fx);
+        assert_eq!(d.state(), State::Steered);
+        assert!(
+            !fx.calls.contains(&"unsteer") && !fx.calls.contains(&"kill"),
+            "a slow VPP must keep its process and its traffic: {:?}",
+            fx.calls
+        );
+        assert_eq!(d.supervisor().failures(), 0);
+    }
+
+    /// A resync start that loses the API resumes the resync alone — the
+    /// attach before it finished, and re-running it on a fresh VPP would
+    /// re-issue a `dev_attach` the device has already taken.
+    #[test]
+    fn a_resync_start_that_loses_the_api_resumes_only_the_resync() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx {
+            resyncs_lose_api: 1,
+            ..Default::default()
+        };
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        let t = d.tick(t0, &mut w, &mut fx);
+        assert!(t.events.contains(&Event::ApiUp));
+        assert_eq!(d.state(), State::Syncing, "held, not in backoff");
+        assert_eq!(fx.calls, vec!["spawn", "attach", "resync"]);
+
+        let seen = settle(&mut d, t0 + RESUME_BASE, &mut w, &mut fx);
+        assert!(seen.contains(&Event::ApiRestored), "{seen:?}");
+        assert_eq!(fx.calls, vec!["spawn", "attach", "resync", "resync"]);
+
+        let seen = settle(&mut d, t0 + 2 * RESUME_BASE, &mut w, &mut fx);
+        assert!(seen.contains(&Event::SyncComplete), "{seen:?}");
+        assert_eq!(d.state(), State::Verifying);
+        assert!(!fx.calls.contains(&"kill"), "{:?}", fx.calls);
+    }
+
+    /// A verify start that loses the API resumes the verify. A transport
+    /// failure is not a verdict — restart-worthy is a verify MISMATCH.
+    #[test]
+    fn a_verify_that_loses_the_api_resumes_the_verify() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx {
+            verifies_lose_api: 1,
+            ..Default::default()
+        };
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        assert_eq!(d.state(), State::Verifying);
+        assert_eq!(fx.calls, vec!["spawn", "attach", "resync", "verify"]);
+
+        // The loss came a tick after the start, so its backoff ends just
+        // past the first ping; the resume is the tick after both.
+        let seen = settle(&mut d, t0 + 2 * RESUME_BASE, &mut w, &mut fx);
+        assert!(seen.contains(&Event::ApiRestored), "{seen:?}");
+        assert_eq!(
+            fx.calls,
+            vec!["spawn", "attach", "resync", "verify", "verify"]
+        );
+        assert_eq!(d.state(), State::Verifying);
+        assert_eq!(d.supervisor().failures(), 0);
+    }
+
+    /// A resync DRAIN that loses the API is resumed the way the
+    /// steady-state drain always was: reconnect, retry, no teardown.
+    #[test]
+    fn a_resync_drain_that_loses_the_api_reconnects_and_carries_on() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 3,
+            drains_lose_api: 2,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+
+        let mut seen = Vec::new();
+        let mut now = t0;
+        for _ in 0..32 {
+            let losses_before = w.drains_lose_api;
+            let t = d.tick(now, &mut w, &mut fx);
+            seen.extend(t.events);
+            if d.state() == State::Verifying {
+                break;
+            }
+            if w.drains_lose_api < losses_before {
+                assert_ne!(
+                    t.sleep,
+                    Some(Duration::ZERO),
+                    "a lost drain must not ask for an immediate re-tick: the next \
+                     attempt would fail on the dropped socket without any I/O"
+                );
+            }
+            now += t
+                .sleep
+                .unwrap_or(PING_INTERVAL)
+                .max(Duration::from_millis(1));
+        }
+        assert_eq!(d.state(), State::Verifying, "{seen:?}");
+        assert!(!seen.contains(&Event::ConvergenceFailed), "{seen:?}");
+        assert_eq!(d.supervisor().failures(), 0);
+        assert!(w.api_readies > 1, "each loss asks for a reconnect");
+    }
+
+    /// The control: resuming in place must not become a way to sit on a
+    /// dead dataplane. The API is lost and never answers again, so the
+    /// detector — on the steered adoptee's published 1.5 s budget, not a
+    /// relaxed one — calls the wedge, and the teardown unsteers FIRST.
+    #[test]
+    fn a_vpp_that_stays_silent_after_the_loss_is_still_torn_down_unsteered_first() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx {
+            attaches_lose_api: 1,
+            ..Default::default()
+        };
+        let mut w = World {
+            api: true,
+            dead: true,
+            ..Default::default()
+        };
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+
+        let mut wedged_at = None;
+        for ms in (0..4_000).step_by(250) {
+            if d.tick(at(t0, ms), &mut w, &mut fx)
+                .events
+                .contains(&Event::Wedged)
+            {
+                wedged_at = Some(ms);
+                break;
+            }
+        }
+        let wedged_at = wedged_at.expect("a silent adoptee must be declared wedged");
+        assert!(
+            Duration::from_millis(wedged_at) <= crate::liveness::worst_case_detection(PING_BUDGET),
+            "the published bound governs a steered adoptee: {wedged_at} ms"
+        );
+        assert_eq!(d.state(), State::Backoff);
+        let pos = |c: &str| fx.calls.iter().position(|x| *x == c);
+        assert!(
+            pos("unsteer").expect("unsteered") < pos("kill").expect("killed"),
+            "{:?}",
+            fx.calls
+        );
+        assert_eq!(
+            fx.calls.iter().filter(|c| **c == "attach").count(),
+            1,
+            "nothing answered, so nothing was resumed: {:?}",
+            fx.calls
+        );
+    }
+
+    /// A step that keeps losing the API while VPP answers pings is paced by
+    /// the resume backoff and ended by the convergence deadline, which an
+    /// interruption never extends. Bounded both ways: resumed more than
+    /// once, never faster than the backoff allows, and not forever.
+    #[test]
+    fn an_interruption_that_never_resolves_is_paced_and_ends_at_the_deadline() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx {
+            attaches_lose_api: usize::MAX,
+            ..Default::default()
+        };
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+
+        let mut now = t0;
+        let mut resumes = Vec::new();
+        let mut timed_out = None;
+        for _ in 0..2_000 {
+            let t = d.tick(now, &mut w, &mut fx);
+            if t.events.contains(&Event::ApiRestored) {
+                resumes.push(now);
+            }
+            if t.events.contains(&Event::PhaseTimedOut) {
+                timed_out = Some(now);
+                break;
+            }
+            now += t
+                .sleep
+                .unwrap_or(PING_INTERVAL)
+                .max(Duration::from_millis(1));
+        }
+        let timed_out = timed_out.expect("the convergence deadline must end it");
+        assert!(timed_out.duration_since(t0) <= CONVERGENCE_BUDGET + PING_INTERVAL);
+        assert_eq!(d.state(), State::Backoff);
+        assert!(
+            resumes.len() > 2,
+            "resumed in place first: {}",
+            resumes.len()
+        );
+        let gaps: Vec<Duration> = resumes.windows(2).map(|p| p[1] - p[0]).collect();
+        assert!(
+            gaps.windows(2).all(|g| g[1] >= g[0]),
+            "the backoff never shortens: {gaps:?}"
+        );
+        assert!(
+            gaps.last().is_some_and(|g| *g >= RESUME_MAX),
+            "and reaches its ceiling: {gaps:?}"
+        );
+        assert!(
+            gaps.iter().all(|g| *g <= RESUME_MAX + PING_INTERVAL),
+            "but never waits past it by more than a ping: {gaps:?}"
+        );
+    }
+
+    /// And a refusal is still a failure, at once.
+    #[test]
+    fn a_refused_attach_still_tears_down_at_once() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx {
+            attach_refused: true,
+            ..Default::default()
+        };
+        let mut w = World {
+            api: true,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        let t = d.tick(t0, &mut w, &mut fx);
+        assert!(
+            t.events.contains(&Event::ConvergenceFailed),
+            "{:?}",
+            t.events
+        );
         assert_eq!(d.state(), State::Backoff);
     }
 
@@ -2164,13 +2696,13 @@ mod tests {
             fn kill(&mut self) -> Disposition {
                 Disposition::SafeToRelease
             }
-            fn attach_devices(&mut self) -> Result<(), String> {
+            fn attach_devices(&mut self) -> Result<(), StepError> {
                 Ok(())
             }
-            fn start_resync(&mut self) -> Result<(), String> {
+            fn start_resync(&mut self) -> Result<(), StepError> {
                 Ok(())
             }
-            fn start_verify(&mut self) -> Result<(), String> {
+            fn start_verify(&mut self) -> Result<(), StepError> {
                 Ok(())
             }
             fn abort_convergence(&mut self) {}

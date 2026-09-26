@@ -2832,3 +2832,109 @@ fn connected_subnets_via_the_router_itself_stay_out_of_vpp() {
         |ev| matches!(ev, Event::Route(r) if !r.is_add && (r.addr, r.len) == ([10, 66, 1, 0], 24))
     ));
 }
+
+/// A reply that outruns the socket deadline — a starved VPP, as the
+/// client sees it — surfaces from the attach as the API LOST, not as a
+/// refusal; the socket that may still owe the late reply is gone; and
+/// the same step, resumed over a fresh connection, completes.
+///
+/// A real `EAGAIN` from the real transport, not a classified string:
+/// this is the leg the supervision tests fake. Steered, so the deadline
+/// is the published 1.5 s and the stall costs this test that much.
+#[test]
+fn a_reply_that_outruns_the_socket_deadline_is_a_lost_api_and_the_attach_resumes() {
+    let fake = Fake::start_behaving(
+        "attach-stall",
+        Behaviour {
+            stall_on: Some(("dev_attach", 0)),
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    e.set_steered(true);
+    assert!(e.api_ready(), "handshake");
+
+    let err = e
+        .attach_devices(AttachMode::Fresh)
+        .expect_err("the reply never comes");
+    assert!(
+        err.api_lost(),
+        "a socket deadline is the API lost, not VPP refusing: {err}"
+    );
+    assert!(err.to_string().contains("socket I/O"), "{err}");
+    assert!(
+        !e.is_connected(),
+        "a socket that may still owe a late reply must not be reused"
+    );
+
+    assert!(e.api_ready(), "the reconnect");
+    e.attach_devices(AttachMode::Fresh)
+        .expect("the resumed attach completes");
+    assert_eq!(
+        e.attached_indices(),
+        vec![("eth4".to_string(), ASSIGNED_INDEX)]
+    );
+}
+
+/// The adoption dump is all or nothing across families.
+///
+/// Adopting as it went, a timeout on the v6 dump left the v4 half in the
+/// ledger — and `adopt_vpp_fib` no-ops on a populated ledger, so the
+/// resumed `StartResync` would read `0`, take it for an empty FIB and
+/// run the diff at once: no deferral for a still-loading source, v4
+/// withdrawn against it, v6 never adopted.
+#[test]
+fn an_adoption_dump_that_times_out_part_way_adopts_nothing() {
+    const EXISTING: &[([u8; 4], u8, u32, bool)] = &[
+        ([203, 0, 113, 0], 24, ASSIGNED_INDEX, true),
+        ([198, 51, 100, 0], 24, ASSIGNED_INDEX, true),
+    ];
+    let fake = Fake::start_behaving(
+        "adopt-stall",
+        Behaviour {
+            existing_routes: EXISTING,
+            // The second dump: v6, after v4 has answered in full.
+            stall_on: Some(("ip_route_dump", 1)),
+            ..Default::default()
+        },
+    );
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            mtu: None,
+            vlans: vec![],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::Both,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    );
+    e.set_steered(true);
+    assert!(e.api_ready(), "handshake");
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+
+    let err = e.adopt_vpp_fib().expect_err("the v6 dump never answers");
+    assert!(err.api_lost(), "{err}");
+    assert_eq!(
+        e.counts().installed,
+        0,
+        "the v4 half must not be adopted on its own"
+    );
+
+    assert!(e.api_ready(), "the reconnect");
+    let adopted = e.adopt_vpp_fib().expect("the resumed dump");
+    assert!(
+        adopted > 0,
+        "the resume must adopt, not report an empty FIB and diff undeferred"
+    );
+    assert_eq!(e.counts().installed, 2);
+}

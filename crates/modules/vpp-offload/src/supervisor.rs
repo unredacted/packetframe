@@ -81,6 +81,20 @@ pub enum PhaseKind {
     Convergence,
 }
 
+/// One step of the attach → resync → verify pipeline, as named by an
+/// interruption that must resume it.
+///
+/// Ordered as the pipeline is: resuming from an earlier step re-runs
+/// every later one, so when a batch reports two interruptions — an
+/// attach that lost the API, then the resync behind it finding the
+/// transport already gone — the earlier step is the one to resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConvergenceStep {
+    Attach,
+    Resync,
+    Verify,
+}
+
 /// Where the supervised VPP is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -241,6 +255,34 @@ pub enum Event {
     /// until `CONVERGENCE_BUDGET` expired — two minutes of waiting for
     /// something already known to have failed.
     ConvergenceFailed,
+    /// A pipeline step lost the binary API — a reply outran the socket
+    /// deadline, or the socket closed — with nothing said about the
+    /// process itself.
+    ///
+    /// NOT a `ConvergenceFailed`, and the difference is the most
+    /// expensive one in this module. On a starved host (softirq ~60%
+    /// during a daemon restart) an adoption's dump hit its socket
+    /// deadline, the `EAGAIN` was reported as a failed pipeline, and
+    /// `fail()` killed the adopted VPP — then did the same to three
+    /// fresh spawns whose attach timed out the same way, before a
+    /// fourth re-converged ~1.09M routes from nothing. VPP was slow,
+    /// not dead. A teardown is the costliest recovery there is, and on
+    /// a steered adoptee a dangerous one: steering must come down
+    /// first, and a respawn restarts the octeon port.
+    ///
+    /// So the step is held for resumption on the SAME process, and the
+    /// evidence that decides otherwise is the evidence that always
+    /// decides: `ProcessExited` from the pidfd, `Wedged` from the
+    /// detector — which keeps its published budget while steered — and
+    /// `PhaseTimedOut`, whose deadline an interruption never extends.
+    ConvergenceInterrupted {
+        step: ConvergenceStep,
+    },
+    /// The binary API answers again after a [`Self::ConvergenceInterrupted`]:
+    /// the driver has reconnected, VPP has answered a ping sent since,
+    /// and the resume backoff has elapsed. Resumes the interrupted step
+    /// and everything after it; stale anywhere nothing is interrupted.
+    ApiRestored,
     /// Steering rules installed.
     Steered,
     /// A reconcile ran against a target that asks for **no port**: the
@@ -531,6 +573,13 @@ pub struct Supervisor {
     /// `BackoffElapsed` do exactly that. Cleared only when the pidfd
     /// reports the exit.
     undead: bool,
+    /// A pipeline step lost the API and waits to be resumed on this
+    /// process — see [`Event::ConvergenceInterrupted`].
+    ///
+    /// Cleared by the resumption, by anything that ends the convergence
+    /// (`fail()`, a stop, a verdict), and never by a state change alone:
+    /// the interruption holds the state where it is, which is the point.
+    interrupted: Option<ConvergenceStep>,
 }
 
 impl Default for Supervisor {
@@ -548,6 +597,7 @@ impl Supervisor {
             steer_wanted: false,
             converging: false,
             undead: false,
+            interrupted: None,
         }
     }
 
@@ -595,6 +645,14 @@ impl Supervisor {
 
     pub fn failures(&self) -> u32 {
         self.failures
+    }
+
+    /// The pipeline step waiting to be resumed after losing the API, if
+    /// any. The driver's half of [`Event::ApiRestored`]: while this is
+    /// set it withholds the drain — the step before it did not finish —
+    /// and paces the reconnect-and-resume.
+    pub fn convergence_interrupted(&self) -> Option<ConvergenceStep> {
+        self.interrupted
     }
 
     /// Backoff for the current failure count: exponential, capped.
@@ -718,7 +776,12 @@ impl Supervisor {
             }
 
             // --- converging ---
-            (Syncing | AdoptedResyncing, SyncComplete) => {
+            //
+            // Not while a step is interrupted: the drain that reports
+            // this is withheld then, so arriving anyway means something
+            // is reporting a table whose attach or resync start never
+            // finished — and verify would bless it.
+            (Syncing | AdoptedResyncing, SyncComplete) if self.interrupted.is_none() => {
                 self.state = Verifying;
                 vec![Action::StartVerify]
             }
@@ -736,9 +799,42 @@ impl Supervisor {
             // `AbortConvergence` and the restart waits for the caller's
             // `ConvergenceStopped`, which is the only thing that knows.
             (Syncing | AdoptedResyncing | Verifying, ConvergenceFailed) => self.fail(),
+            // The API went away under a step. Hold — no teardown, no
+            // abort, no state change — and let the driver resume the
+            // step once VPP answers again. `converging` stays true, so
+            // the restart guard and the relaxed budget are untouched,
+            // and the phase deadline keeps running unextended, so an
+            // interruption that never resolves still ends in
+            // `PhaseTimedOut`.
+            //
+            // The earliest step wins: an attach that lost the API is
+            // followed in the same batch by a resync that finds the
+            // transport gone, and resuming the resync alone would build
+            // a FIB on interfaces that were never attached.
+            (Syncing | AdoptedResyncing | Verifying, ConvergenceInterrupted { step }) => {
+                self.interrupted = Some(self.interrupted.map_or(step, |s| s.min(step)));
+                vec![]
+            }
+            // Resume from the interrupted step, in pipeline order. Every
+            // step is safe to re-run on the same process: attach reuses
+            // what VPP already has on an adoption (and a fresh VPP whose
+            // `dev_attach` landed refuses the second one, which is an
+            // ordinary `ConvergenceFailed`), the resync start re-plans
+            // from the mirror, and verify re-samples.
+            (Syncing | AdoptedResyncing | Verifying, ApiRestored) => {
+                match self.interrupted.take() {
+                    Some(ConvergenceStep::Attach) => {
+                        vec![Action::AttachDevices, Action::StartResync]
+                    }
+                    Some(ConvergenceStep::Resync) => vec![Action::StartResync],
+                    Some(ConvergenceStep::Verify) => vec![Action::StartVerify],
+                    None => vec![],
+                }
+            }
             (Verifying, VerifyPassed) => {
                 self.failures = 0;
                 self.converging = false;
+                self.interrupted = None;
                 // Steer if traffic was flowing before the disruption —
                 // or is still flowing, in the adopted case. A first
                 // attach waits for the operator's explicit canary;
@@ -773,6 +869,7 @@ impl Supervisor {
             // because the next resync withholds the same routes.
             (Verifying | AdoptedResyncing, VerifyIncomplete) => {
                 self.converging = false;
+                self.interrupted = None;
                 self.failures = 0;
                 self.state = Ready;
                 vec![]
@@ -1043,6 +1140,7 @@ impl Supervisor {
                 actions.push(Action::Kill);
                 actions.push(Action::ReleaseResources);
                 self.state = Stopped;
+                self.interrupted = None;
                 self.steer_wanted = false;
                 self.failures = 0;
                 actions
@@ -1082,6 +1180,8 @@ impl Supervisor {
             actions.push(Action::AbortConvergence);
         }
         actions.push(Action::Kill);
+        // An interrupted step belonged to the process being killed.
+        self.interrupted = None;
         self.failures = self.failures.saturating_add(1);
         let delay = self.backoff();
         self.state = State::Backoff;
@@ -2472,5 +2572,126 @@ mod tests {
             s.on(Event::StopRequested).contains(&Action::Unsteer),
             "so every teardown must try again and keep withholding the VF"
         );
+    }
+
+    // ---- A lost API is an interruption, not a failure ----
+
+    /// The whole point: an adopted, steered VPP whose attach loses the API
+    /// is held exactly where it is. No `Unsteer`, no `Kill`, no abort, no
+    /// failure counted — the incident path emitted all four.
+    #[test]
+    fn an_interrupted_step_holds_a_steered_adoptee_without_touching_it() {
+        let mut s = Supervisor::new();
+        s.on(Event::Adopted { steered: true });
+
+        let actions = s.on(Event::ConvergenceInterrupted {
+            step: ConvergenceStep::Attach,
+        });
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(s.state(), State::AdoptedResyncing);
+        assert!(s.is_steered());
+        assert!(s.is_converging(), "the restart guard and budget stand");
+        assert_eq!(s.failures(), 0);
+        assert_eq!(s.convergence_interrupted(), Some(ConvergenceStep::Attach));
+    }
+
+    /// The attach lost the API, and the resync behind it in the same batch
+    /// then found the transport gone. Resuming the resync alone would
+    /// build a FIB on interfaces that were never attached.
+    #[test]
+    fn the_resume_starts_from_the_earliest_interrupted_step() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::ApiUp);
+        s.on(Event::ConvergenceInterrupted {
+            step: ConvergenceStep::Attach,
+        });
+        s.on(Event::ConvergenceInterrupted {
+            step: ConvergenceStep::Resync,
+        });
+
+        assert_eq!(
+            s.on(Event::ApiRestored),
+            vec![Action::AttachDevices, Action::StartResync]
+        );
+        assert_eq!(s.convergence_interrupted(), None, "taken by the resume");
+        assert!(
+            s.on(Event::ApiRestored).is_empty(),
+            "a second restore has nothing to resume"
+        );
+    }
+
+    #[test]
+    fn a_resync_or_verify_resumes_only_itself() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::ApiUp);
+        s.on(Event::ConvergenceInterrupted {
+            step: ConvergenceStep::Resync,
+        });
+        assert_eq!(s.on(Event::ApiRestored), vec![Action::StartResync]);
+
+        s.on(Event::SyncComplete);
+        s.on(Event::ConvergenceInterrupted {
+            step: ConvergenceStep::Verify,
+        });
+        assert_eq!(s.state(), State::Verifying);
+        assert_eq!(s.on(Event::ApiRestored), vec![Action::StartVerify]);
+    }
+
+    /// A drain reporting completion while the attach is unfinished is
+    /// reporting a table built on nothing; verify would bless it.
+    #[test]
+    fn nothing_proceeds_to_verify_while_a_step_is_interrupted() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::ApiUp);
+        s.on(Event::ConvergenceInterrupted {
+            step: ConvergenceStep::Attach,
+        });
+        assert!(s.on(Event::SyncComplete).is_empty());
+        assert_eq!(s.state(), State::Syncing);
+    }
+
+    /// The evidence that always decided still decides. A death or a wedge
+    /// during the interruption is the ordinary teardown — steering first —
+    /// and the interruption dies with the process it belonged to, so the
+    /// replacement's first `ApiRestored` cannot replay it.
+    #[test]
+    fn death_or_a_wedge_during_an_interruption_is_the_ordinary_teardown() {
+        for end in [
+            Event::Wedged,
+            Event::ProcessExited { status: None },
+            Event::PhaseTimedOut,
+        ] {
+            let mut s = Supervisor::new();
+            s.on(Event::Adopted { steered: true });
+            s.on(Event::ConvergenceInterrupted {
+                step: ConvergenceStep::Attach,
+            });
+            let actions = s.on(end.clone());
+            assert_eq!(
+                actions.first(),
+                Some(&Action::Unsteer),
+                "{end:?}: {actions:?}"
+            );
+            assert!(actions.contains(&Action::Kill), "{end:?}");
+            assert_eq!(s.state(), State::Backoff, "{end:?}");
+            assert_eq!(s.convergence_interrupted(), None, "{end:?}");
+        }
+    }
+
+    /// Interruptions and restores outside a convergence are stale.
+    #[test]
+    fn an_interruption_outside_a_convergence_is_stale() {
+        let mut s = running_and_steered();
+        assert!(s
+            .on(Event::ConvergenceInterrupted {
+                step: ConvergenceStep::Resync,
+            })
+            .is_empty());
+        assert_eq!(s.convergence_interrupted(), None);
+        assert!(s.on(Event::ApiRestored).is_empty());
+        assert_eq!(s.state(), State::Steered);
     }
 }

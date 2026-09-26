@@ -1202,6 +1202,13 @@ fn finish(
                 // inverted, and every adoption test in `vpp_service.rs` does
                 // this handshake in its factory with a comment saying the
                 // attach wiring does the same. The comment was aspirational.
+                //
+                // Still required now that a lost API interrupts rather than
+                // fails the pipeline: the driver starts the adoptee's
+                // liveness clock at the injection ON THE STRENGTH OF this
+                // handshake, so an adoptee that never answered would be
+                // held only until the detector called it wedged — the same
+                // kill, a budget later.
                 {
                     use crate::driver::Observe as _;
                     let (mut obs, _) = runtime.views();

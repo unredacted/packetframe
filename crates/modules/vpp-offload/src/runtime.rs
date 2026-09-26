@@ -46,8 +46,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::driver::Observe;
-use crate::engine::{ConvergenceEngine, RouteSource};
-use crate::executor::Effects;
+use crate::engine::{ConvergenceEngine, EngineError, RouteSource};
+use crate::executor::{Effects, StepError};
 use crate::process::{terminate_or_leak, Disposition, VppProcess};
 use crate::supervisor::Event;
 
@@ -2270,6 +2270,26 @@ impl Core {
     }
 }
 
+/// An engine failure, classified for the supervision loop: the binary
+/// API lost, or VPP answering and refusing. See [`StepError`].
+///
+/// The transport is dropped whenever the answer is "API lost", even
+/// where the engine path that failed did not drop it itself — several
+/// return a transport error without doing so (`install_attached_routes`'
+/// requests among them). That was harmless while such a failure always
+/// ended in a teardown that took the socket with the process. A step is
+/// now RESUMED on the same process, so a socket that may still owe a
+/// late reply must never be the one the resume reuses: that reply would
+/// be read as the answer to a different request.
+fn step_error(engine: &mut ConvergenceEngine, e: EngineError) -> StepError {
+    if e.api_lost() {
+        engine.disconnect();
+        StepError::ApiLost(e.to_string())
+    } else {
+        StepError::Failed(e.to_string())
+    }
+}
+
 impl Observe for ObserveView {
     fn poll_exit(&mut self) -> Option<Option<i32>> {
         let mut c = self.core.borrow_mut();
@@ -2320,7 +2340,7 @@ impl Observe for ObserveView {
         self.core.borrow().engine.counts().installed == 0
     }
 
-    fn drain_batch(&mut self, now: std::time::Instant) -> Result<crate::driver::Drain, String> {
+    fn drain_batch(&mut self, now: std::time::Instant) -> Result<crate::driver::Drain, StepError> {
         let mut c = self.core.borrow_mut();
         // A deferred adopted resync is re-checked here, on the driver's
         // paced cadence, because this is the only Observe call that runs
@@ -2573,7 +2593,7 @@ impl Observe for ObserveView {
                             completeness,
                             ..
                         } = &mut *c;
-                        let adopted = engine.adopt_vpp_fib().map_err(|e| e.to_string())?;
+                        let adopted = engine.adopt_vpp_fib().map_err(|e| step_error(engine, e))?;
                         // Revalidate on the FAR side of the dump: it
                         // blocks this thread for seconds, and the world
                         // it re-checks is the MIRROR, not just the
@@ -2679,7 +2699,7 @@ impl Observe for ObserveView {
                         engine
                             .program_neighbours(source.as_ref())
                             .map(|_| ())
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| step_error(engine, e))?;
                     }
                     c.deferred_resync = None;
                 }
@@ -2717,7 +2737,7 @@ impl Observe for ObserveView {
                         engine
                             .program_neighbours(source.as_ref())
                             .map(|_| ())
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| step_error(engine, e))?;
                     }
                     c.deferred_resync = None;
                 }
@@ -2745,41 +2765,37 @@ impl Observe for ObserveView {
             *last_placement = Some(std::time::Instant::now());
             if let Err(e) = engine.refresh_placement(source.as_ref()) {
                 *last_drain_error = Some(e.to_string());
-                return Err(e.to_string());
+                return Err(step_error(engine, e));
             }
         }
         // `?`-equivalent: a failed neighbour programming must not be
         // followed by a route drain that installs paths through the
         // adjacency that just failed to land.
         let r = match engine.apply_changes(source.as_ref(), DELTA_BATCH) {
-            Err(e) => Err(e.to_string()),
-            Ok(_) => engine
-                .drain_batch()
-                .map(|(done, _stats)| {
-                    if done {
-                        crate::driver::Drain::Idle
-                    } else {
-                        crate::driver::Drain::More
-                    }
-                })
-                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+            Ok(_) => engine.drain_batch().map(|(done, _stats)| {
+                if done {
+                    crate::driver::Drain::Idle
+                } else {
+                    crate::driver::Drain::More
+                }
+            }),
         };
         // Every re-queued route of a moved neighbour has gone out once the
         // drain is idle with nothing left in the source: only now does
         // the old adjacency stop carrying traffic, so only now is it
         // removed.
         let r = match r {
-            Ok(crate::driver::Drain::Idle) if source.backlog() == 0 => engine
-                .settle_moves()
-                .map(|()| crate::driver::Drain::Idle)
-                .map_err(|e| e.to_string()),
+            Ok(crate::driver::Drain::Idle) if source.backlog() == 0 => {
+                engine.settle_moves().map(|()| crate::driver::Drain::Idle)
+            }
             other => other,
         };
         // Set on failure and cleared on success, in one place, for the
         // same reason `note_persist` is: a field that only ever gets set
         // reports a fault that recovered as though it were still
         // happening.
-        *last_drain_error = r.as_ref().err().cloned();
+        *last_drain_error = r.as_ref().err().map(|e| e.to_string());
         // The fresh-resync hold: an idle pending map during a fresh
         // resync is NOT completion while the authority still says the
         // source is short — it is what "bird has not dumped yet" looks
@@ -2821,7 +2837,7 @@ impl Observe for ObserveView {
         if release_hold {
             *fresh_hold = None;
         }
-        r
+        r.map_err(|e| step_error(engine, e))
     }
 }
 
@@ -3063,10 +3079,12 @@ impl Effects for EffectsView {
         }
     }
 
-    fn attach_devices(&mut self) -> Result<(), String> {
+    fn attach_devices(&mut self) -> Result<(), StepError> {
         let mut c = self.core.borrow_mut();
         let mode = c.attach_mode;
-        c.engine.attach_devices(mode).map_err(|e| e.to_string())?;
+        if let Err(e) = c.engine.attach_devices(mode) {
+            return Err(step_error(&mut c.engine, e));
+        }
         let indices = c.engine.attached_indices();
         // Unlike spawn, do not tear anything down: the interfaces exist
         // and work. The cost of a lost record is one refused adoption
@@ -3101,7 +3119,7 @@ impl Effects for EffectsView {
         Ok(())
     }
 
-    fn start_resync(&mut self) -> Result<(), String> {
+    fn start_resync(&mut self) -> Result<(), StepError> {
         let mut c = self.core.borrow_mut();
         // Any hold from an earlier attempt is that attempt's state.
         // The fresh arm below re-arms it when it applies.
@@ -3149,7 +3167,7 @@ impl Effects for EffectsView {
             // adoption it is empty while the surviving VPP's FIB is not.
             // A no-op unless the ledger is empty, so a fresh spawn pays one
             // round trip and adopts nothing.
-            let adopted = engine.adopt_vpp_fib().map_err(|e| e.to_string())?;
+            let adopted = engine.adopt_vpp_fib().map_err(|e| step_error(engine, e))?;
             if adopted > 0 {
                 tracing::info!(
                     routes = adopted,
@@ -3187,7 +3205,7 @@ impl Effects for EffectsView {
                 engine
                     .program_neighbours(source.as_ref())
                     .map(|_| ())
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| step_error(engine, e))?;
                 None
             } else {
                 let have = source.route_count();
@@ -3227,7 +3245,7 @@ impl Effects for EffectsView {
         Ok(())
     }
 
-    fn start_verify(&mut self) -> Result<(), String> {
+    fn start_verify(&mut self) -> Result<(), StepError> {
         let mut c = self.core.borrow_mut();
         match c.engine.run_verify() {
             Ok(mut verdict) => {
@@ -3283,7 +3301,7 @@ impl Effects for EffectsView {
                 c.pending.push(event);
                 Ok(())
             }
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(step_error(&mut c.engine, e)),
         }
     }
 

@@ -1799,6 +1799,73 @@ NIC queue IRQ affinity against the VPP cores first (see
 [IRQ affinity before attach](#irq-affinity-before-attach)); on builds
 carrying the check, attach refuses this shape before it can start.
 
+A socket timeout (`Resource temporarily unavailable`) or `binary API is
+not connected` during attach, resync or verify no longer restarts
+anything on current builds. The next section covers it. If a loop
+like that still shows `event=ConvergenceFailed`, the step was
+*refused*, and the error text says by what.
+
+### `binary API lost; VPP is not torn down for this` during a convergence
+
+A convergence step (attach, resync start, a resync drain, or verify)
+lost the binary API. Either a reply took longer than the socket
+deadline, which is `EAGAIN` on the API socket, or the socket closed.
+VPP is held as it is and the step is resumed on the same process. It
+is not killed, steering is not touched, and no failure is counted.
+The journal shows:
+
+```
+WARN supervised action failed action=AttachDevices error=socket I/O: Resource temporarily unavailable (os error 11) (binary API lost; VPP is not torn down for this — ...)
+WARN convergence step lost the binary API; holding VPP rather than tearing it down — ... step=Attach attempt=1 retry_in=500ms
+INFO binary API answering again; resuming the interrupted convergence step
+```
+
+A drain that loses the API mid-resync logs `resync drain lost the
+binary API; reconnecting and resuming the drain on the same VPP`
+instead. Those ops were requeued, so the retry is idempotent.
+
+**Why.** On a CPU-starved host (softirq around 60% during a daemon
+restart), an adopted VPP's route dump hit its socket deadline. The
+`EAGAIN` was treated as a failed pipeline, and the supervisor killed
+the adopted VPP. It then killed three fresh spawns whose attach timed
+out the same way, and the fourth re-converged about 1.09M routes from
+nothing. VPP was slow, not dead. A teardown is the most expensive
+recovery there is. On a steered adoptee it is also a dangerous one:
+steering has to come down first, and a respawn restarts the octeon port.
+
+**What resumes it.** The daemon reconnects, and the step is re-issued
+only after VPP has answered a ping sent *after* the loss. Reconnecting
+alone proves nothing about VPP's main thread. Resumes back off from
+500 ms, doubling to an 8 s ceiling. The resume restarts from the
+earliest step that did not finish. An attach that lost the API is
+re-run together with the resync queued behind it, and nothing is
+drained until the attach completes.
+
+**What still tears it down.** The same evidence as always:
+
+- the process exits (pidfd);
+- VPP stays silent past the wedge budget: **1.5 s while steered**,
+  which is the published bound and applies to a steered adoptee
+  exactly as before, or 10 s for an unsteered convergence;
+- the 120 s convergence deadline runs out. An interruption never
+  extends it, so a step that keeps losing the API while VPP answers
+  pings ends there;
+- a *refusal* (VPP answered and said no) is `ConvergenceFailed` at
+  once, as before.
+
+**A fresh VPP whose `dev_attach` had already landed** refuses the
+resumed `dev_attach`. That refusal is an ordinary `ConvergenceFailed`,
+so the fresh case ends where it did before, a few seconds later. An
+adopted VPP reuses its recorded interfaces and resumes cleanly.
+
+**The socket deadline during attach now matches the detector.** An
+unsteered attach and the adoption's route dump used to run under the
+steady 1.5 s deadline, while the wedge detector allowed 10 s for the
+same moment. That mismatch is how the dump above timed out: it streams
+for about 7 s at the reference table. Both now get the convergence
+budget. So a `stop` issued during an unsteered convergence can wait up
+to 10 s for a blocked request, the same as during a resync drain.
+
 ### A steer or unsteer that "cannot be confirmed"
 
 Both directions refuse rather than guess. `Ok` from unsteer is what

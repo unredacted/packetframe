@@ -220,6 +220,19 @@ pub struct Behaviour {
     /// A BVI a surviving VPP already has: `(vid, sw_if_index, mac)`,
     /// listed by `sw_interface_dump` as `loop<vid>`.
     pub existing_bvi: Option<(u16, u32, [u8; 6])>,
+    /// Go silent at request `n` (0-based) named this: no reply, the
+    /// connection held open, and everything after it on that connection
+    /// swallowed until the client hangs up.
+    ///
+    /// A VPP whose main thread is starved, as the client sees it: the
+    /// read blocks until the socket deadline and fails `EAGAIN`. Unlike
+    /// `stall_pings_after` it can land on any message — mid-attach, or on
+    /// the second family's route dump — and unlike a hangup it costs the
+    /// client its full deadline, which is the shape that tore adopted VPPs
+    /// down.
+    ///
+    /// One-shot across connections, so the reconnect can finish the job.
+    pub stall_on: Option<(&'static str, usize)>,
 }
 
 impl Fake {
@@ -257,10 +270,13 @@ impl Fake {
             // the unacknowledged-neighbour tests: the entry is still there
             // when we come back and ask.
             let mut neighbours: Vec<([u8; 4], u32, [u8; 6], u8)> = b.existing_neighbours.to_vec();
+            // Outside the loop like the table: the stall fires once for
+            // the life of the fake, not once per connection.
+            let mut stall = b.stall_on;
             // Accept repeatedly: a disconnect-and-reconnect is part of
             // what these tests exercise.
             while let Ok((mut sock, _)) = listener.accept() {
-                serve(&mut sock, &tx, b, &mut neighbours);
+                serve(&mut sock, &tx, b, &mut neighbours, &mut stall);
                 // One-shot hangup: the point of that test is that a fresh
                 // connection can finish the job.
                 b.hangup_after = None;
@@ -289,6 +305,7 @@ fn serve(
     tx: &Sender<Event>,
     mut behaviour: Behaviour,
     neighbours: &mut Vec<([u8; 4], u32, [u8; 6], u8)>,
+    stall: &mut Option<(&'static str, usize)>,
 ) -> Option<()> {
     // What `sw_interface_set_mac_address` last set, per interface. The
     // dump reports it, so `attach::set_mac`'s readback has a real answer
@@ -333,6 +350,19 @@ fn serve(
         let ctx = request_context(&req);
         let which = name_for(id);
         let _ = tx.send(Event::Msg(which.to_string()));
+        if let Some((name, n)) = stall.as_mut() {
+            if *name == which {
+                if *n == 0 {
+                    *stall = None;
+                    let _ = tx.send(Event::Msg(format!("stalled on {which}")));
+                    // Silence until the client gives up and hangs up.
+                    loop {
+                        read_frame(sock)?;
+                    }
+                }
+                *n -= 1;
+            }
+        }
 
         let mut out;
         match which {
