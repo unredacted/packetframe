@@ -1445,6 +1445,29 @@ impl Runtime {
         self.core.borrow_mut().retarget(targets);
     }
 
+    /// Hand the engine the reloaded `steer-exempt` set — see
+    /// [`ConvergenceEngine::unexempted_local`](crate::engine::ConvergenceEngine::unexempted_local).
+    pub fn set_steer_exempts(&self, exempts: Vec<packetframe_common::config::Ipv4Prefix>) {
+        self.core.borrow_mut().engine.set_steer_exempts(exempts);
+    }
+
+    /// The kernel-delivered connected subnets no `steer-exempt` covers,
+    /// for the refusal that names them.
+    pub fn unexempted_local(&self) -> Vec<String> {
+        self.core
+            .borrow()
+            .engine
+            .unexempted_local()
+            .iter()
+            .filter_map(|p| match p {
+                packetframe_common::fib::IpPrefix::V4 { addr, prefix_len } => {
+                    Some(format!("{}/{prefix_len}", std::net::Ipv4Addr::from(*addr)))
+                }
+                packetframe_common::fib::IpPrefix::V6 { .. } => None,
+            })
+            .collect()
+    }
+
     /// Hand the exemption tripwire a reloaded exemption set.
     /// Whether the NIC holds any steering rule right now.
     ///
@@ -1717,6 +1740,7 @@ impl Runtime {
             steer_stray: c.steer_stray,
             steer_audit_error: c.steer_audit_error.clone(),
             shadowed_routes: c.engine.shadowed_routes(),
+            kernel_delivered_routes: c.engine.kernel_delivered_routes(),
             null_drops: c.engine.null_drops(),
             neighbours_unplaced: c
                 .engine
@@ -1912,6 +1936,8 @@ pub struct RuntimeStatus {
     /// Mirror prefixes a `local-route` is currently suppressing. See
     /// [`crate::engine::ConvergenceEngine::shadowed_routes`].
     pub shadowed_routes: u64,
+    /// [`crate::engine::ConvergenceEngine::kernel_delivered_routes`].
+    pub kernel_delivered_routes: u64,
     /// Cumulative null-node drops as last sampled, absent until read.
     pub null_drops: Option<u64>,
     /// Bridge neighbours the FDB has never placed behind a member port,

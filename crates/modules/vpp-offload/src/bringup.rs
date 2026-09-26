@@ -213,6 +213,15 @@ pub(crate) fn loopback_collision(
 /// one specific misconfiguration must not become a new way for a
 /// healthy box to fail to start.
 pub(crate) fn kernel_v4_addrs() -> Vec<(String, std::net::Ipv4Addr)> {
+    kernel_v4_ifaddrs()
+        .into_iter()
+        .map(|(name, p)| (name, p.addr))
+        .collect()
+}
+
+/// Every IPv4 address the kernel holds, with its interface and prefix
+/// length. Degrades open like [`kernel_v4_addrs`].
+fn kernel_v4_ifaddrs() -> Vec<(String, packetframe_common::config::Ipv4Prefix)> {
     let mut out = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates the list; freed below on every path
@@ -238,7 +247,27 @@ pub(crate) fn kernel_v4_addrs() -> Vec<(String, std::net::Ipv4Addr)> {
                 let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
                     .to_string_lossy()
                     .into_owned();
-                out.push((name, std::net::Ipv4Addr::from(u32::from_be(raw))));
+                // A missing netmask reads as a host route: the narrowest
+                // claim, never a wider subnet than the kernel stated.
+                let prefix_len = if ifa.ifa_netmask.is_null() {
+                    32
+                } else {
+                    // SAFETY: non-null, and an AF_INET entry's netmask
+                    // is a sockaddr_in.
+                    let mask = unsafe {
+                        (*(ifa.ifa_netmask as *const libc::sockaddr_in))
+                            .sin_addr
+                            .s_addr
+                    };
+                    u32::from_be(mask).count_ones() as u8
+                };
+                out.push((
+                    name,
+                    packetframe_common::config::Ipv4Prefix {
+                        addr: std::net::Ipv4Addr::from(u32::from_be(raw)),
+                        prefix_len,
+                    },
+                ));
             }
         }
         cur = ifa.ifa_next;
@@ -1059,7 +1088,14 @@ fn finish(
     // identity store and the release seam through an `Rc`.
     let local_routes = local_routes.to_vec();
     let trunk_ports = trunk_ports.to_vec();
+    // The router's own addresses and subnets, for the connected routes
+    // its routing daemon redistributes with itself as next hop. Read at
+    // attach: a subnet added later reads as unresolvable, which blocks a
+    // first steer — loud, not silent.
+    let self_nets: Vec<packetframe_common::config::Ipv4Prefix> =
+        kernel_v4_ifaddrs().into_iter().map(|(_, p)| p).collect();
     let drift_exempts = steer_exempts.to_vec();
+    let engine_exempts = steer_exempts.to_vec();
     let factory: LoopFactory = Box::new(move || {
         // What VPP can egress, for the exemption tripwire: the member
         // ports, the kernel bridges `local-route` delivers into, and the
@@ -1084,7 +1120,7 @@ fn finish(
                 .collect(),
             bridged_devices: Vec::new(),
         };
-        let engine = ConvergenceEngine::new(
+        let mut engine = ConvergenceEngine::new(
             api_socket_path,
             port_attach,
             members,
@@ -1094,7 +1130,9 @@ fn finish(
         )
         .with_recorded_indices(recorded)
         .with_local_routes(local_routes)
-        .with_trunk_ports(trunk_ports);
+        .with_trunk_ports(trunk_ports)
+        .with_self_networks(self_nets.clone());
+        engine.set_steer_exempts(engine_exempts.clone());
         // Per-neighbour placement reads the live kernel on Linux; the
         // default elsewhere treats every device as plain.
         #[cfg(target_os = "linux")]

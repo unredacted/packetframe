@@ -157,6 +157,11 @@ pub struct SinkCounts {
     pub installing: u64,
     pub withheld: u64,
     pub unresolvable: u64,
+    /// The router's own connected subnets, left out of VPP, that no
+    /// `steer-exempt` covers. Never tallied by the ledger — those routes
+    /// never enter it — the engine fills it in
+    /// ([`crate::engine::ConvergenceEngine::unexempted_local`]).
+    pub unexempted_local: u64,
 }
 
 impl SinkCounts {
@@ -187,12 +192,20 @@ impl SinkCounts {
     /// into the table whose emptiness just took steering down (see
     /// [`crate::supervisor::Event::TableEmptied`]).
     ///
+    /// And a kernel-delivered connected subnet with no `steer-exempt`
+    /// (`unexempted_local`): absent from VPP by design, so a steered
+    /// packet for it would follow a less-specific route out of the box.
+    ///
     /// This deliberately governs only **first-attach**. Once traffic is
     /// steered, a single later withheld route must not tear steering
     /// down — unsteering a mostly-correct VPP is worse than the gap. An
     /// empty one is not mostly-correct, and has its own event.
     pub fn blocks_first_steer(&self) -> bool {
-        self.unresolvable > 0 || self.withheld > 0 || self.installing > 0 || self.installed == 0
+        self.unresolvable > 0
+            || self.withheld > 0
+            || self.unexempted_local > 0
+            || self.installing > 0
+            || self.installed == 0
     }
 
     /// Health signal. Coincides with [`Self::blocks_first_steer`] on the

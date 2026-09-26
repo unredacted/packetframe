@@ -375,6 +375,11 @@ pub struct StatusSnapshot {
     /// route). Surfaced so a mirror change inside a local prefix is
     /// visible rather than silently absorbed.
     pub shadowed_routes: u64,
+    /// Mirror prefixes routed via the router itself — the routing
+    /// daemon's own connected subnets — which VPP leaves to the kernel.
+    /// Informational: a steady non-zero count is the designed state on a
+    /// feed with `redistribute connected`.
+    pub kernel_delivered_routes: u64,
     /// Cumulative null-node drops from VPP's own error counters,
     /// sampled over `cli_inband`. `None` until a sample succeeds —
     /// absent rather than 0, so a broken read path cannot impersonate
@@ -488,6 +493,7 @@ impl StatusSnapshot {
             // ledger to audit against.
             SteerAudit::default(),
             0,
+            0,
             None,
             Vec::new(),
             0,
@@ -526,6 +532,7 @@ impl StatusSnapshot {
         steer_configured: bool,
         audit: SteerAudit,
         shadowed_routes: u64,
+        kernel_delivered_routes: u64,
         null_drops: Option<u64>,
         neighbours_unplaced: Vec<String>,
         neighbour_moves: u64,
@@ -560,6 +567,7 @@ impl StatusSnapshot {
             drain_error,
             source_backlog,
             shadowed_routes,
+            kernel_delivered_routes,
             null_drops,
             neighbours_unplaced,
             neighbour_moves,
@@ -1903,6 +1911,17 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
         out,
         "packetframe_vpp_neighbours_flooded{{module=\"{module}\"}} {}",
         snap.neighbours_flooded
+    );
+
+    gauge(
+        &mut out,
+        "packetframe_vpp_kernel_delivered_routes",
+        "mirror prefixes routed via the router itself (its own connected subnets), left to the kernel",
+    );
+    let _ = writeln!(
+        out,
+        "packetframe_vpp_kernel_delivered_routes{{module=\"{module}\"}} {}",
+        snap.kernel_delivered_routes
     );
 
     gauge(
