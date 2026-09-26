@@ -2938,3 +2938,45 @@ fn an_adoption_dump_that_times_out_part_way_adopts_nothing() {
     );
     assert_eq!(e.counts().installed, 2);
 }
+
+/// A verify that loses the API keeps the engine in its verify phase, so
+/// the reconnect and the probe that must answer before the resume run
+/// under the CONVERGENCE socket deadline — the one the detector applies
+/// while the supervisor is still verifying — and not the steady 1.5 s.
+///
+/// Clearing the phase on the transport error recreated, one step later,
+/// the deadline mismatch that timed out the adoption dump on a starved
+/// host (review finding, PR #272). Steered here only so the stall costs
+/// the published 1.5 s; the phase, not the budget, is what is asserted.
+#[test]
+fn a_verify_that_loses_the_api_keeps_the_convergence_deadline_for_its_retry() {
+    use packetframe_vpp_offload::engine::Phase;
+
+    let fake = Fake::start_behaving(
+        "verify-stall",
+        Behaviour {
+            stall_on: Some(("ip_route_lookup", 0)),
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    e.set_steered(true);
+    assert!(e.api_ready(), "handshake");
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    e.begin_resync(&mirror(4));
+    drain_to_empty(&mut e);
+
+    let err = e.run_verify().expect_err("the lookup never answers");
+    assert!(err.api_lost(), "{err}");
+    assert_eq!(
+        e.phase(),
+        Some(Phase::Verify),
+        "the convergence deadline must outlive the lost verify"
+    );
+    assert!(e.last_verify().is_none(), "and it is still not a verdict");
+
+    assert!(e.api_ready(), "the reconnect");
+    let v = e.run_verify().expect("the resumed verify");
+    assert!(v.outcome.passed(), "{}", v.outcome.summary());
+    assert_eq!(e.phase(), None, "a verify that completes ends the phase");
+}

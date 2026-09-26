@@ -2778,7 +2778,15 @@ impl ConvergenceEngine {
                 // transport failure is not a verdict on the FIB, and
                 // storing it as a failed verify would report "FIB is
                 // wrong" for what is actually "we could not ask".
-                self.phase = None;
+                //
+                // The phase is KEPT. The supervisor is still converging —
+                // a lost connection resumes the verify, a protocol fault
+                // aborts it (`abort_convergence` clears this) — and the
+                // socket deadline keys on the phase. Cleared here, the
+                // reconnect and the post-loss probe of an unsteered
+                // verify ran under the steady 1.5 s while the detector
+                // allowed 10 s: the mismatch `Phase::Attach` removes,
+                // recreated one step later (review finding, PR #272).
                 Err(EngineError::Transport(e))
             }
         }

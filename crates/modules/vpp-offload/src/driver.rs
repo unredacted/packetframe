@@ -254,6 +254,13 @@ pub struct Driver {
     /// The pending resume of an interrupted convergence step, armed when
     /// the supervisor records the interruption. See `poll_resume`.
     resume: Option<Resume>,
+    /// A resync drain that lost the API, waiting for the same proof a
+    /// resumed step needs before the next batch goes out — see
+    /// `poll_resume`. The driver's own gate rather than a supervisor
+    /// interruption, because re-issuing `StartResync` would re-plan the
+    /// resync (and restart an adopted deferral) when all that is owed is
+    /// the requeued batch.
+    drain_gate: Option<Resume>,
     /// Resumes armed during this convergence — the backoff exponent.
     /// Reset when the convergence ends, however it ends, so one starved
     /// restart does not tax the next convergence's first interruption.
@@ -276,6 +283,7 @@ impl Driver {
             last_steer_retry: None,
             last_empty_unsteer: None,
             resume: None,
+            drain_gate: None,
             resume_attempts: 0,
         }
     }
@@ -430,7 +438,13 @@ impl Driver {
             // steered adoption — a deferral that would go on to unsteer
             // and dump a VPP whose attach never completed. The resumed
             // step starts all of that over.
-            let interrupted = self.sup.convergence_interrupted().is_some();
+            //
+            // And while a resync drain that lost the API waits on its gate:
+            // re-issuing the batch before VPP has answered anything since
+            // is how one starved moment becomes a socket deadline burned
+            // on every tick.
+            let interrupted =
+                self.sup.convergence_interrupted().is_some() || self.drain_gate.is_some();
             if (resyncing || api_up_at_entry) && before != State::Verifying && !interrupted {
                 match obs.drain_batch(now) {
                     // Empty means the resync is done — and only the
@@ -481,18 +495,33 @@ impl Driver {
                     // gives: it is a symptom, and a starved host produces
                     // it from a socket deadline on a VPP that is only
                     // slow. The drainer has requeued every op it holds no
-                    // acknowledgement for, so the retry is idempotent —
-                    // the same argument as the steady-state arm below,
-                    // which already made it. Death is the pidfd's call,
-                    // silence the detector's, and a resync that stops
-                    // moving stops extending the phase deadline (an
-                    // `Err` extends nothing), so the budget still ends a
-                    // convergence that never recovers.
+                    // acknowledgement for, so the retry is idempotent.
+                    // Death is the pidfd's call, silence the detector's,
+                    // and a resync that stops moving stops extending the
+                    // phase deadline (an `Err` extends nothing), so the
+                    // budget still ends a convergence that never recovers.
+                    //
+                    // The retry waits behind the same gate as a resumed
+                    // step — backoff, then a pong from after the loss —
+                    // rather than going out on the next tick's reconnect:
+                    // under sustained starvation that re-sent a full batch
+                    // into the same deadline every tick (review finding,
+                    // PR #272). The steady-state arm below keeps its
+                    // per-tick retry; there a batch is a handful of deltas.
                     Err(StepError::ApiLost(e)) if resyncing => {
+                        let delay = resume_delay(self.resume_attempts);
+                        self.resume_attempts = self.resume_attempts.saturating_add(1);
+                        self.drain_gate = Some(Resume {
+                            interrupted_at: now,
+                            not_before: now + delay,
+                        });
                         tracing::warn!(
                             error = %e,
-                            "resync drain lost the binary API; reconnecting and resuming \
-                             the drain on the same VPP — not a convergence failure"
+                            attempt = self.resume_attempts,
+                            retry_in = ?delay,
+                            "resync drain lost the binary API; reconnecting, and resuming \
+                             the drain on the same VPP once it answers a ping — not a \
+                             convergence failure"
                         );
                         self.reconnect_wanted = true;
                     }
@@ -540,6 +569,13 @@ impl Driver {
 
             events.extend(self.poll_liveness(now, obs));
             events.extend(self.poll_resume(now));
+            // A drain gate that opened asks for the batch at once, not a
+            // ping later.
+            if self.drain_gate.is_some_and(|g| self.gate_open(now, g)) {
+                self.drain_gate = None;
+                tracing::info!("binary API answering again; resuming the resync drain");
+                more_to_drain = true;
+            }
             events.extend(self.poll_emptied(now, obs));
             events.extend(self.poll_steer_retry(now, drain_proved_idle, obs));
         }
@@ -577,9 +613,11 @@ impl Driver {
         // later. Only while that lies ahead: once it has passed, the
         // resume waits on a pong, which the ping schedule in `sleep`
         // already wakes for — capping at zero there would spin.
-        if let Some(r) = self.resume.filter(|r| r.not_before > now) {
-            let wait = r.not_before - now;
-            tick.sleep = Some(tick.sleep.map_or(wait, |s| s.min(wait)));
+        for r in [self.resume, self.drain_gate].into_iter().flatten() {
+            if r.not_before > now {
+                let wait = r.not_before - now;
+                tick.sleep = Some(tick.sleep.map_or(wait, |s| s.min(wait)));
+            }
         }
         // A process whose API has not answered yet has exactly one
         // source of progress: polling `api_ready`. Nothing wakes the
@@ -625,6 +663,11 @@ impl Driver {
     /// API lost has dropped the transport and nothing else on a converging
     /// tick would reconnect it.
     fn track_resume(&mut self, now: Instant) {
+        if !matches!(self.sup.state(), State::Syncing | State::AdoptedResyncing) {
+            // Drains run only in these two; a gate outliving them would
+            // withhold the steady-state drain.
+            self.drain_gate = None;
+        }
         if !matches!(
             self.sup.state(),
             State::Syncing | State::AdoptedResyncing | State::Verifying
@@ -671,19 +714,22 @@ impl Driver {
         let Some(r) = self.resume else {
             return Vec::new();
         };
-        if now < r.not_before {
-            return Vec::new();
-        }
-        let answering = self
-            .detector
-            .as_ref()
-            .is_some_and(|d| d.answered_last_probe() && d.answered_since(r.interrupted_at));
-        if !answering {
+        if !self.gate_open(now, r) {
             return Vec::new();
         }
         self.resume = None;
         tracing::info!("binary API answering again; resuming the interrupted convergence step");
         vec![Event::ApiRestored]
+    }
+
+    /// Whether a resume gate has opened: its backoff is over, VPP has
+    /// answered since the loss, and the latest probe was answered.
+    fn gate_open(&self, now: Instant, r: Resume) -> bool {
+        now >= r.not_before
+            && self
+                .detector
+                .as_ref()
+                .is_some_and(|d| d.answered_last_probe() && d.answered_since(r.interrupted_at))
     }
 
     /// Ping if due, and decide whether the silence has gone too far.
@@ -697,6 +743,17 @@ impl Driver {
             d.on_ping_sent(now);
             if obs.ping().is_ok() {
                 d.on_pong(now);
+            } else {
+                // A failed ping drops the engine's transport, so every
+                // later one fails on `NotConnected` without asking VPP
+                // anything — and the detector then reads OUR silence as
+                // VPP's. Something has to reconnect. A drain used to be
+                // the only thing that noticed, and neither an interrupted
+                // step (drain withheld) nor `Verifying` (drain excluded)
+                // drains: a VPP that recovered a moment after one missed
+                // probe was torn down by the wedge budget anyway (review
+                // finding, PR #272).
+                self.reconnect_wanted = true;
             }
         }
         // The budget depends on whether traffic is steered, NOT on
@@ -975,6 +1032,13 @@ mod tests {
         /// The API never answers again: pings fail and reconnects are
         /// refused — a VPP that is genuinely gone.
         dead: bool,
+        /// Upcoming pings that go unanswered.
+        pings_lost: usize,
+        /// Model the engine's transport: a failed ping drops it, and
+        /// every ping fails on it until `api_ready` reconnects. Off by
+        /// default, where a failed ping leaves nothing behind.
+        model_transport: bool,
+        disconnected: bool,
         ping_fails: bool,
         pings: usize,
         drains: usize,
@@ -996,11 +1060,23 @@ mod tests {
         }
         fn api_ready(&mut self) -> bool {
             self.api_readies += 1;
-            self.api && !self.dead
+            let up = self.api && !self.dead;
+            if up {
+                self.disconnected = false;
+            }
+            up
         }
         fn ping(&mut self) -> Result<(), String> {
             self.pings += 1;
-            if self.ping_fails || self.dead {
+            if self.model_transport && self.disconnected {
+                return Err("binary API is not connected".into());
+            }
+            let lost = self
+                .pings_lost
+                .checked_sub(1)
+                .inspect(|n| self.pings_lost = *n);
+            if self.ping_fails || self.dead || lost.is_some() {
+                self.disconnected = true;
                 Err("no answer".into())
             } else {
                 Ok(())
@@ -1646,6 +1722,111 @@ mod tests {
             gaps.iter().all(|g| *g <= RESUME_MAX + PING_INTERVAL),
             "but never waits past it by more than a ping: {gaps:?}"
         );
+    }
+
+    /// One missed probe after a loss must not strand the transport. The
+    /// failed ping drops the engine's socket; with the drain withheld
+    /// during the interruption nothing else would reconnect, every later
+    /// ping would fail on `NotConnected`, and the detector would tear down
+    /// a VPP that answered again a moment later (review finding, PR #272).
+    #[test]
+    fn a_resume_probe_that_fails_once_still_resumes_without_a_teardown() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx {
+            attaches_lose_api: 1,
+            ..Default::default()
+        };
+        let mut w = World {
+            api: true,
+            batches: 1,
+            model_transport: true,
+            pings_lost: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+        d.tick(t0, &mut w, &mut fx);
+
+        // The first probe after the loss goes unanswered.
+        let t = d.tick(t0 + RESUME_BASE, &mut w, &mut fx);
+        assert!(!t.events.contains(&Event::ApiRestored), "{:?}", t.events);
+        assert_eq!(w.pings, 1);
+
+        let mut seen = Vec::new();
+        for i in 2..8u32 {
+            seen.extend(d.tick(t0 + RESUME_BASE * i, &mut w, &mut fx).events);
+            if seen.contains(&Event::ApiRestored) {
+                break;
+            }
+        }
+        assert!(seen.contains(&Event::ApiRestored), "{seen:?}");
+        assert!(!seen.contains(&Event::Wedged), "{seen:?}");
+        assert_eq!(fx.calls, vec!["attach", "resync", "attach", "resync"]);
+        assert!(!fx.calls.contains(&"kill"), "{:?}", fx.calls);
+    }
+
+    /// And the same in `Verifying`, which never drains: a single failed
+    /// ping must be followed by a reconnect.
+    #[test]
+    fn a_failed_ping_while_verifying_asks_for_a_reconnect() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            model_transport: true,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        assert_eq!(d.state(), State::Verifying);
+
+        w.pings_lost = 1;
+        d.tick(t0 + PING_INTERVAL, &mut w, &mut fx);
+        let readies = w.api_readies;
+        d.tick(t0 + 2 * PING_INTERVAL, &mut w, &mut fx);
+        assert!(w.api_readies > readies, "nothing reconnected");
+        assert!(!w.disconnected, "and the next probe went to VPP");
+        assert_eq!(w.pings, 2);
+    }
+
+    /// A resync drain that lost the API waits for backoff AND a pong from
+    /// after the loss before the next batch goes out — not the next tick's
+    /// reconnect, which under starvation re-sent a full batch into the same
+    /// deadline every tick (review finding, PR #272).
+    #[test]
+    fn a_lost_resync_drain_is_retried_only_after_a_post_loss_pong() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 3,
+            drains_lose_api: 1,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        d.tick(t0, &mut w, &mut fx); // ApiUp
+        let t = d.tick(at(t0, 1), &mut w, &mut fx); // the lost drain
+        assert_eq!(w.drains, 1);
+        assert_ne!(t.sleep, Some(Duration::ZERO));
+
+        // Reconnected, but nothing has answered since the loss.
+        d.tick(at(t0, 2), &mut w, &mut fx);
+        d.tick(at(t0, 250), &mut w, &mut fx);
+        assert_eq!(w.drains, 1, "no batch before the gate opens");
+        assert!(w.api_readies > 1, "the reconnect itself is not withheld");
+
+        // The backoff ends with a ping due: pong, gate opens, and the
+        // batch is asked for at once.
+        let t = d.tick(at(t0, 501), &mut w, &mut fx);
+        assert_eq!(w.drains, 1, "the gate opens after this tick's probe");
+        assert_eq!(t.sleep, Some(Duration::ZERO), "{:?}", t.events);
+        let seen = settle(&mut d, at(t0, 502), &mut w, &mut fx);
+        assert!(w.drains > 1);
+        assert!(!seen.contains(&Event::ConvergenceFailed), "{seen:?}");
+        assert_eq!(d.supervisor().failures(), 0);
     }
 
     /// And a refusal is still a failure, at once.

@@ -1821,8 +1821,11 @@ INFO binary API answering again; resuming the interrupted convergence step
 ```
 
 A drain that loses the API mid-resync logs `resync drain lost the
-binary API; reconnecting and resuming the drain on the same VPP`
-instead. Those ops were requeued, so the retry is idempotent.
+binary API; reconnecting, and resuming the drain on the same VPP once
+it answers a ping` instead. Those ops were requeued, so the retry is
+idempotent. It waits for the same backoff and post-loss ping as a
+resumed step, so a persistently starved VPP is not sent a full batch
+on every tick.
 
 **Why.** On a CPU-starved host (softirq around 60% during a daemon
 restart), an adopted VPP's route dump hit its socket deadline. The
