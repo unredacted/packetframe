@@ -228,6 +228,23 @@ fn a_fresh_attach_acquires_renders_and_supervises() {
     assert_eq!(attached.cores.workers, vec![16, 17]);
     assert_eq!(attached.cores.main, 15);
 
+    // --- The control-plane set is DERIVED here but not applied: a
+    // failure after publishing would degrade the daemon with its threads
+    // still squeezed onto these CPUs, so only the module publishes, once
+    // its attach can no longer fail. Nothing in this binary publishes,
+    // so the global stays empty. The fixture NICs carry no MSI IRQs:
+    // everything but cpu0, the isolated cpu12 and VPP's 15-17.
+    let cp = attached
+        .control_plane
+        .as_ref()
+        .expect("interrupt layout read");
+    assert_eq!(cp.cpus, (1..=14).filter(|c| *c != 12).collect::<Vec<u16>>());
+    assert_eq!(cp.vpp_cores, vec![15, 16, 17]);
+    assert!(
+        packetframe_common::placement::published().is_none(),
+        "bring_up must never publish the placement itself"
+    );
+
     // --- startup.conf: the rendered file must name that exact map, and
     // must carry the statseg stanza whose absence aborted VPP at gate
     // 0b.
@@ -624,6 +641,11 @@ fn a_failure_after_acquisition_releases_what_it_took() {
     assert!(
         host.state().is_none(),
         "acquisition survived a failed attach"
+    );
+    // A failed attach degrades the daemon; placement must not outlive it.
+    assert!(
+        packetframe_common::placement::published().is_none(),
+        "a failed attach published the control-plane placement"
     );
     assert_eq!(
         fs::read_to_string(host.paths.sys.hugepage_pool.join("nr_hugepages"))

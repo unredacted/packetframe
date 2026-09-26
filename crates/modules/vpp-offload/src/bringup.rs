@@ -112,6 +112,10 @@ pub struct Attached {
     /// request — see [`crate::service::ResendVerdict`] for why a failure
     /// leaves the held target unknown.
     pub held_steering: Option<crate::SteeringInputs>,
+    /// Where the control-plane threads should run, for the module to
+    /// publish once the attach has succeeded. `None` when the interrupt
+    /// layout could not be read (already warned).
+    pub control_plane: Option<ControlPlane>,
 }
 
 /// The MACs this member holds: its own PF address as **primary**, plus
@@ -339,9 +343,30 @@ fn log_irq_moves(moved: &[cores::IrqMove]) {
     }
 }
 
-/// Place the daemon's control-plane threads on the CPUs that are
-/// neither VPP's nor taking NIC interrupts (`cores::control_plane_cpus`
-/// has the why and the measurement).
+/// Where the daemon's control-plane threads should run, as this attach
+/// left the host (`cores::control_plane_cpus` has the why and the
+/// measurement). Derived by [`finish`], published by the module once
+/// its attach can no longer fail ([`place_control_plane`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlane {
+    /// Empty when no CPU qualifies.
+    pub cpus: Vec<u16>,
+    /// Every CPU VPP is on, derived or observed.
+    pub vpp_cores: Vec<u16>,
+    /// Every CPU a NIC queue IRQ is delivered on, for the empty case's
+    /// log line.
+    pub irq_cpus: Vec<u16>,
+}
+
+/// Publish the control-plane set: narrow the threads onto it.
+///
+/// Called only after the module's attach has succeeded, never from
+/// [`bring_up`]. A failed attach DEGRADES the daemon rather than ending
+/// it, so placement published on the way to a failure would outlive the
+/// module that justified it — the control plane squeezed onto a CPU or
+/// two for the life of a daemon with no VPP (review finding). After
+/// `bring_up` returns `Ok` nothing in the attach can fail, and every
+/// later path that ends the module ends the process.
 ///
 /// No config knob, deliberately: it only ever NARROWS a thread within
 /// the mask it already had, onto CPUs no poller and no queue IRQ is
@@ -349,36 +374,20 @@ fn log_irq_moves(moved: &[cores::IrqMove]) {
 /// who wants it off pins the daemon elsewhere (`CPUAffinity=`), and
 /// every placement then comes out disjoint and is skipped.
 ///
-/// Never fails the attach: every outcome is one log line.
-fn place_control_plane(paths: &AttachPaths, vpp_cores: &[u16]) {
-    let (cpus, irq_cpus) = match cores::derive_control_plane(
-        &paths.sys.sysfs_net,
-        &paths.proc_irq,
-        &paths.sysfs_cpu,
-        vpp_cores,
-    ) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "could not read the interrupt layout; control-plane threads left where \
-                 the scheduler puts them"
-            );
-            return;
-        }
-    };
-    if cpus.is_empty() {
+/// Never fails: every outcome is one log line.
+pub fn place_control_plane(cp: &ControlPlane) {
+    if cp.cpus.is_empty() {
         tracing::info!(
-            vpp_cores = %cores::format_cpu_list(vpp_cores),
-            irq_cpus = %cores::format_cpu_list(&irq_cpus),
+            vpp_cores = %cores::format_cpu_list(&cp.vpp_cores),
+            irq_cpus = %cores::format_cpu_list(&cp.irq_cpus),
             "no CPU is free of NIC queue IRQs outside VPP's cores, cpu0 and the isolated \
              set; control-plane threads left where the scheduler puts them"
         );
         return;
     }
-    match packetframe_common::placement::publish(&cpus) {
+    match packetframe_common::placement::publish(&cp.cpus) {
         Ok(p) => tracing::info!(
-            cpus = %cores::format_cpu_list(&cpus),
+            cpus = %cores::format_cpu_list(&cp.cpus),
             placed = p.placed,
             disjoint = p.disjoint,
             failed = %p.failed.join("; "),
@@ -1103,11 +1112,30 @@ fn finish(
              resync bursts if they share a core with a worker"
         ),
     }
-    // Then the control-plane threads onto the CPUs nothing else is
-    // using — after both IRQ passes, so the interrupt layout read is the
-    // one this attach produced, and before the supervision thread
-    // exists, so it places itself at start (`placement::join`).
-    place_control_plane(paths, &vacate);
+    // Where the control-plane threads should go — read after both IRQ
+    // passes, so the interrupt layout is the one this attach produced.
+    // Only derived here: publishing waits for the attach to succeed
+    // (`place_control_plane`).
+    let control_plane = match cores::derive_control_plane(
+        &paths.sys.sysfs_net,
+        &paths.proc_irq,
+        &paths.sysfs_cpu,
+        &vacate,
+    ) {
+        Ok((cpus, irq_cpus)) => Some(ControlPlane {
+            cpus,
+            vpp_cores: vacate.clone(),
+            irq_cpus,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not read the interrupt layout; control-plane threads will be left \
+                 where the scheduler puts them"
+            );
+            None
+        }
+    };
     // Whether that VPP is diverting traffic right now. From the recorded
     // steering rules, because that is the only durable evidence — and
     // getting it wrong in the `false` direction would run the resync on
@@ -1395,6 +1423,7 @@ fn finish(
         acquired,
         adopted_process,
         held_steering: Some(held_steering),
+        control_plane,
     })
 }
 

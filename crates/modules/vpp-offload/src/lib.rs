@@ -1300,6 +1300,12 @@ impl Module for VppOffloadModule {
             adopted_process = attached.adopted_process,
             "vpp-offload attached; move PF IRQ affinity off the worker cores"
         );
+        // Here and not inside `bring_up`: from this point the attach
+        // cannot fail, so the placement never outlives a module that
+        // degraded (`bringup::place_control_plane`).
+        if let Some(cp) = &attached.control_plane {
+            bringup::place_control_plane(cp);
+        }
         self.attached = Some(attached);
         Ok(Vec::new())
     }
@@ -2388,6 +2394,7 @@ mod tests {
             acquired: acquire::Acquired::Fresh,
             adopted_process: false,
             held_steering: Some(held),
+            control_plane: None,
         });
         m
     }

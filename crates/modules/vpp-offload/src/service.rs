@@ -546,12 +546,7 @@ impl SupervisionService {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let thread = std::thread::Builder::new()
             .name("vpp-supervision".into())
-            .spawn(move || {
-                // Before the factory, so the threads it spawns (the
-                // drift scan, the FDB mirror) inherit the placement.
-                packetframe_common::placement::join();
-                run_loop(module, factory, &looped, ready_tx)
-            })
+            .spawn(move || run_loop(module, factory, &looped, ready_tx))
             .map_err(|e| format!("spawning the supervision thread: {e}"))?;
         // Three outcomes, all reported synchronously as the attach
         // failures they are: the factory returned an error (a dead API

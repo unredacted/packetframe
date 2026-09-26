@@ -584,41 +584,36 @@ impl DriftScanner {
         let (l, ib) = (latest.clone(), inbox.clone());
         let handle = std::thread::Builder::new()
             .name("pf-drift-scan".into())
-            .spawn(move || {
-                // Inherited already when the supervision loop spawns
-                // this; explicit so it holds wherever it is spawned.
-                packetframe_common::placement::join();
-                loop {
-                    // Adopt and stamp under ONE lock hold, so
-                    // `scanned_under` names exactly the scope the watcher
-                    // is about to scan with.
-                    let scanned_under = {
-                        let mut inbox = ib.0.lock().expect("drift inbox lock");
-                        if inbox.stop {
-                            return;
-                        }
-                        if let Some((exempts, dst_only)) = inbox.pending.take() {
-                            watch.set_scope(exempts, dst_only);
-                        }
-                        inbox.generation
-                    };
-                    let result = watch.uncovered();
-                    *l.lock().expect("drift result lock") = Some((scanned_under, result));
-
+            .spawn(move || loop {
+                // Adopt and stamp under ONE lock hold, so
+                // `scanned_under` names exactly the scope the watcher
+                // is about to scan with.
+                let scanned_under = {
                     let mut inbox = ib.0.lock().expect("drift inbox lock");
-                    let mut waited = std::time::Duration::ZERO;
-                    // Wake early for a new scope or a teardown; otherwise
-                    // sleep out the interval in slices so a stop is not
-                    // waiting on a full one.
-                    while !inbox.stop && inbox.pending.is_none() && waited < every {
-                        let slice = std::time::Duration::from_millis(200);
-                        let (guard, _) = ib.1.wait_timeout(inbox, slice).expect("drift inbox wait");
-                        inbox = guard;
-                        waited += slice;
-                    }
                     if inbox.stop {
                         return;
                     }
+                    if let Some((exempts, dst_only)) = inbox.pending.take() {
+                        watch.set_scope(exempts, dst_only);
+                    }
+                    inbox.generation
+                };
+                let result = watch.uncovered();
+                *l.lock().expect("drift result lock") = Some((scanned_under, result));
+
+                let mut inbox = ib.0.lock().expect("drift inbox lock");
+                let mut waited = std::time::Duration::ZERO;
+                // Wake early for a new scope or a teardown; otherwise
+                // sleep out the interval in slices so a stop is not
+                // waiting on a full one.
+                while !inbox.stop && inbox.pending.is_none() && waited < every {
+                    let slice = std::time::Duration::from_millis(200);
+                    let (guard, _) = ib.1.wait_timeout(inbox, slice).expect("drift inbox wait");
+                    inbox = guard;
+                    waited += slice;
+                }
+                if inbox.stop {
+                    return;
                 }
             })
             .ok();

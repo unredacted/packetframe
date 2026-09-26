@@ -189,23 +189,11 @@ mod imp {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            // This runs on the supervision thread, which is placed on
-            // the control-plane CPUs; VPP must start from the daemon's
-            // unplaced mask instead (`placement::unplaced_mask` has
-            // why). A failed reset leaves the inherited mask — not
-            // worth refusing a spawn over.
-            if let Some(mask) = packetframe_common::placement::unplaced_mask() {
-                use std::os::unix::process::CommandExt;
-                // SAFETY: the closure makes one syscall on data it owns,
-                // which is async-signal-safe between fork and exec.
-                unsafe {
-                    cmd.pre_exec(move || {
-                        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mask);
-                        Ok(())
-                    });
-                }
-            }
-            let child = cmd.spawn()?;
+            // This runs on the supervision thread, which may be placed
+            // on the control-plane CPUs; VPP must start from the
+            // daemon's unplaced mask instead (`placement::unplaced` has
+            // why, and why this is not a `pre_exec` hook).
+            let child = packetframe_common::placement::unplaced(|| cmd.spawn())?;
             let pid = child.id() as i32;
 
             // Open the pidfd before anything else can reap the child.
@@ -665,11 +653,36 @@ mod tests {
             let status = std::fs::read_to_string(format!("/proc/{}/status", p.pid()));
             p.signal(libc::SIGKILL).expect("kill the stand-in");
             p.poll_exit(Duration::from_secs(5)).expect("reap");
+            let own = allowed(&std::fs::read_to_string("/proc/thread-self/status").unwrap());
+            assert_eq!(
+                own,
+                vec![leader[0]],
+                "the spawning thread's placement is restored"
+            );
             allowed(&status.expect("child status"))
         })
         .join()
         .expect("spawning thread");
         let leader = allowed(&std::fs::read_to_string("/proc/self/status").unwrap());
         assert_eq!(child_mask, leader, "the child took the leader's mask");
+    }
+
+    /// An executable that is not a program fails to SPAWN rather than
+    /// being run as a shell script — the `/bin/sh` fallback a `pre_exec`
+    /// hook would have enabled (review finding). The bring-up tests'
+    /// stand-in VPP binary relies on exactly this.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_executable_that_is_not_a_program_fails_to_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pf-noexec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("vpp");
+        std::fs::write(&bin, "not really vpp").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let got = VppProcess::spawn(&bin, Path::new("/dev/null"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let e = got.expect_err("a text file must not spawn");
+        assert_eq!(e.raw_os_error(), Some(libc::ENOEXEC), "{e}");
     }
 }
