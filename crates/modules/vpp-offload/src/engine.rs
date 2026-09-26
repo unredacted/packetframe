@@ -492,17 +492,19 @@ pub struct ConvergenceEngine {
     /// withdraws them. Survives reconnects: it describes the mirror,
     /// not the process.
     shadowed: HashSet<IpPrefix>,
-    /// The router's own addresses ([`Self::with_self_addresses`]): a
-    /// route whose every next hop is one of these was originated by the
-    /// routing daemon itself — a redistributed connected subnet, whose
-    /// NEXT_HOP is the daemon's own session address — and is delivered by
-    /// the kernel, not forwarded. VPP has no path for it; see
-    /// [`Self::kernel_delivered`].
+    /// The router's own addresses ([`Self::with_self_networks`]).
     self_addrs: HashSet<IpAddr>,
-    /// Mirror prefixes left out of VPP because they route via the router
-    /// itself. Kept apart from `shadowed` (a `local-route` footprint) so
-    /// each gauge says one thing.
+    /// The router's connected subnets, one per address.
+    self_nets: Vec<packetframe_common::config::Ipv4Prefix>,
+    /// Mirror prefixes left out of VPP as the router's own connected
+    /// subnets ([`Self::kernel_delivered_route`]). Kept apart from
+    /// `shadowed` (a `local-route` footprint) so each gauge says one
+    /// thing.
     kernel_delivered: HashSet<IpPrefix>,
+    /// The configured `steer-exempt` set, which must cover every
+    /// `kernel_delivered` prefix before a first steer
+    /// ([`Self::unexempted_local`]).
+    steer_exempts: Vec<packetframe_common::config::Ipv4Prefix>,
     /// The address the loopback holds; every member is unnumbered to it.
     loopback: packetframe_common::config::Ipv4Prefix,
     /// The loopback's index once created. `None` until the first attach
@@ -685,7 +687,9 @@ impl ConvergenceEngine {
             local_routes: Vec::new(),
             shadowed: HashSet::new(),
             self_addrs: HashSet::new(),
+            self_nets: Vec::new(),
             kernel_delivered: HashSet::new(),
+            steer_exempts: Vec::new(),
             loopback,
             loop_index: None,
             recorded_indices: Vec::new(),
@@ -832,33 +836,85 @@ impl ConvergenceEngine {
         Some(pv)
     }
 
-    /// Declare the router's own addresses, so routes the routing daemon
-    /// originated itself stay out of VPP ([`Self::kernel_delivered`]).
-    pub fn with_self_addresses(mut self, addrs: impl IntoIterator<Item = IpAddr>) -> Self {
-        self.self_addrs = addrs.into_iter().collect();
+    /// Declare the router's own IPv4 addresses with their prefix
+    /// lengths, so the connected subnets its routing daemon redistributes
+    /// stay out of VPP ([`Self::kernel_delivered_route`]).
+    pub fn with_self_networks(
+        mut self,
+        nets: impl IntoIterator<Item = packetframe_common::config::Ipv4Prefix>,
+    ) -> Self {
+        for n in nets {
+            self.self_addrs.insert(IpAddr::V4(n.addr));
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(n.prefix_len))
+                .unwrap_or(0);
+            self.self_nets.push(packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::from(u32::from(n.addr) & mask),
+                prefix_len: n.prefix_len,
+            });
+        }
         self
     }
 
-    /// Whether every next hop of a route is the router itself.
-    ///
-    /// A routing daemon feeding packetframe over iBGP sends the routes it
-    /// originates — `redistribute connected` above all — with NEXT_HOP
-    /// set to its own session address. The kernel delivers those
-    /// prefixes; VPP has no adjacency for its own host and never will.
-    /// Left in, each one reads as unresolvable, and an unresolvable route
-    /// blocks the first steer by design — which on a production feed
-    /// with a dozen connected subnets meant steering could never start.
-    /// Their destinations are the connected subnets the exemption
-    /// tripwire already requires a `steer-exempt` for, so no steered
-    /// packet reaches them in VPP.
-    fn routes_via_self(&self, nexthops: &[IpAddr]) -> bool {
-        !nexthops.is_empty() && nexthops.iter().all(|n| self.self_addrs.contains(n))
+    /// The configured `steer-exempt` set. Replaced on every reload, from
+    /// the same place steering is retargeted, because the first-steer
+    /// gate judges the exemptions the steer about to happen installs.
+    pub fn set_steer_exempts(&mut self, exempts: Vec<packetframe_common::config::Ipv4Prefix>) {
+        self.steer_exempts = exempts;
     }
 
-    /// How many mirror prefixes route via the router itself and so are
-    /// left out of VPP.
+    /// Whether a route is one of the router's own connected subnets,
+    /// which the kernel delivers and VPP has no path for.
+    ///
+    /// A routing daemon feeding packetframe over iBGP sends what it
+    /// originates — `redistribute connected` above all — with NEXT_HOP
+    /// set to its own session address. VPP has no adjacency for its own
+    /// host and never will: left in, each such route reads as
+    /// unresolvable, which blocks the first steer by design, and on a
+    /// production feed with a dozen connected subnets steering could
+    /// never start.
+    ///
+    /// BOTH conditions, because a self next hop alone does not say where
+    /// a route came from: `next-hop-self` on the packetframe session puts
+    /// the router's address on every TRANSIT route too, and treating
+    /// those as kernel-delivered would withdraw the whole table from VPP
+    /// (review finding). A route counts only when its prefix also lies
+    /// inside a subnet the router is itself addressed on; anything else
+    /// through a self next hop stays unresolvable and keeps blocking.
+    fn kernel_delivered_route(&self, prefix: &IpPrefix, nexthops: &[IpAddr]) -> bool {
+        !nexthops.is_empty()
+            && nexthops.iter().all(|n| self.self_addrs.contains(n))
+            && self.self_nets.iter().any(|net| v4_covers(net, prefix))
+    }
+
+    /// How many mirror prefixes are the router's own connected subnets
+    /// and so are left out of VPP.
     pub fn kernel_delivered_routes(&self) -> u64 {
         self.kernel_delivered.len() as u64
+    }
+
+    /// The kernel-delivered prefixes no `steer-exempt` covers, sorted.
+    ///
+    /// Leaving a connected subnet out of VPP is only safe while steered
+    /// traffic for it never arrives there: a diverted packet whose route
+    /// is absent follows a less-specific one out of the box. The
+    /// exemption tripwire reports such paths, but asynchronously and
+    /// without refusing anything, so these block a first steer through
+    /// [`SinkCounts::unexempted_local`] (review finding). Only IPv4
+    /// matters: steering diverts nothing else.
+    pub fn unexempted_local(&self) -> Vec<IpPrefix> {
+        let mut out: Vec<IpPrefix> = self
+            .kernel_delivered
+            .iter()
+            .filter(|p| matches!(p, IpPrefix::V4 { .. }))
+            .filter(|p| !self.steer_exempts.iter().any(|e| v4_covers(e, p)))
+            .copied()
+            .collect();
+        out.sort_by_key(|p| match p {
+            IpPrefix::V4 { addr, prefix_len } => (*addr, *prefix_len),
+            IpPrefix::V6 { .. } => ([0; 4], 0),
+        });
+        out
     }
 
     /// Install the kernel view placement reads ([`crate::topology`]).
@@ -1471,8 +1527,13 @@ impl ConvergenceEngine {
         }
     }
 
+    /// The ledger's counts, plus the one first-steer blocker the ledger
+    /// cannot see because those routes never enter it
+    /// ([`Self::unexempted_local`]).
     pub fn counts(&self) -> SinkCounts {
-        self.ledger.counts()
+        let mut c = self.ledger.counts();
+        c.unexempted_local = self.unexempted_local().len() as u64;
+        c
     }
 
     /// For fixtures that need a table in a given shape without driving a
@@ -2359,10 +2420,10 @@ impl ConvergenceEngine {
                 continue;
             }
             match nhs {
-                // Routed via the router itself: out of VPP, and withdrawn
-                // in case an earlier update installed it through a real
-                // next hop.
-                Some(v) if self.routes_via_self(&v) => {
+                // The router's own connected subnet: out of VPP, and
+                // withdrawn in case an earlier update installed it through
+                // a real next hop.
+                Some(v) if self.kernel_delivered_route(&prefix, &v) => {
                     self.kernel_delivered.insert(prefix);
                     self.pending.withdraw(prefix);
                 }
@@ -2535,7 +2596,7 @@ impl ConvergenceEngine {
                 return;
             }
             // Same reasoning: not in `seen`, so a stale install goes.
-            if self.routes_via_self(nexthops) {
+            if self.kernel_delivered_route(&prefix, nexthops) {
                 self.kernel_delivered.insert(prefix);
                 plan.kernel_delivered += 1;
                 return;
@@ -2647,12 +2708,13 @@ impl ConvergenceEngine {
             DEFAULT_SAMPLE,
             seed,
         ) {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                outcome.unexempted_local = self.counts().unexempted_local;
                 self.last_verify = Some(outcome.clone());
                 self.phase = None;
                 // The gate the ledger has always been able to answer and
                 // nothing asked.
-                let may_steer = !self.ledger.counts().blocks_first_steer();
+                let may_steer = !self.counts().blocks_first_steer();
                 Ok(Verdict { outcome, may_steer })
             }
             Err(e) => {
@@ -2813,6 +2875,14 @@ fn is_neighbour_adj_fib(route: &IpRoute, nh: &[u8; 16]) -> bool {
         _ => route.prefix.len == 128,
     };
     host && route.prefix.address.un.0 == *nh
+}
+
+/// Whether `net` covers all of `p`. An IPv6 `p` is never covered.
+fn v4_covers(net: &packetframe_common::config::Ipv4Prefix, p: &IpPrefix) -> bool {
+    let IpPrefix::V4 { addr, prefix_len } = p else {
+        return false;
+    };
+    net.prefix_len <= *prefix_len && net.contains_addr(std::net::Ipv4Addr::from(*addr))
 }
 
 fn next_seed(prev: u64) -> u64 {
@@ -3066,6 +3136,7 @@ mod tests {
             mismatches: vec![],
             unresolvable: 0,
             withheld: 0,
+            unexempted_local: 0,
             dead_interfaces: vec![],
         });
         assert!(e.last_verify().is_some());

@@ -916,6 +916,9 @@ fn apply_steering(
         });
     }
     runtime.retarget(req.targets.clone());
+    // Beside the retarget, not the staged scope: the first-steer gate
+    // judges the exemptions the steer about to happen installs.
+    runtime.set_steer_exempts(req.exempts.clone());
     // STAGED here, committed where a steering action succeeds. The
     // NIC has the previous rules until then — and this request may
     // never reach one synchronously: a deferred first steer is
@@ -1012,6 +1015,20 @@ fn apply_steering(
                          not loaded; `packetframe status` shows fib-integrity. The request \
                          is remembered: the module steers on its own once the table is back, \
                          at most {}s later",
+                        crate::driver::STEER_RETRY_EVERY.as_secs()
+                    ));
+                }
+                if counts.unexempted_local > 0 {
+                    return Err(format!(
+                        "refusing the first steer: {} of the router's own connected \
+                         subnet(s) have no steer-exempt: {}. The kernel delivers them and \
+                         VPP has no route for them, so a steered packet for one would \
+                         follow a less-specific route out of the box. Add a steer-exempt \
+                         covering each (hot, via reconfigure). The request is remembered: \
+                         the module steers on its own once they are covered, at most {}s \
+                         later",
+                        counts.unexempted_local,
+                        runtime.unexempted_local().join(", "),
                         crate::driver::STEER_RETRY_EVERY.as_secs()
                     ));
                 }

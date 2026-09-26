@@ -650,16 +650,24 @@ One line does three things at attach:
    exactly its poisoned host route, and a JUMP in it is a mirror
    change worth reading about.
 
-Separately from `local-route`, a route whose every next hop is one of
-the router's own addresses is left out of VPP. A routing daemon feeding
-packetframe over iBGP sends what it originates — `redistribute
-connected` above all — with its own session address as NEXT_HOP; the
-kernel delivers those subnets, and VPP could only ever count them
-unresolvable, which blocks the first steer. They are the connected
-subnets the exemption tripwire already asks a `steer-exempt` for.
-`packetframe_vpp_kernel_delivered_routes` counts them; a steady value
-equal to the number of connected subnets the daemon redistributes is
-normal. The router's addresses are read at attach.
+Separately from `local-route`, the router's own connected subnets are
+left out of VPP. A routing daemon feeding packetframe over iBGP sends
+what it originates, `redistribute connected` above all, with its own
+session address as NEXT_HOP. The kernel delivers those subnets, and VPP
+could only ever count them unresolvable, which blocks the first steer.
+A route is treated this way only when every next hop is one of the
+router's addresses AND its prefix lies inside a subnet the router is
+addressed on. Under `next-hop-self` a transit route carries the router's
+address too, and it stays unresolvable. The router's addresses are read
+at attach. `packetframe_vpp_kernel_delivered_routes` counts them; a
+steady value equal to the number of connected subnets the daemon
+redistributes is normal.
+
+Each one needs a covering `steer-exempt`, and a first steer is refused
+until every one has it. VPP has no route for them, so a steered packet
+would follow a less-specific route out of the box. The refusal names the
+subnets; add the exemptions and `reconfigure`. A gateway `/32` does not
+cover its subnet.
 
 Validation refuses: a port the section does not declare, a vlan
 missing from the port's `vlans` list, a prefix outside every

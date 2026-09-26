@@ -2715,34 +2715,53 @@ impl RouteSource for NexthopSource {
     }
 }
 
-/// A routing daemon feeding packetframe over iBGP sends the routes it
-/// originates itself — `redistribute connected` — with its own session
-/// address as NEXT_HOP. The kernel delivers those; VPP never has an
-/// adjacency for its own host. They stay out of VPP and out of the
-/// unresolvable count, which otherwise blocks the first steer forever
-/// on a feed carrying connected subnets. A route that changes to or from
-/// the router as next hop moves in or out, withdrawn on the way out.
+fn pfx(a: [u8; 4], len: u8) -> packetframe_common::config::Ipv4Prefix {
+    packetframe_common::config::Ipv4Prefix {
+        addr: Ipv4Addr::from(a),
+        prefix_len: len,
+    }
+}
+
+/// A routing daemon feeding packetframe over iBGP sends what it
+/// originates — `redistribute connected` — with its own session address
+/// as NEXT_HOP. The kernel delivers those; VPP never has an adjacency for
+/// its own host. A connected subnet stays out of VPP and out of the
+/// unresolvable count, which otherwise blocks the first steer forever;
+/// one that changes to or from the router as next hop moves in or out,
+/// withdrawn on the way out.
+///
+/// A self next hop alone is not enough: under `next-hop-self` a transit
+/// route carries it too, and must stay unresolvable rather than be
+/// withdrawn from VPP. And a connected subnet with no covering
+/// `steer-exempt` blocks the first steer, since steered traffic for it
+/// would find no route in VPP.
 #[test]
-fn routes_via_the_router_itself_stay_out_of_vpp() {
+fn connected_subnets_via_the_router_itself_stay_out_of_vpp() {
     let own = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
     let fake = Fake::start("self-nexthop");
-    let mut e = engine_for(&fake).with_self_addresses([own]);
+    let mut e =
+        engine_for(&fake).with_self_networks([pfx([198, 51, 100, 1], 30), pfx([10, 66, 1, 1], 24)]);
     assert!(e.api_ready());
     e.attach_devices(AttachMode::Fresh).expect("attach");
     let connected = v4(66, 1);
     let src = NexthopSource {
-        routes: vec![(v4(0, 0), vec![nh()]), (connected, vec![own])],
+        routes: vec![
+            (v4(0, 0), vec![nh()]),
+            (connected, vec![own]),
+            // Transit, rewritten by next-hop-self: not a connected subnet.
+            (v4(77, 0), vec![own]),
+        ],
         queue: Default::default(),
     };
     let plan = e.begin_resync(&src);
-    assert_eq!((plan.upserts, plan.kernel_delivered), (1, 1), "{plan:?}");
+    assert_eq!((plan.upserts, plan.kernel_delivered), (2, 1), "{plan:?}");
     e.program_neighbours(&src).expect("neighbours");
     drain_to_empty(&mut e);
     assert_eq!(e.counts().installed, 1);
     assert_eq!(
         e.counts().unresolvable,
-        0,
-        "a self-routed prefix must not block a steer"
+        1,
+        "only the next-hop-self transit route is unresolvable; the connected subnet is not"
     );
     assert_eq!(e.kernel_delivered_routes(), 1);
     let installed: Vec<WireRoute> = fake
@@ -2760,32 +2779,56 @@ fn routes_via_the_router_itself_stay_out_of_vpp() {
         "the connected subnet never reaches VPP: {installed:?}"
     );
 
-    // The transit route moves onto the router itself: withdrawn.
+    // The transit route withdrawn, so only the exemption gate is left.
     src.queue
         .lock()
         .unwrap()
         .push(packetframe_vpp_offload::engine::SourceChanges {
             neighbours: Vec::new(),
-            routes: vec![(v4(0, 0), Some(vec![own]))],
+            routes: vec![(v4(77, 0), None)],
         });
     e.apply_changes(&src, 64).expect("delta");
     drain_to_empty(&mut e);
-    assert_eq!(e.counts().installed, 0);
-    assert_eq!(e.kernel_delivered_routes(), 2);
-    assert!(fake.drain_events().iter().any(
-        |ev| matches!(ev, Event::Route(r) if !r.is_add && (r.addr, r.len) == ([10, 0, 0, 0], 24))
-    ));
+    assert_eq!(e.counts().unresolvable, 0);
+    assert_eq!(e.counts().unexempted_local, 1);
+    assert!(
+        e.counts().blocks_first_steer(),
+        "a connected subnet VPP lacks, with no steer-exempt, must block the first steer"
+    );
+    // A gateway /32 does not cover the subnet.
+    e.set_steer_exempts(vec![pfx([10, 66, 1, 1], 32)]);
+    assert!(e.counts().blocks_first_steer());
+    e.set_steer_exempts(vec![pfx([10, 66, 1, 1], 32), pfx([10, 66, 0, 0], 16)]);
+    assert_eq!(e.counts().unexempted_local, 0);
+    assert!(!e.counts().blocks_first_steer(), "{:?}", e.counts());
 
-    // And back through a real next hop: installed again.
+    // The connected subnet learned through a real next hop: installed.
     src.queue
         .lock()
         .unwrap()
         .push(packetframe_vpp_offload::engine::SourceChanges {
             neighbours: Vec::new(),
-            routes: vec![(v4(0, 0), Some(vec![nh()]))],
+            routes: vec![(connected, Some(vec![nh()]))],
+        });
+    e.apply_changes(&src, 64).expect("delta");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().installed, 2);
+    assert_eq!(e.kernel_delivered_routes(), 0);
+    let _ = fake.drain_events();
+
+    // And back via the router itself: withdrawn.
+    src.queue
+        .lock()
+        .unwrap()
+        .push(packetframe_vpp_offload::engine::SourceChanges {
+            neighbours: Vec::new(),
+            routes: vec![(connected, Some(vec![own]))],
         });
     e.apply_changes(&src, 64).expect("delta");
     drain_to_empty(&mut e);
     assert_eq!(e.counts().installed, 1);
     assert_eq!(e.kernel_delivered_routes(), 1);
+    assert!(fake.drain_events().iter().any(
+        |ev| matches!(ev, Event::Route(r) if !r.is_add && (r.addr, r.len) == ([10, 66, 1, 0], 24))
+    ));
 }

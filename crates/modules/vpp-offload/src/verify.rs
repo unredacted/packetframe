@@ -96,6 +96,11 @@ pub struct VerifyOutcome {
     /// on it would convert a graceful degradation into a restart loop.
     /// Reported so it can alarm separately.
     pub withheld: u64,
+    /// The router's own connected subnets, left out of VPP, that no
+    /// `steer-exempt` covers — filled by the engine, which alone knows
+    /// them. Fails the pass like `unresolvable`: steered traffic for one
+    /// has no route in VPP.
+    pub unexempted_local: u64,
     /// Owned interfaces that are not both admin-up and link-up.
     pub dead_interfaces: Vec<DeadInterface>,
 }
@@ -139,7 +144,10 @@ impl VerifyOutcome {
     /// starvation): every cycle rebuilt a flawless FIB, re-observed the
     /// same dark ports, and died for it.
     pub fn fib_correct(&self) -> bool {
-        self.sampled > 0 && self.mismatches.is_empty() && self.unresolvable == 0
+        self.sampled > 0
+            && self.mismatches.is_empty()
+            && self.unresolvable == 0
+            && self.unexempted_local == 0
     }
 
     /// Whether a teardown is the remedy — **the** restart-worthy
@@ -201,6 +209,12 @@ impl VerifyOutcome {
             self.unresolvable,
             self.withheld
         );
+        if self.unexempted_local > 0 {
+            s.push_str(&format!(
+                ", {} connected subnet(s) without a steer-exempt",
+                self.unexempted_local
+            ));
+        }
         if self.sampled == 0 {
             s.push_str(" (no installed routes to verify)");
         }
