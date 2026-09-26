@@ -394,7 +394,7 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
     // stops being read.
     let mut opaque = 0usize;
     for r in routes {
-        if r.drops || !scope.divertible.reaches(&r.prefix) {
+        if !scope.divertible.reaches(&r.prefix) {
             continue;
         }
         // A table no policy rule names is inert for every packet.
@@ -407,6 +407,11 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
         if scope.selected_tables.is_some_and(|t| !t.contains(&r.table)) {
             continue;
         }
+        // Drops, device-less routes and paths VPP can take: the one
+        // judgement the dump also makes, so the two cannot drift.
+        if r.cleared_by(reach) {
+            continue;
+        }
         if r.via_nexthop_object && r.oifs.is_empty() {
             if !scope.covers(&r.prefix) {
                 opaque += 1;
@@ -414,33 +419,6 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
             continue;
         }
         let Some(oif) = r.oifs.first() else { continue };
-        // A lightweight-encap path is unreproducible REGARDLESS of
-        // which device it leaves by, so both reachability arms below
-        // are skipped for it — they would clear the route on the
-        // strength of an `oif` that is not the problem.
-        if r.encap.is_none() {
-            if r.kernel_delivers {
-                // Only the segments whose hosts steering diverts. A
-                // transit port's own address is reachable from a
-                // steered host only by a route that would itself be a
-                // finding, and reporting every address on the box
-                // would demand more exemptions than the 16-slot
-                // budget holds — an alarm with no available remedy is
-                // one operators learn to ignore. Documented in the
-                // runbook, with the null-drop gauge as the backstop
-                // for the rest.
-                if !reach.local_devices.iter().any(|d| d == oif) {
-                    continue;
-                }
-            } else if r
-                .oifs
-                .iter()
-                .enumerate()
-                .any(|(i, d)| reach.covers_device(d, r.gatewayed.get(i).copied().unwrap_or(false)))
-            {
-                continue;
-            }
-        }
         // Built-in exemptions cover these on every steered port.
         if crate::steer::BUILTIN_EXEMPTS.iter().any(|(addr, len)| {
             Ipv4Prefix {
@@ -471,6 +449,84 @@ pub fn uncovered_paths(routes: &[KernelRoute], scope: &Scope<'_>) -> Vec<Uncover
         out.push(Uncovered::Opaque(opaque));
     }
     out
+}
+
+/// What a route IS, apart from where it goes: the facts
+/// [`reach_clears`] reads alongside its hops.
+#[derive(Debug, Clone, Copy)]
+struct RouteKind {
+    drops: bool,
+    kernel_delivers: bool,
+    via_nexthop_object: bool,
+    encapsulated: bool,
+}
+
+/// Whether a route is a finding under NO exemption set, diversion
+/// scope or table filter — decided from the route itself and VPP's
+/// reach alone.
+///
+/// Every condition here is one [`uncovered_paths`] skips a route for
+/// regardless of scope, and nothing else is: the kernel drops it; it
+/// names no device and no nexthop object hides one; or VPP can take
+/// it. Each route's verdict is independent of every other's, so
+/// discarding a cleared route cannot change the findings. That is what
+/// lets [`dump_routes`] drop the bulk of a full table before building
+/// it: BGP routes via a gateway on a member port are cleared here by
+/// their DEVICE, never their protocol — the same protocol carries the
+/// w26 remote /24 over an IPSec tunnel, which is a finding.
+///
+/// `hops` are `(device, via a gateway)` in route order.
+fn reach_clears<'a>(
+    kind: RouteKind,
+    hops: impl Iterator<Item = (&'a str, bool)>,
+    reach: &VppReach,
+) -> bool {
+    if kind.drops {
+        return true;
+    }
+    let mut hops = hops.peekable();
+    let Some(&(oif, _)) = hops.peek() else {
+        // Nothing to judge — unless a nexthop object hides the devices,
+        // which is a coverage gap `uncovered_paths` counts.
+        return !kind.via_nexthop_object;
+    };
+    // A lightweight-encap path is unreproducible REGARDLESS of which
+    // device it leaves by, so both reachability arms below are skipped
+    // for it — they would clear the route on the strength of an `oif`
+    // that is not the problem.
+    if kind.encapsulated {
+        return false;
+    }
+    if kind.kernel_delivers {
+        // Only the segments whose hosts steering diverts. A transit
+        // port's own address is reachable from a steered host only by a
+        // route that would itself be a finding, and reporting every
+        // address on the box would demand more exemptions than the
+        // 16-slot budget holds — an alarm with no available remedy is
+        // one operators learn to ignore. Documented in the runbook,
+        // with the null-drop gauge as the backstop for the rest.
+        return !reach.local_devices.iter().any(|d| d == oif);
+    }
+    hops.any(|(dev, gatewayed)| reach.covers_device(dev, gatewayed))
+}
+
+impl KernelRoute {
+    /// [`reach_clears`] for a route already built.
+    fn cleared_by(&self, reach: &VppReach) -> bool {
+        reach_clears(
+            RouteKind {
+                drops: self.drops,
+                kernel_delivers: self.kernel_delivers,
+                via_nexthop_object: self.via_nexthop_object,
+                encapsulated: self.encap.is_some(),
+            },
+            self.oifs
+                .iter()
+                .enumerate()
+                .map(|(i, d)| (d.as_str(), self.gatewayed.get(i).copied().unwrap_or(false))),
+            reach,
+        )
+    }
 }
 
 /// The scan seam the runtime holds, mirroring [`crate::runtime::RxModeKick`]:
@@ -536,7 +592,7 @@ struct ScannerInbox {
 /// The scan, running on its OWN thread.
 ///
 /// A full `RTM_GETROUTE` dump on the reference primary walks ~1.05M
-/// prefixes — parsed and allocated one message at a time — and the
+/// prefixes — parsed one message at a time — and the
 /// supervision loop it used to run on is the same thread that answers
 /// liveness pings, wedge detection, stop requests and steering
 /// changes. A dump that outran the 3 s steering budget would time out
@@ -709,7 +765,8 @@ impl Drop for DriftScanner {
     }
 }
 
-/// The production scan: dump every IPv4 route in every table, compare.
+/// The production scan: dump the IPv4 routes of every table the reach
+/// does not clear ([`dump_routes`]), compare.
 #[cfg(target_os = "linux")]
 pub struct KernelDriftWatch {
     /// `bridged_devices` is recomputed on every scan
@@ -777,8 +834,11 @@ impl KernelDriftWatch {
 #[cfg(target_os = "linux")]
 impl DriftWatch for KernelDriftWatch {
     fn uncovered(&mut self) -> Result<DriftFindings, String> {
+        // Refreshed BEFORE the dump, which discards against this reach:
+        // a stale one would drop a route via a bridge VPP no longer
+        // reaches as if it were still a path VPP can take.
         self.refresh_bridged();
-        let routes = dump_routes()?;
+        let routes = dump_routes(&self.reach)?;
         // A rule dump that fails filters nothing rather than failing
         // the scan: the routes are the finding, the rules only narrow
         // them, and losing the narrowing costs noise where losing the
@@ -814,11 +874,34 @@ impl DriftWatch for KernelDriftWatch {
     }
 }
 
-/// One blocking RTM_GETROUTE dump across every table.
+/// One blocking RTM_GETROUTE dump across every table, returning only
+/// the routes [`reach_clears`] does not clear under `reach`.
 ///
 /// Hand-rolled on `netlink-sys` for the same reason [`crate::fdb`] is:
 /// this crate runs a supervision loop, not an async runtime, and one
 /// dump per minute does not earn one.
+///
+/// **Why the dump returns so little.** On a full-table router the main
+/// table holds ~1.06M routes, nearly all BGP-installed via a gateway on
+/// a member port — paths VPP takes, which can never be findings. They
+/// are still read off the socket and parsed, but judged before a
+/// `KernelRoute` is built, so the scan no longer allocates a
+/// million-entry list (a String per hop, a Vec regrown to the table's
+/// size) only to discard it a moment later. What comes back is what the
+/// verdict can depend on: routes via a device VPP does not take (a
+/// tunnel, an unreached bridge, a bridged segment's connected subnet),
+/// the kernel's own addresses on `local-route` bridges, and
+/// encapsulating and nexthop-object routes.
+///
+/// **Why the kernel does not filter it instead.** A strict-check dump
+/// honours a table, a route type, a protocol and a device — each as
+/// "only this one", never "all but". None of them removes the bulk
+/// without hiding something the verdict needs: the main table is always
+/// selected; a type filter keeps every unicast route; a protocol filter
+/// would hide BGP routes via an IPSec tunnel, the w26 finding; and a
+/// device filter over the non-member devices would hide encapsulation
+/// out a member port, nexthop-object routes and the kernel's own
+/// addresses on `local-route` bridges.
 ///
 /// The LOCAL table is included deliberately. Its entries are the
 /// router's own addresses, and steered traffic to those dies in VPP
@@ -827,7 +910,7 @@ impl DriftWatch for KernelDriftWatch {
 /// introduced to fix. A check that only looked at forwarding would
 /// have missed the first instance of the very class it exists for.
 #[cfg(target_os = "linux")]
-pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
+pub fn dump_routes(reach: &VppReach) -> Result<Vec<KernelRoute>, String> {
     use netlink_packet_core::{
         NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_REQUEST,
     };
@@ -991,22 +1074,7 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                         .map(|i| (i, gatewayed))
                         .chain(hop_oifs)
                         .collect();
-                    out.push(KernelRoute {
-                        prefix: Ipv4Prefix {
-                            // No RTA_DST = the default route.
-                            addr: dst.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
-                            prefix_len: m.header.destination_prefix_length,
-                        },
-                        oifs: hops
-                            .iter()
-                            .map(|&(i, _)| {
-                                names
-                                    .entry(i)
-                                    .or_insert_with(|| crate::fdb::ifname(i))
-                                    .clone()
-                            })
-                            .collect(),
-                        table,
+                    let kind = RouteKind {
                         drops: matches!(
                             m.header.kind,
                             RouteType::BlackHole | RouteType::Unreachable | RouteType::Prohibit
@@ -1016,9 +1084,30 @@ pub fn dump_routes() -> Result<Vec<KernelRoute>, String> {
                             RouteType::Local | RouteType::Broadcast | RouteType::Anycast
                         ),
                         via_nexthop_object: nexthop_object,
-                        gatewayed: hops.iter().map(|&(_, gw)| gw).collect(),
-                        encap,
-                    });
+                        encapsulated: encap.is_some(),
+                    };
+                    for &(i, _) in &hops {
+                        names.entry(i).or_insert_with(|| crate::fdb::ifname(i));
+                    }
+                    let name = |i: u32| names[&i].as_str();
+                    // Judged here, before anything is allocated for it:
+                    // on a full-table box nearly every route is cleared.
+                    if !reach_clears(kind, hops.iter().map(|&(i, gw)| (name(i), gw)), reach) {
+                        out.push(KernelRoute {
+                            prefix: Ipv4Prefix {
+                                // No RTA_DST = the default route.
+                                addr: dst.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                                prefix_len: m.header.destination_prefix_length,
+                            },
+                            oifs: hops.iter().map(|&(i, _)| name(i).to_string()).collect(),
+                            table,
+                            drops: kind.drops,
+                            kernel_delivers: kind.kernel_delivers,
+                            via_nexthop_object: nexthop_object,
+                            gatewayed: hops.iter().map(|&(_, gw)| gw).collect(),
+                            encap,
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -1180,6 +1269,145 @@ mod tests {
                 selected_tables: None,
             },
         )
+    }
+
+    /// The dump discards what `reach_clears` clears before building it
+    /// (`dump_routes`), and that must never change a finding. A full
+    /// table's bulk — gatewayed routes via member ports, however many —
+    /// is dropped, and every scope finds the same things in what is left
+    /// as in the whole table. Nothing is filtered by protocol: the w26
+    /// remote /24, BGP-announced over an IPSec tunnel, looks exactly like
+    /// the bulk except for its device, and it survives.
+    #[test]
+    fn filtering_cleared_routes_at_the_dump_never_changes_the_findings() {
+        use packetframe_common::fib::IpPrefix;
+        let gatewayed = |mut r: KernelRoute| {
+            r.gatewayed = vec![true; r.oifs.len()];
+            r
+        };
+        let in_table = |mut r: KernelRoute, table: u32| {
+            r.table = table;
+            r
+        };
+        // The bulk: BGP routes via a gateway on a member port, one ECMP
+        // pair across both members every hundredth route.
+        const BULK: u32 = 20_000;
+        let mut table: Vec<KernelRoute> = (0..BULK)
+            .map(|n| {
+                let prefix = Ipv4Prefix {
+                    addr: Ipv4Addr::from(u32::from(Ipv4Addr::new(198, 18, 0, 0)) + n),
+                    prefix_len: 32,
+                };
+                let mut r = route(prefix, if n % 2 == 0 { "eth3" } else { "eth4" });
+                if n % 100 == 0 {
+                    r.oifs.push("eth3".into());
+                }
+                in_table(gatewayed(r), 254)
+            })
+            .collect();
+        let bulk_len = table.len();
+
+        // What the verdict can depend on, plus cleared look-alikes.
+        let mut local_on_service_bridge = route(p(192, 0, 2, 1, 32), "br1337");
+        local_on_service_bridge.kernel_delivers = true;
+        local_on_service_bridge.table = 255;
+        let mut local_on_member = route(p(203, 0, 113, 1, 32), "eth3");
+        local_on_member.kernel_delivers = true;
+        local_on_member.table = 255;
+        let mut mpls_out_a_member = gatewayed(route(p(203, 0, 113, 0, 25), "eth3"));
+        mpls_out_a_member.encap = Some("MPLS".into());
+        let mut opaque_nhid = route(p(203, 0, 113, 128, 26), "eth3");
+        opaque_nhid.oifs.clear();
+        opaque_nhid.gatewayed.clear();
+        opaque_nhid.via_nexthop_object = true;
+        let mut inline_nhid = gatewayed(route(p(203, 0, 113, 192, 26), "eth4"));
+        inline_nhid.via_nexthop_object = true;
+        let mut blackhole = route(p(198, 51, 100, 0, 28), "vti64");
+        blackhole.drops = true;
+        let mut deviceless = route(p(198, 51, 100, 16, 28), "vti64");
+        deviceless.oifs.clear();
+        let mut ecmp_member_and_tunnel = gatewayed(route(p(198, 51, 100, 32, 28), "eth3"));
+        ecmp_member_and_tunnel.oifs.push("vti64".into());
+        ecmp_member_and_tunnel.gatewayed.push(true);
+        let mut ecmp_bridge_and_tunnel = route(p(198, 51, 100, 48, 28), "br3998");
+        ecmp_bridge_and_tunnel.oifs.push("vti64".into());
+        ecmp_bridge_and_tunnel.gatewayed = vec![false, true];
+        table.extend([
+            in_table(gatewayed(route(p(198, 51, 100, 128, 25), "vti64")), 254),
+            in_table(gatewayed(route(p(198, 51, 100, 64, 27), "br4040")), 254),
+            in_table(gatewayed(route(p(198, 51, 100, 96, 27), "br3998")), 254),
+            in_table(route(p(192, 0, 2, 0, 24), "br3998"), 254),
+            in_table(route(p(198, 51, 100, 0, 24), "vti64"), 100),
+            local_on_service_bridge,
+            local_on_member,
+            mpls_out_a_member,
+            opaque_nhid,
+            inline_nhid,
+            blackhole,
+            deviceless,
+            ecmp_member_and_tunnel,
+            ecmp_bridge_and_tunnel,
+        ]);
+
+        let reach = reach();
+        let kept: Vec<KernelRoute> = table
+            .iter()
+            .filter(|r| !r.cleared_by(&reach))
+            .cloned()
+            .collect();
+        let kept_prefixes: Vec<String> = kept
+            .iter()
+            .map(|r| format!("{}/{}", r.prefix.addr, r.prefix.prefix_len))
+            .collect();
+        assert_eq!(
+            kept_prefixes,
+            [
+                "198.51.100.128/25", // BGP via the tunnel: w26
+                "198.51.100.64/27",  // via a bridge no member carries
+                "192.0.2.0/24",      // a bridged segment's connected subnet
+                "198.51.100.0/24",   // tunnel route in a policy table
+                "192.0.2.1/32",      // kernel address on a local-route bridge
+                "203.0.113.0/25",    // encapsulated out a member
+                "203.0.113.128/26",  // devices hidden in a nexthop object
+                "198.51.100.48/28",  // ECMP whose only bridge hop is connected
+            ],
+            "every member-gatewayed route cleared, nothing the verdict reads"
+        );
+        assert!(bulk_len >= BULK as usize && kept.len() < 10);
+
+        let allow = [
+            IpPrefix::V4 {
+                addr: [198, 51, 100, 0],
+                prefix_len: 25,
+            },
+            IpPrefix::V4 {
+                addr: [203, 0, 113, 128],
+                prefix_len: 25,
+            },
+        ];
+        let tables = [254u32, 255];
+        let exempts = [p(198, 51, 100, 128, 25), p(192, 0, 2, 1, 32)];
+        let scopes = [
+            (Divertible::Any, None, &[][..]),
+            (Divertible::Any, Some(&tables[..]), &exempts[..]),
+            (Divertible::OnlyDst(&allow), None, &[][..]),
+            (Divertible::OnlyDst(&allow), Some(&tables[..]), &exempts[..]),
+        ];
+        for (divertible, selected_tables, exempts) in scopes {
+            let scope = Scope {
+                reach: &reach,
+                exempts,
+                divertible: divertible.clone(),
+                selected_tables,
+            };
+            let whole = uncovered_paths(&table, &scope);
+            assert!(!whole.is_empty(), "every scope here has findings");
+            assert_eq!(
+                uncovered_paths(&kept, &scope),
+                whole,
+                "{divertible:?} tables {selected_tables:?} exempts {exempts:?}"
+            );
+        }
     }
 
     /// The gateway flag is per hop. An ECMP route whose bridge hop is
