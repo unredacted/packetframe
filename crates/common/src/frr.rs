@@ -102,3 +102,22 @@ impl Vtysh for RealVtysh {
         })
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A call that outlives its budget is an `Err`, not a hang and not a
+    /// partial `Ok` — which is what lets the callers classify it as an
+    /// observation failure. `/bin/sh` stands in for `vtysh` because the
+    /// invocation is `<path> -c <cmd>`, which `sh` runs.
+    #[tokio::test]
+    async fn a_call_past_its_budget_is_an_error() {
+        let slow = RealVtysh::at("/bin/sh", Duration::from_millis(100));
+        let err = slow
+            .run(&["sleep 5".to_string()])
+            .await
+            .expect_err("a call past its budget must fail");
+        assert!(err.starts_with("vtysh timed out after"), "{err}");
+    }
+}

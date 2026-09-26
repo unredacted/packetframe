@@ -263,18 +263,45 @@ integrity-authority frr upstream 192.0.2.1 families v4 interval 60
 
 Each check runs `show bgp <afi> unicast statistics`, which walks the
 whole table. Time it on a full-table box before lowering the interval
-there:
+there — and time it again during a table refill, because that is when
+it is slow:
 
 ```sh
 time vtysh -c 'show bgp ipv4 unicast statistics json' >/dev/null
+time vtysh -c 'show running-config' >/dev/null
 ```
 
+Every `vtysh` call has a **30 s** budget, and a whole check — counts,
+every upstream, the running-config, every upstream again — has
+**150 s**, however many upstreams are declared. On an idle box these
+reads return in well under a second; during a full-table refill they
+wait behind the daemons' own update work, and a 10 s budget was
+observed to time out on check after check for minutes. A read that
+comes back near 30 s under load means the budget is the next thing to
+revisit, not the interval.
+
+Upstreams are read twice per check, before and after the
+running-config, and an upstream that re-established between the two
+readings — or was not loaded at either — disqualifies the check like
+any other readiness loss.
+
+A timed-out read is an observation failure — `FRR authority: prefix
+count failed` or `eligibility could not be established` with `vtysh
+timed out after 30s` or `check budget of 150s spent` — and it changes
+nothing: the previous report stands under the age limit and any
+disqualification stands with it. What
+it does change is pacing: an unreadable check is retried after 10 s,
+then 20 s, 40 s and so on back up to the interval, so one slow sample no
+longer holds a steering gate's release for a whole interval. A readable
+check (clean or disqualified) always waits the full interval.
+
 The ceiling is 300 s, a third of the steering gate's 900 s staleness
-limit, and it has to be: the checker sleeps a full interval after every
-attempt, so one failed check means the retained report is next
-refreshed at about twice the interval — and that has to land before it
-goes stale. Slower than the default would only lengthen the flap cost
-and the staleness exposure together.
+limit, and it has to be: assuming a full interval after every attempt,
+one failed check means the retained report is next refreshed at about
+twice the interval — and that has to land before it goes stale. The
+early retry only makes that land sooner; the ceiling does not rely on
+it. Slower than the default would only lengthen the flap cost and the
+staleness exposure together.
 
 Disqualification is **sticky**: it survives a `vtysh` timeout,
 unparseable output, and a clean check whose counts still disagree.
