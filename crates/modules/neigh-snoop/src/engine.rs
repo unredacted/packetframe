@@ -10,7 +10,9 @@
 //!   errors reported back — success is *not* reported, the kernel's
 //!   `RTM_NEWNEIGH` echo on the multicast group is the confirmation;
 //! - the **persister**: write-then-rename on the blocking pool;
-//! - the **coverage** sampler on its own strict-check connection.
+//! - the **coverage** sampler on its own strict-check connection;
+//! - the FRR **gate** reconciler and the **route-server** dumps, which
+//!   take turns on one `vtysh` queue (`FrrQueue`).
 //!
 //! Every counter that claims an effect is recorded when the effect is
 //! *observed* (the echo, the persist result), not when it is requested.
@@ -121,9 +123,42 @@ struct RsInput {
     interval: Duration,
 }
 
-/// `vtysh` calls are bounded: a received-routes dump of a full
-/// route-server table is large, a wedged bgpd must not hang the task.
-const VTYSH_TIMEOUT: Duration = Duration::from_secs(60);
+/// `vtysh` calls are bounded so a wedged bgpd cannot hang a task. The
+/// gate's calls read and write two short prefix-lists.
+const GATE_VTYSH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A received-routes dump is a whole route-server table (70k–150k
+/// paths): bgpd runs the inbound policy over every one of them and
+/// builds the whole table's JSON before writing it. On a loaded router
+/// that overran the gate's 60 s, and a timed-out dump is no observation
+/// at all, so it gets its own, larger bound.
+const RS_DUMP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// One queue for every `vtysh` call this module makes. bgpd executes
+/// a show command to completion on its main thread, so a gate command
+/// issued mid-dump waits inside bgpd behind it anyway; run in
+/// parallel, the two overran together (a dump timeout and a reconcile
+/// timeout in the same minute) while adding load to a busy bgpd. Queued
+/// here, the wait happens before the call's timeout starts, and the
+/// mutex's FIFO order hands the gate the next turn after the dump in
+/// flight — the dumps themselves already run one at a time.
+struct FrrQueue {
+    inner: RealVtysh,
+    turn: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Vtysh for FrrQueue {
+    fn run<'a>(
+        &'a self,
+        commands: &'a [String],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let _turn = self.turn.lock().await;
+            self.inner.run(commands).await
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
@@ -294,18 +329,26 @@ impl EngineHandle {
             cancel.clone(),
         ))?;
         let unicast = engine.unicast.clone();
-        let vtysh: Arc<dyn Vtysh> = Arc::new(RealVtysh::from_env(VTYSH_TIMEOUT));
+        let turn = Arc::new(tokio::sync::Mutex::new(()));
+        let gate_vtysh: Arc<dyn Vtysh> = Arc::new(FrrQueue {
+            inner: RealVtysh::from_env(GATE_VTYSH_TIMEOUT),
+            turn: turn.clone(),
+        });
+        let rs_vtysh: Arc<dyn Vtysh> = Arc::new(FrrQueue {
+            inner: RealVtysh::from_env(RS_DUMP_TIMEOUT),
+            turn,
+        });
         let tasks = vec![
             runtime.spawn(installer(unicast, install_rx, ctl_tx.clone())),
             runtime.spawn(persister(persist_rx, ctl_tx.clone())),
             runtime.spawn(coverage_task(cov_rx, ctl_tx.clone(), cancel.clone())),
             runtime.spawn(frr_gate::gate_task(
-                vtysh.clone(),
+                gate_vtysh,
                 gate_rx,
                 ctl_tx.clone(),
                 cancel.clone(),
             )),
-            runtime.spawn(rs_task(vtysh, rs_rx, ctl_tx.clone(), cancel.clone())),
+            runtime.spawn(rs_task(rs_vtysh, rs_rx, ctl_tx.clone(), cancel.clone())),
             runtime.spawn(engine.run(messages, frame_rx, ctl_rx)),
         ];
         Ok(Self {
@@ -1714,7 +1757,9 @@ async fn coverage_task(
 
 /// Route-server coverage: dump each configured route server's received
 /// routes every `interval` and hand the pairs to the engine for the
-/// join against the kernel mirror. Idles while no target is configured.
+/// join against the kernel mirror, one route server at a time. Idles
+/// while no target is configured. A failed dump is reported as that
+/// route server's error, never as an empty table.
 async fn rs_task(
     vtysh: Arc<dyn Vtysh>,
     mut input: watch::Receiver<RsInput>,
@@ -1760,10 +1805,21 @@ async fn rs_task(
         }
         let inp = input.borrow_and_update().clone();
         for (bridge_idx, rs) in inp.targets {
+            // `dump_ms` includes a gate call queued ahead of the dump;
+            // it is short beside the dump.
             let started = Instant::now();
             let result = match vtysh.run(&[rs_coverage::received_routes_command(rs)]).await {
-                Ok(json) => rs_coverage::parse_received_routes(&json)
-                    .map(|r| (r, started.elapsed().as_millis() as u64)),
+                Ok(json) => {
+                    let dump_ms = started.elapsed().as_millis() as u64;
+                    // Tens of megabytes of JSON: off the runtime's two
+                    // workers, which also carry the capture pumps.
+                    tokio::task::spawn_blocking(move || {
+                        rs_coverage::parse_received_routes(&json).map(|r| (r, dump_ms))
+                    })
+                    .await
+                    .map_err(|e| format!("received-routes parse task: {e}"))
+                    .and_then(|r| r)
+                }
                 Err(e) => Err(e),
             };
             if ctl

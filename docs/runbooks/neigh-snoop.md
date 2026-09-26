@@ -190,7 +190,16 @@ PF owns the dynamic half when `frr-gate` is configured:
 - Route-server coverage: each `route-server` peer's received routes
   (available for every path because of soft-reconfiguration) are
   dumped every `rs-coverage-interval`; a prefix whose next-hop is
-  neither a bilateral peer nor resolved counts as demoted.
+  neither a bilateral peer nor resolved counts as demoted. The
+  next-hop checked is the global one: FRR's received-routes JSON
+  carries `nextHop` for IPv4 and `nextHopGlobal` for IPv6 and no
+  link-local, and the global is what the route server passes through
+  from the participant and what the gate lists hold.
+- Every `vtysh` call the module makes waits its turn on one queue: the
+  route servers are dumped one at a time, and a gate reconcile runs
+  between dumps, never alongside one (bgpd would make it wait behind
+  the dump anyway). A dump may take up to 300 s, a gate call 60 s; the
+  queue wait counts against neither.
 
 Every BGP upload restarts bgpd and toggles the IX bridge, which
 flushes the kernel neighbour table; expect a `recreated`/`down`/`up`
@@ -259,6 +268,18 @@ session has never been up from their side).
   netlink dump is unavailable on this kernel; participant coverage
   stays measured, route coverage is disabled rather than dumping the
   whole table.
+- **`rs-coverage` Degraded "N without a parsable next-hop"**: FRR
+  answered with a next-hop field the parser does not know. Those
+  prefixes are in the received count and in no coverage figure; compare
+  one entry of `show bgp <afi> unicast neighbors <rs> received-routes
+  json` against `nextHop` / `nextHopGlobal`.
+- **`rs-coverage` Degraded "`<rs>`: unknown (…)"**: the dump failed and
+  that route server is unmeasured, not covered; the last good counts
+  are kept beside the error. `vtysh timed out after 300s` means bgpd
+  could not produce the table in five minutes — a wedged or saturated
+  bgpd, not a coverage problem. `FRR says: Inbound soft reconfiguration
+  not enabled` means the IX session lacks `soft-reconfiguration
+  inbound`.
 - **`evictions` non-zero**: raise `table-max`.
 - **Persisted table ignored at start ("file is for bridge …")**: a
   JSON file was copied between bridges; delete it.
