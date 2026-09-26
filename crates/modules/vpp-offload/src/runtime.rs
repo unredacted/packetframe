@@ -1717,6 +1717,7 @@ impl Runtime {
             steer_stray: c.steer_stray,
             steer_audit_error: c.steer_audit_error.clone(),
             shadowed_routes: c.engine.shadowed_routes(),
+            kernel_delivered_routes: c.engine.kernel_delivered_routes(),
             null_drops: c.engine.null_drops(),
             neighbours_unplaced: c
                 .engine
@@ -1912,6 +1913,8 @@ pub struct RuntimeStatus {
     /// Mirror prefixes a `local-route` is currently suppressing. See
     /// [`crate::engine::ConvergenceEngine::shadowed_routes`].
     pub shadowed_routes: u64,
+    /// [`crate::engine::ConvergenceEngine::kernel_delivered_routes`].
+    pub kernel_delivered_routes: u64,
     /// Cumulative null-node drops as last sampled, absent until read.
     pub null_drops: Option<u64>,
     /// Bridge neighbours the FDB has never placed behind a member port,

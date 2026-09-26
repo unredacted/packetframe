@@ -293,6 +293,9 @@ pub struct ResyncPlan {
     /// working (the reference primary expects exactly its poisoned
     /// host route here).
     pub shadowed: u64,
+    /// Mirror prefixes left out because they route via the router itself
+    /// ([`ConvergenceEngine::kernel_delivered_routes`]).
+    pub kernel_delivered: u64,
 }
 
 /// What a verify pass concluded, and whether traffic may be diverted
@@ -489,6 +492,17 @@ pub struct ConvergenceEngine {
     /// withdraws them. Survives reconnects: it describes the mirror,
     /// not the process.
     shadowed: HashSet<IpPrefix>,
+    /// The router's own addresses ([`Self::with_self_addresses`]): a
+    /// route whose every next hop is one of these was originated by the
+    /// routing daemon itself — a redistributed connected subnet, whose
+    /// NEXT_HOP is the daemon's own session address — and is delivered by
+    /// the kernel, not forwarded. VPP has no path for it; see
+    /// [`Self::kernel_delivered`].
+    self_addrs: HashSet<IpAddr>,
+    /// Mirror prefixes left out of VPP because they route via the router
+    /// itself. Kept apart from `shadowed` (a `local-route` footprint) so
+    /// each gauge says one thing.
+    kernel_delivered: HashSet<IpPrefix>,
     /// The address the loopback holds; every member is unnumbered to it.
     loopback: packetframe_common::config::Ipv4Prefix,
     /// The loopback's index once created. `None` until the first attach
@@ -670,6 +684,8 @@ impl ConvergenceEngine {
             ports,
             local_routes: Vec::new(),
             shadowed: HashSet::new(),
+            self_addrs: HashSet::new(),
+            kernel_delivered: HashSet::new(),
             loopback,
             loop_index: None,
             recorded_indices: Vec::new(),
@@ -814,6 +830,35 @@ impl ConvergenceEngine {
                 .set_port_untagged(&p.port, pv.untagged(&p.port));
         }
         Some(pv)
+    }
+
+    /// Declare the router's own addresses, so routes the routing daemon
+    /// originated itself stay out of VPP ([`Self::kernel_delivered`]).
+    pub fn with_self_addresses(mut self, addrs: impl IntoIterator<Item = IpAddr>) -> Self {
+        self.self_addrs = addrs.into_iter().collect();
+        self
+    }
+
+    /// Whether every next hop of a route is the router itself.
+    ///
+    /// A routing daemon feeding packetframe over iBGP sends the routes it
+    /// originates — `redistribute connected` above all — with NEXT_HOP
+    /// set to its own session address. The kernel delivers those
+    /// prefixes; VPP has no adjacency for its own host and never will.
+    /// Left in, each one reads as unresolvable, and an unresolvable route
+    /// blocks the first steer by design — which on a production feed
+    /// with a dozen connected subnets meant steering could never start.
+    /// Their destinations are the connected subnets the exemption
+    /// tripwire already requires a `steer-exempt` for, so no steered
+    /// packet reaches them in VPP.
+    fn routes_via_self(&self, nexthops: &[IpAddr]) -> bool {
+        !nexthops.is_empty() && nexthops.iter().all(|n| self.self_addrs.contains(n))
+    }
+
+    /// How many mirror prefixes route via the router itself and so are
+    /// left out of VPP.
+    pub fn kernel_delivered_routes(&self) -> u64 {
+        self.kernel_delivered.len() as u64
     }
 
     /// Install the kernel view placement reads ([`crate::topology`]).
@@ -2314,8 +2359,21 @@ impl ConvergenceEngine {
                 continue;
             }
             match nhs {
-                Some(v) => self.pending.upsert(prefix, v),
-                None => self.pending.withdraw(prefix),
+                // Routed via the router itself: out of VPP, and withdrawn
+                // in case an earlier update installed it through a real
+                // next hop.
+                Some(v) if self.routes_via_self(&v) => {
+                    self.kernel_delivered.insert(prefix);
+                    self.pending.withdraw(prefix);
+                }
+                Some(v) => {
+                    self.kernel_delivered.remove(&prefix);
+                    self.pending.upsert(prefix, v);
+                }
+                None => {
+                    self.kernel_delivered.remove(&prefix);
+                    self.pending.withdraw(prefix);
+                }
             }
         }
         Ok(n)
@@ -2465,6 +2523,7 @@ impl ConvergenceEngine {
         // Rebuilt from this walk, so a prefix the mirror dropped while
         // we were not looking leaves the count too.
         self.shadowed.clear();
+        self.kernel_delivered.clear();
         src.for_each_route(&mut |prefix, nexthops| {
             if self.shadows(&prefix) {
                 // Deliberately NOT in `seen`: if the ledger holds a
@@ -2473,6 +2532,12 @@ impl ConvergenceEngine {
                 // cleans it out of VPP.
                 self.shadowed.insert(prefix);
                 plan.shadowed += 1;
+                return;
+            }
+            // Same reasoning: not in `seen`, so a stale install goes.
+            if self.routes_via_self(nexthops) {
+                self.kernel_delivered.insert(prefix);
+                plan.kernel_delivered += 1;
                 return;
             }
             self.pending.upsert(prefix, nexthops.to_vec());

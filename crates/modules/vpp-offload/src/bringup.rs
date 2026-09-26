@@ -1059,6 +1059,14 @@ fn finish(
     // identity store and the release seam through an `Rc`.
     let local_routes = local_routes.to_vec();
     let trunk_ports = trunk_ports.to_vec();
+    // The router's own addresses, for the routes its routing daemon
+    // originates with itself as next hop. Read at attach: an address
+    // added later only matters to a first steer, which an unresolvable
+    // route would then block — loud, not silent.
+    let self_addrs: Vec<std::net::IpAddr> = kernel_v4_addrs()
+        .into_iter()
+        .map(|(_, a)| std::net::IpAddr::V4(a))
+        .collect();
     let drift_exempts = steer_exempts.to_vec();
     let factory: LoopFactory = Box::new(move || {
         // What VPP can egress, for the exemption tripwire: the member
@@ -1094,7 +1102,8 @@ fn finish(
         )
         .with_recorded_indices(recorded)
         .with_local_routes(local_routes)
-        .with_trunk_ports(trunk_ports);
+        .with_trunk_ports(trunk_ports)
+        .with_self_addresses(self_addrs);
         // Per-neighbour placement reads the live kernel on Linux; the
         // default elsewhere treats every device as plain.
         #[cfg(target_os = "linux")]

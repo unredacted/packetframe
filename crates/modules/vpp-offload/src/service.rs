@@ -1180,6 +1180,7 @@ fn run_loop(
                 unreadable: rs.steer_audit_error.clone(),
             },
             rs.shadowed_routes,
+            rs.kernel_delivered_routes,
             rs.null_drops,
             rs.neighbours_unplaced,
             rs.neighbour_moves,

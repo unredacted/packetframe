@@ -2684,3 +2684,108 @@ fn an_adopted_bvi_takes_the_bridges_current_mac() {
         assert_eq!(m.contains(&set), expect_set, "{tag}: {m:?}");
     }
 }
+
+/// A source whose routes each carry their own next hops, and whose delta
+/// batches the test queues by hand.
+struct NexthopSource {
+    routes: Vec<(IpPrefix, Vec<IpAddr>)>,
+    queue: std::sync::Mutex<Vec<packetframe_vpp_offload::engine::SourceChanges>>,
+}
+
+impl RouteSource for NexthopSource {
+    fn requeue(&self, changes: packetframe_vpp_offload::engine::SourceChanges) {
+        self.queue.lock().unwrap().insert(0, changes);
+    }
+    fn drain_changes(&self, _max: usize) -> packetframe_vpp_offload::engine::SourceChanges {
+        self.queue.lock().unwrap().pop().unwrap_or_default()
+    }
+    fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+        for (p, nhs) in &self.routes {
+            visit(*p, nhs);
+        }
+    }
+    fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+        visit(nh(), "eth4", MAC);
+    }
+    fn route_count(&self) -> u64 {
+        self.routes.len() as u64
+    }
+    fn change_seq(&self) -> u64 {
+        0
+    }
+}
+
+/// A routing daemon feeding packetframe over iBGP sends the routes it
+/// originates itself — `redistribute connected` — with its own session
+/// address as NEXT_HOP. The kernel delivers those; VPP never has an
+/// adjacency for its own host. They stay out of VPP and out of the
+/// unresolvable count, which otherwise blocks the first steer forever
+/// on a feed carrying connected subnets. A route that changes to or from
+/// the router as next hop moves in or out, withdrawn on the way out.
+#[test]
+fn routes_via_the_router_itself_stay_out_of_vpp() {
+    let own = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+    let fake = Fake::start("self-nexthop");
+    let mut e = engine_for(&fake).with_self_addresses([own]);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let connected = v4(66, 1);
+    let src = NexthopSource {
+        routes: vec![(v4(0, 0), vec![nh()]), (connected, vec![own])],
+        queue: Default::default(),
+    };
+    let plan = e.begin_resync(&src);
+    assert_eq!((plan.upserts, plan.kernel_delivered), (1, 1), "{plan:?}");
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().installed, 1);
+    assert_eq!(
+        e.counts().unresolvable,
+        0,
+        "a self-routed prefix must not block a steer"
+    );
+    assert_eq!(e.kernel_delivered_routes(), 1);
+    let installed: Vec<WireRoute> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|ev| match ev {
+            Event::Route(r) if r.is_add => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        installed
+            .iter()
+            .all(|r| (r.addr, r.len) != ([10, 66, 1, 0], 24)),
+        "the connected subnet never reaches VPP: {installed:?}"
+    );
+
+    // The transit route moves onto the router itself: withdrawn.
+    src.queue
+        .lock()
+        .unwrap()
+        .push(packetframe_vpp_offload::engine::SourceChanges {
+            neighbours: Vec::new(),
+            routes: vec![(v4(0, 0), Some(vec![own]))],
+        });
+    e.apply_changes(&src, 64).expect("delta");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().installed, 0);
+    assert_eq!(e.kernel_delivered_routes(), 2);
+    assert!(fake.drain_events().iter().any(
+        |ev| matches!(ev, Event::Route(r) if !r.is_add && (r.addr, r.len) == ([10, 0, 0, 0], 24))
+    ));
+
+    // And back through a real next hop: installed again.
+    src.queue
+        .lock()
+        .unwrap()
+        .push(packetframe_vpp_offload::engine::SourceChanges {
+            neighbours: Vec::new(),
+            routes: vec![(v4(0, 0), Some(vec![nh()]))],
+        });
+    e.apply_changes(&src, 64).expect("delta");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().installed, 1);
+    assert_eq!(e.kernel_delivered_routes(), 1);
+}

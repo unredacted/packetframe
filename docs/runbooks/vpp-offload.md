@@ -650,6 +650,17 @@ One line does three things at attach:
    exactly its poisoned host route, and a JUMP in it is a mirror
    change worth reading about.
 
+Separately from `local-route`, a route whose every next hop is one of
+the router's own addresses is left out of VPP. A routing daemon feeding
+packetframe over iBGP sends what it originates — `redistribute
+connected` above all — with its own session address as NEXT_HOP; the
+kernel delivers those subnets, and VPP could only ever count them
+unresolvable, which blocks the first steer. They are the connected
+subnets the exemption tripwire already asks a `steer-exempt` for.
+`packetframe_vpp_kernel_delivered_routes` counts them; a steady value
+equal to the number of connected subnets the daemon redistributes is
+normal. The router's addresses are read at attach.
+
 Validation refuses: a port the section does not declare, a vlan
 missing from the port's `vlans` list, a prefix outside every
 fast-path `local-prefix` (tier agreement — a failover must not change
