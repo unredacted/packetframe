@@ -802,6 +802,13 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             // the bpffs pins hold the kernel references, so the XDP
             // attachment survives.
             tracing::info!("termination signal received; exiting (pins hold the attach per §8.5)");
+            // The explicit half of preserving: a module that must hand
+            // state to the next start (vpp-offload's route ledger) is told
+            // the process is going away. A drop alone cannot say that, and
+            // must not be read as it.
+            for (_, module) in modules.iter_mut() {
+                module.exit_preserving();
+            }
             drop(modules);
         }
         Termination::BreakerTrip => {

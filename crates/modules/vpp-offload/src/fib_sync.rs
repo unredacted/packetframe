@@ -25,7 +25,10 @@ use std::net::IpAddr;
 
 use packetframe_common::fib::IpPrefix;
 
-use crate::sink::{NexthopTarget, PendingMap, PendingOp, RouteLedger, RouteState};
+use crate::sink::{
+    canonical_paths, NexthopTarget, PathKey, PathSetId, PendingMap, PendingOp, RouteLedger,
+    RouteState,
+};
 use crate::vpp_api::generated::{
     Address, AddressUnion, FibPath, IpRoute, IpRouteAddDel, IpRouteAddDelReply, Prefix,
     ADDRESS_IP4, ADDRESS_IP6, FIB_API_PATH_FLAG_NONE, FIB_API_PATH_NH_PROTO_IP4,
@@ -239,7 +242,16 @@ pub fn build_paths(paths: &[ResolvedPath], ports: &PortIndex) -> Option<Vec<FibP
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
         let sw_if_index = ports.get(&p.target)?;
-        let proto = match p.nexthop {
+        out.push(wire_path(p.nexthop, sw_if_index));
+    }
+    Some(out)
+}
+
+/// The wire path this module installs for one resolved nexthop — the
+/// single place every attribute of it is chosen.
+fn wire_path(nexthop: IpAddr, sw_if_index: u32) -> FibPath {
+    {
+        let proto = match nexthop {
             IpAddr::V4(_) => FIB_API_PATH_NH_PROTO_IP4,
             IpAddr::V6(_) => FIB_API_PATH_NH_PROTO_IP6,
         };
@@ -263,13 +275,56 @@ pub fn build_paths(paths: &[ResolvedPath], ports: &PortIndex) -> Option<Vec<FibP
         // The nexthop address goes in the path's own union, which is
         // the bare address — no family tag, since `proto` above
         // already carries it.
-        match p.nexthop {
+        match nexthop {
             IpAddr::V4(v4) => fp.nh.address.0[..4].copy_from_slice(&v4.octets()),
             IpAddr::V6(v6) => fp.nh.address.0.copy_from_slice(&v6.octets()),
         }
-        out.push(fp);
+        fp
     }
-    Some(out)
+}
+
+/// The key of the path this module installs for `nexthop` on
+/// `sw_if_index` — what a route the drainer sent is recorded as.
+pub fn installed_path_key(nexthop: IpAddr, sw_if_index: u32) -> PathKey {
+    path_key(&wire_path(nexthop, sw_if_index))
+}
+
+/// Every forwarding-relevant attribute a wire path carries (see
+/// [`PathKey`] for which, and why the rest are left out).
+///
+/// The one decoding every path comparison goes through — the drainer
+/// recording what it installed, the resync deciding what it may skip, and
+/// verify reading VPP's answer back — so the three cannot disagree about
+/// what "the same path" means. Normalized the way VPP echoes a path back:
+/// a weight of 0 is installed as 1, and only the `n_labels` label entries
+/// that exist are meaningful.
+pub fn path_key(p: &FibPath) -> PathKey {
+    let nexthop = if p.proto == FIB_API_PATH_NH_PROTO_IP6 {
+        IpAddr::V6(std::net::Ipv6Addr::from(p.nh.address.0))
+    } else {
+        let mut v4 = [0u8; 4];
+        v4.copy_from_slice(&p.nh.address.0[..4]);
+        IpAddr::V4(std::net::Ipv4Addr::from(v4))
+    };
+    let n = usize::from(p.n_labels).min(p.label_stack.len());
+    PathKey {
+        nexthop,
+        sw_if_index: p.sw_if_index,
+        weight: p.weight.max(1),
+        preference: p.preference,
+        kind: p.r#type,
+        flags: p.flags,
+        proto: p.proto,
+        labels: p.label_stack[..n]
+            .iter()
+            .map(|l| (l.label, l.ttl, l.exp, l.is_uniform))
+            .collect(),
+    }
+}
+
+/// A route's wire paths as the canonical set the ledger records.
+pub fn path_set_of(paths: &[FibPath]) -> Vec<PathKey> {
+    canonical_paths(paths.iter().map(path_key).collect())
 }
 
 /// What one drain accomplished.
@@ -419,6 +474,9 @@ enum Begun {
         context: u32,
         op: PendingOp,
         derived: bool,
+        /// The path set an upsert carried, for the ledger to record on
+        /// acknowledgement. `None` for withdrawals.
+        via: Option<PathSetId>,
     },
     /// Resolved without touching the socket; already counted.
     Done,
@@ -444,6 +502,9 @@ struct InFlight {
     /// Whether `sent` is a withdrawal this drainer derived rather than
     /// one the route source asked for.
     derived: bool,
+    /// The paths an upsert went out with — what VPP holds for this
+    /// prefix if, and only if, it acknowledges the request.
+    via: Option<PathSetId>,
 }
 
 impl Default for Drainer {
@@ -515,12 +576,14 @@ impl Drainer {
                         context,
                         op: sent,
                         derived,
+                        via,
                     }) => inflight.push(InFlight {
                         context,
                         prefix,
                         sent,
                         original: op,
                         derived,
+                        via,
                     }),
                     // Nothing to send (withheld, unresolvable,
                     // out-of-family): already counted, ledger already
@@ -661,6 +724,7 @@ impl Drainer {
                         context: ctx,
                         op: PendingOp::Withdraw,
                         derived: true,
+                        via: None,
                     });
                 }
 
@@ -700,6 +764,9 @@ impl Drainer {
                 if cap_paths(&mut paths) {
                     stats.paths_capped += 1;
                 }
+                // After the cap: what is recorded is what went on the
+                // wire, not what resolution produced.
+                let via = ledger.intern_paths(&path_set_of(&paths));
                 let msg = IpRouteAddDel {
                     context: 0,
                     is_add: true,
@@ -719,6 +786,7 @@ impl Drainer {
                         nexthops: nexthops.clone(),
                     },
                     derived: false,
+                    via: Some(via),
                 })
             }
             // An authoritative withdrawal: the route source no longer
@@ -727,6 +795,7 @@ impl Drainer {
                 context: transport.send(withdraw_msg(prefix))?,
                 op: PendingOp::Withdraw,
                 derived: false,
+                via: None,
             }),
         }
     }
@@ -746,7 +815,7 @@ impl Drainer {
         // deleted.
         match (&f.sent, retval) {
             (PendingOp::Upsert { .. }, 0) => {
-                ledger.commit_installed(f.prefix);
+                ledger.commit_installed_via(f.prefix, f.via);
                 stats.installed += 1;
             }
             // Authoritative: the source dropped the prefix, so the
@@ -1035,5 +1104,47 @@ mod tests {
         assert_eq!(out[0].nexthop, nh(192, 0, 2, 1));
 
         let _ = RouteLedger::new(Capacity::new(10));
+    }
+
+    /// Every forwarding-relevant attribute distinguishes a path; the
+    /// defaults VPP echoes differently from what was sent do not.
+    #[test]
+    fn a_path_key_compares_every_forwarding_attribute() {
+        let base = wire_path(nh(192, 0, 2, 1), 3);
+        let key = path_key(&base);
+        assert_eq!(key, installed_path_key(nh(192, 0, 2, 1), 3));
+        type Change = (&'static str, fn(&mut FibPath));
+        let differs: [Change; 7] = [
+            ("nexthop", |p| p.nh.address.0[3] = 2),
+            ("interface", |p| p.sw_if_index = 4),
+            ("weight", |p| p.weight = 5),
+            ("preference", |p| p.preference = 1),
+            ("type", |p| p.r#type = FIB_API_PATH_TYPE_NORMAL + 1),
+            ("flags", |p| p.flags = 1),
+            ("labels", |p| {
+                p.n_labels = 1;
+                p.label_stack[0].label = 16;
+            }),
+        ];
+        for (what, change) in differs {
+            let mut p = base.clone();
+            change(&mut p);
+            assert_ne!(path_key(&p), key, "{what} must distinguish a path");
+        }
+        // Echoed differently, forwarding identically.
+        let mut p = base.clone();
+        p.weight = 0;
+        assert_eq!(path_key(&p), key, "VPP installs weight 0 as 1");
+        let mut p = base.clone();
+        p.label_stack[5].label = 99;
+        assert_eq!(path_key(&p), key, "padding past n_labels is not a label");
+        let mut p = base;
+        p.table_id = 7;
+        p.rpf_id = u32::MAX;
+        assert_eq!(
+            path_key(&p),
+            key,
+            "not consulted for a NORMAL attached path"
+        );
     }
 }

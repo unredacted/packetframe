@@ -993,6 +993,29 @@ fn finish(
         })?,
         None => None,
     };
+    // The previous process's preserved route ledger, if its stop left one
+    // (`ledger_record`). Consumed HERE — read and removed before anything
+    // below can change VPP — whether or not it is used: its whole claim is
+    // "VPP has not changed since", and from this adoption on, it will.
+    // The token leaves the in-memory record with it, so this daemon's
+    // first save drops it from the file too.
+    //
+    // Every refusal is logged and falls back to the dump path; none fails
+    // the attach. Only the identity legs are checked here, where the
+    // adopted process and the state file are in hand. VPP's own route
+    // counts are compared in `start_resync`, which has the API.
+    let mut state = state;
+    let ledger_token = state.ledger_token.take();
+    let preserved = crate::ledger_record::consume_for_adoption(
+        &paths.sys.state_dir,
+        adopted.as_ref().map(|p| crate::ledger_record::Adoptee {
+            pid: p.pid(),
+            start_ticks: p.start_ticks(),
+            boot_id: state.vpp_boot_id.as_deref().unwrap_or_default(),
+        }),
+        ledger_token,
+        &recorded,
+    );
     // The daemon vacates VPP's cores here — after adoption has settled
     // WHOSE cores they are, and before the loop that will do the
     // bursting starts. The harm arrives through the scheduler, not the
@@ -1347,7 +1370,12 @@ fn finish(
                 // Order matters and is contractual: `adopt_process`
                 // first, with the same `steered`, so the engine's socket
                 // deadline is already the steered one when `inject`
-                // synchronously runs AttachDevices and StartResync.
+                // synchronously runs AttachDevices and StartResync. The
+                // preserved ledger goes in before the injection for the
+                // same reason: `StartResync` is where it is judged.
+                if let Some(rec) = preserved {
+                    runtime.seed_ledger(rec);
+                }
                 runtime.adopt_process(p, steered);
                 vec![Event::Adopted { steered }]
             }

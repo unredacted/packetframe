@@ -2232,3 +2232,157 @@ fn a_dark_idle_member_neither_pages_nor_pins_failure_history() {
         "the row must name the dark member and say it carries nothing: {msg}"
     );
 }
+
+type Captured =
+    std::sync::Arc<std::sync::Mutex<Option<packetframe_vpp_offload::ledger_record::LedgerBody>>>;
+
+/// A converged service whose store captures a preserved ledger.
+fn converged_capturing(tag: &str) -> (Fake, SupervisionService, Captured) {
+    use packetframe_vpp_offload::ledger_record::LedgerBody;
+    use std::sync::{Arc, Mutex};
+
+    struct CaptureStore(Arc<Mutex<Option<LedgerBody>>>);
+    impl IdentityStore for CaptureStore {
+        fn process_changed(&mut self, _: Option<ProcessIdentity>) -> Result<(), String> {
+            Ok(())
+        }
+        fn interfaces_attached(&mut self, _: &[(String, u32)]) -> Result<(), String> {
+            Ok(())
+        }
+        fn steering_changed(
+            &mut self,
+            _: &[(String, u32)],
+            _: &[(String, u32, packetframe_vpp_offload::steer::RuleSet)],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn preserve_ledger(&mut self, body: LedgerBody) -> Result<(), String> {
+            *self.0.lock().unwrap() = Some(body);
+            Ok(())
+        }
+    }
+
+    let fake = Fake::start_behaving(
+        tag,
+        fake_vpp::Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let sock = fake.path.clone();
+    let captured = Arc::new(Mutex::new(None));
+    let store = captured.clone();
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                    pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                    accept_macs: vec![],
+                    mtu: None,
+                    vlans: vec![],
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+                packetframe_common::config::Ipv4Prefix {
+                    addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                    prefix_len: 32,
+                },
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SteeringUnavailable),
+                Box::new(CaptureStore(store)),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready(), "fake must answer the handshake");
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while svc.status().expect("published").state != State::Ready {
+        assert!(Instant::now() < deadline, "did not reach Ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = fake.drain_events();
+    (fake, svc, captured)
+}
+
+/// The explicit preserving exit writes the route ledger and ends
+/// supervision: the daemon's SIGTERM path calls it (through
+/// `Module::exit_preserving`) just before dropping the modules, and VPP
+/// stays running for the next daemon to adopt — without reading its FIB,
+/// thanks to the ledger. Without this seam the ledger would be a format
+/// with no writer.
+#[test]
+fn an_explicit_preserving_shutdown_leaves_the_ledger_and_tears_nothing_down() {
+    let (fake, svc, captured) = converged_capturing("svc-preserve");
+
+    assert!(
+        svc.shutdown_preserving(),
+        "the loop finished inside the budget"
+    );
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the preserving shutdown left the route ledger");
+    assert_eq!(body.entries.len(), 6);
+    assert!(body.entries.iter().all(|(_, s)| s.is_some()));
+    let after = fake.drain_events();
+    assert!(
+        !after.iter().any(|e| matches!(
+            e,
+            fake_vpp::Event::Route(_) | fake_vpp::Event::Neighbour { .. }
+        )),
+        "a preserving exit changes nothing in VPP: {after:?}"
+    );
+}
+
+/// A bare drop is ambiguous — it cannot tell a process exit from a
+/// caller that let go by accident — so it keeps the old contract: VPP is
+/// left running AND supervised, and nothing is preserved. Ending
+/// supervision here would leave VPP and its steering rules unmonitored,
+/// so a death or wedge would blackhole traffic with nothing to restart it.
+#[test]
+fn a_bare_drop_keeps_supervising_and_preserves_nothing() {
+    let (fake, svc, captured) = converged_capturing("svc-bare-drop");
+
+    drop(svc);
+    // The loop is still pinging VPP well after the drop.
+    std::thread::sleep(Duration::from_millis(1_200));
+    let _ = fake.drain_events();
+    std::thread::sleep(Duration::from_millis(1_200));
+    let after = fake.drain_events();
+    assert!(
+        after
+            .iter()
+            .any(|e| matches!(e, fake_vpp::Event::Msg(m) if m == "control_ping")),
+        "supervision must survive a bare drop: {after:?}"
+    );
+    assert!(
+        captured.lock().unwrap().is_none(),
+        "a bare drop is not a shutdown; nothing is preserved"
+    );
+}

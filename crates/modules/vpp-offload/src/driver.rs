@@ -197,6 +197,30 @@ pub trait Observe {
     /// [`StepError`] — because during a resync the first is resumed in
     /// place and only the second fails the convergence.
     fn drain_batch(&mut self, now: Instant) -> Result<Drain, StepError>;
+
+    /// How long the last [`Self::drain_batch`] call took, on the real
+    /// clock.
+    ///
+    /// The driver's clock is the tick's `now`, read BEFORE the drain, and
+    /// a drain can block for minutes: an adopted resync's FIB dump runs
+    /// inside one. Extending the phase deadline from `now` after such a
+    /// call armed it in the past — on the primary (2026-09-26) a ~3 minute
+    /// dump returned "still waiting", the deadline was pushed to
+    /// `now + 120 s`, already behind the clock, and the very next tick
+    /// tore down a healthy adopted VPP with `PhaseTimedOut`. Extensions
+    /// are measured from `now + took` instead. `ZERO` (the default) is
+    /// exact for anything that does not block.
+    fn last_drain_took(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// The convergence budget for the table this deployment is
+    /// converging — see [`crate::supervisor::convergence_budget`].
+    /// Read once per tick. The default is the flat
+    /// [`crate::supervisor::CONVERGENCE_BUDGET`].
+    fn convergence_budget(&mut self) -> Duration {
+        crate::supervisor::CONVERGENCE_BUDGET
+    }
 }
 
 /// A convergence step that lost the API, waiting to be resumed.
@@ -265,6 +289,10 @@ pub struct Driver {
     /// Reset when the convergence ends, however it ends, so one starved
     /// restart does not tax the next convergence's first interruption.
     resume_attempts: u32,
+    /// The convergence budget in force, from [`Observe::convergence_budget`]
+    /// at the latest tick. Kept because `inject` arms phases too and has
+    /// no `Observe` to ask.
+    convergence_budget: Duration,
 }
 
 impl Default for Driver {
@@ -285,7 +313,15 @@ impl Driver {
             resume: None,
             drain_gate: None,
             resume_attempts: 0,
+            convergence_budget: crate::supervisor::CONVERGENCE_BUDGET,
         }
+    }
+
+    /// The supervisor's phase, with the convergence budget scaled to the
+    /// table. Every arm and extension goes through this, so the deadline
+    /// and the budget cannot disagree about which figure is in force.
+    fn phase(&self) -> Option<(crate::supervisor::PhaseKind, Duration)> {
+        self.sup.phase_with(self.convergence_budget)
     }
 
     pub fn state(&self) -> State {
@@ -359,6 +395,12 @@ impl Driver {
         // was on entry — draining on the tick that first saw the API
         // would act on a transition the supervisor has not applied yet.
         let api_up_at_entry = self.detector.is_some();
+        // The budget this table needs, learned before the deadline is
+        // judged: a phase armed with less (the flat budget an injected
+        // adoption starts from, before any dump has measured the table)
+        // gets the difference. See `Schedule::widen_phase`.
+        self.convergence_budget = obs.convergence_budget();
+        self.sched.widen_phase(self.phase());
 
         // Death first, and **before the deadline events**. A pidfd is
         // level-triggered, so an exit can still be readable on the very
@@ -446,7 +488,12 @@ impl Driver {
             let interrupted =
                 self.sup.convergence_interrupted().is_some() || self.drain_gate.is_some();
             if (resyncing || api_up_at_entry) && before != State::Verifying && !interrupted {
-                match obs.drain_batch(now) {
+                let drained = obs.drain_batch(now);
+                // The instant the drain RETURNED, in this tick's clock —
+                // what every extension below is measured from. See
+                // `Observe::last_drain_took`.
+                let done_at = now + obs.last_drain_took();
+                match drained {
                     // Empty means the resync is done — and only the
                     // drain can say so, which is why this is observed
                     // rather than assumed after issuing StartResync.
@@ -475,7 +522,7 @@ impl Driver {
                     // budget then runs out exactly as designed.
                     Ok(Drain::More) => {
                         if resyncing {
-                            self.sched.extend_phase(now, self.sup.phase());
+                            self.sched.extend_phase(done_at, self.phase());
                         }
                         more_to_drain = true;
                     }
@@ -487,8 +534,13 @@ impl Driver {
                     // `PhaseTimedOut` tears down a healthy adopted VPP,
                     // which is the same defect the deferral exists to
                     // prevent, arriving through the clock.
+                    //
+                    // From when the drain RETURNED: a deferral that just
+                    // spent minutes on a dump the feed spoiled is still
+                    // deliberately waiting, and a deadline armed from the
+                    // tick's start would already be behind the clock.
                     Ok(Drain::AwaitingSource { .. }) => {
-                        self.sched.extend_phase(now, self.sup.phase());
+                        self.sched.extend_phase(done_at, self.phase());
                     }
                     // Losing the API mid-resync is NOT a convergence
                     // failure, for the reason `Event::ConvergenceInterrupted`
@@ -956,7 +1008,7 @@ impl Driver {
                 // transition, including ones with no budget — arming
                 // only on entry to a timed phase would leave a deadline
                 // describing a phase already left.
-                self.sched.arm_phase(now, self.sup.phase());
+                self.sched.arm_phase(now, self.phase());
                 for a in &actions {
                     if let crate::supervisor::Action::ArmBackoff(d) = a {
                         self.sched.arm_backoff(now, *d);
@@ -1052,9 +1104,22 @@ mod tests {
         /// Whether the FIB reads empty. Default `false`: a populated
         /// table is the ordinary case every other test assumes.
         fib_empty: bool,
+        /// How long every drain reports having taken on the real clock —
+        /// a dump blocking inside it. Default zero, which is what the
+        /// trait's default answers.
+        drain_took: Duration,
+        /// The table-scaled convergence budget to report. `None` = the
+        /// trait default, the flat budget.
+        budget: Option<Duration>,
     }
 
     impl Observe for World {
+        fn last_drain_took(&self) -> Duration {
+            self.drain_took
+        }
+        fn convergence_budget(&mut self) -> Duration {
+            self.budget.unwrap_or(CONVERGENCE_BUDGET)
+        }
         fn poll_exit(&mut self) -> Option<Option<i32>> {
             self.exited
         }
@@ -1226,6 +1291,115 @@ mod tests {
     }
 
     // ---- The drain is incremental ----
+
+    /// The 2026-09-26 teardown, reduced to its clock. An adopted
+    /// deferral's release ran a FIB dump that blocked the tick for ~3
+    /// minutes, the feed spoiled it, and the drain returned "still
+    /// waiting" — which extended the deadline from the tick's START, a
+    /// point already ~3 minutes in the past. The very next tick found the
+    /// deadline behind the clock and `PhaseTimedOut` tore down a healthy,
+    /// steered-before-the-restart VPP. Extensions now run from when the
+    /// drain returned.
+    #[test]
+    fn a_drain_that_blocked_past_the_budget_does_not_time_out_on_return() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let dump = Duration::from_secs(175);
+        assert!(
+            dump > CONVERGENCE_BUDGET,
+            "the premise: one call outlasts the budget"
+        );
+        let mut w = World {
+            api: true,
+            deferred_ticks: usize::MAX,
+            drain_took: dump,
+            ..Default::default()
+        };
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+        // The tick whose drain blocked for the whole dump.
+        d.tick(t0, &mut w, &mut fx);
+        // The next tick is the first the clock sees after it returned.
+        let t = d.tick(t0 + dump + Duration::from_secs(1), &mut w, &mut fx);
+        assert!(
+            !t.events.contains(&Event::PhaseTimedOut),
+            "a deferral that is still deliberately waiting must not time out on the \
+             length of its own dump: {:?}",
+            t.events
+        );
+        assert!(!fx.calls.contains(&"kill"), "{:?}", fx.calls);
+        assert_eq!(d.state(), State::AdoptedResyncing);
+    }
+
+    /// An adoption is injected — and its deadline armed — before anything
+    /// has measured the table, so it starts from the flat budget. The
+    /// first tick's wider budget must reach the deadline already armed,
+    /// or the phase is bounded by a figure its own measurements refute.
+    #[test]
+    fn a_budget_learned_after_the_adoption_widens_its_deadline() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let scaled = Duration::from_secs(500);
+        let mut w = World {
+            api: true,
+            batches: 1,
+            budget: Some(scaled),
+            ..Default::default()
+        };
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+        let seen = settle(&mut d, t0, &mut w, &mut fx);
+        assert!(seen.contains(&Event::SyncComplete), "{seen:?}");
+        assert_eq!(d.state(), State::Verifying, "stalled: no verdict comes");
+        let t = d.tick(
+            t0 + CONVERGENCE_BUDGET + Duration::from_secs(10),
+            &mut w,
+            &mut fx,
+        );
+        assert!(
+            !t.events.contains(&Event::PhaseTimedOut),
+            "the deadline armed at injection was widened: {:?}",
+            t.events
+        );
+        let t = d.tick(t0 + scaled + Duration::from_secs(1), &mut w, &mut fx);
+        assert!(t.events.contains(&Event::PhaseTimedOut), "{:?}", t.events);
+    }
+
+    /// The deadline takes the table-scaled budget the world reports — and
+    /// a stall still ends at it, not at the flat 120 s and not never.
+    #[test]
+    fn the_convergence_deadline_takes_the_scaled_budget() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let scaled = Duration::from_secs(500);
+        let mut w = World {
+            api: true,
+            batches: 1,
+            budget: Some(scaled),
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        let mut now = t0;
+        let seen = settle(&mut d, now, &mut w, &mut fx);
+        assert!(seen.contains(&Event::SyncComplete), "{seen:?}");
+        assert_eq!(d.state(), State::Verifying);
+        // This fake never delivers a verdict: a stalled verify.
+        now += CONVERGENCE_BUDGET + Duration::from_secs(10);
+        let t = d.tick(now, &mut w, &mut fx);
+        assert!(
+            !t.events.contains(&Event::PhaseTimedOut),
+            "the flat budget no longer applies to this table: {:?}",
+            t.events
+        );
+        now = t0 + scaled + Duration::from_secs(1);
+        let t = d.tick(now, &mut w, &mut fx);
+        assert!(
+            t.events.contains(&Event::PhaseTimedOut),
+            "a stall still ends at the scaled deadline: {:?}",
+            t.events
+        );
+    }
 
     /// Active progress must extend the phase deadline: the budget
     /// exists to catch a STALLED convergence, and `Drain::More` is

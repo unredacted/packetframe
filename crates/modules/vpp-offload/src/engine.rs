@@ -41,11 +41,14 @@ use std::time::Duration;
 use packetframe_common::fib::IpPrefix;
 
 use crate::attach::{attach_ports, AttachError, AttachMode, AttachedPort, PortAttach};
+use crate::fib_sync::{
+    build_paths, cap_paths, path_set_of, DrainStats, Drainer, FamilyPolicy, PortIndex,
+    ResolvedPath, DEFAULT_WINDOW,
+};
 use crate::fib_sync::{from_prefix, to_address};
-use crate::fib_sync::{DrainStats, Drainer, FamilyPolicy, PortIndex, ResolvedPath, DEFAULT_WINDOW};
 use crate::sink::{Capacity, NexthopMap, PendingMap, RouteLedger, SinkCounts};
 use crate::status::PortLink;
-use crate::verify::{verify, VerifyOutcome, DEFAULT_SAMPLE};
+use crate::verify::{verify_paths, VerifyOutcome, DEFAULT_SAMPLE};
 use crate::vpp_api::generated::{
     CliInband, CliInbandReply, FibPath, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply,
     IpNeighborDetails, IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
@@ -213,7 +216,10 @@ pub trait RouteSource {
 
     /// How many routes the source currently holds.
     ///
-    /// Exists for one consumer: the adopted-resync deferral. A resync is
+    /// Read every tick by two consumers: the adopted-resync deferral,
+    /// and the convergence budget's table size
+    /// ([`crate::supervisor::convergence_budget`]). The first is why it
+    /// exists. A resync is
     /// a diff whose withdrawals are "everything the ledger holds that the
     /// source does not" — which is only meaningful when the source is
     /// COMPLETE. A daemon restart is precisely when it is not: the BGP
@@ -296,6 +302,11 @@ pub struct ResyncPlan {
     /// Mirror prefixes left out because they route via the router itself
     /// ([`ConvergenceEngine::kernel_delivered_routes`]).
     pub kernel_delivered: u64,
+    /// Source routes NOT queued because VPP is recorded holding them
+    /// through exactly the paths they resolve to now. On a
+    /// preserved-ledger adoption this is nearly the whole table — the
+    /// point of preserving it; on a fresh resync it is zero.
+    pub unchanged: u64,
 }
 
 /// What a verify pass concluded, and whether traffic may be diverted
@@ -2474,8 +2485,17 @@ impl ConvergenceEngine {
     /// before this runs, so the diff below sees what VPP actually holds
     /// and withdraws accordingly. Callers must invoke it first;
     /// `Runtime::start_resync` does. Persisting the installed prefix set
-    /// to the state file was the alternative and is not one: that is
-    /// 1.05M prefixes rewritten continuously.
+    /// to the state file CONTINUOUSLY was the alternative and is still
+    /// not one (1.05M prefixes rewritten on every change); what exists
+    /// instead is a one-shot record written by a clean preserving stop
+    /// ([`crate::ledger_record`]), which [`Self::seed_ledger`] loads in
+    /// place of the dump when every check on it passes.
+    ///
+    /// A route the ledger records VPP holding through exactly the paths
+    /// it resolves to now is NOT queued ([`ResyncPlan::unchanged`]): the
+    /// diff pushes differences, not the table. Only paths the ledger
+    /// OBSERVED count — a dump adoption records none, so its resync still
+    /// re-sends everything, as it always has.
     ///
     /// Refreshes the nexthop→device mapping first: a route's
     /// resolvability depends on it, and resolving against a stale map
@@ -2741,8 +2761,17 @@ impl ConvergenceEngine {
                 plan.kernel_delivered += 1;
                 return;
             }
-            self.pending.upsert(prefix, nexthops.to_vec());
             seen.insert(prefix);
+            // Unchanged: VPP holds this prefix through exactly the paths
+            // it resolves to now, so re-sending it would replace a route
+            // with itself. Anything owed for it from before this walk is
+            // an OLDER intent, and goes.
+            if self.installed_unchanged(prefix, nexthops) {
+                self.pending.discard(prefix);
+                plan.unchanged += 1;
+                return;
+            }
+            self.pending.upsert(prefix, nexthops.to_vec());
             plan.upserts += 1;
         });
 
@@ -2782,6 +2811,39 @@ impl ConvergenceEngine {
             );
         }
         plan
+    }
+
+    /// Whether VPP is recorded holding `prefix` through exactly the wire
+    /// paths `nexthops` would be installed through right now.
+    ///
+    /// The same resolution, encoding and cap the drainer applies, and the
+    /// same canonical form it records on acknowledgement
+    /// ([`crate::fib_sync::path_set_of`]), so "unchanged" here means
+    /// "the drainer would send what VPP already has". Any doubt — an
+    /// unresolvable nexthop, an interface without an index yet, paths the
+    /// ledger never observed — answers no, which costs a re-send and
+    /// nothing else.
+    fn installed_unchanged(&self, prefix: IpPrefix, nexthops: &[IpAddr]) -> bool {
+        let Some(via) = self.ledger.installed_via(prefix) else {
+            return false;
+        };
+        let resolved: Vec<ResolvedPath> = nexthops
+            .iter()
+            .filter_map(|nh| {
+                self.nexthops.resolve(nh).map(|target| ResolvedPath {
+                    nexthop: *nh,
+                    target,
+                })
+            })
+            .collect();
+        if resolved.is_empty() {
+            return false;
+        }
+        let Some(mut paths) = build_paths(&resolved, &self.port_index) else {
+            return false;
+        };
+        cap_paths(&mut paths);
+        self.ledger.find_paths(&path_set_of(&paths)) == Some(via)
     }
 
     /// Push one bounded batch. `Ok(true)` = nothing left pending.
@@ -2825,6 +2887,14 @@ impl ConvergenceEngine {
 
     /// Readback verification against a fresh random sample.
     pub fn run_verify(&mut self) -> Result<Verdict, EngineError> {
+        self.run_verify_paths(false)
+    }
+
+    /// [`Self::run_verify`], optionally comparing each probe's paths with
+    /// the ledger's record of them — for a ledger seeded from a preserved
+    /// record, where those paths are the claim being tested (see
+    /// [`crate::verify::verify_paths`]).
+    pub fn run_verify_paths(&mut self, check_paths: bool) -> Result<Verdict, EngineError> {
         // Transport first. Setting the phase before this check leaves it
         // stuck on `Verify` when the early return fires, and a phase
         // that never clears is a convergence the loop believes is still
@@ -2840,13 +2910,14 @@ impl ConvergenceEngine {
 
         let active = self.active_egress_indices();
         let t = self.transport.as_mut().expect("checked just above");
-        match verify(
+        match verify_paths(
             t,
             &self.ledger,
             &self.port_index,
             &active,
             DEFAULT_SAMPLE,
             seed,
+            check_paths,
         ) {
             Ok(mut outcome) => {
                 outcome.unexempted_local = self.counts().unexempted_local;
@@ -2991,6 +3062,131 @@ impl ConvergenceEngine {
         self.phase = None;
         self.last_verify = None;
         self.last_dead_scan = None;
+    }
+
+    /// Whether the ledger holds an opinion about any prefix — the
+    /// adopted paths' "VPP's FIB has been learned" test.
+    pub fn ledger_is_empty(&self) -> bool {
+        self.ledger.is_empty()
+    }
+
+    /// Forget the route ledger without touching VPP: a seeded ledger that
+    /// verify disproved describes nothing, and the dump that follows
+    /// needs an empty ledger to read into (it no-ops on a populated one).
+    /// Owed work in the pending map stays owed.
+    pub fn discard_ledger(&mut self) {
+        self.ledger = RouteLedger::new(self.ledger_capacity());
+    }
+
+    /// Seed an EMPTY ledger from a preserved record: every entry
+    /// installed, through the paths the record names.
+    ///
+    /// Refuses — seeding nothing — when the ledger is not empty (this is
+    /// adoption only, and a populated ledger means VPP was already
+    /// learned another way), and when a recorded path names an interface
+    /// this attach does not own: the record then describes a different
+    /// set of interfaces than the one just attached, and seeding it would
+    /// hand the diff paths that point nowhere. Entries of a family VPP
+    /// does not carry are skipped, exactly as the dump skips them.
+    pub fn seed_ledger(&mut self, body: &crate::ledger_record::LedgerBody) -> Result<u64, String> {
+        if !self.ledger_is_empty() {
+            return Err("the route ledger is already populated".into());
+        }
+        if let Some(p) = body
+            .path_sets
+            .iter()
+            .flatten()
+            .find(|p| !self.port_index.owns(p.sw_if_index))
+        {
+            return Err(format!(
+                "a recorded path via {} egresses sw_if_index {}, which this attach does not \
+                 own",
+                p.nexthop, p.sw_if_index
+            ));
+        }
+        let ids: Vec<crate::sink::PathSetId> = body
+            .path_sets
+            .iter()
+            .map(|set| {
+                self.ledger
+                    .intern_paths(&crate::sink::canonical_paths(set.clone()))
+            })
+            .collect();
+        let mut seeded = 0u64;
+        for (prefix, set) in &body.entries {
+            if !self.drainer.families().carries(*prefix) {
+                continue;
+            }
+            self.ledger
+                .adopt_recorded(*prefix, set.map(|i| ids[i as usize]));
+            seeded += 1;
+        }
+        Ok(seeded)
+    }
+
+    /// The ledger as a preserving stop records it: every installed prefix
+    /// with the path set VPP acknowledged it through.
+    ///
+    /// Refused while anything is `Installing` — a request whose answer
+    /// never came back is exactly what a record cannot describe, since VPP
+    /// may or may not hold it.
+    #[allow(clippy::type_complexity)]
+    pub fn preservable_ledger(
+        &self,
+    ) -> Result<(Vec<Vec<crate::sink::PathKey>>, Vec<(IpPrefix, Option<u32>)>), String> {
+        let c = self.ledger.counts();
+        if c.installing > 0 {
+            return Err(format!(
+                "{} route(s) are still awaiting VPP's acknowledgement",
+                c.installing
+            ));
+        }
+        let mut dense: std::collections::HashMap<crate::sink::PathSetId, u32> =
+            std::collections::HashMap::new();
+        let mut sets: Vec<Vec<crate::sink::PathKey>> = Vec::new();
+        let mut entries = Vec::with_capacity(c.installed as usize);
+        for (prefix, via) in self.ledger.installed_entries() {
+            let set = via.map(|id| {
+                *dense.entry(id).or_insert_with(|| {
+                    sets.push(self.ledger.paths_of(id).unwrap_or_default().to_vec());
+                    (sets.len() - 1) as u32
+                })
+            });
+            entries.push((prefix, set));
+        }
+        Ok((sets, entries))
+    }
+
+    /// VPP's per-length route counts for every family it carries — the
+    /// preserved ledger's "nothing changed since" check (see
+    /// [`crate::ledger_record::FibFingerprint`]).
+    ///
+    /// `Ok(None)` when VPP answered but not with something readable: a
+    /// refused command or an output with no table in it. That is "cannot
+    /// establish", and the caller must treat it as a mismatch, never as
+    /// an empty table that happens to match an empty record.
+    pub fn fib_fingerprint(
+        &mut self,
+    ) -> Result<Option<crate::ledger_record::FibFingerprint>, EngineError> {
+        self.arm_timeout();
+        let mut fp = crate::ledger_record::FibFingerprint::default();
+        for &is_ip6 in self.drainer.families().dump_families() {
+            let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+            let reply = match t.request::<CliInband, CliInbandReply>(CliInband {
+                context: 0,
+                cmd: crate::ledger_record::FibFingerprint::command(is_ip6).into(),
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.disconnect();
+                    return Err(EngineError::Transport(e));
+                }
+            };
+            if reply.retval != 0 || fp.absorb(&reply.reply) == 0 {
+                return Ok(None);
+            }
+        }
+        Ok(Some(fp))
     }
 
     fn ledger_capacity(&self) -> Capacity {
@@ -3909,6 +4105,95 @@ mod tests {
             e.pending().len(),
             6,
             "aborting must not drop routes that are still owed"
+        );
+    }
+
+    /// A preserved ledger seeds only an EMPTY ledger, only onto interfaces
+    /// this attach owns, and only the families VPP carries.
+    #[test]
+    fn a_preserved_ledger_seeds_an_empty_ledger_on_owned_interfaces_only() {
+        use crate::ledger_record::LedgerBody;
+        let mut e = engine();
+        e.port_index.insert("eth4", None, 3);
+        let v6 = IpPrefix::V6 {
+            addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            prefix_len: 32,
+        };
+        let foreign = LedgerBody {
+            path_sets: vec![vec![crate::fib_sync::installed_path_key(nh(1), 99)]],
+            entries: vec![(v4(10, 0, 0, 0, 16), Some(0))],
+            ..Default::default()
+        };
+        assert!(
+            e.seed_ledger(&foreign).is_err(),
+            "sw_if_index 99 is not an interface this attach owns"
+        );
+        assert!(e.ledger_is_empty(), "a refused seed seeds nothing");
+
+        let body = LedgerBody {
+            path_sets: vec![vec![crate::fib_sync::installed_path_key(nh(1), 3)]],
+            entries: vec![
+                (v4(10, 0, 0, 0, 16), Some(0)),
+                (v4(10, 1, 0, 0, 16), None),
+                (v6, Some(0)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(e.seed_ledger(&body), Ok(2), "the v6 entry is out of family");
+        assert_eq!(e.counts().installed, 2);
+        assert!(e.ledger.installed_via(v4(10, 0, 0, 0, 16)).is_some());
+        assert!(e.ledger.installed_via(v4(10, 1, 0, 0, 16)).is_none());
+        assert!(
+            e.seed_ledger(&body).is_err(),
+            "a populated ledger is not an adoption"
+        );
+    }
+
+    /// The resync pushes differences, not the table: a route recorded
+    /// installed through exactly the paths it resolves to now is not
+    /// queued — and anything still owed for it from before the walk is
+    /// dropped as the older intent — while a changed nexthop, a route
+    /// whose paths were never observed, and a new route all go out.
+    #[test]
+    fn a_resync_skips_what_vpp_already_holds_through_the_same_paths() {
+        use crate::ledger_record::LedgerBody;
+        let mut e = engine();
+        e.port_index.insert("eth4", None, 3);
+        let same = v4(10, 0, 0, 0, 16);
+        let moved = v4(10, 1, 0, 0, 16);
+        let unknown = v4(10, 2, 0, 0, 16);
+        let new = v4(10, 3, 0, 0, 16);
+        e.seed_ledger(&LedgerBody {
+            path_sets: vec![vec![crate::fib_sync::installed_path_key(nh(1), 3)]],
+            entries: vec![(same, Some(0)), (moved, Some(0)), (unknown, None)],
+            ..Default::default()
+        })
+        .unwrap();
+        // A stale op owed for `same` from before this walk.
+        e.pending.upsert(same, vec![nh(9)]);
+        let m = Mirror {
+            routes: vec![
+                (same, vec![nh(1)]),
+                (moved, vec![nh(2)]),
+                (unknown, vec![nh(1)]),
+                (new, vec![nh(1)]),
+            ],
+            devices: vec![(nh(1), "eth4".into()), (nh(2), "eth4".into())],
+        };
+        let plan = e.begin_resync(&m);
+        assert_eq!(plan.unchanged, 1);
+        assert_eq!(plan.upserts, 3);
+        assert_eq!(plan.withdrawals, 0);
+        let owed: Vec<IpPrefix> = e
+            .pending
+            .drain_batch(16)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(
+            owed,
+            vec![moved, unknown, new],
+            "`same` owes nothing, stale op included"
         );
     }
 }
