@@ -196,9 +196,10 @@ PF owns the dynamic half when `frr-gate` is configured:
   link-local, and the global is what the route server passes through
   from the participant and what the gate lists hold.
 - Every `vtysh` call the module makes waits its turn on one queue: the
-  route servers are dumped one at a time, and a gate reconcile runs
-  between dumps, never alongside one (bgpd would make it wait behind
-  the dump anyway). A dump may take up to 300 s, a gate call 60 s; the
+  route servers are dumped one at a time, and a whole gate reconcile
+  (every read, update and readback) runs between two dumps, never
+  alongside one and never split across several (bgpd would make it wait
+  behind the dump anyway). A dump may take up to 300 s, a gate call 60 s; the
   queue wait counts against neither.
 
 Every BGP upload restarts bgpd and toggles the IX bridge, which

@@ -141,7 +141,9 @@ const RS_DUMP_TIMEOUT: Duration = Duration::from_secs(300);
 /// timeout in the same minute) while adding load to a busy bgpd. Queued
 /// here, the wait happens before the call's timeout starts, and the
 /// mutex's FIFO order hands the gate the next turn after the dump in
-/// flight — the dumps themselves already run one at a time.
+/// flight — the dumps themselves already run one at a time. A dump
+/// takes a turn per call (it is one call); the gate takes the same
+/// mutex for its whole reconcile in `frr_gate::gate_task`.
 struct FrrQueue {
     inner: RealVtysh,
     turn: Arc<tokio::sync::Mutex<()>>,
@@ -330,13 +332,12 @@ impl EngineHandle {
         ))?;
         let unicast = engine.unicast.clone();
         let turn = Arc::new(tokio::sync::Mutex::new(()));
-        let gate_vtysh: Arc<dyn Vtysh> = Arc::new(FrrQueue {
-            inner: RealVtysh::from_env(GATE_VTYSH_TIMEOUT),
-            turn: turn.clone(),
-        });
+        // The gate takes its turn per reconcile, not per call (see
+        // `gate_task`), so its runner is the bare one.
+        let gate_vtysh: Arc<dyn Vtysh> = Arc::new(RealVtysh::from_env(GATE_VTYSH_TIMEOUT));
         let rs_vtysh: Arc<dyn Vtysh> = Arc::new(FrrQueue {
             inner: RealVtysh::from_env(RS_DUMP_TIMEOUT),
-            turn,
+            turn: turn.clone(),
         });
         let tasks = vec![
             runtime.spawn(installer(unicast, install_rx, ctl_tx.clone())),
@@ -344,6 +345,7 @@ impl EngineHandle {
             runtime.spawn(coverage_task(cov_rx, ctl_tx.clone(), cancel.clone())),
             runtime.spawn(frr_gate::gate_task(
                 gate_vtysh,
+                turn,
                 gate_rx,
                 ctl_tx.clone(),
                 cancel.clone(),
