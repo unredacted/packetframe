@@ -4,6 +4,7 @@
 //! - [`config`]: line-based config parser (see SPEC.md §6)
 //! - [`ethtool`]: NIC interrupt coalescing over `SIOCETHTOOL`
 //! - [`module`]: the [`Module`] trait and support types (see SPEC.md §3.2)
+//! - [`placement`]: the CPUs the daemon's control-plane threads run on
 //! - [`probe`]: kernel capability probes (see SPEC.md §2.1)
 //! - [`topology`]: kernel link shapes and the MACs the router receives on
 
@@ -13,6 +14,7 @@ pub mod fib;
 #[cfg(feature = "frr")]
 pub mod frr;
 pub mod module;
+pub mod placement;
 pub mod probe;
 #[cfg(target_os = "linux")]
 pub mod statefile;

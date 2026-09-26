@@ -339,6 +339,58 @@ fn log_irq_moves(moved: &[cores::IrqMove]) {
     }
 }
 
+/// Place the daemon's control-plane threads on the CPUs that are
+/// neither VPP's nor taking NIC interrupts (`cores::control_plane_cpus`
+/// has the why and the measurement).
+///
+/// No config knob, deliberately: it only ever NARROWS a thread within
+/// the mask it already had, onto CPUs no poller and no queue IRQ is
+/// using, and it changes nothing when no such CPU exists. An operator
+/// who wants it off pins the daemon elsewhere (`CPUAffinity=`), and
+/// every placement then comes out disjoint and is skipped.
+///
+/// Never fails the attach: every outcome is one log line.
+fn place_control_plane(paths: &AttachPaths, vpp_cores: &[u16]) {
+    let (cpus, irq_cpus) = match cores::derive_control_plane(
+        &paths.sys.sysfs_net,
+        &paths.proc_irq,
+        &paths.sysfs_cpu,
+        vpp_cores,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not read the interrupt layout; control-plane threads left where \
+                 the scheduler puts them"
+            );
+            return;
+        }
+    };
+    if cpus.is_empty() {
+        tracing::info!(
+            vpp_cores = %cores::format_cpu_list(vpp_cores),
+            irq_cpus = %cores::format_cpu_list(&irq_cpus),
+            "no CPU is free of NIC queue IRQs outside VPP's cores, cpu0 and the isolated \
+             set; control-plane threads left where the scheduler puts them"
+        );
+        return;
+    }
+    match packetframe_common::placement::publish(&cpus) {
+        Ok(p) => tracing::info!(
+            cpus = %cores::format_cpu_list(&cpus),
+            placed = p.placed,
+            disjoint = p.disjoint,
+            failed = %p.failed.join("; "),
+            "control-plane threads placed off NIC queue IRQs and VPP's cores"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not place the control-plane threads; left where the scheduler puts them"
+        ),
+    }
+}
+
 /// Up to eight conflicts, for an error or warning line.
 fn irq_sample(conflicts: &[cores::IrqConflict]) -> String {
     let mut s: Vec<String> = conflicts
@@ -1051,6 +1103,11 @@ fn finish(
              resync bursts if they share a core with a worker"
         ),
     }
+    // Then the control-plane threads onto the CPUs nothing else is
+    // using — after both IRQ passes, so the interrupt layout read is the
+    // one this attach produced, and before the supervision thread
+    // exists, so it places itself at start (`placement::join`).
+    place_control_plane(paths, &vacate);
     // Whether that VPP is diverting traffic right now. From the recorded
     // steering rules, because that is the only durable evidence — and
     // getting it wrong in the `false` direction would run the resync on

@@ -180,16 +180,32 @@ mod imp {
         /// would signal "exited" immediately and the supervisor would
         /// restart-loop a perfectly healthy VPP.
         pub fn spawn(binary: &Path, conf: &Path) -> io::Result<Self> {
-            let child = Command::new(binary)
-                .arg("-c")
+            let mut cmd = Command::new(binary);
+            cmd.arg("-c")
                 .arg(conf)
                 // VPP's own `log` stanza owns its output. Inheriting
                 // our stdout would interleave dataplane chatter into
                 // packetframe's structured log.
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?;
+                .stderr(Stdio::null());
+            // This runs on the supervision thread, which is placed on
+            // the control-plane CPUs; VPP must start from the daemon's
+            // unplaced mask instead (`placement::unplaced_mask` has
+            // why). A failed reset leaves the inherited mask — not
+            // worth refusing a spawn over.
+            if let Some(mask) = packetframe_common::placement::unplaced_mask() {
+                use std::os::unix::process::CommandExt;
+                // SAFETY: the closure makes one syscall on data it owns,
+                // which is async-signal-safe between fork and exec.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mask);
+                        Ok(())
+                    });
+                }
+            }
+            let child = cmd.spawn()?;
             let pid = child.id() as i32;
 
             // Open the pidfd before anything else can reap the child.
@@ -616,5 +632,44 @@ mod tests {
         let stat = "4242 (vpp) S 1 4242 4242 0 -1 4194560 1234 0 0 0 10 20 0 0 20 0 8 0 987654 \
                     123456789 456\n";
         assert_eq!(parse_start_ticks(stat), Some(987_654));
+    }
+
+    /// A VPP spawned from a placed thread starts from the daemon's
+    /// unplaced mask, not the thread's. `sh -c <conf>` stands in for
+    /// `vpp -c <conf>`, so the "conf" is the command it runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_spawn_from_a_placed_thread_does_not_inherit_the_placement() {
+        fn allowed(status: &str) -> Vec<u16> {
+            let line = status
+                .lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+                .expect("Cpus_allowed_list");
+            crate::cores::parse_cpu_list(line.trim()).expect("cpu list")
+        }
+        // Serialised with the tests that edit every thread's mask,
+        // the leader's included.
+        let _serialised = crate::cores::affinity_tests::lock_affinity();
+        let leader = allowed(&std::fs::read_to_string("/proc/self/status").unwrap());
+        if leader.len() < 2 {
+            return; // a placement would be indistinguishable
+        }
+        let child_mask = std::thread::spawn(move || {
+            let mut one: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            unsafe { libc::CPU_SET(leader[0] as usize, &mut one) };
+            let rc =
+                unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &one) };
+            assert_eq!(rc, 0);
+            let mut p = VppProcess::spawn(Path::new("/bin/sh"), Path::new("sleep 30"))
+                .expect("spawn a stand-in");
+            let status = std::fs::read_to_string(format!("/proc/{}/status", p.pid()));
+            p.signal(libc::SIGKILL).expect("kill the stand-in");
+            p.poll_exit(Duration::from_secs(5)).expect("reap");
+            allowed(&status.expect("child status"))
+        })
+        .join()
+        .expect("spawning thread");
+        let leader = allowed(&std::fs::read_to_string("/proc/self/status").unwrap());
+        assert_eq!(child_mask, leader, "the child took the leader's mask");
     }
 }

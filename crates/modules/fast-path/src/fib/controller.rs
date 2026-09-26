@@ -312,6 +312,11 @@ impl RouteController {
             .worker_threads(2)
             .enable_all()
             .thread_name("packetframe-fib")
+            // A no-op for the workers, which start here, before
+            // vpp-offload has derived a set (its publish finds them by
+            // name); it is what places a blocking-pool thread started
+            // afterwards, whichever thread asked for it.
+            .on_thread_start(packetframe_common::placement::join)
             .build()
             .map_err(ControllerError::Runtime)?;
 
