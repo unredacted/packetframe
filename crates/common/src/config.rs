@@ -790,20 +790,24 @@ pub enum IntegrityAuthoritySpec {
 /// Allowed range for `integrity-authority frr interval`.
 ///
 /// The floor is what one check costs. Every tick runs a `vtysh` per
-/// counted family plus the running-config and one per upstream, each
-/// with a 10 s timeout, and `show bgp <afi> unicast statistics` walks
-/// the whole table — cheap at the lab rig's 69k routes, unmeasured at a
-/// full one. Below ten seconds a slow tick simply runs back to back.
+/// counted family plus one per upstream and the running-config, each
+/// with a 30 s timeout (the fast-path's `VTYSH_TIMEOUT`), and `show bgp
+/// <afi> unicast statistics` walks the whole table — cheap at the lab
+/// rig's 69k routes, and past 10 s on a full-table box under refill
+/// load. Below ten seconds a slow tick simply runs back to back.
 ///
 /// The ceiling comes from the report-age limit the steering gate
 /// applies: a report older than `STEER_MAX_REPORT_AGE` (900 s) is
 /// `Stale` and refuses. **One failed check must not be able to age the
 /// retained report out**, and the arithmetic for that is not "interval
-/// below the limit". The checker sleeps a full interval after every
-/// attempt, failed or not, so from a report at t=0 the next attempt
-/// lands at about `interval + check time` and — if that one fails, which
-/// retains the old report — the one after it at twice that. That second
-/// attempt has to land before t=900.
+/// below the limit". Assume the checker sleeps a full interval after
+/// every attempt: from a report at t=0 the next attempt lands at about
+/// `interval + check time` and — if that one fails, which retains the
+/// old report — the one after it at twice that. That second attempt has
+/// to land before t=900. An unreadable attempt is in fact retried sooner
+/// (from 10 s, doubling back up to the interval; the fast-path's
+/// `next_check_delay`), which only brings the second attempt earlier.
+/// The ceiling is deliberately not relaxed to rely on that.
 ///
 /// An earlier revision allowed two thirds of the limit (600 s) and said
 /// it left room for one failed check. It did not: attempt at ~600,

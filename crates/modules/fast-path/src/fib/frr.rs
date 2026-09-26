@@ -833,6 +833,49 @@ pub fn observation(
     }
 }
 
+/// The first retry after an `Unreadable` check, and the base its
+/// backoff doubles from. The same ten seconds as the interval floor
+/// (`FRR_INTERVAL_SECS`), and for the same reason: below it a slow
+/// check simply runs back to back.
+pub const UNREADABLE_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the checker sleeps before its next check, given how many
+/// checks in a row have come back `Unreadable`.
+///
+/// A readable check — `Clean` or `Disqualified` — is followed by the
+/// full interval. An unreadable one is retried sooner, because it
+/// established nothing and the retained report is what a steering gate
+/// is left holding: vpp-offload's fresh-convergence hold releases only
+/// on a CURRENT converged report, so on a loaded full-table box every
+/// timed-out sample used to cost a whole interval of delayed verify
+/// after the table was already complete.
+///
+/// **Doubling, capped at the interval**, rather than a fixed short
+/// retry. Most unreadable checks are a daemon too busy to answer in the
+/// subprocess budget, and killing a timed-out `vtysh` does not withdraw
+/// the command it already wrote — that is queued on the daemon's socket
+/// and runs when the daemon's event loop reaches it (how a vty session
+/// reads its input; not measured here) — so an aggressive retry stacks a
+/// second table walk behind the first. The rest are persistent — output
+/// this parser does not accept, a ready upstream with no epoch — and a
+/// fixed retry would run the whole check every ten seconds for as long
+/// as they last. The backoff reaches the interval within a few attempts
+/// either way.
+///
+/// Nothing about what an unreadable check MEANS changes: it retains the
+/// previous report under the age policy and any standing revocation.
+/// This only decides when the next chance to renew it comes.
+pub fn next_check_delay(
+    interval: std::time::Duration,
+    consecutive_unreadable: u32,
+) -> std::time::Duration {
+    let Some(doublings) = consecutive_unreadable.checked_sub(1) else {
+        return interval;
+    };
+    let factor = 1u32.checked_shl(doublings).unwrap_or(u32::MAX);
+    UNREADABLE_RETRY_FLOOR.saturating_mul(factor).min(interval)
+}
+
 /// Split `vtysh`'s concatenated output into its first two JSON
 /// documents.
 ///
@@ -2014,6 +2057,56 @@ router bgp 65000
                 &[AuthorityFamily::V4, AuthorityFamily::V6]
             )
             .is_none());
+        }
+    }
+
+    mod check_pacing {
+        use super::*;
+        use std::time::Duration;
+
+        const INTERVAL: Duration = Duration::from_secs(300);
+
+        /// A readable check — clean or disqualified — keeps the full
+        /// interval. The flap cost the runbook states (one to two
+        /// intervals) is a property of that, and pacing does not touch
+        /// it.
+        #[test]
+        fn a_readable_check_waits_the_full_interval() {
+            assert_eq!(next_check_delay(INTERVAL, 0), INTERVAL);
+        }
+
+        /// The first unreadable check retries at the floor and each
+        /// further one doubles, so a persistent failure reaches the
+        /// interval within a few attempts instead of running the whole
+        /// check every ten seconds for as long as it lasts.
+        #[test]
+        fn unreadable_checks_back_off_from_the_floor_to_the_interval() {
+            let got: Vec<u64> = (1..=7)
+                .map(|n| next_check_delay(INTERVAL, n).as_secs())
+                .collect();
+            assert_eq!(got, vec![10, 20, 40, 80, 160, 300, 300]);
+        }
+
+        /// The production shape: a short interval caps the backoff at
+        /// itself, so a retry is never LATER than the interval would
+        /// have been.
+        #[test]
+        fn the_backoff_never_exceeds_the_interval() {
+            let short = Duration::from_secs(30);
+            for n in 0..=64 {
+                assert!(next_check_delay(short, n) <= short, "streak {n}");
+            }
+            assert_eq!(next_check_delay(short, 1), UNREADABLE_RETRY_FLOOR);
+            assert_eq!(next_check_delay(short, 2), Duration::from_secs(20));
+            assert_eq!(next_check_delay(short, 3), short);
+        }
+
+        /// A streak long enough to overflow the doubling saturates
+        /// rather than wrapping back to a short delay.
+        #[test]
+        fn a_long_streak_saturates_at_the_interval() {
+            assert_eq!(next_check_delay(INTERVAL, 33), INTERVAL);
+            assert_eq!(next_check_delay(INTERVAL, u32::MAX), INTERVAL);
         }
     }
 }

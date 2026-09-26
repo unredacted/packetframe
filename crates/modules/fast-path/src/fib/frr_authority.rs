@@ -45,24 +45,45 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use packetframe_common::config::{AuthorityFamily, AuthorityUpstream};
-use packetframe_common::fib::TableCompleteness;
+use packetframe_common::fib::{AuthorityObservation, TableCompleteness};
 use packetframe_common::frr::{RealVtysh, Vtysh};
 
 use crate::fib::frr::{
-    classify_eligibility, mirror_family_mismatch, observation, parse_established_epoch,
-    parse_export_policy, parse_total_prefixes, parse_upstream_state, split_two_json, Eligibility,
-    ExportPolicy, UpstreamState,
+    classify_eligibility, mirror_family_mismatch, next_check_delay, observation,
+    parse_established_epoch, parse_export_policy, parse_total_prefixes, parse_upstream_state,
+    split_two_json, Eligibility, ExportPolicy, UpstreamState,
 };
 use crate::fib::integrity::{Comparison, Drift, SharedSnapshot, DEFAULT_DRIFT_WARN_FRACTION};
 use crate::fib::programmer::FibProgrammerHandle;
 
 /// Subprocess budget for one `vtysh` call.
 ///
-/// Matches `BIRDC_TIMEOUT` and for the same reason: it is a ceiling that
-/// catches a genuine hang, not a latency target. `show running-config`
-/// is the slowest of the four and returns well inside a second on the
-/// reference fleet.
-pub const VTYSH_TIMEOUT: Duration = Duration::from_secs(10);
+/// A ceiling that catches a genuine hang, not a latency target — but
+/// sized for a LOADED full-table box, which the 10 s it used to share
+/// with `BIRDC_TIMEOUT` was not. On a production router refilling a
+/// ~1.3M-route table at 30–60% softirq, both `show bgp ipv4 unicast
+/// statistics` and `show running-config` timed out at 10 s on check
+/// after check for several minutes, though the running-config returns
+/// well inside a second on an idle box. The load is what changed, not
+/// the commands: every read waits its turn on the daemon's main event
+/// loop behind the UPDATE processing (bgpd) or route installs (zebra)
+/// of the refill, and the statistics read then walks the whole table on
+/// top of that. None of the cheaper counters measures the same thing —
+/// `ribCount` and `pfxSnt` are ruled out in [`crate::fib::frr`]'s module
+/// docs, and summing per-peer `pfxRcd` counts a prefix once per upstream
+/// that sends it. `birdc`'s premise — bird answers synchronously against
+/// the live RIB — does not carry over.
+///
+/// A short budget is worse than useless here: a killed `vtysh` loses the
+/// answer without withdrawing the work (see
+/// [`crate::fib::frr::next_check_delay`]), so the daemon pays for the
+/// walk and the checker gets nothing for it.
+///
+/// Why not longer: `FRR_INTERVAL_SECS`'s ceiling assumes a check fits in
+/// half of a 300 s interval, and a check is the counts, then one call
+/// per upstream, then the running-config — sequentially. At 30 s, one
+/// upstream's check is at most 90 s and two upstreams' 120 s.
+pub const VTYSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct FrrAuthorityConfig {
@@ -208,20 +229,48 @@ impl FrrAuthorityChecker {
             pf_peer = %self.config.pf_peer,
             "FrrAuthorityChecker started"
         );
+        let shutdown = self.shutdown.clone();
+        let mut unreadable_streak = 0u32;
         loop {
+            let delay = next_check_delay(self.config.interval, unreadable_streak);
+            if unreadable_streak > 0 {
+                debug!(
+                    streak = unreadable_streak,
+                    retry_in_secs = delay.as_secs(),
+                    "FRR authority: check unreadable, retrying before the interval"
+                );
+            }
             tokio::select! {
-                _ = self.shutdown.cancelled() => {
+                _ = shutdown.cancelled() => {
                     info!("FrrAuthorityChecker shutdown");
                     return;
                 }
-                _ = tokio::time::sleep(self.config.interval) => {
-                    self.run_check().await;
-                }
+                _ = tokio::time::sleep(delay) => {}
             }
+            // The check races shutdown too. With a 30 s subprocess
+            // budget a check can outlast the controller's drain window
+            // by a wide margin, and dropping it here is clean: every
+            // `vtysh` is `kill_on_drop`, nothing is published until the
+            // reads are done, and after shutdown nothing reads what was.
+            let readable = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("FrrAuthorityChecker shutdown");
+                    return;
+                }
+                readable = self.run_check() => readable,
+            };
+            unreadable_streak = if readable {
+                0
+            } else {
+                unreadable_streak.saturating_add(1)
+            };
         }
     }
 
-    async fn run_check(&mut self) {
+    /// One check. Returns whether it was READABLE — `Clean` or
+    /// `Disqualified` — which is all the loop needs to pace the next one
+    /// ([`next_check_delay`]).
+    async fn run_check(&mut self) -> bool {
         // THE PAIR, CONCURRENTLY, for the same reason the birdc checker
         // does it: the gap between the two numbers is the report's error
         // bar, and whatever the mirror does while the other number is
@@ -274,8 +323,10 @@ impl FrrAuthorityChecker {
         // fine and lost the counts is `Unreadable`, which retains the
         // previous report under the age policy and retains any standing
         // revocation. Neither of those is the same as renewing.
+        let obs = observation(&eligibility, fresh_authority, fresh_mirror, at);
+        let readable = !matches!(obs, AuthorityObservation::Unreadable);
         if let Some(handle) = self.completeness.as_ref() {
-            handle.record(observation(&eligibility, fresh_authority, fresh_mirror, at));
+            handle.record(obs);
         }
 
         let mut snap = self.snapshot.write().await;
@@ -409,6 +460,7 @@ impl FrrAuthorityChecker {
                 drift,
             });
         }
+        readable
     }
     /// Sum the declared families' prefix counts.
     ///
@@ -418,6 +470,13 @@ impl FrrAuthorityChecker {
     /// JSON documents, and splitting that stream is a parsing contract
     /// nothing on the box has been measured against. Concurrent calls
     /// narrow the window without inventing one.
+    ///
+    /// Concurrency does not double bgpd's work — each family's table is
+    /// walked once per check, and bgpd runs vty commands one at a time
+    /// on its main thread whichever order they arrive in — but it does
+    /// mean one call's [`VTYSH_TIMEOUT`] can include the other family's
+    /// walk. Checks never overlap each other: the loop awaits one before
+    /// it sleeps toward the next.
     ///
     /// A family that cannot be read fails the WHOLE count. Summing the
     /// families that answered would report a smaller authority than
@@ -452,13 +511,23 @@ impl FrrAuthorityChecker {
     /// the safety argument of this whole authority, and it belongs
     /// somewhere its tests do not need a NIC, a live FRR and a qemu job.
     /// This half is the subprocess calls and nothing else.
+    ///
+    /// **Upstreams first, running-config last.** The End-of-RIB read is
+    /// the one with a timing relationship to the counts just taken: EoR
+    /// landing between a mid-fill count that agrees with an equally
+    /// partial mirror and the read that sees it would pair the two into
+    /// a clean check, so the gap between them should be as short as the
+    /// reads allow. The running-config is the slowest read on a loaded
+    /// box, has no such relationship, and used to sit in that gap — which
+    /// a longer [`VTYSH_TIMEOUT`] would have widened threefold.
+    /// [`classify_eligibility`] does not care which answer came first.
     async fn eligibility(&mut self) -> Eligibility {
-        let export = self.export_policy().await;
         let mut upstreams = Vec::with_capacity(self.config.upstreams.len());
         for u in self.config.upstreams.clone() {
             let state = self.upstream(&u).await;
             upstreams.push((u.addr, state));
         }
+        let export = self.export_policy().await;
         classify_eligibility(export, &upstreams, &mut self.seen_epochs)
     }
 
@@ -622,6 +691,181 @@ mod tests {
         assert!(
             snapshot.read().await.last_error.is_some(),
             "the failed read is still reported, as an error rather than a verdict"
+        );
+    }
+
+    /// The error [`RealVtysh`] returns when its budget runs out, so the
+    /// fakes below fail the way production does.
+    fn timed_out() -> String {
+        format!("vtysh timed out after {VTYSH_TIMEOUT:?}")
+    }
+
+    /// A `vtysh` whose upstream is ready and whose reads can each be
+    /// made to time out, recording the first command of every call so
+    /// the order of the reads is observable.
+    #[derive(Default)]
+    struct Scripted {
+        upstream_down: AtomicBool,
+        stats_time_out: AtomicBool,
+        config_times_out: AtomicBool,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Vtysh for Scripted {
+        fn run<'a>(
+            &'a self,
+            commands: &'a [String],
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                let first = commands.first().cloned().unwrap_or_default();
+                self.calls.lock().expect("calls").push(first.clone());
+                if first.starts_with("show bgp neighbor") {
+                    let state = if self.upstream_down.load(Ordering::SeqCst) {
+                        "Active"
+                    } else {
+                        "Established"
+                    };
+                    return Ok(format!(
+                        r#"{{"192.0.2.1":{{"bgpState":"{state}","gracefulRestartInfo":{{"ipv4Unicast":{{"endOfRibStatus":{{"endOfRibRecv":true}}}}}}}}}}{{"peers":{{"192.0.2.1":{{"peerUptimeEstablishedEpoch":1790000000}}}}}}"#
+                    ));
+                }
+                if first == "show running-config" {
+                    if self.config_times_out.load(Ordering::SeqCst) {
+                        return Err(timed_out());
+                    }
+                    return Ok(String::new());
+                }
+                if self.stats_time_out.load(Ordering::SeqCst) {
+                    return Err(timed_out());
+                }
+                Ok(
+                    r#"{"ipv4Unicast":[{"instance":"VRF default","totalPrefixes":10}]}"#
+                        .to_string(),
+                )
+            })
+        }
+    }
+
+    fn checker_with_handle(
+        vtysh: Arc<Scripted>,
+    ) -> (FrrAuthorityChecker, Arc<TableCompleteness>, SharedSnapshot) {
+        let (prog, _log) = recording_handle();
+        let snapshot = shared_snapshot();
+        let handle = Arc::new(TableCompleteness::new());
+        let checker = FrrAuthorityChecker::with_vtysh(
+            config(),
+            vtysh,
+            snapshot.clone(),
+            prog,
+            CancellationToken::new(),
+        )
+        .with_completeness(handle.clone());
+        (checker, handle, snapshot)
+    }
+
+    /// A timed-out count is an observation failure: the previous report
+    /// stands exactly as it was — same sample, same `at` — nothing is
+    /// revoked, and the loop is told to retry early. The longer budget
+    /// and the retry change WHEN a sample can land, never what a failed
+    /// one means.
+    #[tokio::test]
+    async fn a_timed_out_count_retains_the_report_and_revokes_nothing() {
+        let vtysh = Arc::new(Scripted::default());
+        let (mut checker, handle, snapshot) = checker_with_handle(vtysh.clone());
+
+        assert!(checker.run_check().await, "a fully read check is readable");
+        let (before, verdict) = handle.latest_verdict();
+        assert!(before.is_some(), "the clean check published a report");
+        assert!(
+            !matches!(
+                verdict,
+                packetframe_common::fib::Completeness::Ineligible(_)
+            ),
+            "nothing disqualifying was observed: {verdict:?}"
+        );
+
+        vtysh.stats_time_out.store(true, Ordering::SeqCst);
+        assert!(
+            !checker.run_check().await,
+            "a check whose count timed out is unreadable, so the loop retries early"
+        );
+        let (after, verdict) = handle.latest_verdict();
+        assert_eq!(after, before, "the previous report is retained untouched");
+        assert!(
+            !matches!(
+                verdict,
+                packetframe_common::fib::Completeness::Ineligible(_)
+            ),
+            "a timeout is not evidence, so it cannot revoke: {verdict:?}"
+        );
+        let snap = snapshot.read().await;
+        assert!(
+            snap.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("timed out")),
+            "the timeout is reported as an error: {:?}",
+            snap.last_error
+        );
+        assert!(snap.revoked.is_none(), "and not as a disqualification");
+    }
+
+    /// The running-config read timing out is the same observation
+    /// failure, and it keeps a STANDING revocation in force: stickiness
+    /// clears only on a fully successful check, and a check that could
+    /// not read the export policy is not one — even when the upstream
+    /// that caused the revocation has recovered and the counts read
+    /// fine.
+    #[tokio::test]
+    async fn a_timed_out_running_config_keeps_a_standing_revocation() {
+        let vtysh = Arc::new(Scripted::default());
+        vtysh.upstream_down.store(true, Ordering::SeqCst);
+        let (mut checker, handle, _snapshot) = checker_with_handle(vtysh.clone());
+
+        assert!(
+            checker.run_check().await,
+            "a disqualification is readable — it is positive evidence, paced at the interval"
+        );
+        let revoked = |h: &TableCompleteness| {
+            matches!(
+                h.latest_verdict().1,
+                packetframe_common::fib::Completeness::Ineligible(
+                    packetframe_common::fib::Revocation::UpstreamNotReady(_)
+                )
+            )
+        };
+        assert!(revoked(&handle), "the down upstream revokes");
+
+        vtysh.upstream_down.store(false, Ordering::SeqCst);
+        vtysh.config_times_out.store(true, Ordering::SeqCst);
+        assert!(
+            !checker.run_check().await,
+            "counts and upstream fine, running-config timed out: unreadable"
+        );
+        assert!(
+            revoked(&handle),
+            "an unreadable check must not lift a standing revocation"
+        );
+    }
+
+    /// The End-of-RIB read follows the counts directly; the slow
+    /// running-config read goes last instead of sitting between them.
+    #[tokio::test]
+    async fn upstream_readiness_is_read_before_the_running_config() {
+        let vtysh = Arc::new(Scripted::default());
+        let (mut checker, _handle, _snapshot) = checker_with_handle(vtysh.clone());
+        checker.run_check().await;
+
+        let calls = vtysh.calls.lock().expect("calls").clone();
+        let at = |prefix: &str| {
+            calls
+                .iter()
+                .position(|c| c.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no `{prefix}` call in {calls:?}"))
+        };
+        assert!(at("show bgp ipv4 unicast statistics") < at("show bgp neighbor"));
+        assert!(
+            at("show bgp neighbor") < at("show running-config"),
+            "readiness must not wait behind the running-config: {calls:?}"
         );
     }
 }
