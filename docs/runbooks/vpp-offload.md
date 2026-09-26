@@ -1004,6 +1004,18 @@ kernel forwards the same packets to transit where they die upstream,
 invisibly; VPP drops them locally and counts them. Same outcome, one
 hop earlier, with a number attached.
 
+That floor is what a box WITHOUT a default route in VPP drops. When
+fast-path declares `fallback-default`, VPP carries the same 0.0.0.0/0
+through the same upstream, so steered traffic to anything outside the
+feed's table follows the kernel path's route instead of dying at
+null-node. That includes destinations the kernel reaches only through a
+policy-routed default outside the main table (a UniFi WAN table), which
+the exemption tripwire cannot see. Before this default reached VPP, the
+real destinations among them dropped too. The upstream's neighbour must
+resolve on a member port, like any next hop; if it cannot, the default
+counts as unresolvable and blocks the first steer. With the default in
+place, the floor is whatever the kernel itself drops.
+
 How to read it: the FLOOR is expected and flat (~19k per 2-minute
 interval on the reference primary); the signal is a RATE CHANGE. A
 step UP after a config or routing change means something real joined

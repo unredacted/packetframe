@@ -1811,6 +1811,52 @@ fn local_arp_routes_do_not_reach_the_sink_as_installs() {
     );
 }
 
+/// The `fallback-default` reaches the second tier.
+///
+/// It is injected under a local-ARP peer like the `local-prefix` /32s,
+/// so it scopes with them and never counts as a session route — but it
+/// is a gatewayed route via a real upstream, not local delivery.
+/// Filtered with the /32s, the second tier's FIB lacked it and dropped
+/// every destination only the default covers, which this tier forwards
+/// (the primary, 2026-09-26, 167 pps once steering went live).
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn the_fallback_default_reaches_the_sink() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let default = IpPrefix::V4 {
+        addr: [0, 0, 0, 0],
+        prefix_len: 0,
+    };
+    let upstream = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: PeerId::local_arp(33),
+                prefix: default,
+                nexthops: vec![upstream],
+                path_id: None,
+                local_pref: None,
+            })
+            .await
+            .expect("apply fallback-default Add");
+    });
+
+    let calls = sink.calls();
+    assert!(
+        calls.iter().any(
+            |c| matches!(c, SinkCall::Resolved(p, nhs) if *p == default && nhs == &vec![upstream])
+        ),
+        "the fallback default must be announced via its upstream: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, SinkCall::Withdrawn(p) if *p == default)),
+        "and never withdrawn as if it were local delivery: {calls:?}"
+    );
+}
+
 /// A withdrawal reaches the sink, and by the same path for every way a
 /// prefix can stop forwarding.
 ///
