@@ -431,6 +431,18 @@ mod tests {
 
         drop(done);
         h.join().unwrap();
+        // `join` returns on the exit futex wake, which can precede the
+        // kernel releasing the task: for a moment its /proc entry, and
+        // its start time, are still there. Wait (bounded) for it to go
+        // before asserting the exited-thread refusal.
+        let gone = std::path::PathBuf::from(format!("/proc/self/task/{tid}"));
+        for _ in 0..200 {
+            if !gone.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!gone.exists(), "task {tid} never left /proc");
         let e = place_thread(tid, real, &[a]).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::ESRCH), "{e}");
     }
