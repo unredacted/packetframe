@@ -121,6 +121,19 @@ suppression holds by construction rather than by knob: MCAM rules match
 IPv4 fields, so ARP frames (0x0806) can never be steered — VPP
 physically cannot receive an ARP request.
 
+**Only IPv4 neighbours are programmed.** VPP carries v4 routes only (no
+v6 packet can be steered in; see gate 0b below), so the resolver's IPv6
+neighbours are neither programmed as static neighbours nor pinned in a
+bridge domain's L2FIB, and the neighbour gauges
+(`packetframe_vpp_neighbours_unplaced`, `packetframe_vpp_neighbours_flooded`,
+`packetframe_vpp_neighbour_moves`) count v4 only. `show ip6 neighbors`
+listing entries on an adopted VPP means an earlier build programmed
+them; they are inert (no v6 route
+references them) and deliberately left until the next VPP restart,
+because deleting each one costs the same worker-barrier walk that
+programming them did. A v6-only MAC an earlier build pinned in the
+L2FIB is withdrawn once, at the next resync, as a stale entry.
+
 ## Healthy state
 
 Two ports of call. `packetframe status` for the structured view:
