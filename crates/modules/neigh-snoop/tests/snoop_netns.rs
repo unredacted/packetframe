@@ -740,17 +740,25 @@ fn emits_nothing() {
 /// every invocation (one line per process, so batching is visible),
 /// and serves a canned received-routes JSON. Written by the test into
 /// the scratch directory; the engine finds it via `PACKETFRAME_VTYSH`.
+/// A `frr10` file in the state directory switches `show … prefix-list`
+/// to FRR 10's per-daemon shape (a zebra `%` reply, then a `BGP:`
+/// section), which the first gate parser read as "absent".
 fn write_fake_vtysh(state: &std::path::Path) -> PathBuf {
     let script = format!(
         r#"#!/bin/sh
 STATE="{state}"
 echo "$*" >> "$STATE/log"
 show_list() {{
-  fam="$1"; name="$2"; f="$STATE/$3"
+  fam="$1"; name="$2"; f="$STATE/$3"; daemon=""
+  if [ -f "$STATE/frr10" ]; then
+    # FRR 10's per-daemon shape: zebra lacks the list, bgpd holds it.
+    echo "% Can't find specified prefix-list"
+    daemon="BGP: "
+  fi
   if [ -f "$f" ]; then
-    echo "$fam prefix-list $name: $(wc -l < "$f" | tr -d ' ') entries"
+    echo "$daemon$fam prefix-list $name: $(wc -l < "$f" | tr -d ' ') entries"
     sed 's/^/   /' "$f"
-  else
+  elif [ -z "$daemon" ]; then
     echo "% Can't find specified prefix-list"
   fi
 }}
@@ -889,7 +897,10 @@ fn gate_reconciles_lists_and_measures_route_server_coverage() {
     );
 
     // FRR reload: a bgpd restart empties BOTH lists back to their
-    // placeholders; the next tick refills.
+    // placeholders; the next tick refills. From here on the fake answers
+    // in FRR 10's per-daemon shape, so the refill, its readback and the
+    // removal below all run against it.
+    std::fs::write(rig.names.persist.join("frr10"), "").unwrap();
     std::fs::write(&v4_file, "seq 5 deny 0.0.0.0/32\n").unwrap();
     std::fs::write(rig.names.persist.join("v6"), "seq 5 deny ::/128\n").unwrap();
     wait_for(Duration::from_secs(15), "reload refill", || {

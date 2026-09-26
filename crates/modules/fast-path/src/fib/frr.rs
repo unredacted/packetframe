@@ -222,7 +222,8 @@ pub enum ExportPolicy {
     Filtered { why: String },
 }
 
-/// Read the PF peer's outbound policy out of `show running-config`.
+/// Read the PF peer's outbound policy out of `show running-config`, for
+/// the families being attested.
 ///
 /// **A blacklist of the directives known to narrow a table, and its
 /// doc used to claim the opposite.** The first version said it was a
@@ -243,19 +244,40 @@ pub enum ExportPolicy {
 /// belongs to**. Plain `maximum-prefix` caps what the peer may send us
 /// and is not covered.
 ///
+/// **An outbound route-map is read, not refused on sight.** The first
+/// launch on an FRR 10 production router disqualified a mirror whose
+/// outbound maps drop nothing: an empty `permit 10` for v4, and for v6 a
+/// `match` + `set ipv6 next-hop` entry ahead of an empty `permit 20`.
+/// Whether a map passes every route is [`route_map_narrows`]'s call, and
+/// every shape it does not recognise still narrows.
+///
+/// **Only the attested families count.** A line inside `address-family
+/// ipv6 unicast` shapes the v6 table and nothing else; refusing a v4-only
+/// attestation over it refuses on a table nobody compared (and a v6 feed
+/// the declaration does not cover is already revoked by
+/// [`mirror_family_mismatch`]). Lines outside any address-family block
+/// apply to every family, and so does a block this cannot place as v4 or
+/// v6 — the conservative reading.
+///
 /// Peer-group inheritance is not an extra: FRR keys an inherited policy
 /// by the GROUP name, and the peer's own line reads `neighbor <peer>
 /// peer-group <G>`, which matches nothing in the list. Without
 /// resolving it, the single most ordinary way to attach a route-map to
 /// a session was invisible and this returned `Unfiltered` over a
 /// narrowed feed — the one failure mode the counts cannot catch
-/// afterwards (review finding, PR #229).
+/// afterwards (review finding, PR #229). Membership is read wherever it
+/// appears; the group's policy lines are scoped per family exactly like
+/// the peer's own.
 ///
 /// `next-hop-self` is the one known-harmless per-peer AF directive on
 /// this path — it rewrites an attribute, it does not remove prefixes.
 ///
 /// [D2b]: the discovery gate in the VPP readiness plan
-pub fn parse_export_policy(running_config: &str, peer: &str) -> ExportPolicy {
+pub fn parse_export_policy(
+    running_config: &str,
+    peer: &str,
+    families: &[AuthorityFamily],
+) -> ExportPolicy {
     // The peer's own name, plus every peer-group it is a member of.
     // Resolved first, in its own pass, because a `peer-group` line can
     // appear after the group's policy in the rendered config and a
@@ -270,30 +292,98 @@ pub fn parse_export_policy(running_config: &str, peer: &str) -> ExportPolicy {
             }
         }
     }
+    // Its own pass for the same reason: FRR renders the route-maps after
+    // the `router bgp` block that references them.
+    let maps = parse_route_maps(running_config);
+    let needles: Vec<(String, &String)> = names
+        .iter()
+        .map(|name| (format!("neighbor {name} "), name))
+        .collect();
 
-    for name in &names {
-        let needle = format!("neighbor {name} ");
-        for raw in running_config.lines() {
-            let line = raw.trim();
-            let Some(tail) = line.strip_prefix(&needle) else {
+    let mut scope = AfScope::All;
+    for raw in running_config.lines() {
+        let line = raw.trim();
+        // A column-0 line (`exit`, `router bgp …`, `route-map …`, `!`)
+        // closes any address-family block that was open.
+        if !raw.starts_with(char::is_whitespace) {
+            scope = AfScope::All;
+        }
+        if let Some(af) = line.strip_prefix("address-family ") {
+            scope = AfScope::of(af);
+            continue;
+        }
+        if line == "exit-address-family" {
+            scope = AfScope::All;
+            continue;
+        }
+        if !scope.covers_any(families) {
+            continue;
+        }
+        for (needle, name) in &needles {
+            let Some(tail) = line.strip_prefix(needle.as_str()) else {
                 continue;
             };
-            if narrows_export(tail) {
-                let via = if name == peer {
-                    String::new()
-                } else {
-                    format!(" (inherited by {peer} from peer-group {name})")
-                };
-                return ExportPolicy::Filtered {
-                    why: format!("`neighbor {name} {tail}` narrows what this peer receives{via}"),
-                };
-            }
+            let Some(detail) = narrows_export(tail, &maps) else {
+                continue;
+            };
+            let within = match &scope {
+                AfScope::All => String::new(),
+                AfScope::Only { label, .. } => format!(" in `address-family {label}`"),
+            };
+            let via = if name.as_str() == peer {
+                String::new()
+            } else {
+                format!(" (inherited by {peer} from peer-group {name})")
+            };
+            return ExportPolicy::Filtered {
+                why: format!(
+                    "`neighbor {name} {tail}`{within} narrows what this peer receives{via}{detail}"
+                ),
+            };
         }
     }
     ExportPolicy::Unfiltered
 }
 
+/// The families a `neighbor …` line applies to, from the address-family
+/// block it sits in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AfScope {
+    /// Outside any address-family block, or inside one that is neither
+    /// `ipv4 …` nor `ipv6 …`: every family, which is the safe reading.
+    All,
+    /// Inside `address-family <label>`, which shapes `family` only.
+    Only {
+        family: AuthorityFamily,
+        label: String,
+    },
+}
+
+impl AfScope {
+    /// From the words after `address-family`. Every `ipv4` SAFI maps to
+    /// v4 rather than only `unicast`: a policy on `ipv4 labeled-unicast`
+    /// counted against a v4 attestation errs toward refusing.
+    fn of(af: &str) -> Self {
+        let label = af.split_whitespace().collect::<Vec<_>>().join(" ");
+        let family = match label.split(' ').next() {
+            Some("ipv4") => AuthorityFamily::V4,
+            Some("ipv6") => AuthorityFamily::V6,
+            _ => return AfScope::All,
+        };
+        AfScope::Only { family, label }
+    }
+
+    fn covers_any(&self, families: &[AuthorityFamily]) -> bool {
+        match self {
+            AfScope::All => true,
+            AfScope::Only { family, .. } => families.contains(family),
+        }
+    }
+}
+
 /// Whether one `neighbor <x> …` tail narrows what FRR SENDS that peer.
+/// `Some(detail)` when it does; the detail is appended to the operator
+/// message and is empty when the line alone says everything.
 ///
 /// **Outbound only.** An inbound filter on the packetframe peer governs
 /// what packetframe advertises to FRR, which is nothing — it cannot
@@ -310,21 +400,163 @@ pub fn parse_export_policy(running_config: &str, peer: &str) -> ExportPolicy {
 /// Direction is the LAST word of a `route-map`/`prefix-list`/
 /// `filter-list`/`distribute-list` line; anything other than a literal
 /// `in` counts as narrowing, so an unrecognised form errs toward
-/// refusing. `unsuppress-map` and `maximum-prefix-out` only ever shape
-/// the outbound table. Plain `maximum-prefix` limits what the peer
-/// sends US, so it is inbound and ignored.
-fn narrows_export(tail: &str) -> bool {
-    let mut words = tail.split_whitespace();
-    let Some(kw) = words.next() else {
-        return false;
-    };
-    match kw {
-        "route-map" | "prefix-list" | "filter-list" | "distribute-list" => {
-            tail.split_whitespace().last() != Some("in")
+/// refusing. An outbound `route-map <NAME> out` is the one line whose
+/// verdict depends on something else in the config — the map itself —
+/// and only that exact three-word form is looked up. `unsuppress-map`
+/// and `maximum-prefix-out` only ever shape the outbound table. Plain
+/// `maximum-prefix` limits what the peer sends US, so it is inbound and
+/// ignored.
+fn narrows_export(tail: &str, maps: &HashMap<String, RouteMap>) -> Option<String> {
+    let words: Vec<&str> = tail.split_whitespace().collect();
+    match words.first().copied()? {
+        "route-map" => match words[..] {
+            [.., "in"] => None,
+            [_, name, "out"] => route_map_narrows(maps, name).map(|why| format!(": {why}")),
+            _ => Some(String::new()),
+        },
+        "prefix-list" | "filter-list" | "distribute-list" => {
+            (words.last() != Some(&"in")).then(String::new)
         }
-        "unsuppress-map" | "maximum-prefix-out" => true,
-        _ => false,
+        "unsuppress-map" | "maximum-prefix-out" => Some(String::new()),
+        _ => None,
     }
+}
+
+/// One `route-map <NAME> permit|deny <SEQ>` entry and its clauses, as
+/// `show running-config` renders them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteMapEntry {
+    permit: bool,
+    seq: u32,
+    /// Each indented line under the header, trimmed.
+    clauses: Vec<String>,
+}
+
+/// Every entry of one route-map, or the header that could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RouteMap {
+    entries: Vec<RouteMapEntry>,
+    /// A `route-map <NAME> …` header this does not understand. The map
+    /// is then of unknown shape and narrows.
+    unparsed: Option<String>,
+}
+
+/// Collect every route-map in `show running-config`, keyed by name.
+///
+/// A header is a line whose first word is `route-map` — no other line
+/// FRR renders starts with it (a neighbor's reads `neighbor …`,
+/// redistribution's `redistribute …`). Its clauses are the indented
+/// lines that follow, up to the next column-0 line (`exit` in FRR 10,
+/// `!` in older renderings).
+fn parse_route_maps(running_config: &str) -> HashMap<String, RouteMap> {
+    let mut maps: HashMap<String, RouteMap> = HashMap::new();
+    // The map and entry index clauses are currently being added to.
+    let mut open: Option<(String, usize)> = None;
+    for raw in running_config.lines() {
+        let line = raw.trim();
+        let indented = raw.starts_with(char::is_whitespace);
+        if indented && !line.is_empty() && line != "exit" && line != "!" {
+            if let Some((name, idx)) = &open {
+                if let Some(e) = maps.get_mut(name).and_then(|m| m.entries.get_mut(*idx)) {
+                    e.clauses.push(line.to_string());
+                }
+                continue;
+            }
+        }
+        open = None;
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.first() != Some(&"route-map") {
+            continue;
+        }
+        let Some(name) = words.get(1) else {
+            continue;
+        };
+        let map = maps.entry(name.to_string()).or_default();
+        let entry = match words[..] {
+            [_, _, action @ ("permit" | "deny"), seq] => {
+                seq.parse::<u32>().ok().map(|seq| RouteMapEntry {
+                    permit: action == "permit",
+                    seq,
+                    clauses: Vec::new(),
+                })
+            }
+            _ => None,
+        };
+        match entry {
+            Some(e) => {
+                map.entries.push(e);
+                open = Some((name.to_string(), map.entries.len() - 1));
+            }
+            None => {
+                map.unparsed.get_or_insert_with(|| line.to_string());
+            }
+        }
+    }
+    maps
+}
+
+/// Why applying route-map `name` outbound can drop a route, or `None`
+/// when it passes every route.
+///
+/// It passes every route when some entry is `permit` with no `match`,
+/// and every entry before it is a `permit` too. A `permit` entry with
+/// matches never drops: a route it matches is permitted (its `set`
+/// clauses rewrite attributes, which is not narrowing), and a route it
+/// does not match falls through to the next entry — so walking in
+/// sequence order, the first unconditional permit is reached by every
+/// route that nothing before it permitted.
+///
+/// Everything else narrows, and deliberately includes shapes that might
+/// not: a `deny` anywhere before that entry; no unconditional permit at
+/// all (a route no entry matches meets FRR's implicit deny); a clause
+/// other than `match`/`set`/`description` in the entries walked
+/// (`call`, `on-match`, `continue` can each carry a route to an entry
+/// this walk never inspected); an unreadable header; and a name with no
+/// map, which FRR applies as deny-all.
+fn route_map_narrows(maps: &HashMap<String, RouteMap>, name: &str) -> Option<String> {
+    let Some(map) = maps.get(name) else {
+        return Some(format!(
+            "route-map {name} is not defined, and FRR applies a missing route-map as deny-all"
+        ));
+    };
+    if let Some(header) = &map.unparsed {
+        return Some(format!(
+            "route-map {name} has an entry this check cannot read (`{header}`)"
+        ));
+    }
+    let mut entries: Vec<&RouteMapEntry> = map.entries.iter().collect();
+    entries.sort_by_key(|e| e.seq);
+    for e in entries {
+        let action = if e.permit { "permit" } else { "deny" };
+        let mut conditional = false;
+        for clause in &e.clauses {
+            match clause.split_whitespace().next() {
+                Some("set") | Some("description") => {}
+                Some("match") => conditional = true,
+                _ => {
+                    return Some(format!(
+                        "route-map {name} entry `{action} {}` has `{clause}`, which this check \
+                         does not follow",
+                        e.seq
+                    ))
+                }
+            }
+        }
+        if !e.permit {
+            return Some(format!(
+                "route-map {name} entry `deny {}` comes before any permit that matches \
+                 everything",
+                e.seq
+            ));
+        }
+        if !conditional {
+            return None;
+        }
+    }
+    Some(format!(
+        "route-map {name} has no permit entry without a `match`, so a route no entry \
+         matches is denied"
+    ))
 }
 
 // ---------------------------------------------------------------------
@@ -819,7 +1051,7 @@ router bgp 65000
  exit-address-family
 ";
         assert_eq!(
-            parse_export_policy(cfg, "192.0.2.202"),
+            parse_export_policy(cfg, "192.0.2.202", DUAL),
             ExportPolicy::Unfiltered
         );
     }
@@ -835,7 +1067,7 @@ router bgp 65000
   neighbor 192.0.2.202 route-map TRIM out
  exit-address-family
 ";
-        match parse_export_policy(cfg, "192.0.2.202") {
+        match parse_export_policy(cfg, "192.0.2.202", DUAL) {
             ExportPolicy::Filtered { why } => assert!(why.contains("route-map"), "{why}"),
             other => panic!("expected Filtered, got {other:?}"),
         }
@@ -845,7 +1077,7 @@ router bgp 65000
     fn a_prefix_list_is_filtering() {
         let cfg = "  neighbor 192.0.2.202 prefix-list ONLY-SOME out\n";
         assert!(matches!(
-            parse_export_policy(cfg, "192.0.2.202"),
+            parse_export_policy(cfg, "192.0.2.202", DUAL),
             ExportPolicy::Filtered { .. }
         ));
     }
@@ -865,7 +1097,7 @@ router bgp 65000
  exit-address-family
 ";
         assert_eq!(
-            parse_export_policy(cfg, "192.0.2.202"),
+            parse_export_policy(cfg, "192.0.2.202", DUAL),
             ExportPolicy::Unfiltered
         );
     }
@@ -878,7 +1110,7 @@ router bgp 65000
   neighbor 192.0.2.202 route-map PACKETFRAME-IN in
   neighbor 192.0.2.202 route-map TRIM out
 ";
-        let ExportPolicy::Filtered { why } = parse_export_policy(cfg, "192.0.2.202") else {
+        let ExportPolicy::Filtered { why } = parse_export_policy(cfg, "192.0.2.202", DUAL) else {
             panic!("an outbound route-map must disqualify");
         };
         assert!(why.contains("TRIM out"), "names the outbound line: {why}");
@@ -892,7 +1124,7 @@ router bgp 65000
             let cfg = format!("  neighbor 192.0.2.202 {tail}\n");
             assert!(
                 matches!(
-                    parse_export_policy(&cfg, "192.0.2.202"),
+                    parse_export_policy(&cfg, "192.0.2.202", DUAL),
                     ExportPolicy::Filtered { .. }
                 ),
                 "{tail}"
@@ -904,7 +1136,7 @@ router bgp 65000
  neighbor 192.0.2.202 peer-group PF
 ";
         assert_eq!(
-            parse_export_policy(cfg, "192.0.2.202"),
+            parse_export_policy(cfg, "192.0.2.202", DUAL),
             ExportPolicy::Unfiltered,
             "an inherited inbound filter is no more export policy than the peer's own"
         );
@@ -915,9 +1147,285 @@ router bgp 65000
     fn a_filter_on_a_different_peer_is_ignored() {
         let cfg = "  neighbor 192.168.10.1 route-map UPSTREAM in\n";
         assert_eq!(
-            parse_export_policy(cfg, "192.0.2.202"),
+            parse_export_policy(cfg, "192.0.2.202", DUAL),
             ExportPolicy::Unfiltered
         );
+    }
+
+    const V4: &[AuthorityFamily] = &[AuthorityFamily::V4];
+    const V6: &[AuthorityFamily] = &[AuthorityFamily::V6];
+    const DUAL: &[AuthorityFamily] = &[AuthorityFamily::V4, AuthorityFamily::V6];
+
+    fn filtered_why(cfg: &str, families: &[AuthorityFamily]) -> String {
+        match parse_export_policy(cfg, "192.0.2.202", families) {
+            ExportPolicy::Filtered { why } => why,
+            ExportPolicy::Unfiltered => panic!("expected Filtered for {families:?}"),
+        }
+    }
+
+    /// The shape of the FRR 10 production router whose first launch
+    /// disqualified the mirror: an inbound deny-all, and outbound maps
+    /// that rewrite attributes and drop nothing. Sanitized, structure
+    /// verbatim.
+    const PASS_ALL_OUT: &str = "\
+router bgp 64500
+ neighbor 192.0.2.202 remote-as 64500
+ !
+ address-family ipv4 unicast
+  neighbor 192.0.2.202 activate
+  neighbor 192.0.2.202 send-community all
+  neighbor 192.0.2.202 route-map PF-IN in
+  neighbor 192.0.2.202 route-map PF-OUT-V4 out
+ exit-address-family
+ !
+ address-family ipv6 unicast
+  neighbor 192.0.2.202 activate
+  neighbor 192.0.2.202 route-map PF-IN in
+  neighbor 192.0.2.202 route-map PF-OUT-V6 out
+ exit-address-family
+exit
+!
+bgp as-path access-list LOCAL-ORIGIN seq 5 permit ^$
+!
+route-map PF-IN deny 10
+exit
+!
+route-map PF-OUT-V4 permit 10
+exit
+!
+route-map PF-OUT-V6 permit 10
+ match as-path LOCAL-ORIGIN
+ set ipv6 next-hop global 2001:db8::2
+exit
+!
+route-map PF-OUT-V6 permit 20
+exit
+";
+
+    #[test]
+    fn a_pass_all_outbound_route_map_is_unfiltered() {
+        for families in [V4, V6, DUAL] {
+            assert_eq!(
+                parse_export_policy(PASS_ALL_OUT, "192.0.2.202", families),
+                ExportPolicy::Unfiltered,
+                "{families:?}"
+            );
+        }
+    }
+
+    /// A `deny` walked before the first unconditional permit drops the
+    /// routes it matches; the message names the entry.
+    #[test]
+    fn a_deny_before_the_unconditional_permit_is_filtering() {
+        let cfg = "\
+router bgp 64500
+ address-family ipv4 unicast
+  neighbor 192.0.2.202 route-map TRIM out
+ exit-address-family
+exit
+route-map TRIM deny 10
+ match ip address prefix-list SOME
+exit
+route-map TRIM permit 20
+exit
+";
+        let why = filtered_why(cfg, V4);
+        assert!(why.contains("route-map TRIM out"), "names the line: {why}");
+        assert!(why.contains("`deny 10`"), "and the entry: {why}");
+        assert!(why.contains("address-family ipv4 unicast"), "{why}");
+    }
+
+    /// Sequence order, not rendering order, decides which entry is
+    /// walked first.
+    #[test]
+    fn entries_are_walked_in_sequence_order() {
+        let cfg = "\
+ neighbor 192.0.2.202 route-map TRIM out
+route-map TRIM permit 20
+exit
+route-map TRIM deny 10
+exit
+";
+        assert!(filtered_why(cfg, V4).contains("`deny 10`"));
+    }
+
+    /// Every entry conditional: a route none of them matches meets
+    /// FRR's implicit deny.
+    #[test]
+    fn a_map_with_only_conditional_permits_is_filtering() {
+        let cfg = "\
+ neighbor 192.0.2.202 route-map ONLY-LOCAL out
+route-map ONLY-LOCAL permit 10
+ match as-path LOCAL-ORIGIN
+ set local-preference 200
+exit
+";
+        let why = filtered_why(cfg, V4);
+        assert!(why.contains("no permit entry without a `match`"), "{why}");
+    }
+
+    /// FRR applies a referenced-but-missing map as deny-all.
+    #[test]
+    fn an_undefined_route_map_is_filtering() {
+        let cfg = "\
+ address-family ipv4 unicast
+  neighbor 192.0.2.202 route-map NOWHERE out
+ exit-address-family
+";
+        let why = filtered_why(cfg, V4);
+        assert!(why.contains("NOWHERE is not defined"), "{why}");
+    }
+
+    /// Clauses that move a route to an entry the walk never inspected,
+    /// and headers that cannot be read, are of unknown shape and narrow.
+    #[test]
+    fn unknown_route_map_shapes_are_filtering() {
+        for clause in ["call OTHER", "on-match goto 30", "continue 30"] {
+            let cfg = format!(
+                " neighbor 192.0.2.202 route-map M out\nroute-map M permit 10\n {clause}\nexit\n"
+            );
+            let why = filtered_why(&cfg, V4);
+            assert!(why.contains(clause), "{clause}: {why}");
+        }
+        let cfg = " neighbor 192.0.2.202 route-map M out\nroute-map M permit\nexit\n";
+        assert!(filtered_why(cfg, V4).contains("cannot read"));
+    }
+
+    /// `set` alone never narrows, before or on the unconditional permit.
+    #[test]
+    fn set_clauses_do_not_narrow() {
+        let cfg = "\
+ neighbor 192.0.2.202 route-map REWRITE out
+route-map REWRITE permit 10
+ description tag everything
+ set community 64500:1 additive
+ set as-path prepend 64500
+exit
+";
+        assert_eq!(
+            parse_export_policy(cfg, "192.0.2.202", V4),
+            ExportPolicy::Unfiltered
+        );
+    }
+
+    /// A filter in the v6 block says nothing about the v4 table, and the
+    /// reverse; a v4-only attestation must not refuse over it.
+    #[test]
+    fn only_the_attested_families_count() {
+        let cfg = "\
+router bgp 64500
+ address-family ipv4 unicast
+  neighbor 192.0.2.202 route-map PF-OUT-V4 out
+ exit-address-family
+ address-family ipv6 unicast
+  neighbor 192.0.2.202 route-map TRIM6 out
+  neighbor 192.0.2.202 prefix-list SOME6 out
+ exit-address-family
+exit
+route-map PF-OUT-V4 permit 10
+exit
+route-map TRIM6 deny 10
+exit
+";
+        assert_eq!(
+            parse_export_policy(cfg, "192.0.2.202", V4),
+            ExportPolicy::Unfiltered
+        );
+        let why = filtered_why(cfg, V6);
+        assert!(why.contains("TRIM6"), "{why}");
+        assert!(why.contains("address-family ipv6 unicast"), "{why}");
+        assert!(filtered_why(cfg, DUAL).contains("TRIM6"));
+
+        let v4_only = cfg.replace(
+            "route-map PF-OUT-V4 permit 10",
+            "route-map PF-OUT-V4 deny 10",
+        );
+        let v4_only = v4_only.replace("TRIM6 out", "PF-OUT-V4 in");
+        let v4_only = v4_only.replace("prefix-list SOME6 out", "activate");
+        assert!(filtered_why(&v4_only, V4).contains("PF-OUT-V4"));
+        assert_eq!(
+            parse_export_policy(&v4_only, "192.0.2.202", V6),
+            ExportPolicy::Unfiltered
+        );
+    }
+
+    /// Outside any address-family block — including after one closes —
+    /// a line applies to every family.
+    #[test]
+    fn a_line_outside_any_address_family_applies_to_every_family() {
+        let cfg = "\
+router bgp 64500
+ address-family ipv6 unicast
+  neighbor 192.0.2.202 activate
+ exit-address-family
+ neighbor 192.0.2.202 prefix-list ONLY-SOME out
+exit
+";
+        for families in [V4, V6] {
+            let why = filtered_why(cfg, families);
+            assert!(!why.contains("address-family"), "{why}");
+        }
+    }
+
+    /// A block this cannot place as v4 or v6 counts against every family.
+    #[test]
+    fn an_unrecognised_address_family_counts_against_every_family() {
+        let cfg = "\
+ address-family l2vpn evpn
+  neighbor 192.0.2.202 route-map NOWHERE out
+ exit-address-family
+";
+        assert!(matches!(
+            parse_export_policy(cfg, "192.0.2.202", V4),
+            ExportPolicy::Filtered { .. }
+        ));
+    }
+
+    /// Inheritance is resolved per family too: the group's v6 policy is
+    /// found for a v6 attestation and ignored for a v4 one.
+    #[test]
+    fn peer_group_inheritance_is_per_family() {
+        let cfg = "\
+router bgp 64500
+ neighbor PF peer-group
+ neighbor PF remote-as 64500
+ neighbor 192.0.2.202 peer-group PF
+ address-family ipv4 unicast
+  neighbor PF route-map PASS out
+ exit-address-family
+ address-family ipv6 unicast
+  neighbor PF route-map TRIM6 out
+ exit-address-family
+exit
+route-map PASS permit 10
+exit
+route-map TRIM6 permit 10
+ match ipv6 address prefix-list SOME6
+exit
+";
+        assert_eq!(
+            parse_export_policy(cfg, "192.0.2.202", V4),
+            ExportPolicy::Unfiltered
+        );
+        let why = filtered_why(cfg, V6);
+        assert!(
+            why.contains("inherited") && why.contains("peer-group PF"),
+            "{why}"
+        );
+        assert!(why.contains("TRIM6"), "{why}");
+    }
+
+    /// The other outbound directives are not looked into and still
+    /// narrow in the attested family.
+    #[test]
+    fn a_prefix_list_out_in_the_attested_family_is_filtering() {
+        let cfg = "\
+ address-family ipv4 unicast
+  neighbor 192.0.2.202 prefix-list ONLY-SOME out
+ exit-address-family
+";
+        let why = filtered_why(cfg, V4);
+        assert!(why.contains("prefix-list ONLY-SOME out"), "{why}");
     }
 
     /// The precedence between "disqualified", "could not read" and
@@ -1396,7 +1904,7 @@ router bgp 65000
   neighbor TRANSIT route-map ONLY-CUSTOMERS out
  exit-address-family
 ";
-        let ExportPolicy::Filtered { why } = parse_export_policy(cfg, "192.0.2.202") else {
+        let ExportPolicy::Filtered { why } = parse_export_policy(cfg, "192.0.2.202", DUAL) else {
             panic!("an inherited route-map must disqualify");
         };
         assert!(why.contains("ONLY-CUSTOMERS"), "{why}");
@@ -1418,7 +1926,7 @@ router bgp 65000
  neighbor 192.0.2.202 peer-group TRANSIT
 ";
         assert!(matches!(
-            parse_export_policy(cfg, "192.0.2.202"),
+            parse_export_policy(cfg, "192.0.2.202", DUAL),
             ExportPolicy::Filtered { .. }
         ));
     }
@@ -1437,7 +1945,7 @@ router bgp 65000
  neighbor 192.0.2.202 next-hop-self
 ";
         assert_eq!(
-            parse_export_policy(cfg, "192.0.2.202"),
+            parse_export_policy(cfg, "192.0.2.202", DUAL),
             ExportPolicy::Unfiltered
         );
     }
@@ -1451,7 +1959,7 @@ router bgp 65000
  neighbor 192.0.2.202 remote-as 65000
 ";
         assert_eq!(
-            parse_export_policy(cfg, "192.0.2.202"),
+            parse_export_policy(cfg, "192.0.2.202", DUAL),
             ExportPolicy::Unfiltered
         );
     }

@@ -179,7 +179,10 @@ PF owns the dynamic half when `frr-gate` is configured:
   numbers below 100 are the operator's placeholders and are never
   touched; runtime entries are written with explicit sequence numbers
   from 100 upward (FRR's auto-numbering would continue from the
-  placeholder into the operator's range).
+  placeholder into the operator's range). FRR 10 answers per daemon —
+  a `%` line from a daemon without the list, then a `BGP: ip
+  prefix-list …` section — and the list counts as present when bgpd
+  holds it, since bgpd's route-maps are what consult it.
 - One batched `vtysh` invocation per changed tick; a readback that
   matches the desired set is what counts as `changed`.
 - A reload (the lists fell back to placeholders only) triggers an
