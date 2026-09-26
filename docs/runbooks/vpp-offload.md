@@ -2797,6 +2797,55 @@ while VPP is running re-spreads its IRQs under a live VPP until the
 next restart, so a window harness that touches ring sizes should still
 restart packetframe (stop → `detach --all` → start) afterwards.
 
+**The daemon's control-plane threads go where the interrupts are
+not.** Moving member IRQs off VPP's cores concentrates them, and the
+softirq of every generic-XDP packet they carry, on the CPUs that
+remain. On the primary (2026-09-26) a full reload of ~1.09M routes ran
+at 1,773 routes/s, with the busiest daemon threads (`vpp-supervision`,
+`pf-drift-scan`, two `packetframe-fib`) on cpu1 and cpu2. A lightly
+loaded shadow converges the same table in under 60 s. So after both
+IRQ passes attach derives the CPUs that are online, not cpu0, not
+isolated, not VPP's (derived or observed), and deliver no queue IRQ of
+**any** NIC on the host (effective affinity, read after the moves). It
+places those threads there:
+
+```
+INFO control-plane threads placed off NIC queue IRQs and VPP's cores cpus=5-9 placed=2 disjoint=0 failed=
+```
+
+The line comes only once the attach has succeeded. A failed attach
+degrades the daemon, and a placement made on the way to the failure
+would outlive the module that justified it. `placed` counts the threads
+it narrowed: the fast-path runtime, the supervision loop, the drift
+scan and the FDB mirror. Fast-path blocking threads started later
+place themselves. Only this process's own threads are touched. Each is
+re-identified by its start time around the write, so a thread id that
+exited and was reused elsewhere is not narrowed. Placement only narrows
+a thread's existing mask. It
+never adds a CPU the daemon was not allowed, so a systemd
+`CPUAffinity=` survives. A thread whose mask shares nothing with the
+set is left alone (`disjoint`), and that is also how to opt out: pin
+the daemon away from the set. VPP itself is spawned from the daemon's
+unplaced mask, not the supervision thread's: the thread is widened for
+the spawn and narrowed again after. Otherwise VPP's unpinned helper
+threads would inherit a one- or two-CPU mask that the next adoption
+reads back as VPP placement.
+
+**On the reference NIC this is usually a no-op.** Every CPU carries a
+queue IRQ of every port (18 cores, 18 queues), so after the moves no
+candidate is left, and attach logs this once and leaves the threads to
+the scheduler:
+
+```
+INFO no CPU is free of NIC queue IRQs outside VPP's cores, cpu0 and the isolated set; control-plane threads left where the scheduler puts them vpp_cores=11,13-17 irq_cpus=0-10,12
+```
+
+It is not an error and never blocks attach. To give the control plane
+a CPU of its own there, free one of interrupts first: fewer queues
+(`ethtool -L`) or an IRQ layout that leaves a CPU empty. Like the IRQ
+moves, the placement is computed at attach only. A udapi re-spread
+while VPP runs is not followed until the next restart.
+
 ## Constraints worth knowing before you debug
 
 - **`packetframe feasibility` does not attach anything.** It used to,

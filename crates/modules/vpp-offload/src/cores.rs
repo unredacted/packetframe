@@ -734,7 +734,7 @@ pub fn restrict_daemon_from(_vpp_cores: &[u16]) -> Result<usize, String> {
     Ok(0)
 }
 #[cfg(all(test, target_os = "linux"))]
-mod affinity_tests {
+pub(crate) mod affinity_tests {
     use super::*;
 
     /// Serialises the tests in this module, because what they exercise
@@ -751,7 +751,7 @@ mod affinity_tests {
     /// would just hide the second result behind the first.
     static AFFINITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn lock_affinity() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock_affinity() -> std::sync::MutexGuard<'static, ()> {
         AFFINITY_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -971,35 +971,7 @@ pub fn nic_irq_conflicts(
 ) -> Result<Vec<IrqConflict>, String> {
     let mut conflicts = Vec::new();
     for iface in ifaces {
-        let dir = sysfs_net.join(iface).join("device").join("msi_irqs");
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("read {}: {e}", dir.display())),
-        };
-        let mut irqs: Vec<u32> = entries
-            .filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse().ok()))
-            .collect();
-        irqs.sort_unstable();
-        for irq in irqs {
-            let eff = proc_irq
-                .join(irq.to_string())
-                .join("effective_affinity_list");
-            let raw = match std::fs::read_to_string(&eff) {
-                Ok(s) => s,
-                Err(_) => {
-                    let smp = proc_irq.join(irq.to_string()).join("smp_affinity_list");
-                    match std::fs::read_to_string(&smp) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    }
-                }
-            };
-            let cpus = match parse_cpu_list(raw.trim()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+        for (irq, cpus) in queue_irq_delivery(sysfs_net, proc_irq, iface)? {
             let overlap: Vec<u16> = cpus.into_iter().filter(|c| vpp_cores.contains(c)).collect();
             if !overlap.is_empty() {
                 conflicts.push(IrqConflict {
@@ -1011,6 +983,132 @@ pub fn nic_irq_conflicts(
         }
     }
     Ok(conflicts)
+}
+
+/// Each queue IRQ of `iface`, ascending, with the CPUs it is delivered
+/// on — the reading [`nic_irq_conflicts`] documents (effective affinity,
+/// mask as the fallback, a missing `msi_irqs` or an unreadable IRQ
+/// contributing nothing, an unreadable directory failing).
+fn queue_irq_delivery(
+    sysfs_net: &std::path::Path,
+    proc_irq: &std::path::Path,
+    iface: &str,
+) -> Result<Vec<(u32, Vec<u16>)>, String> {
+    let dir = sysfs_net.join(iface).join("device").join("msi_irqs");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", dir.display())),
+    };
+    let mut irqs: Vec<u32> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse().ok()))
+        .collect();
+    irqs.sort_unstable();
+    let mut out = Vec::new();
+    for irq in irqs {
+        let eff = proc_irq
+            .join(irq.to_string())
+            .join("effective_affinity_list");
+        let raw = match std::fs::read_to_string(&eff) {
+            Ok(s) => s,
+            Err(_) => {
+                let smp = proc_irq.join(irq.to_string()).join("smp_affinity_list");
+                match std::fs::read_to_string(&smp) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                }
+            }
+        };
+        if let Ok(cpus) = parse_cpu_list(raw.trim()) {
+            out.push((irq, cpus));
+        }
+    }
+    Ok(out)
+}
+
+/// Every CPU a queue IRQ of ANY NIC on the host is delivered on.
+///
+/// Every NIC, not only VPP's member ports: the placement this feeds is
+/// about where softirq runs, and an attached fast-path port that is not
+/// a member interrupts just as hard — this module cannot see fast-path's
+/// attach list, and a superset can only make the choice more cautious,
+/// never put a thread on a CPU taking interrupts. Devices without
+/// `device/msi_irqs` (bridges, VLANs, loopback) contribute nothing.
+pub fn nic_irq_cpus(
+    sysfs_net: &std::path::Path,
+    proc_irq: &std::path::Path,
+) -> Result<Vec<u16>, String> {
+    let entries =
+        std::fs::read_dir(sysfs_net).map_err(|e| format!("read {}: {e}", sysfs_net.display()))?;
+    let mut ifaces: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    ifaces.sort_unstable();
+    let mut cpus = Vec::new();
+    for iface in &ifaces {
+        for (_, on) in queue_irq_delivery(sysfs_net, proc_irq, iface)? {
+            cpus.extend(on);
+        }
+    }
+    cpus.sort_unstable();
+    cpus.dedup();
+    Ok(cpus)
+}
+
+/// The CPUs the daemon's control-plane threads (`packetframe_common::
+/// placement::CONTROL_PLANE_THREADS`) should run on: online, not cpu0,
+/// not isolated, not VPP's, and taking no NIC queue interrupt.
+///
+/// **Why these threads get placed at all.** Moving member IRQs off
+/// VPP's cores ([`move_irqs_off`]) concentrates them — and the softirq
+/// of every generic-XDP packet they carry — on the CPUs that remain.
+/// The supervision loop that pushes routes to VPP and the fast-path FIB
+/// runtime were measured competing with that softirq on the primary
+/// (2026-09-26): a full reload of ~1.09M routes ran at 1,773 routes/s
+/// with the busiest daemon threads on cpu1 and cpu2, where a lightly
+/// loaded shadow converges the same table in under 60 s.
+///
+/// cpu0 and the isolated set are excluded for [`derive_core_map`]'s
+/// reasons. Empty is an ordinary answer — on the reference NIC every
+/// CPU carries a queue IRQ of every port — and means "leave the threads
+/// to the scheduler", never "fail".
+pub fn control_plane_cpus(
+    online: &[u16],
+    isolated: &[u16],
+    vpp_cores: &[u16],
+    irq_cpus: &[u16],
+) -> Vec<u16> {
+    let mut v: Vec<u16> = online
+        .iter()
+        .copied()
+        .filter(|c| {
+            *c != 0 && !isolated.contains(c) && !vpp_cores.contains(c) && !irq_cpus.contains(c)
+        })
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// [`control_plane_cpus`] from the live host, and the interrupt-taking
+/// set it excluded (for the log line when nothing is left).
+///
+/// Read AFTER every IRQ move of the attach, so it sees where interrupts
+/// are delivered now rather than where the kernel's spread put them.
+pub fn derive_control_plane(
+    sysfs_net: &std::path::Path,
+    proc_irq: &std::path::Path,
+    sysfs_cpu: &std::path::Path,
+    vpp_cores: &[u16],
+) -> Result<(Vec<u16>, Vec<u16>), String> {
+    let (online, isolated) = read_cpu_topology(sysfs_cpu)?;
+    let irq_cpus = nic_irq_cpus(sysfs_net, proc_irq)?;
+    Ok((
+        control_plane_cpus(&online, &isolated, vpp_cores, &irq_cpus),
+        irq_cpus,
+    ))
 }
 
 #[cfg(test)]
@@ -1353,6 +1451,124 @@ mod tests {
         let (net, proc_irq) = irq_fixture("absent", &[]);
         let got = nic_irq_conflicts(&net, &proc_irq, &["eth-nonexistent".into()], &[1, 2]).unwrap();
         assert!(got.is_empty());
+    }
+
+    /// A fake host for the control-plane derivation: `nics` are
+    /// `(iface, [(irq, effective list)])`, `virt` are devices with no
+    /// `device/` (bridges, VLANs), and the CPU topology is written as
+    /// given. An IRQ whose list starts with `smp:` gets only a mask file,
+    /// the fallback a kernel without the effective file exposes.
+    #[allow(clippy::type_complexity)]
+    fn host_fixture(
+        tag: &str,
+        nics: &[(&str, &[(u32, &str)])],
+        virt: &[&str],
+        online: &str,
+        isolated: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let mut base = std::env::temp_dir();
+        base.push(format!("pf-cp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (net, proc_irq, cpu) = (base.join("net"), base.join("proc_irq"), base.join("cpu"));
+        for (iface, irqs) in nics {
+            let msi = net.join(iface).join("device").join("msi_irqs");
+            std::fs::create_dir_all(&msi).unwrap();
+            for (irq, aff) in *irqs {
+                std::fs::write(msi.join(irq.to_string()), "").unwrap();
+                let d = proc_irq.join(irq.to_string());
+                std::fs::create_dir_all(&d).unwrap();
+                match aff.strip_prefix("smp:") {
+                    Some(mask) => std::fs::write(d.join("smp_affinity_list"), mask).unwrap(),
+                    None => std::fs::write(d.join("effective_affinity_list"), aff).unwrap(),
+                }
+            }
+        }
+        for v in virt {
+            std::fs::create_dir_all(net.join(v)).unwrap();
+        }
+        std::fs::create_dir_all(&cpu).unwrap();
+        std::fs::write(cpu.join("online"), format!("{online}\n")).unwrap();
+        std::fs::write(cpu.join("isolated"), format!("{isolated}\n")).unwrap();
+        (net, proc_irq, cpu)
+    }
+
+    /// Every exclusion applies: cpu0, isolated, VPP's cores, and any CPU
+    /// taking a NIC queue interrupt.
+    #[test]
+    fn the_control_plane_set_excludes_cpu0_isolated_vpp_and_interrupted_cpus() {
+        let online: Vec<u16> = (0..18).collect();
+        let vpp = [11, 13, 14, 15, 16, 17];
+        let got = control_plane_cpus(&online, &[12], &vpp, &[0, 1, 2, 3, 4]);
+        assert_eq!(format_cpu_list(&got), "5-10");
+    }
+
+    /// The reference NIC: every CPU carries a queue IRQ of every port,
+    /// so nothing is left — an empty answer, not an error, and not a
+    /// fallback onto the least-bad CPU.
+    #[test]
+    fn a_host_with_an_interrupt_on_every_cpu_leaves_no_control_plane_set() {
+        let online: Vec<u16> = (0..18).collect();
+        let irq: Vec<u16> = (0..18).collect();
+        assert!(control_plane_cpus(&online, &[12], &[13, 14, 15, 16, 17], &irq).is_empty());
+    }
+
+    /// From a fake /proc and /sys: IRQs of EVERY NIC count (eth8 is not
+    /// a member, and its IRQ reads through the mask fallback), a device
+    /// with no `device/` contributes nothing, and an IRQ whose list is
+    /// unreadable is skipped rather than failing the derivation.
+    #[test]
+    fn the_derivation_reads_every_nics_delivery_from_proc() {
+        let (net, proc_irq, cpu) = host_fixture(
+            "derive",
+            &[
+                ("eth9", &[(40, "1"), (41, "2")]),
+                ("eth8", &[(50, "smp:3")]),
+            ],
+            &["br0", "lo"],
+            "0-7",
+            "6",
+        );
+        // An IRQ listed under msi_irqs whose affinity files are gone
+        // (freed between the listing and the read).
+        std::fs::write(net.join("eth9/device/msi_irqs/42"), "").unwrap();
+
+        let (cpus, irq) = derive_control_plane(&net, &proc_irq, &cpu, &[7]).unwrap();
+        assert_eq!(
+            irq,
+            vec![1, 2, 3],
+            "every NIC's delivery, not only members'"
+        );
+        assert_eq!(
+            cpus,
+            vec![4, 5],
+            "not 0, 1-3 (IRQs), 6 (isolated) or 7 (VPP)"
+        );
+    }
+
+    /// What the attach move leaves behind is what the derivation sees:
+    /// after a member IRQ is moved off VPP's core onto cpu1, cpu1 is no
+    /// longer a control-plane candidate.
+    #[test]
+    fn the_derivation_follows_an_irq_the_attach_moved() {
+        let (net, proc_irq, cpu) =
+            host_fixture("moved", &[("eth9", &[(60, "smp:5")])], &[], "0-5", "");
+        let (before, _) = derive_control_plane(&net, &proc_irq, &cpu, &[5]).unwrap();
+        assert_eq!(before, vec![1, 2, 3, 4]);
+
+        let conflicts = nic_irq_conflicts(&net, &proc_irq, &["eth9".into()], &[5]).unwrap();
+        move_irqs_off(&proc_irq, &conflicts, &[0, 1, 2, 3, 4]).unwrap();
+        let (after, irq) = derive_control_plane(&net, &proc_irq, &cpu, &[5]).unwrap();
+        assert_eq!(irq, vec![1]);
+        assert_eq!(after, vec![2, 3, 4]);
+    }
+
+    /// No `/sys/class/net` at all is a read failure the caller logs,
+    /// not an empty interrupt set that would place threads anywhere.
+    #[test]
+    fn an_unreadable_net_directory_is_an_error_not_an_empty_irq_set() {
+        let missing = std::env::temp_dir().join(format!("pf-cp-nonet-{}", std::process::id()));
+        let e = nic_irq_cpus(&missing, &missing).unwrap_err();
+        assert!(e.contains("read"), "{e}");
     }
 
     /// The reference fleet: 18 cores, `isolcpus=12` owned by
