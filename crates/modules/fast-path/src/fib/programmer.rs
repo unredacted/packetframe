@@ -463,6 +463,47 @@ struct NexthopRecord {
     live: Option<(u32, [u8; 6], [u8; 6])>,
 }
 
+/// Whether a mirror record is a local-delivery host route, which stays
+/// off the second tier (the announce site in `recompute_fib_entry_inner`).
+///
+/// Every advertisement must come from the local-ARP namespace AND every
+/// nexthop must be the route's own address: `local-prefix` seeds each
+/// neighbour as a /32 or /128 whose nexthop is the host itself. The
+/// peer namespace alone is not enough, because `fallback-default`
+/// injects its 0.0.0.0/0 under a local-ARP peer too — so it scopes like
+/// the /32s and never counts as a session route — yet it is a gatewayed
+/// route via a real upstream. Filtered with the /32s, it never reached
+/// the second tier, whose FIB then dropped every destination only the
+/// default covers, all of which this tier forwards upstream: measured
+/// on the primary at 167 pps once steering went live (2026-09-26).
+fn is_local_delivery(
+    prefix: &IpPrefix,
+    peers: impl Iterator<Item = PeerId>,
+    nexthops: &[IpAddr],
+) -> bool {
+    let mut peers = peers.peekable();
+    if peers.peek().is_none() || !peers.all(|p| p.as_local_arp_ifindex().is_some()) {
+        return false;
+    }
+    nexthops.iter().all(|nh| match (prefix, nh) {
+        (
+            IpPrefix::V4 {
+                addr,
+                prefix_len: 32,
+            },
+            IpAddr::V4(a),
+        ) => a.octets() == *addr,
+        (
+            IpPrefix::V6 {
+                addr,
+                prefix_len: 128,
+            },
+            IpAddr::V6(a),
+        ) => a.octets() == *addr,
+        _ => false,
+    })
+}
+
 /// Per-route state tracked in userspace. The `fib_value` lets
 /// us unwind the BPF map entry on Del without a read-modify-write
 /// dance; `nexthop_ips` lets us decrement refcounts on the right
@@ -2086,15 +2127,20 @@ impl FibProgrammer {
                 // tracing the primary's config (2026-08-14) before the
                 // second attach window rather than during it.
                 //
+                // Judged by what the route IS, not only by the peer
+                // namespace it arrived under — see
+                // [`is_local_delivery`] for the `fallback-default`
+                // that shares the namespace and must reach the sink.
+                //
                 // Filtered here, at the single announce site, because
                 // this is also the only writer of the feed's mirror
                 // copy — so the resync diff inherits the same
                 // exclusion and the two paths cannot disagree.
-                let local_only = !rec.advertisements.is_empty()
-                    && rec
-                        .advertisements
-                        .keys()
-                        .all(|(p, _)| p.as_local_arp_ifindex().is_some());
+                let local_only = is_local_delivery(
+                    &prefix,
+                    rec.advertisements.keys().map(|(p, _)| *p),
+                    &rec.nexthop_ips,
+                );
                 if local_only {
                     // A withdrawal, not silence. In the ordinary case
                     // (a record that was local-ARP from birth) this is
@@ -2470,5 +2516,73 @@ fn prefix_peer_key(prefix: &IpPrefix) -> (bool, [u8; 16], u8) {
             (true, padded, *prefix_len)
         }
         IpPrefix::V6 { addr, prefix_len } => (false, *addr, *prefix_len),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    const HOST: IpPrefix = IpPrefix::V4 {
+        addr: [192, 0, 2, 50],
+        prefix_len: 32,
+    };
+    const DEFAULT: IpPrefix = IpPrefix::V4 {
+        addr: [0, 0, 0, 0],
+        prefix_len: 0,
+    };
+
+    fn v4(a: [u8; 4]) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::from(a))
+    }
+
+    #[test]
+    fn a_local_prefix_host_route_is_local_delivery() {
+        let local = [PeerId::local_arp(33)];
+        assert!(is_local_delivery(
+            &HOST,
+            local.into_iter(),
+            &[v4([192, 0, 2, 50])]
+        ));
+        let host6 = IpPrefix::V6 {
+            addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5).octets(),
+            prefix_len: 128,
+        };
+        assert!(is_local_delivery(
+            &host6,
+            local.into_iter(),
+            &[IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5))]
+        ));
+    }
+
+    #[test]
+    fn the_fallback_default_is_not_local_delivery() {
+        assert!(!is_local_delivery(
+            &DEFAULT,
+            [PeerId::local_arp(33)].into_iter(),
+            &[v4([198, 51, 100, 1])]
+        ));
+        // Nor is any local-ARP route through a nexthop other than itself.
+        assert!(!is_local_delivery(
+            &HOST,
+            [PeerId::local_arp(33)].into_iter(),
+            &[v4([198, 51, 100, 1])]
+        ));
+    }
+
+    #[test]
+    fn a_route_source_advertisement_is_never_local_delivery() {
+        assert!(!is_local_delivery(
+            &HOST,
+            [PeerId(0x2222)].into_iter(),
+            &[v4([192, 0, 2, 50])]
+        ));
+        assert!(!is_local_delivery(
+            &HOST,
+            [PeerId::local_arp(33), PeerId(0x2222)].into_iter(),
+            &[v4([192, 0, 2, 50])]
+        ));
+        assert!(!is_local_delivery(&HOST, std::iter::empty(), &[]));
     }
 }
