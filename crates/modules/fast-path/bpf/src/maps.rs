@@ -252,12 +252,22 @@ pub enum StatIdx {
     /// counts split by family rather than by depth, the hypothesis is
     /// wrong.
     ErrParseTcL3V6 = 49,
+    // --- Destination-MAC check. Append-only. ---------------------------
+    /// Allowlist-matched frame whose destination MAC is not one the
+    /// router receives on at its ingress port (`RX_MACS`), handed to
+    /// the kernel untouched. On a bridge member these are host-to-host
+    /// frames the kernel is only bridging, plus every broadcast and
+    /// multicast frame; the kernel bridges or delivers them. A subset
+    /// of `matched_v4 + matched_v6`. A jump to a large share of it, with
+    /// `fwd_ok` falling by as much, means a port's receive MACs are
+    /// missing: see docs/runbooks/custom-fib.md.
+    PassNotForUs = 50,
 }
 
 /// Total counter count. Sizes the `[u64; N]` value of the single-entry
 /// `STATS` per-CPU map. New counters bump this; dashboards keying on
 /// indices keep working.
-pub const STATS_COUNT: u32 = 50;
+pub const STATS_COUNT: u32 = 51;
 
 /// `STATS_COUNT` as usize, for the array-of-counters value type.
 pub const STATS_COUNT_USIZE: usize = STATS_COUNT as usize;
@@ -331,6 +341,12 @@ const VLAN_RESOLVE_MAX_ENTRIES: u32 = 256;
 /// `mss-clamp <cidr> [via <iface>] <mtu>` directive becomes one entry.
 const MSS_CLAMP_PREFIX_MAX_ENTRIES: u32 = 1024;
 
+/// Max `(ingress ifindex, destination MAC)` pairs in `RX_MACS`. A port
+/// has one MAC, or its bridge's plus one per VLAN L3 device with a MAC
+/// of its own; 1024 covers every attached port on a box whose VLAN
+/// bridges all carry distinct MACs.
+const RX_MACS_MAX_ENTRIES: u32 = 1024;
+
 /// Max per-egress mss-clamp entries. Sized like the redirect devmap
 /// one entry per attached egress iface that has a `mss-clamp via X N`
 /// rule. 64 is comfortable for any non-container deployment.
@@ -378,6 +394,19 @@ pub struct VlanResolve {
     pub vid: u16,
     pub _pad: u16,
 }
+
+/// Key of `RX_MACS`: a destination MAC the router receives on at one
+/// ingress port. 12 bytes with the pad explicit, so the stack key the
+/// program builds is fully written and matches userspace byte-for-byte.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RxMacKey {
+    pub ifindex: u32,
+    pub mac: [u8; 6],
+    pub _pad: u16,
+}
+
+const _: () = assert!(core::mem::size_of::<RxMacKey>() == 12);
 
 /// Value stored in the mss-clamp LPM tries. `mss` is a native u16
 /// clamp ceiling; `iface_filter` is an optional egress ifindex
@@ -653,6 +682,18 @@ pub static REDIRECT_DEVMAP: DevMapHash =
 #[map]
 pub static VLAN_RESOLVE: HashMap<u32, VlanResolve> =
     HashMap::with_max_entries(VLAN_RESOLVE_MAX_ENTRIES, 0);
+
+/// Destination MACs the router receives on, per ingress port: the
+/// port's own MAC for a plain port; its bridge's plus the bridge's VLAN
+/// L3 devices' for a bridge member (`packetframe_common::topology::
+/// receive_macs`). A matched frame whose `(ingress ifindex, dst MAC)`
+/// is absent is not addressed to the router and is XDP_PASSed untouched
+/// (`PassNotForUs`). A port with no entries therefore passes
+/// everything, which is the kernel path and always correct; userspace
+/// fills the map before any XDP attach and follows MAC changes from
+/// the redirect-target watcher. The value is unused.
+#[map]
+pub static RX_MACS: HashMap<RxMacKey, u8> = HashMap::with_max_entries(RX_MACS_MAX_ENTRIES, 0);
 
 /// IPv4 mss-clamp policy by src-or-dst prefix (v0.2.4+). XDP looks up
 /// the packet's src first, then dst, mirroring `allow-prefix` semantics.

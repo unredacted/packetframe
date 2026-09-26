@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 /// operators (19 hid `err_head_shift`; 33 hid the mss-clamp and
 /// tail-call diagnostics from the Prometheus export; a separate
 /// hardcoded 37 hid `pass_ndp` from `packetframe status`).
-pub const COUNTER_NAMES: [&str; 50] = [
+pub const COUNTER_NAMES: [&str; 51] = [
     "rx_total",
     "matched_v4",
     "matched_v6",
@@ -95,6 +95,9 @@ pub const COUNTER_NAMES: [&str; 50] = [
     "err_parse_tc_vlan",
     "err_parse_tc_l3_v4",
     "err_parse_tc_l3_v6",
+    // --- destination-MAC check: matched frames not addressed to the
+    // router at their ingress port, handed to the kernel untouched ---
+    "pass_not_for_us",
 ];
 
 /// `COUNTER_NAMES.len()` as a named const. Sizes the `[u64; N]` value
@@ -297,7 +300,7 @@ mod tests {
         // Mirror of `STATS_COUNT` from `bpf/src/maps.rs`. If these
         // drift, the zip() in render_textfile silently truncates
         // this test catches that at unit-test time.
-        assert_eq!(COUNTER_NAMES.len(), 50);
+        assert_eq!(COUNTER_NAMES.len(), 51);
         assert_eq!(COUNTER_NAMES.len(), COUNTER_COUNT);
         // The newest counters, as a canary that the tail of the list
         // stayed aligned with the `StatIdx` discriminants.
@@ -311,6 +314,7 @@ mod tests {
         assert_eq!(COUNTER_NAMES[47], "err_parse_tc_vlan");
         assert_eq!(COUNTER_NAMES[48], "err_parse_tc_l3_v4");
         assert_eq!(COUNTER_NAMES[49], "err_parse_tc_l3_v6");
+        assert_eq!(COUNTER_NAMES[50], "pass_not_for_us");
     }
 
     #[test]

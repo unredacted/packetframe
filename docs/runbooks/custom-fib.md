@@ -78,6 +78,14 @@ Indicators that the custom-FIB path is working:
   and not regaining it — see the triage entry below.
 - `packetframe status` shows `nexthops (incomplete)` and `nexthops
   (failed)` at or near zero once the table has converged.
+- `pass_not_for_us` holds steady as a share of matched traffic. It
+  counts allowlisted frames whose destination MAC is not one the router
+  receives on at the ingress port: host-to-host frames the kernel is
+  bridging past the router on a bridge member, plus every broadcast and
+  multicast frame. They go to the kernel untouched, which is correct.
+  Near zero on plain routed ports; on a bridge member it tracks how much
+  allowlisted traffic stays inside a VLAN. A step change is a triage
+  entry below.
 - `bmp_peer_down` stays at zero unless a BGP session you expect to
   flap has flapped.
 - `nexthop_seq_retry` stays below ~0.01% of `custom_fib_hit` (the
@@ -467,6 +475,13 @@ the kernel ARP table for hosts within an operator-declared CIDR
 MAC at `state=Resolved`, and inserts the /32 in FIB_V4. The /32
 wins over the /24 in LPM, so XDP redirects directly to the host.
 
+Those /32s put both ends of same-subnet host-to-host traffic in the
+FIB. On a bridge member the XDP hook also sees the frames the kernel
+bridges between two such hosts. They are addressed to the other host's
+MAC, not the router's, so the destination-MAC check passes them to the
+kernel to bridge untouched (`pass_not_for_us`). Only frames addressed
+to the router take the /32.
+
 ### When to enable it
 
 When you're running custom-fib (not kernel-fib) and the box has
@@ -733,6 +748,11 @@ bird-fed route still wins LPM; the /0 catches bogon-bound traffic.
 XDP redirects directly to upstream: same upstream rejection behavior,
 just no kernel / conntrack involvement. Measured ~25% reduction in
 steady-state conntrack pressure on a busy Tor exit relay.
+
+The /0 only ever sees frames addressed to the router. Broadcast,
+multicast and bridged host-to-host frames never reach the FIB
+(`pass_not_for_us`), so a subnet broadcast or an mDNS packet from an
+allowlisted host is not sent upstream.
 
 ### `block-prefix` (v0.2.1, issue #33)
 
@@ -1209,6 +1229,54 @@ Check:
   nexthop's `ifindex` names the egress; if it is a non-Ethernet device
   (tunnel, loopback) or oper-down, the miss is correct and the route
   itself is the problem.
+
+### Symptom: `pass_not_for_us` jumps and `fwd_ok` falls with it
+
+What it means: the XDP program routes a matched frame only when its
+destination MAC is in `RX_MACS` for the port it arrived on. Everything
+else goes to the kernel untouched and counts `pass_not_for_us`. Without
+the check, a bridge member's hook routed frames between two hosts on
+one VLAN when either address was allowlisted: TTL decremented, source
+MAC rewritten to the router's, where the kernel would have bridged them
+untouched. Broadcast and multicast frames also went through the FIB,
+and a `fallback-default` /0 sent them upstream.
+
+Per port, `RX_MACS` holds the MACs `packetframe_common::topology::
+receive_macs` derives, the same rule vpp-offload uses for its divert
+rules:
+
+- a bridge member: the bridge's MAC, plus the MAC of each L3 device (a
+  VLAN device or VLAN bridge that no bridge has enslaved) on a VLAN of
+  that bridge;
+- a plain port: its own MAC. A VLAN sub-interface there with a MAC of
+  its own is left out, so frames addressed to it take the kernel path.
+
+Attach fills the map before the first XDP attach. From then on the
+redirect-target watcher refreshes it on every `RTM_NEWLINK`, so a bridge
+that takes a new MAC is followed within the watcher's debounce. A SIGHUP
+refreshes it too. A port whose MACs cannot be read keeps the entries it
+has. A port with no entries passes every frame, which is the kernel
+path: correct, but none of that port's traffic is fast-pathed.
+
+A step change, with `fwd_ok` falling by about as much, means a port's
+router MAC is missing from the map. Check:
+
+- `journalctl -u packetframe | grep -E 'RX_MACS|receive MACs'`: attach
+  logs `RX_MACS populated`, the watcher logs `RX_MACS refreshed from
+  link events`, and a port whose MACs could not be read logs `receive
+  MACs unreadable` by name.
+- `bpftool map dump pinned /sys/fs/bpf/packetframe/fast-path/maps/RX_MACS`
+  against `ip -br link`. Each key is the port's ifindex (4 bytes,
+  little-endian), the MAC and 2 pad bytes. Every attached port should
+  have its own MAC (plain port) or its bridge's MAC (bridge member).
+- The MAC your hosts actually send to: `ip neigh` on a host for the
+  gateway address, or `tcpdump -e` on the port. A MAC that belongs to
+  none of the devices above, such as a macvlan or VRRP virtual MAC, is
+  not in the map by design, and its frames take the kernel path.
+
+Remedy: `systemctl reload packetframe` re-runs the refresh. If the MACs
+are correct in `ip link` but still missing after a reload, collect the
+journal lines above before restarting.
 
 ### Symptom: `bmp_peer_down` incremented
 

@@ -12,6 +12,9 @@
 //!   `EcmpDeadLegFallback` bumps
 //! - Seqlock torn-read: a permanently-odd `seq` is never observed as
 //!   stable and drains the 4-retry budget
+//! - Destination-MAC check: only frames addressed to one of the ingress
+//!   port's `RX_MACS` are routed; the rest pass untouched, counted
+//!   `PassNotForUs`
 //!
 //! Compare-mode and VLAN-subif egress tests belong in the netns-backed
 //! integration test (a real kernel FIB vs our mocks). They're out of
@@ -26,7 +29,11 @@
 mod common;
 
 use aya::maps::Array;
-use common::{xdp_action, Harness, Ipv4TcpBuilder, Ipv6TcpBuilder, StatIdx};
+use common::{
+    insert_vlan_tag, xdp_action, Harness, Ipv4TcpBuilder, Ipv6TcpBuilder, StatIdx, BUILDER_DST_MAC,
+    FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_IPV4, FP_CFG_FLAG_IPV6,
+    TEST_RUN_INGRESS_IFINDEX,
+};
 use packetframe_fast_path::fib::types::{NexthopEntry, NH_STATE_INCOMPLETE};
 
 /// `lo` is always ifindex 1 on every Linux kernel. Using it as the
@@ -751,4 +758,264 @@ fn fib_cache_hit_on_tc_datapath() {
     assert_eq!(v2, common::tc_action::TC_ACT_REDIRECT);
     assert_eq!(h.stat(StatIdx::FibCacheHit), 1);
     assert_eq!(out1, out2);
+}
+
+// ========== Destination-MAC check =========================================
+//
+// Every fixture here first proves the setup FORWARDS a frame addressed to
+// the router, so a pass on the other frame can only be the check's doing:
+// with the check removed, each foreign, broadcast and unpopulated case
+// below redirects instead.
+
+/// A host on the segment, not the router: the destination of a frame
+/// the kernel is only bridging.
+const FOREIGN_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x99];
+
+/// Custom-FIB harness with a resolved nexthop covering every
+/// destination (a `fallback-default`-shaped 0/0 and ::/0), so any
+/// allowlisted frame that reaches the FIB is redirected.
+fn dst_mac_harness() -> Harness {
+    let mut h = prep_custom_fib_harness();
+    h.add_allow_v4("192.0.2.0/24");
+    h.add_allow_v6("2001:db8::/32");
+    h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
+    h.add_nexthop_v6(2, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
+    h.add_fib_v4_single("0.0.0.0/0", 1);
+    h.add_fib_v6_single("::/0", 2);
+    h
+}
+
+fn v4_to(dst_mac: [u8; 6], dst_ip: [u8; 4]) -> Vec<u8> {
+    Ipv4TcpBuilder {
+        dst_mac,
+        src_ip: [192, 0, 2, 1],
+        dst_ip,
+        ..Default::default()
+    }
+    .build()
+}
+
+fn v6_to(dst_mac: [u8; 6], dst: &str) -> Vec<u8> {
+    Ipv6TcpBuilder {
+        dst_mac,
+        dst_ip: v6_dst(dst),
+        next_hdr: 17,
+        ..Default::default()
+    }
+    .build()
+}
+
+/// `pkt` is handed to the kernel byte-identical, counted
+/// `pass_not_for_us` and `matched`, and never reaches the FIB.
+fn assert_passed_not_for_us(h: &Harness, pkt: &[u8], matched: StatIdx, what: &str) {
+    let before = h.stat(StatIdx::PassNotForUs);
+    let before_matched = h.stat(matched);
+    let before_hit = h.stat(StatIdx::CustomFibHit);
+    let before_fwd = h.stat(StatIdx::FwdOk);
+    let (verdict, out) = h.run(pkt);
+    assert_eq!(
+        verdict,
+        xdp_action::XDP_PASS,
+        "{what}: must pass to the kernel"
+    );
+    assert_eq!(
+        h.stat(StatIdx::PassNotForUs),
+        before + 1,
+        "{what}: pass_not_for_us"
+    );
+    assert_eq!(
+        h.stat(matched),
+        before_matched + 1,
+        "{what}: still counts as matched"
+    );
+    assert_eq!(
+        h.stat(StatIdx::CustomFibHit),
+        before_hit,
+        "{what}: must not reach the FIB"
+    );
+    assert_eq!(
+        h.stat(StatIdx::FwdOk),
+        before_fwd,
+        "{what}: must not forward"
+    );
+    assert_eq!(out, pkt, "{what}: must be delivered unmodified (TTL, MACs)");
+}
+
+fn assert_forwarded(h: &Harness, pkt: &[u8], what: &str) {
+    let before = h.stat(StatIdx::PassNotForUs);
+    let (verdict, out) = h.run(pkt);
+    assert_eq!(
+        verdict,
+        xdp_action::XDP_REDIRECT,
+        "{what}: precondition, must forward"
+    );
+    assert_eq!(
+        &out[0..6],
+        &NEXTHOP_MAC,
+        "{what}: rewritten toward the nexthop"
+    );
+    assert_eq!(h.stat(StatIdx::PassNotForUs), before, "{what}: not counted");
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn a_frame_to_a_foreign_mac_is_passed_and_counted() {
+    let h = dst_mac_harness();
+    // Two hosts on one VLAN, both allowlisted: the bridged frame carries
+    // the other host's MAC. The router-addressed twin forwards.
+    assert_forwarded(&h, &v4_to(BUILDER_DST_MAC, [192, 0, 2, 2]), "v4 to router");
+    assert_passed_not_for_us(
+        &h,
+        &v4_to(FOREIGN_MAC, [192, 0, 2, 2]),
+        StatIdx::MatchedV4,
+        "v4 to a host",
+    );
+    assert_forwarded(&h, &v6_to(BUILDER_DST_MAC, "2001:db8::2"), "v6 to router");
+    assert_passed_not_for_us(
+        &h,
+        &v6_to(FOREIGN_MAC, "2001:db8::2"),
+        StatIdx::MatchedV6,
+        "v6 to a host",
+    );
+}
+
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn a_frame_to_the_router_mac_is_still_forwarded() {
+    let h = dst_mac_harness();
+    let before_fwd = h.stat(StatIdx::FwdOk);
+    assert_forwarded(&h, &v4_to(BUILDER_DST_MAC, [192, 0, 2, 2]), "v4");
+    assert_forwarded(&h, &v6_to(BUILDER_DST_MAC, "2001:db8::2"), "v6");
+    assert_eq!(h.stat(StatIdx::FwdOk), before_fwd + 2);
+}
+
+/// Policy: a port with no receive MACs passes everything (the kernel
+/// path), rather than skipping the check. Attach fills the map before
+/// the first XDP attach, so in production this is the state of a port
+/// whose MACs could not be read.
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn before_rx_macs_are_populated_every_frame_passes() {
+    let mut h = dst_mac_harness();
+    let pkt = v4_to(BUILDER_DST_MAC, [192, 0, 2, 2]);
+    assert_forwarded(&h, &pkt, "populated");
+    h.clear_rx_macs();
+    assert_passed_not_for_us(&h, &pkt, StatIdx::MatchedV4, "unpopulated");
+}
+
+/// The key is `(ingress ifindex, MAC)`: the router's MAC on another port
+/// says nothing about this one.
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn a_receive_mac_is_scoped_to_its_ingress_port() {
+    let mut h = dst_mac_harness();
+    let pkt = v4_to(BUILDER_DST_MAC, [192, 0, 2, 2]);
+    h.clear_rx_macs();
+    h.add_rx_mac(TEST_RUN_INGRESS_IFINDEX + 6, BUILDER_DST_MAC);
+    assert_passed_not_for_us(&h, &pkt, StatIdx::MatchedV4, "MAC of another port");
+    h.add_rx_mac(TEST_RUN_INGRESS_IFINDEX, BUILDER_DST_MAC);
+    assert_forwarded(&h, &pkt, "MAC of this port");
+}
+
+/// Broadcast and multicast frames from an allowlisted host must never be
+/// routed; with a default route in the custom FIB (`fallback-default`)
+/// they were, since the program had no MAC check at all.
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn broadcast_and_multicast_frames_are_never_routed() {
+    let h = dst_mac_harness();
+    assert_forwarded(
+        &h,
+        &v4_to(BUILDER_DST_MAC, [192, 0, 2, 255]),
+        "unicast twin",
+    );
+    assert_passed_not_for_us(
+        &h,
+        &v4_to([0xff; 6], [255, 255, 255, 255]),
+        StatIdx::MatchedV4,
+        "v4 limited broadcast",
+    );
+    assert_passed_not_for_us(
+        &h,
+        &v4_to([0xff; 6], [192, 0, 2, 255]),
+        StatIdx::MatchedV4,
+        "v4 directed broadcast",
+    );
+    assert_passed_not_for_us(
+        &h,
+        &v4_to([0x01, 0, 0x5e, 0, 0, 0xfb], [224, 0, 0, 251]),
+        StatIdx::MatchedV4,
+        "v4 multicast",
+    );
+    assert_passed_not_for_us(
+        &h,
+        &v6_to([0x33, 0x33, 0, 0, 0, 0xfb], "ff02::fb"),
+        StatIdx::MatchedV6,
+        "v6 multicast",
+    );
+}
+
+/// On a trunk port the check reads the MAC of the tagged frame.
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn a_tagged_frame_is_checked_on_its_mac() {
+    let h = dst_mac_harness();
+    let to_router = insert_vlan_tag(&v4_to(BUILDER_DST_MAC, [192, 0, 2, 2]), 100);
+    let (verdict, _) = h.run(&to_router);
+    assert_eq!(
+        verdict,
+        xdp_action::XDP_REDIRECT,
+        "precondition: the tagged frame to the router forwards"
+    );
+    assert_passed_not_for_us(
+        &h,
+        &insert_vlan_tag(&v4_to(FOREIGN_MAC, [192, 0, 2, 2]), 100),
+        StatIdx::MatchedV4,
+        "tagged, to a host",
+    );
+}
+
+/// A bridged frame is not the router's to drop: the check runs ahead of
+/// the bogon block, and of dry-run's forward accounting.
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn a_foreign_frame_is_neither_bogon_dropped_nor_dry_run_counted() {
+    let mut h = dst_mac_harness();
+    h.add_block_v4("192.0.2.0/24");
+    h.set_cfg_flags(
+        FP_CFG_FLAG_IPV4 | FP_CFG_FLAG_IPV6 | FP_CFG_FLAG_CUSTOM_FIB | FP_CFG_FLAG_BLOCK_PRESENT,
+    );
+    let (verdict, _) = h.run(&v4_to(BUILDER_DST_MAC, [192, 0, 2, 2]));
+    assert_eq!(
+        verdict,
+        xdp_action::XDP_DROP,
+        "precondition: a routed bogon drops"
+    );
+    assert_passed_not_for_us(
+        &h,
+        &v4_to(FOREIGN_MAC, [192, 0, 2, 2]),
+        StatIdx::MatchedV4,
+        "bridged bogon",
+    );
+
+    h.set_dry_run(true);
+    let before_dry = h.stat(StatIdx::FwdDryRun);
+    let (verdict, _) = h.run(&v4_to(BUILDER_DST_MAC, [192, 0, 2, 2]));
+    assert_eq!(verdict, xdp_action::XDP_PASS);
+    assert_eq!(
+        h.stat(StatIdx::FwdDryRun),
+        before_dry + 1,
+        "precondition: dry-run counts a routed frame"
+    );
+    assert_passed_not_for_us(
+        &h,
+        &v4_to(FOREIGN_MAC, [192, 0, 2, 2]),
+        StatIdx::MatchedV4,
+        "bridged, dry-run",
+    );
+    assert_eq!(
+        h.stat(StatIdx::FwdDryRun),
+        before_dry + 1,
+        "dry-run does not count a bridged frame"
+    );
 }

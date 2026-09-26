@@ -586,6 +586,91 @@ pub struct VlanResolve {
 // SAFETY: repr(C), all primitive fields, every bit pattern valid.
 unsafe impl aya::Pod for VlanResolve {}
 
+pub use crate::rx_macs::RxMacKey;
+
+// SAFETY: repr(C), u32 + [u8; 6] + u16 with no implicit padding (12
+// bytes, asserted in `rx_macs`), every bit pattern valid.
+unsafe impl aya::Pod for RxMacKey {}
+
+/// The XDP-attached ports as `(iface, ifindex)`: the ports `RX_MACS`
+/// covers. tc attaches are left out — the tc datapath has no
+/// destination-MAC check.
+pub(crate) fn xdp_ports(state: &ActiveState) -> Vec<(String, u32)> {
+    state
+        .links
+        .iter()
+        .filter(|l| !matches!(l.effective_mode, AttachMode::Tc))
+        .map(|l| (l.iface.clone(), l.ifindex))
+        .collect()
+}
+
+/// What one [`sync_rx_macs`] pass did.
+#[derive(Debug, Default)]
+pub(crate) struct RxMacSync {
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Bring `RX_MACS` to what each attached XDP port (`(iface, ifindex)`)
+/// receives on now ([`crate::rx_macs`]): additions first, then
+/// removals, and a port whose MACs cannot be read keeps its entries.
+/// The one writer of the map, shared by attach, the redirect-target
+/// watcher and the SIGHUP reconcile so none of them can apply the rule
+/// differently. Failures are logged here, per port and per key.
+pub(crate) fn sync_rx_macs<T: std::borrow::BorrowMut<aya::maps::MapData>>(
+    map: &mut AyaHashMap<T, RxMacKey, u8>,
+    ports: &[(String, u32)],
+) -> RxMacSync {
+    let current: Vec<RxMacKey> = map.keys().filter_map(Result::ok).collect();
+    let desired: Vec<crate::rx_macs::PortMacs> = ports
+        .iter()
+        .map(|(iface, ifindex)| {
+            (
+                iface.clone(),
+                *ifindex,
+                crate::rx_macs::kernel_port_receive_macs(iface),
+            )
+        })
+        .collect();
+    let plan = crate::rx_macs::plan(&current, &desired);
+    let mut out = RxMacSync::default();
+    for (iface, ifindex, why) in &plan.unknown {
+        let held = current.iter().filter(|k| k.ifindex == *ifindex).count();
+        warn!(
+            iface = %iface,
+            ifindex,
+            error = %why,
+            entries_kept = held,
+            "receive MACs unreadable; this port's RX_MACS entries are left as they were (with \
+             entries_kept=0, every matched frame on it takes the kernel path, counted \
+             pass_not_for_us)"
+        );
+    }
+    for key in &plan.add {
+        match map.insert(*key, 1u8, 0) {
+            Ok(()) => out.added += 1,
+            Err(e) => warn!(
+                ifindex = key.ifindex,
+                mac = %packetframe_common::config::format_mac(key.mac),
+                error = %e,
+                "RX_MACS insert failed; frames to this MAC take the kernel path"
+            ),
+        }
+    }
+    for key in &plan.remove {
+        match map.remove(key) {
+            Ok(()) => out.removed += 1,
+            Err(e) => warn!(
+                ifindex = key.ifindex,
+                mac = %packetframe_common::config::format_mac(key.mac),
+                error = %e,
+                "RX_MACS remove failed"
+            ),
+        }
+    }
+    out
+}
+
 /// Layout mirror of `MssClampValue` in `bpf/src/maps.rs`. Value type
 /// for the `MSS_CLAMP_V4` / `MSS_CLAMP_V6` LPM tries. `#[repr(C)]`
 /// with explicit padding so the userspace and BPF layouts match
@@ -621,8 +706,9 @@ pub struct ActiveState {
     /// `kernel-fib` mode (which is the default and today's behavior).
     /// `detach` shuts it down cooperatively before tearing down pins.
     pub route_controller: Option<crate::fib::controller::RouteController>,
-    /// Keeps `REDIRECT_DEVMAP` / `TC_REDIRECT_TARGETS` current with the
-    /// kernel link table between SIGHUPs (see `redirect_watch`).
+    /// Keeps `REDIRECT_DEVMAP` / `TC_REDIRECT_TARGETS` (and `RX_MACS`)
+    /// current with the kernel link table between SIGHUPs (see
+    /// `redirect_watch`).
     /// Started right after the maps are pinned, in every forwarding
     /// mode; stopped first in `detach`. `None` only before attach.
     pub redirect_watch: Option<crate::redirect_watch::RedirectTargetWatcher>,
@@ -1444,22 +1530,6 @@ pub fn attach(
     }
     populate_mutation_progs(&mut state.ebpf)?;
 
-    let prog: &mut Xdp = state
-        .ebpf
-        .program_mut("fast_path")
-        .ok_or_else(|| ModuleError::other(MODULE_NAME, "fast_path program missing from ELF"))?
-        .try_into()
-        .map_err(|e| ModuleError::other(MODULE_NAME, format!("fast_path program not XDP: {e}")))?;
-
-    prog.load().map_err(|e| {
-        ModuleError::other(
-            MODULE_NAME,
-            format!("Xdp::load failed (verifier rejection?): {e}"),
-        )
-    })?;
-
-    let prog_id = prog.info().map(|i| i.id()).unwrap_or(0);
-
     // Collect attach directives up-front so we can populate redirect_devmap
     // with every ifindex in scope before any packet flows.
     let attach_dirs: Vec<(String, AttachMode, u32)> = cfg
@@ -1543,6 +1613,41 @@ pub fn attach(
              (the tc datapath has no kernel-fib/compare arm)",
         ));
     }
+
+    // Receive MACs before the first XDP attach, so no frame on an
+    // attached port ever meets an empty `RX_MACS` set (which would pass
+    // it to the kernel path). Unknown ports are reported, not refused:
+    // their frames take the kernel path, which is always correct.
+    {
+        let ports: Vec<(String, u32)> = xdp_dirs
+            .iter()
+            .map(|(iface, _, ifindex)| (iface.clone(), *ifindex))
+            .collect();
+        let map = state
+            .ebpf
+            .map_mut("RX_MACS")
+            .ok_or_else(|| ModuleError::other(MODULE_NAME, "RX_MACS map missing from ELF"))?;
+        let mut rx: AyaHashMap<_, RxMacKey, u8> = AyaHashMap::try_from(map)
+            .map_err(|e| ModuleError::other(MODULE_NAME, format!("RX_MACS try_from: {e}")))?;
+        let sync = sync_rx_macs(&mut rx, &ports);
+        info!(entries = sync.added, "RX_MACS populated");
+    }
+
+    let prog: &mut Xdp = state
+        .ebpf
+        .program_mut("fast_path")
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "fast_path program missing from ELF"))?
+        .try_into()
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("fast_path program not XDP: {e}")))?;
+
+    prog.load().map_err(|e| {
+        ModuleError::other(
+            MODULE_NAME,
+            format!("Xdp::load failed (verifier rejection?): {e}"),
+        )
+    })?;
+
+    let prog_id = prog.info().map(|i| i.id()).unwrap_or(0);
 
     let settle_time = cfg.global.attach_settle_time;
     let mut attach_count = 0usize;
@@ -1726,6 +1831,7 @@ pub fn attach(
     match crate::redirect_watch::RedirectTargetWatcher::start(
         &state.bpffs_root,
         cfg.section.directives.to_vec(),
+        xdp_ports(state),
     ) {
         Ok(w) => state.redirect_watch = Some(w),
         Err(e) => warn!(

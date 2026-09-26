@@ -31,6 +31,13 @@
 //! the rest of the control plane, and it runs in every forwarding mode:
 //! the pre-check is the same under kernel-fib and custom-fib.
 //!
+//! The same refresh keeps `RX_MACS` — the destination MACs each
+//! attached port receives on — in step with the link table: a bridge
+//! takes a new MAC when its lowest-addressed member changes, and a VLAN
+//! device follows its lower's, and each arrives as an `RTM_NEWLINK`.
+//! Written through `linux_impl::sync_rx_macs`, the one writer attach
+//! and the SIGHUP reconcile use too.
+//!
 //! Membership policy is the one the SIGHUP reconcile already applies:
 //! an Ethernet link becomes a target when the kernel reports it oper-up
 //! (or `unknown`, which virtual devices report for lack of carrier
@@ -57,7 +64,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::linux_impl::{
-    enumerate_redirect_targets, set_cfg_flag_in, FpCfg, VlanResolve, FP_CFG_FLAG_VLAN_PRESENT,
+    enumerate_redirect_targets, set_cfg_flag_in, sync_rx_macs, FpCfg, RxMacKey, VlanResolve,
+    FP_CFG_FLAG_VLAN_PRESENT,
 };
 use crate::pin;
 use crate::reconcile::{apply_vlan_resolve, desired_vlan_resolve, ifindex_exists};
@@ -84,13 +92,20 @@ impl RedirectTargetWatcher {
     /// Spawn the watcher thread. `directives` are the module's, for
     /// the `bridge-resolve` rule the VLAN derivation consults; a SIGHUP
     /// that changes them hands the new set over via
-    /// [`set_directives`](Self::set_directives).
+    /// [`set_directives`](Self::set_directives). `rx_ports` are the
+    /// XDP-attached `(iface, ifindex)` pairs whose `RX_MACS` entries the
+    /// refresh keeps current; fixed for the life of the attach, since a
+    /// SIGHUP never changes the attach set.
     ///
     /// `Err` only when the thread itself cannot be created. A netlink
     /// or map failure *inside* the thread is logged and ends it: attach
     /// stays up and the SIGHUP reconcile remains the fallback refresh,
     /// exactly as before this existed.
-    pub fn start(bpffs_root: &Path, directives: Vec<ModuleDirective>) -> std::io::Result<Self> {
+    pub fn start(
+        bpffs_root: &Path,
+        directives: Vec<ModuleDirective>,
+        rx_ports: Vec<(String, u32)>,
+    ) -> std::io::Result<Self> {
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
         let root = bpffs_root.to_path_buf();
@@ -115,7 +130,7 @@ impl RedirectTargetWatcher {
                         return;
                     }
                 };
-                rt.block_on(run(root, token, shared, wake));
+                rt.block_on(run(root, token, shared, wake, rx_ports));
             })?;
         Ok(Self {
             shutdown,
@@ -176,10 +191,12 @@ struct Targets {
     cfg: Array<MapData, FpCfg>,
     in_devmap: HashSet<u32>,
     in_tc: HashSet<u32>,
+    rx: AyaHashMap<MapData, RxMacKey, u8>,
+    rx_ports: Vec<(String, u32)>,
 }
 
 impl Targets {
-    fn open(root: &Path) -> Result<Self, String> {
+    fn open(root: &Path, rx_ports: Vec<(String, u32)>) -> Result<Self, String> {
         let dm = MapData::from_pin(pin::map_path(root, "REDIRECT_DEVMAP"))
             .map_err(|e| format!("REDIRECT_DEVMAP pin open: {e}"))?;
         let devmap = DevMapHash::try_from(Map::DevMapHash(dm))
@@ -195,6 +212,10 @@ impl Targets {
         let cm = MapData::from_pin(pin::map_path(root, "CFG"))
             .map_err(|e| format!("CFG pin open: {e}"))?;
         let cfg = Array::try_from(Map::Array(cm)).map_err(|e| format!("CFG try_from: {e}"))?;
+        let rm = MapData::from_pin(pin::map_path(root, "RX_MACS"))
+            .map_err(|e| format!("RX_MACS pin open: {e}"))?;
+        let rx =
+            AyaHashMap::try_from(Map::HashMap(rm)).map_err(|e| format!("RX_MACS try_from: {e}"))?;
         // Seed membership from what attach (or a previous SIGHUP) put
         // in each map.
         let in_devmap = devmap.keys().filter_map(Result::ok).collect();
@@ -206,7 +227,23 @@ impl Targets {
             cfg,
             in_devmap,
             in_tc,
+            rx,
+            rx_ports,
         })
+    }
+
+    /// Bring `RX_MACS` to what the attached ports receive on now.
+    /// Independent of the VLAN refresh: a topology read failure there
+    /// must not hold back a MAC change here.
+    fn refresh_rx_macs(&mut self) {
+        let sync = sync_rx_macs(&mut self.rx, &self.rx_ports);
+        if sync.added > 0 || sync.removed > 0 {
+            info!(
+                added = sync.added,
+                removed = sync.removed,
+                "RX_MACS refreshed from link events"
+            );
+        }
     }
 
     fn admit(&mut self, ifindex: u32, why: &'static str) {
@@ -352,6 +389,7 @@ async fn run(
     shutdown: CancellationToken,
     directives: Arc<Mutex<Vec<ModuleDirective>>>,
     refresh_now: Arc<tokio::sync::Notify>,
+    rx_ports: Vec<(String, u32)>,
 ) {
     // Subscribe BEFORE the reconcile so a link that changes during the
     // reconcile is replayed from the socket buffer afterwards instead
@@ -370,7 +408,7 @@ async fn run(
     };
     tokio::spawn(conn);
 
-    let mut targets = match Targets::open(&root) {
+    let mut targets = match Targets::open(&root, rx_ports) {
         Ok(t) => t,
         Err(e) => {
             warn!(
@@ -421,8 +459,8 @@ async fn run(
     }
 }
 
-/// The debounced pass: `VLAN_RESOLVE` first, then the admits it was
-/// holding back. A topology read failure keeps every admit pending and
+/// The debounced pass: `RX_MACS`, then `VLAN_RESOLVE`, then the admits
+/// it was holding back. A topology read failure keeps every admit pending and
 /// re-arms the debounce; a translation that could not be written keeps
 /// THAT admit pending the same way. Either way a transient failure
 /// costs a retry, never a redirect to an untranslated sub-interface.
@@ -431,6 +469,7 @@ fn refresh(
     pending: &mut Pending,
     directives: &Arc<Mutex<Vec<ModuleDirective>>>,
 ) {
+    targets.refresh_rx_macs();
     let snapshot: Vec<ModuleDirective> = match directives.lock() {
         Ok(d) => d.clone(),
         Err(_) => Vec::new(),

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::MODULE_NAME;
 
 /// Every §4.5 map that gets pinned. Order is not significant.
-pub const MAP_NAMES: [&str; 24] = [
+pub const MAP_NAMES: [&str; 25] = [
     "ALLOW_V4",
     "ALLOW_V6",
     "CFG",
@@ -67,16 +67,20 @@ pub const MAP_NAMES: [&str; 24] = [
     // every start and never ran, so redirect targets only refreshed on
     // SIGHUP on every box (#220's live tracking, never live).
     "TC_REDIRECT_TARGETS",
+    // Destination MACs each attached port receives on; the watcher opens
+    // it by pin to follow MAC changes.
+    "RX_MACS",
 ];
 
 /// The pinned maps the redirect-target watcher opens
 /// (`redirect_watch::Targets::open`). Each must be in [`MAP_NAMES`],
 /// or the watcher cannot start in production.
-pub const REDIRECT_WATCH_MAPS: [&str; 4] = [
+pub const REDIRECT_WATCH_MAPS: [&str; 5] = [
     "REDIRECT_DEVMAP",
     "TC_REDIRECT_TARGETS",
     "VLAN_RESOLVE",
     "CFG",
+    "RX_MACS",
 ];
 
 /// The fast-path XDP program's pinned basename (attached per-iface).

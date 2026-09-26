@@ -25,8 +25,9 @@ use tracing::{info, warn};
 use crate::linux_impl::{
     discover_bridge_chains, feature_flags_from_config, fib_cache_enabled,
     fib_flags_from_forwarding_mode, if_nametoindex, mss_clamp_global_value, read_vlan_config,
-    set_cfg_flag, ActiveState, FpCfg, MssClampValue, VlanResolve, CFG_WRITE_LOCK,
-    FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT, FP_CFG_VERSION_V2,
+    set_cfg_flag, sync_rx_macs, xdp_ports, ActiveState, FpCfg, MssClampValue, RxMacKey,
+    VlanResolve, CFG_WRITE_LOCK, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT,
+    FP_CFG_VERSION_V2,
 };
 use crate::MODULE_NAME;
 
@@ -146,6 +147,7 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     let mss_clamp = reconcile_mss_clamp(state, cfg)?;
     let vlan = reconcile_vlan_resolve(state, cfg)?;
     let devmap = reconcile_devmap(state)?;
+    let rx_macs = reconcile_rx_macs(state)?;
     reconcile_fib_cache(state, cfg);
     // The watcher derives VLAN_RESOLVE from the same directives
     // (`bridge-resolve`), so a reload that changes them must reach it
@@ -173,6 +175,8 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
         vlan_removed = vlan.removed,
         devmap_added = devmap.added,
         devmap_removed = devmap.removed,
+        rx_macs_added = rx_macs.added,
+        rx_macs_removed = rx_macs.removed,
         "SIGHUP reconcile applied"
     );
     Ok(())
@@ -639,6 +643,25 @@ fn reconcile_devmap(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
         }
     }
     Ok(delta)
+}
+
+/// `RX_MACS` to what the attached ports receive on now, through the
+/// same `sync_rx_macs` the watcher uses. The fallback refresh for a
+/// box whose watcher is not running (it hands the reload to the
+/// watcher too, via `set_directives`).
+fn reconcile_rx_macs(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
+    let ports = xdp_ports(state);
+    let map = state
+        .ebpf
+        .map_mut("RX_MACS")
+        .ok_or_else(|| ModuleError::other(MODULE_NAME, "RX_MACS map missing"))?;
+    let mut rx: AyaHashMap<_, RxMacKey, u8> = AyaHashMap::try_from(map)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("RX_MACS try_from: {e}")))?;
+    let sync = sync_rx_macs(&mut rx, &ports);
+    Ok(DeltaCount {
+        added: sync.added,
+        removed: sync.removed,
+    })
 }
 
 /// Does the kernel still know this ifindex? Wraps `if_indextoname`;

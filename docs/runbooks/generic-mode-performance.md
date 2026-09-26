@@ -438,6 +438,11 @@ over the live pins.
   silently after the count (see "Silent TX drops under generic XDP" below).
 - `pass_not_in_devmap`, `err_tail_call`: should be 0; non-zero means matched
   traffic silently falling back to the slow path.
+- `pass_not_for_us`: matched frames not addressed to the router at their
+  ingress port (bridged host-to-host, broadcast, multicast), correctly left
+  to the kernel. Steady on a bridge member; a jump with `fwd_ok` falling by
+  the same amount means a port's MAC is missing from `RX_MACS` (custom-fib
+  runbook, triage).
 - `custom_fib_miss`: destinations the BGP feed doesn't cover (consider
   `fallback-default`).
 - `nexthop_seq_retry`, `custom_fib_no_neigh`: sustained growth means nexthop churn

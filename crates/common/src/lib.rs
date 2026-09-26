@@ -4,6 +4,7 @@
 //! - [`config`]: line-based config parser (see SPEC.md §6)
 //! - [`module`]: the [`Module`] trait and support types (see SPEC.md §3.2)
 //! - [`probe`]: kernel capability probes (see SPEC.md §2.1)
+//! - [`topology`]: kernel link shapes and the MACs the router receives on
 
 pub mod config;
 pub mod fib;
@@ -11,6 +12,7 @@ pub mod fib;
 pub mod frr;
 pub mod module;
 pub mod probe;
+pub mod topology;
 
 pub use config::{Config, ConfigError, GlobalConfig, ModuleSection};
 pub use module::{

@@ -46,7 +46,10 @@
 //! and `repeat` well below 253, looping the syscall many times and
 //! taking the median of the kernel-reported per-iteration averages.
 //! A `FwdOk` delta assertion guards against ever silently measuring
-//! the `PassLowTtl` path instead.
+//! the `PassLowTtl` path instead. The same reuse carries the rewritten
+//! destination MAC into the next pass, so the forward harness also
+//! programs the nexthop's MAC as a receive MAC; without it every pass
+//! after the first would measure `PassNotForUs`.
 
 #![cfg(target_os = "linux")]
 
@@ -165,6 +168,8 @@ fn custom_fib_harness() -> Harness {
     );
     h.add_fib_v4_single("10.0.0.0/8", 0);
     h.add_devmap_ifindex(LO_IFINDEX);
+    // In-syscall passes 2..N see the frame pass 1 rewrote.
+    h.add_rx_mac(LO_IFINDEX, [0x02, 0, 0, 0, 0, 0xff]);
     h
 }
 
