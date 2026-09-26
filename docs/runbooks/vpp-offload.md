@@ -404,6 +404,26 @@ the change was refused or withdrawn, **it is not in effect** — that is
 deliberate, so "the rollout step succeeded" and "the rollout step is
 pending" cannot look the same.
 
+"Withdrawn" is the answer when the supervision loop does not pick the
+request up within 3 s: a tick mid-convergence can take longer than
+that. It applies only to a reload that asks the loop for something. A
+reload that changes no steering input — an edit to fast-path's
+`dry-run`, say, with `allow-prefix` untouched — is answered without the
+loop unless re-sending would do something there: from `Ready` with a
+remembered want (the "ask now" retry), from `Steered` (the repair
+below), or with every port off while something is still steered or
+wanted. Those still go to the loop and can still be withdrawn; re-run
+once `packetframe status` shows the convergence finished.
+
+**A module failure does not roll the reload back.** The daemon
+publishes the allowlist and reconfigures every module in config order,
+recording failures and carrying on, so every module the error does not
+name is running the new config. `packetframe reconfigure` says so
+("every other module applied it, and nothing was rolled back") and
+exits 2. A fast-path edit alongside a withdrawn vpp-offload change is
+live; re-running the same config re-applies every module, which
+changes nothing for the ones that already landed.
+
 Not in effect is not the same as forgotten. A steer refused by either
 gate — the completeness verdict, or a FIB still holding withheld,
 unresolvable or in-flight routes — leaves the *ask* recorded, and the
@@ -1073,11 +1093,13 @@ steering  DEGRADED — 1 steering rule(s) ... a convergence re-applies
                      with the want remembered, and from there the module
                      re-attempts the steer by itself once both gates
                      permit. Until it converges there is nothing to ask:
-                     `packetframe reconfigure` answers "not converged"
-                     from here and changes no steering
+                     from here `packetframe reconfigure` changes no
+                     steering. A reload that edits steering answers "not
+                     converged"; one that does not answers OK, which
+                     means only that it had nothing to apply
 ```
 
-That last sentence used to read *"`packetframe reconfigure` asks
+That closing part used to read *"`packetframe reconfigure` asks
 immediately rather than waiting"* — which contradicted the paragraph
 directly above it, and was wrong on every line it ever printed: the
 only states that reach this arm are the ones that refuse steering

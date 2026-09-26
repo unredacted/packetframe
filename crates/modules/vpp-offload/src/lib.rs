@@ -562,6 +562,11 @@ fn reload_collateral(old: &VppOffloadConfig, new: &VppOffloadConfig) -> String {
 /// So the loader owns one of these, publishes into it from a single
 /// derivation, and hands the same object to the module. There is nothing
 /// to keep in sync because there is only one copy.
+///
+/// The module does remember the [`SteeringInputs`] its last request
+/// carried, and that is not a copy of this: it is what the loop holds, and
+/// a reload compares a plan freshly derived from this handle against it.
+/// The allowlist itself is still never snapshotted.
 #[derive(Debug, Default)]
 pub struct SharedAllowlist(std::sync::RwLock<Vec<packetframe_common::fib::IpPrefix>>);
 
@@ -621,6 +626,25 @@ pub struct SteeringTarget {
     /// every NIC; slots are per-interface, so that costs nothing).
     pub targets: Vec<(String, u32, steer::RuleSet)>,
     /// Whether traffic should be diverted once the target is in place.
+    pub want_steer: bool,
+}
+
+/// Everything one steering request hands the supervision loop, as the
+/// loop holds it after applying one: the target it reconciles the NIC to,
+/// the exemptions the first-steer gate and the drift watcher judge, the
+/// watcher's diversion scope, and whether anything is to be steered.
+///
+/// Compared, never diffed: a reload whose freshly planned inputs equal the
+/// ones the loop holds may skip the round trip — see
+/// [`service::ResendVerdict`] for when that is safe. Planned from the LIVE
+/// allowlist every time, so this is not the stale snapshot
+/// [`SharedAllowlist`] exists to prevent: an `allow-prefix` edit changes
+/// the plan and the plan goes to the loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteeringInputs {
+    pub targets: Vec<(String, u32, steer::RuleSet)>,
+    pub exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+    pub dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
     pub want_steer: bool,
 }
 
@@ -1302,6 +1326,9 @@ impl Module for VppOffloadModule {
     /// keeping the running gate and the file on disk from disagreeing.
     /// See [`VppOffloadConfig::restart_only_delta`] for why refusing beat
     /// wiring it up.
+    ///
+    /// A reload that changes no steering input usually costs no round trip
+    /// to the supervision loop at all; see the comment at the skip.
     fn reconfigure(&mut self, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         let new = VppOffloadConfig::from_directives(&cfg.section.directives);
         if let Err(why) = self.cfg.restart_only_delta(&new) {
@@ -1314,14 +1341,15 @@ impl Module for VppOffloadModule {
         // Nothing to steer into. Not an error: a config with every port
         // `steer off` and no attachment is a legitimate state, and so is
         // a SIGHUP arriving between `load` and `attach`.
-        let Some(attached) = &self.attached else {
+        let Some(attached) = &mut self.attached else {
             self.cfg = new;
             return Ok(());
         };
 
+        let allowlist = self.allowlist.get();
         let target = steering_target(
             &new,
-            &self.allowlist.get(),
+            &allowlist,
             planning_table(&self.state_dir),
             &topology::kernel_receive_macs,
         )
@@ -1343,20 +1371,70 @@ impl Module for VppOffloadModule {
             .iter()
             .map(|(_, _, steer, _, _)| *steer)
             .ne(new.ports.iter().map(|(_, _, steer, _, _)| *steer));
-        attached
-            .service
-            .apply_steering(
-                target.targets,
-                new.steer_exempts.clone(),
-                // The SAME derivation attach uses, run against the
-                // config just accepted — allowlist and directions are
-                // both hot, so a scope captured at attach goes stale
-                // the moment either moves.
-                drift::divertible_scope(&new.ports, new.steer_direction, &self.allowlist.get()),
-                target.want_steer,
-                lever_moved,
-            )
-            .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
+        let planned = SteeringInputs {
+            targets: target.targets,
+            exempts: new.steer_exempts.clone(),
+            // The SAME derivation attach uses, run against the config
+            // just accepted — allowlist and directions are both hot, so a
+            // scope captured at attach goes stale the moment either moves.
+            dst_only: drift::divertible_scope(&new.ports, new.steer_direction, &allowlist),
+            want_steer: target.want_steer,
+        };
+        // Nothing for the loop to do? Then do not ask it.
+        //
+        // Every reload used to go through the loop, including one that
+        // edited only fast-path's section — and a loop mid-convergence
+        // can spend longer than the steering budget on one tick, so a
+        // fast-path `dry-run` flip failed here with "did not pick up the
+        // steering change" about a change nobody made (hardware, during a
+        // fresh 1.09M-route convergence). Now a reload skips the round
+        // trip only when all of these hold:
+        //
+        // - the lever did not move — implied by equal targets, stated so
+        //   the canary rule does not rest on an inference;
+        // - the planned inputs equal what the loop holds, which this
+        //   module knows only after an attach or an `Ok`
+        //   (`held_steering` is cleared on every failure);
+        // - the loop is alive, so its snapshot is current rather than
+        //   frozen by a panic;
+        // - that snapshot says an identical request would change nothing.
+        //   That last test is the loop's own, observed from the predicates
+        //   `apply_steering` branches on — it keeps the plain
+        //   `reconfigure` that the runbook uses as a steering repair and
+        //   as "ask now" for a remembered want going to the loop exactly
+        //   as before. See `service::ResendVerdict`.
+        //
+        // The drift scope is safe too: nothing is staged, and nothing
+        // needs to be, because what would have been staged is what the
+        // watcher already has or is waiting to commit.
+        if !lever_moved
+            && attached.held_steering.as_ref() == Some(&planned)
+            && attached.service.is_alive()
+            && attached
+                .service
+                .status()
+                .is_some_and(|p| p.resend.inert(planned.want_steer))
+        {
+            tracing::debug!(
+                "vpp-offload: reload changes no steering input and the supervision loop has \
+                 nothing to re-apply; not sent to the loop"
+            );
+            self.cfg = new;
+            return Ok(());
+        }
+        let outcome = attached.service.apply_steering(
+            planned.targets.clone(),
+            planned.exempts.clone(),
+            planned.dst_only.clone(),
+            planned.want_steer,
+            lever_moved,
+        );
+        // Known only on success. A refusal after `retarget` leaves the
+        // loop holding the NEW target, one before it the old, and a
+        // timeout either — so remembering the old inputs could skip a
+        // reload that reverts to them while the loop holds something else.
+        attached.held_steering = outcome.is_ok().then_some(planned);
+        outcome.map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         // Recorded only after the change landed. A `cfg` updated ahead of
         // the apply would make the NEXT reconfigure diff against a target
         // that was never installed, so a failed canary step would look
@@ -1663,6 +1741,7 @@ mod tests {
             resources_leaked: false,
             last_failures: Vec::new(),
             store_error: None,
+            resend: service::ResendVerdict::observe(State::Ready, false),
         }
     }
 
@@ -2244,6 +2323,162 @@ mod tests {
             m.cfg.require_table_complete,
             "a refused reload must not record the value it refused"
         );
+    }
+
+    /// One `dst` port, `steer off`, plus whatever else a test adds. `dst`
+    /// so the watcher's scope IS the allowlist, which makes an
+    /// `allow-prefix` edit a steering change; `steer off` so planning
+    /// reads no NIC.
+    fn resend_section(
+        extra: Vec<packetframe_common::config::ModuleDirective>,
+    ) -> packetframe_common::config::ModuleSection {
+        let mut directives = vec![packetframe_common::config::ModuleDirective::VppPort {
+            iface: "eth4".into(),
+            cores: 1,
+            steer: false,
+            vlans: vec![],
+            vlans_all: false,
+            direction: Some(VppSteerDirection::Dst),
+            line: 1,
+        }];
+        directives.extend(extra);
+        packetframe_common::config::ModuleSection {
+            name: "vpp-offload".into(),
+            directives,
+        }
+    }
+
+    fn doc_prefix(fourth: u8) -> packetframe_common::fib::IpPrefix {
+        packetframe_common::fib::IpPrefix::V4 {
+            addr: [192, 0, 2, fourth],
+            prefix_len: 32,
+        }
+    }
+
+    /// Loaded and attached as `attach` would leave it — `held_steering`
+    /// as `bring_up` records it — but behind a loop that never picks up a
+    /// steering request: the tick mid-convergence, held forever.
+    fn behind_a_wedged_loop(
+        section: &packetframe_common::config::ModuleSection,
+        published: service::Published,
+    ) -> VppOffloadModule {
+        let global = packetframe_common::config::GlobalConfig::default();
+        let ctx = LoaderCtx {
+            bpffs_root: std::path::Path::new("/sys/fs/bpf"),
+            state_dir: std::path::Path::new("/tmp/pf-resend-skip"),
+        };
+        let mut m = VppOffloadModule::new();
+        m.set_allowlist(std::sync::Arc::new(SharedAllowlist::new(vec![doc_prefix(
+            1,
+        )])));
+        m.load(&ModuleConfig::new(section, &global), &ctx)
+            .expect("the section loads");
+        let held = SteeringInputs {
+            targets: Vec::new(),
+            exempts: m.cfg.steer_exempts.clone(),
+            dst_only: drift::divertible_scope(
+                &m.cfg.ports,
+                m.cfg.steer_direction,
+                &m.allowlist.get(),
+            ),
+            want_steer: false,
+        };
+        m.attached = Some(bringup::Attached {
+            service: service::SupervisionService::wedged_for_test(published),
+            cores: cores::CoreMap {
+                main: 0,
+                workers: Vec::new(),
+            },
+            acquired: acquire::Acquired::Fresh,
+            adopted_process: false,
+            held_steering: Some(held),
+        });
+        m
+    }
+
+    fn reload(
+        m: &mut VppOffloadModule,
+        section: &packetframe_common::config::ModuleSection,
+    ) -> ModuleResult<()> {
+        let global = packetframe_common::config::GlobalConfig::default();
+        m.reconfigure(&ModuleConfig::new(section, &global))
+    }
+
+    /// The hardware failure: a reload that edited only fast-path's
+    /// section, while the loop was mid-convergence, failed on a steering
+    /// change nobody made. With the inputs unchanged and nothing for the
+    /// loop to re-apply, the loop is not asked.
+    #[test]
+    fn an_unchanged_reload_does_not_wait_for_a_busy_loop() {
+        let section = resend_section(vec![]);
+        let mut m = behind_a_wedged_loop(&section, healthy_published());
+        let started = std::time::Instant::now();
+        reload(&mut m, &section).expect("nothing changed, so nothing can be refused");
+        assert!(
+            started.elapsed() < service::STEERING_BUDGET / 2,
+            "answered in {:?} — that is the loop's budget, so it was asked",
+            started.elapsed()
+        );
+        m.detach().expect("the stand-in loop stops");
+    }
+
+    /// Any real steering change still goes to the loop, with the same
+    /// timeout and withdrawal as before — and a failure forgets what the
+    /// loop holds, so re-sending the same config is not mistaken for a
+    /// no-op. That re-send is how an operator retries.
+    #[test]
+    fn a_changed_reload_still_needs_the_loop_and_a_failure_is_not_remembered() {
+        let exempt = packetframe_common::config::ModuleDirective::VppSteerExempt(
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 0),
+                prefix_len: 24,
+            },
+        );
+        let section = resend_section(vec![]);
+        let changed = resend_section(vec![exempt]);
+        let mut m = behind_a_wedged_loop(&section, healthy_published());
+        let e = reload(&mut m, &changed).expect_err("a new `steer-exempt` must reach the loop");
+        assert!(e.to_string().contains("did not pick up"), "{e}");
+        assert!(
+            m.attached
+                .as_ref()
+                .expect("attached")
+                .held_steering
+                .is_none(),
+            "a failed request leaves the loop's target unknown"
+        );
+        let e = reload(&mut m, &changed).expect_err("the retry must reach the loop too");
+        assert!(e.to_string().contains("did not pick up"), "{e}");
+        m.detach().expect("the stand-in loop stops");
+    }
+
+    /// The allowlist lives in fast-path's section, and the plan is drawn
+    /// from the live handle — so an `allow-prefix` edit with this module's
+    /// own section untouched is still a steering change, which is the
+    /// whole reason `SharedAllowlist` is a handle.
+    #[test]
+    fn an_allowlist_edit_alone_still_needs_the_loop() {
+        let section = resend_section(vec![]);
+        let mut m = behind_a_wedged_loop(&section, healthy_published());
+        m.allowlist.publish(vec![doc_prefix(1), doc_prefix(2)]);
+        let e = reload(&mut m, &section).expect_err("the watcher's scope moved");
+        assert!(e.to_string().contains("did not pick up"), "{e}");
+        m.detach().expect("the stand-in loop stops");
+    }
+
+    /// Unchanged inputs are not enough. Here the config asks for nothing
+    /// steered while the loop still has something steered or wanted — a
+    /// refused removal, say — and re-sending is the rollback's retry, so
+    /// it must reach the loop.
+    #[test]
+    fn an_unchanged_reload_still_reaches_the_loop_when_a_resend_would_act() {
+        let section = resend_section(vec![]);
+        let mut p = healthy_published();
+        p.resend = service::ResendVerdict::observe(State::Ready, true);
+        let mut m = behind_a_wedged_loop(&section, p);
+        let e = reload(&mut m, &section).expect_err("the removal must be re-asked");
+        assert!(e.to_string().contains("did not pick up"), "{e}");
+        m.detach().expect("the stand-in loop stops");
     }
 
     /// A refused reload says what ELSE it did not apply.

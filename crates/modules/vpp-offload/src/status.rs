@@ -1424,8 +1424,14 @@ impl StatusSnapshot {
                  converging, precisely so a deferral cannot strand traffic on VPP with \
                  no lever"
             } else {
-                "Until it converges there is nothing to ask: `packetframe reconfigure` \
-                 answers \"not converged\" from here and changes no steering"
+                // Two answers, one outcome: a reload that edits no steering
+                // input is not sent to the loop at all when an identical
+                // request would be refused here (`service::ResendVerdict`),
+                // so "answers not converged" alone was false of it.
+                "Until it converges there is nothing to ask: from here `packetframe \
+                 reconfigure` changes no steering. A reload that edits steering answers \
+                 \"not converged\"; one that does not answers OK, which means only that it \
+                 had nothing to apply"
             };
             format!(
                 "a convergence re-applies steering only if it verifies clean — one that \

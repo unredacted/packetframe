@@ -58,11 +58,22 @@ pub enum ReconfigureError {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     #[error("{0}")]
     DaemonNotRunning(String),
-    /// SIGHUP delivered, daemon ack'd, but the ack reported a parse
-    /// error or per-module reconcile failure. Exit 2 (runtime).
+    /// SIGHUP delivered, daemon ack'd, but the ack reported a parse or
+    /// validation error: nothing from the new config was applied.
+    /// Exit 2 (runtime).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     #[error("{0}")]
     DaemonRejected(String),
+    /// SIGHUP delivered, daemon ack'd, and one or more modules failed to
+    /// apply the new config. Exit 2 (runtime), like a rejection — but NOT
+    /// one: `reconfigure_from_signal` publishes the shared allowlist and
+    /// then reconfigures every module in turn, recording failures without
+    /// stopping and rolling nothing back, so every module the message does
+    /// not name is running the new config. Reporting it as "rejected" told
+    /// an operator whose fast-path edit had landed that it had not.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[error("{0}")]
+    PartiallyApplied(String),
     /// SIGHUP delivered but no ack within 5s. Daemon may be wedged.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     #[error("daemon did not acknowledge reconfigure within 5s")]
@@ -1783,7 +1794,11 @@ fn parse_reconfigure_marker(body: &str) -> Result<(), ReconfigureError> {
             }
             _ => rest,
         };
-        Err(ReconfigureError::DaemonRejected(message.to_string()))
+        // `module:` is the one category written after the module loop ran.
+        Err(match message.strip_prefix("module: ") {
+            Some(failed) => ReconfigureError::PartiallyApplied(failed.to_string()),
+            None => ReconfigureError::DaemonRejected(message.to_string()),
+        })
     } else {
         // Marker exists but doesn't match the expected format.
         Err(ReconfigureError::Io(format!(
@@ -3247,6 +3262,21 @@ mod terminal_scrub_tests {
         let clean = scrub_for_terminal(forged);
         assert!(!clean.contains('\n'), "{clean:?}");
         assert_eq!(clean, "cannot reach VPP   vpp-offload: healthy");
+    }
+
+    /// A per-module failure is not a rejection: the modules it does not
+    /// name applied the new config, and nothing rolled them back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_module_failure_marker_reads_as_partially_applied() {
+        match parse_reconfigure_marker("ERR module: vpp-offload: busy 1700000000000000000\n") {
+            Err(ReconfigureError::PartiallyApplied(m)) => assert_eq!(m, "vpp-offload: busy"),
+            other => panic!("{other:?}"),
+        }
+        match parse_reconfigure_marker("ERR validate: unsafe 1700000000000000000\n") {
+            Err(ReconfigureError::DaemonRejected(m)) => assert_eq!(m, "validate: unsafe"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// And the marker path keeps its newlines, so this did not quietly
