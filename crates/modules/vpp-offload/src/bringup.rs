@@ -106,6 +106,12 @@ pub struct Attached {
     /// dataplane: it may already be forwarding.
     pub acquired: Acquired,
     pub adopted_process: bool,
+    /// The steering inputs the supervision loop is holding, when this
+    /// module knows them: what attach built the runtime with, then the
+    /// last request `reconfigure` saw succeed. `None` after any failed
+    /// request — see [`crate::service::ResendVerdict`] for why a failure
+    /// leaves the held target unknown.
+    pub held_steering: Option<crate::SteeringInputs>,
 }
 
 /// The MACs this member holds: its own PF address as **primary**, plus
@@ -469,6 +475,15 @@ pub fn bring_up(
     // reachable — the conservative default, including when the config
     // declares no direction at all.
     let dst_only_scope = crate::drift::divertible_scope(&cfg.ports, cfg.steer_direction, allowlist);
+    // Exactly what the runtime is built with below — the target, the
+    // engine's and the watcher's exemptions, the watcher's scope — so the
+    // first reload can tell whether it changes any of it.
+    let held_steering = crate::SteeringInputs {
+        targets: steer_targets.clone(),
+        exempts: cfg.steer_exempts.clone(),
+        dst_only: dst_only_scope.clone(),
+        want_steer: wants_steer,
+    };
     let steering = NtupleSteering::new(member_ports, steer_targets);
 
     let workers = cfg.total_workers();
@@ -691,6 +706,7 @@ pub fn bring_up(
         local_routes,
         &cfg.steer_exempts,
         dst_only_scope,
+        held_steering,
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -767,6 +783,7 @@ fn finish(
     local_routes: &[crate::LocalRoute],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
     dst_only_scope: Option<Vec<packetframe_common::fib::IpPrefix>>,
+    held_steering: crate::SteeringInputs,
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -1313,6 +1330,7 @@ fn finish(
         cores: core_map.clone(),
         acquired,
         adopted_process,
+        held_steering: Some(held_steering),
     })
 }
 
