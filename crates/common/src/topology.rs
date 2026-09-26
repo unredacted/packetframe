@@ -81,9 +81,11 @@ pub fn classify(facts: &dyn LinkFacts, dev: &str) -> Option<DevKind> {
 ///   device on a VLAN the port carries (`carried`; `None` when the
 ///   membership is unknown, which takes every VLAN — each extra MAC is
 ///   still one the router owns). "L3 device" means one no bridge has
-///   enslaved: `br3998`, not the `switch0.3998` beneath it, which never
+///   enslaved (a VRF may have): `br3998`, not the `switch0.3998` beneath it, which never
 ///   does L3.
-/// - **A plain port**: its own MAC only. A VLAN device there with a MAC
+/// - **A plain port**, including one enslaved to a master that is not a
+///   bridge (a VRF, say, which routes rather than bridges): its own MAC
+///   only. A VLAN device there with a MAC
 ///   of its own is left out: VPP's subif accepts only the VF's MAC, so
 ///   steering frames addressed to it would drop them, and for the
 ///   fast path a left-out MAC only means its frames take the kernel
@@ -100,7 +102,10 @@ pub fn receive_macs(
     master_of: impl Fn(&str) -> Option<String>,
     mac_of: impl Fn(&str) -> Option<[u8; 6]>,
 ) -> Vec<[u8; 6]> {
-    let Some(master) = master_of(port) else {
+    // Only a bridge master makes a port a bridge member; any other
+    // master (a VRF) leaves it a routed port with its own MAC.
+    let bridge_of = |dev: &str| master_of(dev).filter(|m| facts.is_bridge(m));
+    let Some(master) = bridge_of(port) else {
         return mac_of(port).into_iter().collect();
     };
     let mut macs: Vec<[u8; 6]> = mac_of(&master).into_iter().collect();
@@ -111,7 +116,7 @@ pub fn receive_macs(
             }
             _ => false,
         };
-        if on_carried_vlan && master_of(d).is_none() {
+        if on_carried_vlan && bridge_of(d).is_none() {
             macs.extend(mac_of(d));
         }
     }
@@ -311,6 +316,45 @@ mod tests {
             "a plain port scopes to its own MAC"
         );
         assert!(receive_macs(&edge(), &devs, "eth9", None, master_of, mac_of).is_empty());
+    }
+
+    /// A master that is not a bridge (a VRF) routes rather than bridges:
+    /// a port under it is a routed port with its own MAC, and a VLAN L3
+    /// device under it is still an L3 device of its bridge.
+    #[test]
+    fn a_non_bridge_master_leaves_a_port_routed() {
+        let mac = |b: u8| [0x02, 0, 0, 0, 0, b];
+        let devs: Vec<String> = ["switch0", "switch0.1337", "br1337", "eth3", "eth4", "vrf-a"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let master_of = |d: &str| match d {
+            "eth3" => Some("vrf-a".to_string()),
+            "eth4" => Some("switch0".to_string()),
+            "switch0.1337" => Some("br1337".to_string()),
+            "br1337" => Some("vrf-a".to_string()),
+            _ => None,
+        };
+        let mac_of = |d: &str| {
+            Some(match d {
+                "switch0" => mac(1),
+                "br1337" => mac(2),
+                "switch0.1337" => mac(3),
+                "eth3" => mac(0x30),
+                "vrf-a" => mac(0x70),
+                _ => return None,
+            })
+        };
+        assert_eq!(
+            receive_macs(&edge(), &devs, "eth3", None, master_of, mac_of),
+            vec![mac(0x30)],
+            "a VRF member receives on its own MAC, not the VRF device's"
+        );
+        assert_eq!(
+            receive_macs(&edge(), &devs, "eth4", None, master_of, mac_of),
+            vec![mac(1), mac(2)],
+            "br1337 in a VRF is still switch0's VLAN 1337 L3 device"
+        );
     }
 
     /// The sysfs-rooted lookup reads every device fact — masters,

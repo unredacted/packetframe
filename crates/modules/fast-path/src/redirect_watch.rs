@@ -193,6 +193,8 @@ struct Targets {
     in_tc: HashSet<u32>,
     rx: AyaHashMap<MapData, RxMacKey, u8>,
     rx_ports: Vec<(String, u32)>,
+    /// Ports whose receive MACs the last refresh could not read.
+    rx_unknown: HashSet<u32>,
 }
 
 impl Targets {
@@ -229,14 +231,22 @@ impl Targets {
             in_tc,
             rx,
             rx_ports,
+            rx_unknown: HashSet::new(),
         })
     }
 
     /// Bring `RX_MACS` to what the attached ports receive on now.
     /// Independent of the VLAN refresh: a topology read failure there
     /// must not hold back a MAC change here.
-    fn refresh_rx_macs(&mut self) {
-        let sync = sync_rx_macs(&mut self.rx, &self.rx_ports);
+    ///
+    /// Returns whether to retry: some port that still exists could not
+    /// be read. The event that announced its change has been consumed,
+    /// and another may never come, so the caller re-arms the debounce
+    /// exactly as it does for a failed VLAN read. A port whose ifindex is
+    /// gone is not retried (its XDP link went with it). Each unknown port
+    /// is warned about once, and its recovery logged.
+    fn refresh_rx_macs(&mut self) -> bool {
+        let sync = sync_rx_macs(&mut self.rx, &self.rx_ports, &self.rx_unknown);
         if sync.added > 0 || sync.removed > 0 {
             info!(
                 added = sync.added,
@@ -244,6 +254,14 @@ impl Targets {
                 "RX_MACS refreshed from link events"
             );
         }
+        let now: HashSet<u32> = sync.unknown.iter().map(|(_, i)| *i).collect();
+        for (iface, ifindex) in &self.rx_ports {
+            if self.rx_unknown.contains(ifindex) && !now.contains(ifindex) {
+                info!(iface = %iface, ifindex, "receive MACs readable again; RX_MACS current");
+            }
+        }
+        self.rx_unknown = now;
+        self.rx_unknown.iter().any(|i| ifindex_exists(*i))
     }
 
     fn admit(&mut self, ifindex: u32, why: &'static str) {
@@ -462,14 +480,16 @@ async fn run(
 /// The debounced pass: `RX_MACS`, then `VLAN_RESOLVE`, then the admits
 /// it was holding back. A topology read failure keeps every admit pending and
 /// re-arms the debounce; a translation that could not be written keeps
-/// THAT admit pending the same way. Either way a transient failure
-/// costs a retry, never a redirect to an untranslated sub-interface.
+/// THAT admit pending the same way, and so does a port whose receive
+/// MACs could not be read. Either way a transient failure costs a
+/// retry, never a redirect to an untranslated sub-interface or a MAC
+/// change left unapplied until some later event.
 fn refresh(
     targets: &mut Targets,
     pending: &mut Pending,
     directives: &Arc<Mutex<Vec<ModuleDirective>>>,
 ) {
-    targets.refresh_rx_macs();
+    let rx_retry = targets.refresh_rx_macs();
     let snapshot: Vec<ModuleDirective> = match directives.lock() {
         Ok(d) => d.clone(),
         Err(_) => Vec::new(),
@@ -503,6 +523,9 @@ fn refresh(
     }
     if !held.is_empty() {
         pending.admit = held;
+        pending.touch();
+    }
+    if rx_retry {
         pending.touch();
     }
 }

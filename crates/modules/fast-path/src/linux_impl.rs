@@ -609,32 +609,38 @@ pub(crate) fn xdp_ports(state: &ActiveState) -> Vec<(String, u32)> {
 pub(crate) struct RxMacSync {
     pub added: usize,
     pub removed: usize,
+    /// Ports whose state could not be read this pass; their entries were
+    /// left alone. The watcher retries while any of them still exists.
+    pub unknown: Vec<(String, u32)>,
 }
 
 /// Bring `RX_MACS` to what each attached XDP port (`(iface, ifindex)`)
-/// receives on now ([`crate::rx_macs`]): additions first, then
-/// removals, and a port whose MACs cannot be read keeps its entries.
-/// The one writer of the map, shared by attach, the redirect-target
-/// watcher and the SIGHUP reconcile so none of them can apply the rule
-/// differently. Failures are logged here, per port and per key.
+/// receives on now ([`crate::rx_macs`]): every addition first, then the
+/// removals of each port whose additions all landed; a port whose state
+/// cannot be read keeps its entries. The one writer of the map, shared
+/// by attach, the redirect-target watcher and the SIGHUP reconcile so
+/// none of them can apply the rule differently. An unknown port is
+/// warned about unless its ifindex is in `reported` (the watcher's
+/// retries); failed writes are always warned about.
 pub(crate) fn sync_rx_macs<T: std::borrow::BorrowMut<aya::maps::MapData>>(
     map: &mut AyaHashMap<T, RxMacKey, u8>,
     ports: &[(String, u32)],
+    reported: &std::collections::HashSet<u32>,
 ) -> RxMacSync {
     let current: Vec<RxMacKey> = map.keys().filter_map(Result::ok).collect();
     let desired: Vec<crate::rx_macs::PortMacs> = ports
         .iter()
-        .map(|(iface, ifindex)| {
-            (
-                iface.clone(),
-                *ifindex,
-                crate::rx_macs::kernel_port_receive_macs(iface),
-            )
+        .map(|(iface, ifindex)| crate::rx_macs::PortMacs {
+            iface: iface.clone(),
+            ifindex: *ifindex,
+            rx: crate::rx_macs::kernel_port_rx(iface),
         })
         .collect();
     let plan = crate::rx_macs::plan(&current, &desired);
-    let mut out = RxMacSync::default();
     for (iface, ifindex, why) in &plan.unknown {
+        if reported.contains(ifindex) {
+            continue;
+        }
         let held = current.iter().filter(|k| k.ifindex == *ifindex).count();
         warn!(
             iface = %iface,
@@ -646,29 +652,40 @@ pub(crate) fn sync_rx_macs<T: std::borrow::BorrowMut<aya::maps::MapData>>(
              pass_not_for_us)"
         );
     }
-    for key in &plan.add {
-        match map.insert(*key, 1u8, 0) {
-            Ok(()) => out.added += 1,
-            Err(e) => warn!(
-                ifindex = key.ifindex,
-                mac = %packetframe_common::config::format_mac(key.mac),
-                error = %e,
-                "RX_MACS insert failed; frames to this MAC take the kernel path"
-            ),
-        }
+    // `apply` needs the map from both closures; they run one at a time.
+    let cell = std::cell::RefCell::new(map);
+    let applied = crate::rx_macs::apply(
+        &plan,
+        |k| {
+            cell.borrow_mut()
+                .insert(*k, 1u8, 0)
+                .map_err(|e| e.to_string())
+        },
+        |k| cell.borrow_mut().remove(k).map_err(|e| e.to_string()),
+    );
+    for (key, error) in &applied.failed {
+        warn!(
+            ifindex = key.ifindex,
+            mac = %packetframe_common::config::format_mac(key.mac),
+            error = %error,
+            "RX_MACS write failed"
+        );
     }
-    for key in &plan.remove {
-        match map.remove(key) {
-            Ok(()) => out.removed += 1,
-            Err(e) => warn!(
-                ifindex = key.ifindex,
-                mac = %packetframe_common::config::format_mac(key.mac),
-                error = %e,
-                "RX_MACS remove failed"
-            ),
-        }
+    for iface in &applied.held {
+        warn!(
+            iface = %iface,
+            "RX_MACS replacement insert failed; this port keeps its previous MACs until it lands"
+        );
     }
-    out
+    RxMacSync {
+        added: applied.added,
+        removed: applied.removed,
+        unknown: plan
+            .unknown
+            .into_iter()
+            .map(|(iface, ifindex, _)| (iface, ifindex))
+            .collect(),
+    }
 }
 
 /// Layout mirror of `MssClampValue` in `bpf/src/maps.rs`. Value type
@@ -1629,7 +1646,7 @@ pub fn attach(
             .ok_or_else(|| ModuleError::other(MODULE_NAME, "RX_MACS map missing from ELF"))?;
         let mut rx: AyaHashMap<_, RxMacKey, u8> = AyaHashMap::try_from(map)
             .map_err(|e| ModuleError::other(MODULE_NAME, format!("RX_MACS try_from: {e}")))?;
-        let sync = sync_rx_macs(&mut rx, &ports);
+        let sync = sync_rx_macs(&mut rx, &ports, &Default::default());
         info!(entries = sync.added, "RX_MACS populated");
     }
 

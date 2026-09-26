@@ -1248,15 +1248,21 @@ rules:
 - a bridge member: the bridge's MAC, plus the MAC of each L3 device (a
   VLAN device or VLAN bridge that no bridge has enslaved) on a VLAN of
   that bridge;
-- a plain port: its own MAC. A VLAN sub-interface there with a MAC of
-  its own is left out, so frames addressed to it take the kernel path.
+- a plain port, including one enslaved to a master that is not a
+  bridge (a VRF): its own MAC. A VLAN sub-interface there with a MAC of
+  its own is left out, so frames addressed to it take the kernel path;
+- a bond: its MACs, keyed on the bond's ifindex and on each slave's
+  (native XDP on a bond reports the slave as the ingress interface).
 
 Attach fills the map before the first XDP attach. From then on the
 redirect-target watcher refreshes it on every `RTM_NEWLINK`, so a bridge
 that takes a new MAC is followed within the watcher's debounce. A SIGHUP
 refreshes it too. A port whose MACs cannot be read keeps the entries it
-has. A port with no entries passes every frame, which is the kernel
-path: correct, but none of that port's traffic is fast-pathed.
+has, and the watcher retries it every debounce interval until the read
+succeeds. A replacement MAC that cannot be inserted leaves the port's
+old MACs in place. A port with no entries passes every frame, which is
+the kernel path: correct, but none of that port's traffic is
+fast-pathed.
 
 A step change, with `fwd_ok` falling by about as much, means a port's
 router MAC is missing from the map. Check:

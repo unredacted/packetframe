@@ -657,7 +657,7 @@ fn reconcile_rx_macs(state: &mut ActiveState) -> ModuleResult<DeltaCount> {
         .ok_or_else(|| ModuleError::other(MODULE_NAME, "RX_MACS map missing"))?;
     let mut rx: AyaHashMap<_, RxMacKey, u8> = AyaHashMap::try_from(map)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("RX_MACS try_from: {e}")))?;
-    let sync = sync_rx_macs(&mut rx, &ports);
+    let sync = sync_rx_macs(&mut rx, &ports, &Default::default());
     Ok(DeltaCount {
         added: sync.added,
         removed: sync.removed,

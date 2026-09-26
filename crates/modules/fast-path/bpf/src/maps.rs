@@ -686,7 +686,9 @@ pub static VLAN_RESOLVE: HashMap<u32, VlanResolve> =
 /// Destination MACs the router receives on, per ingress port: the
 /// port's own MAC for a plain port; its bridge's plus the bridge's VLAN
 /// L3 devices' for a bridge member (`packetframe_common::topology::
-/// receive_macs`). A matched frame whose `(ingress ifindex, dst MAC)`
+/// receive_macs`). An attached bond's MACs are keyed on each slave's
+/// ifindex as well, since that is the `ingress_ifindex` native XDP on a
+/// bond reports. A matched frame whose `(ingress ifindex, dst MAC)`
 /// is absent is not addressed to the router and is XDP_PASSed untouched
 /// (`PassNotForUs`). A port with no entries therefore passes
 /// everything, which is the kernel path and always correct; userspace
