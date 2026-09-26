@@ -1395,25 +1395,20 @@ impl Module for VppOffloadModule {
         // - the planned inputs equal what the loop holds, which this
         //   module knows only after an attach or an `Ok`
         //   (`held_steering` is cleared on every failure);
-        // - the loop is alive, so its snapshot is current rather than
-        //   frozen by a panic;
-        // - that snapshot says an identical request would change nothing.
-        //   That last test is the loop's own, observed from the predicates
-        //   `apply_steering` branches on — it keeps the plain
-        //   `reconfigure` that the runbook uses as a steering repair and
-        //   as "ask now" for a remembered want going to the loop exactly
-        //   as before. See `service::ResendVerdict`.
+        // - the loop, alive, says an identical request would change
+        //   nothing — from a snapshot no pass in flight can overturn for
+        //   the reason it gives. That test is the loop's own, observed
+        //   from the predicates `apply_steering` branches on, and it keeps
+        //   the plain `reconfigure` that the runbook uses as a steering
+        //   repair and as "ask now" for a remembered want going to the
+        //   loop exactly as before. See `service::ResendVerdict`.
         //
         // The drift scope is safe too: nothing is staged, and nothing
         // needs to be, because what would have been staged is what the
         // watcher already has or is waiting to commit.
         if !lever_moved
             && attached.held_steering.as_ref() == Some(&planned)
-            && attached.service.is_alive()
-            && attached
-                .service
-                .status()
-                .is_some_and(|p| p.resend.inert(planned.want_steer))
+            && attached.service.resend_is_inert(planned.want_steer)
         {
             tracing::debug!(
                 "vpp-offload: reload changes no steering input and the supervision loop has \
@@ -2361,6 +2356,7 @@ mod tests {
     fn behind_a_wedged_loop(
         section: &packetframe_common::config::ModuleSection,
         published: service::Published,
+        mid_pass: bool,
     ) -> VppOffloadModule {
         let global = packetframe_common::config::GlobalConfig::default();
         let ctx = LoaderCtx {
@@ -2384,7 +2380,7 @@ mod tests {
             want_steer: false,
         };
         m.attached = Some(bringup::Attached {
-            service: service::SupervisionService::wedged_for_test(published),
+            service: service::SupervisionService::wedged_for_test(published, mid_pass),
             cores: cores::CoreMap {
                 main: 0,
                 workers: Vec::new(),
@@ -2411,7 +2407,24 @@ mod tests {
     #[test]
     fn an_unchanged_reload_does_not_wait_for_a_busy_loop() {
         let section = resend_section(vec![]);
-        let mut m = behind_a_wedged_loop(&section, healthy_published());
+        let mut m = behind_a_wedged_loop(&section, healthy_published(), false);
+        let started = std::time::Instant::now();
+        reload(&mut m, &section).expect("nothing changed, so nothing can be refused");
+        assert!(
+            started.elapsed() < service::STEERING_BUDGET / 2,
+            "answered in {:?} — that is the loop's budget, so it was asked",
+            started.elapsed()
+        );
+        m.detach().expect("the stand-in loop stops");
+    }
+
+    /// The same, with the loop blocked inside a pass — the hardware case
+    /// exactly. Nothing steered or wanted is a verdict no pass in flight
+    /// can overturn, so the busy tick does not matter.
+    #[test]
+    fn an_unchanged_reload_does_not_wait_for_a_loop_mid_pass() {
+        let section = resend_section(vec![]);
+        let mut m = behind_a_wedged_loop(&section, healthy_published(), true);
         let started = std::time::Instant::now();
         reload(&mut m, &section).expect("nothing changed, so nothing can be refused");
         assert!(
@@ -2436,7 +2449,7 @@ mod tests {
         );
         let section = resend_section(vec![]);
         let changed = resend_section(vec![exempt]);
-        let mut m = behind_a_wedged_loop(&section, healthy_published());
+        let mut m = behind_a_wedged_loop(&section, healthy_published(), false);
         let e = reload(&mut m, &changed).expect_err("a new `steer-exempt` must reach the loop");
         assert!(e.to_string().contains("did not pick up"), "{e}");
         assert!(
@@ -2459,7 +2472,7 @@ mod tests {
     #[test]
     fn an_allowlist_edit_alone_still_needs_the_loop() {
         let section = resend_section(vec![]);
-        let mut m = behind_a_wedged_loop(&section, healthy_published());
+        let mut m = behind_a_wedged_loop(&section, healthy_published(), false);
         m.allowlist.publish(vec![doc_prefix(1), doc_prefix(2)]);
         let e = reload(&mut m, &section).expect_err("the watcher's scope moved");
         assert!(e.to_string().contains("did not pick up"), "{e}");
@@ -2475,7 +2488,7 @@ mod tests {
         let section = resend_section(vec![]);
         let mut p = healthy_published();
         p.resend = service::ResendVerdict::observe(State::Ready, true);
-        let mut m = behind_a_wedged_loop(&section, p);
+        let mut m = behind_a_wedged_loop(&section, p, false);
         let e = reload(&mut m, &section).expect_err("the removal must be re-asked");
         assert!(e.to_string().contains("did not pick up"), "{e}");
         m.detach().expect("the stand-in loop stops");

@@ -412,8 +412,13 @@ reload that changes no steering input — an edit to fast-path's
 loop unless re-sending would do something there: from `Ready` with a
 remembered want (the "ask now" retry), from `Steered` (the repair
 below), or with every port off while something is still steered or
-wanted. Those still go to the loop and can still be withdrawn; re-run
-once `packetframe status` shows the convergence finished.
+wanted. A want remembered during a convergence also goes to the loop
+while a loop pass is running, because that pass may be the one that
+ends the convergence and steers. And after any failed request the
+module no longer knows which target the loop holds, so the next reload
+goes to the loop whatever it changes. All of these can still be
+withdrawn; re-run once `packetframe status` shows the convergence
+finished.
 
 **A module failure does not roll the reload back.** The daemon
 publishes the allowlist and reconfigures every module in config order,
@@ -1094,10 +1099,15 @@ steering  DEGRADED — 1 steering rule(s) ... a convergence re-applies
                      re-attempts the steer by itself once both gates
                      permit. Until it converges there is nothing to ask:
                      from here `packetframe reconfigure` changes no
-                     steering. A reload that edits steering answers "not
-                     converged"; one that does not answers OK, which
-                     means only that it had nothing to apply
+                     steering, and a reload that edits steering answers
+                     "not converged"
 ```
+
+A reload that edits no steering input changes nothing here either, but
+its answer varies: usually OK without asking the loop, and "not
+converged" when it does ask — after a failed request, when the module no
+longer knows which target the loop holds, or while a loop pass is in
+flight.
 
 That closing part used to read *"`packetframe reconfigure` asks
 immediately rather than waiting"* — which contradicted the paragraph
