@@ -59,7 +59,11 @@ pub const LEDGER_FILE_NAME: &str = "vpp-route-ledger.bin";
 
 /// Bump on any layout change. A record of another version is refused,
 /// which costs one dump-path adoption and nothing else.
-pub const LEDGER_FORMAT_VERSION: u32 = 1;
+///
+/// **2** since a path records every forwarding attribute (weight,
+/// preference, type, flags, proto, labels), not just nexthop and
+/// interface — see `sink::PathKey`.
+pub const LEDGER_FORMAT_VERSION: u32 = 2;
 
 const MAGIC: &[u8; 8] = b"PFVPPLGR";
 
@@ -233,9 +237,22 @@ impl LedgerRecord {
         out.extend_from_slice(&(b.path_sets.len() as u32).to_le_bytes());
         for set in &b.path_sets {
             out.extend_from_slice(&(set.len() as u16).to_le_bytes());
-            for (nh, idx) in set {
-                put_addr(&mut out, *nh);
-                out.extend_from_slice(&idx.to_le_bytes());
+            for p in set {
+                put_addr(&mut out, p.nexthop);
+                out.extend_from_slice(&p.sw_if_index.to_le_bytes());
+                out.push(p.weight);
+                out.push(p.preference);
+                out.extend_from_slice(&p.kind.to_le_bytes());
+                out.extend_from_slice(&p.flags.to_le_bytes());
+                out.extend_from_slice(&p.proto.to_le_bytes());
+                // At most 16 on the wire (`label_stack`); a u8 holds it.
+                out.push(p.labels.len().min(u8::MAX as usize) as u8);
+                for (label, ttl, exp, uniform) in p.labels.iter().take(u8::MAX as usize) {
+                    out.extend_from_slice(&label.to_le_bytes());
+                    out.push(*ttl);
+                    out.push(*exp);
+                    out.push(*uniform);
+                }
             }
         }
         out.extend_from_slice(&(b.entries.len() as u32).to_le_bytes());
@@ -309,10 +326,33 @@ impl LedgerRecord {
         let mut path_sets = Vec::with_capacity(n);
         for _ in 0..n {
             let m = r.u16()? as usize;
-            let mut set = Vec::with_capacity(m.min(r.remaining() / 9));
+            // The smallest encoded path: v4 nexthop (5) + interface (4) +
+            // weight, preference (2) + kind, flags, proto (12) + count (1).
+            let mut set = Vec::with_capacity(m.min(r.remaining() / 24));
             for _ in 0..m {
-                let nh = r.addr()?;
-                set.push((nh, r.u32()?));
+                let nexthop = r.addr()?;
+                let sw_if_index = r.u32()?;
+                let weight = r.u8()?;
+                let preference = r.u8()?;
+                let kind = r.u32()?;
+                let flags = r.u32()?;
+                let proto = r.u32()?;
+                let n_labels = r.u8()?;
+                let mut labels = Vec::with_capacity(usize::from(n_labels).min(16));
+                for _ in 0..n_labels {
+                    let label = r.u32()?;
+                    labels.push((label, r.u8()?, r.u8()?, r.u8()?));
+                }
+                set.push(PathKey {
+                    nexthop,
+                    sw_if_index,
+                    weight,
+                    preference,
+                    kind,
+                    flags,
+                    proto,
+                    labels,
+                });
             }
             path_sets.push(set);
         }
@@ -649,6 +689,10 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, d))
     }
 
+    fn pk(d: u8, idx: u32) -> PathKey {
+        crate::fib_sync::installed_path_key(nh(d), idx)
+    }
+
     fn record() -> LedgerRecord {
         LedgerRecord {
             pid: 4242,
@@ -660,7 +704,20 @@ mod tests {
                     counts: vec![("ipv4-VRF:0".into(), 24, 3), ("ipv4-VRF:0".into(), 32, 5)],
                 },
                 interfaces: vec![("eth4".into(), 3)],
-                path_sets: vec![vec![(nh(1), 3)], vec![(nh(1), 3), (nh(2), 3)]],
+                path_sets: vec![
+                    vec![pk(1, 3)],
+                    vec![
+                        pk(1, 3),
+                        // A labelled, weighted path, so every field of the
+                        // encoding round-trips.
+                        PathKey {
+                            weight: 3,
+                            preference: 1,
+                            labels: vec![(16, 64, 0, 1)],
+                            ..pk(2, 3)
+                        },
+                    ],
+                ],
                 entries: vec![
                     (
                         IpPrefix::V4 {

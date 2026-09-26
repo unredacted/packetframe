@@ -3601,6 +3601,19 @@ mod preserved {
         seed: Option<LedgerRecord>,
         source: Option<Box<dyn RouteSource>>,
     ) -> (Runtime, Driver, Log, Instant) {
+        let (rt, d, log, t0, _) = daemon_b_with_session(fake, mirror, seed, source, true);
+        (rt, d, log, t0)
+    }
+
+    /// [`daemon_b`], with the feed session's starting state chosen and
+    /// its handle returned — for holding a deferral open.
+    pub fn daemon_b_with_session(
+        fake: &Fake,
+        mirror: Vec<IpPrefix>,
+        seed: Option<LedgerRecord>,
+        source: Option<Box<dyn RouteSource>>,
+        live: bool,
+    ) -> (Runtime, Driver, Log, Instant, super::steered::Session) {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let source = source.unwrap_or_else(|| Box::new(SharedMirror(Arc::new(Mutex::new(mirror)))));
         let rt = runtime_with(
@@ -3613,8 +3626,8 @@ mod preserved {
             Box::new(NullStore),
         );
         let session = Arc::new(packetframe_common::fib::FeedSession::new());
-        session.set_up(true);
-        rt.feed_session(session);
+        session.set_up(live);
+        rt.feed_session(session.clone());
         if let Some(rec) = seed {
             rt.seed_ledger(rec);
         }
@@ -3626,7 +3639,7 @@ mod preserved {
             d.inject(t0, Event::Adopted { steered: true }, &mut fx);
         }
         rt.set_steered(true);
-        (rt, d, log, t0)
+        (rt, d, log, t0, session)
     }
 
     pub fn dumps(events: &[fake_vpp::Event]) -> usize {
@@ -3740,62 +3753,131 @@ mod preserved {
 
     /// Verify disagreeing with the seed: VPP holds the routes, on the
     /// right interface and in the right number (so the counts match), but
-    /// through a different nexthop than the record says. Traffic comes
-    /// off VPP, the seed is discarded, and the resync starts over from a
-    /// read of VPP's FIB — on the same process, never a teardown.
+    /// not through the paths the record says — a different nexthop, or the
+    /// SAME nexthop and interface with a different weight (a replacement
+    /// by another client that a where-only comparison would pass). Traffic
+    /// comes off VPP, the seed is discarded, and the resync starts over
+    /// from a read of VPP's FIB — on the same process, never a teardown.
     #[test]
     fn a_ledger_verify_disproves_falls_back_to_the_dump_path_without_a_teardown() {
-        const VIA_ELSEWHERE: &[([u8; 4], u8, [u8; 4], u32)] = &[
-            ([10, 0, 0, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX),
-            ([10, 0, 1, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX),
-            ([10, 0, 2, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX),
-            ([10, 0, 3, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX),
+        const VIA_ELSEWHERE: &[fake_vpp::ExistingVia] = &[
+            ([10, 0, 0, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX, 1),
+            ([10, 0, 1, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX, 1),
+            ([10, 0, 2, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX, 1),
+            ([10, 0, 3, 0], 24, [192, 0, 2, 2], ASSIGNED_INDEX, 1),
         ];
-        let fake = Fake::start_behaving(
-            "pl-disproved",
-            Behaviour {
-                track_routes: true,
-                existing_via: VIA_ELSEWHERE,
-                ..Default::default()
-            },
-        );
-        // The record claims the four routes via 192.0.2.1 — which is also
-        // what the source says, so the diff has nothing to send and only
-        // verify can find the lie.
-        let mut fp = FibFingerprint::default();
-        let mut t = fake_vpp::RouteTable::new();
-        for &(a, l, nh, i) in VIA_ELSEWHERE {
-            t.insert((a, l), vec![(nh, i)]);
+        const REWEIGHTED: &[fake_vpp::ExistingVia] = &[
+            ([10, 0, 0, 0], 24, [192, 0, 2, 1], ASSIGNED_INDEX, 7),
+            ([10, 0, 1, 0], 24, [192, 0, 2, 1], ASSIGNED_INDEX, 7),
+            ([10, 0, 2, 0], 24, [192, 0, 2, 1], ASSIGNED_INDEX, 7),
+            ([10, 0, 3, 0], 24, [192, 0, 2, 1], ASSIGNED_INDEX, 7),
+        ];
+        for (name, held) in [("nexthop", VIA_ELSEWHERE), ("weight", REWEIGHTED)] {
+            let fake = Fake::start_behaving(
+                &format!("pl-disproved-{name}"),
+                Behaviour {
+                    track_routes: true,
+                    existing_via: held,
+                    ..Default::default()
+                },
+            );
+            // The record claims the four routes as this module installs
+            // them via 192.0.2.1 — which is also what the source says, so
+            // the diff has nothing to send and only verify can find the lie.
+            // From the constant, not the fake's live table: the serving
+            // thread fills that asynchronously.
+            let mut fp = FibFingerprint::default();
+            let mut t = fake_vpp::RouteTable::new();
+            for &(a, l, ..) in held {
+                t.insert((a, l), Vec::new());
+            }
+            fp.absorb(&fake_vpp::fib_summary(&t));
+            let body = LedgerBody {
+                fingerprint: fp,
+                interfaces: vec![("eth4".into(), ASSIGNED_INDEX)],
+                path_sets: vec![vec![packetframe_vpp_offload::fib_sync::installed_path_key(
+                    fake_vpp::nh(),
+                    ASSIGNED_INDEX,
+                )]],
+                entries: table(4).into_iter().map(|p| (p, Some(0))).collect(),
+            };
+            let (rt, mut d, log, t0) = daemon_b(&fake, table(4), Some(record(body)), None);
+            let (_, events) = run_paced(&mut d, &rt, t0, 512, |d| d.state() == State::Steered);
+
+            assert!(
+                events.contains(&Event::PreservedLedgerRejected),
+                "{name}: verify must have caught the seed: {events:?}"
+            );
+            assert!(
+                !events.contains(&Event::VerifyFailed) && d.supervisor().failures() == 0,
+                "{name}: a disproved RECORD is not a broken VPP — no teardown: {events:?}"
+            );
+            assert_eq!(
+                log.lock().unwrap().as_slice(),
+                &["unsteer", "steer"],
+                "{name}: off VPP at the rejection, back on only after the dump path verified"
+            );
+            let seen = fake.drain_events();
+            assert_eq!(dumps(&seen), 1, "{name}: the fallback read VPP's FIB");
+            assert_eq!(
+                route_ops(&seen).len(),
+                4,
+                "{name}: and re-sent the four routes it could not vouch for"
+            );
+            assert!(events.contains(&Event::VerifyPassed), "{name}: {events:?}");
         }
-        fp.absorb(&fake_vpp::fib_summary(&t));
-        let body = LedgerBody {
-            fingerprint: fp,
-            interfaces: vec![("eth4".into(), ASSIGNED_INDEX)],
-            path_sets: vec![vec![(fake_vpp::nh(), ASSIGNED_INDEX)]],
-            entries: table(4).into_iter().map(|p| (p, Some(0))).collect(),
-        };
-        let (rt, mut d, log, t0) = daemon_b(&fake, table(4), Some(record(body)), None);
-        let (_, events) = run_paced(&mut d, &rt, t0, 512, |d| d.state() == State::Steered);
+    }
+
+    /// The seed was checked against VPP's route counts before the wait
+    /// for the source; another client adding a route DURING that wait
+    /// leaves a route the seed knows nothing about — never withdrawn by
+    /// the diff, never sampled by verify. The counts are read again at
+    /// the release, the seed is discarded, and the dump path reads VPP's
+    /// FIB (and withdraws the stranger) instead of steering on.
+    #[test]
+    fn counts_that_move_during_the_seeded_deferral_fall_back_to_the_dump_path() {
+        let fake = Fake::start_behaving("pl-moved", tracked());
+        let body = daemon_a(&fake, table(6));
+        let (rt, mut d, log, t0, session) =
+            daemon_b_with_session(&fake, table(6), Some(record(body)), None, false);
+        // Held: the feed is not up, so the seeded diff cannot release.
+        let ticks = std::cell::Cell::new(0);
+        let (now, _) = run_paced(&mut d, &rt, t0, 64, |_| {
+            ticks.set(ticks.get() + 1);
+            ticks.get() > 40
+        });
+        assert!(
+            rt.status().preserved_fib,
+            "the seed was accepted before the wait"
+        );
+        assert!(
+            rt.status().resync_deferred.is_some(),
+            "and the diff is held"
+        );
+        // Another client adds a route while we wait.
+        fake.routes.lock().unwrap().insert(
+            ([10, 0, 200, 0], 24),
+            vec![fake_vpp::table_path([192, 0, 2, 1], ASSIGNED_INDEX, 1)],
+        );
+        let _ = fake.drain_events();
+        session.set_up(true);
+        let (_, events) = run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
 
         assert!(
-            events.contains(&Event::PreservedLedgerRejected),
-            "verify must have caught the seed: {events:?}"
-        );
-        assert!(
-            !events.contains(&Event::VerifyFailed) && d.supervisor().failures() == 0,
-            "a disproved RECORD is not a broken VPP — no teardown: {events:?}"
+            !events.contains(&Event::PreservedLedgerRejected),
+            "caught at the release, before any diff or verify ran on the seed: {events:?}"
         );
         assert_eq!(
             log.lock().unwrap().as_slice(),
             &["unsteer", "steer"],
-            "off VPP at the rejection, back on only after the dump path verified"
+            "the dump path took traffic off VPP to read it"
         );
         let seen = fake.drain_events();
-        assert_eq!(dumps(&seen), 1, "the fallback read VPP's FIB");
-        assert_eq!(
-            route_ops(&seen).len(),
-            4,
-            "and re-sent the four routes it could not vouch for"
+        assert_eq!(dumps(&seen), 1, "VPP's FIB was read");
+        assert!(
+            route_ops(&seen).contains(&(false, [10, 0, 200, 0])),
+            "the stranger the seed could not see is withdrawn: {:?}",
+            route_ops(&seen)
         );
         assert!(events.contains(&Event::VerifyPassed), "{events:?}");
     }

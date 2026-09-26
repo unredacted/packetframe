@@ -683,13 +683,13 @@ struct Core {
     /// anything reads or changes VPP's FIB. Kept across a resync start
     /// that lost the API, so the resumed step decides it instead.
     preserved: Option<crate::ledger_record::LedgerRecord>,
-    /// How many routes the engine's ledger was seeded with from a
-    /// preserved record, while that seed is still unverified by this
-    /// process. Set by `start_resync`; cleared by the verify that judges
-    /// it (either way) and by the process going away. While set, verify
-    /// compares paths too, and a disagreement is
+    /// The seed the engine's ledger holds from a preserved record, while
+    /// that seed is still unverified by this process. Set by
+    /// `start_resync`; cleared by the verify that judges it (either way),
+    /// by the pre-diff re-check disproving it, and by the process going
+    /// away. While set, verify compares paths too, and a disagreement is
     /// [`Event::PreservedLedgerRejected`] rather than a teardown.
-    seeded: Option<u64>,
+    seeded: Option<Seed>,
     /// How long the last `drain_batch` took on the real clock. See
     /// [`Observe::last_drain_took`].
     last_drain_took: Duration,
@@ -964,6 +964,54 @@ impl FeedGate {
             epoch: None,
             demoted: false,
         }
+    }
+}
+
+/// A ledger seeded from a preserved record, and what it was checked
+/// against when it was seeded.
+#[derive(Debug, Clone)]
+struct Seed {
+    /// How many routes it seeded.
+    routes: u64,
+    /// VPP's per-length route counts as they stood when the seed was
+    /// accepted — equal to the preserving stop's. Kept because the diff
+    /// can wait minutes for the source after that check, and a route
+    /// another client adds or removes in that window is one the seed
+    /// knows nothing about: never withdrawn by the diff, and never
+    /// sampled by verify, which probes only ledger entries (review
+    /// finding). So the counts are read again immediately before the
+    /// deferred diff is released — see `Core::seed_still_holds`.
+    fingerprint: crate::ledger_record::FibFingerprint,
+}
+
+/// Why VPP's current route counts (`now`, `None` if unreadable) do not
+/// vouch for a ledger checked against `expected`, or `None` if they do.
+/// One wording for the check at seeding and the re-check before the diff.
+fn fingerprint_refusal(
+    now: Option<&crate::ledger_record::FibFingerprint>,
+    expected: &crate::ledger_record::FibFingerprint,
+) -> Option<String> {
+    match now {
+        None => Some(
+            "VPP's `show ip fib summary` could not be read, so whether anything changed its \
+             FIB cannot be established"
+                .to_string(),
+        ),
+        Some(now) if now != expected => {
+            let recorded = &expected.counts;
+            let first = now
+                .counts
+                .iter()
+                .chain(recorded.iter())
+                .find(|c| !recorded.contains(c) || !now.counts.contains(c))
+                .map(|(t, l, n)| format!("{t} /{l} = {n}"))
+                .unwrap_or_default();
+            Some(format!(
+                "VPP's route counts no longer match the preserved ledger's (first difference: \
+                 {first}) — something added or removed routes"
+            ))
+        }
+        Some(_) => None,
     }
 }
 
@@ -2647,29 +2695,7 @@ impl Core {
                 return Err(step_error(&mut self.engine, e));
             }
         };
-        let refused = match fingerprint {
-            None => Some(
-                "VPP's `show ip fib summary` could not be read, so whether anything changed \
-                 its FIB since the stop cannot be established"
-                    .to_string(),
-            ),
-            Some(now) if now != rec.body.fingerprint => {
-                let recorded = &rec.body.fingerprint.counts;
-                let first = now
-                    .counts
-                    .iter()
-                    .chain(recorded.iter())
-                    .find(|c| !recorded.contains(c) || !now.counts.contains(c))
-                    .map(|(t, l, n)| format!("{t} /{l} = {n}"))
-                    .unwrap_or_default();
-                Some(format!(
-                    "VPP's route counts changed since the stop that preserved it (first \
-                     difference: {first}) — something added or removed routes"
-                ))
-            }
-            Some(_) => None,
-        };
-        if let Some(why) = refused {
+        if let Some(why) = fingerprint_refusal(fingerprint.as_ref(), &rec.body.fingerprint) {
             tracing::warn!(
                 reason = %why,
                 "preserved route ledger not used; this adoption reads VPP's FIB instead \
@@ -2679,7 +2705,10 @@ impl Core {
         }
         match self.engine.seed_ledger(&rec.body) {
             Ok(n) => {
-                self.seeded = Some(n);
+                self.seeded = Some(Seed {
+                    routes: n,
+                    fingerprint: rec.body.fingerprint,
+                });
                 tracing::info!(
                     routes = n,
                     "adopted VPP's FIB from the preserved route ledger — no dump. VPP's route \
@@ -2694,6 +2723,43 @@ impl Core {
             ),
         }
         Ok(())
+    }
+
+    /// Re-read VPP's route counts immediately before a seeded diff is
+    /// released, and discard the seed if they moved since it was
+    /// accepted (see [`Seed::fingerprint`]). `Ok(true)`: the seed still
+    /// stands (or there is none). `Ok(false)`: it was discarded, with the
+    /// reason logged, and the engine's ledger is empty for the dump that
+    /// must follow. `Err`: the read lost the API, and the seed is kept for
+    /// the retried release to judge.
+    ///
+    /// Cost, since on the steered path it runs with traffic on VPP: one
+    /// `cli_inband` (`show ip fib summary`, per family carried). That is a
+    /// non-mp-safe message, so VPP takes its worker barrier for it — but
+    /// for a per-prefix-length hash count, not a table walk: the same
+    /// class of pause as the null-drop sampler's `show errors`, which
+    /// already runs every minute while steered, and nothing like the
+    /// dump's seconds.
+    fn seed_still_holds(&mut self) -> Result<bool, StepError> {
+        let Some(expected) = self.seeded.as_ref().map(|s| s.fingerprint.clone()) else {
+            return Ok(true);
+        };
+        let now = self
+            .engine
+            .fib_fingerprint()
+            .map_err(|e| step_error(&mut self.engine, e))?;
+        let Some(why) = fingerprint_refusal(now.as_ref(), &expected) else {
+            return Ok(true);
+        };
+        tracing::warn!(
+            reason = %why,
+            "the preserved ledger no longer describes VPP after the wait for the route source; \
+             discarding the seed — this adoption reads VPP's FIB instead (the dump path: \
+             unsteer, dump, diff, verify)"
+        );
+        self.seeded = None;
+        self.engine.discard_ledger();
+        Ok(false)
     }
 }
 
@@ -2791,7 +2857,7 @@ impl Observe for ObserveView {
             .source
             .route_count()
             .max(c.engine.counts().installed)
-            .max(c.seeded.unwrap_or(0));
+            .max(c.seeded.as_ref().map_or(0, |s| s.routes));
         crate::supervisor::convergence_budget(routes, c.last_dump_took)
     }
 }
@@ -3086,6 +3152,24 @@ impl ObserveView {
                         c.deferred_resync = Some(DeferredResync::AwaitingSeededDiff { feed });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
+                    // The seed was checked against VPP before the wait;
+                    // the wait may have been minutes. Checked again now,
+                    // and a seed that no longer holds takes the dump path
+                    // from here — through the pre-dump stage, handed THIS
+                    // gate so the release already earned carries over and
+                    // the next tick asks for the unsteer at once. Traffic
+                    // is not steered into a FIB the seed misdescribes for
+                    // any longer than that request takes.
+                    if !c.seed_still_holds()? {
+                        c.deferred_resync = Some(DeferredResync::AwaitingFallback {
+                            feed,
+                            last_request: None,
+                            restoring: false,
+                            spoiled: 0,
+                            settled_have: None,
+                        });
+                        return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                    }
                     let Core { engine, source, .. } = &mut *c;
                     let plan = engine.begin_resync(source.as_ref());
                     tracing::info!(
@@ -3125,6 +3209,33 @@ impl ObserveView {
                         let want = gate.floor;
                         c.deferred_resync = Some(DeferredResync::AwaitingDiff { adopted, gate });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                    }
+                    // The unsteered seeded adoption re-checks too (see the
+                    // steered arm). Nothing is on VPP here, so the dump
+                    // the discarded seed owes runs at once, and the diff
+                    // then waits behind a gate sized to what it read.
+                    if c.seeded.is_some() && !c.seed_still_holds()? {
+                        let Core {
+                            engine,
+                            last_dump_took,
+                            ..
+                        } = &mut *c;
+                        let started = std::time::Instant::now();
+                        let adopted = engine.adopt_vpp_fib().map_err(|e| step_error(engine, e))?;
+                        let took = started.elapsed();
+                        *last_dump_took = Some(last_dump_took.map_or(took, |t| t.max(took)));
+                        if adopted > 0 {
+                            let gate = SourceGate::new(
+                                (adopted / ADOPTED_SOURCE_FLOOR_DIVISOR).max(1),
+                                seq,
+                            );
+                            let want = gate.floor;
+                            c.deferred_resync =
+                                Some(DeferredResync::AwaitingDiff { adopted, gate });
+                            return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                        }
+                        // An empty FIB has no withdrawal universe to
+                        // protect: diff now, as a fresh resync would.
                     }
                     {
                         let Core { engine, source, .. } = &mut *c;
@@ -3541,7 +3652,7 @@ impl Effects for EffectsView {
         // ordinary diff gate when it is not. Checked before the steered
         // arm below, which would otherwise schedule exactly the dump the
         // seed replaces.
-        if let Some(seeded) = c.seeded {
+        if let Some(seeded) = c.seeded.as_ref().map(|s| s.routes) {
             let floor = (seeded / ADOPTED_SOURCE_FLOOR_DIVISOR).max(1);
             let seq = c.source.change_seq();
             let steered = !c.steering.installed().is_empty();

@@ -656,11 +656,13 @@ blocking dump rather than its end — fired `PhaseTimedOut` the next tick
 and tore VPP down.
 
 **Now a clean stop leaves the ledger for the next start.** When the
-daemon exits the preserving way (SIGTERM / `systemctl stop` — the
-supervision thread is dropped without `stop()`), the loop writes
+daemon exits the preserving way (SIGTERM / `systemctl stop`: the
+loader calls `Module::exit_preserving` just before dropping the modules,
+and vpp-offload's loop ends WITHOUT the teardown), the loop writes
 `<state-dir>/vpp-route-ledger.bin` after its last tick: every installed
-prefix with the exact paths (nexthop + `sw_if_index`) VPP acknowledged
-it through, VPP's own per-prefix-length route counts (`show ip fib
+prefix with the exact paths VPP acknowledged it through — nexthop,
+interface, and every forwarding attribute (weight, preference, type,
+flags, labels) — VPP's own per-prefix-length route counts (`show ip fib
 summary`), the VPP process identity (pid, start ticks, boot id) and a
 fresh token that is also written into `vpp-offload.json`. Compact binary
 with a trailing checksum: ~10 bytes a route, ~11 MB at 1.1M, written
@@ -679,7 +681,9 @@ supervisor `Ready`/`Steered` (or a previous ledger-seeded adoption still
 waiting on the feed, untouched), nothing awaiting VPP's acknowledgement,
 and VPP's summary readable. A stop during a dump-path deferral, a crash,
 a `kill -9`, or anything that is not a clean preserving exit writes
-nothing — and "nothing" is simply the dump path below.
+nothing — and "nothing" is simply the dump path below. So does a bare
+drop of the supervision service: it cannot tell a process exit from an
+accidental drop, so it keeps supervising VPP and preserves nothing.
 
 **The start that finds it** adopts WITHOUT reading VPP's FIB and without
 unsteering, in this order:
@@ -698,8 +702,11 @@ unsteering, in this order:
 3. The resync diff waits behind the same loaded-and-quiet release the
    dump path uses (feed live, floor = half the seeded table, quiet 2 s
    with a completeness authority / 5 s without), **steered the whole
-   time**, then pushes only the differences: a route VPP holds through
-   exactly the paths it resolves to now is not sent.
+   time**. At the release VPP's route counts are read AGAIN — the wait
+   can be minutes, and a route another client adds or removes in it is
+   one the seed knows nothing about — and a change discards the seed for
+   the dump path. Then the diff pushes only the differences: a route VPP
+   holds through exactly the paths it resolves to now is not sent.
 4. Verify runs its 64 probes with the **paths compared** too, still
    steered. Pass → `Ready` → the usual re-assert steer.
 
@@ -725,7 +732,7 @@ logged with its reason (`preserved route ledger not used: ...` /
 | Token missing or different (another daemon adopted since, or a downgrade rewrote the state file) | bring-up |
 | Corrupt, truncated, planted symlink, or another format version | bring-up (the file is still removed) |
 | Interfaces differ from the state file's, or a recorded path egresses an interface this attach does not own | bring-up / seed |
-| VPP's route counts differ from the recorded ones, or the summary cannot be read | `StartResync` |
+| VPP's route counts differ from the recorded ones, or the summary cannot be read | `StartResync`, and again when the deferred diff is released |
 | **Verify disagrees** (a prefix absent, or held through other paths) | the seeded verify |
 
 The last one is `PreservedLedgerRejected`, deliberately not
@@ -1905,7 +1912,9 @@ systemctl stop packetframe && packetframe detach --all && systemctl start packet
 ### VPP is gone after `systemctl stop`, but its steering rules are not
 
 On builds whose unit has `KillMode=mixed`, every stop kills VPP. Look
-for this in the journal:
+for this in the journal (on builds with the preserved route ledger the
+first line reads `preserved VPP's route ledger for the next daemon` or
+`VPP's route ledger was not preserved` instead):
 
 ```
 packetframe: vpp-offload supervision dropped without stop(); VPP is left running and adoptable

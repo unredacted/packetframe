@@ -2233,13 +2233,11 @@ fn a_dark_idle_member_neither_pages_nor_pins_failure_history() {
     );
 }
 
-/// The preserving exit writes the route ledger: the daemon's SIGTERM path
-/// is `drop(modules)`, and a drop — unlike `stop()` — leaves VPP running
-/// and must leave the next daemon the ledger that lets it adopt without
-/// reading VPP's FIB. Without this seam the ledger would be a format with
-/// no writer.
-#[test]
-fn a_preserving_drop_leaves_the_route_ledger_and_tears_nothing_down() {
+type Captured =
+    std::sync::Arc<std::sync::Mutex<Option<packetframe_vpp_offload::ledger_record::LedgerBody>>>;
+
+/// A converged service whose store captures a preserved ledger.
+fn converged_capturing(tag: &str) -> (Fake, SupervisionService, Captured) {
     use packetframe_vpp_offload::ledger_record::LedgerBody;
     use std::sync::{Arc, Mutex};
 
@@ -2265,7 +2263,7 @@ fn a_preserving_drop_leaves_the_route_ledger_and_tears_nothing_down() {
     }
 
     let fake = Fake::start_behaving(
-        "svc-preserve",
+        tag,
         fake_vpp::Behaviour {
             track_routes: true,
             ..Default::default()
@@ -2327,14 +2325,29 @@ fn a_preserving_drop_leaves_the_route_ledger_and_tears_nothing_down() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let _ = fake.drain_events();
+    (fake, svc, captured)
+}
 
-    drop(svc);
+/// The explicit preserving exit writes the route ledger and ends
+/// supervision: the daemon's SIGTERM path calls it (through
+/// `Module::exit_preserving`) just before dropping the modules, and VPP
+/// stays running for the next daemon to adopt — without reading its FIB,
+/// thanks to the ledger. Without this seam the ledger would be a format
+/// with no writer.
+#[test]
+fn an_explicit_preserving_shutdown_leaves_the_ledger_and_tears_nothing_down() {
+    let (fake, svc, captured) = converged_capturing("svc-preserve");
+
+    assert!(
+        svc.shutdown_preserving(),
+        "the loop finished inside the budget"
+    );
 
     let body = captured
         .lock()
         .unwrap()
         .take()
-        .expect("the preserving drop left the route ledger");
+        .expect("the preserving shutdown left the route ledger");
     assert_eq!(body.entries.len(), 6);
     assert!(body.entries.iter().all(|(_, s)| s.is_some()));
     let after = fake.drain_events();
@@ -2344,5 +2357,32 @@ fn a_preserving_drop_leaves_the_route_ledger_and_tears_nothing_down() {
             fake_vpp::Event::Route(_) | fake_vpp::Event::Neighbour { .. }
         )),
         "a preserving exit changes nothing in VPP: {after:?}"
+    );
+}
+
+/// A bare drop is ambiguous — it cannot tell a process exit from a
+/// caller that let go by accident — so it keeps the old contract: VPP is
+/// left running AND supervised, and nothing is preserved. Ending
+/// supervision here would leave VPP and its steering rules unmonitored,
+/// so a death or wedge would blackhole traffic with nothing to restart it.
+#[test]
+fn a_bare_drop_keeps_supervising_and_preserves_nothing() {
+    let (fake, svc, captured) = converged_capturing("svc-bare-drop");
+
+    drop(svc);
+    // The loop is still pinging VPP well after the drop.
+    std::thread::sleep(Duration::from_millis(1_200));
+    let _ = fake.drain_events();
+    std::thread::sleep(Duration::from_millis(1_200));
+    let after = fake.drain_events();
+    assert!(
+        after
+            .iter()
+            .any(|e| matches!(e, fake_vpp::Event::Msg(m) if m == "control_ping")),
+        "supervision must survive a bare drop: {after:?}"
+    );
+    assert!(
+        captured.lock().unwrap().is_none(),
+        "a bare drop is not a shutdown; nothing is preserved"
     );
 }

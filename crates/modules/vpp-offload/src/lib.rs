@@ -1439,6 +1439,15 @@ impl Module for VppOffloadModule {
         Ok(())
     }
 
+    /// The daemon is exiting without detaching: hand VPP to the next start
+    /// with its route ledger, and stop supervising — the process is going
+    /// away, so there is nothing left to supervise from.
+    fn exit_preserving(&mut self) {
+        if let Some(attached) = self.attached.take() {
+            attached.service.shutdown_preserving();
+        }
+    }
+
     fn detach(&mut self) -> ModuleResult<()> {
         // Reconcile a background teardown before answering. The failure
         // recorded when `stop()` timed out is PROVISIONAL: the loop kept
@@ -2399,6 +2408,25 @@ mod tests {
     ) -> ModuleResult<()> {
         let global = packetframe_common::config::GlobalConfig::default();
         m.reconfigure(&ModuleConfig::new(section, &global))
+    }
+
+    /// The loader's SIGTERM path reaches the service's preserving
+    /// shutdown through `Module::exit_preserving`: supervision ends —
+    /// the process is going away — without the detach teardown, and the
+    /// module no longer claims an attachment it has handed on.
+    #[test]
+    fn exit_preserving_ends_supervision_without_a_teardown() {
+        let section = resend_section(vec![]);
+        let mut m = behind_a_wedged_loop(&section, healthy_published(), false);
+        let started = std::time::Instant::now();
+        m.exit_preserving();
+        assert!(m.attached.is_none(), "the attachment is handed on");
+        assert!(m.teardown_failure.is_none() && m.teardown_pending.is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the stand-in loop honours the preserve request promptly: {:?}",
+            started.elapsed()
+        );
     }
 
     /// The hardware failure: a reload that edited only fast-path's

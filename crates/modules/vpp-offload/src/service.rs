@@ -139,7 +139,7 @@ const DETACH_BUDGET: Duration = Duration::from_millis(900);
 /// it, and says plainly which of the two happened.
 pub(crate) const STEERING_BUDGET: Duration = Duration::from_secs(3);
 
-/// How long a preserving drop waits for the loop to leave its route
+/// How long a preserving shutdown waits for the loop to leave its route
 /// ledger behind ([`crate::ledger_record`]).
 ///
 /// The work is the tick already in progress (a steered tick's API calls
@@ -360,7 +360,8 @@ struct Shared {
     stop: AtomicBool,
     /// A preserving exit: leave VPP exactly as it is, write the route
     /// ledger for the next daemon, and end the loop WITHOUT the stop
-    /// transition. Set only by `Drop` — see there.
+    /// transition. Set only by
+    /// [`SupervisionService::shutdown_preserving`] — never by a drop.
     preserve: AtomicBool,
     latest: Mutex<Option<Published>>,
     /// A steering change waiting to be applied. At most one: a second
@@ -900,6 +901,44 @@ impl SupervisionService {
         }
     }
 
+    /// End supervision the PRESERVING way, for a daemon that is exiting
+    /// without detaching (SPEC.md §7.3/§8.5): VPP, its resources and its
+    /// steering rules stay for the next start to adopt, and the loop
+    /// leaves the route ledger behind first ([`crate::ledger_record`]), so
+    /// that adoption need not read VPP's FIB — which on a steered VPP
+    /// means taking traffic off it (primary, 2026-09-26: ~13 minutes
+    /// unsteered for a restart that kept VPP).
+    ///
+    /// The loop ends WITHOUT the stop transition, so nothing is unsteered,
+    /// aborted or killed; the worst a slow loop costs is a missing record,
+    /// which is a dump-path adoption, what every adoption was before.
+    /// Bounded by [`PRESERVE_BUDGET`]; returns whether the loop finished
+    /// inside it.
+    ///
+    /// Only for a process that is really going away — see `Drop` for why
+    /// an ambiguous drop must keep supervising instead.
+    pub fn shutdown_preserving(mut self) -> bool {
+        let Some(t) = self.thread.take() else {
+            return true;
+        };
+        self.shared.preserve.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + PRESERVE_BUDGET;
+        while !t.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(STOP_POLL_CAP);
+        }
+        if t.is_finished() {
+            let _ = t.join();
+            return true;
+        }
+        tracing::warn!(
+            budget_ms = PRESERVE_BUDGET.as_millis() as u64,
+            "the supervision loop did not finish preserving the route ledger in time; \
+             exiting anyway. If no ledger was written the next adoption reads VPP's FIB \
+             instead (the dump path) — VPP itself is untouched either way"
+        );
+        false
+    }
+
     /// Whether the loop thread is still running. `false` after `stop`,
     /// and — importantly — after a panic: a dead loop means nothing is
     /// supervising VPP, which the caller must surface rather than keep
@@ -930,42 +969,24 @@ impl Drop for SupervisionService {
     /// So teardown has exactly one entrance: [`SupervisionService::stop`],
     /// which `Module::detach` calls. A drop that still holds the thread
     /// handle is by definition NOT that path, and is either a preserving
-    /// exit or a caller that dropped without detaching — and both leave
-    /// VPP running and adoptable, so both are logged rather than silently
-    /// converted into a teardown.
+    /// exit (the thread dies with the process — correct) or a caller that
+    /// dropped without detaching, which leaks one thread and is logged
+    /// rather than silently converted into a teardown.
     ///
-    /// What it DOES do is the other half of preserving: it asks the loop
-    /// to leave its route ledger for the next daemon
-    /// ([`crate::ledger_record`]) and waits, bounded by
-    /// [`PRESERVE_BUDGET`], for that to happen. That is not the race the
-    /// stop flag was: the preserve flag makes the loop END without the
-    /// stop transition, so there is no ordering in which it unsteers or
-    /// kills anything — the worst a lost race costs is a missing record,
-    /// and a missing record is a dump-path adoption, which is what every
-    /// adoption was before. Without the ledger, the next daemon has to
-    /// read VPP's FIB, and on a steered VPP that means taking traffic off
-    /// it first (primary, 2026-09-26: ~13 minutes unsteered for a restart
-    /// that kept VPP).
+    /// Nor does it preserve the route ledger, and that is the same rule
+    /// from the other side. A drop cannot tell a process exit from an
+    /// accidental drop, and ending supervision on the second would leave
+    /// VPP and its steering rules running unmonitored — a death or wedge
+    /// then blackholes traffic with nothing to restart it (review
+    /// finding). Preservation is asked for explicitly, by the one caller
+    /// that knows the process is going away:
+    /// [`SupervisionService::shutdown_preserving`], from the loader's
+    /// SIGTERM path through `Module::exit_preserving`.
     fn drop(&mut self) {
-        let Some(t) = self.thread.as_ref() else {
-            return;
-        };
-        tracing::info!(
-            "vpp-offload supervision dropped without stop(); VPP is left running and \
-             adoptable (§8.5 preserve-on-exit); preserving its route ledger for the \
-             next daemon. `packetframe detach` is what tears it down."
-        );
-        self.shared.preserve.store(true, Ordering::SeqCst);
-        let deadline = Instant::now() + PRESERVE_BUDGET;
-        while !t.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(STOP_POLL_CAP);
-        }
-        if !t.is_finished() {
-            tracing::warn!(
-                budget_ms = PRESERVE_BUDGET.as_millis() as u64,
-                "the supervision loop did not finish preserving the route ledger in time; \
-                 exiting anyway. If no ledger was written the next adoption reads VPP's FIB \
-                 instead (the dump path) — VPP itself is untouched either way"
+        if self.thread.is_some() {
+            tracing::info!(
+                "vpp-offload supervision dropped without stop(); VPP is left running and \
+                 adoptable (§8.5 preserve-on-exit). `packetframe detach` is what tears it down."
             );
         }
     }

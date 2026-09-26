@@ -127,6 +127,10 @@ pub enum Event {
 
 pub struct Fake {
     pub path: PathBuf,
+    /// The tracked route table (`Behaviour::track_routes`), shared with
+    /// the serving thread so a test can play ANOTHER client editing VPP's
+    /// FIB between two of this module's requests.
+    pub routes: std::sync::Arc<std::sync::Mutex<RouteTable>>,
     _dir: tempdir::TempDir,
     events: Receiver<Event>,
 }
@@ -245,18 +249,31 @@ pub struct Behaviour {
     /// other finds. The table outlives connections, like the neighbour
     /// table.
     pub track_routes: bool,
-    /// Routes the table starts with, as `(addr, len, nexthop, sw_if_index)`
-    /// — for a surviving VPP holding a route through a nexthop other than
-    /// the one `existing_routes` implies. Only with `track_routes`.
-    pub existing_via: &'static [([u8; 4], u8, [u8; 4], u32)],
+    /// Routes the table starts with, as
+    /// `(addr, len, nexthop, sw_if_index, weight)` — for a surviving VPP
+    /// holding a route through a path other than the one
+    /// `existing_routes` implies. Only with `track_routes`.
+    pub existing_via: &'static [ExistingVia],
     /// Set when an `ip_route_dump` is served — the moment VPP's FIB is
     /// being read, which a test's route source can key churn on.
     pub dumped: Option<&'static std::sync::atomic::AtomicBool>,
 }
 
-/// The fake's route table, for `Behaviour::track_routes`: prefix →
-/// `(nexthop, sw_if_index)` paths.
-pub type RouteTable = std::collections::BTreeMap<([u8; 4], u8), Vec<([u8; 4], u32)>>;
+/// One `Behaviour::existing_via` route:
+/// `(addr, len, nexthop, sw_if_index, weight)`.
+pub type ExistingVia = ([u8; 4], u8, [u8; 4], u32, u8);
+
+/// The fake's route table, for `Behaviour::track_routes`: prefix → the
+/// paths exactly as they were installed, every attribute kept, so a
+/// lookup echoes what the table holds.
+pub type RouteTable = std::collections::BTreeMap<([u8; 4], u8), Vec<FibPath>>;
+
+/// One path as `existing_route` builds it, with a chosen weight.
+pub fn table_path(nh: [u8; 4], sw_if_index: u32, weight: u8) -> FibPath {
+    let mut p = existing_route([0; 4], 32, sw_if_index, true, nh).paths[0].clone();
+    p.weight = weight;
+    p
+}
 
 /// `show ip fib summary` over a tracked table, in VPP's layout: a table
 /// header whose tail carries lock counts, then `length count` rows.
@@ -302,6 +319,8 @@ impl Fake {
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx): (Sender<Event>, Receiver<Event>) = channel();
 
+        let routes: std::sync::Arc<std::sync::Mutex<RouteTable>> = Default::default();
+        let table = routes.clone();
         thread::spawn(move || {
             let mut b = behaviour;
             // VPP's neighbour table, OUTSIDE the accept loop, because it
@@ -311,13 +330,17 @@ impl Fake {
             // when we come back and ask.
             let mut neighbours: Vec<([u8; 4], u32, [u8; 6], u8)> = b.existing_neighbours.to_vec();
             // Likewise the route table, for `track_routes`.
-            let mut routes: RouteTable = RouteTable::new();
-            for &(addr, len, idx, has_nh) in b.existing_routes {
-                let nh = if has_nh { [192, 0, 2, 1] } else { [0; 4] };
-                routes.insert((addr, len), vec![(nh, idx)]);
-            }
-            for &(addr, len, nh, idx) in b.existing_via {
-                routes.insert((addr, len), vec![(nh, idx)]);
+            {
+                let mut routes = table.lock().unwrap();
+                for &(addr, len, idx, has_nh) in b.existing_routes {
+                    routes.insert(
+                        (addr, len),
+                        existing_route(addr, len, idx, has_nh, [192, 0, 2, 1]).paths,
+                    );
+                }
+                for &(addr, len, nh, idx, weight) in b.existing_via {
+                    routes.insert((addr, len), vec![table_path(nh, idx, weight)]);
+                }
             }
             // Outside the loop like the table: the stall fires once for
             // the life of the fake, not once per connection.
@@ -325,7 +348,7 @@ impl Fake {
             // Accept repeatedly: a disconnect-and-reconnect is part of
             // what these tests exercise.
             while let Ok((mut sock, _)) = listener.accept() {
-                serve(&mut sock, &tx, b, &mut neighbours, &mut routes, &mut stall);
+                serve(&mut sock, &tx, b, &mut neighbours, &table, &mut stall);
                 // One-shot hangup: the point of that test is that a fresh
                 // connection can finish the job.
                 b.hangup_after = None;
@@ -335,6 +358,7 @@ impl Fake {
 
         Self {
             path,
+            routes,
             _dir: dir,
             events: rx,
         }
@@ -354,7 +378,7 @@ fn serve(
     tx: &Sender<Event>,
     mut behaviour: Behaviour,
     neighbours: &mut Vec<([u8; 4], u32, [u8; 6], u8)>,
-    routes: &mut RouteTable,
+    table: &std::sync::Mutex<RouteTable>,
     stall: &mut Option<(&'static str, usize)>,
 ) -> Option<()> {
     // What `sw_interface_set_mac_address` last set, per interface. The
@@ -676,21 +700,13 @@ fn serve(
                     path_indices: r.route.paths.iter().map(|p| p.sw_if_index).collect(),
                 }));
                 // A real VPP applies before it answers.
+                let mut routes = table.lock().unwrap();
                 if r.is_add {
-                    let paths = r
-                        .route
-                        .paths
-                        .iter()
-                        .map(|p| {
-                            let mut nh = [0u8; 4];
-                            nh.copy_from_slice(&p.nh.address.0[..4]);
-                            (nh, p.sw_if_index)
-                        })
-                        .collect();
-                    routes.insert((addr, r.route.prefix.len), paths);
+                    routes.insert((addr, r.route.prefix.len), r.route.paths.clone());
                 } else {
                     routes.remove(&(addr, r.route.prefix.len));
                 }
+                drop(routes);
 
                 routes_seen += 1;
                 if behaviour.hangup_after.is_some_and(|n| routes_seen > n) {
@@ -799,15 +815,8 @@ fn serve(
                 let mut addr = [0u8; 4];
                 addr.copy_from_slice(&q.prefix.address.un.0[..4]);
                 out = reply_head("ip_route_lookup_reply");
-                let (retval, paths) = match routes.get(&(addr, q.prefix.len)) {
-                    Some(p) => (
-                        0,
-                        p.iter()
-                            .map(|&(nh, idx)| {
-                                existing_route(addr, q.prefix.len, idx, true, nh).paths[0].clone()
-                            })
-                            .collect(),
-                    ),
+                let (retval, paths) = match table.lock().unwrap().get(&(addr, q.prefix.len)) {
+                    Some(p) => (0, p.clone()),
                     // VNET_API_ERROR_NO_SUCH_ENTRY.
                     None => (-6, Vec::new()),
                 };
@@ -852,12 +861,10 @@ fn serve(
                 if let Some(f) = behaviour.dumped {
                     f.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
-                for (&(addr, len), paths) in routes.iter() {
-                    let mut route = existing_route(addr, len, paths[0].1, true, paths[0].0);
-                    route.paths = paths
-                        .iter()
-                        .map(|&(nh, idx)| existing_route(addr, len, idx, true, nh).paths[0].clone())
-                        .collect();
+                let snapshot = table.lock().unwrap().clone();
+                for (&(addr, len), paths) in snapshot.iter() {
+                    let mut route = existing_route(addr, len, 0, true, [192, 0, 2, 1]);
+                    route.paths = paths.clone();
                     route.n_paths = route.paths.len() as u8;
                     let mut d = reply_head("ip_route_details");
                     IpRouteDetails {
@@ -972,7 +979,7 @@ fn serve(
                     .cmd;
                 let _ = tx.send(Event::Msg(format!("cli {cmd}")));
                 let reply = if cmd.contains("fib summary") && behaviour.track_routes {
-                    fib_summary(routes)
+                    fib_summary(&table.lock().unwrap())
                 } else if cmd.contains("fib summary") {
                     // Not a table this fake can describe: an answer the
                     // client must refuse to fingerprint.

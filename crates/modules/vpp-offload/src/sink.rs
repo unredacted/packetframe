@@ -674,10 +674,49 @@ impl PendingMap {
     }
 }
 
-/// One FIB path as VPP holds it: the nexthop and the interface it
-/// egresses. What a route was installed THROUGH, which is what a restart
-/// has to compare to decide whether re-sending it would change anything.
-pub type PathKey = (IpAddr, u32);
+/// One FIB path as VPP holds it — every attribute of it that decides
+/// forwarding, not just where it goes. What a route was installed
+/// THROUGH, which is what a restart compares to decide whether re-sending
+/// it would change anything, and what verify compares against a seeded
+/// ledger.
+///
+/// Where-it-goes alone was the first version and it was not enough
+/// (review finding): another client replacing a route with the same
+/// nexthop and interface but a different weight, preference, type, flags
+/// or label stack keeps every per-length count and every
+/// `(nexthop, interface)` pair, so neither the fingerprint nor a
+/// where-only verify would notice, and the resync would skip restoring
+/// it. Built only by `fib_sync::path_key` from a wire path — the one
+/// decoding the drainer, the resync and verify share — which also
+/// normalizes the defaults VPP echoes differently from what was sent.
+///
+/// Deliberately NOT here: `table_id` (the lookup table of a recursive or
+/// deag path), `rpf_id` (multicast), and the `via_label` / `obj_id` /
+/// `classify_table_index` members of the nexthop union — none is
+/// consulted for the NORMAL attached-nexthop paths this module installs,
+/// and a path that became one of the kinds that does consult them has
+/// changed `kind`, which is compared.
+///
+/// Interned with the rest of its set (see [`PathSets`]), so the wider key
+/// costs per distinct path set, not per route: the ledger still holds a
+/// 4-byte id a route.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PathKey {
+    pub nexthop: IpAddr,
+    pub sw_if_index: u32,
+    /// Normalized: VPP installs a weight of 0 as 1.
+    pub weight: u8,
+    pub preference: u8,
+    /// `FIB_API_PATH_TYPE_*`.
+    pub kind: u32,
+    /// `FIB_API_PATH_FLAG_*`.
+    pub flags: u32,
+    /// `FIB_API_PATH_NH_PROTO_*`.
+    pub proto: u32,
+    /// The MPLS label stack as `(label, ttl, exp, is_uniform)` — only the
+    /// `n_labels` entries that exist, never the zero padding behind them.
+    pub labels: Vec<(u32, u8, u8, u8)>,
+}
 
 /// An interned path set. See [`RouteLedger::intern_paths`].
 pub type PathSetId = u32;
@@ -1628,6 +1667,10 @@ mod tests {
         );
     }
 
+    fn pk(d: u8, idx: u32) -> PathKey {
+        crate::fib_sync::installed_path_key(nh(192, 0, 2, d), idx)
+    }
+
     /// The paths a route is recorded holding are VPP's acknowledgement,
     /// kept exactly as long as the version they describe is what VPP
     /// forwards — the property the resync skip and the preserved ledger
@@ -1636,13 +1679,9 @@ mod tests {
     fn recorded_paths_follow_what_vpp_acknowledged_and_nothing_else() {
         let mut led = RouteLedger::new(Capacity::new(100));
         let p = v4(10, 0, 0, 0, 24);
-        let a = led.intern_paths(&[(nh(192, 0, 2, 1), 3)]);
-        let b = led.intern_paths(&[(nh(192, 0, 2, 2), 3)]);
-        assert_eq!(
-            led.intern_paths(&[(nh(192, 0, 2, 1), 3)]),
-            a,
-            "interned once"
-        );
+        let a = led.intern_paths(&[pk(1, 3)]);
+        let b = led.intern_paths(&[pk(2, 3)]);
+        assert_eq!(led.intern_paths(&[pk(1, 3)]), a, "interned once");
 
         led.classify_resolved(p, 1);
         assert_eq!(
@@ -1681,14 +1720,17 @@ mod tests {
         assert_eq!(led.installed_via(kept), Some(a));
         let entries: Vec<_> = led.installed_entries().collect();
         assert_eq!(entries, vec![(p, None), (dumped, None), (kept, Some(a))]);
-        assert_eq!(led.paths_of(a), Some(&[(nh(192, 0, 2, 1), 3)][..]));
+        assert_eq!(led.paths_of(a), Some(&[pk(1, 3)][..]));
     }
 
     #[test]
     fn canonical_paths_ignore_order_and_repeats() {
-        let x = (nh(192, 0, 2, 1), 3);
-        let y = (nh(192, 0, 2, 2), 4);
-        assert_eq!(canonical_paths(vec![y, x, y]), canonical_paths(vec![x, y]));
+        let x = pk(1, 3);
+        let y = pk(2, 4);
+        assert_eq!(
+            canonical_paths(vec![y.clone(), x.clone(), y.clone()]),
+            canonical_paths(vec![x, y])
+        );
     }
 
     /// The resync skip must be able to drop an older owed op outright.

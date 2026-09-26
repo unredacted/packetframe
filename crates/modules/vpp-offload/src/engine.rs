@@ -3007,15 +3007,16 @@ impl ConvergenceEngine {
         if !self.ledger_is_empty() {
             return Err("the route ledger is already populated".into());
         }
-        if let Some((nh, idx)) = body
+        if let Some(p) = body
             .path_sets
             .iter()
             .flatten()
-            .find(|(_, idx)| !self.port_index.owns(*idx))
+            .find(|p| !self.port_index.owns(p.sw_if_index))
         {
             return Err(format!(
-                "a recorded path via {nh} egresses sw_if_index {idx}, which this attach does \
-                 not own"
+                "a recorded path via {} egresses sw_if_index {}, which this attach does not \
+                 own",
+                p.nexthop, p.sw_if_index
             ));
         }
         let ids: Vec<crate::sink::PathSetId> = body
@@ -4034,7 +4035,7 @@ mod tests {
             prefix_len: 32,
         };
         let foreign = LedgerBody {
-            path_sets: vec![vec![(nh(1), 99)]],
+            path_sets: vec![vec![crate::fib_sync::installed_path_key(nh(1), 99)]],
             entries: vec![(v4(10, 0, 0, 0, 16), Some(0))],
             ..Default::default()
         };
@@ -4045,7 +4046,7 @@ mod tests {
         assert!(e.ledger_is_empty(), "a refused seed seeds nothing");
 
         let body = LedgerBody {
-            path_sets: vec![vec![(nh(1), 3)]],
+            path_sets: vec![vec![crate::fib_sync::installed_path_key(nh(1), 3)]],
             entries: vec![
                 (v4(10, 0, 0, 0, 16), Some(0)),
                 (v4(10, 1, 0, 0, 16), None),
@@ -4078,7 +4079,7 @@ mod tests {
         let unknown = v4(10, 2, 0, 0, 16);
         let new = v4(10, 3, 0, 0, 16);
         e.seed_ledger(&LedgerBody {
-            path_sets: vec![vec![(nh(1), 3)]],
+            path_sets: vec![vec![crate::fib_sync::installed_path_key(nh(1), 3)]],
             entries: vec![(same, Some(0)), (moved, Some(0)), (unknown, None)],
             ..Default::default()
         })

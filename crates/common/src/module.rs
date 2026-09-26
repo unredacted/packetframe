@@ -262,6 +262,18 @@ pub trait Module: Send + Sync {
 
     fn detach(&mut self) -> ModuleResult<()>;
 
+    /// The daemon is exiting WITHOUT detaching (SIGTERM/SIGINT, SPEC.md
+    /// §7.3/§8.5) and the attachment must survive for the next start.
+    /// Called by the loader immediately before it drops the modules on
+    /// that path, and from nowhere else — so a module may treat it as the
+    /// one unambiguous signal that its process is going away with the
+    /// dataplane preserved, which a drop alone cannot be.
+    ///
+    /// Additive, with a default that does nothing: the eBPF modules'
+    /// bpffs pins already preserve their attachment. vpp-offload uses it
+    /// to leave its route ledger for the next daemon's adoption.
+    fn exit_preserving(&mut self) {}
+
     fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()>;
 
     /// Structured health readback. Returns a [`HealthReport`] the
