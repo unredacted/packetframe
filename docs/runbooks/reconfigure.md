@@ -83,6 +83,7 @@ The directives that require it:
 - **`route-source` config (custom-FIB only).** The RouteController's runtime is started at attach. Editing the BGP/BMP listener address or peer-AS requires bringing the runtime down and back up.
 - **`circuit-breaker` thresholds.** The breaker sampler thread reads its config at thread start; it doesn't currently observe SIGHUP.
 - **`local-prefix` / `local-prefix6` directives (custom-FIB only).** The connected-fast-path resolver is similarly attach-time-bound. Both families are collected once at attach and handed to the resolver; editing either and reloading leaves the running set untouched with no warning.
+- **`coalesce` (NIC interrupt coalescing).** Written to each attached NIC once at attach and reversed at detach from `<state-dir>/coalesce.json`. Unlike the silent entries in this list, a reload whose `coalesce` line differs from the running one is **refused by name** (the CLI exits non-zero with ``daemon rejected: fast-path: `coalesce` changed ...``), and fast-path applies nothing else from that reload.
 - **`bpffs-root`, `state-dir`.** Used at module load only; baked into the running daemon's pin paths and the metrics file location.
 
 If you change one of these in the config and reload, the daemon keeps using the old value silently (with a `WARN`-level log line for attach-set changes). Restart is the only way through.

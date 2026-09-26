@@ -2247,6 +2247,19 @@ fn detach_fast_path(
             if n > 0 {
                 tracing::info!(count = n, "tc filters detached");
             }
+            // `coalesce` directive: NIC settings the daemon changed,
+            // written back from their record. After the detach, the
+            // reverse of attach's order. Warn-only (a performance knob's
+            // reversal must not fail the recovery path); a refused write
+            // keeps its record for the next detach.
+            let s = packetframe_fast_path::coalesce_restore_from_state_dir(state_dir);
+            if s.restored > 0 || s.retained > 0 {
+                tracing::info!(
+                    restored = s.restored,
+                    retained = s.retained,
+                    "NIC coalescing restored"
+                );
+            }
         }
 
         packetframe_fast_path::registry::remove(state_dir)
