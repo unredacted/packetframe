@@ -4035,13 +4035,13 @@ mod tests {
             fn kill(&mut self) -> Disposition {
                 Disposition::SafeToRelease
             }
-            fn attach_devices(&mut self) -> Result<(), String> {
+            fn attach_devices(&mut self) -> Result<(), crate::executor::StepError> {
                 Ok(())
             }
-            fn start_resync(&mut self) -> Result<(), String> {
+            fn start_resync(&mut self) -> Result<(), crate::executor::StepError> {
                 Ok(())
             }
-            fn start_verify(&mut self) -> Result<(), String> {
+            fn start_verify(&mut self) -> Result<(), crate::executor::StepError> {
                 Ok(())
             }
             fn abort_convergence(&mut self) {}

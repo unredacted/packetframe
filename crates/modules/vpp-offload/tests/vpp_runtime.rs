@@ -203,17 +203,18 @@ fn the_full_loop_converges_an_adopted_vpp_to_ready() {
         .all(|r| r.path_indices == vec![ASSIGNED_INDEX]));
 }
 
-/// A drain that dies mid-resync must fail convergence, deliver the
-/// abort acknowledgement, and reach a retryable state — not spin, not
-/// hang, not absorb the error.
+/// A socket that breaks mid-resync is RESUMED on the same VPP: the engine
+/// reconnects, the drainer's requeued ops go out on the new connection,
+/// and the convergence reaches `Ready` without a teardown.
 ///
-/// The retry itself goes through `Spawn`, which host CI cannot perform
-/// (there is no VPP binary, and on non-Linux the process handle is an
-/// ENOSYS stub) — so this asserts the failure path up to and including
-/// the retry *attempt*, and full crash-recovery with a respawn stays
-/// hardware territory alongside the failover drills.
+/// The inverse of what this test asserted before interruptions were
+/// resumed. A lost connection is a symptom — the pidfd decides death and
+/// the wedge detector silence — and treating it as a failed convergence
+/// is what killed an adopted VPP over one socket-deadline `EAGAIN` on a
+/// starved host, then three fresh spawns the same way. The fake's hangup
+/// is one-shot, exactly as a VPP that was only slow.
 #[test]
-fn a_broken_socket_mid_resync_fails_convergence_and_retries() {
+fn a_broken_socket_mid_resync_reconnects_and_converges_in_place() {
     // Hang up after 2 route ops, once; later connections behave.
     let fake = Fake::start_with("loop-hangup", 2);
     let rt = runtime_for(&fake, 8);
@@ -231,49 +232,195 @@ fn a_broken_socket_mid_resync_fails_convergence_and_retries() {
     }
 
     let (_, events) = run_until(&mut d, &rt, t0, |d| {
-        d.supervisor().failures() > 0 && d.state() != State::Syncing
+        d.state() == State::Ready || d.supervisor().failures() > 0
     });
 
-    assert!(
-        events.contains(&Event::ConvergenceFailed),
-        "the hangup must be reported, not absorbed: {events:?}"
+    assert_eq!(
+        d.state(),
+        State::Ready,
+        "a transient socket loss must not cost the process: {events:?}"
     );
+    assert_eq!(d.supervisor().failures(), 0, "{events:?}");
     assert!(
-        events.contains(&Event::ConvergenceStopped),
-        "the abort must be acknowledged, or may_restart never clears: {events:?}"
+        !events.contains(&Event::ConvergenceFailed),
+        "the hangup is an interruption, not a failed pipeline: {events:?}"
     );
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 
-    let first_failures = d.supervisor().failures();
-    assert!(first_failures > 0);
-    // Drive on from a clock past the backoff deadline until the retry
-    // is attempted and itself fails (a second recorded failure). The
-    // state is already `Backoff` at entry, so stopping on state would
-    // stop before a single tick.
-    let (_, more) = run_until(&mut d, &rt, t0 + Duration::from_secs(60), |d| {
-        d.supervisor().failures() > first_failures
-    });
-    let all: Vec<_> = events.iter().chain(more.iter()).cloned().collect();
-    assert!(
-        more.contains(&Event::BackoffElapsed),
-        "the backoff must fire a retry: {all:?}"
-    );
-    assert!(
-        all.contains(&Event::SpawnFailed),
-        "host CI has no VPP to spawn, and that must be reported as \
-         SpawnFailed — not sat on: {all:?}"
-    );
-
-    // Nothing was silently lost: the routes the hangup interrupted are
-    // still owed, so a real respawn would converge them.
+    // Nothing was lost across the reconnect: every route is installed,
+    // on the index the attach recorded.
     let status = rt.status();
+    assert_eq!(status.counts.installed, 8);
+    assert_eq!(status.pending_ops, 0);
+    assert!(status.drain_error.is_none(), "{:?}", status.drain_error);
+}
+
+/// A VPP that stays gone after the socket breaks still reaches the
+/// teardown — through the wedge detector, on its own budget, rather than
+/// through the socket error.
+///
+/// The control for the test above: resuming in place must not become a
+/// way to sit on a dead dataplane. The socket path is unlinked while the
+/// first connection is still up, so the hangup leaves nothing to
+/// reconnect to and every ping fails.
+#[test]
+fn a_vpp_that_stays_gone_mid_resync_is_still_torn_down() {
+    let fake = Fake::start_with("loop-gone", 2);
+    let rt = runtime_for(&fake, 8);
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    // The live connection survives the unlink; nothing new can connect.
+    std::fs::remove_file(&fake.path).expect("unlink the fake's socket");
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+
+    let (end, events) = run_until(&mut d, &rt, t0, |d| d.supervisor().failures() > 0);
+
     assert!(
-        status.pending_ops > 0,
-        "unacknowledged work must still be pending after the failure"
+        events.contains(&Event::Wedged),
+        "the silence must be judged by the detector: {events:?}"
     );
     assert!(
-        status.counts.installed <= 2,
-        "only routes the fake acknowledged before hanging up may count"
+        !events.contains(&Event::ConvergenceFailed),
+        "the socket error itself decides nothing: {events:?}"
     );
+    assert_eq!(d.state(), State::Backoff);
+    // Unsteered and converging, so the relaxed budget governs — and it
+    // does govern: well inside the convergence deadline.
+    assert!(
+        end.duration_since(t0) < packetframe_vpp_offload::supervisor::CONVERGENCE_BUDGET,
+        "the detector, not the phase deadline, ended it: {:?}",
+        end.duration_since(t0)
+    );
+    // The interrupted work is still owed, for whatever runs next.
+    assert!(rt.status().pending_ops > 0);
+}
+
+/// Adoption with a reply that never comes: VPP goes silent on the route
+/// dump that `StartResync` opens with, the socket deadline expires
+/// (`EAGAIN` — a real one, from the real transport), and the step is
+/// resumed on the same VPP once it answers a ping.
+///
+/// Steered, so the deadline is the published 1.5 s and the stall costs
+/// the test that much wall time; the loop's own clock is virtual.
+#[test]
+fn an_adoption_whose_route_dump_times_out_is_resumed_not_torn_down() {
+    let fake = Fake::start_behaving(
+        "loop-dump-stall",
+        Behaviour {
+            stall_on: Some(("ip_route_dump", 0)),
+            ..Default::default()
+        },
+    );
+    let rt = runtime_for(&fake, 5);
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    // As `adopt_process` does: the steered deadline is in force before
+    // the adoption's synchronous steps run.
+    rt.set_steered(true);
+    let injected = {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx)
+    };
+    assert!(
+        injected
+            .outcome
+            .events
+            .contains(&Event::ConvergenceInterrupted {
+                step: packetframe_vpp_offload::supervisor::ConvergenceStep::Resync,
+            }),
+        "the dump's timeout must surface as an interruption: {:?}",
+        injected.outcome
+    );
+    assert_eq!(d.state(), State::AdoptedResyncing, "held, not torn down");
+    assert!(d.supervisor().is_steered(), "and steering was not touched");
+
+    let (_, events) = run_until(&mut d, &rt, t0, |d| {
+        d.supervisor().failures() > 0 || !d.supervisor().is_converging()
+    });
+    assert_eq!(d.supervisor().failures(), 0, "{events:?}");
+    assert!(events.contains(&Event::ApiRestored), "{events:?}");
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+    let dumps = fake
+        .drain_events()
+        .into_iter()
+        .filter(|e| matches!(e, fake_vpp::Event::Msg(m) if m == "ip_route_dump"))
+        .count();
+    assert_eq!(dumps, 2, "the stalled dump, then the resumed one");
+    assert_eq!(rt.status().counts.installed, 5);
+}
+
+/// The same, one step earlier: VPP goes silent mid-attach. The resync
+/// queued behind it in the same batch finds the transport gone, and the
+/// resume must start from the ATTACH — a resync resumed alone would
+/// build a FIB on interfaces that were never attached.
+#[test]
+fn an_adoption_whose_attach_times_out_is_resumed_from_the_attach() {
+    let fake = Fake::start_behaving(
+        "loop-attach-stall",
+        Behaviour {
+            stall_on: Some(("dev_attach", 0)),
+            ..Default::default()
+        },
+    );
+    let rt = runtime_for(&fake, 5);
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    rt.set_steered(true);
+    let injected = {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx)
+    };
+    assert!(
+        !injected.outcome.events.contains(&Event::ConvergenceFailed),
+        "{:?}",
+        injected.outcome
+    );
+    assert_eq!(d.state(), State::AdoptedResyncing);
+
+    let (_, events) = run_until(&mut d, &rt, t0, |d| {
+        d.supervisor().failures() > 0 || !d.supervisor().is_converging()
+    });
+    assert_eq!(d.supervisor().failures(), 0, "{events:?}");
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+    let msgs: Vec<String> = fake
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            fake_vpp::Event::Msg(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        msgs.iter().filter(|m| *m == "dev_attach").count(),
+        2,
+        "the stalled attach, then the resumed one: {msgs:?}"
+    );
+    // Every route references the index the RESUMED attach recorded.
+    let status = rt.status();
+    assert_eq!(status.counts.installed, 5);
+    assert!(status
+        .port_links
+        .iter()
+        .all(|p| p.sw_if_index == ASSIGNED_INDEX));
 }
 
 /// A persist that fails and later succeeds must stop being reported.
