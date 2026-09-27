@@ -1713,6 +1713,25 @@ impl ConvergenceEngine {
         self.local_routes.iter().any(|lr| lr.prefix.covers(p))
     }
 
+    /// Whether VPP holds a route for exactly this v6 prefix: installed,
+    /// or handed to the transport. What the drift tripwire settles a
+    /// kernel route with only link-local next hops against
+    /// ([`crate::drift::V6Scan::settle`]): the kernel's hops say nothing
+    /// about VPP's here — zebra installs the `fe80::` hop while the feed
+    /// also carries the global one, and the engine installs through that
+    /// — so only the ledger can say whether VPP lacks the prefix. Refused
+    /// as link-local-only, withheld, unresolvable, left out as a
+    /// connected subnet, or never in the feed: all not held.
+    pub fn holds_v6(&self, prefix: &packetframe_common::config::Ipv6Prefix) -> bool {
+        matches!(
+            self.ledger.state_of(IpPrefix::V6 {
+                addr: prefix.addr.octets(),
+                prefix_len: prefix.prefix_len,
+            }),
+            Some(crate::sink::RouteState::Installed | crate::sink::RouteState::Installing { .. })
+        )
+    }
+
     /// How many mirror prefixes a `local-route` is currently shadowing.
     pub fn shadowed_routes(&self) -> u64 {
         self.shadowed.len() as u64
@@ -3662,6 +3681,36 @@ mod tests {
                 prefix_len: 32,
             },
         )
+    }
+
+    /// What the drift tripwire settles a link-local kernel route against:
+    /// installed or in flight is held; unresolvable (and so refused, and
+    /// never seen) is not — whatever the kernel's own hops say.
+    #[test]
+    fn holds_v6_reads_the_ledger_not_the_kernel() {
+        let p = |a: &str| packetframe_common::config::Ipv6Prefix {
+            addr: a.parse().unwrap(),
+            prefix_len: 48,
+        };
+        let key = |q: &packetframe_common::config::Ipv6Prefix| IpPrefix::V6 {
+            addr: q.addr.octets(),
+            prefix_len: q.prefix_len,
+        };
+        let (installed, installing, unresolvable, absent) = (
+            p("2001:db8:1::"),
+            p("2001:db8:2::"),
+            p("2001:db8:3::"),
+            p("2001:db8:4::"),
+        );
+        let mut e = engine();
+        e.ledger_mut().adopt_installed(key(&installed));
+        e.ledger_mut().adopt_installed(key(&installing));
+        e.ledger_mut().classify_resolved(key(&installing), 1);
+        e.ledger_mut().classify_resolved(key(&unresolvable), 0);
+        assert!(e.holds_v6(&installed));
+        assert!(e.holds_v6(&installing), "a replacement in flight is held");
+        assert!(!e.holds_v6(&unresolvable));
+        assert!(!e.holds_v6(&absent));
     }
 
     fn mirror(n: u8) -> Mirror {

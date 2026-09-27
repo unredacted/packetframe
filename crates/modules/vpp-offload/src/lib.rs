@@ -845,8 +845,8 @@ pub struct SteeringTarget {
 
 /// Everything one steering request hands the supervision loop, as the
 /// loop holds it after applying one: the target it reconciles the NIC to,
-/// the exemptions the first-steer gate and the drift watcher judge, the
-/// watcher's diversion scope, and whether anything is to be steered.
+/// the drift watcher's scope (whose exemptions the first-steer gate judges
+/// too), and whether anything is to be steered.
 ///
 /// Compared, never diffed: a reload whose freshly planned inputs equal the
 /// ones the loop holds may skip the round trip — see
@@ -857,8 +857,7 @@ pub struct SteeringTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SteeringInputs {
     pub targets: Vec<(String, u32, steer::RuleSet)>,
-    pub exempts: Vec<packetframe_common::config::Ipv4Prefix>,
-    pub dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
+    pub scope: drift::DriftScope,
     pub want_steer: bool,
 }
 
@@ -1621,11 +1620,11 @@ impl Module for VppOffloadModule {
             .ne(new.ports.iter().map(|(_, _, steer, _, _)| *steer));
         let planned = SteeringInputs {
             targets: target.targets,
-            exempts: new.steer_exempts.clone(),
             // The SAME derivation attach uses, run against the config
-            // just accepted — allowlist and directions are both hot, so a
-            // scope captured at attach goes stale the moment either moves.
-            dst_only: drift::divertible_scope(&new.ports, new.steer_direction, &allowlist),
+            // just accepted — exemptions, allowlist, directions and
+            // `v6-outbound` are all hot, so a scope captured at attach
+            // goes stale the moment any of them moves.
+            scope: drift::DriftScope::from_config(&new, &allowlist),
             want_steer: target.want_steer,
         };
         // Nothing for the loop to do? Then do not ask it.
@@ -1667,8 +1666,7 @@ impl Module for VppOffloadModule {
         }
         let outcome = attached.service.apply_steering(
             planned.targets.clone(),
-            planned.exempts.clone(),
-            planned.dst_only.clone(),
+            planned.scope.clone(),
             planned.want_steer,
             lever_moved,
         );
@@ -2646,12 +2644,7 @@ mod tests {
             .expect("the section loads");
         let held = SteeringInputs {
             targets: Vec::new(),
-            exempts: m.cfg.steer_exempts.clone(),
-            dst_only: drift::divertible_scope(
-                &m.cfg.ports,
-                m.cfg.steer_direction,
-                &m.allowlist.get(),
-            ),
+            scope: drift::DriftScope::from_config(&m.cfg, &m.allowlist.get()),
             want_steer: false,
         };
         m.attached = Some(bringup::Attached {

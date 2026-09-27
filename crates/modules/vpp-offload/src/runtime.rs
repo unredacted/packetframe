@@ -616,10 +616,10 @@ struct Core {
     /// request, and would have left the watcher on the old exemptions
     /// (both review findings). It is committed at the places every
     /// steering action goes through, whichever path asked for it.
-    pending_drift_scope: Option<(
-        Vec<packetframe_common::config::Ipv4Prefix>,
-        Option<Vec<packetframe_common::fib::IpPrefix>>,
-    )>,
+    pending_drift_scope: Option<crate::drift::DriftScope>,
+    /// The IPv6 half of the tripwire, retained by the same rules as the
+    /// v4 fields above — see [`crate::drift::V6DriftState`].
+    drift_v6: crate::drift::V6DriftState,
     /// Set when a steering change failed PARTWAY and left rules on
     /// the NIC, so neither the old exemption set nor the new one
     /// describes what is installed.
@@ -1526,6 +1526,7 @@ impl Runtime {
                 drift_unreadable: None,
                 drift_scope_stale: None,
                 pending_drift_scope: None,
+                drift_v6: crate::drift::V6DriftState::default(),
                 steer_missing: 0,
                 steer_stray: 0,
                 steer_audit_error: None,
@@ -1733,12 +1734,8 @@ impl Runtime {
         self.core.borrow_mut().commit_drift_scope();
     }
 
-    pub fn stage_drift_scope(
-        &self,
-        exempts: Vec<packetframe_common::config::Ipv4Prefix>,
-        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
-    ) {
-        self.core.borrow_mut().stage_drift_scope(exempts, dst_only);
+    pub fn stage_drift_scope(&self, scope: crate::drift::DriftScope) {
+        self.core.borrow_mut().stage_drift_scope(scope);
     }
 
     /// The two trait views the driver's tick takes.
@@ -1941,13 +1938,31 @@ impl Runtime {
                         c.drift_routes = found.routes;
                         c.drift_uncovered = found.lines;
                         c.drift_unreadable = None;
+                        // Settled HERE, against the ledger: the scan
+                        // thread cannot read the engine, and whether VPP
+                        // holds a prefix is the engine's to say.
+                        let core = &mut *c;
+                        let engine = &core.engine;
+                        if let Some(lines) = core.drift_v6.absorb(found.v6, |p| engine.holds_v6(p))
+                        {
+                            tracing::warn!(
+                                paths = ?lines,
+                                "IPv6 kernel path(s) VPP cannot take while a port diverts \
+                                 IPv6; diverted traffic for them dies in VPP instead of \
+                                 reaching the kernel path. No IPv6 exemption exists: fix the \
+                                 feed if VPP should carry the route, or keep the traffic \
+                                 with `steer-keep6`, or stop diverting the port"
+                            );
+                        }
                     }
                     // The previous findings stand — an unreadable
                     // kernel is not evidence the routes went away —
                     // but the failure is published, so a scan that
                     // never succeeds cannot pass for a quiet one.
+                    // Both families: the v6 half never ran.
                     Err(e) => {
                         tracing::debug!(error = %e, "route-drift scan failed");
+                        c.drift_v6.scan_failed(&e);
                         c.drift_unreadable = Some(e);
                     }
                 }
@@ -2012,6 +2027,7 @@ impl Runtime {
             drift_pending: c.drift_pending,
             drift_unreadable: c.drift_unreadable.clone(),
             drift_scope_stale: c.drift_scope_stale.clone(),
+            drift_v6: c.drift_v6.clone(),
             preserved_fib: c.seeded.is_some(),
             authority: authority_posture(
                 c.completeness.is_some(),
@@ -2259,6 +2275,8 @@ pub struct RuntimeStatus {
     pub drift_unreadable: Option<String>,
     /// Why the scan cannot say which exemptions the NIC holds, if so.
     pub drift_scope_stale: Option<String>,
+    /// The IPv6 half of the tripwire.
+    pub drift_v6: crate::drift::V6DriftState,
 }
 
 impl Core {
@@ -2406,13 +2424,9 @@ impl Core {
     /// longer exists — the operator who just added the exemption the
     /// health line asked for should not have to wait out a minute of
     /// it still complaining.
-    fn stage_drift_scope(
-        &mut self,
-        exempts: Vec<packetframe_common::config::Ipv4Prefix>,
-        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
-    ) {
+    fn stage_drift_scope(&mut self, scope: crate::drift::DriftScope) {
         if self.drift_scanner.is_some() {
-            self.pending_drift_scope = Some((exempts, dst_only));
+            self.pending_drift_scope = Some(scope);
         }
     }
 
@@ -2443,18 +2457,21 @@ impl Core {
         // Degraded with the gauge absent until an unrelated
         // reconfigure happened along (review finding).
         self.drift_scope_stale = None;
-        let Some((exempts, dst_only)) = self.pending_drift_scope.take() else {
+        let Some(scope) = self.pending_drift_scope.take() else {
             return;
         };
         if let Some(s) = self.drift_scanner.as_ref() {
-            s.set_scope(exempts, dst_only);
+            let scans_v6 = scope.scans_v6;
+            s.set_scope(scope);
             // The findings described the OLD config, so they go —
             // the scanner republishes against the new one on its next
             // pass. The READ failure does not go with them: whether
             // the kernel answers has nothing to do with which config
-            // we are judging.
+            // we are judging. (A v6 half the new scope switches off goes
+            // entirely — see `V6DriftState::scope_committed`.)
             self.drift_uncovered.clear();
             self.drift_routes = 0;
+            self.drift_v6.scope_committed(scans_v6);
         }
     }
 
