@@ -892,11 +892,19 @@ link-locals:
   route via VPP (`ip -6 route show default` / `rdisc6 <if>` on a host
   shows only the router's own RAs, if any).
 
-Degraded `fib-v6` names both counts: **withheld** means the v6 table
-outgrew its 400k budget (the fix is sizing); **unresolvable** means a v6
-next hop VPP has no adjacency for (a neighbour on a port VPP does not
-own, or a next hop the kernel never resolved). Neither affects IPv4 or
-steering, and nothing v6 is dropped — none of it is steered.
+Degraded `fib-v6` names every condition that holds, each with its own
+`packetframe_vpp_family_routes{family="ipv6",state=…}` gauge. None of
+them affects IPv4 or its steering, none is restart-worthy, and nothing
+v6 is dropped — none of it is steered:
+
+| Condition (`state=`) | Meaning | What to do |
+|---|---|---|
+| `withheld` | the v6 table outgrew its 400k budget | sizing; raise the budget in `startup_conf.rs` once rung 0 has measured |
+| `unresolvable` | a v6 next hop VPP has no adjacency for (a neighbour on a port VPP does not own, or one the kernel never resolved) | as for v4: `ip -6 neigh`, the port list |
+| `rejected` | VPP refused the route (non-zero `ip_route_add_del`). Parked, not retried every drain — a v6 retry loop would keep the drain from going idle and hold back IPv4's convergence. Retried when the route next changes, and at every resync | the journal's retval; a VPP-side limit or bug |
+| `link_local_refused` | every next hop is link-local. Scoped addresses reach the module without their interface (the feed, and the fast path upstream of it, key neighbours by address alone, and the same `fe80::` can be on two links), so VPP is never given one. A route that also names a global next hop installs through that alone | expected for peers announcing link-local-only next hops; the follow-up is carrying `(address, ifindex)` end to end |
+| `verify_mismatch` | the last verify's v6 probes found VPP disagreeing with the ledger. Retained until the next verify (which does not re-run in steady state) | `vppctl … show ip6 fib <prefix>` against the ledger; a restart re-derives the v6 table |
+| `dark_egress` | a member with no link carries v6 adjacencies. IPv4's link gate counts only interfaces IPv4 routes use, so a dark port with only v6 on it never refuses a v4 steer | the cable / the port, as for any dark member |
 
 ### What to measure (the numbers rung 0 exists for)
 

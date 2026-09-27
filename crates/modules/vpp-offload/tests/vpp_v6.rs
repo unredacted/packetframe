@@ -20,6 +20,8 @@ use packetframe_vpp_offload::attach::{AttachMode, PortAttach};
 use packetframe_vpp_offload::engine::{ConvergenceEngine, RouteSource, SourceChanges};
 use packetframe_vpp_offload::fib_sync::FamilyPolicy;
 use packetframe_vpp_offload::ledger_record::LedgerBody;
+use packetframe_vpp_offload::runtime::{NoResources, NullStore, Runtime, SteeringUnavailable};
+use packetframe_vpp_offload::supervisor::{Event as SupEvent, State};
 
 use fake_vpp::{Behaviour, Event, Fake, WireRoute, ASSIGNED_INDEX, MAC};
 
@@ -370,6 +372,12 @@ fn verify_samples_both_families_and_only_v4_gates() {
     assert!(v.outcome.passed(), "a v6 hole cannot fail the v4 gate");
     assert!(!v.outcome.restart_worthy(), "nor tear VPP down");
     assert!(v.outcome.any_mismatch(), "but it does disprove a record");
+    // And it is retained where health reads it: `fib-v6` degrades on it
+    // (the status surface renders `v6.degraded()`), the v4 gate does not.
+    let c = e.counts();
+    assert_eq!(c.v6.unwrap().verify_mismatches, 1);
+    assert!(c.v6.unwrap().degraded());
+    assert!(!c.blocks_first_steer());
 
     // Under V4Only there is no v6 half at all.
     let fake = Fake::start("v6-verify-off");
@@ -554,4 +562,319 @@ fn a_connected_v6_subnet_via_the_router_itself_is_kernel_delivered() {
     assert_eq!(c.v6.unwrap().installed, 0);
     assert!(e.unexempted_local().is_empty(), "v6 needs no steer-exempt");
     assert!(!c.blocks_first_steer());
+}
+
+/// A member that is dark and carries only v6 adjacencies is idle to the
+/// IPv4 link gate: verify passes, the fresh dead-member scan does not
+/// mark it in use, and the v4 steer is not refused. It degrades `fib-v6`
+/// and nothing else.
+#[test]
+fn a_dark_member_carrying_only_v6_does_not_block_v4() {
+    struct Split;
+    impl RouteSource for Split {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            visit(v4(0), &[NH4]);
+            visit(v6(0), &[NH6]);
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(NH4, "eth4", MAC);
+            // The v6 peer sits behind eth5, the dark member.
+            visit(NH6, "eth5", MAC6);
+        }
+        fn requeue(&self, _: SourceChanges) {}
+        fn route_count(&self) -> u64 {
+            2
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+    let fake = Fake::start_behaving(
+        "v6-dark",
+        Behaviour {
+            dark_extra_ports: true,
+            ..Default::default()
+        },
+    );
+    let mut eth5 = port();
+    eth5.port = "eth5".into();
+    eth5.pci_addr = "0002:08:00.1".into();
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![port(), eth5],
+        vec!["eth4".into(), "eth5".into()],
+        1_000_000,
+        FamilyPolicy::Both,
+        packetframe_common::config::Ipv4Prefix {
+            addr: Ipv4Addr::new(198, 51, 100, 254),
+            prefix_len: 32,
+        },
+    );
+    converge(&mut e, &Split, AttachMode::Fresh);
+    let c = e.counts();
+    assert_eq!((c.installed, c.v6.unwrap().installed), (1, 1));
+
+    let v = e.run_verify().expect("verify");
+    let dark: Vec<_> = v.outcome.dead_interfaces.iter().collect();
+    assert_eq!(dark.len(), 1, "{}", v.outcome.summary());
+    assert!(!dark[0].in_use, "v6-only adjacencies do not make it in use");
+    assert!(v.outcome.passed(), "{}", v.outcome.summary());
+    assert!(v.may_steer);
+    let scan = e.dead_members().expect("fresh scan");
+    assert!(scan.iter().all(|d| !d.in_use), "{scan:?}");
+
+    let c = e.counts();
+    assert_eq!(c.v6.unwrap().dark_egress, 1, "reported against v6");
+    assert!(c.v6.unwrap().degraded());
+    assert!(!c.blocks_first_steer());
+
+    // The same member under V4Only never had a v6 neighbour at all.
+    let fake = Fake::start_behaving(
+        "v6-dark-off",
+        Behaviour {
+            dark_extra_ports: true,
+            ..Default::default()
+        },
+    );
+    let mut eth5 = port();
+    eth5.port = "eth5".into();
+    eth5.pci_addr = "0002:08:00.1".into();
+    let mut off = ConvergenceEngine::new(
+        &fake.path,
+        vec![port(), eth5],
+        vec!["eth4".into(), "eth5".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: Ipv4Addr::new(198, 51, 100, 254),
+            prefix_len: 32,
+        },
+    );
+    converge(&mut off, &Split, AttachMode::Fresh);
+    assert!(off.run_verify().expect("verify").outcome.passed());
+}
+
+/// Link-local next hops are scoped, and the feed keys neighbours by
+/// address alone — the same `fe80::1` on two members collapses to one.
+/// So nothing is ever installed through one: a v6 route whose only next
+/// hop is link-local is refused and counted, one that also names a
+/// global next hop installs through that alone, no link-local static
+/// neighbour reaches VPP, and a v4 route through one reads unresolvable
+/// exactly as it does under `V4Only`.
+#[test]
+fn link_local_next_hops_are_never_installed_through() {
+    const LL: IpAddr = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+    struct Scoped;
+    impl RouteSource for Scoped {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            visit(v4(0), &[NH4]);
+            visit(v4(1), &[LL]);
+            visit(v6(0), &[LL]);
+            visit(v6(1), &[NH6, LL]);
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(NH4, "eth4", MAC);
+            visit(NH6, "eth4", MAC6);
+            // One address, two links: whichever the map kept would be a
+            // guess.
+            visit(LL, "eth4", [0x02, 0, 0, 0, 0, 0xa1]);
+            visit(LL, "eth5", [0x02, 0, 0, 0, 0, 0xa2]);
+        }
+        fn requeue(&self, _: SourceChanges) {}
+        fn route_count(&self) -> u64 {
+            4
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+    let unresolvable_v4 = |families| {
+        let fake = Fake::start_behaving(
+            "v6-ll",
+            Behaviour {
+                track_routes: true,
+                ..Default::default()
+            },
+        );
+        let mut e = engine(&fake, families);
+        converge(&mut e, &Scoped, AttachMode::Fresh);
+        (e, fake)
+    };
+
+    let (e, fake) = unresolvable_v4(FamilyPolicy::Both);
+    let events = fake.drain_events();
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev, Event::Neighbour { ip, .. } if *ip == LL)),
+        "no link-local neighbour reaches VPP: {events:?}"
+    );
+    let routes6 = fake.routes6.lock().unwrap().clone();
+    assert_eq!(routes6.len(), 1, "only the route with a global next hop");
+    let (_, paths) = routes6.iter().next().unwrap();
+    assert_eq!(
+        paths.len(),
+        1,
+        "installed through the global next hop alone"
+    );
+    let c = e.counts();
+    let v6c = c.v6.unwrap();
+    assert_eq!(v6c.link_local_refused, 1);
+    assert_eq!(
+        v6c.unresolvable, 0,
+        "refused is its own state, not unresolvable"
+    );
+    assert!(v6c.degraded());
+    let both_v4 = (c.installed, c.unresolvable);
+
+    let (off, _fake) = unresolvable_v4(FamilyPolicy::V4Only);
+    assert_eq!(
+        both_v4,
+        (off.counts().installed, off.counts().unresolvable),
+        "the v4 route through a link-local reads exactly as under V4Only"
+    );
+    assert_eq!(both_v4, (1, 1));
+
+    // A delta moving the refused route onto a global next hop admits it;
+    // one moving the installed route onto link-local only withdraws it.
+    let fake = Fake::start_behaving(
+        "v6-ll-delta",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let mut e = engine(&fake, FamilyPolicy::Both);
+    let src = DualStack::new(0, 1);
+    converge(&mut e, &src, AttachMode::Fresh);
+    src.changes.borrow_mut().push(SourceChanges {
+        routes: vec![(v6(0), Some(vec![LL]))],
+        neighbours: vec![],
+    });
+    e.apply_changes(&src, 64).expect("deltas");
+    drain_to_empty(&mut e);
+    assert!(fake.routes6.lock().unwrap().is_empty(), "withdrawn");
+    assert_eq!(e.counts().v6.unwrap().link_local_refused, 1);
+    src.changes.borrow_mut().push(SourceChanges {
+        routes: vec![(v6(0), Some(vec![LL, NH6]))],
+        neighbours: vec![],
+    });
+    e.apply_changes(&src, 64).expect("deltas");
+    drain_to_empty(&mut e);
+    assert_eq!(fake.routes6.lock().unwrap().len(), 1, "admitted again");
+    assert_eq!(e.counts().v6.unwrap().link_local_refused, 0);
+}
+
+/// A v6 route VPP refuses every time is parked and counted, not retried
+/// on every drain: the drain goes idle, verify passes and the v4 table
+/// may be steered. A newer intent for the prefix retries it once and
+/// parks it again.
+#[test]
+fn a_permanently_rejected_v6_route_does_not_stall_v4() {
+    let fake = Fake::start_behaving(
+        "v6-reject",
+        Behaviour {
+            track_routes: true,
+            reject_v6_routes: true,
+            ..Default::default()
+        },
+    );
+    let mut e = engine(&fake, FamilyPolicy::Both);
+    let src = DualStack::new(3, 2);
+    converge(&mut e, &src, AttachMode::Fresh);
+    assert!(e.pending().is_empty(), "the drain went idle");
+    let c = e.counts();
+    assert_eq!(c.installed, 3);
+    let v6c = c.v6.unwrap();
+    assert_eq!((v6c.installed, v6c.rejected), (0, 2));
+    assert!(v6c.degraded());
+    assert!(!c.blocks_first_steer());
+    let v = e.run_verify().expect("verify");
+    assert!(v.outcome.passed() && v.may_steer, "{}", v.outcome.summary());
+
+    let _ = fake.drain_events();
+    src.changes.borrow_mut().push(SourceChanges {
+        routes: vec![(v6(0), Some(vec![NH6]))],
+        neighbours: vec![],
+    });
+    e.apply_changes(&src, 64).expect("deltas");
+    assert_eq!(
+        e.counts().v6.unwrap().rejected,
+        1,
+        "superseded by the update"
+    );
+    drain_to_empty(&mut e);
+    assert_eq!(v6_route_adds(&fake.drain_events()), 1, "retried once");
+    assert_eq!(e.counts().v6.unwrap().rejected, 2, "and parked again");
+
+    // A resync re-queues them (the bounded retry) and still goes idle.
+    e.begin_resync(&src);
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().v6.unwrap().rejected, 2);
+    // A prefix the source drops leaves the refused lot.
+    let fewer = DualStack::new(3, 1);
+    e.begin_resync(&fewer);
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().v6.unwrap().rejected, 1);
+}
+
+/// The whole loop: with every v6 route refused, IPv4 still reaches
+/// `SyncComplete`, a passing verify and `Ready`, with the first-steer
+/// gate open.
+#[test]
+fn the_loop_reaches_ready_with_every_v6_route_refused() {
+    use packetframe_vpp_offload::driver::Driver;
+    use std::time::{Duration, Instant};
+
+    let fake = Fake::start_behaving(
+        "v6-reject-loop",
+        Behaviour {
+            track_routes: true,
+            reject_v6_routes: true,
+            ..Default::default()
+        },
+    );
+    let rt = Runtime::new(
+        engine(&fake, FamilyPolicy::Both),
+        Box::new(DualStack::new(4, 3)),
+        Box::new(SteeringUnavailable),
+        Box::new(NullStore),
+        Box::new(NoResources),
+        "/usr/bin/vpp",
+        "/tmp/startup.conf",
+    );
+    let mut d = Driver::new();
+    let mut now = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(now, SupEvent::Adopted { steered: false }, &mut fx);
+    }
+    let (mut obs, mut fx) = rt.views();
+    let mut seen = Vec::new();
+    for _ in 0..256 {
+        if d.state() == State::Ready {
+            break;
+        }
+        let t = d.tick(now, &mut obs, &mut fx);
+        seen.extend(t.events.clone());
+        for ev in rt.take_pending() {
+            seen.extend(d.inject(now, ev, &mut fx).events);
+        }
+        now += t
+            .sleep
+            .unwrap_or(Duration::from_millis(100))
+            .max(Duration::from_millis(1));
+    }
+    assert_eq!(d.state(), State::Ready, "events: {seen:?}");
+    assert!(seen.contains(&SupEvent::SyncComplete), "{seen:?}");
+    assert!(seen.contains(&SupEvent::VerifyPassed), "{seen:?}");
+    let status = rt.status();
+    assert_eq!(status.counts.installed, 4);
+    assert_eq!(status.counts.v6.unwrap().rejected, 3);
+    assert!(!status.counts.blocks_first_steer(), "v4 may be steered");
 }

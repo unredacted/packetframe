@@ -1315,14 +1315,43 @@ impl StatusSnapshot {
     fn fib_v6_health(&self) -> Option<SubsystemHealth> {
         let v6 = self.counts.v6?;
         let (state, message) = if v6.degraded() {
+            // Every condition that holds, each named, because each has a
+            // different remedy; the counts that are zero stay out of the
+            // line so the one that matters is readable.
+            let mut parts = vec![format!("{} installed", v6.installed)];
+            for (n, what) in [
+                (v6.withheld, "withheld (v6 pool at capacity)"),
+                (v6.unresolvable, "unresolvable (next hop not on a VPP port)"),
+                (
+                    v6.rejected,
+                    "refused by VPP (parked; retried when the route next changes or \
+                     at the next resync)",
+                ),
+                (
+                    v6.link_local_refused,
+                    "left out because every next hop is link-local, whose interface \
+                     the route feed does not carry",
+                ),
+                (
+                    v6.verify_mismatches,
+                    "probe(s) VPP disagreed on at the last verify (the table differs from \
+                     the ledger; verify does not re-run in steady state)",
+                ),
+                (
+                    v6.dark_egress,
+                    "member interface(s) carrying v6 adjacencies with no link",
+                ),
+            ] {
+                if n > 0 {
+                    parts.push(format!("{n} {what}"));
+                }
+            }
             (
                 HealthState::Degraded,
                 format!(
-                    "IPv6 table incomplete in VPP: {} installed, {} withheld (v6 pool at \
-                     capacity), {} unresolvable (next hop not on a VPP port). No IPv6 \
-                     is steered, so nothing is dropped; the IPv4 table and its steering are \
-                     unaffected",
-                    v6.installed, v6.withheld, v6.unresolvable
+                    "IPv6 in VPP is impaired: {}. No IPv6 is steered, so nothing is dropped; \
+                     the IPv4 table and its steering are unaffected",
+                    parts.join(", ")
                 ),
             )
         } else if v6.installed == 0 {
@@ -1971,16 +2000,32 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
                     installing: c.installing,
                     withheld: c.withheld,
                     unresolvable: c.unresolvable,
+                    ..Default::default()
                 },
             ),
             ("ipv6", v6),
         ] {
-            for (label, value) in [
+            // The non-gating family's extra states (see `FamilyCounts`)
+            // exist only for it; IPv4's refusals are requeued, not parked.
+            let extra: &[(&str, u64)] = if family == "ipv6" {
+                &[
+                    ("rejected", f.rejected),
+                    ("link_local_refused", f.link_local_refused),
+                    ("verify_mismatch", f.verify_mismatches),
+                    ("dark_egress", f.dark_egress),
+                ]
+            } else {
+                &[]
+            };
+            for &(label, value) in [
                 ("installed", f.installed),
                 ("installing", f.installing),
                 ("withheld", f.withheld),
                 ("unresolvable", f.unresolvable),
-            ] {
+            ]
+            .iter()
+            .chain(extra)
+            {
                 let _ = writeln!(
                     out,
                     "packetframe_vpp_family_routes{{module=\"{module}\",family=\"{family}\",state=\"{label}\"}} {value}"
@@ -4274,7 +4319,7 @@ mod tests {
             installed: 200,
             withheld: 7,
             unresolvable: 3,
-            installing: 0,
+            ..Default::default()
         });
         let s = steered(holes);
         let r = s.report();
@@ -4296,6 +4341,48 @@ mod tests {
         );
         let fib = r.subsystems.iter().find(|x| x.name == SUBSYS_FIB).unwrap();
         assert_eq!(fib.state, HealthState::Healthy, "the v4 row is v4's");
+
+        // A complete v6 table VPP disagrees with, a refused route, a
+        // link-local refusal and a dark v6 egress: each named, each
+        // Degraded on `fib-v6` alone.
+        let mut odd = on;
+        odd.v6 = Some(crate::sink::FamilyCounts {
+            installed: 250,
+            rejected: 1,
+            link_local_refused: 2,
+            verify_mismatches: 3,
+            dark_egress: 1,
+            ..Default::default()
+        });
+        let s = steered(odd);
+        let r = s.report();
+        let row = r
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_FIB_V6)
+            .expect("row");
+        assert_eq!(row.state, HealthState::Degraded);
+        let msg = row.message.as_deref().unwrap_or("");
+        for want in [
+            "1 refused by VPP",
+            "2 left out because every next hop is link-local",
+            "3 probe(s) VPP disagreed",
+            "1 member interface(s)",
+        ] {
+            assert!(msg.contains(want), "missing {want}: {msg}");
+        }
+        assert!(!msg.contains("withheld"), "zero counts stay out: {msg}");
+        assert_eq!(r.overall, HealthState::Degraded);
+        let fib = r.subsystems.iter().find(|x| x.name == SUBSYS_FIB).unwrap();
+        assert_eq!(fib.state, HealthState::Healthy);
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(
+            m.contains(
+                "packetframe_vpp_family_routes{module=\"vpp-offload\",family=\"ipv6\",state=\"verify_mismatch\"} 3"
+            ),
+            "{m}"
+        );
+        assert!(!m.contains("family=\"ipv4\",state=\"rejected\""), "{m}");
     }
 
     /// The exemption tripwire: quiet = no row, firing = Degraded with

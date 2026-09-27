@@ -183,19 +183,49 @@ pub struct SinkCounts {
 }
 
 /// One address family's route-ledger totals. See [`SinkCounts`].
+///
+/// The first four are the ledger's. The rest are conditions only a
+/// NON-GATING family has — IPv6 under `v6 on`, which every surface
+/// reports and nothing lets block, stall or tear down IPv4 — so the
+/// ledger leaves them zero and the engine fills them in
+/// ([`crate::engine::ConvergenceEngine::counts`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FamilyCounts {
     pub installed: u64,
     pub installing: u64,
     pub withheld: u64,
     pub unresolvable: u64,
+    /// Ops VPP refused (a non-zero `ip_route_add_del` retval), parked out
+    /// of the active queue ([`PendingMap::reject`]) rather than retried
+    /// on every drain — a retry loop that kept the drain from ever going
+    /// idle would hold IPv4's convergence hostage.
+    pub rejected: u64,
+    /// Routes left out of VPP because every next hop is link-local, whose
+    /// interface scope the route feed does not carry
+    /// ([`crate::engine::ConvergenceEngine`]'s link-local refusal).
+    pub link_local_refused: u64,
+    /// Probes of this family the last verify found VPP disagreeing on —
+    /// retained here because the family cannot fail the pass, so
+    /// nothing else would keep it.
+    pub verify_mismatches: u64,
+    /// Member interfaces that cannot forward and that this family's
+    /// adjacencies use. Reported here and nowhere that gates: IPv4's link
+    /// gate counts only interfaces IPv4 routes use.
+    pub dark_egress: u64,
 }
 
 impl FamilyCounts {
-    /// Whether this family's table is incomplete — the per-family twin of
-    /// [`SinkCounts::degraded`].
+    /// Whether this family's table is incomplete or disagrees with VPP —
+    /// the per-family twin of [`SinkCounts::degraded`], wider because a
+    /// non-gating family has more ways to be impaired without blocking
+    /// anything.
     pub fn degraded(&self) -> bool {
-        self.unresolvable > 0 || self.withheld > 0
+        self.unresolvable > 0
+            || self.withheld > 0
+            || self.rejected > 0
+            || self.link_local_refused > 0
+            || self.verify_mismatches > 0
+            || self.dark_egress > 0
     }
 }
 
@@ -646,6 +676,8 @@ pub struct PendingMap {
     /// returns" is unimplementable — the route stays missing until an
     /// unrelated source event happens to touch the same prefix.
     withheld: BTreeMap<PrefixKey, PendingOp>,
+    /// IPv6 ops VPP refused, parked out of `ops` ([`Self::reject`]).
+    rejected: BTreeMap<PrefixKey, PendingOp>,
 }
 
 impl PendingMap {
@@ -718,13 +750,39 @@ impl PendingMap {
     /// Record an install/replace. Overwrites any pending op for this
     /// prefix, including a pending withdrawal (the newer intent wins).
     pub fn upsert(&mut self, prefix: IpPrefix, nexthops: Vec<IpAddr>) {
-        self.ops
-            .insert(prefix.into(), PendingOp::Upsert { nexthops });
+        let k = PrefixKey::from(prefix);
+        // A newer intent supersedes a refused one outright, and is the
+        // retry: it goes back through the drain like any other op.
+        self.rejected.remove(&k);
+        self.ops.insert(k, PendingOp::Upsert { nexthops });
     }
 
     /// Record a withdrawal, overwriting any pending upsert.
     pub fn withdraw(&mut self, prefix: IpPrefix) {
-        self.ops.insert(prefix.into(), PendingOp::Withdraw);
+        let k = PrefixKey::from(prefix);
+        self.rejected.remove(&k);
+        self.ops.insert(k, PendingOp::Withdraw);
+    }
+
+    /// Park an IPv6 op VPP refused, out of the active map.
+    ///
+    /// IPv4's refusals are requeued, so a transient cause resolves on the
+    /// next drain — and a permanent one keeps the drain busy, which is
+    /// right for the family steering depends on: its table is not
+    /// complete, and "not idle" is how that holds a first steer back.
+    /// IPv6 gates nothing, so the same requeue would make one refused v6
+    /// route keep the drain from ever reporting idle, and with it hold
+    /// back `SyncComplete`, verify and every IPv4 steer. Parked here it is
+    /// counted ([`FamilyCounts::rejected`]) and retried when anything
+    /// newer arrives for the prefix — a source update, or the next resync,
+    /// which re-queues every route VPP is not recorded holding.
+    pub fn reject(&mut self, prefix: IpPrefix, op: PendingOp) {
+        self.rejected.insert(prefix.into(), op);
+    }
+
+    /// How many refused ops are parked.
+    pub fn rejected_len(&self) -> usize {
+        self.rejected.len()
     }
 
     /// Take up to `max` pending ops in key order, removing them from the
@@ -754,6 +812,9 @@ impl PendingMap {
     /// lifecycle, and the resync releases them separately.
     pub fn retain(&mut self, keep: impl Fn(&IpPrefix) -> bool) {
         self.ops.retain(|k, _| keep(&IpPrefix::from(*k)));
+        // Refused ops too: one for a prefix the source has since dropped
+        // is owed nothing, and left parked would keep counting.
+        self.rejected.retain(|k, _| keep(&IpPrefix::from(*k)));
     }
 
     /// Re-queue an op the transport could not apply — but only if the
@@ -775,6 +836,7 @@ impl PendingMap {
         let k = PrefixKey::from(prefix);
         self.ops.remove(&k);
         self.withheld.remove(&k);
+        self.rejected.remove(&k);
     }
 }
 
@@ -922,6 +984,10 @@ pub struct RouteLedger {
     v6: FamilyCounts,
     capacity: Capacity,
     paths: PathSets,
+    /// How many IPv4 prefixes are recorded holding each path set — so
+    /// the IPv4 link gate can ask which next hops IPv4 routes actually
+    /// use ([`Self::v4_nexthops`]) without walking a million routes.
+    v4_via_refs: std::collections::HashMap<PathSetId, u64>,
 }
 
 impl RouteLedger {
@@ -932,6 +998,7 @@ impl RouteLedger {
             v6: FamilyCounts::default(),
             capacity,
             paths: PathSets::default(),
+            v4_via_refs: std::collections::HashMap::new(),
         }
     }
 
@@ -1044,8 +1111,10 @@ impl RouteLedger {
         };
         if let Some(old) = self.state.insert(key, Slot { state: st, via }) {
             Self::tally(&mut self.counts, &mut self.v6, &key, old.state, false);
+            self.via_ref(&key, old.via, false);
         }
         Self::tally(&mut self.counts, &mut self.v6, &key, st, true);
+        self.via_ref(&key, via, true);
     }
 
     fn set_state(&mut self, key: PrefixKey, st: RouteState) {
@@ -1062,7 +1131,37 @@ impl RouteLedger {
     fn clear_state(&mut self, key: PrefixKey) -> Option<RouteState> {
         let old = self.state.remove(&key)?;
         Self::tally(&mut self.counts, &mut self.v6, &key, old.state, false);
+        self.via_ref(&key, old.via, false);
         Some(old.state)
+    }
+
+    /// Keep [`Self::v4_via_refs`] in step with one v4 slot's recorded
+    /// paths. A known path set is recorded only while VPP holds a live
+    /// version (see `set_state`), so counting known ids counts live routes.
+    fn via_ref(&mut self, key: &PrefixKey, via: PathSetId, add: bool) {
+        if key.family != 4 || via == UNKNOWN_PATHS {
+            return;
+        }
+        if add {
+            *self.v4_via_refs.entry(via).or_default() += 1;
+        } else if let Some(n) = self.v4_via_refs.get_mut(&via) {
+            *n -= 1;
+            if *n == 0 {
+                self.v4_via_refs.remove(&via);
+            }
+        }
+    }
+
+    /// Every next hop an IPv4 route is recorded installed through. Routes
+    /// whose paths were never observed (a dump adoption not yet re-sent)
+    /// contribute nothing; see the link gate for why that is safe.
+    pub fn v4_nexthops(&self) -> std::collections::HashSet<IpAddr> {
+        self.v4_via_refs
+            .keys()
+            .filter_map(|id| self.paths.get(*id))
+            .flatten()
+            .map(|p| p.nexthop)
+            .collect()
     }
 
     /// Capacity slots in use in one family's pool: installed plus
@@ -1902,6 +2001,30 @@ mod tests {
         assert_eq!((c.installed, c.withheld), (2, 1), "v4 stops at ITS mark");
         assert_eq!(led.v6_counts(), v6, "and v6 is untouched by it");
         assert_eq!((led.counts(), led.v6_counts()), led.counts_by_scan());
+    }
+
+    /// The v4 next-hop index the IPv4 link gate reads follows exactly the
+    /// paths v4 routes are recorded holding — replaced, forgotten, and
+    /// never a v6 route's.
+    #[test]
+    fn v4_nexthops_follow_the_recorded_v4_paths() {
+        let mut led = RouteLedger::new(Capacity::new(100));
+        let v6nh = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let a = led.intern_paths(&[pk(1, 3)]);
+        let b = led.intern_paths(&[crate::fib_sync::installed_path_key(v6nh, 3)]);
+        let p = v4(10, 0, 0, 0, 24);
+        led.classify_resolved(p, 1);
+        led.commit_installed_via(p, Some(a));
+        led.classify_resolved(v6p(0), 1);
+        led.commit_installed_via(v6p(0), Some(b));
+        assert_eq!(led.v4_nexthops(), [nh(192, 0, 2, 1)].into_iter().collect());
+        // Replaced through a v6 next hop (RFC 8950): the index moves.
+        led.classify_resolved(p, 1);
+        led.commit_installed_via(p, Some(b));
+        assert_eq!(led.v4_nexthops(), [v6nh].into_iter().collect());
+        led.forget(p);
+        assert!(led.v4_nexthops().is_empty(), "the v6 route never counted");
+        assert!(led.v4_via_refs.is_empty());
     }
 
     /// Only the family with headroom has its parked ops released.

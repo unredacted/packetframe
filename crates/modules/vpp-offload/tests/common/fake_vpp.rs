@@ -274,6 +274,10 @@ pub struct Behaviour {
     /// Set when an `ip_route_dump` is served — the moment VPP's FIB is
     /// being read, which a test's route source can key churn on.
     pub dumped: Option<&'static std::sync::atomic::AtomicBool>,
+    /// Refuse every IPv6 route op with a non-zero retval, forever, without
+    /// applying it — a VPP that will not take some v6 route, whatever the
+    /// reason, which must never stall IPv4's convergence.
+    pub reject_v6_routes: bool,
 }
 
 /// One `Behaviour::existing_via` route:
@@ -765,15 +769,16 @@ fn serve(
                     is_ip6,
                     addr16,
                 }));
-                // A real VPP applies before it answers.
-                if is_ip6 {
+                let refuse_v6 = is_ip6 && behaviour.reject_v6_routes;
+                // A real VPP applies before it answers — unless it refuses.
+                if is_ip6 && !refuse_v6 {
                     let mut routes = table6.lock().unwrap();
                     if r.is_add {
                         routes.insert((addr16, r.route.prefix.len), r.route.paths.clone());
                     } else {
                         routes.remove(&(addr16, r.route.prefix.len));
                     }
-                } else {
+                } else if !is_ip6 {
                     let mut routes = table.lock().unwrap();
                     if r.is_add {
                         routes.insert((addr, r.route.prefix.len), r.route.paths.clone());
@@ -789,7 +794,9 @@ fn serve(
                 // Reject deletes for a while, so the retry path is
                 // exercised against a per-route refusal rather than a
                 // connection fault.
-                let retval = if !r.is_add && behaviour.reject_deletes > 0 {
+                let retval = if refuse_v6 {
+                    -1
+                } else if !r.is_add && behaviour.reject_deletes > 0 {
                     behaviour.reject_deletes -= 1;
                     -1
                 } else {

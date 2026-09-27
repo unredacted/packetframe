@@ -338,7 +338,9 @@ pub struct DrainStats {
     pub withheld: u64,
     /// No nexthop resolved to a VPP-owned device.
     pub unresolvable: u64,
-    /// VPP returned a non-zero retval. Requeued, not dropped.
+    /// VPP returned a non-zero retval. Requeued, not dropped — IPv4's
+    /// into the active map, IPv6's into the refused lot
+    /// (`PendingMap::reject`).
     pub rejected: u64,
     /// Not attempted because a target had no interface index yet.
     /// **Requeued**, so a later drain installs it once attach
@@ -846,6 +848,18 @@ impl Drainer {
                 ledger.classify_resolved(f.prefix, 0);
                 stats.withdrawn += 1;
                 stats.unresolvable += 1;
+            }
+            // IPv6, refused: unwound the same way, but PARKED rather than
+            // requeued. IPv6 gates nothing, and a requeued op that VPP
+            // refuses every time would keep the drain from ever going
+            // idle — holding back `SyncComplete`, verify and every IPv4
+            // steer for a family that must never block IPv4. Parked, it
+            // is counted and retried on the next newer intent for the
+            // prefix (see `PendingMap::reject`).
+            _ if matches!(f.prefix, IpPrefix::V6 { .. }) => {
+                ledger.fail_install(f.prefix);
+                pending.reject(f.prefix, f.original.clone());
+                stats.rejected += 1;
             }
             // A per-route rejection is NOT a connection fault: the
             // stream is fine and other routes will succeed. Unwind

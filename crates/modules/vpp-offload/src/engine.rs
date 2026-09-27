@@ -307,6 +307,9 @@ pub struct ResyncPlan {
     /// preserved-ledger adoption this is nearly the whole table — the
     /// point of preserving it; on a fresh resync it is zero.
     pub unchanged: u64,
+    /// IPv6 source routes left out of VPP because every next hop is
+    /// link-local (see [`ConvergenceEngine`]'s link-local refusal).
+    pub link_local_refused: u64,
     /// Source routes of a family VPP does not carry, left out of the diff
     /// at its entry ([`ConvergenceEngine::begin_resync`]) — every v6
     /// route under `V4Only`. Counted rather than folded into `upserts`,
@@ -561,6 +564,11 @@ pub struct ConvergenceEngine {
     /// `shadowed` (a `local-route` footprint) so each gauge says one
     /// thing.
     kernel_delivered: HashSet<IpPrefix>,
+    /// IPv6 mirror prefixes left out of VPP because every next hop is
+    /// link-local ([`scope_nexthops`]). Rebuilt by each resync walk and
+    /// kept by the deltas, like `kernel_delivered`, so the count is the
+    /// mirror's current state rather than a tally.
+    link_local_refused: HashSet<IpPrefix>,
     /// The configured `steer-exempt` set, which must cover every
     /// `kernel_delivered` prefix before a first steer
     /// ([`Self::unexempted_local`]).
@@ -760,6 +768,7 @@ impl ConvergenceEngine {
             self_nets: Vec::new(),
             self_nets6: Vec::new(),
             kernel_delivered: HashSet::new(),
+            link_local_refused: HashSet::new(),
             steer_exempts: Vec::new(),
             loopback,
             loop_index: None,
@@ -1101,8 +1110,21 @@ impl ConvergenceEngine {
     /// the route classifies **unresolvable**, which blocks a first steer
     /// and shows in health: loud, never a route installed through an
     /// adjacency nobody programmed.
+    ///
+    /// **Link-local neighbours are never admitted**, under any policy.
+    /// A link-local address is scoped to its link, and the same `fe80::`
+    /// address legitimately exists on several (IX and transit LANs reuse
+    /// them freely) — but the feed keys neighbours by address alone
+    /// (`RouteFeed`, and upstream of it the fast path's own resolver and
+    /// programmer), and a route's next hop carries no interface. One
+    /// link's neighbour overwrites another's, and a route through it
+    /// would install on whichever interface won, with verify none the
+    /// wiser (it checks the interface is owned, not that it is the right
+    /// one). Refused, a v6 route through one is counted
+    /// ([`scope_nexthops`]); a v4 route through one (RFC 8950) reads
+    /// unresolvable, exactly as it does under `V4Only`.
     fn carries_neighbour(&self, nh: IpAddr) -> bool {
-        self.drainer.families().carries_address(nh)
+        self.drainer.families().carries_address(nh) && !is_link_local(&nh)
     }
 
     /// The source's neighbours, less the families VPP does not carry.
@@ -1739,7 +1761,22 @@ impl ConvergenceEngine {
         let mut c = self.ledger.counts();
         c.unexempted_local = self.unexempted_local().len() as u64;
         if self.drainer.families().carries_v6() {
-            c.v6 = Some(self.ledger.v6_counts());
+            let mut v6 = self.ledger.v6_counts();
+            // Only IPv6 ops are ever parked as refused.
+            v6.rejected = self.pending.rejected_len() as u64;
+            v6.link_local_refused = self.link_local_refused.len() as u64;
+            v6.verify_mismatches = self
+                .last_verify
+                .as_ref()
+                .and_then(|v| v.v6.as_ref())
+                .map_or(0, |v| v.mismatches.len() as u64);
+            let v6_egress = self.egress_indices(|nh| nh.is_ipv6());
+            v6.dark_egress = self
+                .latest_dead()
+                .iter()
+                .filter(|d| v6_egress.contains(&d.sw_if_index))
+                .count() as u64;
+            c.v6 = Some(v6);
         }
         c
     }
@@ -1808,20 +1845,7 @@ impl ConvergenceEngine {
     /// read that feeds the steer gate), so the health surface reads it
     /// live rather than as a recording.
     pub fn port_links(&self) -> Vec<PortLink> {
-        // The freshest observation available, and the scan wins when
-        // there is one: it is what the steer gate acted on, so a port
-        // restored between the last verify and the last steer reads as
-        // restored here too. Falling back to the verify's recording
-        // covers the window before any gate has run.
-        let dead = self
-            .last_dead_scan
-            .as_deref()
-            .or_else(|| {
-                self.last_verify
-                    .as_ref()
-                    .map(|v| v.dead_interfaces.as_slice())
-            })
-            .unwrap_or_default();
+        let dead = self.latest_dead();
         let active = self.active_egress_indices();
         self.attached
             .iter()
@@ -1845,6 +1869,22 @@ impl ConvergenceEngine {
                 }
             })
             .collect()
+    }
+
+    /// The freshest dark-interface observation available, and the scan
+    /// wins when there is one: it is what the steer gate acted on, so a
+    /// port restored between the last verify and the last steer reads as
+    /// restored here too. Falling back to the verify's recording covers
+    /// the window before any gate has run.
+    fn latest_dead(&self) -> &[crate::verify::DeadInterface] {
+        self.last_dead_scan
+            .as_deref()
+            .or_else(|| {
+                self.last_verify
+                    .as_ref()
+                    .map(|v| v.dead_interfaces.as_slice())
+            })
+            .unwrap_or_default()
     }
 
     /// Tell the engine whether traffic is currently steered.
@@ -2764,10 +2804,22 @@ impl ConvergenceEngine {
                 }
                 Some(v) => {
                     self.kernel_delivered.remove(&prefix);
-                    self.pending.upsert(prefix, v);
+                    match scope_nexthops(prefix, &v) {
+                        Some(scoped) => {
+                            self.link_local_refused.remove(&prefix);
+                            self.pending.upsert(prefix, scoped.into_owned());
+                        }
+                        // Only link-local next hops: refused, and withdrawn
+                        // in case an earlier update installed it.
+                        None => {
+                            self.link_local_refused.insert(prefix);
+                            self.pending.withdraw(prefix);
+                        }
+                    }
                 }
                 None => {
                     self.kernel_delivered.remove(&prefix);
+                    self.link_local_refused.remove(&prefix);
                     self.pending.withdraw(prefix);
                 }
             }
@@ -2921,6 +2973,7 @@ impl ConvergenceEngine {
         // we were not looking leaves the count too.
         self.shadowed.clear();
         self.kernel_delivered.clear();
+        self.link_local_refused.clear();
         let families = self.drainer.families();
         src.for_each_route(&mut |prefix, nexthops| {
             // A family VPP does not carry never enters the diff — the
@@ -2951,6 +3004,14 @@ impl ConvergenceEngine {
                 plan.kernel_delivered += 1;
                 return;
             }
+            // Link-local next hops dropped; with none left the route is
+            // refused — not in `seen` either, so a stale install goes.
+            let Some(scoped) = scope_nexthops(prefix, nexthops) else {
+                self.link_local_refused.insert(prefix);
+                plan.link_local_refused += 1;
+                return;
+            };
+            let nexthops: &[IpAddr] = &scoped;
             seen.insert(prefix);
             // Unchanged: VPP holds this prefix through exactly the paths
             // it resolves to now, so re-sending it would replace a route
@@ -3176,12 +3237,42 @@ impl ConvergenceEngine {
     /// neighbour's L2FIB entry pins — or, for one that floods, every
     /// member. Those are what the link gate must see as in use; the BVI
     /// alone would let a steer start over a dark trunk (review finding).
+    ///
+    /// **IPv4's gate, under `v6 on`.** Only adjacencies an IPv4 route can
+    /// use count: every v4 neighbour, plus any v6 neighbour an installed
+    /// v4 route is recorded going through (RFC 8950 — no production feed
+    /// sends one, but the gate must not miss it if one appears). A member
+    /// whose only adjacencies are the unsteered v6 table's is idle to
+    /// IPv4: dark, it degrades `fib-v6` ([`FamilyCounts::dark_egress`])
+    /// and never refuses a v4 steer. A v4 route adopted from a dump whose
+    /// paths were never observed contributes no v6 next hop here; the
+    /// adoption's resync re-sends it through observed paths before any
+    /// steer, and verify's probes still see its interface. Under `V4Only`
+    /// every neighbour is v4, so this is exactly the set it always was.
+    ///
+    /// [`FamilyCounts::dark_egress`]: crate::sink::FamilyCounts::dark_egress
     fn active_egress_indices(&self) -> std::collections::HashSet<u32> {
+        if !self.drainer.families().carries_v6() {
+            return self.egress_indices(|_| true);
+        }
+        let v6_via_v4: HashSet<IpAddr> = self
+            .ledger
+            .v4_nexthops()
+            .into_iter()
+            .filter(IpAddr::is_ipv6)
+            .collect();
+        self.egress_indices(|nh| nh.is_ipv4() || v6_via_v4.contains(nh))
+    }
+
+    /// Interfaces the admitted neighbours' adjacencies egress, with BVIs
+    /// expanded to their members (see [`Self::active_egress_indices`]).
+    fn egress_indices(&self, admit: impl Fn(&IpAddr) -> bool) -> std::collections::HashSet<u32> {
         let on: Vec<(u32, IpAddr)> = self
             .neighbours_installed
             .keys()
             .copied()
             .chain(self.neighbours_unacked.iter().copied())
+            .filter(|(_, nh)| admit(nh))
             .collect();
         let mut active: std::collections::HashSet<u32> = on.iter().map(|(i, _)| *i).collect();
         for (vid, bvi) in self.port_index.bvis() {
@@ -3413,6 +3504,38 @@ fn is_neighbour_adj_fib(route: &IpRoute, nh: &[u8; 16]) -> bool {
         _ => route.prefix.len == 128,
     };
     host && route.prefix.address.un.0 == *nh
+}
+
+/// `fe80::/10`: scoped to one link, so meaningless without an interface.
+fn is_link_local(ip: &IpAddr) -> bool {
+    matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80)
+}
+
+/// A route's next hops with link-local ones dropped, for an IPv6 route —
+/// or `None` when that leaves none, and the route is refused
+/// ([`ConvergenceEngine`]'s `link_local_refused`). IPv4 routes, and v6
+/// routes without a link-local next hop, pass through untouched.
+///
+/// Why refuse rather than resolve: see `carries_neighbour`. The feed has
+/// already collapsed each link-local address to one interface by the
+/// time it reaches here, so "exactly one member carries it" is not
+/// observable, and the only safe answer VPP can be given for a scoped
+/// next hop without its scope is none. A route that ALSO names a global
+/// next hop keeps it and installs through that alone. The follow-up that
+/// would admit them — carrying `(address, ifindex)` for link-local next
+/// hops from the fast path's resolver, through `ResolvedRouteSink` and
+/// the feed, into `NexthopMap` — needs the route's next hop to carry its
+/// interface too, which the BGP feed does not provide today.
+fn scope_nexthops(prefix: IpPrefix, nexthops: &[IpAddr]) -> Option<std::borrow::Cow<'_, [IpAddr]>> {
+    if matches!(prefix, IpPrefix::V4 { .. }) || !nexthops.iter().any(is_link_local) {
+        return Some(std::borrow::Cow::Borrowed(nexthops));
+    }
+    let global: Vec<IpAddr> = nexthops
+        .iter()
+        .copied()
+        .filter(|n| !is_link_local(n))
+        .collect();
+    (!global.is_empty()).then_some(std::borrow::Cow::Owned(global))
 }
 
 /// Whether the v6 network `net/len` covers all of `p`. A v4 `p` is never
