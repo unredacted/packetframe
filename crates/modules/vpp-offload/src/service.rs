@@ -1678,20 +1678,37 @@ fn run_loop(
         && !shared.stop.load(Ordering::SeqCst)
         && shared.preserve.load(Ordering::SeqCst)
     {
+        use packetframe_common::events::{kind, Event};
         match runtime.preserve(driver.state()) {
-            Ok(routes) => tracing::info!(
-                routes,
-                state = ?driver.state(),
-                "preserved VPP's route ledger for the next daemon: a `--keep-vpp` start adopts \
-                 it without reading VPP's FIB, and steering stays up across the restart"
-            ),
-            Err(e) => tracing::info!(
-                reason = %e,
-                state = ?driver.state(),
-                "VPP's route ledger was not preserved; the next adoption reads VPP's FIB \
-                 instead (the dump path — on a steered VPP, traffic moves to the eBPF tier \
-                 while it does)"
-            ),
+            Ok(routes) => {
+                tracing::info!(
+                    routes,
+                    state = ?driver.state(),
+                    "preserved VPP's route ledger for the next daemon: a `--keep-vpp` start \
+                     adopts it without reading VPP's FIB, and steering stays up across the \
+                     restart"
+                );
+                Event::info(crate::MODULE_NAME, kind::LEDGER_PRESERVED)
+                    .field("preserved", true)
+                    .field("routes", routes)
+                    .field("state", format!("{:?}", driver.state()))
+                    .emit();
+            }
+            Err(e) => {
+                tracing::info!(
+                    reason = %e,
+                    state = ?driver.state(),
+                    "VPP's route ledger was not preserved; the next adoption reads VPP's FIB \
+                     instead (the dump path — on a steered VPP, traffic moves to the eBPF tier \
+                     while it does)"
+                );
+                Event::info(crate::MODULE_NAME, kind::LEDGER_PRESERVED)
+                    .field("preserved", false)
+                    .field("reason", e.to_string())
+                    .field("state", format!("{:?}", driver.state()))
+                    .detail("not preserved; the next adoption reads VPP's FIB instead")
+                    .emit();
+            }
         }
         return;
     }

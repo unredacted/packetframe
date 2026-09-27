@@ -2,6 +2,7 @@
 //!
 //! Shared types used across userspace crates:
 //! - [`config`]: line-based config parser (see SPEC.md §6)
+//! - [`events`]: the persistent event log of significant transitions
 //! - [`ethtool`]: NIC interrupt coalescing over `SIOCETHTOOL`
 //! - [`module`]: the [`Module`] trait and support types (see SPEC.md §3.2)
 //! - [`placement`]: the CPUs the daemon's control-plane threads run on
@@ -10,6 +11,7 @@
 
 pub mod config;
 pub mod ethtool;
+pub mod events;
 pub mod fib;
 #[cfg(feature = "frr")]
 pub mod frr;

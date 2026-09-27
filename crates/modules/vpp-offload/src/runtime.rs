@@ -45,6 +45,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
+use packetframe_common::events::{self as event_log, kind as event_kind};
+
 use crate::driver::Observe;
 use crate::engine::{ConvergenceEngine, EngineError, RouteSource};
 use crate::executor::{Effects, StepError};
@@ -2536,6 +2538,14 @@ impl Core {
                 if ready { "ready" } else { "not ready" },
                 if ready { "permitted" } else { "held back" }
             );
+            let ev = if ready {
+                event_log::Event::info(crate::MODULE_NAME, event_kind::HANDBACK_READY)
+                    .detail("IPv6 hand-back path ready; the IPv6 half of steering is permitted")
+            } else {
+                event_log::Event::warn(crate::MODULE_NAME, event_kind::HANDBACK_HELD_BACK)
+                    .detail("IPv6 hand-back path not ready; the IPv6 half of steering is held back")
+            };
+            ev.emit();
             if resteer
                 && self.engine.steered()
                 && self.engine.handback_wanted()
@@ -2907,6 +2917,7 @@ impl Core {
                 "preserved route ledger not used; this adoption reads VPP's FIB instead \
                  (the dump path: unsteer when the fallback is ready, dump, diff, verify)"
             );
+            ledger_rejected("fingerprint", &why);
             return Ok(());
         }
         match self.engine.seed_ledger(&rec.body) {
@@ -2922,11 +2933,15 @@ impl Core {
                      and verify probes VPP against the ledger, paths included, before it \
                      counts as verified"
                 );
+                adoption_path("preserved-ledger", n);
             }
-            Err(why) => tracing::warn!(
-                reason = %why,
-                "preserved route ledger not used; this adoption reads VPP's FIB instead"
-            ),
+            Err(why) => {
+                tracing::warn!(
+                    reason = %why,
+                    "preserved route ledger not used; this adoption reads VPP's FIB instead"
+                );
+                ledger_rejected("seed", &why);
+            }
         }
         Ok(())
     }
@@ -2968,10 +2983,31 @@ impl Core {
              discarding the seed — this adoption reads VPP's FIB instead (the dump path: \
              unsteer, dump, diff, verify)"
         );
+        ledger_rejected("fingerprint-moved", &why);
         self.seeded = None;
         self.engine.discard_ledger();
         Ok(false)
     }
+}
+
+/// Which of the three ways an adoption took over VPP's FIB — the
+/// preserved ledger (no dump), a read of VPP's FIB (the dump path), or
+/// none at all (an empty VPP: fresh installs) — for the event log.
+fn adoption_path(path: &'static str, routes: u64) {
+    event_log::Event::info(crate::MODULE_NAME, event_kind::ADOPTION_PATH)
+        .field("path", path)
+        .field("routes", routes)
+        .emit();
+}
+
+/// The preserved ledger was not used (or was disproved); `stage` says
+/// which check refused it. The dump path follows.
+fn ledger_rejected(stage: &'static str, why: &dyn std::fmt::Display) {
+    event_log::Event::warn(crate::MODULE_NAME, event_kind::PRESERVED_LEDGER_REJECTED)
+        .field("stage", stage)
+        .field("reason", why.to_string())
+        .detail("the preserved route ledger was not used; this adoption reads VPP's FIB instead")
+        .emit();
 }
 
 /// An engine failure, classified for the supervision loop: the binary
@@ -3937,6 +3973,14 @@ impl Effects for EffectsView {
                  dump runs against an idle VPP, and steering returns after the verified \
                  resync"
             );
+            event_log::Event::info(crate::MODULE_NAME, event_kind::ADOPTION_PATH)
+                .field("path", "readback-deferred")
+                .field("steered", true)
+                .detail(
+                    "adopted a steered VPP; its FIB is read once the route source is loaded \
+                     and the eBPF tier has taken the traffic back",
+                )
+                .emit();
             c.deferred_resync = Some(DeferredResync::AwaitingFallback {
                 feed: FeedGate::new(floor, seq),
                 last_request: None,
@@ -3973,6 +4017,9 @@ impl Effects for EffectsView {
                     "adopted VPP's existing FIB; the resync diff can now withdraw what the \
                      route source no longer advertises"
                 );
+                adoption_path("readback", adopted);
+            } else {
+                adoption_path("fresh", 0);
             }
             // The diff is only meaningful against a source that has
             // finished loading, and a daemon restart is exactly when it
@@ -4093,6 +4140,7 @@ impl Effects for EffectsView {
                     // but it disproves the record all the same
                     // (`VerifyOutcome::any_mismatch`).
                     if verdict.outcome.any_mismatch() {
+                        ledger_rejected("verify", &verdict.outcome.summary());
                         tracing::warn!(
                             outcome = %verdict.outcome.summary(),
                             first = ?verdict.outcome.mismatches.first().or_else(|| {
@@ -4120,17 +4168,34 @@ impl Effects for EffectsView {
                 // — sampled/mismatches/unresolvable were invisible
                 // even with the unit log captured, and the loop was
                 // misread for a hardware fault because of it.
-                match event {
-                    Event::VerifyFailed => tracing::warn!(
-                        outcome = %verdict.outcome.summary(),
-                        "verify found FIB mismatches; teardown and a fresh resync follow"
-                    ),
-                    Event::VerifyIncomplete => tracing::info!(
-                        outcome = %verdict.outcome.summary(),
-                        "verify incomplete; steering stays refused and VPP stays up"
-                    ),
-                    _ => tracing::info!(outcome = %verdict.outcome.summary(), "verify passed"),
-                }
+                let summary = verdict.outcome.summary();
+                let recorded = match event {
+                    Event::VerifyFailed => {
+                        tracing::warn!(
+                            outcome = %summary,
+                            "verify found FIB mismatches; teardown and a fresh resync follow"
+                        );
+                        event_log::Event::warn(crate::MODULE_NAME, event_kind::VERIFY_FAILED)
+                            .detail("FIB mismatches; teardown and a fresh resync follow")
+                    }
+                    Event::VerifyIncomplete => {
+                        tracing::info!(
+                            outcome = %summary,
+                            "verify incomplete; steering stays refused and VPP stays up"
+                        );
+                        event_log::Event::info(crate::MODULE_NAME, event_kind::VERIFY_INCOMPLETE)
+                            .detail("steering stays refused and VPP stays up")
+                    }
+                    _ => {
+                        tracing::info!(outcome = %summary, "verify passed");
+                        event_log::Event::info(crate::MODULE_NAME, event_kind::VERIFY_PASSED)
+                    }
+                };
+                recorded
+                    .field("outcome", summary.to_string())
+                    .field("seeded", seeded)
+                    .field("may_steer", verdict.may_steer)
+                    .emit();
                 c.pending.push(event);
                 Ok(())
             }

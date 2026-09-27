@@ -23,7 +23,10 @@
 //!    supervisor understands, or a recorded failure. Silence is never
 //!    an outcome.
 
+use std::sync::Mutex;
 use std::time::Duration;
+
+use packetframe_common::events::{self, kind};
 
 use crate::process::Disposition;
 use crate::runtime::SteerOutcome;
@@ -160,6 +163,50 @@ impl Outcome {
     }
 }
 
+/// The last steering event recorded, as `(kind, key)`.
+///
+/// A refused steer is retried every `STEER_RETRY_EVERY` for as long as
+/// its gate stays shut, and each retry fails the same way; recording
+/// every one would put a line in the event log twice a minute for hours.
+/// An outcome is recorded when it differs from the previous one, so the
+/// log carries the transitions — refused, and later steered — and the
+/// journal keeps the retries.
+static LAST_STEERING: Mutex<Option<(&'static str, String)>> = Mutex::new(None);
+
+/// Record a steering event unless it repeats the previous one. `key`
+/// distinguishes outcomes of the same kind (a failure's reason).
+fn steering_event(ev: events::Event, key: &str) {
+    let mut last = LAST_STEERING.lock().unwrap_or_else(|e| e.into_inner());
+    let k = ev.kind();
+    if last.as_ref().is_some_and(|(lk, lr)| *lk == k && lr == key) {
+        return;
+    }
+    *last = Some((k, key.to_string()));
+    ev.emit();
+}
+
+fn steer_failed(action: &str, why: &str, rules_remain: bool) {
+    steering_event(steer_failed_event(action, why, rules_remain), why);
+}
+
+/// The `steer_failed` record. What it says about where traffic is
+/// follows `rules_remain`: a rollback that could not delete every rule
+/// leaves some traffic diverted to VPP, and "traffic stays on the eBPF
+/// tier" would then be false exactly when it matters (review finding on
+/// #289).
+fn steer_failed_event(action: &str, why: &str, rules_remain: bool) -> events::Event {
+    events::Event::warn(crate::MODULE_NAME, kind::STEER_FAILED)
+        .field("action", action)
+        .field("reason", why)
+        .field("rules_remain", rules_remain)
+        .detail(if rules_remain {
+            "steering was not installed as asked, and the rollback left rules in the NIC: \
+             traffic matching them is still diverted to VPP"
+        } else {
+            "steering was not installed as asked; traffic stays on the eBPF tier"
+        })
+}
+
 /// Execute `actions` in order, in full.
 ///
 /// Failures are recorded and execution continues, with one exception
@@ -187,6 +234,12 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                 // releasing a VF that MCAM is still pointing at.
                 Ok(()) => {
                     tracing::info!("steering DOWN: traffic returned to the eBPF fast-path tier");
+                    steering_event(
+                        events::Event::info(crate::MODULE_NAME, kind::STEERING_DOWN)
+                            .field("cause", "unsteer")
+                            .detail("traffic returned to the eBPF fast-path tier"),
+                        "",
+                    );
                     Event::Unsteered
                 }
                 Err(e) => {
@@ -197,6 +250,15 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                         error = %e,
                         "steering could NOT be removed; traffic is still diverted into a VPP \
                          that is being stopped, and the VF will be withheld"
+                    );
+                    steering_event(
+                        events::Event::error(crate::MODULE_NAME, kind::UNSTEER_FAILED)
+                            .field("reason", e.as_str())
+                            .detail(
+                                "steering could not be removed; traffic is still diverted into \
+                                 a VPP that is being stopped, and the VF is withheld",
+                            ),
+                        &e,
                     );
                     out.failures.push((*action, e));
                     teardown_clean = false;
@@ -246,6 +308,13 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                         "steering RESTORED: the adopted VPP's intact FIB takes the traffic \
                          back while the fallback is not ready"
                     );
+                    steering_event(
+                        events::Event::info(crate::MODULE_NAME, kind::STEERING_RESTORED).detail(
+                            "the adopted VPP's intact FIB takes the traffic back while the \
+                             fallback is not ready",
+                        ),
+                        "",
+                    );
                     Event::Steered
                 }
                 // The config stopped asking for this port between the
@@ -258,6 +327,15 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                         "steering DOWN: no port is configured to steer, so the restore \
                          removed the adopted rules instead of re-installing them"
                     );
+                    steering_event(
+                        events::Event::info(crate::MODULE_NAME, kind::STEERING_DOWN)
+                            .field("cause", "nothing-to-steer")
+                            .detail(
+                                "no port is configured to steer; the restore removed the \
+                                 adopted rules",
+                            ),
+                        "",
+                    );
                     Event::NothingToSteer
                 }
                 Err(e) => {
@@ -266,6 +344,7 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                         rules_remain = fx.steering_in_place(),
                         "restore-steer failed; traffic stays on the eBPF tier"
                     );
+                    steer_failed("restore-steer", &e, fx.steering_in_place());
                     out.failures.push((*action, e));
                     Event::SteerFailed {
                         rules_remain: fx.steering_in_place(),
@@ -284,6 +363,13 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                         "steering UP: allowlisted traffic is now diverted to VPP (the eBPF \
                          tier remains the failover)"
                     );
+                    steering_event(
+                        events::Event::info(crate::MODULE_NAME, kind::STEERING_UP).detail(
+                            "allowlisted traffic is diverted to VPP; the eBPF tier remains the \
+                             failover",
+                        ),
+                        "",
+                    );
                     Event::Steered
                 }
                 // A reconcile whose target asks for nothing. It is a
@@ -299,6 +385,15 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                          removed what was left and installed nothing; traffic is on the \
                          eBPF fast-path tier"
                     );
+                    steering_event(
+                        events::Event::info(crate::MODULE_NAME, kind::STEERING_DOWN)
+                            .field("cause", "nothing-to-steer")
+                            .detail(
+                                "no port is configured to steer; traffic is on the eBPF \
+                                 fast-path tier",
+                            ),
+                        "",
+                    );
                     Event::NothingToSteer
                 }
                 Err(e) => {
@@ -307,6 +402,7 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                         rules_remain = fx.steering_in_place(),
                         "steer failed; traffic stays on the eBPF tier"
                     );
+                    steer_failed("steer", &e, fx.steering_in_place());
                     out.failures.push((*action, e));
                     // Verified but not steered as asked: reported, not
                     // papered over, and NOT a process restart — the
@@ -367,6 +463,24 @@ fn step_failed(out: &mut Outcome, action: Action, step: ConvergenceStep, e: Step
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record must not say traffic is on the eBPF tier when the
+    /// rollback left rules diverting it.
+    #[test]
+    fn steer_failed_says_where_traffic_is() {
+        let clean = steer_failed_event("steer", "ntuple insert refused", false).into_record();
+        assert_eq!(clean.fields["rules_remain"], false);
+        assert!(clean.fields["detail"]
+            .as_str()
+            .unwrap()
+            .contains("traffic stays on the eBPF tier"));
+
+        let left = steer_failed_event("steer", "ntuple delete refused", true).into_record();
+        assert_eq!(left.fields["rules_remain"], true);
+        let detail = left.fields["detail"].as_str().unwrap();
+        assert!(!detail.contains("stays on the eBPF tier"), "{detail}");
+        assert!(detail.contains("still diverted to VPP"), "{detail}");
+    }
 
     /// Records calls in order and fails whichever ones it is told to.
     #[derive(Default)]

@@ -291,6 +291,7 @@ Quick directive index:
 
 **Global**
 - `bpffs-root`, `state-dir`, `metrics-textfile`, `log-level`, `attach-settle-time`
+- `event-log {<path>|off}`, `event-log-max <size>`: the persistent event log (default `<state-dir>/events.log`, 10M per file)
 
 **Module fast-path: attach + allowlist**
 - `attach <iface> {native|generic|auto}`
@@ -329,6 +330,7 @@ Quick directive index:
 
 ```sh
 sudo packetframe status                # live counters, plus each module's health
+sudo packetframe events --since 12h    # the persistent event log: steering, verify, restarts, health
 sudo packetframe fib stats             # custom-FIB occupancy / hash mode
 sudo packetframe fib lookup <ip>       # "what would XDP do for this dst?"
 sudo packetframe fib dump-v4           # walk FIB_V4 LPM trie
@@ -336,6 +338,8 @@ sudo packetframe detach --all          # remove all pins, detach XDP
 ```
 
 Counters export as a Prometheus textfile every 15 s when `metrics-textfile` is set: per-counter gauges, custom-FIB occupancy by nexthop state, the active forwarding mode, and whatever each loaded module publishes.
+
+Operationally significant transitions — steering up/down, verify results, restarts and the adoption path each took, reconfigure outcomes, module health changes, teardowns — are also written to a small persistent event log (newline-delimited JSON, `<state-dir>/events.log` by default, rotated to `.1` at `event-log-max`), because a journal capped for the whole box can lose them within hours. `packetframe events` reads it. On appliances whose root filesystem is reset by firmware upgrades, point `event-log` at persistent storage. See [the runbook](docs/runbooks/event-log.md).
 
 ## Documentation
 
@@ -350,6 +354,7 @@ Runbooks, in `docs/runbooks/`:
 | [`guard.md`](docs/runbooks/guard.md) | The guard frame policer: monitor→enforce ladder, counters, triage |
 | [`neigh-snoop.md`](docs/runbooks/neigh-snoop.md) | The neighbour snooper: rollout, counters, FRR next-hop gate, triage |
 | [`reconfigure.md`](docs/runbooks/reconfigure.md) | What SIGHUP applies and what needs a restart |
+| [`event-log.md`](docs/runbooks/event-log.md) | The persistent event log: location, format, event kinds, rotation, failure handling |
 | [`mss-clamp.md`](docs/runbooks/mss-clamp.md) | MSS clamping and the iptables-bypass gap it closes |
 | [`tail-call-architecture.md`](docs/runbooks/tail-call-architecture.md) | The two-stage BPF datapath and why it is split |
 | [`generic-mode-performance.md`](docs/runbooks/generic-mode-performance.md) | Measured cost of generic vs native XDP, and host tuning |

@@ -15,6 +15,7 @@ use crate::scrub::scrub_for_terminal;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 use std::time::{Duration, Instant};
 
+use packetframe_common::events::{self, kind, Event, DAEMON_MODULE};
 use packetframe_common::{config::Config, probe::run_probes};
 
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
@@ -124,6 +125,36 @@ pub fn run(config_path: &Path) -> Result<(), RunError> {
     // startup default, which is how its own error message got printed.
     crate::logging::apply_config_level(config.global.log_level);
 
+    // Next, so a start that is refused below is on the record as well
+    // as one that comes up: a crash loop reads as a column of
+    // `process_start` / `process_stop` pairs, which is the history the
+    // journal loses overnight.
+    crate::events_cli::install_from(&config.global);
+    Event::info(DAEMON_MODULE, kind::PROCESS_START)
+        .field("version", env!("CARGO_PKG_VERSION"))
+        .field("pid", std::process::id())
+        .field("config", config_path.display().to_string())
+        .emit();
+
+    let result = run_with(config, config_path);
+    // The clean exits record their own reason from inside the run; a
+    // failure is recorded here, where its message is.
+    if let Err(e) = &result {
+        let (stage, e) = match e {
+            RunError::Startup(m) => ("startup", m),
+            RunError::Runtime(m) => ("runtime", m),
+        };
+        Event::error(DAEMON_MODULE, kind::PROCESS_STOP)
+            .field("reason", "error")
+            .field("stage", stage)
+            .detail(e)
+            .emit();
+    }
+    events::shutdown();
+    result
+}
+
+fn run_with(config: Config, config_path: &Path) -> Result<(), RunError> {
     config
         .validate_interfaces()
         .map_err(|e| RunError::Startup(e.to_string()))?;
@@ -352,6 +383,13 @@ fn degrade_on_start_failure(
         "continuing WITHOUT it — the eBPF fast-path keeps forwarding (this module's \
          failure degrades, it does not abort)"
     );
+    Event::error(name, kind::MODULE_START_FAILED)
+        .field("stage", stage)
+        .field("degraded", true)
+        .detail(format!(
+            "{err}; running without it, the eBPF fast-path forwards on its own"
+        ))
+        .emit();
     Ok(crate::health::NotAttached {
         module: name.to_string(),
         reason: err.to_string(),
@@ -676,6 +714,9 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         }
 
         tracing::info!(module = %name, attachments = file.attachments.len(), "module attached");
+        Event::info(&name, kind::MODULE_ATTACHED)
+            .field("attachments", file.attachments.len())
+            .emit();
     }
     // Out of the running set, so nothing downstream — the health poll,
     // a SIGHUP's reconfigure, shutdown's detach — ever calls into a
@@ -810,18 +851,34 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 module.exit_preserving();
             }
             drop(modules);
+            Event::info(DAEMON_MODULE, kind::PROCESS_STOP)
+                .field("reason", "signal")
+                .detail("termination signal; exiting with the attach preserved (pins hold it)")
+                .emit();
         }
         Termination::BreakerTrip => {
             // Breaker fired (SIGUSR1). Tear down pins so the kernel
             // detaches; the sticky trip flag is already on disk so
             // subsequent `run` invocations refuse to re-attach.
             tracing::error!("circuit breaker tripped, detaching every module");
+            Event::error(DAEMON_MODULE, kind::CIRCUIT_BREAKER_TRIPPED)
+                .detail("circuit breaker tripped; detaching every module (the trip flag is sticky)")
+                .emit();
+            let mut failed: Vec<String> = Vec::new();
             for (name, module) in modules.iter_mut() {
                 if let Err(e) = module.detach() {
                     tracing::error!(module = %name, error = %e, "detach failed");
+                    failed.push(format!("{name}: {e}"));
                 }
             }
             drop(modules);
+            let mut ev = Event::error(DAEMON_MODULE, kind::PROCESS_STOP)
+                .field("reason", "breaker")
+                .detail("exiting after the circuit breaker detached every module");
+            if !failed.is_empty() {
+                ev = ev.field("detach_failures", failed.join("; "));
+            }
+            ev.emit();
         }
     }
     // The health snapshot describes a *daemon*, and this one is
@@ -1084,6 +1141,7 @@ fn reconfigure_from_signal(
         Err(e) => {
             tracing::error!(error = %e, "SIGHUP config parse failed; keeping current config");
             write_reconfigure_marker(&marker_path, &format!("ERR parse: {e}"));
+            reconfigure_refused("parse", &e);
             return Published::No;
         }
     };
@@ -1107,11 +1165,13 @@ fn reconfigure_from_signal(
     if let Err(e) = new_config.validate_fast_path() {
         tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
         write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
+        reconfigure_refused("validate", &e);
         return Published::No;
     }
     if let Err(e) = new_config.validate_vpp_offload() {
         tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
         write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
+        reconfigure_refused("validate", &e);
         return Published::No;
     }
     // Same rule for the guard section: every validator that runs at
@@ -1121,12 +1181,14 @@ fn reconfigure_from_signal(
     if let Err(e) = new_config.validate_guard() {
         tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
         write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
+        reconfigure_refused("validate", &e);
         return Published::No;
     }
     // And the neigh-snoop section, for the same reason.
     if let Err(e) = new_config.validate_neigh_snoop() {
         tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
         write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
+        reconfigure_refused("validate", &e);
         return Published::No;
     }
 
@@ -1137,6 +1199,7 @@ fn reconfigure_from_signal(
     // point — raising to debug to watch a canary steer, or a route
     // mirror converge, must not cost a restart of the data plane.
     crate::logging::apply_config_level(new_config.global.log_level);
+    crate::events_cli::warn_if_event_log_changed(&new_config.global);
 
     // Before the module loop, and for the WHOLE config rather than per
     // module. vpp-offload's steering target is derived from fast-path's
@@ -1148,41 +1211,16 @@ fn reconfigure_from_signal(
     allowlist.publish(crate::feasibility::allowlist_from_config(&new_config));
 
     let mut failures: Vec<String> = Vec::new();
-    // Additions are restart-only, symmetric with the removal refusal
-    // below: the module set is fixed at startup, so a section with no
-    // loaded module cannot be constructed here. Without this, adding
-    // `module guard` and reloading wrote an OK marker while no guard
-    // existed — the operator believes the documented monitor/enforce
-    // protection is active when nothing is attached (review finding,
-    // PR #206).
-    for section in &new_config.modules {
-        if let Some(f) = not_attached.iter().find(|f| f.module == section.name) {
-            // Not "added to config": it was configured all along and
-            // failed to come up. Reporting it as an addition would send
-            // the operator looking for an edit they never made.
-            failures.push(crate::health::not_attached_reconfigure_line(f));
-            continue;
-        }
-        if !modules.iter().any(|(name, _)| name == &section.name) {
-            tracing::warn!(
-                module = %section.name,
-                "module added to config; reconfigure cannot construct it \
-                 (the module set is restart-only)"
-            );
-            failures.push(format!(
-                "{}: added to config (restart required)",
-                section.name
-            ));
-        }
-    }
-    for f in not_attached {
-        if !new_config.modules.iter().any(|m| m.name == f.module) {
-            tracing::warn!(
-                module = %f.module,
-                "module that failed at startup removed from config; still reported until restart"
-            );
-            failures.push(crate::health::not_attached_removed_line(f));
-        }
+    // Every one of these reaches the marker AND the event log: they are
+    // produced together, so a case cannot reach one and not the other
+    // (the not-attached ones once reached only the marker — review
+    // finding on #289).
+    let sections: Vec<&str> = new_config.modules.iter().map(|m| m.name.as_str()).collect();
+    let running: Vec<&str> = modules.iter().map(|(n, _)| n.as_str()).collect();
+    for (module, line) in module_set_failures(&sections, &running, not_attached) {
+        tracing::warn!(module = %module, "reconfigure: {line}");
+        reconfigure_failed(&module, &line);
+        failures.push(line);
     }
     for (name, module) in modules.iter_mut() {
         let section = match new_config.modules.iter().find(|m| &m.name == name) {
@@ -1192,14 +1230,19 @@ fn reconfigure_from_signal(
                     module = %name,
                     "module removed from config; reconfigure skipped (attach-set changes require restart)"
                 );
+                reconfigure_failed(name, &"removed from config (restart required)");
                 failures.push(format!("{name}: removed from config (restart required)"));
                 continue;
             }
         };
         let mcfg = ModuleConfig::new(section, &new_config.global);
-        if let Err(e) = module.reconfigure(&mcfg) {
-            tracing::warn!(module = %name, error = %e, "reconfigure failed");
-            failures.push(format!("{name}: {e}"));
+        match module.reconfigure(&mcfg) {
+            Ok(()) => Event::info(name, kind::RECONFIGURE_APPLIED).emit(),
+            Err(e) => {
+                tracing::warn!(module = %name, error = %e, "reconfigure failed");
+                reconfigure_failed(name, &e);
+                failures.push(format!("{name}: {e}"));
+            }
         }
     }
 
@@ -1228,6 +1271,106 @@ fn reconfigure_from_signal(
         );
     }
     Published::Yes
+}
+
+/// The module-set half of a reload's verdict: every configured module
+/// the reload cannot reach, as `(module, failure line)`. Running modules
+/// are reconciled by the caller; a running module REMOVED from the config
+/// is its business too, since it must skip that module's reconfigure.
+///
+/// - A section whose module failed at startup: not "added to config" —
+///   it was configured all along, and calling it an addition would send
+///   the operator looking for an edit they never made.
+/// - A section with no loaded module: an addition. The module set is
+///   fixed at startup, so it cannot be constructed here; without this,
+///   adding `module guard` and reloading wrote an OK marker while no
+///   guard existed (review finding, PR #206).
+/// - A module that failed at startup and is now gone from the config:
+///   still carried, and reported Degraded, until a restart.
+#[cfg(feature = "fast-path")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn module_set_failures(
+    sections: &[&str],
+    running: &[&str],
+    not_attached: &[crate::health::NotAttached],
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for section in sections {
+        if let Some(f) = not_attached.iter().find(|f| f.module == *section) {
+            out.push((
+                f.module.clone(),
+                crate::health::not_attached_reconfigure_line(f),
+            ));
+        } else if !running.contains(section) {
+            out.push((
+                section.to_string(),
+                format!("{section}: added to config (restart required)"),
+            ));
+        }
+    }
+    for f in not_attached {
+        if !sections.contains(&f.module.as_str()) {
+            out.push((
+                f.module.clone(),
+                crate::health::not_attached_removed_line(f),
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(all(test, feature = "fast-path"))]
+mod module_set_tests {
+    use super::module_set_failures;
+    use crate::health::NotAttached;
+
+    #[test]
+    fn every_unreachable_module_is_named_with_its_reason() {
+        let failed = NotAttached {
+            module: "vpp-offload".into(),
+            reason: "hugepages unavailable".into(),
+            metrics: String::new(),
+        };
+        // Configured but never attached, and a brand-new section.
+        let got = module_set_failures(
+            &["fast-path", "vpp-offload", "guard"],
+            &["fast-path"],
+            std::slice::from_ref(&failed),
+        );
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].0, "vpp-offload");
+        assert!(got[0].1.contains("hugepages unavailable"), "{}", got[0].1);
+        assert!(got[0].1.contains("failed to come up"), "{}", got[0].1);
+        assert_eq!(got[1].0, "guard");
+        assert!(got[1].1.contains("added to config"), "{}", got[1].1);
+
+        // The failed module's section removed: still reported, by name.
+        let got = module_set_failures(&["fast-path"], &["fast-path"], &[failed]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "vpp-offload");
+        assert!(got[0].1.contains("removed from config"), "{}", got[0].1);
+
+        // Nothing unreachable: nothing reported.
+        assert!(module_set_failures(&["fast-path"], &["fast-path"], &[]).is_empty());
+    }
+}
+
+/// A SIGHUP whose config was refused whole: nothing from it applied.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn reconfigure_refused(stage: &str, why: &dyn std::fmt::Display) {
+    Event::error(DAEMON_MODULE, kind::RECONFIGURE_REFUSED)
+        .field("stage", stage)
+        .detail(format!("{why}; keeping the running config"))
+        .emit();
+}
+
+/// One module that did not apply a SIGHUP's config (every other module
+/// did; nothing is rolled back).
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+fn reconfigure_failed(module: &str, why: &dyn std::fmt::Display) {
+    Event::warn(module, kind::RECONFIGURE_FAILED)
+        .detail(why.to_string())
+        .emit();
 }
 
 /// Whether a reconfigure attempt refreshed the health file.
@@ -1730,6 +1873,17 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
         }
     }
 
+    // Only now, with no daemon to share the file with: a teardown is one
+    // of the transitions the event log exists to keep.
+    let log_global = parsed.as_ref().map_or_else(
+        || packetframe_common::config::GlobalConfig {
+            state_dir: state_dir.clone(),
+            ..Default::default()
+        },
+        |c| c.global.clone(),
+    );
+    crate::events_cli::install_from(&log_global);
+
     // Checked before anything is torn down, so a refusal leaves the box
     // exactly as the stop left it.
     #[cfg(feature = "vpp-offload")]
@@ -1808,21 +1962,32 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     // the config with the vpp-offload section cut off, scoped with
     // `--config` — correct, and easy to get wrong at 3 a.m.
     #[cfg(feature = "vpp-offload")]
-    match vpp_detach(all, config_has_vpp, keep_vpp) {
-        VppDetach::Keep => tracing::info!(
-            "vpp-offload left running (--keep-vpp): VPP, its VFs, hugepages and MCAM \
-             steering rules stay, and the next `packetframe run` adopts them"
-        ),
+    let vpp_disposition = match vpp_detach(all, config_has_vpp, keep_vpp) {
+        VppDetach::Keep => {
+            tracing::info!(
+                "vpp-offload left running (--keep-vpp): VPP, its VFs, hugepages and MCAM \
+                 steering rules stay, and the next `packetframe run` adopts them"
+            );
+            "kept"
+        }
         VppDetach::TearDown => {
-            if let Err(e) = detach_vpp_offload(&state_dir) {
+            let r = detach_vpp_offload(&state_dir);
+            let label = vpp_teardown_label(&r);
+            if let Err(e) = r {
                 errors.push(e);
             }
+            label
         }
-        VppDetach::OutOfScope => tracing::info!(
-            "vpp-offload state left alone: this detach is scoped to the supplied config; \
-             use `--all` to tear down modules it does not declare"
-        ),
-    }
+        VppDetach::OutOfScope => {
+            tracing::info!(
+                "vpp-offload state left alone: this detach is scoped to the supplied config; \
+                 use `--all` to tear down modules it does not declare"
+            );
+            "out-of-scope"
+        }
+    };
+    #[cfg(not(feature = "vpp-offload"))]
+    let vpp_disposition = "not-built";
     #[cfg(not(feature = "vpp-offload"))]
     let _ = (config_has_vpp, keep_vpp);
 
@@ -1846,10 +2011,47 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     #[cfg(not(any(feature = "vpp-offload", feature = "guard", feature = "neigh-snoop")))]
     let _ = all;
 
-    if !errors.is_empty() {
-        return Err(errors.join("; AND "));
+    let result = if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; AND "))
+    };
+    let ev = match &result {
+        Ok(()) => Event::info(DAEMON_MODULE, kind::DETACH).field("outcome", "ok"),
+        Err(e) => Event::error(DAEMON_MODULE, kind::DETACH)
+            .field("outcome", "failed")
+            .detail(e),
+    };
+    ev.field("all", all)
+        .field("keep_vpp", keep_vpp)
+        .field("vpp", vpp_disposition)
+        .emit();
+    events::shutdown();
+    result
+}
+
+/// What the `detach` event records for a vpp-offload teardown: only a
+/// teardown that succeeded is `torn-down`. A failed one may have left
+/// VPP, its VFs or its steering rules in place, and recording it as done
+/// is the claim an operator would act on (review finding on #289).
+#[cfg_attr(not(feature = "vpp-offload"), allow(dead_code))]
+fn vpp_teardown_label(r: &Result<(), String>) -> &'static str {
+    match r {
+        Ok(()) => "torn-down",
+        Err(_) => "teardown-failed",
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod detach_event_tests {
+    #[test]
+    fn a_failed_vpp_teardown_is_not_recorded_as_done() {
+        assert_eq!(super::vpp_teardown_label(&Ok(())), "torn-down");
+        assert_eq!(
+            super::vpp_teardown_label(&Err("VF still bound".into())),
+            "teardown-failed"
+        );
+    }
 }
 
 /// Refuse a `--keep-vpp` the next start could not adopt, before any
@@ -2441,7 +2643,36 @@ pub fn status(config_path: &Path) -> Result<(), String> {
     #[cfg(feature = "neigh-snoop")]
     print_neigh_snoop_cache(&config);
 
+    print_event_log(&config);
+
     Ok(())
+}
+
+/// Where the event log is, how full, and — from the daemon's last health
+/// snapshot — whether its writer is keeping up. A writer that cannot
+/// write says so only here and once in the journal, so this is the line
+/// that makes a silent log visible.
+fn print_event_log(config: &Config) {
+    // The daemon's own account of its writer, from its health snapshot
+    // (removed on a clean exit, so present means a daemon is, or was
+    // until it crashed, writing).
+    #[cfg(feature = "fast-path")]
+    let running = crate::health::load(&config.global.state_dir)
+        .ok()
+        .flatten()
+        .and_then(|s| s.event_log);
+    #[cfg(not(feature = "fast-path"))]
+    let running: Option<packetframe_common::events::Status> = None;
+    let configured = config
+        .global
+        .event_log_path()
+        .map(|p| (p, config.global.event_log_max));
+    println!();
+    for line in crate::events_cli::status_lines(configured, running.as_ref(), |p| {
+        std::fs::metadata(p).map(|m| m.len()).ok()
+    }) {
+        println!("{line}");
+    }
 }
 
 /// The neigh-snoop persisted tables, one line per configured bridge.
