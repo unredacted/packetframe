@@ -433,6 +433,11 @@ pub struct StatusSnapshot {
     /// before declaring any floor benign (runbook, "The null-drop
     /// gauge").
     pub null_drops: Option<u64>,
+    /// VPP's glean and ARP-reply transmit counters, absent until
+    /// sampled. Metrics only: rendered as gauges, never a health input —
+    /// a glean burst is a scan or a new host, not a fault. Not an
+    /// `observe_parts` argument; the service sets it on the snapshot.
+    pub neighbour_counters: Option<crate::engine::NeighbourCounters>,
     /// Bridge neighbours the FDB has never placed behind a member port
     /// (`"<nexthop> on <device>"`): VPP cannot reach them, so their
     /// routes are unresolvable. Degraded, neighbour named.
@@ -635,6 +640,7 @@ impl StatusSnapshot {
             shadowed_routes,
             kernel_delivered_routes,
             null_drops,
+            neighbour_counters: None,
             neighbours_unplaced,
             neighbour_moves,
             neighbours_flooded,
@@ -1104,12 +1110,18 @@ impl StatusSnapshot {
     /// the whole tripwire is pending or cannot tell which config the NIC
     /// holds — the `exempt-drift` row already says so, for both halves,
     /// and a second row repeating it would only double the noise.
+    ///
+    /// Findings a `drift-accept6` covers are named AFTER the unaccepted
+    /// ones and degrade nothing: with only those (or only an accept that
+    /// matches nothing) the row is Healthy and carries them as a note, so
+    /// a decision already made stays visible without keeping the row red
+    /// and hiding the next real finding behind it.
     fn drift_v6_health(&self) -> Option<SubsystemHealth> {
         let v6 = &self.drift_v6;
         if !v6.active || self.drift_scope_stale.is_some() || self.drift_pending {
             return None;
         }
-        let message = if !v6.lines.is_empty() {
+        let degraded = if !v6.lines.is_empty() {
             // Retained across a failed read, so the failure travels with
             // them — the same rule, and the same reason, as the v4 row.
             let stale = v6.unreadable.as_ref().map(|why| {
@@ -1119,30 +1131,38 @@ impl StatusSnapshot {
                      one may already be gone"
                 )
             });
-            format!(
+            Some(format!(
                 "IPv6 kernel path(s) VPP cannot take, while a port diverts IPv6 \
                  (`v6-divert`): {} — diverted IPv6 for these dies in VPP, or leaves by a less \
                  specific route VPP holds, instead of taking the kernel path. There is no \
                  IPv6 `steer-exempt` (the NIC cannot match a v6 address). If VPP should carry \
                  the route, fix the feed or the port's `vlans` so it can; if it is kernel-only, \
-                 accept the risk knowingly, keep its traffic on the kernel by port with \
-                 `steer-keep6`, or drop `v6-divert` from the ports whose hosts reach it{}",
+                 keep its traffic on the kernel by port with `steer-keep6`, drop `v6-divert` \
+                 from the ports whose hosts reach it, or accept the risk knowingly with \
+                 `drift-accept6 <prefix>` (it stops degrading this row; the traffic still \
+                 dies){}",
                 v6.lines.join("; "),
                 stale.unwrap_or_default()
-            )
-        } else if let Some(why) = &v6.unreadable {
-            format!(
-                "the exemption tripwire could not read the kernel's IPv6 routes ({why}), so it \
-                 is not watching for v6 paths VPP cannot take while a port diverts IPv6 — an \
-                 uncovered one would blackhole diverted traffic unreported. The scan retries \
-                 every minute; a persistent failure needs looking at"
-            )
+            ))
         } else {
-            return None;
+            v6.unreadable.as_ref().map(|why| {
+                format!(
+                    "the exemption tripwire could not read the kernel's IPv6 routes ({why}), so \
+                     it is not watching for v6 paths VPP cannot take while a port diverts IPv6 \
+                     — an uncovered one would blackhole diverted traffic unreported. The scan \
+                     retries every minute; a persistent failure needs looking at"
+                )
+            })
+        };
+        let (state, message) = match (degraded, drift_v6_acceptance_note(v6)) {
+            (Some(d), Some(note)) => (HealthState::Degraded, format!("{d}. {note}")),
+            (Some(d), None) => (HealthState::Degraded, d),
+            (None, Some(note)) => (HealthState::Healthy, note),
+            (None, None) => return None,
         };
         Some(SubsystemHealth {
             name: SUBSYS_EXEMPT_DRIFT_V6.into(),
-            state: HealthState::Degraded,
+            state,
             message: Some(message),
             last_success_age_seconds: None,
         })
@@ -2178,6 +2198,27 @@ pub fn render_not_attached_metrics(module: &str) -> String {
     out
 }
 
+/// The `drift-accept6` part of the `exempt-drift-v6` row: the accepted
+/// findings, then each accept that matched nothing. `None` when there is
+/// neither.
+fn drift_v6_acceptance_note(v6: &crate::drift::V6DriftState) -> Option<String> {
+    let mut parts = Vec::new();
+    if !v6.accepted.is_empty() {
+        parts.push(format!(
+            "accepted: {} (`drift-accept6` — acknowledged, not fixed: diverted IPv6 for these \
+             still dies in VPP)",
+            v6.accepted.join("; ")
+        ));
+    }
+    parts.extend(v6.unmatched_accepts.iter().map(|p| {
+        format!(
+            "drift-accept6 {p} matches nothing — the finding it accepted is gone; drop the \
+             line, or it will silently accept whatever appears there next"
+        )
+    }));
+    (!parts.is_empty()).then(|| parts.join(". "))
+}
+
 /// Render `packetframe_vpp_*` gauges for the Prometheus textfile
 /// collector.
 ///
@@ -2379,6 +2420,44 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
         let _ = writeln!(out, "packetframe_vpp_null_drops{{module=\"{module}\"}} {n}");
     }
 
+    // Cumulative, ABSENT until sampled — the null-drop rule. The
+    // family label mirrors `packetframe_vpp_family_routes`.
+    if let Some(c) = &snap.neighbour_counters {
+        gauge(
+            &mut out,
+            "packetframe_vpp_glean_sent",
+            "cumulative ARP requests (ipv4) / neighbour solicitations (ipv6) VPP's glean sent for local-route hosts it holds no neighbour for (absent until sampled)",
+        );
+        for (family, n) in [("ipv4", c.arp_requests_sent), ("ipv6", c.ns_sent)] {
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_glean_sent{{module=\"{module}\",family=\"{family}\"}} {n}"
+            );
+        }
+        gauge(
+            &mut out,
+            "packetframe_vpp_glean_throttled",
+            "cumulative glean requests VPP's per-destination 1 ms throttle suppressed (absent until sampled)",
+        );
+        for (family, n) in [("ipv4", c.arp_requests_throttled), ("ipv6", c.ns_throttled)] {
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_glean_throttled{{module=\"{module}\",family=\"{family}\"}} {n}"
+            );
+        }
+        if let Some(n) = c.arp_replies_sent {
+            gauge(
+                &mut out,
+                "packetframe_vpp_arp_replies_sent",
+                "cumulative ARP replies VPP transmitted, all for its loopback-address (absent until sampled)",
+            );
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_arp_replies_sent{{module=\"{module}\"}} {n}"
+            );
+        }
+    }
+
     // ABSENT while the scan cannot read the kernel, never zero — the
     // same rule as the freshness gauges and the null-drop counter. A
     // dashboard alarming on `> 0` would read a retained (or
@@ -2418,6 +2497,19 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
             out,
             "packetframe_vpp_exempt_drift_v6{{module=\"{module}\"}} {}",
             v6.routes
+        );
+        // Beside it, by the same presence rule, so `drift_v6 +
+        // drift_v6_accepted` is every v6 finding and a dashboard can tell
+        // an accept that silenced a count from a count that went away.
+        gauge(
+            &mut out,
+            "packetframe_vpp_exempt_drift_v6_accepted",
+            "IPv6 kernel paths VPP cannot take that a drift-accept6 covers (acknowledged, still blackholed if diverted)",
+        );
+        let _ = writeln!(
+            out,
+            "packetframe_vpp_exempt_drift_v6_accepted{{module=\"{module}\"}} {}",
+            v6.accepted_routes
         );
     }
 
@@ -5329,6 +5421,7 @@ mod tests {
             lines: vec!["2001:db8:100::/48 via tun0 (table 52)".into()],
             routes: 1,
             unreadable: None,
+            ..Default::default()
         };
         let report = s.report();
         assert!(!report
@@ -5405,6 +5498,7 @@ mod tests {
                 lines: vec!["2001:db8:100::/48 via tun0 (table 52)".into()],
                 routes: 1,
                 unreadable: None,
+                ..Default::default()
             };
             if stale {
                 s.drift_scope_stale = Some("a steering change failed partway".into());
@@ -5419,6 +5513,107 @@ mod tests {
                 .any(|x| x.name == SUBSYS_EXEMPT_DRIFT));
             assert!(!render_metrics(&s, "vpp-offload").contains("packetframe_vpp_exempt_drift"));
         }
+    }
+
+    /// Only accepted v6 findings: the row stays, Healthy, carrying them as
+    /// an `accepted:` note that says the traffic still dies; overall is
+    /// Healthy; the degrading gauge reads 0 and the accepted one counts
+    /// them. The v4 series is untouched.
+    #[test]
+    fn only_accepted_v6_findings_leave_a_healthy_row_with_a_note() {
+        let mut s = quiet_snap();
+        s.drift_v6 = crate::drift::V6DriftState {
+            active: true,
+            accepted: vec!["2001:db8:100::/48 via tun0 (table 52)".into()],
+            accepted_routes: 1,
+            ..Default::default()
+        };
+        let row = v6_row(&s).expect("accepted findings stay visible");
+        assert_eq!(row.state, HealthState::Healthy);
+        let msg = row.message.unwrap_or_default();
+        assert!(
+            msg.starts_with("accepted: 2001:db8:100::/48 via tun0 (table 52)"),
+            "{msg}"
+        );
+        assert!(msg.contains("still dies in VPP"), "{msg}");
+        assert_eq!(s.report().overall, HealthState::Healthy);
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(m.contains("packetframe_vpp_exempt_drift_v6{module=\"vpp-offload\"} 0"));
+        assert!(m.contains("packetframe_vpp_exempt_drift_v6_accepted{module=\"vpp-offload\"} 1"));
+        let v4: Vec<&str> = m
+            .lines()
+            .filter(|l| l.contains("packetframe_vpp_exempt_drift") && !l.contains("drift_v6"))
+            .collect();
+        assert_eq!(
+            v4,
+            [
+                "# HELP packetframe_vpp_exempt_drift kernel paths VPP cannot take that no \
+                 steer-exempt covers (steered = blackholed)",
+                "# TYPE packetframe_vpp_exempt_drift gauge",
+                "packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 0",
+            ]
+        );
+    }
+
+    /// Unaccepted and accepted together: Degraded, the unaccepted named
+    /// first with the remedies, the accepted after; each gauge counts its
+    /// own. A blind read omits both gauges.
+    #[test]
+    fn mixed_v6_findings_degrade_naming_the_unaccepted_first() {
+        let mut s = quiet_snap();
+        s.drift_v6 = crate::drift::V6DriftState {
+            active: true,
+            lines: vec!["2001:db8:200::/48 via wg0 (table 254)".into()],
+            routes: 1,
+            accepted: vec![
+                "2001:db8:100::/48 via tun0 (table 52)".into(),
+                "3 route(s) via nexthop objects".into(),
+            ],
+            accepted_routes: 4,
+            ..Default::default()
+        };
+        let row = v6_row(&s).expect("the v6 row");
+        assert_eq!(row.state, HealthState::Degraded);
+        let msg = row.message.unwrap_or_default();
+        let open = msg
+            .find("2001:db8:200::/48 via wg0")
+            .expect("unaccepted named");
+        let accepted = msg
+            .find("accepted: 2001:db8:100::/48")
+            .expect("accepted named");
+        assert!(open < accepted, "{msg}");
+        assert!(msg.contains("3 route(s) via nexthop objects"), "{msg}");
+        assert_ne!(s.report().overall, HealthState::Healthy);
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(m.contains("packetframe_vpp_exempt_drift_v6{module=\"vpp-offload\"} 1"));
+        assert!(m.contains("packetframe_vpp_exempt_drift_v6_accepted{module=\"vpp-offload\"} 4"));
+
+        s.drift_v6.unreadable = Some("netlink recv: EIO".into());
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(!m.contains("packetframe_vpp_exempt_drift_v6"), "{m}");
+    }
+
+    /// An accept that matches nothing is an informational line on a
+    /// Healthy row — never a degradation — so a stale accept is seen
+    /// before it silently accepts whatever appears under it next.
+    #[test]
+    fn an_unmatched_accept_is_named_without_degrading() {
+        let mut s = quiet_snap();
+        s.drift_v6 = crate::drift::V6DriftState {
+            active: true,
+            unmatched_accepts: vec!["2001:db8:900::/48".into()],
+            ..Default::default()
+        };
+        let row = v6_row(&s).expect("a stale accept is reported");
+        assert_eq!(row.state, HealthState::Healthy);
+        let msg = row.message.unwrap_or_default();
+        assert!(
+            msg.contains("drift-accept6 2001:db8:900::/48 matches nothing"),
+            "{msg}"
+        );
+        assert_eq!(s.report().overall, HealthState::Healthy);
+        assert!(render_metrics(&s, "vpp-offload")
+            .contains("packetframe_vpp_exempt_drift_v6_accepted{module=\"vpp-offload\"} 0"));
     }
 
     /// Placement: all placed = no subsystem row (nothing for an operator
@@ -5509,6 +5704,52 @@ mod tests {
         let m = render_metrics(&s, "vpp-offload");
         assert!(
             m.contains("packetframe_vpp_null_drops{module=\"vpp-offload\"} 117015"),
+            "{m}"
+        );
+    }
+
+    /// The glean gauges: absent until sampled, one series per family,
+    /// the reply gauge absent on its own when only its read failed —
+    /// and never a health input.
+    #[test]
+    fn the_glean_gauges_are_absent_until_sampled_and_informational() {
+        let mut s = snap_of(
+            &Supervisor::new(),
+            &ledger_with(0, 0, 0),
+            ApiHealth::NoProcess,
+            FibSync::NeverVerified,
+            Vec::new(),
+        );
+        let before = format!("{:?}", s.report());
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(!m.contains("packetframe_vpp_glean"), "{m}");
+        assert!(!m.contains("packetframe_vpp_arp_replies_sent"), "{m}");
+        s.neighbour_counters = Some(crate::engine::NeighbourCounters {
+            arp_requests_sent: 1380,
+            arp_requests_throttled: 97,
+            ns_sent: 4,
+            ns_throttled: 2,
+            arp_replies_sent: None,
+        });
+        let m = render_metrics(&s, "vpp-offload");
+        for line in [
+            "packetframe_vpp_glean_sent{module=\"vpp-offload\",family=\"ipv4\"} 1380",
+            "packetframe_vpp_glean_sent{module=\"vpp-offload\",family=\"ipv6\"} 4",
+            "packetframe_vpp_glean_throttled{module=\"vpp-offload\",family=\"ipv4\"} 97",
+            "packetframe_vpp_glean_throttled{module=\"vpp-offload\",family=\"ipv6\"} 2",
+        ] {
+            assert!(m.contains(line), "missing {line}:\n{m}");
+        }
+        assert!(!m.contains("packetframe_vpp_arp_replies_sent"), "{m}");
+        assert_eq!(
+            format!("{:?}", s.report()),
+            before,
+            "metrics only, never a health input"
+        );
+        s.neighbour_counters.as_mut().unwrap().arp_replies_sent = Some(3);
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(
+            m.contains("packetframe_vpp_arp_replies_sent{module=\"vpp-offload\"} 3"),
             "{m}"
         );
     }

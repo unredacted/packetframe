@@ -59,10 +59,15 @@ use crate::vpp_api::{Transport, TransportError};
 
 /// `IP_API_NEIGHBOR_FLAG_STATIC` from ip_neighbor.api.
 ///
-/// Static because VPP cannot refresh a neighbour on this platform: MCAM
-/// rules match IP fields, so an ARP or ND frame can never be steered to
-/// it. An ageing dynamic entry would silently become an unresolved
-/// adjacency and blackhole every route through that nexthop.
+/// Static because VPP cannot refresh a neighbour on this platform. It
+/// can SEND a probe, but the answer is a unicast ARP reply or NA to the
+/// MAC it sent from — the kernel bridge's (on a BVI) or the kernel
+/// port's — and MCAM rules match IP fields and never divert ICMPv6, so
+/// that answer lands on the kernel, not in VPP. (VPP does receive
+/// broadcast ARP — every VF on the LMAC gets a copy — but nothing in
+/// that stream answers a probe.) An ageing dynamic entry would silently
+/// become an unresolved adjacency and blackhole every route through
+/// that nexthop.
 pub const IP_NEIGHBOR_STATIC: u8 = 1;
 
 /// How long to wait for the handshake on a connect attempt.
@@ -134,10 +139,14 @@ pub trait RouteSource {
     ///
     /// The MAC is not optional here. VPP is started without `linux-cp`
     /// (it cannot pair kernel-owned PFs), so it begins with an empty
-    /// neighbour table, and MCAM rules match IP fields so an ARP frame
-    /// can never be steered into it — VPP physically cannot learn a
-    /// neighbour. Every adjacency has to be programmed statically from
-    /// this snapshot.
+    /// neighbour table, and it cannot fill it for nexthops: it only sends
+    /// ARP from its glean nodes, inside a `local-route` attached prefix,
+    /// and even there the unicast reply goes to a kernel-owned MAC — MCAM
+    /// rules match IP fields, so a unicast ARP frame is never steered to
+    /// VPP. The broadcast ARP it does receive (its VF gets a copy of
+    /// every broadcast) teaches it nothing it could forward with.
+    /// Every adjacency has to be programmed statically from this
+    /// snapshot.
     ///
     /// Getting this wrong is a silent blackhole of the worst kind: route
     /// installs are acknowledged, readback verification passes (it checks
@@ -474,6 +483,96 @@ pub(crate) fn parse_null_drops(text: &str) -> u64 {
         .sum()
 }
 
+/// VPP's own neighbour-discovery transmit counters: what its glean
+/// nodes and its `arp-reply` node have put on the wire, cumulative since
+/// the process started. Metrics only — informational, never a health
+/// input (runbook, "Glean and ARP counters").
+///
+/// Glean is VPP resolving a host inside a `local-route` /
+/// `local-route6` attached prefix that it holds no static neighbour
+/// for: `ip4-glean` broadcasts an ARP request (sourced from the
+/// loopback's address — the attached path has no connected prefix),
+/// `ip6-glean` multicasts a neighbour solicitation from the interface's
+/// link-local. Both leave through the BVI, flood every member on that
+/// VLAN, and bypass the kernel-side `guard` policer entirely.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NeighbourCounters {
+    /// `ip4-glean` "ARP requests sent".
+    pub arp_requests_sent: u64,
+    /// `ip4-glean` "ARP requests throttled" — suppressed by VPP's
+    /// per-destination, per-worker 1 ms throttle.
+    pub arp_requests_throttled: u64,
+    /// `ip6-glean` "neighbor solicitations sent".
+    pub ns_sent: u64,
+    /// `ip6-glean` "throttled".
+    pub ns_throttled: u64,
+    /// ARP replies actually transmitted, summed over every interface's
+    /// `show ip neighbor-stats` `arp: tx:[reply:N]`. NOT `arp-reply`'s
+    /// "ARP replies sent" error row: in v26.06 a request dropped before
+    /// its error code is reassigned is booked under that same row, so it
+    /// over-counts by every such drop. `None` until that read's tick
+    /// has come round, or when it failed or did not parse.
+    pub arp_replies_sent: Option<u64>,
+}
+
+/// The glean rows of `show errors` (non-verbose, so VPP has already
+/// summed each counter across workers). The node is column two and the
+/// reason is everything after it, matched exactly or followed by the
+/// severity column — the reason strings are v26.06's, from the
+/// vendored `ip_neighbor.api.json` counter definitions. Malformed rows
+/// are skipped, the null-drop parser's rule.
+pub(crate) fn parse_glean_counters(text: &str) -> NeighbourCounters {
+    let mut c = NeighbourCounters::default();
+    for line in text.lines() {
+        let mut tok = line.split_whitespace();
+        let Some(count) = tok.next().and_then(|t| t.parse::<u64>().ok()) else {
+            continue;
+        };
+        let Some(node) = tok.next() else { continue };
+        let reason = tok.collect::<Vec<_>>().join(" ");
+        let is = |want: &str| {
+            reason == want
+                || reason
+                    .strip_prefix(want)
+                    .is_some_and(|rest| rest.starts_with(' '))
+        };
+        match node {
+            "ip4-glean" if is("ARP requests sent") => c.arp_requests_sent += count,
+            "ip4-glean" if is("ARP requests throttled") => c.arp_requests_throttled += count,
+            "ip6-glean" if is("neighbor solicitations sent") => c.ns_sent += count,
+            "ip6-glean" if is("throttled") => c.ns_throttled += count,
+            _ => {}
+        }
+    }
+    c
+}
+
+/// Sum the transmitted ARP replies out of `show ip neighbor-stats`,
+/// whose per-interface line in v26.06 is
+/// `    arp: rx:[reply:N request:N gratuitous:N ] tx:[reply:N ...]`
+/// (`format_ip_neighbor_counters`). `None` when no `arp:` line parsed —
+/// an answer that is not this shape is unknown, not zero.
+pub(crate) fn parse_arp_replies_sent(text: &str) -> Option<u64> {
+    let mut total = None;
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("arp:") else {
+            continue;
+        };
+        let Some((_, tx)) = rest.split_once("tx:[") else {
+            continue;
+        };
+        let tx = tx.split(']').next().unwrap_or("");
+        let reply = tx
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("reply:"))
+            .and_then(|n| n.parse::<u64>().ok());
+        if let Some(n) = reply {
+            *total.get_or_insert(0) += n;
+        }
+    }
+    total
+}
+
 impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -546,6 +645,13 @@ pub struct ConvergenceEngine {
     /// against fast-path's `local-prefix` (`local-prefix6` for a
     /// `local-route6`) for the kernel device. Both families.
     local_routes: Vec<crate::LocalRoute>,
+    /// Where each local route's attached route sits in THIS VPP, keyed by
+    /// the prefix as sent: the interface VPP acknowledged it on, or
+    /// `None` once a send for it failed without an answer VPP can be
+    /// trusted on. Absent until attach first sends it; cleared with the
+    /// process. What [`Self::rehome_attached_routes`] compares against the
+    /// interface the route belongs on now.
+    attached_at: std::collections::HashMap<IpPrefix, Option<u32>>,
     /// Mirror prefixes currently suppressed by a `local-route` — kept
     /// as a set so health can report a count that means "routes the
     /// mirror carries that VPP deliberately does not", not a
@@ -749,6 +855,16 @@ pub struct ConvergenceEngine {
     /// Metrics only; nothing here feeds a forwarding or supervision
     /// decision.
     null_drops: Option<u64>,
+    /// VPP's glean counters from the same `show errors` sample, absent
+    /// by the same rule. `arp_replies_sent` inside it is always `None`
+    /// here; the accessor fills it from [`Self::arp_replies_sent`].
+    /// Metrics only.
+    neighbour_counters: Option<NeighbourCounters>,
+    /// Transmitted ARP replies from `show ip neighbor-stats`, read on
+    /// the OTHER sample ticks (see [`Self::sample_error_counters`]).
+    arp_replies_sent: Option<u64>,
+    /// Which read the next [`Self::sample_error_counters`] call makes.
+    sample_neighbor_stats_next: bool,
 
     /// Advanced once per verify so each pass samples a different set.
     ///
@@ -778,6 +894,7 @@ impl ConvergenceEngine {
             transport: None,
             ports,
             local_routes: Vec::new(),
+            attached_at: std::collections::HashMap::new(),
             shadowed: HashSet::new(),
             self_addrs: HashSet::new(),
             self_nets: Vec::new(),
@@ -820,6 +937,9 @@ impl ConvergenceEngine {
             #[cfg(test)]
             test_dead_members: None,
             null_drops: None,
+            neighbour_counters: None,
+            arp_replies_sent: None,
+            sample_neighbor_stats_next: false,
             verify_seed: 0,
         }
     }
@@ -1012,7 +1132,11 @@ impl ConvergenceEngine {
         self.ensure_bridges()?;
         // And a new subif or BVI gets ip6 before any v6 neighbour or route
         // is placed on it — also nothing sent when nothing is new.
-        self.ensure_ip6()
+        self.ensure_ip6()?;
+        // A BVI built just now, or a VLAN that turned untagged or tagged,
+        // changes where a local route's attached route belongs. After
+        // ip6, which a v6 attached route's new interface needs first.
+        self.rehome_attached_routes()
     }
 
     /// Take the members' untagged VLANs from the kernel bridge, and hand
@@ -1848,36 +1972,79 @@ impl ConvergenceEngine {
         self.null_drops
     }
 
-    /// Sample VPP's error counters and cache the null-node total.
+    /// The last sampled glean / ARP-reply counters, if any. Present once
+    /// `show errors` has answered; `arp_replies_sent` inside it fills in
+    /// from the next tick's `show ip neighbor-stats`.
+    pub fn neighbour_counters(&self) -> Option<NeighbourCounters> {
+        self.neighbour_counters.map(|c| NeighbourCounters {
+            arp_replies_sent: self.arp_replies_sent,
+            ..c
+        })
+    }
+
+    /// Sample VPP's error counters — exactly ONE `cli_inband` round trip
+    /// per call, alternating: `show errors` (the null-node total and the
+    /// glean rows) on one call, `show ip neighbor-stats` (the real
+    /// ARP-reply count) on the next.
     ///
-    /// Metrics only, so every failure degrades the gauge to absent and
+    /// One read, never two, because this runs on the supervision thread
+    /// inside `Runtime::status()`, and each read may take the whole
+    /// socket deadline. Two back to back could cost twice that — enough
+    /// to exhaust the steering budget and have a valid reconfigure
+    /// withdrawn as timed out (review finding). Alternating keeps the
+    /// worst case this call adds to a tick at what the null-drop sample
+    /// alone cost; the runtime ticks it twice as often so each read
+    /// keeps its old cadence.
+    ///
+    /// Metrics only, so every failure degrades the gauges to absent and
     /// none escalates: a counter read must not be able to restart a
     /// forwarding VPP. A transport error still drops the socket — the
     /// reply may be partly read, and every other path here refuses to
     /// leave a poisoned stream looking healthy to `api_ready`.
-    pub fn sample_null_drops(&mut self) {
+    pub fn sample_error_counters(&mut self) {
+        let neighbor_stats = self.sample_neighbor_stats_next;
+        self.sample_neighbor_stats_next = !neighbor_stats;
         self.arm_timeout();
         let Some(t) = self.transport.as_mut() else {
             self.null_drops = None;
+            self.neighbour_counters = None;
+            self.arp_replies_sent = None;
             return;
         };
-        match t.request::<CliInband, CliInbandReply>(CliInband {
+        let cmd = if neighbor_stats {
+            "show ip neighbor-stats"
+        } else {
+            "show errors"
+        };
+        let reply = match t.request::<CliInband, CliInbandReply>(CliInband {
             context: 0,
-            cmd: "show errors".into(),
+            cmd: cmd.into(),
         }) {
-            Ok(r) if r.retval == 0 => self.null_drops = Some(parse_null_drops(&r.reply)),
+            Ok(r) if r.retval == 0 => Some(r.reply),
             Ok(r) => {
                 tracing::debug!(
                     retval = r.retval,
-                    "`show errors` refused; the null-drop gauge goes absent"
+                    "`{cmd}` refused; the gauges it feeds go absent"
                 );
-                self.null_drops = None;
+                None
             }
             Err(e) => {
-                tracing::debug!(error = %e, "`show errors` failed; the null-drop gauge goes absent");
+                tracing::debug!(error = %e, "`{cmd}` failed; the error-counter gauges go absent");
                 self.disconnect();
+                // All of them, not just this read's: the runtime samples
+                // only while connected, so the other read's last value
+                // would otherwise sit there looking current.
                 self.null_drops = None;
+                self.neighbour_counters = None;
+                self.arp_replies_sent = None;
+                return;
             }
+        };
+        if neighbor_stats {
+            self.arp_replies_sent = reply.as_deref().and_then(parse_arp_replies_sent);
+        } else {
+            self.null_drops = reply.as_deref().map(parse_null_drops);
+            self.neighbour_counters = reply.as_deref().map(parse_glean_counters);
         }
     }
 
@@ -2325,8 +2492,10 @@ impl ConvergenceEngine {
     }
 
     /// Install one attached route per `local-route` and `local-route6`,
-    /// straight onto the subif — deliberately OUTSIDE the pending/ledger
-    /// path.
+    /// straight onto the interface its VLAN is delivered through
+    /// ([`Self::attached_target`]) — deliberately OUTSIDE the
+    /// pending/ledger path. That interface can change while VPP runs;
+    /// [`Self::rehome_attached_routes`] follows it.
     ///
     /// These are module-owned topology, not mirror state: the resync
     /// diff withdraws whatever the ledger holds that the source no
@@ -2340,14 +2509,24 @@ impl ConvergenceEngine {
     /// The nexthop-less NORMAL path on the subif is VPP's attached
     /// route: dst inside the prefix resolves via the interface, with
     /// per-host adjacencies coming from the mirrored static
-    /// neighbours (VPP never ARPs; a never-seen host drops here where
-    /// the kernel would ARP-queue — documented, service hosts are
-    /// static).
+    /// neighbours.
     ///
-    /// **For a `local-route6` that drop is not the end of it.** A packet
-    /// for a host VPP holds no neighbour for takes the attached route's
-    /// glean adjacency, and VPP v26.06's `ip6-glean` solicits the host:
-    /// the NS is sourced from the interface's LINK-LOCAL, unconditionally
+    /// **A host VPP holds no neighbour for is gleaned, in both
+    /// families.** The packet takes the attached route's glean
+    /// adjacency and is dropped (glean does not queue — where the
+    /// kernel would ARP-queue it), and VPP resolves the host itself.
+    ///
+    /// IPv4: `ip4-glean` broadcasts an ARP request. Its sender address
+    /// is the loopback's (`loopback-address`), because the attached
+    /// path is nexthop-less on an unnumbered interface with no
+    /// connected prefix to pick a source from; its sender MAC is the
+    /// interface's — the kernel bridge's on a BVI. So the host's
+    /// unicast reply lands on the kernel bridge (MCAM steers IP, never
+    /// 0x0806), where neigh-snoop learns it, fast-path's `local-prefix`
+    /// registers it, and it comes back here as a static neighbour.
+    ///
+    /// IPv6: VPP v26.06's `ip6-glean` solicits the host.
+    /// The NS is sourced from the interface's LINK-LOCAL, unconditionally
     /// (`ip6_discover_neighbor_inline`), so no global address or
     /// connected prefix is needed and none is configured — only ip6
     /// enabled on the interface, which [`Self::ensure_ip6`] did before
@@ -2356,39 +2535,21 @@ impl ConvergenceEngine {
     /// own, so the host's reply — a unicast NA, ICMPv6, which is never
     /// diverted — lands on the kernel bridge. There neigh-snoop learns it
     /// and installs it `STALE`, fast-path's `local-prefix6` registers it,
-    /// and it comes back here as a static neighbour. The triggering packet
-    /// is dropped either way (glean does not queue): the first-packet cost
-    /// IPv4 pays too.
+    /// and it comes back here as a static neighbour.
     ///
-    /// VPP rate-limits the solicitations itself (`nd_throttle`): at most
-    /// one per (destination, interface) per millisecond per worker, the
-    /// rest counted as `ip6-glean` `throttled`. A stream to a silent
-    /// address therefore solicits up to ~1000 times a second per worker;
-    /// the runbook says what that costs and how to see it.
+    /// VPP rate-limits glean itself (`arp_throttle` / `nd_throttle`): at
+    /// most one request per (destination, interface) per millisecond per
+    /// worker, the rest counted as `throttled`. A stream to a silent
+    /// address therefore gleans up to ~1000 times a second PER WORKER —
+    /// the throttle state is per worker and RSS spreads one address's
+    /// flows across them, so ~workers x 1000/s in aggregate, far above
+    /// the kernel's ~3/s — out the BVI, flooding every member
+    /// of that VLAN, and past the kernel-side `guard` policer, which
+    /// only sees frames the kernel transmits. The counters are exported
+    /// ([`NeighbourCounters`]); the runbook says what normal looks like.
     fn install_attached_routes(&mut self) -> Result<(), EngineError> {
-        if self.local_routes.is_empty() {
-            return Ok(());
-        }
-        let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
-        for lr in &self.local_routes {
-            // A bridged VLAN delivers through its BVI (the bridge's MAC,
-            // hosts behind any member); a trunk's untagged VLAN with no
-            // BVI through the VF, which the bridge sends it bare on; a
-            // plain port's VLAN through the subif.
-            let bvi = crate::sink::NexthopTarget::Bvi { vlan: lr.vlan };
-            let target = if self.port_index.get(&bvi).is_some() {
-                bvi
-            } else if self.nexthops.is_untagged(&lr.port, lr.vlan) {
-                crate::sink::NexthopTarget::Vf {
-                    port: lr.port.clone(),
-                }
-            } else {
-                crate::sink::NexthopTarget::Subif {
-                    port: lr.port.clone(),
-                    vlan: lr.vlan,
-                }
-            };
-            let Some(sw_if_index) = self.port_index.get(&target) else {
+        for lr in self.local_routes.clone() {
+            let Some(sw_if_index) = self.attached_target(&lr) else {
                 // Config guarantees the port declares this vlan (or
                 // carries it, for `vlans all`), and attach just created
                 // every subif — a miss here is an ordering bug, not an
@@ -2399,43 +2560,10 @@ impl ConvergenceEngine {
                     detail: format!("no subif index for {}.{}", lr.port, lr.vlan),
                 });
             };
-            let mut path = FibPath {
-                sw_if_index,
-                table_id: 0,
-                rpf_id: 0,
-                weight: 1,
-                preference: 0,
-                r#type: FIB_API_PATH_TYPE_NORMAL,
-                flags: FIB_API_PATH_FLAG_NONE,
-                proto: if lr.prefix.is_v6() {
-                    FIB_API_PATH_NH_PROTO_IP6
-                } else {
-                    FIB_API_PATH_NH_PROTO_IP4
-                },
-                nh: Default::default(),
-                n_labels: 0,
-                label_stack: Default::default(),
-            };
-            // Zero nexthop = attached: resolve via the interface.
-            path.nh = Default::default();
-            let reply: IpRouteAddDelReply = t.request(IpRouteAddDel {
-                context: 0,
-                is_add: true,
-                is_multipath: false,
-                route: IpRoute {
-                    table_id: 0,
-                    stats_index: 0,
-                    prefix: crate::fib_sync::to_prefix(lr.prefix.network()),
-                    n_paths: 1,
-                    paths: vec![path],
-                },
-            })?;
-            if reply.retval != 0 {
-                return Err(EngineError::AttachedRouteFailed {
-                    prefix: lr.prefix.to_string(),
-                    detail: format!("retval {}", reply.retval),
-                });
-            }
+            // A REPLACE: whatever this prefix held — an adopted VPP's
+            // route on an interface it no longer belongs on — leaves as
+            // the one path lands, in one message.
+            self.send_attached(&lr, sw_if_index)?;
             tracing::info!(
                 prefix = %lr.prefix,
                 port = %lr.port,
@@ -2444,6 +2572,152 @@ impl ConvergenceEngine {
                 "attached route installed — VPP delivers this prefix itself"
             );
         }
+        Ok(())
+    }
+
+    /// The interface `lr`'s attached route belongs on as things stand: a
+    /// bridged VLAN delivers through its BVI (the bridge's MAC, hosts
+    /// behind any member); a trunk's untagged VLAN with no BVI through the
+    /// VF, which the bridge sends it bare on; a plain port's VLAN through
+    /// the subif. `None` when that interface does not exist.
+    ///
+    /// The BVI only when it is the BVI of `lr`'s own bridge — the one its
+    /// port is enslaved to, which is how [`Self::ensure_bridges`] assigns
+    /// domains. A second VLAN-aware bridge reusing the vid gets no BVI of
+    /// its own, and borrowing the first bridge's would deliver its prefix
+    /// into another L2 domain; it stays on its subif or VF, exactly as the
+    /// resolver keeps its neighbours off that BVI
+    /// ([`crate::sink::NexthopMap::set_bvi`]).
+    fn attached_target(&self, lr: &crate::LocalRoute) -> Option<u32> {
+        let bvi = crate::sink::NexthopTarget::Bvi { vlan: lr.vlan };
+        let own_bvi = self.port_index.get(&bvi).is_some()
+            && self
+                .nexthops
+                .bvi_bridge(lr.vlan)
+                .is_some_and(|owner| self.topology.master_of(&lr.port).as_deref() == Some(owner));
+        let target = if own_bvi {
+            bvi
+        } else if self.nexthops.is_untagged(&lr.port, lr.vlan) {
+            crate::sink::NexthopTarget::Vf {
+                port: lr.port.clone(),
+            }
+        } else {
+            crate::sink::NexthopTarget::Subif {
+                port: lr.port.clone(),
+                vlan: lr.vlan,
+            }
+        };
+        self.port_index.get(&target)
+    }
+
+    /// Put every attached route whose interface has changed since it was
+    /// installed onto the one it belongs on now
+    /// ([`Self::attached_target`]).
+    ///
+    /// Attach places each route on the interface that exists at that
+    /// moment, and a bridged VLAN's BVI may not: [`Self::ensure_bridges`]
+    /// skips a VLAN the router has no L3 device on yet, or whose members
+    /// are not enslaved to the bridge yet. Its route then lands on the
+    /// member's subif, and when the domain and BVI appear at runtime the
+    /// connected subnet would stay bound to that one trunk — hosts behind
+    /// every other member, and the glean that finds them, sent the wrong
+    /// way — until a restart. The same holds for a VLAN that turns
+    /// untagged or tagged under a route on the VF or subif.
+    ///
+    /// A move is the replacing add attach sends: VPP swaps the prefix's
+    /// whole path set for the one path in one update, so the prefix is
+    /// never pathless and never holds two. A send that fails in any way —
+    /// refused, or its reply lost with VPP perhaps having applied it —
+    /// leaves the route recorded as unconfirmed, and the next refresh
+    /// sends it again wherever it belongs then, even if that is where it
+    /// was last confirmed. Nothing is sent for a confirmed route already
+    /// where it belongs, one attach has not installed on this VPP yet
+    /// (attach owns the first install), or one whose right interface does
+    /// not exist.
+    fn rehome_attached_routes(&mut self) -> Result<(), EngineError> {
+        for lr in self.local_routes.clone() {
+            let prefix = lr.prefix.network();
+            let Some(&from) = self.attached_at.get(&prefix) else {
+                continue;
+            };
+            let Some(to) = self.attached_target(&lr) else {
+                continue;
+            };
+            if from == Some(to) {
+                continue;
+            }
+            self.send_attached(&lr, to)?;
+            tracing::info!(
+                prefix = %lr.prefix,
+                port = %lr.port,
+                vlan = lr.vlan,
+                from_sw_if_index = ?from,
+                to_sw_if_index = to,
+                "attached route moved to the interface its VLAN is delivered through now"
+            );
+        }
+        Ok(())
+    }
+
+    /// Put `lr`'s attached route on `sw_if_index` alone: one nexthop-less
+    /// NORMAL path, which VPP resolves via the interface, sent as a
+    /// REPLACING add (`is_multipath` false) so whatever paths the prefix
+    /// held go in the same update. Recorded in `attached_at` — the
+    /// interface once acknowledged, unconfirmed on any failure.
+    fn send_attached(
+        &mut self,
+        lr: &crate::LocalRoute,
+        sw_if_index: u32,
+    ) -> Result<(), EngineError> {
+        let prefix = lr.prefix.network();
+        let path = FibPath {
+            sw_if_index,
+            table_id: 0,
+            rpf_id: 0,
+            weight: 1,
+            preference: 0,
+            r#type: FIB_API_PATH_TYPE_NORMAL,
+            flags: FIB_API_PATH_FLAG_NONE,
+            proto: if lr.prefix.is_v6() {
+                FIB_API_PATH_NH_PROTO_IP6
+            } else {
+                FIB_API_PATH_NH_PROTO_IP4
+            },
+            // Zero nexthop = attached: resolve via the interface.
+            nh: Default::default(),
+            n_labels: 0,
+            label_stack: Default::default(),
+        };
+        let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+        // In doubt from the moment it is written: a lost reply may still
+        // have been applied.
+        self.attached_at.insert(prefix, None);
+        let reply: IpRouteAddDelReply = match t.request(IpRouteAddDel {
+            context: 0,
+            is_add: true,
+            is_multipath: false,
+            route: IpRoute {
+                table_id: 0,
+                stats_index: 0,
+                prefix: crate::fib_sync::to_prefix(prefix),
+                n_paths: 1,
+                paths: vec![path],
+            },
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                // The reply may still be on the stream; see `attach_devices`.
+                self.disconnect();
+                return Err(e.into());
+            }
+        };
+        if reply.retval != 0 {
+            return Err(EngineError::AttachedRouteFailed {
+                prefix: lr.prefix.to_string(),
+                detail: format!("on sw_if_index {sw_if_index}: retval {}", reply.retval),
+            });
+        }
+        self.attached_at.insert(prefix, Some(sw_if_index));
         Ok(())
     }
 
@@ -2510,7 +2784,7 @@ impl ConvergenceEngine {
         // static flag): an entry with a stale MAC must be replaced —
         // that walk is the price of correctness — and a dynamic entry
         // must be replaced with a static one, because VPP can never
-        // refresh it here (MCAM cannot steer ARP).
+        // refresh it here (a probe's unicast reply lands on the kernel).
         let existing = self.dump_static_neighbours()?;
         // Seed the acknowledged ledger from VPP's own answer, so the
         // DELTA path's skip covers adopted entries too — not only ones
@@ -2696,7 +2970,8 @@ impl ConvergenceEngine {
     /// the steady-state delta path — and a second hand-written copy of
     /// this is how the tiers end up disagreeing about a flag. The static
     /// bit especially: VPP must never age these out and never ARP to
-    /// refresh them, because it cannot receive the reply.
+    /// refresh them, because the unicast reply goes to a kernel-owned MAC
+    /// and never reaches VPP.
     fn send_neighbour(
         &mut self,
         ip: IpAddr,
@@ -3032,7 +3307,7 @@ impl ConvergenceEngine {
                 // `set_device` alone makes `resolve` return `Some`, so
                 // routes through this nexthop classify as resolvable and
                 // install — while VPP, which runs without linux-cp and
-                // can never ARP for the adjacency, has nothing to send
+                // cannot resolve a nexthop adjacency itself, has nothing to send
                 // them to. Verification would not catch it either: it
                 // checks a route exists on an interface we own,
                 // deliberately not that its adjacency resolves. That is
@@ -3503,6 +3778,9 @@ impl ConvergenceEngine {
         // The counters died with the process; a stale total would read
         // as "no new drops" across a restart that reset it to zero.
         self.null_drops = None;
+        self.neighbour_counters = None;
+        self.arp_replies_sent = None;
+        self.sample_neighbor_stats_next = false;
         self.port_index = PortIndex::default();
         // The state file's recorded indices belong to the dead instance
         // too. Keeping them meant the replacement process was handed
@@ -3518,6 +3796,8 @@ impl ConvergenceEngine {
         self.loop_index = None;
         // And the address read back on it.
         self.icmp6_source = None;
+        // The attached routes died with the FIB they sat in.
+        self.attached_at.clear();
         // The neighbour ledger describes the dead instance's table.
         self.neighbours_installed.clear();
         self.moved_from.clear();
@@ -4250,6 +4530,52 @@ mod tests {
                     not-a-count          null-node             garbage                    error\n";
         assert_eq!(parse_null_drops(text), 117_027);
         assert_eq!(parse_null_drops(""), 0);
+    }
+
+    /// Glean rows by node AND exact reason: `ip4-arp` shares the
+    /// counter set and must not be summed in, `ip6-glean`'s bare
+    /// "throttled" must not match a longer reason, and the severity
+    /// column (or its absence) must not matter.
+    #[test]
+    fn glean_parsing_matches_node_and_reason() {
+        let text =
+            "   Count                    Node                  Reason               Severity\n\
+                    1380                 ip4-glean       ARP requests sent              info\n\
+                    20                   ip4-glean       ARP requests sent\n\
+                    97                   ip4-glean       ARP requests throttled         info\n\
+                    555                  ip4-arp         ARP requests sent              info\n\
+                    4                    ip6-glean       neighbor solicitations sent    info\n\
+                    2                    ip6-glean       throttled                      info\n\
+                    9                    ip6-glean       throttled-ish                  info\n\
+                    7                    ip6-glean       no buffers                     error\n\
+                    117015               null-node       blackholed packets             error\n";
+        assert_eq!(
+            parse_glean_counters(text),
+            NeighbourCounters {
+                arp_requests_sent: 1400,
+                arp_requests_throttled: 97,
+                ns_sent: 4,
+                ns_throttled: 2,
+                arp_replies_sent: None,
+            }
+        );
+        assert_eq!(parse_glean_counters(""), NeighbourCounters::default());
+    }
+
+    /// `show ip neighbor-stats`: tx replies summed over interfaces, the
+    /// rx half and the `nd:` lines ignored, and an answer with no
+    /// `arp:` line unknown rather than zero.
+    #[test]
+    fn arp_reply_parsing_sums_tx_replies() {
+        let text = "  loop0\n    arp: rx:[reply:0 request:0 gratuitous:0 ] tx:[reply:2 request:0 gratuitous:0 ]\n    \
+                    nd:  rx:[reply:0 request:0 gratuitous:0 ] tx:[reply:50 request:0 gratuitous:0 ]\n  \
+                    bvi100\n    arp: rx:[reply:70 request:900 gratuitous:1 ] tx:[reply:5 request:0 gratuitous:0 ]\n";
+        assert_eq!(parse_arp_replies_sent(text), Some(7));
+        assert_eq!(parse_arp_replies_sent(""), None);
+        assert_eq!(
+            parse_arp_replies_sent("unknown input `neighbor-stats'"),
+            None
+        );
     }
 
     /// A restored cable must not read as dark forever.

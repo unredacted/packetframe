@@ -116,6 +116,10 @@ pub struct Attached {
     /// publish once the attach has succeeded. `None` when the interrupt
     /// layout could not be read (already warned).
     pub control_plane: Option<ControlPlane>,
+    /// The `drift-accept6` set the supervision loop reads, for
+    /// `reconfigure` to publish reloads into directly
+    /// ([`crate::drift::DriftAccepts6`]).
+    pub drift_accepts6: Arc<crate::drift::DriftAccepts6>,
 }
 
 /// The MACs this member holds: its own PF address as **primary**, plus
@@ -183,8 +187,13 @@ pub(crate) fn iommu_active(dir: &Path) -> std::io::Result<Option<std::ffi::OsStr
     }
 }
 
-/// VPP's arp node answers requests targeting its loopback's address,
-/// sourcing the member VF's MAC. If that address is a LIVE kernel
+/// VPP's arp node answers requests targeting its loopback's address —
+/// the only address it answers for — sourcing the MAC of the interface
+/// the request arrived on (the kernel bridge's, on a BVI). Broadcast
+/// ARP does reach it: every VF on the LMAC gets a copy. And since every
+/// interface is unnumbered to the loopback, `arp_unnumbered` waives the
+/// sender-subnet check, so it answers on ANY bridged VLAN — an IX VLAN
+/// included — if anyone there asks. If that address is a LIVE kernel
 /// address — the gateway, in the reference incident — two responders
 /// fight over it and hosts learn whichever answered last. Measured on
 /// the primary (w22, 2026-08-14): loop0 held 192.0.2.1, the
@@ -883,6 +892,7 @@ pub fn bring_up(
         &cfg.steer_exempts,
         held_steering,
         cfg.families(),
+        Arc::new(crate::drift::DriftAccepts6::new(cfg.drift_accepts6.clone())),
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -961,6 +971,7 @@ fn finish(
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
     held_steering: crate::SteeringInputs,
     families: FamilyPolicy,
+    drift_accepts6: Arc<crate::drift::DriftAccepts6>,
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -1361,6 +1372,7 @@ fn finish(
         .unwrap_or(1500)
         .max(1500);
     let handback_wanted = crate::handback::plans_divert_v6(&held_steering.targets);
+    let loop_accepts6 = drift_accepts6.clone();
     let factory: LoopFactory = Box::new(move || {
         // What VPP can egress, for the exemption tripwire: the member
         // ports, the kernel bridges `local-route` and `local-route6`
@@ -1457,6 +1469,7 @@ fn finish(
         if let Some(handle) = feed_session {
             runtime.feed_session(handle);
         }
+        runtime.drift_accepts6(loop_accepts6);
         // The kernel rx-mode kick — the AllmultiKick doc in `runtime`
         // carries the w6/w8 evidence. Installed unconditionally on
         // Linux: every member VF attach needs it, and the real
@@ -1625,6 +1638,7 @@ fn finish(
         adopted_process,
         held_steering: Some(held_steering),
         control_plane,
+        drift_accepts6,
     })
 }
 
@@ -1800,6 +1814,7 @@ mod completeness_gate_tests {
             trunk_ports: vec![],
             v6_divert: vec![],
             steer_keeps6: vec![],
+            drift_accepts6: vec![],
             v6: false,
             steer_direction: Default::default(),
             loopback_address6: None,

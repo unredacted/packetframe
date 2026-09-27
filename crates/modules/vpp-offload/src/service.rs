@@ -1383,7 +1383,7 @@ fn run_loop(
         // check said Degraded and Prometheus said Healthy, about the same
         // instant, during exactly the failure the patch existed to
         // surface. One condition, one place: `StatusSnapshot`.
-        let snap = StatusSnapshot::observe_parts(
+        let mut snap = StatusSnapshot::observe_parts(
             driver.supervisor(),
             rs.counts,
             rs.pending_ops,
@@ -1422,6 +1422,7 @@ fn run_loop(
             rs.drift_scope_stale,
             rs.drift_v6,
         );
+        snap.neighbour_counters = rs.neighbour_counters;
         let report = snap.report();
         let episode_over = snap.failure_episode_over();
         let published = Published {

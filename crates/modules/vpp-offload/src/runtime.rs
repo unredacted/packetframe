@@ -646,6 +646,10 @@ struct Core {
     /// The IPv6 half of the tripwire, retained by the same rules as the
     /// v4 fields above — see [`crate::drift::V6DriftState`].
     drift_v6: crate::drift::V6DriftState,
+    /// The `drift-accept6` set, read each time a v6 verdict lands. The
+    /// module's handle, so a reload reaches it without this loop — see
+    /// [`crate::drift::DriftAccepts6`] for why it is not in the scope.
+    drift_accepts6: std::sync::Arc<crate::drift::DriftAccepts6>,
     /// Set when a steering change failed PARTWAY and left rules on
     /// the NIC, so neither the old exemption set nor the new one
     /// describes what is installed.
@@ -1557,6 +1561,7 @@ impl Runtime {
                 drift_scope_stale: None,
                 pending_drift_scope: None,
                 drift_v6: crate::drift::V6DriftState::default(),
+                drift_accepts6: std::sync::Arc::default(),
                 steer_missing: 0,
                 steer_stray: 0,
                 steer_audit_error: None,
@@ -1685,6 +1690,12 @@ impl Runtime {
     /// Install the kernel rx-mode kick. The attach wiring installs the
     /// ioctl-backed [`AllmultiKick`] on Linux; everything else keeps
     /// [`NoKick`]. See [`RxModeKick`] for why this exists.
+    /// Attach the `drift-accept6` handle the module publishes reloads
+    /// into. Without one the set is empty: every v6 finding degrades.
+    pub fn drift_accepts6(&self, handle: std::sync::Arc<crate::drift::DriftAccepts6>) {
+        self.core.borrow_mut().drift_accepts6 = handle;
+    }
+
     /// Install the exemption tripwire. Same wiring rule as the others.
     pub fn drift_watch(&self, w: Box<dyn crate::drift::DriftWatch + Send>) {
         self.core.borrow_mut().drift_scanner =
@@ -1907,10 +1918,10 @@ impl Runtime {
             let now = std::time::Instant::now();
             let due = c
                 .last_null_sample
-                .is_none_or(|t| now.duration_since(t) >= NULL_DROPS_EVERY);
+                .is_none_or(|t| now.duration_since(t) >= ERROR_COUNTERS_EVERY);
             if due && c.engine.is_connected() {
                 c.last_null_sample = Some(now);
-                c.engine.sample_null_drops();
+                c.engine.sample_error_counters();
             }
             // A COMPLETED result, if the scanner finished a pass
             // since the last look. Never a scan performed here: this
@@ -1974,7 +1985,10 @@ impl Runtime {
                         // holds a prefix is the engine's to say.
                         let core = &mut *c;
                         let engine = &core.engine;
-                        if let Some(lines) = core.drift_v6.absorb(found.v6, |p| engine.holds_v6(p))
+                        let accepts = core.drift_accepts6.get();
+                        if let Some(lines) =
+                            core.drift_v6
+                                .absorb(found.v6, |p| engine.holds_v6(p), &accepts)
                         {
                             tracing::warn!(
                                 paths = ?lines,
@@ -1982,7 +1996,8 @@ impl Runtime {
                                  IPv6; diverted traffic for them dies in VPP instead of \
                                  reaching the kernel path. No IPv6 exemption exists: fix the \
                                  feed if VPP should carry the route, or keep the traffic \
-                                 with `steer-keep6`, or stop diverting the port"
+                                 with `steer-keep6`, or stop diverting the port, or accept \
+                                 the risk with `drift-accept6`"
                             );
                         }
                     }
@@ -2043,6 +2058,7 @@ impl Runtime {
             shadowed_routes: c.engine.shadowed_routes(),
             kernel_delivered_routes: c.engine.kernel_delivered_routes(),
             null_drops: c.engine.null_drops(),
+            neighbour_counters: c.engine.neighbour_counters(),
             neighbours_unplaced: c
                 .engine
                 .unplaced_neighbours()
@@ -2100,13 +2116,18 @@ impl Runtime {
 /// gone indefinitely.
 const STEER_AUDIT_EVERY: Duration = Duration::from_secs(30);
 
-/// How often to read VPP's error counters for the null-drop gauge.
+/// How often to take one error-counter read (null-drop, glean and
+/// ARP-reply gauges).
 ///
-/// One `cli_inband "show errors"` round trip on the API socket, which
-/// shares VPP's main thread with the route batches — 60 s keeps it
-/// invisible next to the liveness ping while still giving Prometheus a
-/// usable rate.
-const NULL_DROPS_EVERY: Duration = Duration::from_secs(60);
+/// Each tick is ONE `cli_inband` round trip on the API socket, which
+/// shares VPP's main thread with the route batches, alternating between
+/// `show errors` and `show ip neighbor-stats`
+/// ([`crate::engine::ConvergenceEngine::sample_error_counters`]). So a
+/// tick never blocks this thread longer than the single null-drop read
+/// did, and at 30 s each read keeps the 60 s cadence the null-drop
+/// gauge always had — invisible next to the liveness ping while still
+/// giving Prometheus a usable rate.
+const ERROR_COUNTERS_EVERY: Duration = Duration::from_secs(30);
 
 /// How often the bridge-FDB tripwire scans for hosts behind a port
 /// other than their `local-route` declaration. One netlink dump; a
@@ -2294,6 +2315,9 @@ pub struct RuntimeStatus {
     pub kernel_delivered_routes: u64,
     /// Cumulative null-node drops as last sampled, absent until read.
     pub null_drops: Option<u64>,
+    /// VPP's glean and ARP-reply transmit counters as last sampled,
+    /// absent until read. See [`crate::engine::NeighbourCounters`].
+    pub neighbour_counters: Option<crate::engine::NeighbourCounters>,
     /// Bridge neighbours the FDB has never placed behind a member port,
     /// `"<nexthop> on <device>"` each: their routes are unresolvable.
     pub neighbours_unplaced: Vec<String>,

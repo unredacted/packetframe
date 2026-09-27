@@ -44,7 +44,11 @@
 //!
 //! - nothing exempts. There is no v6 address rule to install (the NIC
 //!   cannot match one), so `steer-exempt` does not apply and the remedy
-//!   is the feed, a `steer-keep6`, or dropping `v6-divert`;
+//!   is the feed, a `steer-keep6`, or dropping `v6-divert`. A finding
+//!   the operator has examined and decided to live with can instead be
+//!   ACCEPTED (`drift-accept6`, [`DriftAccepts6`]): still listed, counted
+//!   on its own gauge, degrading nothing — an acknowledgement, not a
+//!   remedy, so there is no v4 form;
 //! - a kernel route whose owned-device hops are link-local is judged by
 //!   what VPP HOLDS, not by its hops: zebra installs the `fe80::` hop
 //!   while the feed also carries a global one VPP installs through, and
@@ -714,11 +718,27 @@ fn candidate_hops<'a>(
 /// settles them against the ledger when the result lands.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct V6Scan {
-    /// Findings that stand whatever VPP holds: paths, and the
-    /// nexthop-object summary. Sorted.
+    /// Path findings that stand whatever VPP holds. Sorted.
     pub findings: Vec<Uncovered<Ipv6Prefix>>,
+    /// The nexthop-object routes, by prefix — summarised on one line when
+    /// settled ([`Uncovered::Opaque`]), but kept per route until then so a
+    /// `drift-accept6` can match each ([`Self::settle_accepting`]).
+    pub opaque: Vec<Ipv6Prefix>,
     /// Link-local candidates, sorted by prefix then table.
     pub link_local: Vec<LinkLocalRoute>,
+}
+
+/// One v6 scan settled against VPP's table and the `drift-accept6` set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettledV6 {
+    /// What no accept covers — the findings that degrade health.
+    pub findings: Vec<Uncovered<Ipv6Prefix>>,
+    /// What some accept covers, in the same shape: paths, then the
+    /// summaries, each summary counting only its accepted routes.
+    pub accepted: Vec<Uncovered<Ipv6Prefix>>,
+    /// Accepts that cover no finding at all, accepted or not, in config
+    /// order: the finding they were written for is gone.
+    pub unmatched: Vec<Ipv6Prefix>,
 }
 
 impl V6Scan {
@@ -739,37 +759,109 @@ impl V6Scan {
     /// forwards over the paths it resolved, the any-path rule the v4 scan
     /// applies to ECMP.
     pub fn settle(&self, vpp_holds: impl Fn(&Ipv6Prefix) -> bool) -> Vec<Uncovered<Ipv6Prefix>> {
-        let mut out = self.findings.clone();
-        let mut lacking: Vec<&LinkLocalRoute> = Vec::new();
-        let mut mixed = false;
-        for r in self.link_local.iter().filter(|r| !vpp_holds(&r.prefix)) {
-            match &r.unowned {
-                Some(dev) => {
-                    out.push(Uncovered::Path {
-                        prefix: r.prefix,
-                        oif: dev.to_string(),
-                        table: r.table,
-                        kernel_delivers: false,
-                        encap: None,
-                    });
-                    mixed = true;
+        self.settle_accepting(vpp_holds, &[]).findings
+    }
+
+    /// [`Self::settle`], with every finding a `drift-accept6` covers set
+    /// apart ([`SettledV6`]).
+    ///
+    /// Matched per ROUTE prefix, whatever the category — a path, a
+    /// nexthop-object route, a link-local candidate VPP lacks — and before
+    /// the summaries are built, so one accepted route never takes the rest
+    /// of its summary with it. An accept covers a finding whose prefix it
+    /// equals or contains; a finding LESS specific than the accept (a
+    /// default route via a tunnel, under an accept for one overlay /48)
+    /// is not covered, since most of what it carries is not what the
+    /// operator accepted.
+    pub fn settle_accepting(
+        &self,
+        vpp_holds: impl Fn(&Ipv6Prefix) -> bool,
+        accepts: &[Ipv6Prefix],
+    ) -> SettledV6 {
+        // Every accept covering the prefix is marked, not just the first:
+        // a nested pair both match, and neither is reported as stale.
+        let mut matched = vec![false; accepts.len()];
+        let mut accepted = |p: &Ipv6Prefix| {
+            let mut any = false;
+            for (i, a) in accepts.iter().enumerate() {
+                if a.contains_prefix(p) {
+                    matched[i] = true;
+                    any = true;
                 }
-                None => lacking.push(r),
+            }
+            any
+        };
+        let (mut open, mut taken) = (V6Findings::default(), V6Findings::default());
+        for f in &self.findings {
+            let Uncovered::Path { prefix, .. } = f else {
+                continue;
+            };
+            let side = if accepted(prefix) {
+                &mut taken
+            } else {
+                &mut open
+            };
+            side.paths.push(f.clone());
+        }
+        for p in &self.opaque {
+            let side = if accepted(p) { &mut taken } else { &mut open };
+            side.opaque += 1;
+        }
+        for r in self.link_local.iter().filter(|r| !vpp_holds(&r.prefix)) {
+            let side = if accepted(&r.prefix) {
+                &mut taken
+            } else {
+                &mut open
+            };
+            // An unowned hop makes it a path naming that device
+            // ([`Self::settle`]).
+            match &r.unowned {
+                Some(dev) => side.paths.push(Uncovered::Path {
+                    prefix: r.prefix,
+                    oif: dev.to_string(),
+                    table: r.table,
+                    kernel_delivers: false,
+                    encap: None,
+                }),
+                None => side.lacking.push(r),
             }
         }
-        if mixed {
-            // Paths first, sorted, as everywhere else; the summaries follow.
-            let (mut paths, summaries): (Vec<_>, Vec<_>) = out
-                .into_iter()
-                .partition(|u| matches!(u, Uncovered::Path { .. }));
-            sort_paths(&mut paths);
-            paths.extend(summaries);
-            out = paths;
+        SettledV6 {
+            findings: open.into_lines(),
+            accepted: taken.into_lines(),
+            unmatched: accepts
+                .iter()
+                .zip(matched)
+                .filter(|(_, m)| !m)
+                .map(|(a, _)| *a)
+                .collect(),
         }
-        if !lacking.is_empty() {
+    }
+}
+
+/// One side of a settled v6 scan, before it is put in reporting order.
+#[derive(Default)]
+struct V6Findings<'a> {
+    paths: Vec<Uncovered<Ipv6Prefix>>,
+    opaque: usize,
+    lacking: Vec<&'a LinkLocalRoute>,
+}
+
+impl V6Findings<'_> {
+    /// Paths first, sorted, as everywhere else; the summaries follow.
+    /// Sorted here rather than trusted from the scan because the lacking
+    /// candidates with an unowned hop were appended as paths.
+    fn into_lines(self) -> Vec<Uncovered<Ipv6Prefix>> {
+        let mut out = self.paths;
+        sort_paths(&mut out);
+        if self.opaque > 0 {
+            out.push(Uncovered::Opaque(self.opaque));
+        }
+        if !self.lacking.is_empty() {
             out.push(Uncovered::LinkLocal {
-                routes: lacking.len(),
-                examples: lacking
+                routes: self.lacking.len(),
+                examples: self
+                    .lacking
                     .iter()
                     .take(LINK_LOCAL_EXAMPLES)
                     .map(|r| format!("{} via {} (table {})", r.prefix.cidr(), r.oif, r.table))
@@ -824,7 +916,7 @@ fn classify_v6(
             || selected_tables.is_some_and(|t| !t.contains(&table))
     };
     let mut out = Vec::new();
-    let mut opaque = 0usize;
+    let mut opaque = Vec::new();
     let mut link_local: Vec<LinkLocalRoute> = candidates
         .into_iter()
         .filter(|c| !skipped(&c.prefix, c.table))
@@ -834,7 +926,7 @@ fn classify_v6(
             continue;
         }
         if r.via_nexthop_object && r.oifs.is_empty() {
-            opaque += 1;
+            opaque.push(r.prefix);
             continue;
         }
         let Some(oif) = r.oifs.first() else { continue };
@@ -857,12 +949,10 @@ fn classify_v6(
         });
     }
     sort_paths(&mut out);
-    if opaque > 0 {
-        out.push(Uncovered::Opaque(opaque));
-    }
     link_local.sort_by_key(|a| (a.prefix.sort_key(), a.table));
     V6Scan {
         findings: out,
+        opaque,
         link_local,
     }
 }
@@ -1011,18 +1101,34 @@ pub struct V6DriftState {
     pub lines: Vec<String>,
     /// How many routes `lines` stand for — the v6 gauge.
     pub routes: usize,
+    /// Findings from the same read that a `drift-accept6` covers: listed
+    /// and counted apart, degrading nothing ([`V6Scan::settle_accepting`]).
+    pub accepted: Vec<String>,
+    /// How many routes `accepted` stands for — the accepted gauge.
+    pub accepted_routes: usize,
+    /// `drift-accept6` prefixes that matched no finding in that read,
+    /// `addr/len`. Reported so an accept does not outlive its reason
+    /// unseen; they degrade nothing.
+    pub unmatched_accepts: Vec<String>,
     /// Why the latest v6 read failed, if it did.
     pub unreadable: Option<String>,
 }
 
 impl V6DriftState {
     /// Take one scan's v6 verdict, settling its link-local candidates
-    /// against `vpp_holds` ([`V6Scan::settle`]). Returns the findings when
-    /// they are non-empty and changed, for the caller's warning.
+    /// against `vpp_holds` and setting apart what `accepts` covers
+    /// ([`V6Scan::settle_accepting`]). Returns the unaccepted findings when
+    /// they are non-empty and changed, for the caller's warning — an
+    /// accepted one is a decision already made, not news.
+    ///
+    /// The accepts are the set in force NOW, not when the scan started:
+    /// they change what is reported, never what is scanned, so a reload
+    /// that edits them is honoured by the next scan to land.
     pub fn absorb(
         &mut self,
         v6: V6Drift,
         vpp_holds: impl Fn(&Ipv6Prefix) -> bool,
+        accepts: &[Ipv6Prefix],
     ) -> Option<&[String]> {
         match v6 {
             V6Drift::Inactive => {
@@ -1030,13 +1136,17 @@ impl V6DriftState {
                 None
             }
             V6Drift::Scanned(scan) => {
-                let found = scan.settle(vpp_holds);
-                let lines: Vec<String> = found.iter().map(Uncovered::to_string).collect();
+                let settled = scan.settle_accepting(vpp_holds, accepts);
+                let lines: Vec<String> =
+                    settled.findings.iter().map(Uncovered::to_string).collect();
                 let changed = !lines.is_empty() && lines != self.lines;
                 *self = Self {
                     active: true,
                     lines,
-                    routes: found.iter().map(Uncovered::routes).sum(),
+                    routes: settled.findings.iter().map(Uncovered::routes).sum(),
+                    accepted: settled.accepted.iter().map(accepted_line).collect(),
+                    accepted_routes: settled.accepted.iter().map(Uncovered::routes).sum(),
+                    unmatched_accepts: settled.unmatched.iter().map(RoutePrefix::cidr).collect(),
                     unreadable: None,
                 };
                 changed.then_some(self.lines.as_slice())
@@ -1071,14 +1181,67 @@ impl V6DriftState {
         if scans_v6 {
             self.lines.clear();
             self.routes = 0;
+            self.accepted.clear();
+            self.accepted_routes = 0;
+            self.unmatched_accepts.clear();
         } else {
             *self = Self::default();
         }
     }
 
-    /// Nothing for health to say: inactive, or active with a clean read.
+    /// Nothing for health to object to: inactive, or active with a clean
+    /// read. Accepted findings and unmatched accepts do not count — they
+    /// are notes on a Healthy row, not degradation.
     pub fn quiet(&self) -> bool {
         !self.active || (self.lines.is_empty() && self.unreadable.is_none())
+    }
+}
+
+/// An accepted finding as the row lists it. A path reads as it would
+/// unaccepted; a summary drops the diagnosis, which the operator read
+/// before accepting, and keeps the count and examples.
+fn accepted_line(u: &Uncovered<Ipv6Prefix>) -> String {
+    match u {
+        Uncovered::Path { .. } => u.to_string(),
+        Uncovered::Opaque(n) => format!("{n} route(s) via nexthop objects"),
+        Uncovered::LinkLocal { routes, examples } => format!(
+            "{routes} route(s) via link-local next hops only ({}{})",
+            examples.join(", "),
+            if *routes > examples.len() {
+                ", …"
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
+/// The `drift-accept6` set, shared between the module, which replaces it
+/// on every accepted reconfigure, and the supervision loop, which reads it
+/// each time a scan lands ([`V6DriftState::absorb`]).
+///
+/// A handle, not a [`DriftScope`] field. The scope is committed only once
+/// the NIC holds rules matching it — while steered, a reload that moves no
+/// lever leaves it pending until the next steer — because the exemptions
+/// it carries describe NIC state. An accept describes none: it changes
+/// what the tripwire reports and nothing else, so holding it back for a
+/// steer would keep the row red over a decision the operator has already
+/// made and reloaded. Same shape as [`crate::SharedAllowlist`].
+#[derive(Debug, Default)]
+pub struct DriftAccepts6(std::sync::RwLock<Vec<Ipv6Prefix>>);
+
+impl DriftAccepts6 {
+    pub fn new(accepts: Vec<Ipv6Prefix>) -> Self {
+        Self(std::sync::RwLock::new(accepts))
+    }
+
+    /// Replace the whole set. The module is the only writer.
+    pub fn publish(&self, accepts: Vec<Ipv6Prefix>) {
+        *self.0.write().expect("drift-accept6 lock") = accepts;
+    }
+
+    pub fn get(&self) -> Vec<Ipv6Prefix> {
+        self.0.read().expect("drift-accept6 lock").clone()
     }
 }
 
@@ -3098,20 +3261,20 @@ mod tests {
         let found = vec!["2001:db8:100::/48 via tun0 (table 254)".to_string()];
         let holds = |p: &Ipv6Prefix| *p == held;
         assert_eq!(
-            s.absorb(V6Drift::Scanned(scan.clone()), holds),
+            s.absorb(V6Drift::Scanned(scan.clone()), holds, &[]),
             Some(found.as_slice()),
             "new findings are handed back for the warning — settled, so the \
              held link-local prefix is not among them"
         );
         assert_eq!(s.routes, 1);
         assert_eq!(
-            s.absorb(V6Drift::Scanned(scan.clone()), holds),
+            s.absorb(V6Drift::Scanned(scan.clone()), holds, &[]),
             None,
             "unchanged findings are not warned twice"
         );
         assert!(!s.quiet());
         // The same scan settled against a VPP that lost the prefix.
-        s.absorb(V6Drift::Scanned(scan), |_| false);
+        s.absorb(V6Drift::Scanned(scan), |_| false, &[]);
         assert_eq!(s.routes, 2, "{:?}", s.lines);
         s.absorb(
             V6Drift::Scanned(classify_v6(
@@ -3121,9 +3284,10 @@ mod tests {
                 None,
             )),
             holds,
+            &[],
         );
 
-        s.absorb(V6Drift::Unreadable("netlink recv: EIO".into()), holds);
+        s.absorb(V6Drift::Unreadable("netlink recv: EIO".into()), holds, &[]);
         assert_eq!(s.lines, found, "retained across the failed read");
         assert_eq!(s.unreadable.as_deref(), Some("netlink recv: EIO"));
 
@@ -3134,12 +3298,12 @@ mod tests {
             "the read failure is not the scope's"
         );
 
-        s.absorb(V6Drift::Scanned(V6Scan::default()), holds);
+        s.absorb(V6Drift::Scanned(V6Scan::default()), holds, &[]);
         assert!(s.active && s.quiet() && s.unreadable.is_none());
         s.scan_failed("netlink socket: permission denied");
         assert!(!s.quiet(), "an active half is blind with the whole scan");
 
-        s.absorb(V6Drift::Inactive, holds);
+        s.absorb(V6Drift::Inactive, holds, &[]);
         assert_eq!(s, V6DriftState::default(), "no port diverts v6 any more");
     }
 
@@ -3160,6 +3324,7 @@ mod tests {
                 None,
             )),
             |_| false,
+            &[],
         );
         assert!(s.active && !s.quiet());
 
@@ -3210,5 +3375,252 @@ mod tests {
         flipped.link_local.push(true);
         let found = uncovered_paths_v6(&[flipped], &reach(), None, |_| false);
         assert_eq!(lines6(&found), ["2001:db8:42::/48 via wg0 (table 254)"]);
+    }
+
+    // ---- drift-accept6 ---------------------------------------------------
+
+    /// An accept covers a finding whose prefix it equals or contains, and
+    /// nothing less specific: a default route via a tunnel is NOT covered
+    /// by an accept for one overlay /48 inside it.
+    #[test]
+    fn an_accept_covers_equal_and_narrower_v6_findings_only() {
+        let routes = [
+            via(route6(p6("::", 0), "tun0"), false),
+            via(route6(p6("2001:db8:100::", 48), "tun0"), false),
+            via(route6(p6("2001:db8:100:5::", 64), "tun0"), false),
+            via(route6(p6("2001:db8:200::", 48), "tun0"), false),
+        ];
+        let scan = classify_v6(&routes, Vec::new(), &reach(), None);
+        let settled = scan.settle_accepting(|_| false, &[p6("2001:db8:100::", 48)]);
+        assert_eq!(
+            lines6(&settled.findings),
+            [
+                "::/0 via tun0 (table 254)",
+                "2001:db8:200::/48 via tun0 (table 254)",
+            ]
+        );
+        assert_eq!(
+            lines6(&settled.accepted),
+            [
+                "2001:db8:100::/48 via tun0 (table 254)",
+                "2001:db8:100:5::/64 via tun0 (table 254)",
+            ]
+        );
+        assert!(settled.unmatched.is_empty());
+        // No accepts: `settle` exactly.
+        assert_eq!(
+            scan.settle_accepting(|_| false, &[]).findings,
+            scan.settle(|_| false)
+        );
+    }
+
+    /// Every v6 category is matched per ROUTE prefix before its summary
+    /// is built: a path, a nexthop-object route, a link-local candidate
+    /// VPP lacks, and one that mixes in an unowned hop. Each summary on
+    /// either side counts only its own routes, and a candidate VPP holds
+    /// is no finding on either side — so an accept covering only that is
+    /// unmatched.
+    #[test]
+    fn every_v6_finding_category_is_accepted_per_route() {
+        let nhid = |prefix: Ipv6Prefix| {
+            let mut r = route6(prefix, "eth3");
+            r.oifs.clear();
+            r.gatewayed.clear();
+            r.link_local.clear();
+            r.via_nexthop_object = true;
+            r
+        };
+        let mut mixed = via(route6(p6("2001:db8:a4::", 48), "eth3"), true);
+        mixed.oifs.push("wg0".into());
+        mixed.gatewayed.push(true);
+        mixed.link_local.push(false);
+        let held = p6("2001:db8:c0::", 48);
+        let routes = [
+            via(route6(p6("2001:db8:a0::", 48), "tun0"), false),
+            via(route6(p6("2001:db8:b0::", 48), "tun0"), false),
+            nhid(p6("2001:db8:a1::", 48)),
+            nhid(p6("2001:db8:b1::", 48)),
+            nhid(p6("2001:db8:b2::", 48)),
+            via(route6(p6("2001:db8:a2::", 48), "eth3"), true),
+            via(route6(p6("2001:db8:b3::", 48), "br3998"), true),
+            via(route6(p6("2001:db8:b4::", 48), "eth4"), true),
+            mixed,
+            via(route6(held, "eth3"), true),
+        ];
+        let scan = classify_v6(&routes, Vec::new(), &reach(), None);
+        let accepts = [
+            p6("2001:db8:a0::", 44), // a0..af: one of each category
+            held,                    // held by VPP: no finding to match
+        ];
+        let settled = scan.settle_accepting(|p| *p == held, &accepts);
+
+        assert_eq!(
+            settled.findings,
+            [
+                Uncovered::Path {
+                    prefix: p6("2001:db8:b0::", 48),
+                    oif: "tun0".into(),
+                    table: 254,
+                    kernel_delivers: false,
+                    encap: None,
+                },
+                Uncovered::Opaque(2),
+                Uncovered::LinkLocal {
+                    routes: 2,
+                    examples: vec![
+                        "2001:db8:b3::/48 via br3998 (table 254)".into(),
+                        "2001:db8:b4::/48 via eth4 (table 254)".into(),
+                    ],
+                },
+            ]
+        );
+        assert_eq!(
+            settled.accepted,
+            [
+                Uncovered::Path {
+                    prefix: p6("2001:db8:a0::", 48),
+                    oif: "tun0".into(),
+                    table: 254,
+                    kernel_delivers: false,
+                    encap: None,
+                },
+                Uncovered::Path {
+                    prefix: p6("2001:db8:a4::", 48),
+                    oif: "wg0".into(),
+                    table: 254,
+                    kernel_delivers: false,
+                    encap: None,
+                },
+                Uncovered::Opaque(1),
+                Uncovered::LinkLocal {
+                    routes: 1,
+                    examples: vec!["2001:db8:a2::/48 via eth3 (table 254)".into()],
+                },
+            ]
+        );
+        let count = |u: &[Uncovered<Ipv6Prefix>]| u.iter().map(Uncovered::routes).sum::<usize>();
+        assert_eq!((count(&settled.findings), count(&settled.accepted)), (5, 4));
+        assert_eq!(settled.unmatched, [held]);
+    }
+
+    /// An accept that covers no finding at all — accepted or not — is
+    /// reported, in config order; a nested pair that both cover one
+    /// finding are both matched.
+    #[test]
+    fn an_accept_that_matches_nothing_is_reported() {
+        let scan = classify_v6(
+            &[via(route6(p6("2001:db8:100::", 48), "tun0"), false)],
+            Vec::new(),
+            &reach(),
+            None,
+        );
+        let accepts = [
+            p6("2001:db8:900::", 48),
+            p6("2001:db8::", 32),
+            p6("2001:db8:100::", 48),
+            p6("2001:db8:901::", 48),
+        ];
+        let settled = scan.settle_accepting(|_| false, &accepts);
+        assert!(settled.findings.is_empty());
+        assert_eq!(settled.accepted.len(), 1);
+        assert_eq!(
+            settled.unmatched,
+            [p6("2001:db8:900::", 48), p6("2001:db8:901::", 48)]
+        );
+        // Nothing found at all: every accept is unmatched.
+        let clean = V6Scan::default().settle_accepting(|_| false, &accepts);
+        assert_eq!(clean.unmatched, accepts);
+    }
+
+    /// The retained state splits the count: `routes` (the degrading gauge)
+    /// holds only the unaccepted findings, `accepted_routes` the rest; an
+    /// accepted finding is listed, is never handed back for the warning,
+    /// and leaves the half quiet when it is all there is.
+    #[test]
+    fn absorbed_v6_findings_split_into_open_and_accepted() {
+        let scan = classify_v6(
+            &[
+                via(route6(p6("2001:db8:100::", 48), "tun0"), false),
+                via(route6(p6("2001:db8:200::", 48), "tun0"), false),
+                via(route6(p6("2001:db8:300::", 48), "eth3"), true),
+            ],
+            Vec::new(),
+            &reach(),
+            None,
+        );
+        let mut s = V6DriftState::default();
+        let accepts = [p6("2001:db8:100::", 48), p6("2001:db8:900::", 48)];
+        let warned = s
+            .absorb(V6Drift::Scanned(scan.clone()), |_| false, &accepts)
+            .map(<[String]>::to_vec)
+            .expect("unaccepted findings are news");
+        assert_eq!(warned.len(), 2, "{warned:?}");
+        assert_eq!(warned[0], "2001:db8:200::/48 via tun0 (table 254)");
+        assert!(
+            warned[1].contains("2001:db8:300::/48 via eth3"),
+            "{warned:?}"
+        );
+        assert_eq!((s.routes, s.accepted_routes), (2, 1));
+        assert_eq!(s.accepted, ["2001:db8:100::/48 via tun0 (table 254)"]);
+        assert_eq!(s.unmatched_accepts, ["2001:db8:900::/48"]);
+        assert!(!s.quiet());
+
+        // Everything accepted: quiet, nothing to warn about, still listed.
+        let all = [p6("2001:db8::", 32)];
+        assert_eq!(
+            s.absorb(V6Drift::Scanned(scan.clone()), |_| false, &all),
+            None
+        );
+        assert!(s.quiet() && s.active);
+        assert_eq!((s.routes, s.accepted_routes), (0, 3));
+        assert_eq!(
+            s.accepted,
+            [
+                "2001:db8:100::/48 via tun0 (table 254)",
+                "2001:db8:200::/48 via tun0 (table 254)",
+                "1 route(s) via link-local next hops only (2001:db8:300::/48 via eth3 (table 254))",
+            ]
+        );
+        assert!(s.unmatched_accepts.is_empty());
+
+        // A failed read keeps them; a new scope drops them with the findings.
+        s.absorb(
+            V6Drift::Unreadable("netlink recv: EIO".into()),
+            |_| false,
+            &all,
+        );
+        assert_eq!(s.accepted_routes, 3, "retained across the failed read");
+        s.scope_committed(true);
+        assert!(s.accepted.is_empty() && s.accepted_routes == 0 && s.unmatched_accepts.is_empty());
+    }
+
+    /// Hot reload: the accepts are read when a scan LANDS, from the handle
+    /// the module publishes into, so the next scan after a reload is
+    /// classified under the new set — in both directions.
+    #[test]
+    fn a_reloaded_accept_set_reclassifies_the_next_scan() {
+        let scan = classify_v6(
+            &[via(route6(p6("2001:db8:100::", 48), "tun0"), false)],
+            Vec::new(),
+            &reach(),
+            None,
+        );
+        let handle = std::sync::Arc::new(DriftAccepts6::default());
+        let mut s = V6DriftState::default();
+        s.absorb(V6Drift::Scanned(scan.clone()), |_| false, &handle.get());
+        assert_eq!((s.routes, s.accepted_routes), (1, 0));
+
+        handle.publish(vec![p6("2001:db8:100::", 48)]);
+        s.absorb(V6Drift::Scanned(scan.clone()), |_| false, &handle.get());
+        assert_eq!((s.routes, s.accepted_routes), (0, 1));
+        assert!(s.quiet());
+
+        handle.publish(Vec::new());
+        assert_eq!(
+            s.absorb(V6Drift::Scanned(scan), |_| false, &handle.get()),
+            Some(["2001:db8:100::/48 via tun0 (table 254)".to_string()].as_slice()),
+            "an accept taken away degrades again — and warns, as news"
+        );
+        assert_eq!((s.routes, s.accepted_routes), (1, 0));
     }
 }

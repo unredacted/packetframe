@@ -120,14 +120,34 @@ Membership (a `port` line) is all-or-nothing across the forwarding
 domain and is validated at config load. Steering (`steer on|off`) is
 per-port and is the canary lever.
 
-**VPP never ARPs.** Neighbours are static, from the resolver. ARP
-suppression holds by construction rather than by knob: MCAM rules match
-IPv4 fields, so ARP frames (0x0806) can never be steered — VPP
-physically cannot receive an ARP request. The IPv6 diversion
-(`v6-divert`) keeps the same property for neighbour discovery by a
-different route: it matches TCP and UDP only, so no ICMPv6 frame —
-solicitation, advertisement or echo, multicast or unicast — can reach
-VPP — see [v6-divert steering](#v6-divert-steering).
+**Neighbours are static, from the resolver — but VPP is not
+ARP-silent.** MCAM rules match IP fields, so no ARP frame (0x0806) is
+ever *steered* to VPP, and `v6-divert` matches TCP and UDP only, so no
+ICMPv6 is either — see [v6-divert steering](#v6-divert-steering). That
+is why VPP cannot learn or refresh a neighbour: the unicast answer to
+anything it sends goes to a kernel-owned MAC and lands on the kernel.
+It does NOT make VPP deaf or mute on ARP:
+
+- **It receives broadcast ARP.** Each member VF keeps a promiscuous
+  vote (see "A bridge-member port goes dark right after attach") and the
+  NIC replicates broadcast to every function on the LMAC, so the
+  bridge domain floods the segment's broadcast ARP to the BVI and on to
+  VPP's `arp-reply` node. Nearly all of it is rejected there
+  (`IP4 destination address not local to subnet` / `IP4 source address
+  not local to subnet` in `show errors`).
+- **It replies for its `loopback-address`, and only that.** The reply
+  leaves from the receiving interface's MAC — the kernel bridge's, on a
+  BVI. Every interface is unnumbered to the loopback, and VPP's
+  `arp_unnumbered` skips the sender-subnet check for unnumbered
+  interfaces, so it would answer on ANY bridged VLAN, IX VLANs included,
+  if someone there asked. Hence the rule to pick a `loopback-address`
+  nothing else uses (attach refuses a kernel-held one — "Hosts flap
+  between two MACs for the gateway").
+- **It sends ARP requests and neighbour solicitations (glean)** for
+  unknown hosts inside a `local-route` / `local-route6` prefix, up to
+  ~1000/s per address PER WORKER (so ~workers × 1000/s for one silent
+  address in aggregate), past the `guard` policer. See
+  [Glean and ARP counters](#glean-and-arp-counters).
 
 **Only IPv4 neighbours are programmed.** VPP carries v4 routes only (no
 v6 packet can be steered in; see gate 0b below), so the resolver's IPv6
@@ -213,11 +233,14 @@ current value without a mapping table:
 | `packetframe_vpp_source_backlog` | sustained non-zero — deltas are not draining |
 | `packetframe_vpp_drain_failing` | `1` — the steady-state delta apply is retrying |
 | `packetframe_vpp_exempt_drift` | `> 0` — a kernel path VPP cannot take has no `steer-exempt`; steered traffic for it is (or will be) blackholed. ALSO alarm on `absent()` while attached: the gauge is omitted, never zeroed, when the scan cannot read the kernel |
-| `packetframe_vpp_exempt_drift_v6` | `> 0` — an IPv6 kernel path VPP cannot take while a port carries `v6-divert`; diverted v6 for it is (or will be) blackholed. Present ONLY while some port carries `v6-divert` under `v6 on`, so alarm on `absent()` only on boxes configured that way: it is omitted, never zeroed, when the v6 scan cannot read |
+| `packetframe_vpp_exempt_drift_v6` | `> 0` — an IPv6 kernel path VPP cannot take while a port carries `v6-divert`; diverted v6 for it is (or will be) blackholed. Present ONLY while some port carries `v6-divert` under `v6 on`, so alarm on `absent()` only on boxes configured that way: it is omitted, never zeroed, when the v6 scan cannot read. Counts only findings no `drift-accept6` covers |
+| `packetframe_vpp_exempt_drift_v6_accepted` | not an alarm — v6 findings a `drift-accept6` covers (still blackholed if diverted). Present exactly when the series above is; a step up means a new route appeared under an accepted prefix |
 | `packetframe_vpp_neighbours_unplaced` | `> 0` — a bridge neighbour the kernel FDB has not placed behind any member port; routes through it are unresolvable |
 | `packetframe_vpp_neighbour_moves` | a step — spanning tree moved neighbours between trunks and VPP followed; worth correlating with switch events |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
 | `packetframe_vpp_api_silent_seconds` | approaching the wedge budget (1.5 s steered) |
+| `packetframe_vpp_glean_sent{family}` / `packetframe_vpp_glean_throttled{family}` | informational, never a health input — cumulative; watch the RATE. See [Glean and ARP counters](#glean-and-arp-counters) for normal vs a scan |
+| `packetframe_vpp_arp_replies_sent` | informational — a step on a box whose `loopback-address` nobody should be asking for |
 
 Every series also carries `module="vpp-offload"`.
 
@@ -959,19 +982,36 @@ module vpp-offload
 
 One line does three things at attach:
 
-1. **An attached route** for the prefix onto the port's dot1q subif —
-   `show ip fib 192.0.2.0/24` shows the subif adjacency, not a
-   drop. Installed outside the route ledger (module-owned topology,
-   like the loopback), so resyncs never withdraw it.
+1. **An attached route** for the prefix onto the VLAN's BVI when it is
+   bridged (the BVI of the port's own bridge — a second bridge reusing
+   the vid gets none), else the port's VF if the port sends the VLAN
+   untagged, else its dot1q subif — `show ip fib 192.0.2.0/24` shows
+   that adjacency, not a drop. Installed outside the route ledger
+   (module-owned topology, like the loopback), so resyncs never
+   withdraw it. The choice is re-made while VPP runs: a BVI built after
+   attach (the router had no L3 device on the VLAN yet), or a VLAN that
+   turns untagged or tagged on the port, moves the route within seconds
+   in one replacing route update (`attached route moved` in the
+   journal, with both interface indices). A move VPP refused or never
+   answered is re-sent on the next placement pass.
 2. **The neighbour mirror**: kernel neighbours on the backing bridge
    (the `via` of the covering fast-path `local-prefix`) become VPP
    static neighbours, each on the subif of the member port the bridge
    FDB learned that host behind (see "Bridge neighbours" below), so
    hosts split across two trunks are all reachable; `port` names only
-   where the attached route sits. VPP never ARPs — a host the kernel
-   has never resolved drops in VPP where the kernel would ARP-queue.
-   Service hosts are static; if one ever matters, ping it from the
-   router once.
+   where the attached route sits. A host VPP holds no neighbour for
+   is **gleaned**: the packet is dropped (where the kernel would
+   ARP-queue it) and `ip4-glean` broadcasts an ARP request, sourced
+   from `loopback-address` (the attached path has no connected prefix
+   to source from) and the BVI's MAC — the bridge's. The host's
+   unicast reply therefore lands on the kernel bridge; with neigh-snoop
+   watching the bridge (`bridge` + `prefix` for this prefix) it is
+   learned, installed, registered by fast-path's `local-prefix`, and
+   comes back as a static neighbour, like the IPv6 path below. Without
+   neigh-snoop there the reply is discarded and VPP keeps gleaning on
+   every packet to that host; ping it from the router once and the
+   kernel's own entry feeds the mirror. Rate, cost and counters:
+   [Glean and ARP counters](#glean-and-arp-counters).
 3. **Shadowing**: mirror routes INSIDE the prefix are skipped, at
    resync and in deltas. The kernel tier delivers to bridge hosts
    before its FIB lookup, so bird's view inside a local prefix (the
@@ -1078,15 +1118,18 @@ interface: at most one solicitation per millisecond per worker
 comparison, sends `mcast_solicit` (3) solicitations a second apart per
 resolution attempt. So a sustained stream to an
 address that never answers (a departed host, a typo, a scan) makes VPP
-solicit up to ~1000 times a second per worker toward that address's
-solicited-node group, and a scan across the `/64` solicits about once
+solicit up to ~1000 times a second per worker — roughly workers ×
+1000/s in aggregate, since that address's packets can land on every
+worker — toward its solicited-node group, and a scan across the `/64` solicits about once
 per scanned packet. On a switch without MLD snooping each one floods
 the VLAN. That is the price of delivering IPv6 in VPP at all, and it is
 not a stall risk: glean runs in VPP's data plane and never reaches the
 API, and what comes back is paced by neigh-snoop's `install-rate`
 (default 50/s, daemon-wide). A customer host has no routes resolving
 through it, so a neighbour add is not the dependent-FIB walk an IX
-next hop's is. Watch `ip6-glean`'s counters (below). If the rate matters
+next hop's is. Watch `ip6-glean`'s counters (below, and
+`packetframe_vpp_glean_sent{family="ipv6"}` —
+[Glean and ARP counters](#glean-and-arp-counters)). If the rate matters
 on a VLAN, the rollback is dropping its `local-route6` (restart).
 
 Entries age out with the kernel's: an unused `STALE` entry is removed
@@ -1488,7 +1531,8 @@ differences:
 
 - **Nothing exempts.** The NIC cannot match a v6 address, so there is
   no IPv6 `steer-exempt` and every finding stands until its cause
-  goes. That is why it has its own row: its remedies are not
+  goes, or until you accept it ([`drift-accept6`](#accepting-a-finding-drift-accept6)).
+  That is why it has its own row: its remedies are not
   `exempt-drift`'s.
 - **A link-local kernel next hop is judged by VPP's table, not the
   kernel's.** Under FRR, a peer that sends both a global and a
@@ -1533,10 +1577,65 @@ The remedy depends on which kind of route it is:
   declare the VLAN on the port (`port … vlans`) so VPP reaches the
   device.
 - **A kernel-only route** (a tunnel, an overlay, anything VPP will
-  never own): either accept the black-hole risk knowingly (the row
-  stays Degraded while it stands); or keep that traffic on the kernel
-  by port with `steer-keep6`, when it is identifiable by port; or drop
-  `v6-divert` from the ports whose hosts reach that destination.
+  never own): keep that traffic on the kernel by port with
+  `steer-keep6`, when it is identifiable by port; or drop `v6-divert`
+  from the ports whose hosts reach that destination; or accept the
+  black-hole risk knowingly with `drift-accept6` (below).
+
+##### Accepting a finding (`drift-accept6`)
+
+Some findings are examined and then deliberately left standing: an
+overlay VPN's ULA routes via its tunnel device when no diverted host
+talks to the overlay, an IX LAN /64 VPP deliberately holds no connected
+route for, a stale kernel route the routing daemon left behind that
+nothing uses. With no v6 exemption to install, such a finding would
+keep `exempt-drift-v6` — and overall health — Degraded forever, and a
+permanently red row hides the NEXT finding behind it. So:
+
+```
+module vpp-offload
+  v6 on
+  drift-accept6 2001:db8:ff00::/40
+```
+
+A v6 finding whose destination prefix equals or lies inside an accepted
+prefix is **accepted**: it no longer degrades the row or overall health
+and is not counted in `packetframe_vpp_exempt_drift_v6`; it is counted
+in `packetframe_vpp_exempt_drift_v6_accepted` instead (same
+absent-not-zero rule, so the two always sum to every v6 finding) and
+still listed on the row. A finding LESS specific than the accept (a
+`::/0` via a tunnel, under an accept for one /48 inside it) is not
+covered. Every category is matched per route prefix — paths,
+nexthop-object routes, and the link-local summary, whose accepted and
+unaccepted routes are counted and summarised separately.
+
+```
+exempt-drift-v6: healthy — accepted: 2001:db8:ff00::/48 via tun0
+  (table 52) (`drift-accept6` — acknowledged, not fixed: diverted IPv6
+  for these still dies in VPP)
+```
+
+With unaccepted findings too, the row is Degraded and names them first,
+the accepted ones after. An accept that matches no finding at all adds
+`drift-accept6 2001:db8:ff00::/40 matches nothing` to the row, without
+degrading it: the finding it was written for is gone (the tunnel was
+torn down, the feed was fixed), so drop the line before it silently
+accepts whatever appears under that prefix next.
+
+**Accept, or fix?** Accept only what you have looked at and decided to
+live with, as narrowly as the finding (the finding's own prefix, not a
+covering /32). Accepting is an acknowledgement, **not a fix**: diverted
+IPv6 to an accepted prefix still dies in VPP, exactly as before the
+line — the tripwire just stops shouting about it. If any diverted host
+needs that destination, fix it instead: the feed, the port's `vlans`,
+a `steer-keep6`, or dropping `v6-divert`. Validation: a valid IPv6
+prefix with host bits zero, `v6 on` required, an exact duplicate
+refused, and `/0` refused (it would silence the whole v6 half — drop
+`v6-divert` instead if that is what you mean). Hot-reloadable without
+the supervision loop: a reload takes effect when the next scan lands
+(within a minute), in either direction. There is deliberately **no IPv4
+form**: a v4 finding has a real remedy, `steer-exempt`, which keeps the
+traffic working instead of merely silencing the report.
 
 `packetframe_vpp_exempt_drift_v6` carries the route count, as its own
 series: `packetframe_vpp_exempt_drift` keeps its single, unlabelled
@@ -1586,6 +1685,110 @@ steady rate was misread as harmless for three windows ("spoofed
 replies, undeliverable by anyone") until the destination profile
 showed ~a third of it was live inter-site traffic. Profile before
 declaring a floor harmless.
+
+### Glean and ARP counters
+
+VPP sends ARP and neighbour discovery of its own. The kernel transmits
+none of it, so none of it shows up in the kernel's transmit counters or
+in `guard`:
+
+- **Glean.** Steered traffic to a host inside a `local-route` (IPv4) or
+  `local-route6` (IPv6) prefix that VPP holds no static neighbour for
+  hits the attached route's glean adjacency. The packet is dropped and
+  `ip4-glean` broadcasts an ARP request (sender address =
+  `loopback-address`, sender MAC = the BVI's, i.e. the bridge's) or
+  `ip6-glean` multicasts a neighbour solicitation from the BVI's
+  link-local. It leaves through the BVI and floods every member port
+  on that VLAN. The reply is unicast to the bridge's MAC, reaches the kernel,
+  and becomes a static neighbour through neigh-snoop → fast-path →
+  vpp-offload (see local-route / local-route6 above).
+- **Rate.** VPP throttles glean per destination (and interface) per
+  worker at 1 ms, compiled in with no knob: up to ~1000 requests a
+  second per silent address PER WORKER. The throttle is per worker, and
+  RSS spreads one address's flows across workers, so the aggregate
+  ceiling for one silent address is roughly workers × 1000/s — against
+  the kernel's ~3 per resolution. Requests past the throttle are counted `throttled`, not
+  sent.
+- **The `guard` bypass.** `guard`'s `arp-ns-ratelimit` polices frames
+  the kernel transmits (tc egress on the bridge). Glean leaves through
+  VPP's VF and never meets it. If a VLAN needs a hard ceiling on the
+  router's ARP rate, the lever is the `local-route` line, not guard.
+- **Replies.** VPP answers ARP for its `loopback-address` only (see
+  Architecture). Hosts that saw a glean request carry that address as a
+  neighbour and may ARP for it later, so a trickle of replies is
+  expected where glean runs; anywhere else, a step means something is
+  asking for an address it should not know.
+
+Exported from VPP's own counters (summed across workers), absent until
+the first sample and after any read trouble, the null-drop rule. The
+sampler makes one API read per 30 s tick, alternating `show errors`
+(null-drop and glean) with `show ip neighbor-stats` (replies), so each
+refreshes every 60 s and the reply gauge appears one tick after the
+glean ones; a tick never blocks the supervision loop longer than a
+single read. All cumulative since VPP started; all informational —
+no status condition reads them:
+
+| series | source |
+|---|---|
+| `packetframe_vpp_glean_sent{family="ipv4"}` | `ip4-glean` "ARP requests sent" |
+| `packetframe_vpp_glean_throttled{family="ipv4"}` | `ip4-glean` "ARP requests throttled" |
+| `packetframe_vpp_glean_sent{family="ipv6"}` | `ip6-glean` "neighbor solicitations sent" |
+| `packetframe_vpp_glean_throttled{family="ipv6"}` | `ip6-glean` "throttled" |
+| `packetframe_vpp_arp_replies_sent` | `show ip neighbor-stats`, `arp: tx:[reply:N]` summed over interfaces |
+
+The reply gauge deliberately does not use `arp-reply`'s
+"ARP replies sent" row from `show errors`: in v26.06 a request dropped
+before its error code is reassigned is booked under that row, so it
+over-counts by every such drop. `show ip neighbor-stats` is the real
+transmit count.
+
+**What normal looks like.** On the reference primary, IPv4 glean runs
+at roughly **20-25 requests/s** with a service VLAN under
+`local-route` — hosts coming and going, flows to departed addresses —
+with `throttled` a small fraction of it. IPv6 glean is rare (a few per
+new customer address; proven end to end). Replies: near zero.
+
+**What a scan-driven storm looks like.** A scan across a `local-route`
+prefix gleans about once per scanned address, so
+`rate(packetframe_vpp_glean_sent{family="ipv4"}[1m])` jumps from tens
+to hundreds or thousands per second while `throttled` stays flat — many
+distinct addresses, one request each. The other shape is a sustained
+flow to one departed or silent host: `sent` near ~1000/s for each
+worker that host's traffic lands on (up to workers × 1000/s) and
+`throttled` climbing much faster, since every packet after the first in
+each millisecond on each worker is throttled. Either way each request is
+a broadcast on every member port of that VLAN. A `local-route6` `/64`
+behaves the same way per scanned address, toward solicited-node groups.
+
+**When to worry.** A sustained rate in the hundreds per second or more
+that does not track a known event, or any storm on a VLAN whose
+switches or hosts are fragile to broadcast. Glean is not a stall risk
+for PacketFrame (it runs in VPP's data plane and never reaches the
+API), and neigh-snoop paces what comes back (`install-rate`). The
+rollback is dropping the VLAN's `local-route` / `local-route6`
+(restart-only).
+
+On the box:
+
+```sh
+# Glean and ARP, summed across workers. ip4-glean / ip6-glean as above;
+# arp-reply's "not local to subnet" rows are broadcast ARP VPP received
+# and refused (normal, and large); its "ARP replies sent" over-counts.
+vppctl show errors | grep -E 'glean|arp-reply'
+# The real ARP/ND transmit and receive counts, per interface:
+# "arp: ... tx:[reply:N ...]" is the replies VPP actually sent.
+vppctl show ip neighbor-stats
+# l2-flood counts EVERY packet entering the flood node, in both
+# directions: mostly member broadcast/multicast delivered to the BVI,
+# plus glean's broadcasts. Routed unicast floods every member port only
+# for neighbours counted in packetframe_vpp_neighbours_flooded.
+vppctl show errors | grep l2-flood
+# The exported gauges.
+grep -E 'packetframe_vpp_(glean|arp_replies)' /var/lib/node_exporter/textfile/packetframe.prom
+```
+
+Take two readings a minute apart and divide; the counters are
+cumulative.
 
 ## v6-divert steering
 
@@ -2516,7 +2719,8 @@ forwarded by an unsupervised process — restart packetframe, which will
 ### Hosts flap between two MACs for the gateway, or duplicate-address warnings appear
 
 VPP's arp node answers requests targeting its loopback's address,
-sourcing the member VF's MAC. If `loopback-address` is a **live kernel
+sourcing the receiving interface's MAC (the bridge's, on a BVI; the
+member VF's on a plain port). If `loopback-address` is a **live kernel
 address** — the gateway being the worst case — VPP and the kernel both
 answer, hosts learn whichever replied last, and traffic oscillates
 between two delivery paths. Measured on the primary (2026-08-14, w22):
