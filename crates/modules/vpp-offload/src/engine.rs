@@ -59,10 +59,15 @@ use crate::vpp_api::{Transport, TransportError};
 
 /// `IP_API_NEIGHBOR_FLAG_STATIC` from ip_neighbor.api.
 ///
-/// Static because VPP cannot refresh a neighbour on this platform: MCAM
-/// rules match IP fields, so an ARP or ND frame can never be steered to
-/// it. An ageing dynamic entry would silently become an unresolved
-/// adjacency and blackhole every route through that nexthop.
+/// Static because VPP cannot refresh a neighbour on this platform. It
+/// can SEND a probe, but the answer is a unicast ARP reply or NA to the
+/// MAC it sent from — the kernel bridge's (on a BVI) or the kernel
+/// port's — and MCAM rules match IP fields and never divert ICMPv6, so
+/// that answer lands on the kernel, not in VPP. (VPP does receive
+/// broadcast ARP — every VF on the LMAC gets a copy — but nothing in
+/// that stream answers a probe.) An ageing dynamic entry would silently
+/// become an unresolved adjacency and blackhole every route through
+/// that nexthop.
 pub const IP_NEIGHBOR_STATIC: u8 = 1;
 
 /// How long to wait for the handshake on a connect attempt.
@@ -134,10 +139,14 @@ pub trait RouteSource {
     ///
     /// The MAC is not optional here. VPP is started without `linux-cp`
     /// (it cannot pair kernel-owned PFs), so it begins with an empty
-    /// neighbour table, and MCAM rules match IP fields so an ARP frame
-    /// can never be steered into it — VPP physically cannot learn a
-    /// neighbour. Every adjacency has to be programmed statically from
-    /// this snapshot.
+    /// neighbour table, and it cannot fill it for nexthops: it only sends
+    /// ARP from its glean nodes, inside a `local-route` attached prefix,
+    /// and even there the unicast reply goes to a kernel-owned MAC — MCAM
+    /// rules match IP fields, so a unicast ARP frame is never steered to
+    /// VPP. The broadcast ARP it does receive (its VF gets a copy of
+    /// every broadcast) teaches it nothing it could forward with.
+    /// Every adjacency has to be programmed statically from this
+    /// snapshot.
     ///
     /// Getting this wrong is a silent blackhole of the worst kind: route
     /// installs are acknowledged, readback verification passes (it checks
@@ -474,6 +483,96 @@ pub(crate) fn parse_null_drops(text: &str) -> u64 {
         .sum()
 }
 
+/// VPP's own neighbour-discovery transmit counters: what its glean
+/// nodes and its `arp-reply` node have put on the wire, cumulative since
+/// the process started. Metrics only — informational, never a health
+/// input (runbook, "Glean and ARP counters").
+///
+/// Glean is VPP resolving a host inside a `local-route` /
+/// `local-route6` attached prefix that it holds no static neighbour
+/// for: `ip4-glean` broadcasts an ARP request (sourced from the
+/// loopback's address — the attached path has no connected prefix),
+/// `ip6-glean` multicasts a neighbour solicitation from the interface's
+/// link-local. Both leave through the BVI, flood every member on that
+/// VLAN, and bypass the kernel-side `guard` policer entirely.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NeighbourCounters {
+    /// `ip4-glean` "ARP requests sent".
+    pub arp_requests_sent: u64,
+    /// `ip4-glean` "ARP requests throttled" — suppressed by VPP's
+    /// per-destination, per-worker 1 ms throttle.
+    pub arp_requests_throttled: u64,
+    /// `ip6-glean` "neighbor solicitations sent".
+    pub ns_sent: u64,
+    /// `ip6-glean` "throttled".
+    pub ns_throttled: u64,
+    /// ARP replies actually transmitted, summed over every interface's
+    /// `show ip neighbor-stats` `arp: tx:[reply:N]`. NOT `arp-reply`'s
+    /// "ARP replies sent" error row: in v26.06 a request dropped before
+    /// its error code is reassigned is booked under that same row, so it
+    /// over-counts by every such drop. `None` when that second read
+    /// failed or did not parse.
+    pub arp_replies_sent: Option<u64>,
+}
+
+/// The glean rows of `show errors` (non-verbose, so VPP has already
+/// summed each counter across workers). The node is column two and the
+/// reason is everything after it, matched exactly or followed by the
+/// severity column — the reason strings are v26.06's, from the
+/// vendored `ip_neighbor.api.json` counter definitions. Malformed rows
+/// are skipped, the null-drop parser's rule.
+pub(crate) fn parse_glean_counters(text: &str) -> NeighbourCounters {
+    let mut c = NeighbourCounters::default();
+    for line in text.lines() {
+        let mut tok = line.split_whitespace();
+        let Some(count) = tok.next().and_then(|t| t.parse::<u64>().ok()) else {
+            continue;
+        };
+        let Some(node) = tok.next() else { continue };
+        let reason = tok.collect::<Vec<_>>().join(" ");
+        let is = |want: &str| {
+            reason == want
+                || reason
+                    .strip_prefix(want)
+                    .is_some_and(|rest| rest.starts_with(' '))
+        };
+        match node {
+            "ip4-glean" if is("ARP requests sent") => c.arp_requests_sent += count,
+            "ip4-glean" if is("ARP requests throttled") => c.arp_requests_throttled += count,
+            "ip6-glean" if is("neighbor solicitations sent") => c.ns_sent += count,
+            "ip6-glean" if is("throttled") => c.ns_throttled += count,
+            _ => {}
+        }
+    }
+    c
+}
+
+/// Sum the transmitted ARP replies out of `show ip neighbor-stats`,
+/// whose per-interface line in v26.06 is
+/// `    arp: rx:[reply:N request:N gratuitous:N ] tx:[reply:N ...]`
+/// (`format_ip_neighbor_counters`). `None` when no `arp:` line parsed —
+/// an answer that is not this shape is unknown, not zero.
+pub(crate) fn parse_arp_replies_sent(text: &str) -> Option<u64> {
+    let mut total = None;
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("arp:") else {
+            continue;
+        };
+        let Some((_, tx)) = rest.split_once("tx:[") else {
+            continue;
+        };
+        let tx = tx.split(']').next().unwrap_or("");
+        let reply = tx
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("reply:"))
+            .and_then(|n| n.parse::<u64>().ok());
+        if let Some(n) = reply {
+            *total.get_or_insert(0) += n;
+        }
+    }
+    total
+}
+
 impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -749,6 +848,9 @@ pub struct ConvergenceEngine {
     /// Metrics only; nothing here feeds a forwarding or supervision
     /// decision.
     null_drops: Option<u64>,
+    /// VPP's glean and ARP-reply transmit counters from the same
+    /// sample, absent by the same rule. Metrics only.
+    neighbour_counters: Option<NeighbourCounters>,
 
     /// Advanced once per verify so each pass samples a different set.
     ///
@@ -820,6 +922,7 @@ impl ConvergenceEngine {
             #[cfg(test)]
             test_dead_members: None,
             null_drops: None,
+            neighbour_counters: None,
             verify_seed: 0,
         }
     }
@@ -1848,36 +1951,81 @@ impl ConvergenceEngine {
         self.null_drops
     }
 
-    /// Sample VPP's error counters and cache the null-node total.
+    /// The last sampled glean / ARP-reply counters, if any.
+    pub fn neighbour_counters(&self) -> Option<NeighbourCounters> {
+        self.neighbour_counters
+    }
+
+    /// Sample VPP's error counters: the null-node total and the glean
+    /// rows out of one `show errors`, then the real ARP-reply count out
+    /// of `show ip neighbor-stats`.
     ///
-    /// Metrics only, so every failure degrades the gauge to absent and
+    /// Metrics only, so every failure degrades the gauges to absent and
     /// none escalates: a counter read must not be able to restart a
     /// forwarding VPP. A transport error still drops the socket — the
     /// reply may be partly read, and every other path here refuses to
     /// leave a poisoned stream looking healthy to `api_ready`.
-    pub fn sample_null_drops(&mut self) {
+    pub fn sample_error_counters(&mut self) {
         self.arm_timeout();
         let Some(t) = self.transport.as_mut() else {
             self.null_drops = None;
+            self.neighbour_counters = None;
             return;
         };
         match t.request::<CliInband, CliInbandReply>(CliInband {
             context: 0,
             cmd: "show errors".into(),
         }) {
-            Ok(r) if r.retval == 0 => self.null_drops = Some(parse_null_drops(&r.reply)),
+            Ok(r) if r.retval == 0 => {
+                self.null_drops = Some(parse_null_drops(&r.reply));
+                self.neighbour_counters = Some(parse_glean_counters(&r.reply));
+            }
             Ok(r) => {
                 tracing::debug!(
                     retval = r.retval,
-                    "`show errors` refused; the null-drop gauge goes absent"
+                    "`show errors` refused; the null-drop and glean gauges go absent"
                 );
                 self.null_drops = None;
+                self.neighbour_counters = None;
+                return;
             }
             Err(e) => {
-                tracing::debug!(error = %e, "`show errors` failed; the null-drop gauge goes absent");
+                tracing::debug!(
+                    error = %e,
+                    "`show errors` failed; the null-drop and glean gauges go absent"
+                );
                 self.disconnect();
                 self.null_drops = None;
+                self.neighbour_counters = None;
+                return;
             }
+        }
+        let Some(t) = self.transport.as_mut() else {
+            return;
+        };
+        let replies = match t.request::<CliInband, CliInbandReply>(CliInband {
+            context: 0,
+            cmd: "show ip neighbor-stats".into(),
+        }) {
+            Ok(r) if r.retval == 0 => parse_arp_replies_sent(&r.reply),
+            Ok(r) => {
+                tracing::debug!(
+                    retval = r.retval,
+                    "`show ip neighbor-stats` refused; the ARP-reply gauge goes absent"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "`show ip neighbor-stats` failed; the ARP-reply gauge goes absent"
+                );
+                self.disconnect();
+                None
+            }
+        };
+        if let Some(c) = self.neighbour_counters.as_mut() {
+            c.arp_replies_sent = replies;
         }
     }
 
@@ -2340,14 +2488,24 @@ impl ConvergenceEngine {
     /// The nexthop-less NORMAL path on the subif is VPP's attached
     /// route: dst inside the prefix resolves via the interface, with
     /// per-host adjacencies coming from the mirrored static
-    /// neighbours (VPP never ARPs; a never-seen host drops here where
-    /// the kernel would ARP-queue — documented, service hosts are
-    /// static).
+    /// neighbours.
     ///
-    /// **For a `local-route6` that drop is not the end of it.** A packet
-    /// for a host VPP holds no neighbour for takes the attached route's
-    /// glean adjacency, and VPP v26.06's `ip6-glean` solicits the host:
-    /// the NS is sourced from the interface's LINK-LOCAL, unconditionally
+    /// **A host VPP holds no neighbour for is gleaned, in both
+    /// families.** The packet takes the attached route's glean
+    /// adjacency and is dropped (glean does not queue — where the
+    /// kernel would ARP-queue it), and VPP resolves the host itself.
+    ///
+    /// IPv4: `ip4-glean` broadcasts an ARP request. Its sender address
+    /// is the loopback's (`loopback-address`), because the attached
+    /// path is nexthop-less on an unnumbered interface with no
+    /// connected prefix to pick a source from; its sender MAC is the
+    /// interface's — the kernel bridge's on a BVI. So the host's
+    /// unicast reply lands on the kernel bridge (MCAM steers IP, never
+    /// 0x0806), where neigh-snoop learns it, fast-path's `local-prefix`
+    /// registers it, and it comes back here as a static neighbour.
+    ///
+    /// IPv6: VPP v26.06's `ip6-glean` solicits the host.
+    /// The NS is sourced from the interface's LINK-LOCAL, unconditionally
     /// (`ip6_discover_neighbor_inline`), so no global address or
     /// connected prefix is needed and none is configured — only ip6
     /// enabled on the interface, which [`Self::ensure_ip6`] did before
@@ -2356,15 +2514,16 @@ impl ConvergenceEngine {
     /// own, so the host's reply — a unicast NA, ICMPv6, which is never
     /// diverted — lands on the kernel bridge. There neigh-snoop learns it
     /// and installs it `STALE`, fast-path's `local-prefix6` registers it,
-    /// and it comes back here as a static neighbour. The triggering packet
-    /// is dropped either way (glean does not queue): the first-packet cost
-    /// IPv4 pays too.
+    /// and it comes back here as a static neighbour.
     ///
-    /// VPP rate-limits the solicitations itself (`nd_throttle`): at most
-    /// one per (destination, interface) per millisecond per worker, the
-    /// rest counted as `ip6-glean` `throttled`. A stream to a silent
-    /// address therefore solicits up to ~1000 times a second per worker;
-    /// the runbook says what that costs and how to see it.
+    /// VPP rate-limits glean itself (`arp_throttle` / `nd_throttle`): at
+    /// most one request per (destination, interface) per millisecond per
+    /// worker, the rest counted as `throttled`. A stream to a silent
+    /// address therefore gleans up to ~1000 times a second per worker —
+    /// far above the kernel's ~3/s — out the BVI, flooding every member
+    /// of that VLAN, and past the kernel-side `guard` policer, which
+    /// only sees frames the kernel transmits. The counters are exported
+    /// ([`NeighbourCounters`]); the runbook says what normal looks like.
     fn install_attached_routes(&mut self) -> Result<(), EngineError> {
         if self.local_routes.is_empty() {
             return Ok(());
@@ -2510,7 +2669,7 @@ impl ConvergenceEngine {
         // static flag): an entry with a stale MAC must be replaced —
         // that walk is the price of correctness — and a dynamic entry
         // must be replaced with a static one, because VPP can never
-        // refresh it here (MCAM cannot steer ARP).
+        // refresh it here (a probe's unicast reply lands on the kernel).
         let existing = self.dump_static_neighbours()?;
         // Seed the acknowledged ledger from VPP's own answer, so the
         // DELTA path's skip covers adopted entries too — not only ones
@@ -2696,7 +2855,8 @@ impl ConvergenceEngine {
     /// the steady-state delta path — and a second hand-written copy of
     /// this is how the tiers end up disagreeing about a flag. The static
     /// bit especially: VPP must never age these out and never ARP to
-    /// refresh them, because it cannot receive the reply.
+    /// refresh them, because the unicast reply goes to a kernel-owned MAC
+    /// and never reaches VPP.
     fn send_neighbour(
         &mut self,
         ip: IpAddr,
@@ -3032,7 +3192,7 @@ impl ConvergenceEngine {
                 // `set_device` alone makes `resolve` return `Some`, so
                 // routes through this nexthop classify as resolvable and
                 // install — while VPP, which runs without linux-cp and
-                // can never ARP for the adjacency, has nothing to send
+                // cannot resolve a nexthop adjacency itself, has nothing to send
                 // them to. Verification would not catch it either: it
                 // checks a route exists on an interface we own,
                 // deliberately not that its adjacency resolves. That is
@@ -3503,6 +3663,7 @@ impl ConvergenceEngine {
         // The counters died with the process; a stale total would read
         // as "no new drops" across a restart that reset it to zero.
         self.null_drops = None;
+        self.neighbour_counters = None;
         self.port_index = PortIndex::default();
         // The state file's recorded indices belong to the dead instance
         // too. Keeping them meant the replacement process was handed
@@ -4250,6 +4411,52 @@ mod tests {
                     not-a-count          null-node             garbage                    error\n";
         assert_eq!(parse_null_drops(text), 117_027);
         assert_eq!(parse_null_drops(""), 0);
+    }
+
+    /// Glean rows by node AND exact reason: `ip4-arp` shares the
+    /// counter set and must not be summed in, `ip6-glean`'s bare
+    /// "throttled" must not match a longer reason, and the severity
+    /// column (or its absence) must not matter.
+    #[test]
+    fn glean_parsing_matches_node_and_reason() {
+        let text =
+            "   Count                    Node                  Reason               Severity\n\
+                    1380                 ip4-glean       ARP requests sent              info\n\
+                    20                   ip4-glean       ARP requests sent\n\
+                    97                   ip4-glean       ARP requests throttled         info\n\
+                    555                  ip4-arp         ARP requests sent              info\n\
+                    4                    ip6-glean       neighbor solicitations sent    info\n\
+                    2                    ip6-glean       throttled                      info\n\
+                    9                    ip6-glean       throttled-ish                  info\n\
+                    7                    ip6-glean       no buffers                     error\n\
+                    117015               null-node       blackholed packets             error\n";
+        assert_eq!(
+            parse_glean_counters(text),
+            NeighbourCounters {
+                arp_requests_sent: 1400,
+                arp_requests_throttled: 97,
+                ns_sent: 4,
+                ns_throttled: 2,
+                arp_replies_sent: None,
+            }
+        );
+        assert_eq!(parse_glean_counters(""), NeighbourCounters::default());
+    }
+
+    /// `show ip neighbor-stats`: tx replies summed over interfaces, the
+    /// rx half and the `nd:` lines ignored, and an answer with no
+    /// `arp:` line unknown rather than zero.
+    #[test]
+    fn arp_reply_parsing_sums_tx_replies() {
+        let text = "  loop0\n    arp: rx:[reply:0 request:0 gratuitous:0 ] tx:[reply:2 request:0 gratuitous:0 ]\n    \
+                    nd:  rx:[reply:0 request:0 gratuitous:0 ] tx:[reply:50 request:0 gratuitous:0 ]\n  \
+                    bvi100\n    arp: rx:[reply:70 request:900 gratuitous:1 ] tx:[reply:5 request:0 gratuitous:0 ]\n";
+        assert_eq!(parse_arp_replies_sent(text), Some(7));
+        assert_eq!(parse_arp_replies_sent(""), None);
+        assert_eq!(
+            parse_arp_replies_sent("unknown input `neighbor-stats'"),
+            None
+        );
     }
 
     /// A restored cable must not read as dark forever.

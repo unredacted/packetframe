@@ -926,8 +926,8 @@ fn a_refused_neighbour_does_not_cost_the_batch_its_routes() {
 /// This is #115's worst finding arriving through a different door. Giving
 /// the nexthop a device is enough for `NexthopMap::resolve` to return
 /// `Some`, so routes through it classify as resolvable and install — and
-/// VPP, which runs without linux-cp and can never ARP for the adjacency,
-/// has nothing to send them to. Readback verification does not catch it
+/// VPP, which runs without linux-cp and cannot resolve a nexthop
+/// adjacency itself, has nothing to send them to. Readback verification does not catch it
 /// either: it checks a route exists on an interface we own, deliberately
 /// not that its adjacency resolves. Route acks, verify passes, every
 /// packet drops.

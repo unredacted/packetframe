@@ -1908,7 +1908,7 @@ impl Runtime {
                 .is_none_or(|t| now.duration_since(t) >= NULL_DROPS_EVERY);
             if due && c.engine.is_connected() {
                 c.last_null_sample = Some(now);
-                c.engine.sample_null_drops();
+                c.engine.sample_error_counters();
             }
             // A COMPLETED result, if the scanner finished a pass
             // since the last look. Never a scan performed here: this
@@ -2041,6 +2041,7 @@ impl Runtime {
             shadowed_routes: c.engine.shadowed_routes(),
             kernel_delivered_routes: c.engine.kernel_delivered_routes(),
             null_drops: c.engine.null_drops(),
+            neighbour_counters: c.engine.neighbour_counters(),
             neighbours_unplaced: c
                 .engine
                 .unplaced_neighbours()
@@ -2292,6 +2293,9 @@ pub struct RuntimeStatus {
     pub kernel_delivered_routes: u64,
     /// Cumulative null-node drops as last sampled, absent until read.
     pub null_drops: Option<u64>,
+    /// VPP's glean and ARP-reply transmit counters as last sampled,
+    /// absent until read. See [`crate::engine::NeighbourCounters`].
+    pub neighbour_counters: Option<crate::engine::NeighbourCounters>,
     /// Bridge neighbours the FDB has never placed behind a member port,
     /// `"<nexthop> on <device>"` each: their routes are unresolvable.
     pub neighbours_unplaced: Vec<String>,

@@ -404,9 +404,9 @@ fn a_refused_derived_delete_is_retried() {
 /// Static neighbours must be programmed, on the index VPP assigned, and
 /// **before** the routes that depend on them.
 ///
-/// VPP starts without `linux-cp` and MCAM rules match IP fields, so an
-/// ARP frame can never be steered to it — VPP physically cannot learn a
-/// neighbour. Skip this and route installs are still acknowledged and
+/// VPP starts without `linux-cp` and MCAM rules match IP fields, so the
+/// unicast reply to any ARP it sends lands on the kernel — VPP cannot
+/// learn a nexthop's neighbour. Skip this and route installs are still acknowledged and
 /// readback verification still passes (it checks a path exists on an
 /// interface we own, not that the adjacency resolves) while every packet
 /// is dropped on an incomplete adjacency. Nothing else in the module
@@ -908,8 +908,8 @@ fn a_refused_neighbour_hands_the_whole_delta_batch_back() {
 /// This is why the fix cannot simply queue the batch's routes and return
 /// the error. `set_device` alone makes `resolve` answer `Some`, so every
 /// route through the nexthop classifies installable and installs — while
-/// VPP, which runs without linux-cp and can never ARP for the adjacency,
-/// has nothing to send them to. Readback verification checks that a route
+/// VPP, which runs without linux-cp and cannot resolve a nexthop
+/// adjacency itself, has nothing to send them to. Readback verification checks that a route
 /// exists on an interface we own, deliberately not that its adjacency
 /// resolves, so it passes. That is #115's worst finding: "a route through
 /// an unprogrammed adjacency installs cleanly, verifies cleanly, and drops
@@ -2122,7 +2122,7 @@ fn null_drops_sample_over_cli_inband() {
     let mut e = engine_for(&fake);
     assert!(e.api_ready());
     assert_eq!(e.null_drops(), None, "absent until sampled");
-    e.sample_null_drops();
+    e.sample_error_counters();
     assert_eq!(e.null_drops(), Some(117_015));
     e.on_process_gone();
     assert_eq!(
@@ -2130,6 +2130,48 @@ fn null_drops_sample_over_cli_inband() {
         None,
         "the counters died with the process; a stale total would read as quiet"
     );
+}
+
+/// The glean and ARP-reply sample rides the same tick: glean rows out of
+/// the one `show errors`, the real reply count out of a second
+/// `show ip neighbor-stats` summed over interfaces — and all of it
+/// absent again once the process is gone.
+#[test]
+fn glean_counters_sample_over_cli_inband() {
+    let fake = Fake::start_behaving(
+        "glean",
+        Behaviour {
+            show_errors: "   Count            Node            Reason        Severity\n\
+                          1380            ip4-glean       ARP requests sent          info\n\
+                          97              ip4-glean       ARP requests throttled     info\n\
+                          4               ip6-glean       neighbor solicitations sent info\n\
+                          2               ip6-glean       throttled                  info\n\
+                          5000            arp-reply       ARP replies sent           info\n",
+            neighbor_stats: "  loop0\n\
+                             \x20   arp: rx:[reply:0 request:0 gratuitous:0 ] tx:[reply:0 request:0 gratuitous:0 ]\n\
+                             \x20   nd:  rx:[reply:0 request:0 gratuitous:0 ] tx:[reply:0 request:0 gratuitous:0 ]\n\
+                             \x20 bvi100\n\
+                             \x20   arp: rx:[reply:9 request:40 gratuitous:0 ] tx:[reply:3 request:0 gratuitous:0 ]\n\
+                             \x20   nd:  rx:[reply:1 request:0 gratuitous:0 ] tx:[reply:0 request:4 gratuitous:0 ]\n",
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    assert_eq!(e.neighbour_counters(), None, "absent until sampled");
+    e.sample_error_counters();
+    let c = e.neighbour_counters().expect("sampled");
+    assert_eq!(c.arp_requests_sent, 1380);
+    assert_eq!(c.arp_requests_throttled, 97);
+    assert_eq!(c.ns_sent, 4);
+    assert_eq!(c.ns_throttled, 2);
+    assert_eq!(
+        c.arp_replies_sent,
+        Some(3),
+        "the transmit counter, not arp-reply's over-counting error row"
+    );
+    e.on_process_gone();
+    assert_eq!(e.neighbour_counters(), None);
 }
 
 /// B3 v2 through a BVI: an IX peer's neighbour and routes sit on the

@@ -209,6 +209,10 @@ pub struct Behaviour {
     /// VPP answer (no counters yet), so the default keeps the
     /// null-drop gauge absent-or-zero without special-casing.
     pub show_errors: &'static str,
+    /// What `cli_inband "show ip neighbor-stats"` answers. Empty (the
+    /// default) parses as no `arp:` line, so the ARP-reply gauge stays
+    /// absent unless a test asks for it.
+    pub neighbor_stats: &'static str,
     /// Drop the connection after this many route ops.
     pub hangup_after: Option<usize>,
     /// Reject this many *deletes* with a non-zero retval before
@@ -1514,6 +1518,8 @@ fn serve(
                     fib6_summary(&table6.lock().unwrap())
                 } else if cmd.contains("fib summary") && behaviour.track_routes {
                     fib_summary(&table.lock().unwrap())
+                } else if cmd == "show ip neighbor-stats" {
+                    behaviour.neighbor_stats.to_string()
                 } else if cmd.contains("fib summary") {
                     // Not a table this fake can describe: an answer the
                     // client must refuse to fingerprint.
