@@ -1538,7 +1538,8 @@ hop limit 1.
 **Lifetime.** Built on the first target that diverts IPv6 (at start, or
 by the `packetframe reconfigure` that adds `v6-divert`), and kept until
 the module stops or `packetframe detach --all`, both of which remove the
-/128s, the VPP host interface, the veth and the nft table. A
+/128s, the VPP host interface, the veth and the nft table — `detach
+--all` even when no state file is left, since the veth can outlive it. A
 `--keep-vpp` restart leaves all of it in place, and the next daemon
 re-verifies it rather than trusting it: it finds the host interface by
 name (never a second socket on the veth), re-asserts its settings,
@@ -1619,8 +1620,17 @@ type — TCP or UDP — MAC, VLAN id and mask, L4 port, the `FLOW_EXT` /
 `FLOW_MAC_EXT` bits). A v6 half held back for the hand-back path is not
 drift: the audit compares against what may be installed, and the
 `v6-handback` row carries the reason. The hand-back path is re-checked
-every 30 s — veth, guard, VPP interface — and rebuilt when a part has
-gone. The **exemption tripwire (`exempt-drift`) is v4-only**: a v6
+every 30 s and repaired when a part has gone or changed: the veth; the
+guard, compared structurally (`nft -j`: both hooked chains with type,
+hook, priority and policy, and exactly its rules in order — any edit to
+the table counts as gone, and the table is reloaded); VPP's interface
+(one bound to a veth that no longer exists — wrong MAC, or no link — is
+deleted and recreated, never adopted); and every /128 and the static
+neighbour, read back from VPP. While a piece is being repaired the path
+reads not ready, so the v6 half is held back. An address event whose
+re-read fails holds it back too (the new address may have no /128 yet);
+a failed periodic re-read with nothing heard keeps the last good address
+set, so one flaky read does not churn the v6 rules. The **exemption tripwire (`exempt-drift`) is v4-only**: a v6
 diversion's correctness rests on VPP's v6 FIB, and the keeps are what
 protect the router's own services.
 

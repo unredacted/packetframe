@@ -23,8 +23,8 @@ use packetframe_vpp_offload::attach::{AttachMode, PortAttach};
 use packetframe_vpp_offload::engine::{ConvergenceEngine, RouteSource, SourceChanges};
 use packetframe_vpp_offload::fib_sync::FamilyPolicy;
 use packetframe_vpp_offload::handback::{
-    eui64_link_local, router_owned, HostAddr, HostCheck, HostFacts, HostSide, RT_SCOPE_UNIVERSE,
-    VPP_HOST_IF,
+    eui64_link_local, router_owned, AddrReadError, HostAddr, HostCheck, HostFacts, HostSide,
+    CHECK_EVERY, RETRY_EVERY, RT_SCOPE_UNIVERSE, VPP_HOST_IF,
 };
 use packetframe_vpp_offload::runtime::{NoResources, NullStore, Runtime, SteerOutcome};
 
@@ -52,6 +52,12 @@ struct HostState {
     heard: bool,
     ensures: usize,
     torn_down: bool,
+    /// Every address read fails while set. `heard` stays set across a
+    /// failure, as the kernel side keeps a change pending until a read
+    /// succeeds — so the failure is pending exactly when a change was.
+    fail_reads: bool,
+    /// Report a periodic re-read as due, with nothing heard.
+    periodic_due: bool,
 }
 
 impl FakeHost {
@@ -93,11 +99,22 @@ impl HostSide for FakeHost {
             guard: true,
         }
     }
-    fn owned_addrs(&mut self, facts: &HostFacts) -> Result<Option<BTreeSet<Ipv6Addr>>, String> {
+    fn owned_addrs(
+        &mut self,
+        facts: &HostFacts,
+    ) -> Result<Option<BTreeSet<Ipv6Addr>>, AddrReadError> {
         let mut s = self.0.lock().unwrap();
-        if !std::mem::take(&mut s.heard) {
+        if !s.heard && !s.periodic_due {
             return Ok(None);
         }
+        if s.fail_reads {
+            return Err(AddrReadError {
+                pending: s.heard,
+                why: "netlink recv: EIO".into(),
+            });
+        }
+        s.heard = false;
+        s.periodic_due = false;
         Ok(Some(router_owned(
             &s.addrs,
             &[facts.kernel_ifindex, facts.vpp_ifindex],
@@ -451,6 +468,145 @@ fn a_surviving_path_is_reverified_not_trusted() {
     want.sort();
     assert_eq!(ops, want);
     assert_eq!(held(&fake), owned());
+    assert!(e.handback_ready());
+}
+
+/// A host interface of the right NAME bound to a veth that is gone — here
+/// wearing another MAC, as one created on a since-recreated `pfpunt0-vpp`
+/// does — is deleted and recreated, never adopted: its socket reads a
+/// dead ifindex, and adopting it would re-adopt a down interface forever.
+#[test]
+fn a_stale_host_interface_is_recreated_not_adopted() {
+    let fake = Fake::start_behaving("hb-stale", behaviour());
+    fake.af_packets.lock().unwrap().push((
+        VPP_HOST_IF.into(),
+        AF_PACKET_BASE,
+        [0x02, 0, 0, 0, 0, 0xee],
+    ));
+    let host = host();
+    let mut e = engine(&fake, &host);
+    converge(&mut e, &Mirror(1));
+    let events = fake.drain_events();
+    let delete = position(
+        &events,
+        |ev| matches!(ev, Event::Msg(m) if m == &format!("af_packet_delete {VPP_HOST_IF}")),
+    );
+    let create = position(
+        &events,
+        |ev| matches!(ev, Event::Msg(m) if m.starts_with("af_packet_create ")),
+    );
+    assert!(delete < create, "the stale one goes before the new one");
+    assert_eq!(
+        *fake.af_packets.lock().unwrap(),
+        vec![(VPP_HOST_IF.to_string(), AF_PACKET_BASE, VPP_MAC)],
+        "one host interface, on the current veth end"
+    );
+    e.service_handback(true).expect("sync");
+    assert!(e.handback_ready());
+}
+
+/// The acknowledgement cache is re-read on every check. A /128 removed
+/// from VPP behind the module, one replaced to point elsewhere, and the
+/// static neighbour deleted are all noticed: the path reads NOT ready —
+/// the v6 gate closed — until the repair, and the next sync puts every
+/// piece back.
+#[test]
+fn the_check_reads_back_the_128s_and_the_neighbour_and_repairs_them() {
+    let fake = Fake::start_behaving("hb-revalidate", behaviour());
+    let host = host();
+    let mut e = engine(&fake, &host);
+    converge(&mut e, &Mirror(1));
+    e.service_handback(true).expect("sync");
+    assert!(e.handback_ready());
+    let _ = fake.drain_events();
+
+    let gone = addr("2001:db8:ee::5");
+    let hijacked = addr("2001:db8:100::1");
+    {
+        let mut t = fake.routes6.lock().unwrap();
+        t.remove(&(gone.octets(), 128));
+        let paths = t.get_mut(&(hijacked.octets(), 128)).expect("installed");
+        paths[0].sw_if_index = fake_vpp::ASSIGNED_INDEX;
+    }
+    fake.neighbours6.lock().unwrap().clear();
+
+    // The check, with no sync yet: noticed, and the gate is shut.
+    let later = std::time::Instant::now() + CHECK_EVERY;
+    e.service_handback_at(false, later).expect("check");
+    assert!(!e.handback_ready(), "a missing piece closes the gate");
+    let events = fake.drain_events();
+    assert!(
+        events.iter().any(|ev| matches!(
+            ev,
+            Event::Neighbour { sw_if_index, is_add: true, mac, .. }
+                if *sw_if_index == AF_PACKET_BASE && *mac == KERNEL_MAC
+        )),
+        "the neighbour is re-added on the spot"
+    );
+
+    // The sync re-installs both /128s, and the path is ready again.
+    e.service_handback_at(true, later).expect("sync");
+    let mut ops = handback_ops(&fake.drain_events());
+    ops.sort();
+    let mut want = vec![(gone, true), (hijacked, true)];
+    want.sort();
+    assert_eq!(ops, want);
+    assert_eq!(held(&fake), owned());
+    assert!(e.handback_ready());
+}
+
+/// An address event whose read then fails leaves the host's address set
+/// UNKNOWN — the new address may already be answering with no /128 behind
+/// it — so the gate closes until a read succeeds. A failed PERIODIC
+/// re-read, with nothing heard, keeps the last good set and the gate open:
+/// a flaky read must not churn every v6 rule.
+#[test]
+fn a_failed_address_read_closes_the_gate_only_when_a_change_was_pending() {
+    let fake = Fake::start_behaving("hb-addrs", behaviour());
+    let host = host();
+    let mut e = engine(&fake, &host);
+    converge(&mut e, &Mirror(1));
+    e.service_handback(true).expect("sync");
+    assert!(e.handback_ready());
+    let t0 = std::time::Instant::now();
+
+    // Periodic, nothing heard: the last good set stands.
+    {
+        let mut s = host.0.lock().unwrap();
+        s.fail_reads = true;
+        s.periodic_due = true;
+    }
+    e.service_handback_at(true, t0)
+        .expect("a read failure is not a transport one");
+    assert!(e.handback_ready(), "{:?}", e.handback_status());
+    let st = e.handback_status().unwrap();
+    assert!(
+        st.error
+            .as_deref()
+            .is_some_and(|m| m.contains("the last good set stands")),
+        "{st:?}"
+    );
+
+    // An address added, and the read after it fails: the gate shuts.
+    host.set(&[
+        (2, "2001:db8:ffff::1", RT_SCOPE_UNIVERSE),
+        (3, "2001:db8:ee::5", RT_SCOPE_UNIVERSE),
+        (4, "2001:db8:100::1", RT_SCOPE_UNIVERSE),
+        (7, "2001:db8:7::7", RT_SCOPE_UNIVERSE),
+        (9, "2001:db8:9::9", RT_SCOPE_UNIVERSE),
+    ]);
+    let t1 = t0 + RETRY_EVERY;
+    e.service_handback_at(true, t1).expect("read fails again");
+    assert!(
+        !e.handback_ready(),
+        "a pending change that could not be read"
+    );
+    assert!(held(&fake).len() == 4, "nothing guessed");
+
+    // The read recovers: the new /128 goes in and the gate opens.
+    host.0.lock().unwrap().fail_reads = false;
+    e.service_handback_at(true, t1 + RETRY_EVERY).expect("sync");
+    assert!(held(&fake).contains(&addr("2001:db8:9::9")));
     assert!(e.handback_ready());
 }
 

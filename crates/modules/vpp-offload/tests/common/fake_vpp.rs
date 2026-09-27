@@ -76,6 +76,12 @@ pub const AF_PACKET_TX: u64 = 42;
 /// mac)`. VPP state, so it outlives a connection.
 pub type AfPackets = std::sync::Arc<std::sync::Mutex<Vec<(String, u32, [u8; 6])>>>;
 
+/// One v6 neighbour: `(ip, sw_if_index, mac, flags)`.
+pub type Neighbour6 = ([u8; 16], u32, [u8; 6], u8);
+
+/// The fake's v6 neighbour table.
+pub type Neighbours6 = std::sync::Arc<std::sync::Mutex<Vec<Neighbour6>>>;
+
 /// Link-layer address the fake mirror hands out for its one neighbour.
 pub const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
@@ -162,6 +168,9 @@ pub struct Fake {
     /// Host interfaces (`af_packet_create_v3`). Seeding it before the
     /// client connects models a surviving VPP that already has one.
     pub af_packets: AfPackets,
+    /// The v6 neighbour table — shared so a test can play another client
+    /// removing an entry behind the module's back.
+    pub neighbours6: Neighbours6,
     _dir: tempdir::TempDir,
     events: Receiver<Event>,
 }
@@ -390,6 +399,10 @@ impl Fake {
         let ip6 = ip6_enabled.clone();
         let af_packets: AfPackets = Default::default();
         let afp = af_packets.clone();
+        let neighbours6: Neighbours6 = std::sync::Arc::new(std::sync::Mutex::new(
+            behaviour.existing_neighbours6.to_vec(),
+        ));
+        let n6 = neighbours6.clone();
         thread::spawn(move || {
             let mut b = behaviour;
             // VPP's neighbour table, OUTSIDE the accept loop, because it
@@ -400,8 +413,6 @@ impl Fake {
             let mut neighbours: Vec<([u8; 4], u32, [u8; 6], u8)> = b.existing_neighbours.to_vec();
             // The v6 neighbour table, kept apart for the same reason the
             // route tables are.
-            let mut neighbours6: Vec<([u8; 16], u32, [u8; 6], u8)> =
-                b.existing_neighbours6.to_vec();
             // Likewise the route table, for `track_routes`.
             {
                 let mut routes = table.lock().unwrap();
@@ -426,7 +437,7 @@ impl Fake {
                     &tx,
                     b,
                     &mut neighbours,
-                    &mut neighbours6,
+                    &n6,
                     &table,
                     &table6,
                     &ip6,
@@ -446,6 +457,7 @@ impl Fake {
             routes6,
             ip6_enabled,
             af_packets,
+            neighbours6,
             _dir: dir,
             events: rx,
         }
@@ -466,7 +478,7 @@ fn serve(
     tx: &Sender<Event>,
     mut behaviour: Behaviour,
     neighbours: &mut Vec<([u8; 4], u32, [u8; 6], u8)>,
-    neighbours6: &mut Vec<([u8; 16], u32, [u8; 6], u8)>,
+    neighbours6: &std::sync::Mutex<Vec<Neighbour6>>,
     table: &std::sync::Mutex<RouteTable>,
     table6: &std::sync::Mutex<RouteTable6>,
     ip6_enabled: &std::sync::Mutex<std::collections::BTreeSet<u32>>,
@@ -848,7 +860,8 @@ fn serve(
                     .expect("decodes as a neighbour dump")
                     .af;
                 if want == ADDRESS_IP6 {
-                    for &(ip, sw_if_index, mac, flags) in neighbours6.iter() {
+                    let snapshot = neighbours6.lock().unwrap().clone();
+                    for &(ip, sw_if_index, mac, flags) in snapshot.iter() {
                         let mut d = reply_head("ip_neighbor_details");
                         IpNeighborDetails {
                             context: ctx,
@@ -917,6 +930,7 @@ fn serve(
                 // bytes would surface as a bogus v4 neighbour.
                 if retval == 0 && n.neighbor.ip_address.af == ADDRESS_IP6 {
                     let key = n.neighbor.ip_address.un.0;
+                    let mut neighbours6 = neighbours6.lock().unwrap();
                     neighbours6
                         .retain(|(ip, idx, _, _)| !(*ip == key && *idx == n.neighbor.sw_if_index));
                     if n.is_add {

@@ -854,12 +854,23 @@ impl ConvergenceEngine {
     /// socket like every other; a refusal leaves the path not ready and is
     /// on its status.
     pub fn service_handback(&mut self, sync: bool) -> Result<(), EngineError> {
+        self.service_handback_at(sync, std::time::Instant::now())
+    }
+
+    /// [`Self::service_handback`] against a given clock: the path's check
+    /// and retry cadences are measured on it, so a test can reach the
+    /// next check without waiting it out.
+    pub fn service_handback_at(
+        &mut self,
+        sync: bool,
+        now: std::time::Instant,
+    ) -> Result<(), EngineError> {
         if self.handback.is_none() {
             return Ok(());
         }
         self.arm_timeout();
         let hb = self.handback.as_mut().expect("checked just above");
-        match hb.service(self.transport.as_mut(), std::time::Instant::now(), sync) {
+        match hb.service(self.transport.as_mut(), now, sync) {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.disconnect();

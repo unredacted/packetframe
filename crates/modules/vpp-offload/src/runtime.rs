@@ -4077,11 +4077,12 @@ impl Effects for EffectsView {
         // teardown reported clean, so a live VPP cannot be DMAing into
         // what it releases.
         let mut c = self.core.borrow_mut();
-        let released = c.resources.release();
-        // The IPv6 hand-back path's kernel half — its VPP half died with
-        // the process. Reported, never fatal: the VFs are the resources
-        // whose release must not be blocked, and `packetframe detach
-        // --all` removes the veth and the guard by name.
+        // The IPv6 hand-back path's kernel half first — its VPP half died
+        // with the process — while the state file still exists, so a
+        // leftover is never the only trace of this module. Reported, never
+        // fatal: the VFs are the resources whose release must not be
+        // blocked, and `packetframe detach --all` removes the veth and the
+        // guard by name, with or without a state file.
         if let Err(e) = c.engine.teardown_handback() {
             tracing::warn!(
                 error = %e,
@@ -4089,7 +4090,7 @@ impl Effects for EffectsView {
                  removes it"
             );
         }
-        released
+        c.resources.release()
     }
 }
 

@@ -72,9 +72,9 @@ use crate::vpp_api::generated::{
     AfPacketCreateV3, AfPacketCreateV3Reply, AfPacketDelete, AfPacketDeleteReply, AfPacketDetails,
     AfPacketDump, CliInband, CliInbandReply, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply,
     IpNeighborDetails, IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
-    IpRouteDump, IpTable, SwInterfaceSetFlags, SwInterfaceSetFlagsReply, SwInterfaceSetMtu,
-    SwInterfaceSetMtuReply, ADDRESS_IP6, AF_PACKET_API_FLAG_QDISC_BYPASS,
-    AF_PACKET_API_MODE_ETHERNET,
+    IpRouteDump, IpRouteLookup, IpRouteLookupReply, IpTable, SwInterfaceSetFlags,
+    SwInterfaceSetFlagsReply, SwInterfaceSetMtu, SwInterfaceSetMtuReply, ADDRESS_IP6,
+    AF_PACKET_API_FLAG_QDISC_BYPASS, AF_PACKET_API_MODE_ETHERNET,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -210,14 +210,154 @@ pub fn nft_ruleset() -> String {
     )
 }
 
-/// Whether `nft list table` output is the guard [`nft_ruleset`] loads —
-/// both chains, the accept and both drops, on the veth.
-pub fn guard_matches(listing: &str) -> bool {
-    let on_veth = format!("iifname \"{KERNEL_IF}\"");
-    listing.contains("chain input")
-        && listing.contains("chain forward")
-        && listing.contains("established,related accept")
-        && listing.matches(&on_veth).count() >= 3
+/// The guard's shape, as the check compares it: per chain, its base-chain
+/// header `(type, hook, priority, policy)` and its rules in order, each a
+/// list of normalized terms.
+type GuardShape = Vec<(String, (String, String, i64, String), Vec<Vec<String>>)>;
+
+/// What [`nft_ruleset`] loads, in [`GuardShape`] form — the one shape the
+/// check accepts. Anything else in the table (an extra rule, a reordered
+/// accept, a `policy drop`, another priority, a third chain) is not the
+/// guard: it is a table someone edited, and the guard is reloaded.
+fn expected_guard() -> GuardShape {
+    let on_veth = format!("iifname=={KERNEL_IF}");
+    let hdr = |hook: &str| {
+        (
+            "filter".to_string(),
+            hook.to_string(),
+            0,
+            "accept".to_string(),
+        )
+    };
+    vec![
+        (
+            "input".into(),
+            hdr("input"),
+            vec![
+                vec![
+                    on_veth.clone(),
+                    "ct state in established,related".into(),
+                    "accept".into(),
+                ],
+                vec![on_veth.clone(), "drop".into()],
+            ],
+        ),
+        (
+            "forward".into(),
+            hdr("forward"),
+            vec![vec![on_veth, "drop".into()]],
+        ),
+    ]
+}
+
+/// Whether `nft -j list table inet packetframe_handback` output is exactly
+/// the guard: the two hooked base chains with type, hook, priority and
+/// policy as loaded, and exactly the loaded rules, in order. Compared
+/// structurally from the JSON, never by substring — a listing that merely
+/// CONTAINS the right text (an `accept` rule inserted above the drop, say)
+/// would otherwise pass while guarding nothing.
+pub fn guard_matches_json(listing: &str) -> bool {
+    parse_guard_json(listing).is_some_and(|shape| shape == expected_guard())
+}
+
+fn parse_guard_json(listing: &str) -> Option<GuardShape> {
+    let v: serde_json::Value = serde_json::from_str(listing).ok()?;
+    let mut chains: GuardShape = Vec::new();
+    for item in v.get("nftables")?.as_array()? {
+        if let Some(c) = item.get("chain") {
+            let name = c.get("name")?.as_str()?.to_string();
+            let header = (
+                c.get("type")?.as_str()?.to_string(),
+                c.get("hook")?.as_str()?.to_string(),
+                c.get("prio")?.as_i64()?,
+                c.get("policy")?.as_str()?.to_string(),
+            );
+            chains.push((name, header, Vec::new()));
+        } else if let Some(r) = item.get("rule") {
+            let chain = r.get("chain")?.as_str()?;
+            let terms = r
+                .get("expr")?
+                .as_array()?
+                .iter()
+                .map(json_term)
+                .collect::<Option<Vec<String>>>()?;
+            chains
+                .iter_mut()
+                .find(|(n, _, _)| n == chain)?
+                .2
+                .push(terms);
+        }
+    }
+    Some(chains)
+}
+
+/// One rule expression, normalized: `iifname==<name>`, `ct state in
+/// <sorted,states>`, or the verdict. Anything else is kept verbatim, so it
+/// can only ever fail the comparison.
+fn json_term(e: &serde_json::Value) -> Option<String> {
+    if let Some(m) = e.get("match") {
+        let left = m.get("left")?;
+        let right = m.get("right")?;
+        if left.pointer("/meta/key").and_then(|k| k.as_str()) == Some("iifname")
+            && m.get("op")?.as_str()? == "=="
+        {
+            return Some(format!("iifname=={}", right.as_str()?));
+        }
+        if left.pointer("/ct/key").and_then(|k| k.as_str()) == Some("state") {
+            // `established,related` prints as a list, or a set of one
+            // version's shape; `in` and `==` both mean membership here.
+            let list = right.get("set").unwrap_or(right);
+            let mut states: Vec<&str> = match list {
+                serde_json::Value::Array(a) => {
+                    a.iter().map(|s| s.as_str()).collect::<Option<_>>()?
+                }
+                serde_json::Value::String(s) => vec![s.as_str()],
+                _ => return None,
+            };
+            states.sort_unstable();
+            return matches!(m.get("op")?.as_str()?, "in" | "==")
+                .then(|| format!("ct state in {}", states.join(",")));
+        }
+    }
+    for verdict in ["accept", "drop"] {
+        if e.get(verdict).is_some() {
+            return Some(verdict.to_string());
+        }
+    }
+    Some(e.to_string())
+}
+
+/// The text-listing fallback, for an `nft` built without JSON output:
+/// exactly the lines [`nft_ruleset`]'s table lists as, in order, with
+/// whitespace collapsed and blank lines, `# handle` comments and the
+/// table's own braces as the only tolerated differences. Still whole-table
+/// and ordered — not a substring test.
+pub fn guard_matches_text(listing: &str) -> bool {
+    let norm = |s: &str| {
+        let s = s.split(" # ").next().unwrap_or(s);
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let got: Vec<String> = listing
+        .lines()
+        .map(norm)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let want: Vec<String> = [
+        format!("table inet {NFT_TABLE} {{"),
+        "chain input {".into(),
+        "type filter hook input priority filter; policy accept;".into(),
+        format!("iifname \"{KERNEL_IF}\" ct state established,related accept"),
+        format!("iifname \"{KERNEL_IF}\" drop"),
+        "}".into(),
+        "chain forward {".into(),
+        "type filter hook forward priority filter; policy accept;".into(),
+        format!("iifname \"{KERNEL_IF}\" drop"),
+        "}".into(),
+        "}".into(),
+    ]
+    .into_iter()
+    .collect();
+    got == want
 }
 
 /// `tx packets` for `name` from VPP's `show interface <name>` text.
@@ -285,10 +425,28 @@ pub trait HostSide {
     /// The router-owned addresses ([`router_owned`]) if they may have
     /// changed since the last call — `Some` on the first call, after any
     /// RTM_NEWADDR/RTM_DELADDR, and on a periodic resync; `None` when
-    /// nothing has been heard.
-    fn owned_addrs(&mut self, facts: &HostFacts) -> Result<Option<BTreeSet<Ipv6Addr>>, String>;
+    /// nothing has been heard. A failed read says whether a change was
+    /// PENDING ([`AddrReadError::pending`]), and a pending change stays
+    /// pending — re-read on every call — until a read succeeds.
+    fn owned_addrs(
+        &mut self,
+        facts: &HostFacts,
+    ) -> Result<Option<BTreeSet<Ipv6Addr>>, AddrReadError>;
     /// Remove the guard table and the veth pair. Absent is success.
     fn teardown(&mut self) -> Result<(), String>;
+}
+
+/// A failed read of the host's addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddrReadError {
+    /// An address event had arrived (or the watch overran or broke, so
+    /// events may have been lost) and the read that would have followed
+    /// it failed: the host's address set is UNKNOWN, and a /128 may be
+    /// missing for an address the router now answers on. `false` for a
+    /// failed periodic re-read with nothing heard since the last good
+    /// one, which leaves that set standing.
+    pub pending: bool,
+    pub why: String,
 }
 
 /// A refusal or transport failure from VPP while building or syncing the
@@ -345,7 +503,12 @@ pub struct VppHalf {
     pub bound_to: (u32, u32),
     /// The kernel veth's link-local, which the static neighbour resolves.
     pub next_hop: Ipv6Addr,
-    /// The /128s VPP has ACKNOWLEDGED holding through this interface.
+    /// The kernel veth's MAC: the static neighbour's link-layer address.
+    pub next_hop_mac: [u8; 6],
+    /// The /128s VPP has ACKNOWLEDGED holding through this interface —
+    /// an acknowledgement cache, re-read against VPP on every check
+    /// ([`revalidate`]), since another client or an operator can remove
+    /// or replace one behind it.
     pub routes: BTreeSet<Ipv6Addr>,
 }
 
@@ -361,10 +524,34 @@ pub struct VppHalf {
 /// and walks every route through it.
 pub fn ensure_vpp(t: &mut Transport, facts: &HostFacts) -> Result<VppHalf, HandbackError> {
     let existing: Vec<AfPacketDetails> = t.dump(AfPacketDump { context: 0 })?;
-    let adopted = existing
+    let mut adopted = existing
         .iter()
         .find(|d| d.host_if_name == VPP_HOST_IF)
         .map(|d| d.sw_if_index);
+    // A host interface of that NAME may be bound to a veth that no longer
+    // exists: `pfpunt0` deleted and recreated while VPP survived (a
+    // `--keep-vpp` restart across it, an operator's `ip link del`). Its
+    // socket then reads a dead ifindex forever, and adopting it would
+    // re-adopt a down interface on every check. Two tells, either enough:
+    // it does not wear the current veth end's MAC (we create it wearing
+    // that MAC, and a recreated veth gets a new one), or its link is down
+    // while that end is up (ensure brought it up just before this).
+    if let Some(idx) = adopted {
+        let bound = crate::attach::interfaces(t)?
+            .into_iter()
+            .find(|i| i.sw_if_index == idx)
+            .is_some_and(|i| i.l2_address == facts.vpp_mac && i.link_up());
+        if !bound {
+            tracing::warn!(
+                sw_if_index = idx,
+                host_if = VPP_HOST_IF,
+                "VPP's hand-back host interface is bound to a veth that is gone (wrong MAC or \
+                 no link); deleting and recreating it"
+            );
+            delete_host_if(t)?;
+            adopted = None;
+        }
+    }
     let sw_if_index = match adopted {
         Some(idx) => {
             tracing::info!(
@@ -406,36 +593,7 @@ pub fn ensure_vpp(t: &mut Transport, facts: &HostFacts) -> Result<VppHalf, Handb
     })?;
 
     let next_hop = eui64_link_local(facts.kernel_mac);
-    let neighbours: Vec<IpNeighborDetails> = t.dump(IpNeighborDump {
-        context: 0,
-        sw_if_index,
-        af: ADDRESS_IP6,
-    })?;
-    let present = neighbours.iter().any(|d| {
-        d.neighbor.sw_if_index == sw_if_index
-            && crate::fib_sync::from_address(&d.neighbor.ip_address) == Some(IpAddr::V6(next_hop))
-            && d.neighbor.mac_address == facts.kernel_mac
-            && d.neighbor.flags == crate::engine::IP_NEIGHBOR_STATIC
-    });
-    if !present {
-        let reply: IpNeighborAddDelReply = t.request(IpNeighborAddDel {
-            context: 0,
-            is_add: true,
-            neighbor: IpNeighbor {
-                sw_if_index,
-                flags: crate::engine::IP_NEIGHBOR_STATIC,
-                mac_address: facts.kernel_mac,
-                ip_address: crate::fib_sync::to_address(IpAddr::V6(next_hop)),
-            },
-        })?;
-        if reply.retval != 0 {
-            return Err(refused(
-                "ip_neighbor_add_del",
-                reply.retval,
-                format!("static neighbour {next_hop} on the hand-back interface"),
-            ));
-        }
-    }
+    ensure_neighbour(t, sw_if_index, next_hop, facts.kernel_mac)?;
     // A just-created interface has no routes through it; only an adopted
     // one is worth a table read.
     let routes = if adopted.is_some() {
@@ -447,8 +605,95 @@ pub fn ensure_vpp(t: &mut Transport, facts: &HostFacts) -> Result<VppHalf, Handb
         sw_if_index,
         bound_to: (facts.kernel_ifindex, facts.vpp_ifindex),
         next_hop,
+        next_hop_mac: facts.kernel_mac,
         routes,
     })
+}
+
+/// Make sure VPP holds the static neighbour the /128s resolve through,
+/// adding it only when the dump does not show it exactly — a re-add
+/// replaces the entry and walks every route through it. `true` when it
+/// had to be added.
+fn ensure_neighbour(
+    t: &mut Transport,
+    sw_if_index: u32,
+    next_hop: Ipv6Addr,
+    mac: [u8; 6],
+) -> Result<bool, HandbackError> {
+    let neighbours: Vec<IpNeighborDetails> = t.dump(IpNeighborDump {
+        context: 0,
+        sw_if_index,
+        af: ADDRESS_IP6,
+    })?;
+    let present = neighbours.iter().any(|d| {
+        d.neighbor.sw_if_index == sw_if_index
+            && crate::fib_sync::from_address(&d.neighbor.ip_address) == Some(IpAddr::V6(next_hop))
+            && d.neighbor.mac_address == mac
+            && d.neighbor.flags == crate::engine::IP_NEIGHBOR_STATIC
+    });
+    if present {
+        return Ok(false);
+    }
+    let reply: IpNeighborAddDelReply = t.request(IpNeighborAddDel {
+        context: 0,
+        is_add: true,
+        neighbor: IpNeighbor {
+            sw_if_index,
+            flags: crate::engine::IP_NEIGHBOR_STATIC,
+            mac_address: mac,
+            ip_address: crate::fib_sync::to_address(IpAddr::V6(next_hop)),
+        },
+    })?;
+    if reply.retval != 0 {
+        return Err(refused(
+            "ip_neighbor_add_del",
+            reply.retval,
+            format!("static neighbour {next_hop} on the hand-back interface"),
+        ));
+    }
+    Ok(true)
+}
+
+/// Read back what readiness rests on, cheaply: an exact lookup per /128
+/// the cache says VPP holds (a handful, not a table dump), and the
+/// interface's neighbour dump. A /128 that is gone, or no longer points
+/// at the hand-back interface and next hop, leaves the cache — so the
+/// path reads not ready until the next sync puts it back. A missing or
+/// altered neighbour is re-added on the spot. Returns the /128s dropped.
+pub fn revalidate(t: &mut Transport, half: &mut VppHalf) -> Result<usize, HandbackError> {
+    let mut lost = 0usize;
+    for addr in half.routes.clone() {
+        let reply: IpRouteLookupReply = t.request(IpRouteLookup {
+            context: 0,
+            table_id: 0,
+            exact: 1,
+            prefix: crate::fib_sync::to_prefix(IpPrefix::V6 {
+                addr: addr.octets(),
+                prefix_len: 128,
+            }),
+        })?;
+        let ours = reply.retval == 0
+            && !reply.route.paths.is_empty()
+            && reply.route.paths.iter().all(|p| {
+                p.sw_if_index == half.sw_if_index && p.nh.address.0 == half.next_hop.octets()
+            });
+        if !ours {
+            tracing::warn!(
+                %addr,
+                "a hand-back /128 is gone from VPP or no longer points at the hand-back \
+                 interface; re-installing it"
+            );
+            half.routes.remove(&addr);
+            lost += 1;
+        }
+    }
+    if ensure_neighbour(t, half.sw_if_index, half.next_hop, half.next_hop_mac)? {
+        tracing::warn!(
+            next_hop = %half.next_hop,
+            "the hand-back static neighbour was missing or altered in VPP; re-added"
+        );
+    }
+    Ok(lost)
 }
 
 /// Open VPP's end on [`VPP_HOST_IF`], wearing the veth end's own MAC.
@@ -575,6 +820,11 @@ pub fn sync_routes(
 /// Take VPP's end down: its routes, its neighbour, the host interface.
 pub fn remove_vpp(t: &mut Transport, half: &mut VppHalf) -> Result<(), HandbackError> {
     sync_routes(t, half, &BTreeSet::new())?;
+    // The static neighbour goes with its interface.
+    delete_host_if(t)
+}
+
+fn delete_host_if(t: &mut Transport) -> Result<(), HandbackError> {
     let reply: AfPacketDeleteReply = t.request(AfPacketDelete {
         context: 0,
         host_if_name: VPP_HOST_IF.into(),
@@ -586,7 +836,6 @@ pub fn remove_vpp(t: &mut Transport, half: &mut VppHalf) -> Result<(), HandbackE
             format!("host interface {VPP_HOST_IF}"),
         ));
     }
-    // The static neighbour went with its interface.
     Ok(())
 }
 
@@ -654,6 +903,10 @@ pub struct Handback {
     vpp_up: bool,
     tx_packets: Option<u64>,
     desired: Option<BTreeSet<Ipv6Addr>>,
+    /// An address change is pending and its read failed: `desired` may be
+    /// missing an address the router now answers on. See
+    /// [`AddrReadError::pending`] and [`Self::ready`].
+    addrs_unknown: bool,
     error: Option<String>,
     retry_at: Option<Instant>,
     checked_at: Option<Instant>,
@@ -672,6 +925,7 @@ impl Handback {
             vpp_up: false,
             tx_packets: None,
             desired: None,
+            addrs_unknown: false,
             error: None,
             retry_at: None,
             checked_at: None,
@@ -698,6 +952,14 @@ impl Handback {
     /// Complete, and holding a /128 for every address the host last
     /// reported: the only state in which the v6 half of steering may be
     /// installed.
+    ///
+    /// Not ready while an address change is pending and could not be read
+    /// (`addrs_unknown`): a new address may be one the router already
+    /// answers on with no /128 behind it, and its traffic would die in
+    /// VPP. A failed PERIODIC re-read, with nothing heard since the last
+    /// good one, leaves the last good set standing instead — the watch
+    /// would have heard a change, and closing the gate on a flaky read
+    /// would churn every v6 rule for nothing.
     pub fn ready(&self) -> bool {
         self.wanted
             && self.facts.is_some()
@@ -705,6 +967,7 @@ impl Handback {
             && self.check.guard
             && self.vpp_up
             && !self.routes_in_doubt
+            && !self.addrs_unknown
             && match (&self.vpp, &self.desired) {
                 (Some(v), Some(d)) => v.routes == *d,
                 _ => false,
@@ -824,10 +1087,26 @@ impl Handback {
                         sw_if_index,
                         "the hand-back interface is gone from VPP or not up; re-asserting it"
                     );
-                    // Re-asserted by the ensure below, which is idempotent
-                    // (adopt by name, admin up); a link that stays down —
-                    // the veth end down — keeps the path not ready.
+                    // Re-asserted by the ensure below: adopted by name when
+                    // it is still bound to the veth, recreated when not; a
+                    // link that stays down keeps the path not ready.
                     self.vpp = None;
+                } else if !self.routes_in_doubt {
+                    // The /128s and the neighbour, read back. What is gone
+                    // leaves the cache, so the path reads not ready — the
+                    // v6 gate closed — until the sync below re-installs it,
+                    // in this same pass on a tick; a sync VPP refuses keeps
+                    // it closed.
+                    let v = self.vpp.as_mut().expect("checked just above");
+                    match revalidate(t, v) {
+                        Ok(_) => {}
+                        Err(HandbackError::Transport(e)) => return Err(e),
+                        Err(other) => {
+                            self.vpp = None;
+                            self.fail(now, other.to_string());
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
@@ -899,10 +1178,25 @@ impl Handback {
         // the host's addresses is what lets an adopted path that already
         // holds every /128 read as ready at attach, before anything moves.
         match self.host.owned_addrs(&facts) {
-            Ok(Some(set)) => self.desired = Some(set),
+            Ok(Some(set)) => {
+                self.desired = Some(set);
+                self.addrs_unknown = false;
+            }
             Ok(None) => {}
             Err(e) => {
-                self.fail(now, format!("reading the router's IPv6 addresses: {e}"));
+                self.addrs_unknown |= e.pending;
+                self.fail(
+                    now,
+                    format!(
+                        "reading the router's IPv6 addresses{}: {}",
+                        if e.pending {
+                            " after a change (the v6 half is held back until it is read)"
+                        } else {
+                            " (periodic re-read; the last good set stands)"
+                        },
+                        e.why
+                    ),
+                );
                 return Ok(());
             }
         }
@@ -991,8 +1285,8 @@ mod kernel {
     use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 
     use super::{
-        guard_matches, nft_ruleset, router_owned, HostAddr, HostCheck, HostFacts, HostSide,
-        KERNEL_IF, NFT_TABLE, VPP_HOST_IF,
+        guard_matches_json, guard_matches_text, nft_ruleset, router_owned, AddrReadError, HostAddr,
+        HostCheck, HostFacts, HostSide, KERNEL_IF, NFT_TABLE, VPP_HOST_IF,
     };
 
     /// `RTMGRP_IPV6_IFADDR`: the multicast group RTM_NEWADDR/RTM_DELADDR
@@ -1006,6 +1300,9 @@ mod kernel {
         mtu: u32,
         watch: Option<Socket>,
         dumped_at: Option<Instant>,
+        /// A change was heard (or events may have been lost) and no read
+        /// has succeeded since. See [`super::AddrReadError::pending`].
+        pending: bool,
     }
 
     impl KernelHostSide {
@@ -1015,6 +1312,7 @@ mod kernel {
                 mtu,
                 watch: None,
                 dumped_at: None,
+                pending: false,
             }
         }
     }
@@ -1216,6 +1514,16 @@ mod kernel {
         nft(&["list", "table", "inet", NFT_TABLE], None).ok()
     }
 
+    /// Whether the guard is loaded exactly as [`nft_ruleset`] loads it:
+    /// compared structurally from `nft -j`, or — for an `nft` built
+    /// without JSON output — line by line from the text listing.
+    fn guard_as_loaded() -> bool {
+        match nft(&["-j", "list", "table", "inet", NFT_TABLE], None) {
+            Ok(json) => guard_matches_json(&json),
+            Err(_) => guard_listing().is_some_and(|l| guard_matches_text(&l)),
+        }
+    }
+
     /// Ours: a veth named [`KERNEL_IF`] whose peer is [`VPP_HOST_IF`].
     fn find_pair(links: &[Link]) -> Result<Option<(Link, Link)>, String> {
         let k = links.iter().find(|l| l.name == KERNEL_IF);
@@ -1364,31 +1672,45 @@ mod kernel {
                 }
                 _ => false,
             };
-            let guard = guard_listing().is_some_and(|l| guard_matches(&l));
+            let guard = guard_as_loaded();
             HostCheck { veth, guard }
         }
 
-        fn owned_addrs(&mut self, facts: &HostFacts) -> Result<Option<BTreeSet<Ipv6Addr>>, String> {
-            // The watch opens BEFORE the dump it triggers, so an address
-            // added between the two is heard rather than lost.
-            let mut due = false;
+        fn owned_addrs(
+            &mut self,
+            facts: &HostFacts,
+        ) -> Result<Option<BTreeSet<Ipv6Addr>>, AddrReadError> {
+            // A watch that is not open (first call, or broken below) may
+            // have missed events: the read it forces is pending, not
+            // periodic. It opens BEFORE the dump it triggers, so an
+            // address added between the two is heard rather than lost.
             if self.watch.is_none() {
-                self.watch = Some(open_watch()?);
-                due = true;
-            }
-            match drain_watch(self.watch.as_ref().expect("opened above")) {
-                Ok(heard) => due |= heard,
-                Err(e) => {
-                    // Reopened, with a full read, on the next call.
-                    self.watch = None;
-                    return Err(e);
+                self.pending = true;
+                match open_watch() {
+                    Ok(s) => self.watch = Some(s),
+                    Err(why) => return Err(AddrReadError { pending: true, why }),
                 }
             }
-            due |= self.dumped_at.is_none_or(|t| t.elapsed() >= RESYNC_EVERY);
-            if !due {
+            match drain_watch(self.watch.as_ref().expect("opened above")) {
+                Ok(heard) => self.pending |= heard,
+                Err(why) => {
+                    // Reopened, with a full read, on the next call.
+                    self.watch = None;
+                    self.pending = true;
+                    return Err(AddrReadError { pending: true, why });
+                }
+            }
+            let periodic = self.dumped_at.is_none_or(|t| t.elapsed() >= RESYNC_EVERY);
+            if !self.pending && !periodic {
                 return Ok(None);
             }
-            let addrs = dump_v6_addrs()?;
+            // `pending` survives a failure, so the next call reads again
+            // even with nothing new heard.
+            let addrs = dump_v6_addrs().map_err(|why| AddrReadError {
+                pending: self.pending,
+                why,
+            })?;
+            self.pending = false;
             self.dumped_at = Some(Instant::now());
             Ok(Some(router_owned(
                 &addrs,
@@ -1415,6 +1737,7 @@ mod kernel {
             }
             self.watch = None;
             self.dumped_at = None;
+            self.pending = false;
             if errors.is_empty() {
                 Ok(())
             } else {
@@ -1446,8 +1769,14 @@ impl HostSide for KernelHostSide {
     fn check(&mut self, _facts: &HostFacts) -> HostCheck {
         HostCheck::default()
     }
-    fn owned_addrs(&mut self, _facts: &HostFacts) -> Result<Option<BTreeSet<Ipv6Addr>>, String> {
-        Err("the IPv6 hand-back path needs Linux".into())
+    fn owned_addrs(
+        &mut self,
+        _facts: &HostFacts,
+    ) -> Result<Option<BTreeSet<Ipv6Addr>>, AddrReadError> {
+        Err(AddrReadError {
+            pending: true,
+            why: "the IPv6 hand-back path needs Linux".into(),
+        })
     }
     fn teardown(&mut self) -> Result<(), String> {
         Ok(())
@@ -1539,14 +1868,146 @@ mod tests {
         assert!(forward_body.contains("hook forward"));
         assert!(forward_body.contains("iifname \"pfpunt0\" drop"));
         assert!(!forward_body.contains("established"));
-        // What `nft list table` prints of it reads back as the guard.
-        let listing = "table inet packetframe_handback {\n\tchain input {\n\t\ttype filter hook \
-                       input priority filter; policy accept;\n\t\tiifname \"pfpunt0\" ct state \
-                       established,related accept\n\t\tiifname \"pfpunt0\" drop\n\t}\n\n\tchain \
-                       forward {\n\t\ttype filter hook forward priority filter; policy \
-                       accept;\n\t\tiifname \"pfpunt0\" drop\n\t}\n}\n";
-        assert!(guard_matches(listing));
-        assert!(!guard_matches(
+    }
+
+    /// `nft -j list table inet packetframe_handback` for the guard as
+    /// loaded, with a `{ruleN}` hole per rule and `{input}`/`{forward}`
+    /// for the chain headers, so each test tampers with one piece.
+    fn guard_json(input_rules: &[&str], forward_rules: &[&str], input_hdr: &str) -> String {
+        let iif =
+            r#"{"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "pfpunt0"}}"#;
+        let rule = |chain: &str, h: usize, exprs: &str| {
+            format!(
+                r#"{{"rule": {{"family": "inet", "table": "packetframe_handback", "chain": "{chain}", "handle": {h}, "expr": [{exprs}]}}}}"#
+            )
+        };
+        let mut items = vec![
+            r#"{"metainfo": {"version": "0.9.8", "release_name": "E.D.S.", "json_schema_version": 1}}"#.to_string(),
+            r#"{"table": {"family": "inet", "name": "packetframe_handback", "handle": 7}}"#.to_string(),
+            format!(
+                r#"{{"chain": {{"family": "inet", "table": "packetframe_handback", "name": "input", "handle": 1, {input_hdr}}}}}"#
+            ),
+            r#"{"chain": {"family": "inet", "table": "packetframe_handback", "name": "forward", "handle": 2, "type": "filter", "hook": "forward", "prio": 0, "policy": "accept"}}"#.to_string(),
+        ];
+        for (i, r) in input_rules.iter().enumerate() {
+            items.push(rule("input", 3 + i, &r.replace("IIF", iif)));
+        }
+        for (i, r) in forward_rules.iter().enumerate() {
+            items.push(rule("forward", 10 + i, &r.replace("IIF", iif)));
+        }
+        format!(r#"{{"nftables": [{}]}}"#, items.join(", "))
+    }
+
+    const HDR: &str = r#""type": "filter", "hook": "input", "prio": 0, "policy": "accept""#;
+    const ACCEPT_EST: &str = r#"IIF, {"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["established", "related"]}}, {"accept": null}"#;
+    const DROP: &str = r#"IIF, {"drop": null}"#;
+
+    /// The guard is recognised by its STRUCTURE: both hooked base chains
+    /// with type, hook, priority and policy as loaded, and exactly the
+    /// loaded rules in order. Every tampering that keeps the telling
+    /// substrings — an accept inserted above the drop, the rules swapped,
+    /// a priority or policy changed, a rule removed or added, the accept
+    /// widened past established/related — is not the guard.
+    #[test]
+    fn the_guard_check_compares_structure_not_substrings() {
+        assert!(guard_matches_json(&guard_json(
+            &[ACCEPT_EST, DROP],
+            &[DROP],
+            HDR
+        )));
+        // nft versions that print the state list as a set are the same guard.
+        let as_set = ACCEPT_EST.replace(
+            r#"["established", "related"]"#,
+            r#"{"set": ["related", "established"]}"#,
+        );
+        assert!(guard_matches_json(&guard_json(
+            &[&as_set, DROP],
+            &[DROP],
+            HDR
+        )));
+
+        let accept_all = r#"IIF, {"accept": null}"#;
+        let only_new = ACCEPT_EST.replace(r#"["established", "related"]"#, r#"["new"]"#);
+        for (what, json) in [
+            (
+                "an accept above the drop",
+                guard_json(&[ACCEPT_EST, accept_all, DROP], &[DROP], HDR),
+            ),
+            (
+                "rules swapped",
+                guard_json(&[DROP, ACCEPT_EST], &[DROP], HDR),
+            ),
+            (
+                "input drop removed",
+                guard_json(&[ACCEPT_EST], &[DROP], HDR),
+            ),
+            (
+                "forward drop removed",
+                guard_json(&[ACCEPT_EST, DROP], &[], HDR),
+            ),
+            (
+                "forward accepts",
+                guard_json(&[ACCEPT_EST, DROP], &[accept_all], HDR),
+            ),
+            (
+                "state widened",
+                guard_json(&[&only_new, DROP], &[DROP], HDR),
+            ),
+            (
+                "another priority",
+                guard_json(
+                    &[ACCEPT_EST, DROP],
+                    &[DROP],
+                    &HDR.replace(r#""prio": 0"#, r#""prio": 100"#),
+                ),
+            ),
+            (
+                "another hook",
+                guard_json(
+                    &[ACCEPT_EST, DROP],
+                    &[DROP],
+                    &HDR.replace(r#""hook": "input""#, r#""hook": "output""#),
+                ),
+            ),
+            (
+                "a regular chain, not hooked",
+                guard_json(
+                    &[ACCEPT_EST, DROP],
+                    &[DROP],
+                    r#""comment": "not a base chain""#,
+                ),
+            ),
+        ] {
+            assert!(!guard_matches_json(&json), "{what} must not pass");
+        }
+        assert!(!guard_matches_json("not json"));
+        assert!(
+            !guard_matches_json(r#"{"nftables": []}"#),
+            "an empty table is no guard"
+        );
+    }
+
+    /// The text fallback is whole-table and ordered too.
+    #[test]
+    fn the_text_fallback_compares_every_line_in_order() {
+        let listing =
+            "table inet packetframe_handback { # handle 7\n\tchain input { # handle 1\n\t\t\
+                       type filter hook input priority filter; policy accept;\n\t\tiifname \
+                       \"pfpunt0\" ct state established,related accept # handle 3\n\t\tiifname \
+                       \"pfpunt0\" drop # handle 4\n\t}\n\n\tchain forward { # handle 2\n\t\ttype \
+                       filter hook forward priority filter; policy accept;\n\t\tiifname \
+                       \"pfpunt0\" drop # handle 5\n\t}\n}\n";
+        assert!(guard_matches_text(listing));
+        let widened = listing.replace(
+            "\t\tiifname \"pfpunt0\" drop # handle 4",
+            "\t\tiifname \"pfpunt0\" accept\n\t\tiifname \"pfpunt0\" drop # handle 4",
+        );
+        assert!(!guard_matches_text(&widened));
+        assert!(!guard_matches_text(&listing.replace(
+            "policy accept;\n\t\tiifname \"pfpunt0\" ct",
+            "policy drop;\n\t\tiifname \"pfpunt0\" ct"
+        )));
+        assert!(!guard_matches_text(
             "table inet packetframe_handback {\n\tchain input {\n\t}\n}\n"
         ));
     }
@@ -1616,7 +2077,7 @@ mod tests {
         fn owned_addrs(
             &mut self,
             _facts: &HostFacts,
-        ) -> Result<Option<BTreeSet<Ipv6Addr>>, String> {
+        ) -> Result<Option<BTreeSet<Ipv6Addr>>, AddrReadError> {
             Ok(self.0.lock().unwrap().addrs.take())
         }
         fn teardown(&mut self) -> Result<(), String> {

@@ -1927,6 +1927,33 @@ fn vpp_detach(all: bool, config_has_vpp: bool, keep_vpp: bool) -> VppDetach {
 mod keep_vpp_tests {
     use super::*;
 
+    /// `detach --all` removes the IPv6 hand-back path even when there is
+    /// no state file left: the daemon's teardown releases the VFs (and the
+    /// record) even if the veth would not go, and names this command as the
+    /// remedy. A failure says what to remove by hand.
+    #[test]
+    fn detach_removes_the_handback_path_without_a_state_file() {
+        let dir = std::env::temp_dir().join(format!("pf-detach-hb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut called = false;
+        detach_vpp_offload_with(&dir, || {
+            called = true;
+            Ok(())
+        })
+        .expect("nothing else to do");
+        assert!(called, "the hand-back teardown ran with no state file");
+        let e = detach_vpp_offload_with(&dir, || Err("nft exited 1".into()))
+            .expect_err("a leftover is reported");
+        assert!(
+            e.contains("nft exited 1")
+                && e.contains("nft delete table inet packetframe_handback")
+                && e.contains("ip link del pfpunt0"),
+            "{e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `--keep-vpp` wins over both `--all` and a config that declares the
     /// module — it exists for exactly the restart where both are true.
     #[test]
@@ -2149,6 +2176,26 @@ fn detach_fast_path_attachments(
 /// at a VF nothing services.
 #[cfg(feature = "vpp-offload")]
 fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
+    detach_vpp_offload_with(state_dir, packetframe_vpp_offload::handback::teardown_host)
+}
+
+/// The by-hand remedy for a hand-back path `detach` could not remove.
+#[cfg(feature = "vpp-offload")]
+fn handback_leftover(e: String) -> String {
+    format!(
+        "vpp-offload: the IPv6 hand-back path could not be removed ({e}); by hand: `nft delete \
+         table inet {}` and `ip link del {}`",
+        packetframe_vpp_offload::handback::NFT_TABLE,
+        packetframe_vpp_offload::handback::KERNEL_IF
+    )
+}
+
+/// [`detach_vpp_offload`] with the hand-back teardown as a seam.
+#[cfg(feature = "vpp-offload")]
+fn detach_vpp_offload_with(
+    state_dir: &Path,
+    teardown_handback: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     use packetframe_vpp_offload::acquire::{release, SysPaths};
     use packetframe_vpp_offload::ntuple::NtupleSteering;
     use packetframe_vpp_offload::process::{terminate_or_leak, Disposition, VppProcess};
@@ -2158,7 +2205,11 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
     use packetframe_vpp_offload::runtime::{Steering as _, TERM_GRACE};
 
     let Some(state) = ResourceState::load(state_dir).map_err(|e| format!("vpp state: {e}"))? else {
-        return Ok(()); // nothing was ever acquired
+        // Nothing acquired — but the IPv6 hand-back path can outlive the
+        // record (a teardown that released the VFs and could not remove
+        // the veth), and this command is the remedy the daemon names for
+        // exactly that. No VPP to kill first: there is no record of one.
+        return teardown_handback().map_err(handback_leftover);
     };
 
     // Recorded MCAM rules mean traffic is DIVERTED to a VF this function is
@@ -2310,7 +2361,7 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
     // the daemon's own teardown does, since this process has no engine
     // and no record of it; a leftover is reported, never a reason to keep
     // the VFs bound.
-    let handback = packetframe_vpp_offload::handback::teardown_host();
+    let handback = teardown_handback();
     match &handback {
         Ok(()) => tracing::info!("vpp-offload: IPv6 hand-back path removed (if it existed)"),
         Err(e) => {
@@ -2338,14 +2389,7 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
     let paths = SysPaths::live(state_dir, pool_bytes);
     release(&paths, state).map_err(|e| format!("vpp-offload: {e}"))?;
     tracing::info!("vpp-offload: VFs rebound and hugepages restored");
-    handback.map_err(|e| {
-        format!(
-            "vpp-offload: VFs and hugepages released, but the IPv6 hand-back path could not be \
-             removed ({e}); by hand: `nft delete table inet {}` and `ip link del {}`",
-            packetframe_vpp_offload::handback::NFT_TABLE,
-            packetframe_vpp_offload::handback::KERNEL_IF
-        )
-    })
+    handback.map_err(|e| format!("{} (VFs and hugepages were released)", handback_leftover(e)))
 }
 
 pub fn status(config_path: &Path) -> Result<(), String> {
