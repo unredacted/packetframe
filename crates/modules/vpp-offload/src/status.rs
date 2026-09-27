@@ -744,7 +744,9 @@ impl StatusSnapshot {
             // and a named one already gone (review finding).
             let stale = self.drift_unreadable.as_ref().map(|why| {
                 format!(
-                    ". NOTE: the latest scan could not read the kernel ({why}), so this list                      is the last good one — newly added routes are invisible and a named one                      may already be gone"
+                    ". NOTE: the latest scan could not read the kernel ({why}), so this list \
+                     is the last good one — newly added routes are invisible and a named one \
+                     may already be gone"
                 )
             });
             subsystems.push(SubsystemHealth {
@@ -1391,12 +1393,21 @@ impl StatusSnapshot {
     /// Healthy while the v6 table is whole, Degraded with both counts
     /// named when it is not — withheld (the v6 pool outgrew its budget)
     /// and unresolvable (a v6 next hop VPP cannot reach) page differently,
-    /// as on the v4 row. Never Unhealthy: nothing v6 is steered, so
-    /// nothing is blackholed however incomplete the table. Verification's
+    /// as on the v4 row. What an incomplete table COSTS depends on whether
+    /// the installed rules divert IPv6 (`v6-outbound`): unsteered, nothing
+    /// v6 reaches VPP and nothing is dropped; diverted, a packet whose
+    /// prefix VPP lacks follows a less specific VPP route or is dropped,
+    /// and the row says so — and an empty v6 table under a live diversion
+    /// is Degraded, since every diverted packet dies. Never Unhealthy: the
+    /// v4 table and its steering are unaffected either way. Verification's
     /// v6 probes are in the verify summary (`VerifyOutcome::summary`),
     /// logged with every verdict.
     fn fib_v6_health(&self) -> Option<SubsystemHealth> {
         let v6 = self.counts.v6?;
+        // Read from the installed plan, like the steering row: what the
+        // NIC diverts, not what the config wants.
+        let diverted =
+            (!self.steer_v6_outbound.is_empty()).then(|| self.steer_v6_outbound.join(", "));
         let (state, message) = if v6.degraded() {
             // Every condition that holds, each named, because each has a
             // different remedy; the counts that are zero stay out of the
@@ -1429,27 +1440,56 @@ impl StatusSnapshot {
                     parts.push(format!("{n} {what}"));
                 }
             }
+            let cost = match &diverted {
+                None => "No IPv6 is steered, so nothing is dropped".to_string(),
+                Some(on) => format!(
+                    "Outbound IPv6 is diverted into VPP on {on}, so a diverted packet whose \
+                     prefix is withheld, unresolvable, refused or left out follows a less \
+                     specific VPP route or is dropped (`exempt-drift-v6` names the kernel \
+                     paths VPP cannot take)"
+                ),
+            };
             (
                 HealthState::Degraded,
                 format!(
-                    "IPv6 in VPP is impaired: {}. No IPv6 is steered, so nothing is dropped; \
-                     the IPv4 table and its steering are unaffected",
+                    "IPv6 in VPP is impaired: {}. {cost}; the IPv4 table and its steering \
+                     are unaffected",
                     parts.join(", ")
                 ),
             )
         } else if v6.installed == 0 {
-            (
-                HealthState::Healthy,
-                format!(
-                    "v6 on, no IPv6 routes in VPP yet ({} in flight); nothing IPv6 is \
-                     steered",
-                    v6.installing
+            match &diverted {
+                None => (
+                    HealthState::Healthy,
+                    format!(
+                        "v6 on, no IPv6 routes in VPP yet ({} in flight); nothing IPv6 is \
+                         steered",
+                        v6.installing
+                    ),
                 ),
-            )
+                Some(on) => (
+                    HealthState::Degraded,
+                    format!(
+                        "no IPv6 routes in VPP yet ({} in flight) while outbound IPv6 is \
+                         diverted into VPP on {on}: every diverted IPv6 packet is dropped \
+                         until the table loads. Drop `v6-outbound` (or set the port `steer \
+                         off`) and `packetframe reconfigure` to put it back on the eBPF \
+                         tier meanwhile",
+                        v6.installing
+                    ),
+                ),
+            }
         } else {
             (
                 HealthState::Healthy,
-                format!("{} IPv6 routes loaded in VPP, not steered", v6.installed),
+                match &diverted {
+                    None => format!("{} IPv6 routes loaded in VPP, not steered", v6.installed),
+                    Some(on) => format!(
+                        "{} IPv6 routes loaded in VPP; outbound IPv6 is diverted into VPP \
+                         on {on}",
+                        v6.installed
+                    ),
+                },
             )
         };
         Some(SubsystemHealth {
@@ -4625,6 +4665,70 @@ mod tests {
             "{m}"
         );
         assert!(!m.contains("family=\"ipv4\",state=\"rejected\""), "{m}");
+    }
+
+    /// Once the installed rules divert IPv6, the `fib-v6` row stops
+    /// claiming nothing is steered: holes cost diverted packets and it
+    /// says so, an empty v6 table under a live diversion drops every
+    /// diverted packet and is Degraded, and a whole table names where v6
+    /// is diverted. Never "No IPv6 is steered" while it is.
+    #[test]
+    fn the_fib_v6_row_tells_the_truth_while_ipv6_is_diverted() {
+        let row = |v6: crate::sink::FamilyCounts| {
+            let mut counts = ledger_with(5, 0, 0).counts();
+            counts.v6 = Some(v6);
+            let mut s = StatusSnapshot::observe(
+                &steered_supervisor(),
+                counts,
+                &PendingMap::new(),
+                ApiHealth::Answering {
+                    silent_for: Duration::from_millis(1),
+                },
+                verified(1),
+                ports_up(),
+                true,
+            );
+            s.steer_v6_outbound = vec!["eth4 vlan 100".into()];
+            s.report()
+                .subsystems
+                .into_iter()
+                .find(|x| x.name == SUBSYS_FIB_V6)
+                .expect("row")
+        };
+
+        let holes = row(crate::sink::FamilyCounts {
+            installed: 200,
+            withheld: 7,
+            ..Default::default()
+        });
+        let msg = holes.message.unwrap_or_default();
+        assert_eq!(holes.state, HealthState::Degraded);
+        assert!(!msg.contains("No IPv6 is steered"), "{msg}");
+        assert!(
+            msg.contains("diverted into VPP on eth4 vlan 100") && msg.contains("dropped"),
+            "{msg}"
+        );
+
+        let empty = row(crate::sink::FamilyCounts {
+            installing: 40,
+            ..Default::default()
+        });
+        assert_eq!(empty.state, HealthState::Degraded, "{empty:?}");
+        let msg = empty.message.unwrap_or_default();
+        assert!(!msg.contains("nothing IPv6 is steered"), "{msg}");
+        assert!(
+            msg.contains("every diverted IPv6 packet is dropped"),
+            "{msg}"
+        );
+
+        let whole = row(crate::sink::FamilyCounts {
+            installed: 250,
+            ..Default::default()
+        });
+        assert_eq!(whole.state, HealthState::Healthy);
+        let msg = whole.message.unwrap_or_default();
+        assert!(!msg.contains("not steered"), "{msg}");
+        assert!(msg.contains("diverted into VPP on eth4 vlan 100"), "{msg}");
     }
 
     /// The exemption tripwire: quiet = no row, firing = Degraded with

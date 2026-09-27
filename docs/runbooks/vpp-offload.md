@@ -1353,14 +1353,23 @@ carries — with these differences:
   no IPv6 `steer-exempt` and every finding stands until its cause
   goes. That is why it has its own row: its remedies are not
   `exempt-drift`'s.
-- **Link-local next hops are no path.** VPP installs no route whose
-  every next hop is link-local (the feed does not carry the interface
-  that scopes one; `fib-v6` counts those as link-local refused). A
-  route VPP could take only through one — an RA-learned default via
-  `fe80::1` on a member, a peer reached over link-local — is reported,
-  as **one summary line** counting every such route and naming the
-  first three, because a link-local BGP mesh can produce many. A route
-  with any global next hop on an owned device is covered.
+- **A link-local kernel next hop is judged by VPP's table, not the
+  kernel's.** Under FRR, a peer that sends both a global and a
+  link-local next hop gets its kernel route installed via the `fe80::`
+  one ("(used)" in `show bgp`), while the feed also carries the global
+  one and VPP installs the prefix through it — VPP refuses only routes
+  whose EVERY feed next hop is link-local (`fib-v6` counts those). So a
+  kernel route whose owned-device hops are all link-local is covered
+  when VPP holds the prefix (installed or in flight), and reported only
+  when VPP does not: refused as link-local-only, or never in the feed
+  (an RA-learned default via `fe80::1` on a member). Those are **one
+  summary line**, counting every such route and naming the first
+  three. The check runs when each scan lands, so in the first scan
+  after an attach — before the v6 table has loaded — they are reported
+  until the next one. A route with any global next hop on an owned
+  device is covered by its device. An ECMP route mixing a link-local
+  member hop with a hop out a device VPP does not own is, when VPP
+  lacks the prefix, an ordinary finding naming that device.
 - **`local-route` bridges are no v6 reach.** `local-route` delivers an
   IPv4 subnet; VPP has no route onto that bridge for its v6 subnet, so
   a connected v6 route there is a finding.

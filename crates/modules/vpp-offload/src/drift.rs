@@ -45,10 +45,12 @@
 //! - nothing exempts. There is no v6 address rule to install (the NIC
 //!   cannot match one), so `steer-exempt` does not apply and the remedy
 //!   is the feed, a `steer-keep6`, or dropping `v6-outbound`;
-//! - a link-local next hop is not a path. VPP refuses a route whose every
-//!   next hop is link-local by design (the engine's
-//!   `link_local_refused`), so such a route is a black-hole risk and is
-//!   REPORTED, as one summary line, rather than cleared by its device;
+//! - a kernel route whose owned-device hops are link-local is judged by
+//!   what VPP HOLDS, not by its hops: zebra installs the `fe80::` hop
+//!   while the feed also carries a global one VPP installs through, and
+//!   VPP refuses only routes whose every feed next hop is link-local
+//!   (the engine's `link_local_refused`). Only prefixes VPP holds no
+//!   route for are reported, as one summary line ([`V6Scan::settle`]);
 //! - `local-route` bridges are not reach. `local-route` is IPv4
 //!   ([`crate::LocalRoute::prefix`]), so VPP delivers no v6 subnet there;
 //! - link-local and multicast destinations, and the router's own
@@ -131,9 +133,10 @@ pub struct KernelRoute<P = Ipv4Prefix> {
     /// hop's gateway (review finding).
     pub gatewayed: Vec<bool>,
     /// Per entry of `oifs`: whether that hop's gateway is IPv6
-    /// link-local (`fe80::/10`). VPP installs no route through one — the
-    /// feed does not carry the interface that scopes it — so such a hop
-    /// is no path whatever its device (see [`uncovered_paths_v6`]).
+    /// link-local (`fe80::/10`). Such a hop cannot clear the route by its
+    /// device: VPP never installs through one (the feed does not carry
+    /// the interface that scopes it), so whether VPP has the prefix is a
+    /// question for VPP's table, not the kernel's ([`uncovered_paths_v6`]).
     /// Always false on an IPv4 route, whose gateways cannot be.
     pub link_local: Vec<bool>,
     /// The route names a NEXTHOP OBJECT (`ip route ... nhid N`,
@@ -395,8 +398,9 @@ pub enum Uncovered<P = Ipv4Prefix> {
     /// see. Reported so the operator knows the coverage is partial
     /// rather than believing a quiet scan means a clean box.
     Opaque(usize),
-    /// IPv6 only: routes VPP could take but for their link-local next
-    /// hops, which it refuses. One line for all of them, like
+    /// IPv6 only: kernel routes whose owned-device hops are link-local,
+    /// for prefixes VPP holds no route for ([`V6Scan::settle`]). One line
+    /// for all of them, like
     /// [`Self::Opaque`] and for the same reason — a box whose BGP
     /// sessions run over link-local can hold a great many, and a finding
     /// per route would bury every other line. `examples` names the first
@@ -479,10 +483,10 @@ impl<P: RoutePrefix> std::fmt::Display for Uncovered<P> {
             ),
             Self::LinkLocal { routes, examples } => write!(
                 f,
-                "{routes} route(s) leave only through link-local next hops ({}{}), and VPP \
-                 installs no route whose every next hop is link-local — the feed does not \
-                 carry the interface that scopes one — so VPP holds no path of its own for \
-                 them",
+                "{routes} route(s) leave the kernel only through link-local next hops and \
+                 VPP holds no route for the prefix ({}{}) — the feed gave VPP only link-local \
+                 next hops, which it refuses (their interface is not carried), or never \
+                 carried the prefix at all",
                 examples.join(", "),
                 if *routes > examples.len() {
                     ", …"
@@ -623,21 +627,176 @@ const LINK_LOCAL_EXAMPLES: usize = 3;
 ///   where diverted traffic to the router is handed back, not a kernel
 ///   path VPP lacks.
 ///
-/// Reported that the v4 scan never sees: a route VPP could take but for
-/// its link-local next hops ([`Uncovered::LinkLocal`]). The engine
-/// refuses those by design (`link_local_refused`), so VPP has no route
-/// of its own for the prefix, and diverted traffic for it takes whatever
-/// less specific route VPP holds — or dies at VPP's default. That is the
-/// black hole this scan exists for, so it is summarised rather than
-/// hidden: counted per route (the gauge), one line (the health surface).
-/// A link-local hop out a device VPP does not own is an ordinary path
-/// finding instead: the device is the problem there, and the message
-/// should say so.
+/// Judged against VPP, not the kernel: a route VPP could take but for
+/// its kernel next hops being link-local ([`LinkLocalRoute`]). Those hops
+/// say nothing about VPP's copy. Under FRR, an eBGP peer that sends both
+/// a global and a link-local next hop gets its KERNEL route installed via
+/// the `fe80::` hop, while the feed carries the global one too and the
+/// engine installs the prefix in VPP through that alone — it refuses only
+/// a route whose EVERY feed next hop is link-local (`link_local_refused`).
+/// So such a route is a finding only when VPP holds no route for the
+/// prefix ([`V6Scan::settle`]): refused as link-local-only, or never in
+/// the feed at all (an RA-learned default, say). Diverted traffic for
+/// that prefix takes whatever less specific route VPP holds, or dies at
+/// its default, which is the black hole this scan exists for; judging
+/// by the kernel's hops alone would instead report nearly every v6 route
+/// of a link-local BGP mesh, permanently. What remains is summarised
+/// ([`Uncovered::LinkLocal`]): counted per route (the gauge), one line
+/// (the health surface). A link-local hop out a device VPP does not own
+/// is an ordinary path finding instead: the device is the problem there.
+///
+/// `vpp_holds` answers "does VPP hold a route for exactly this prefix" —
+/// [`crate::engine::ConvergenceEngine::holds_v6`] in production.
 pub fn uncovered_paths_v6(
     routes: &[KernelRoute<Ipv6Prefix>],
     reach: &VppReach,
     selected_tables: Option<&[u32]>,
+    vpp_holds: impl Fn(&Ipv6Prefix) -> bool,
 ) -> Vec<Uncovered<Ipv6Prefix>> {
+    classify_v6(routes, Vec::new(), reach, selected_tables).settle(vpp_holds)
+}
+
+/// A kernel v6 route VPP could take but for its link-local next hops —
+/// a finding only if VPP holds no route for the prefix. Kept this small
+/// because a link-local BGP mesh makes nearly every v6 route one of
+/// these, and the dump builds them instead of a full [`KernelRoute`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkLocalRoute {
+    pub prefix: Ipv6Prefix,
+    pub table: u32,
+    /// The first owned device a link-local hop leaves by, for the example
+    /// line — shared per device.
+    pub oif: std::sync::Arc<str>,
+    /// The first hop out a device VPP does not own, when the route mixes
+    /// one in (an ECMP group of a link-local member hop and a tunnel hop).
+    /// If VPP lacks the prefix, THAT hop is the finding and names the
+    /// device — the link-local summary would name the wrong interface.
+    pub unowned: Option<std::sync::Arc<str>>,
+}
+
+/// Where a link-local candidate's hops point, by position: the first
+/// link-local hop on an owned device, and the first hop out a device VPP
+/// does not own, if any. Every other hop of a candidate is one of these
+/// two kinds — a covered global hop would have cleared it.
+fn candidate_hops<'a>(
+    hops: impl Iterator<Item = Hop<'a>>,
+    reach: &VppReach,
+) -> (usize, Option<usize>) {
+    let mut link_local = 0;
+    let mut unowned = None;
+    let mut seen_link_local = false;
+    for (i, h) in hops.enumerate() {
+        let owned = reach.covers_device(h.dev, h.gatewayed);
+        if owned && h.link_local && !seen_link_local {
+            link_local = i;
+            seen_link_local = true;
+        } else if !owned && unowned.is_none() {
+            unowned = Some(i);
+        }
+    }
+    (link_local, unowned)
+}
+
+/// The v6 half of one scan, before it is settled against VPP's table.
+///
+/// Split because the two halves live on different threads: the scan
+/// cannot read the engine (it runs beside the supervision loop, never on
+/// it), so it hands the loop the link-local candidates and the loop
+/// settles them against the ledger when the result lands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct V6Scan {
+    /// Findings that stand whatever VPP holds: paths, and the
+    /// nexthop-object summary. Sorted.
+    pub findings: Vec<Uncovered<Ipv6Prefix>>,
+    /// Link-local candidates, sorted by prefix then table.
+    pub link_local: Vec<LinkLocalRoute>,
+}
+
+impl V6Scan {
+    /// The findings, plus the link-local candidates whose prefix VPP does
+    /// not hold, summarised.
+    ///
+    /// Settled when the scan lands, not on every status poll: the
+    /// candidates can number in the hundreds of thousands, and a verdict
+    /// up to one scan interval behind VPP's table is the cadence the
+    /// whole tripwire already runs at. So in the first scan after an
+    /// attach, before the table has loaded, VPP holds nothing and they
+    /// are reported — truly, at that moment — until the next scan.
+    ///
+    /// A lacking candidate that mixes in a hop out an unowned device is an
+    /// ordinary path finding naming that device, not part of the summary:
+    /// VPP has no route, and the reason worth naming is the tunnel (review
+    /// finding). A HELD one is covered whatever its other hops are — VPP
+    /// forwards over the paths it resolved, the any-path rule the v4 scan
+    /// applies to ECMP.
+    pub fn settle(&self, vpp_holds: impl Fn(&Ipv6Prefix) -> bool) -> Vec<Uncovered<Ipv6Prefix>> {
+        let mut out = self.findings.clone();
+        let mut lacking: Vec<&LinkLocalRoute> = Vec::new();
+        let mut mixed = false;
+        for r in self.link_local.iter().filter(|r| !vpp_holds(&r.prefix)) {
+            match &r.unowned {
+                Some(dev) => {
+                    out.push(Uncovered::Path {
+                        prefix: r.prefix,
+                        oif: dev.to_string(),
+                        table: r.table,
+                        kernel_delivers: false,
+                        encap: None,
+                    });
+                    mixed = true;
+                }
+                None => lacking.push(r),
+            }
+        }
+        if mixed {
+            // Paths first, sorted, as everywhere else; the summaries follow.
+            let (mut paths, summaries): (Vec<_>, Vec<_>) = out
+                .into_iter()
+                .partition(|u| matches!(u, Uncovered::Path { .. }));
+            sort_paths(&mut paths);
+            paths.extend(summaries);
+            out = paths;
+        }
+        if !lacking.is_empty() {
+            out.push(Uncovered::LinkLocal {
+                routes: lacking.len(),
+                examples: lacking
+                    .iter()
+                    .take(LINK_LOCAL_EXAMPLES)
+                    .map(|r| format!("{} via {} (table {})", r.prefix.cidr(), r.oif, r.table))
+                    .collect(),
+            });
+        }
+        out
+    }
+}
+
+/// Whether a route is a link-local candidate: not cleared, and some hop
+/// VPP would take were its gateway not link-local — the refusal, not the
+/// device, is what may leave VPP without a path. Not for an
+/// encapsulating route (the action is its finding) nor kernel delivery.
+/// One predicate for the dump and [`classify_v6`], so they cannot drift.
+fn link_local_candidate<'a, I: Iterator<Item = Hop<'a>>>(
+    kind: RouteKind,
+    hops: impl Fn() -> I,
+    reach: &VppReach,
+) -> bool {
+    // The hop test first: it is false for every IPv4 route, and the dump
+    // runs this over the whole v4 table.
+    !kind.encapsulated
+        && !kind.kernel_delivers
+        && hops().any(|h| h.link_local && reach.covers_device(h.dev, h.gatewayed))
+        && !reach_clears(kind, hops(), reach)
+}
+
+/// The unsettled half of [`uncovered_paths_v6`]: `routes` as the dump
+/// builds them, plus the link-local candidates it built compactly.
+fn classify_v6(
+    routes: &[KernelRoute<Ipv6Prefix>],
+    candidates: Vec<LinkLocalRoute>,
+    reach: &VppReach,
+    selected_tables: Option<&[u32]>,
+) -> V6Scan {
     let reach = reach.for_v6();
     let link_local_dst = Ipv6Prefix {
         addr: std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
@@ -647,22 +806,22 @@ pub fn uncovered_paths_v6(
         addr: std::net::Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0),
         prefix_len: 8,
     };
+    // Destinations that are no path, and tables no rule selects — before
+    // every branch below, as in the v4 scan: inert is inert, whatever
+    // else the route is.
+    let skipped = |prefix: &Ipv6Prefix, table: u32| {
+        link_local_dst.contains_prefix(prefix)
+            || multicast_dst.contains_prefix(prefix)
+            || selected_tables.is_some_and(|t| !t.contains(&table))
+    };
     let mut out = Vec::new();
     let mut opaque = 0usize;
-    let mut link_local: Vec<&KernelRoute<Ipv6Prefix>> = Vec::new();
+    let mut link_local: Vec<LinkLocalRoute> = candidates
+        .into_iter()
+        .filter(|c| !skipped(&c.prefix, c.table))
+        .collect();
     for r in routes {
-        if link_local_dst.contains_prefix(&r.prefix)
-            || multicast_dst.contains_prefix(&r.prefix)
-            || r.kernel_delivers
-        {
-            continue;
-        }
-        // Before the opaque and link-local branches, as in the v4 scan:
-        // a route in a table no rule selects is inert, whatever it is.
-        if selected_tables.is_some_and(|t| !t.contains(&r.table)) {
-            continue;
-        }
-        if r.cleared_by(&reach) {
+        if r.kernel_delivers || skipped(&r.prefix, r.table) || r.cleared_by(&reach) {
             continue;
         }
         if r.via_nexthop_object && r.oifs.is_empty() {
@@ -670,14 +829,14 @@ pub fn uncovered_paths_v6(
             continue;
         }
         let Some(oif) = r.oifs.first() else { continue };
-        // A hop VPP would take were its gateway not link-local: the
-        // refusal, not the device, is what leaves VPP without a path.
-        // Not for an encapsulating route, whose finding is the action.
-        if r.encap.is_none()
-            && r.hops()
-                .any(|h| h.link_local && reach.covers_device(h.dev, h.gatewayed))
-        {
-            link_local.push(r);
+        if link_local_candidate(r.kind(), || r.hops(), &reach) {
+            let (ll, unowned) = candidate_hops(r.hops(), &reach);
+            link_local.push(LinkLocalRoute {
+                prefix: r.prefix,
+                table: r.table,
+                oif: r.oifs[ll].as_str().into(),
+                unowned: unowned.map(|i| r.oifs[i].as_str().into()),
+            });
             continue;
         }
         out.push(Uncovered::Path {
@@ -692,25 +851,11 @@ pub fn uncovered_paths_v6(
     if opaque > 0 {
         out.push(Uncovered::Opaque(opaque));
     }
-    if !link_local.is_empty() {
-        link_local.sort_by_key(|r| (r.prefix.sort_key(), r.table));
-        out.push(Uncovered::LinkLocal {
-            routes: link_local.len(),
-            examples: link_local
-                .iter()
-                .take(LINK_LOCAL_EXAMPLES)
-                .map(|r| {
-                    format!(
-                        "{} via {} (table {})",
-                        r.prefix.cidr(),
-                        r.oifs.first().map(String::as_str).unwrap_or_default(),
-                        r.table
-                    )
-                })
-                .collect(),
-        });
+    link_local.sort_by_key(|a| (a.prefix.sort_key(), a.table));
+    V6Scan {
+        findings: out,
+        link_local,
     }
-    out
 }
 
 /// What a route IS, apart from where it goes: the facts
@@ -795,18 +940,18 @@ impl<P> KernelRoute<P> {
         })
     }
 
+    fn kind(&self) -> RouteKind {
+        RouteKind {
+            drops: self.drops,
+            kernel_delivers: self.kernel_delivers,
+            via_nexthop_object: self.via_nexthop_object,
+            encapsulated: self.encap.is_some(),
+        }
+    }
+
     /// [`reach_clears`] for a route already built.
     fn cleared_by(&self, reach: &VppReach) -> bool {
-        reach_clears(
-            RouteKind {
-                drops: self.drops,
-                kernel_delivers: self.kernel_delivers,
-                via_nexthop_object: self.via_nexthop_object,
-                encapsulated: self.encap.is_some(),
-            },
-            self.hops(),
-            reach,
-        )
+        reach_clears(self.kind(), self.hops(), reach)
     }
 }
 
@@ -834,8 +979,9 @@ pub enum V6Drift {
     /// destination can reach VPP and there is nothing to judge.
     #[default]
     Inactive,
-    /// Scanned: `lines` and `routes` as [`DriftFindings`]' v4 pair.
-    Scanned { lines: Vec<String>, routes: usize },
+    /// Scanned, not yet settled against VPP's table — the loop does that
+    /// ([`V6DriftState::absorb`]).
+    Scanned(V6Scan),
     /// The kernel would not answer the v6 dump.
     Unreadable(String),
 }
@@ -861,20 +1007,27 @@ pub struct V6DriftState {
 }
 
 impl V6DriftState {
-    /// Take one scan's v6 verdict. Returns the findings when they are
-    /// non-empty and changed, for the caller's warning.
-    pub fn absorb(&mut self, v6: V6Drift) -> Option<&[String]> {
+    /// Take one scan's v6 verdict, settling its link-local candidates
+    /// against `vpp_holds` ([`V6Scan::settle`]). Returns the findings when
+    /// they are non-empty and changed, for the caller's warning.
+    pub fn absorb(
+        &mut self,
+        v6: V6Drift,
+        vpp_holds: impl Fn(&Ipv6Prefix) -> bool,
+    ) -> Option<&[String]> {
         match v6 {
             V6Drift::Inactive => {
                 *self = Self::default();
                 None
             }
-            V6Drift::Scanned { lines, routes } => {
+            V6Drift::Scanned(scan) => {
+                let found = scan.settle(vpp_holds);
+                let lines: Vec<String> = found.iter().map(Uncovered::to_string).collect();
                 let changed = !lines.is_empty() && lines != self.lines;
                 *self = Self {
                     active: true,
                     lines,
-                    routes,
+                    routes: found.iter().map(Uncovered::routes).sum(),
                     unreadable: None,
                 };
                 changed.then_some(self.lines.as_slice())
@@ -898,9 +1051,20 @@ impl V6DriftState {
     /// A new scope was committed: the findings described the old one.
     /// The read failure stays, as the v4 one does — whether the kernel
     /// answers has nothing to do with which config is judged.
-    pub fn clear_findings(&mut self) {
-        self.lines.clear();
-        self.routes = 0;
+    ///
+    /// Unless the new scope switches the half OFF: then there is nothing
+    /// left to be blind about, and the whole state goes. Keeping `active`
+    /// until the scanner next answered `Inactive` let a v4 dump failing in
+    /// between be recorded as a v6 failure ([`Self::scan_failed`]), and
+    /// under a persistently failing v4 dump `exempt-drift-v6` would claim
+    /// a disabled scan was unreadable indefinitely (review finding).
+    pub fn scope_committed(&mut self, scans_v6: bool) {
+        if scans_v6 {
+            self.lines.clear();
+            self.routes = 0;
+        } else {
+            *self = Self::default();
+        }
     }
 
     /// Nothing for health to say: inactive, or active with a clean read.
@@ -1210,10 +1374,7 @@ impl DriftWatch for KernelDriftWatch {
         // does: each family's read failure is its own.
         let v6 = if self.scope.scans_v6 {
             match self.scan_v6() {
-                Ok(found) => V6Drift::Scanned {
-                    routes: found.iter().map(Uncovered::routes).sum(),
-                    lines: found.iter().map(Uncovered::to_string).collect(),
-                },
+                Ok(scan) => V6Drift::Scanned(scan),
                 Err(e) => V6Drift::Unreadable(e),
             }
         } else {
@@ -1236,15 +1397,21 @@ impl KernelDriftWatch {
     /// The IPv6 half: the v6 routes the v6 reach does not clear, judged
     /// under the v6 policy rules. Same failure rules as the v4 half — an
     /// unreadable rule set filters nothing, an unreadable route dump is
-    /// the half's `Err`.
-    fn scan_v6(&self) -> Result<Vec<Uncovered<Ipv6Prefix>>, String> {
-        let routes = dump_routes_v6(&self.reach)?;
+    /// the half's `Err`. Unsettled: the loop settles the link-local
+    /// candidates against VPP's table ([`V6Scan::settle`]).
+    fn scan_v6(&self) -> Result<V6Scan, String> {
+        let (routes, candidates) = dump_routes_v6(&self.reach)?;
         let tables =
             dump_rule_tables(netlink_packet_route::AddressFamily::Inet6).unwrap_or_else(|e| {
                 tracing::debug!(error = %e, "IPv6 policy-rule dump failed; not filtering by table");
                 None
             });
-        Ok(uncovered_paths_v6(&routes, &self.reach, tables.as_deref()))
+        Ok(classify_v6(
+            &routes,
+            candidates,
+            &self.reach,
+            tables.as_deref(),
+        ))
     }
 }
 
@@ -1286,7 +1453,8 @@ impl KernelDriftWatch {
 #[cfg(target_os = "linux")]
 pub fn dump_routes(reach: &VppReach) -> Result<Vec<KernelRoute>, String> {
     use netlink_packet_route::route::RouteAddress;
-    dump_family(
+    // No IPv4 gateway is link-local, so no candidate is ever built here.
+    let (routes, _) = dump_family(
         netlink_packet_route::AddressFamily::Inet,
         reach,
         |dst, prefix_len| Ipv4Prefix {
@@ -1297,17 +1465,23 @@ pub fn dump_routes(reach: &VppReach) -> Result<Vec<KernelRoute>, String> {
             },
             prefix_len,
         },
-    )
+    )?;
+    Ok(routes)
 }
 
 /// [`dump_routes`] for IPv6, against the v6 reach ([`VppReach::for_v6`])
-/// so the discard agrees with [`uncovered_paths_v6`]. The v6 table is
-/// the smaller one (a quarter of the v4 DFZ), and the same discard keeps
-/// its member-gatewayed bulk from being built at all.
+/// so the discard agrees with [`classify_v6`]. The member-gatewayed bulk
+/// is discarded as for v4; the link-local candidates come back compact
+/// ([`LinkLocalRoute`]), because under a link-local BGP mesh that is
+/// nearly the whole v6 table, and building a full route for each only
+/// for most to settle as held would be the million-entry allocation the
+/// v4 dump was changed to avoid.
 #[cfg(target_os = "linux")]
-pub fn dump_routes_v6(reach: &VppReach) -> Result<Vec<KernelRoute<Ipv6Prefix>>, String> {
+pub fn dump_routes_v6(
+    reach: &VppReach,
+) -> Result<(Vec<KernelRoute<Ipv6Prefix>>, Vec<LinkLocalRoute>), String> {
     use netlink_packet_route::route::RouteAddress;
-    dump_family(
+    let (routes, candidates) = dump_family(
         netlink_packet_route::AddressFamily::Inet6,
         &reach.for_v6(),
         |dst, prefix_len| Ipv6Prefix {
@@ -1317,17 +1491,36 @@ pub fn dump_routes_v6(reach: &VppReach) -> Result<Vec<KernelRoute<Ipv6Prefix>>, 
             },
             prefix_len,
         },
-    )
+    )?;
+    let candidates = candidates
+        .into_iter()
+        .map(|(prefix, table, oif, unowned)| LinkLocalRoute {
+            prefix,
+            table,
+            oif,
+            unowned,
+        })
+        .collect();
+    Ok((routes, candidates))
 }
+
+/// Link-local candidates as [`dump_family`] builds them:
+/// `(prefix, table, link-local device, unowned device)` — see
+/// [`LinkLocalRoute`].
+#[cfg(target_os = "linux")]
+type Candidates<P> = Vec<(P, u32, std::sync::Arc<str>, Option<std::sync::Arc<str>>)>;
 
 /// The dump both families share; `prefix` builds the destination from
 /// `RTA_DST` (absent for a default route) and the header's length.
+/// Returns the routes [`reach_clears`] does not clear, less the
+/// link-local candidates ([`link_local_candidate`]), which come back
+/// separately and compact.
 #[cfg(target_os = "linux")]
 fn dump_family<P>(
     family: netlink_packet_route::AddressFamily,
     reach: &VppReach,
     prefix: impl Fn(Option<&netlink_packet_route::route::RouteAddress>, u8) -> P,
-) -> Result<Vec<KernelRoute<P>>, String> {
+) -> Result<(Vec<KernelRoute<P>>, Candidates<P>), String> {
     use netlink_packet_core::{
         NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_REQUEST,
     };
@@ -1400,8 +1593,11 @@ fn dump_family<P>(
     // Interface names are resolved once per dump rather than per
     // route: a full table can carry thousands of entries out of a
     // handful of devices.
-    let mut names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    // Shared, so a link-local candidate carries its device for a refcount.
+    let mut names: std::collections::HashMap<u32, std::sync::Arc<str>> =
+        std::collections::HashMap::new();
     let mut out = Vec::new();
+    let mut candidates: Candidates<P> = Vec::new();
     let mut recv_buf = vec![0u8; 64 * 1024];
     'dump: loop {
         let n = socket
@@ -1520,17 +1716,32 @@ fn dump_family<P>(
                         encapsulated: encap.is_some(),
                     };
                     for &(i, _, _) in &hops {
-                        names.entry(i).or_insert_with(|| crate::fdb::ifname(i));
+                        names
+                            .entry(i)
+                            .or_insert_with(|| crate::fdb::ifname(i).into());
                     }
-                    let name = |i: u32| names[&i].as_str();
-                    let judged = hops.iter().map(|&(i, gatewayed, link_local)| Hop {
-                        dev: name(i),
-                        gatewayed,
-                        link_local,
-                    });
+                    let name = |i: u32| &*names[&i];
+                    let judged = || {
+                        hops.iter().map(|&(i, gatewayed, link_local)| Hop {
+                            dev: name(i),
+                            gatewayed,
+                            link_local,
+                        })
+                    };
                     // Judged here, before anything is allocated for it:
-                    // on a full-table box nearly every route is cleared.
-                    if !reach_clears(kind, judged, reach) {
+                    // on a full-table box nearly every route is cleared,
+                    // and under a link-local mesh nearly every v6 one is
+                    // a candidate.
+                    if link_local_candidate(kind, judged, reach) {
+                        let (ll, unowned) = candidate_hops(judged(), reach);
+                        let dev = |at: usize| names[&hops[at].0].clone();
+                        candidates.push((
+                            prefix(dst, m.header.destination_prefix_length),
+                            table,
+                            dev(ll),
+                            unowned.map(dev),
+                        ));
+                    } else if !reach_clears(kind, judged(), reach) {
                         out.push(KernelRoute {
                             prefix: prefix(dst, m.header.destination_prefix_length),
                             oifs: hops.iter().map(|&(i, _, _)| name(i).to_string()).collect(),
@@ -1549,7 +1760,7 @@ fn dump_family<P>(
             offset += len;
         }
     }
-    Ok(out)
+    Ok((out, candidates))
 }
 
 /// The table ids some policy rule can select, or `None` when they
@@ -2482,8 +2693,10 @@ mod tests {
         r
     }
 
+    /// Against a VPP that holds nothing — every link-local candidate is
+    /// then lacking, so the non-link-local tests see exactly the paths.
     fn find6(routes: &[KernelRoute<Ipv6Prefix>]) -> Vec<Uncovered<Ipv6Prefix>> {
-        uncovered_paths_v6(routes, &reach(), None)
+        uncovered_paths_v6(routes, &reach(), None, |_| false)
     }
 
     fn lines6(found: &[Uncovered<Ipv6Prefix>]) -> Vec<String> {
@@ -2526,16 +2739,16 @@ mod tests {
         assert_eq!(lines6(&found), ["2001:db8:1::/64 via br1337 (table 254)"]);
     }
 
-    /// A route VPP could take but for its link-local next hops is a
-    /// finding: the engine refuses it (`link_local_refused`), so VPP has
-    /// no route of its own for the prefix. Reported as ONE summary line
+    /// A kernel route with only link-local hops on owned devices, for a
+    /// prefix VPP holds no route for (refused as link-local-only, or
+    /// never in the feed), is a finding. Reported as ONE summary line
     /// counting every such route — a link-local BGP mesh can produce a
     /// great many — naming the first few. A route with ANY global next
-    /// hop on an owned device is covered: VPP installs through that one.
-    /// A link-local hop out a device VPP does not own is an ordinary path
-    /// finding, because the device is the problem there.
+    /// hop on an owned device is covered by its device. A link-local hop
+    /// out a device VPP does not own is an ordinary path finding, because
+    /// the device is the problem there — whatever VPP holds.
     #[test]
-    fn link_local_next_hops_are_reported_in_one_summary() {
+    fn link_local_next_hops_for_prefixes_vpp_lacks_are_one_summary() {
         let mut ecmp_one_global = via(route6(p6("2001:db8:20::", 48), "eth3"), true);
         ecmp_one_global.oifs.push("eth4".into());
         ecmp_one_global.gatewayed.push(true);
@@ -2573,6 +2786,49 @@ mod tests {
         };
         assert_eq!((*routes, examples.len()), (5, LINK_LOCAL_EXAMPLES));
         assert!(found[0].to_string().contains(", …)"), "{}", found[0]);
+    }
+
+    /// The FRR shape: an eBGP peer sends a global AND a link-local next
+    /// hop, zebra installs the KERNEL route via the `fe80::` one, and the
+    /// engine installs the prefix in VPP through the global one. The
+    /// kernel's hops say "link-local only", VPP holds the prefix, so it is
+    /// covered and must NOT be reported — flagging it would hold
+    /// `exempt-drift-v6` Degraded forever over routes VPP forwards fine.
+    /// Only the prefixes VPP genuinely lacks are counted.
+    #[test]
+    fn a_link_local_kernel_hop_is_covered_when_vpp_holds_the_prefix() {
+        let held = p6("2001:db8:10::", 48); // installed via the global
+        let refused = p6("2001:db8:11::", 48); // every feed next hop link-local
+        let absent = p6("::", 0); // RA-learned default, never in the feed
+        let routes = [
+            via(route6(held, "br3998"), true),
+            via(route6(refused, "eth3"), true),
+            via(route6(absent, "eth3"), true),
+        ];
+        let vpp_holds = |p: &Ipv6Prefix| *p == held;
+        let found = uncovered_paths_v6(&routes, &reach(), None, vpp_holds);
+        assert_eq!(
+            found,
+            [Uncovered::LinkLocal {
+                routes: 2,
+                examples: vec![
+                    "::/0 via eth3 (table 254)".into(),
+                    "2001:db8:11::/48 via eth3 (table 254)".into(),
+                ],
+            }],
+            "the held prefix is covered; the refused and the absent ones are not"
+        );
+
+        // VPP holding all of them: nothing to say.
+        assert!(uncovered_paths_v6(&routes, &reach(), None, |_| true).is_empty());
+
+        // Holding the prefix does NOT cover a path finding: a link-local
+        // hop out a device VPP does not own is about the device.
+        let unowned = [via(route6(held, "wg0"), true)];
+        assert_eq!(
+            lines6(&uncovered_paths_v6(&unowned, &reach(), None, vpp_holds)),
+            ["2001:db8:10::/48 via wg0 (table 254)"]
+        );
     }
 
     /// Not paths a diverted packet takes, so never findings, whatever
@@ -2628,7 +2884,7 @@ mod tests {
         let routes = [blackhole, parked, in_use, opaque];
 
         let selected = [52u32, 254, 255];
-        let found = uncovered_paths_v6(&routes, &reach(), Some(&selected));
+        let found = uncovered_paths_v6(&routes, &reach(), Some(&selected), |_| false);
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0].table(), Some(52));
         assert_eq!(found[1], Uncovered::Opaque(1));
@@ -2639,37 +2895,101 @@ mod tests {
     }
 
     /// The v6 dump discards what `reach_clears` clears against the v6
-    /// reach before building a route, and that must never change a v6
-    /// finding — the same invariant the v4 dump rests on, over the v6
-    /// shapes: a member-gatewayed bulk, link-local next hops, a local-route
-    /// bridge that is not v6 reach, and the router's own addresses.
+    /// reach and builds link-local candidates compactly instead of as
+    /// routes, and neither may change a v6 finding — the same invariant
+    /// the v4 dump rests on, over the v6 shapes: a member-gatewayed bulk,
+    /// a link-local bulk (the FRR mesh), a local-route bridge that is not
+    /// v6 reach, and the router's own addresses. Checked against a VPP
+    /// that holds the link-local bulk but not the default.
     #[test]
-    fn filtering_cleared_v6_routes_at_the_dump_never_changes_the_findings() {
+    fn splitting_v6_routes_at_the_dump_never_changes_the_findings() {
         let mut table: Vec<KernelRoute<Ipv6Prefix>> = (0..2_000u16)
             .map(|n| {
                 let dev = if n % 2 == 0 { "eth3" } else { "eth4" };
-                via(route6(p6(&format!("2001:db8:{n:x}::"), 48), dev), false)
+                // Half gatewayed globally, half via fe80:: (the FRR mesh).
+                via(route6(p6(&format!("2001:db8:{n:x}::"), 48), dev), n % 4 < 2)
             })
             .collect();
         let mut local = route6(p6("2001:db8:ffff::1", 128), "br1337");
         local.kernel_delivers = true;
+        let mut ll_parked = via(route6(p6("2001:db8:fff2::", 48), "eth3"), true);
+        ll_parked.table = 4242;
+        // ECMP: a link-local member hop beside a tunnel hop.
+        let mut mixed = via(route6(p6("2001:db8:fff3::", 48), "eth3"), true);
+        mixed.oifs.push("tun0".into());
+        mixed.gatewayed.push(true);
+        mixed.link_local.push(false);
         table.extend([
             via(route6(p6("::", 0), "eth3"), true),
             via(route6(p6("2001:db8:fff0::", 48), "tun0"), false),
             route6(p6("2001:db8:fff1::", 64), "br1337"),
             route6(p6("fe80::", 64), "tun0"),
+            ll_parked,
+            mixed,
             local,
         ]);
         let v6_reach = reach().for_v6();
+        let is_candidate =
+            |r: &KernelRoute<Ipv6Prefix>| link_local_candidate(r.kind(), || r.hops(), &v6_reach);
         let kept: Vec<_> = table
             .iter()
-            .filter(|r| !r.cleared_by(&v6_reach))
+            .filter(|r| !is_candidate(r) && !r.cleared_by(&v6_reach))
             .cloned()
             .collect();
+        let candidates: Vec<LinkLocalRoute> = table
+            .iter()
+            .filter(|r| is_candidate(r))
+            .map(|r| {
+                let (ll, unowned) = candidate_hops(r.hops(), &v6_reach);
+                LinkLocalRoute {
+                    prefix: r.prefix,
+                    table: r.table,
+                    oif: r.oifs[ll].as_str().into(),
+                    unowned: unowned.map(|i| r.oifs[i].as_str().into()),
+                }
+            })
+            .collect();
         assert!(kept.len() < 10, "the bulk is discarded: {}", kept.len());
-        let whole = find6(&table);
-        assert_eq!(whole.len(), 3, "{whole:?}");
-        assert_eq!(find6(&kept), whole);
+        assert_eq!(
+            candidates.len(),
+            1_000 + 3,
+            "the mesh, the default, the parked one, the mixed one"
+        );
+
+        let selected = [254u32, 255];
+        // VPP holds the mesh (installed via the feed's global next hops)
+        // and lacks the default, the parked prefix and the mixed one.
+        let lacking = [
+            p6("::", 0),
+            p6("2001:db8:fff2::", 48),
+            p6("2001:db8:fff3::", 48),
+        ];
+        let holds = |p: &Ipv6Prefix| !lacking.contains(p);
+        for tables in [None, Some(&selected[..])] {
+            let whole = uncovered_paths_v6(&table, &reach(), tables, holds);
+            let split = classify_v6(&kept, candidates.clone(), &reach(), tables).settle(holds);
+            assert_eq!(split, whole, "tables {tables:?}");
+            // Paths: tun0, br1337's connected subnet, and the mixed route
+            // by its tunnel hop. Summary: the default VPP lacks, plus the
+            // parked one only when no table filter applies.
+            let paths: Vec<String> = whole
+                .iter()
+                .filter(|u| matches!(u, Uncovered::Path { .. }))
+                .map(Uncovered::to_string)
+                .collect();
+            assert_eq!(
+                paths,
+                [
+                    "2001:db8:fff0::/48 via tun0 (table 254)",
+                    "2001:db8:fff3::/48 via tun0 (table 254)",
+                    "2001:db8:fff1::/64 via br1337 (table 254)",
+                ]
+            );
+            let Some(Uncovered::LinkLocal { routes, .. }) = whole.last() else {
+                panic!("{whole:?}");
+            };
+            assert_eq!(*routes, if tables.is_some() { 1 } else { 2 }, "{whole:?}");
+        }
     }
 
     /// The v6 half runs only while VPP carries IPv6 AND some port line
@@ -2715,45 +3035,128 @@ mod tests {
             "an inactive half had nothing to read"
         );
 
-        let found = vec!["2001:db8:100::/48 via tun0 (table 254)".to_string()];
-        assert_eq!(
-            s.absorb(V6Drift::Scanned {
-                lines: found.clone(),
-                routes: 1
-            }),
-            Some(found.as_slice()),
-            "new findings are handed back for the warning"
+        let tun = route6(p6("2001:db8:100::", 48), "tun0");
+        let held = p6("2001:db8:10::", 48);
+        let scan = classify_v6(
+            &[tun, via(route6(held, "eth3"), true)],
+            Vec::new(),
+            &reach(),
+            None,
         );
+        let found = vec!["2001:db8:100::/48 via tun0 (table 254)".to_string()];
+        let holds = |p: &Ipv6Prefix| *p == held;
         assert_eq!(
-            s.absorb(V6Drift::Scanned {
-                lines: found.clone(),
-                routes: 1
-            }),
+            s.absorb(V6Drift::Scanned(scan.clone()), holds),
+            Some(found.as_slice()),
+            "new findings are handed back for the warning — settled, so the \
+             held link-local prefix is not among them"
+        );
+        assert_eq!(s.routes, 1);
+        assert_eq!(
+            s.absorb(V6Drift::Scanned(scan.clone()), holds),
             None,
             "unchanged findings are not warned twice"
         );
         assert!(!s.quiet());
+        // The same scan settled against a VPP that lost the prefix.
+        s.absorb(V6Drift::Scanned(scan), |_| false);
+        assert_eq!(s.routes, 2, "{:?}", s.lines);
+        s.absorb(
+            V6Drift::Scanned(classify_v6(
+                &[route6(p6("2001:db8:100::", 48), "tun0")],
+                Vec::new(),
+                &reach(),
+                None,
+            )),
+            holds,
+        );
 
-        s.absorb(V6Drift::Unreadable("netlink recv: EIO".into()));
+        s.absorb(V6Drift::Unreadable("netlink recv: EIO".into()), holds);
         assert_eq!(s.lines, found, "retained across the failed read");
         assert_eq!(s.unreadable.as_deref(), Some("netlink recv: EIO"));
 
-        s.clear_findings();
+        s.scope_committed(true);
         assert!(s.lines.is_empty() && s.routes == 0);
         assert!(
             s.unreadable.is_some(),
             "the read failure is not the scope's"
         );
 
-        s.absorb(V6Drift::Scanned {
-            lines: Vec::new(),
-            routes: 0,
-        });
+        s.absorb(V6Drift::Scanned(V6Scan::default()), holds);
         assert!(s.active && s.quiet() && s.unreadable.is_none());
         s.scan_failed("netlink socket: permission denied");
         assert!(!s.quiet(), "an active half is blind with the whole scan");
 
-        s.absorb(V6Drift::Inactive);
+        s.absorb(V6Drift::Inactive, holds);
         assert_eq!(s, V6DriftState::default(), "no port diverts v6 any more");
+    }
+
+    /// A reload that drops the last `v6-outbound` switches the v6 half off
+    /// the moment its scope commits — not when the scanner next answers
+    /// `Inactive`. A v4 dump failing in between must not be recorded as a
+    /// v6 failure, or `exempt-drift-v6` claims a disabled scan is
+    /// unreadable, for as long as the v4 dump keeps failing (review
+    /// finding).
+    #[test]
+    fn committing_a_scope_without_v6_resets_the_half() {
+        let mut s = V6DriftState::default();
+        s.absorb(
+            V6Drift::Scanned(classify_v6(
+                &[route6(p6("2001:db8:100::", 48), "tun0")],
+                Vec::new(),
+                &reach(),
+                None,
+            )),
+            |_| false,
+        );
+        assert!(s.active && !s.quiet());
+
+        s.scope_committed(false);
+        assert_eq!(s, V6DriftState::default());
+        s.scan_failed("netlink recv: EIO");
+        assert!(
+            s.quiet() && s.unreadable.is_none(),
+            "a disabled half cannot be blind: {s:?}"
+        );
+    }
+
+    /// An ECMP route mixing a link-local hop on a member with a hop out an
+    /// unowned device: if VPP lacks the prefix, the finding is the tunnel
+    /// hop, named — not a link-local summary naming the member (review
+    /// finding). If VPP holds the prefix it is covered, the any-path rule
+    /// the v4 scan applies to ECMP.
+    #[test]
+    fn a_mixed_ecmp_route_vpp_lacks_names_its_unowned_hop() {
+        let mut mixed = via(route6(p6("2001:db8:40::", 48), "eth3"), true);
+        mixed.oifs.push("wg0".into());
+        mixed.gatewayed.push(true);
+        mixed.link_local.push(false);
+        let pure = via(route6(p6("2001:db8:41::", 48), "eth4"), true);
+        let routes = [mixed.clone(), pure];
+
+        let found = uncovered_paths_v6(&routes, &reach(), None, |_| false);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].to_string(), "2001:db8:40::/48 via wg0 (table 254)");
+        assert_eq!(
+            found[1],
+            Uncovered::LinkLocal {
+                routes: 1,
+                examples: vec!["2001:db8:41::/48 via eth4 (table 254)".into()],
+            },
+            "only the pure link-local route is summarised"
+        );
+
+        let held = p6("2001:db8:40::", 48);
+        let found = uncovered_paths_v6(&[mixed.clone()], &reach(), None, |p| *p == held);
+        assert!(found.is_empty(), "held = covered: {found:?}");
+
+        // The unowned hop first in route order: same verdict, and the
+        // summary's example names the owned link-local hop's device.
+        let mut flipped = via(route6(p6("2001:db8:42::", 48), "wg0"), false);
+        flipped.oifs.push("eth3".into());
+        flipped.gatewayed.push(true);
+        flipped.link_local.push(true);
+        let found = uncovered_paths_v6(&[flipped], &reach(), None, |_| false);
+        assert_eq!(lines6(&found), ["2001:db8:42::/48 via wg0 (table 254)"]);
     }
 }

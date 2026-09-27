@@ -1938,7 +1938,13 @@ impl Runtime {
                         c.drift_routes = found.routes;
                         c.drift_uncovered = found.lines;
                         c.drift_unreadable = None;
-                        if let Some(lines) = c.drift_v6.absorb(found.v6) {
+                        // Settled HERE, against the ledger: the scan
+                        // thread cannot read the engine, and whether VPP
+                        // holds a prefix is the engine's to say.
+                        let core = &mut *c;
+                        let engine = &core.engine;
+                        if let Some(lines) = core.drift_v6.absorb(found.v6, |p| engine.holds_v6(p))
+                        {
                             tracing::warn!(
                                 paths = ?lines,
                                 "IPv6 kernel path(s) VPP cannot take while a port diverts \
@@ -2455,15 +2461,17 @@ impl Core {
             return;
         };
         if let Some(s) = self.drift_scanner.as_ref() {
+            let scans_v6 = scope.scans_v6;
             s.set_scope(scope);
             // The findings described the OLD config, so they go —
             // the scanner republishes against the new one on its next
             // pass. The READ failure does not go with them: whether
             // the kernel answers has nothing to do with which config
-            // we are judging.
+            // we are judging. (A v6 half the new scope switches off goes
+            // entirely — see `V6DriftState::scope_committed`.)
             self.drift_uncovered.clear();
             self.drift_routes = 0;
-            self.drift_v6.clear_findings();
+            self.drift_v6.scope_committed(scans_v6);
         }
     }
 
