@@ -213,6 +213,7 @@ current value without a mapping table:
 | `packetframe_vpp_source_backlog` | sustained non-zero — deltas are not draining |
 | `packetframe_vpp_drain_failing` | `1` — the steady-state delta apply is retrying |
 | `packetframe_vpp_exempt_drift` | `> 0` — a kernel path VPP cannot take has no `steer-exempt`; steered traffic for it is (or will be) blackholed. ALSO alarm on `absent()` while attached: the gauge is omitted, never zeroed, when the scan cannot read the kernel |
+| `packetframe_vpp_exempt_drift_v6` | `> 0` — an IPv6 kernel path VPP cannot take while a port carries `v6-divert`; diverted v6 for it is (or will be) blackholed. Present ONLY while some port carries `v6-divert` under `v6 on`, so alarm on `absent()` only on boxes configured that way: it is omitted, never zeroed, when the v6 scan cannot read |
 | `packetframe_vpp_neighbours_unplaced` | `> 0` — a bridge neighbour the kernel FDB has not placed behind any member port; routes through it are unresolvable |
 | `packetframe_vpp_neighbour_moves` | a step — spanning tree moved neighbours between trunks and VPP followed; worth correlating with switch events |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
@@ -1006,6 +1007,137 @@ fast-path `local-prefix` (tier agreement — a failover must not change
 what is delivered), and overlapping declarations. Restart-only; the
 reload names it.
 
+### local-route6: a customer VLAN VPP can deliver IPv6 to
+
+`local-route` is enough for IPv4 service hosts, which are static and
+which the kernel has resolved. A customer VLAN's IPv6 hosts are
+neither: customers talk to the router from their link-locals, so the
+kernel rarely holds their global addresses, and privacy addresses
+rotate daily. Before inbound IPv6 for a customer VLAN is steered into
+VPP, VPP must be able to reach a host it has never been told about.
+Three modules take part, and all three lines are required:
+
+```
+module fast-path
+  allow-prefix6 2001:db8:0:1337::/64
+  local-prefix6 2001:db8:0:1337::/64 via br1337
+
+module vpp-offload
+  v6 on
+  port eth4 cores 1 steer on vlans 88,1337
+  local-route6 2001:db8:0:1337::/64 port eth4 vlan 1337
+
+module neigh-snoop
+  bridge br1337                       # not ix-mode
+  prefix br1337 2001:db8:0:1337::/64  # the customer /64; no fe80::/10 needed
+```
+
+How a never-seen host becomes reachable:
+
+1. **`local-route6`** installs an attached `/64` on the VLAN's BVI (or
+   subif / VF, chosen as for `local-route`), and shadows the mirror
+   inside it, including a route for the `/64` itself, which would
+   otherwise replace the attached route's path. This is also what makes
+   customer hosts deliverable in VPP at all, even ones the kernel knows:
+   `local-prefix6`'s `/128`s are local-ARP routes and never reach VPP,
+   and a static neighbour becomes a usable host route only under an
+   attached cover on its own interface.
+2. **VPP gleans.** A packet for a host VPP holds no neighbour for hits
+   the attached route's glean adjacency, and `ip6-glean` sends a
+   neighbour solicitation to the host's solicited-node group out the
+   bridge domain. VPP v26.06 always sources it from the interface's
+   link-local, so nothing beyond the ip6 enable `v6 on` already does
+   is configured: no global address, no connected prefix. The BVI
+   carries the kernel bridge's MAC, so its EUI-64 link-local is the
+   bridge's own (assuming the bridge uses the default EUI-64 address
+   generation) and so is the solicitation's source link-layer address.
+   The packet that triggered it is **dropped**: glean does not queue.
+3. **The host answers the router**: a solicited NA, unicast to the
+   bridge's MAC. It is ICMPv6, which the MCAM never diverts, so it
+   reaches the kernel bridge. The kernel discards it: it holds no
+   INCOMPLETE entry for the target, and 5.15 has no
+   `accept_untracked_na`.
+4. **neigh-snoop learns it** (target + target link-layer option; the
+   Solicited flag and unicast destination are not consulted) and
+   installs it `STALE`, at its `install-rate`.
+5. **fast-path's `local-prefix6`** sees the `RTM_NEWNEIGH`, registers
+   the host as a `/128` next hop, and the programmer hands the
+   neighbour to vpp-offload's feed.
+6. **VPP gets a static neighbour** on the BVI, placed per host from the
+   bridge FDB like any bridge neighbour. The next packet is delivered.
+
+The known cost: the first packet to an address VPP has never had is
+lost, and so is every packet until steps 3-6 finish (not yet measured
+on hardware; neigh-snoop's install pacing is one term of it).
+IPv4 makes the same trade under `local-route`. TCP retransmits a lost
+SYN; a one-shot UDP query to a quiet host can be lost.
+
+**Solicitation rate.** VPP throttles glean per destination and
+interface: at most one solicitation per millisecond per worker
+(`nd_throttle`, compiled in, with no API to tune it). The kernel, for
+comparison, sends `mcast_solicit` (3) solicitations a second apart per
+resolution attempt. So a sustained stream to an
+address that never answers (a departed host, a typo, a scan) makes VPP
+solicit up to ~1000 times a second per worker toward that address's
+solicited-node group, and a scan across the `/64` solicits about once
+per scanned packet. On a switch without MLD snooping each one floods
+the VLAN. That is the price of delivering IPv6 in VPP at all, and it is
+not a stall risk: glean runs in VPP's data plane and never reaches the
+API, and what comes back is paced by neigh-snoop's `install-rate`
+(default 50/s, daemon-wide). A customer host has no routes resolving
+through it, so a neighbour add is not the dependent-FIB walk an IX
+next hop's is. Watch `ip6-glean`'s counters (below). If the rate matters
+on a VLAN, the rollback is dropping its `local-route6` (restart).
+
+Entries age out with the kernel's: an unused `STALE` entry is removed
+by neighbour GC (`gc_stale_time`, once the table is above
+`gc_thresh1`), `RTM_DELNEIGH` reaches VPP as a lost neighbour, and the
+next inbound packet gleans again. neigh-snoop's `table-max` (default
+4096) bounds what it remembers per bridge. Size it for hosts ×
+addresses per host, because privacy addressing keeps several per host
+alive at once.
+
+Delivery is designed for bridged VLANs (the BVI case). On a plain
+port's subif or an untagged VF the solicitation carries the port's own
+MAC, and whether the NA reaches the kernel or the VF on the reference
+NIC has not been measured.
+
+Validation refuses `local-route6` without `v6 on`, outside every
+fast-path `local-prefix6` (the v4 `local-prefix` is no cover), on a
+port or vlan the section does not declare, and overlapping another
+`local-route6`. Restart-only on both doors: a reload names it, and a
+`--keep-vpp` restart across an added or removed line refuses adoption
+and restarts VPP. That restart is what removes an attached route,
+since the route is kept outside the ledger. A config without any
+`local-route6` records exactly what earlier builds recorded, so an
+upgrade still adopts.
+
+Verifying on the box (`vppctl` is fine for these; they are not bulk
+reads):
+
+```sh
+# The attached /64, on the BVI (loop1337), and no drop or mirror path.
+vppctl show ip6 fib 2001:db8:0:1337::/64
+# Static neighbours VPP holds for the VLAN's hosts ("S" flag).
+vppctl show ip6 neighbors loop1337
+# Glean at work: "neighbor solicitations sent" climbing when new hosts
+# are reached; "throttled" is the rate limit; "address overflow drops"
+# means link down or ip6 not enabled on the interface; "no source
+# address" means it has no link-local (ip6 enable failed).
+vppctl show errors | grep -i glean
+# What neigh-snoop installed on the kernel side.
+ip -6 neigh show dev br1337 nud stale
+# The learning side, per bridge.
+grep 'neigh_snoop_.*iface="br1337"' /var/lib/node_exporter/textfile/packetframe.prom
+```
+
+A healthy VLAN shows solicitations sent roughly tracking new addresses,
+`STALE` entries appearing for the customer `/64`, and the same hosts as
+static neighbours on `loop1337`. If solicitations climb but no `STALE`
+entry appears, the NA is not reaching neigh-snoop: check the `bridge`
+and `prefix` lines, and that `frames_total{kind="na"}` counts on the
+bridge.
+
 ### direction dst: steering inbound
 
 Per-port, because the bidirectional service edge is asymmetric by
@@ -1194,7 +1326,9 @@ announces a remote host route and the hole re-opens with nobody
 touching packetframe. So it is watched on a clock rather than
 validated once: every 60 s the module dumps the kernel's IPv4 routes
 across all tables and reports any path VPP cannot take that no
-`steer-exempt` covers.
+`steer-exempt` covers — and, while a port diverts IPv6, the kernel's
+IPv6 routes too ([IPv6 findings](#ipv6-findings-exempt-drift-v6)
+below).
 
 ```
 exempt-drift: degraded — kernel path(s) VPP cannot take, with no
@@ -1319,6 +1453,91 @@ NIC diverts.
 It is detection only. Deriving the exemptions automatically was
 considered and rejected for v1: it would change forwarding without an
 operator asking and could exhaust the MCAM budget silently.
+
+#### IPv6 findings (`exempt-drift-v6`)
+
+A `v6-divert` diversion matches by FRAME (TCP/UDP over IPv6 to the
+router's MAC on a listed VLAN), never by address, so once one exists
+any IPv6 destination can reach VPP. A kernel-only IPv6 route VPP lacks
+— an overlay's ULA via its tunnel device, a static route out an
+interface VPP does not own, a route added by hand — is then silently
+black-holed there. So the scan also dumps the kernel's IPv6 routes, on
+the same thread and cadence, but **only while VPP carries IPv6 (`v6
+on`) AND some port line carries `v6-divert`** — from config, not the
+lever, so a `v6-divert` staged behind `steer off` is already scanned
+(the same reason the v4 scan runs before the canary). Drop
+`v6-divert` from every port and the half, its row and its gauge go
+away.
+
+```
+exempt-drift-v6: degraded — IPv6 kernel path(s) VPP cannot take, while
+  a port diverts IPv6 (`v6-divert`): 2001:db8:100::/48 via tun0
+  (table 52) — diverted IPv6 for these dies in VPP, or leaves by a less
+  specific route VPP holds, instead of taking the kernel path. …
+```
+
+It is the same judgement as v4 — a route is covered when some next hop
+leaves by a member port, or via a gateway on a bridge VLAN a member
+carries — with these differences:
+
+- **Nothing exempts.** The NIC cannot match a v6 address, so there is
+  no IPv6 `steer-exempt` and every finding stands until its cause
+  goes. That is why it has its own row: its remedies are not
+  `exempt-drift`'s.
+- **A link-local kernel next hop is judged by VPP's table, not the
+  kernel's.** Under FRR, a peer that sends both a global and a
+  link-local next hop gets its kernel route installed via the `fe80::`
+  one ("(used)" in `show bgp`), while the feed also carries the global
+  one and VPP installs the prefix through it — VPP refuses only routes
+  whose EVERY feed next hop is link-local (`fib-v6` counts those). So a
+  kernel route whose owned-device hops are all link-local is covered
+  when VPP holds the prefix (installed or in flight), and reported only
+  when VPP does not: refused as link-local-only, or never in the feed
+  (an RA-learned default via `fe80::1` on a member). Those are **one
+  summary line**, counting every such route and naming the first
+  three. The check runs when each scan lands, so in the first scan
+  after an attach — before the v6 table has loaded — they are reported
+  until the next one. A route with any global next hop on an owned
+  device is covered by its device. An ECMP route mixing a link-local
+  member hop with a hop out a device VPP does not own is, when VPP
+  lacks the prefix, an ordinary finding naming that device.
+- **`local-route` bridges are no v6 reach.** `local-route` delivers an
+  IPv4 subnet; VPP has no route onto that bridge for its v6 subnet, so
+  a connected v6 route there is a finding.
+- **Not paths, never findings:** link-local destinations (routers
+  never forward `fe80::/10`), multicast destinations (a `33:33` frame
+  no diversion's unicast MAC matches), and the router's own addresses
+  (local and anycast). The v4 scan reports router addresses on the
+  steered segments because a `steer-exempt` fixes them; v6 has no
+  address rule, and what reaches the router over a diverted VLAN stays
+  on the kernel by port (the built-in DNS keeps and `steer-keep6`), a
+  match this scan cannot relate to a route.
+- **Tables** are filtered by the v6 policy rules (`ip -6 rule`), a set
+  separate from the v4 rules; nexthop-object routes and routes the
+  kernel drops are handled as for v4.
+
+The remedy depends on which kind of route it is:
+
+- **A route VPP should carry** (it leaves by a device VPP owns or
+  should own): fix the feed so VPP learns it with a usable next hop, or
+  declare the VLAN on the port (`port … vlans`) so VPP reaches the
+  device.
+- **A kernel-only route** (a tunnel, an overlay, anything VPP will
+  never own): either accept the black-hole risk knowingly (the row
+  stays Degraded while it stands); or keep that traffic on the kernel
+  by port with `steer-keep6`, when it is identifiable by port; or drop
+  `v6-divert` from the ports whose hosts reach that destination.
+
+`packetframe_vpp_exempt_drift_v6` carries the route count, as its own
+series: `packetframe_vpp_exempt_drift` keeps its single, unlabelled
+series and counts IPv4 alone, so every query written against it reads
+exactly as before. The v6 gauge follows the same absent-not-zero rule —
+omitted while the v6 dump cannot read, while the tripwire is pending or
+cannot tell which config the NIC holds (the `exempt-drift` row speaks
+for both halves then), and whenever no port carries `v6-divert`. A v6
+dump that fails does not discard the v4 verdict, and the other way
+round: a failed v4 dump leaves the v6 half blind too, since it runs
+second.
 
 ### The null-drop gauge
 
@@ -1663,9 +1882,15 @@ neighbour, read back from VPP. While a piece is being repaired the path
 reads not ready, so the v6 half is held back. An address event whose
 re-read fails holds it back too (the new address may have no /128 yet);
 a failed periodic re-read with nothing heard keeps the last good address
-set, so one flaky read does not churn the v6 rules. The **exemption tripwire (`exempt-drift`) is v4-only**: a v6
-diversion's correctness rests on VPP's v6 FIB, and the keeps are what
-protect the router's own services.
+set, so one flaky read does not churn the v6 rules.
+
+The **exemption tripwire scans IPv6 too** while
+any port carries `v6-divert`: a kernel v6 route VPP cannot take is an
+`exempt-drift-v6` finding, counted on `packetframe_vpp_exempt_drift_v6`
+(see [IPv6 findings](#ipv6-findings-exempt-drift-v6) for what it
+reports and the remedies — there is no v6 exemption). The keeps are
+what protect the router's own services; the tripwire does not judge
+them.
 
 ### Rollback
 

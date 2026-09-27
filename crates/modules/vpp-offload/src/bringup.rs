@@ -607,15 +607,16 @@ pub fn bring_up(
     // exemption slot for it would spend a scarce resource on nothing.
     // Any src (or `both`) port anywhere means any destination is
     // reachable — the conservative default, including when the config
-    // declares no direction at all.
-    let dst_only_scope = crate::drift::divertible_scope(&cfg.ports, cfg.steer_direction, allowlist);
+    // declares no direction at all. The same holds for whether the IPv6
+    // half runs: `v6-divert` on any port line, lever or not
+    // ([`crate::drift::DriftScope::scans_v6`]).
+    //
     // Exactly what the runtime is built with below — the target, the
     // engine's and the watcher's exemptions, the watcher's scope — so the
     // first reload can tell whether it changes any of it.
     let held_steering = crate::SteeringInputs {
         targets: steer_targets.clone(),
-        exempts: cfg.steer_exempts.clone(),
-        dst_only: dst_only_scope.clone(),
+        scope: crate::drift::DriftScope::from_config(cfg, allowlist),
         want_steer: wants_steer,
     };
     let steering = NtupleSteering::new(member_ports, steer_targets);
@@ -839,7 +840,6 @@ pub fn bring_up(
         &cfg.trunk_ports,
         local_routes,
         &cfg.steer_exempts,
-        dst_only_scope,
         held_steering,
         cfg.families(),
     ) {
@@ -917,7 +917,6 @@ fn finish(
     trunk_ports: &[String],
     local_routes: &[crate::LocalRoute],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
-    dst_only_scope: Option<Vec<packetframe_common::fib::IpPrefix>>,
     held_steering: crate::SteeringInputs,
     families: FamilyPolicy,
 ) -> Result<Attached, String> {
@@ -1308,7 +1307,7 @@ fn finish(
     } else {
         Vec::new()
     };
-    let drift_exempts = steer_exempts.to_vec();
+    let drift_scope = held_steering.scope.clone();
     let engine_exempts = steer_exempts.to_vec();
     // The IPv6 hand-back path's sizing and want, from the same inputs the
     // runtime starts with: the veth takes the largest member MTU, so any
@@ -1338,8 +1337,13 @@ fn finish(
         let _ = (&drift_port_vlans, &drift_trunks);
         let drift_reach = crate::drift::VppReach {
             members: members.clone(),
+            // IPv4 local routes only: the scan judges the kernel's v4
+            // table, and a bridge VPP delivers only v6 into (a
+            // `local-route6` alone) would clear a v4 connected route out
+            // of it that VPP has no attached route for.
             local_devices: local_routes
                 .iter()
+                .filter(|lr| !lr.prefix.is_v6())
                 .map(|lr| lr.kernel_dev.clone())
                 .collect(),
             bridged_devices: Vec::new(),
@@ -1415,8 +1419,7 @@ fn finish(
             reach: drift_reach,
             port_vlans: drift_port_vlans,
             trunk_ports: drift_trunks,
-            exempts: drift_exempts,
-            dst_only: dst_only_scope,
+            scope: drift_scope,
         }));
         // Rules from a previous process are adopted below, and the
         // config on disk may have been edited while the daemon was
@@ -1428,7 +1431,7 @@ fn finish(
             runtime.note_inherited_steering();
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = (drift_reach, drift_exempts, dst_only_scope);
+        let _ = (drift_reach, drift_scope);
         let initial = match adopted {
             Some(p) => {
                 // The API handshake MUST happen before the adoption is
@@ -1707,6 +1710,7 @@ mod completeness_gate_tests {
             require_table_complete: require,
             steer_exempts: vec![],
             local_routes: vec![],
+            local_routes6: vec![],
             steer_capacity: None,
             trunk_ports: vec![],
             v6_divert: vec![],

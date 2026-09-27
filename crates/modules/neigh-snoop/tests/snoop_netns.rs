@@ -402,6 +402,24 @@ fn na_with_tllao(src_mac: [u8; 6], src: Ipv6Addr, target: Ipv6Addr) -> Vec<u8> {
     )
 }
 
+/// A solicited NA (Solicited + Override) unicast to the snooped
+/// device's own MAC and address — the answer to a solicitation the
+/// router sent, which is what a vpp-offload glean draws from a
+/// customer host.
+fn na_solicited_unicast(
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    target: Ipv6Addr,
+) -> Vec<u8> {
+    let mut body = vec![0x60, 0, 0, 0];
+    body.extend_from_slice(&target.octets());
+    body.extend_from_slice(&[2, 1]);
+    body.extend_from_slice(&src_mac);
+    icmp6(src_mac, dst_mac, src, dst, 136, &body)
+}
+
 // --- the engine under test --------------------------------------------------
 
 struct Rig {
@@ -547,6 +565,35 @@ fn learns_ns_and_na_pairs() {
     // The snapshot is published once per housekeeping tick; wait for it
     // rather than reading the previous tick's.
     rig.wait_counter("three entries", |s| s.bridges[0].table_entries == 3);
+    rig.stop();
+}
+
+/// (b2) A solicited NA addressed to the router itself, for a global
+/// the kernel never asked about, is learned and installed STALE. The
+/// kernel discards such an answer — it holds no INCOMPLETE entry for the
+/// target, and neither 5.15 (no `accept_untracked_na`) nor 6.6 (off by
+/// default) creates one — so the entry below can only be the engine's.
+/// This is the leg a customer VLAN behind a vpp-offload `local-route6`
+/// stands on: VPP's glean solicits, the host answers the bridge's MAC,
+/// and nothing else on the box ever learns the answer.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn learns_a_solicited_na_the_kernel_discards() {
+    let rig = Rig::start();
+    let a_mac = mac_of(&rig.names.veth_a);
+    assert!(rig.neigh("2001:db8::79").is_none(), "clean start");
+    rig.inject(&na_solicited_unicast(
+        MAC_Z,
+        a_mac,
+        ll(0x79),
+        v6(1),
+        v6(0x79),
+    ));
+    let line = rig.wait_neigh("2001:db8::79", |l| l.contains("STALE"));
+    assert!(line.contains(&mac_str(MAC_Z)), "{line}");
+    rig.wait_counter("install confirmed", |s| {
+        s.bridges[0].counters.installs[InstallOutcome::Confirmed.index()] >= 1
+    });
     rig.stop();
 }
 

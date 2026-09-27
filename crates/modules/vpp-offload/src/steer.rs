@@ -64,9 +64,11 @@
 //! VLAN goes to VPP, whatever its source; which VLANs to list is the
 //! operator's call, and the runbook says what it implies.
 //!
-//! The route-drift tripwire ([`crate::drift`]) stays v4-only: a v6
-//! diversion relies on the VPP FIB for correctness, and the keeps are
-//! what protect the control plane.
+//! Because the diversion is by frame, any v6 destination can reach VPP
+//! once one exists, so the route-drift tripwire ([`crate::drift`]) scans
+//! the kernel's IPv6 routes too while any port carries `v6-divert`. It
+//! can only report: there is no v6 address rule to exempt with. The
+//! keeps are what protect the control plane.
 //!
 //! ## What is here, and what is not
 //!

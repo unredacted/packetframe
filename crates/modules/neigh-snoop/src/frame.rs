@@ -11,7 +11,26 @@
 //!   `::` (duplicate address detection carries no usable source).
 //! - ICMPv6 Neighbor Advertisement (136): `(target, TLLAO)`, plus
 //!   `(ip6.src, TLLAO)` when the source is a link-local address other
-//!   than the target — one router, two addresses, one frame.
+//!   than the target — one router, two addresses, one frame. Solicited
+//!   or not, multicast or unicast: the Solicited flag and the
+//!   destination are deliberately not consulted. The solicited, unicast
+//!   case is load-bearing on a customer VLAN behind a vpp-offload
+//!   `local-route6`: VPP's glean solicits a host the kernel never
+//!   resolved, the host answers the router's MAC, and the kernel —
+//!   holding no INCOMPLETE entry for it — discards the answer (5.15 has
+//!   no `accept_untracked_na`). This parser is the only thing that ever
+//!   learns it.
+//!
+//! A DAD solicitation's TARGET is not learned either, although its
+//! Ethernet source names the host claiming it. The address is
+//! tentative: if DAD fails, the claimant is the duplicate and the owner
+//! defends with an NA — and a STALE entry written for the claimant would
+//! then hold the owner's address against the loser's MAC, with the
+//! install holddown keeping the owner's correction out for up to 30 s.
+//! The claim also carries no link-layer option (RFC 4862 forbids one
+//! from `::`), so the option-equals-source check below has nothing to
+//! bind. Hosts that complete DAD are learned the first time they are
+//! solicited, which costs the one packet glean always costs.
 //!
 //! The link-layer option of an NS/NA must equal `eth.src` too. The
 //! fabric's port security binds a member to its Ethernet source MAC
@@ -126,7 +145,9 @@ pub enum Reject {
     Ip6HopLimit(u8),
     Icmp6Type(u8),
     Icmp6Code(u8),
-    /// NS from `::` — duplicate address detection.
+    /// NS from `::` — duplicate address detection. Neither the source
+    /// (there is none) nor the tentative target is learned; see the
+    /// module doc.
     DadSource,
     /// NS without a Source LL option / NA without a Target LL option,
     /// including an options walk that ended on a zero-length option.
@@ -525,6 +546,33 @@ pub(crate) mod testframes {
         na(src_mac, src, target, &ll_option(2, src_mac))
     }
 
+    /// The router's MAC and link-local on a customer bridge: the kernel
+    /// bridge's, which a vpp-offload BVI shares.
+    pub const ROUTER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0xb0, 0x01];
+    pub fn router_ll() -> Ipv6Addr {
+        Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)
+    }
+
+    /// A solicited NA (Solicited + Override) for `target`, unicast from
+    /// `src` to the router — the answer to a solicitation the router
+    /// sent from its link-local — with a TLLAO.
+    pub fn na_solicited_to_router(src_mac: [u8; 6], src: Ipv6Addr, target: Ipv6Addr) -> Vec<u8> {
+        let mut body = vec![0x60, 0, 0, 0];
+        body.extend_from_slice(&target.octets());
+        body.extend_from_slice(&ll_option(2, src_mac));
+        icmp6(
+            src_mac,
+            ROUTER_MAC,
+            src,
+            router_ll(),
+            255,
+            58,
+            136,
+            0,
+            &body,
+        )
+    }
+
     /// An IPv6 TCP SYN-shaped frame (not ND) for negative tests.
     pub fn ip6_tcp(src_mac: [u8; 6]) -> Vec<u8> {
         let mut f = eth(MAC_B, src_mac, 0x86dd);
@@ -653,6 +701,17 @@ mod tests {
         assert_eq!(parse_frame(&f), Err(Reject::DadSource));
     }
 
+    /// A DAD probe teaches nothing — not even its target, which the
+    /// Ethernet source claims — and says so by reason. See the module
+    /// doc for why the tentative address is not learned.
+    #[test]
+    fn dad_probe_target_is_not_learned() {
+        // RFC 4862 §5.4.2: from `::`, to the target's solicited-node
+        // group, and without a source link-layer option.
+        let f = ns(MAC_A, Ipv6Addr::UNSPECIFIED, v6(0x20), &[]);
+        assert_eq!(parse_frame(&f), Err(Reject::DadSource));
+    }
+
     #[test]
     fn ns_without_option_is_refused() {
         let f = ns(MAC_A, v6(0x10), v6(0x20), &[]);
@@ -681,6 +740,24 @@ mod tests {
     fn na_from_link_local_source_learns_two_pairs() {
         let v = parse_frame(&na_with_tllao(MAC_A, ll(0x10), v6(0x10))).unwrap();
         assert_eq!(v.len(), 2);
+        assert_eq!(v[0].ip, IpAddr::V6(v6(0x10)));
+        assert_eq!(v[1].ip, IpAddr::V6(ll(0x10)));
+        assert!(v.iter().all(|l| l.mac == MAC_A));
+    }
+
+    /// The answer to VPP's glean on a customer VLAN: unicast to the
+    /// router's MAC and link-local, Solicited set, target a global. The
+    /// target is learned exactly as from an unsolicited NA; sent from
+    /// the host's link-local (the usual source), that is learned too.
+    #[test]
+    fn solicited_unicast_na_to_the_router_teaches_the_global_target() {
+        let l = one(&na_solicited_to_router(MAC_A, v6(0x10), v6(0x10)));
+        assert_eq!(l.ip, IpAddr::V6(v6(0x10)));
+        assert_eq!(l.mac, MAC_A);
+        assert_eq!(l.source, Source::NeighborAdvertisement);
+
+        let v = parse_frame(&na_solicited_to_router(MAC_A, ll(0x10), v6(0x10))).unwrap();
+        assert_eq!(v.len(), 2, "{v:?}");
         assert_eq!(v[0].ip, IpAddr::V6(v6(0x10)));
         assert_eq!(v[1].ip, IpAddr::V6(ll(0x10)));
         assert!(v.iter().all(|l| l.mac == MAC_A));

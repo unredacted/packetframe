@@ -169,17 +169,14 @@ pub struct SteeringRequest {
     /// `(PF iface, VF index, rules)` for every port now configured
     /// `steer on` — per-port rules because direction is per-port.
     pub targets: Vec<(String, u32, crate::steer::RuleSet)>,
-    /// The reloaded `steer-exempt` set, for the drift tripwire. It
-    /// rides the steering request because it IS part of the steering
-    /// config — the same directive produces both the Keep rules and
-    /// the scan's notion of what is covered, and letting them travel
-    /// separately is how the watcher ended up frozen at attach.
-    pub exempts: Vec<packetframe_common::config::Ipv4Prefix>,
-    /// The diversion scope the same reconfigure produced — see
-    /// [`crate::drift::divertible_scope`]. Travels with the exemptions
-    /// because freezing either half re-opens the hole the tripwire
-    /// closes.
-    pub dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
+    /// The drift tripwire's scope — the reloaded `steer-exempt` set,
+    /// the diversion scope and whether the v6 half runs. It rides the
+    /// steering request because it IS part of the steering config —
+    /// the same directives produce both the rules and the scan's notion
+    /// of what is covered, and letting them travel separately is how
+    /// the watcher ended up frozen at attach. The first-steer gate reads
+    /// its `exempts` too.
+    pub scope: crate::drift::DriftScope,
     /// Whether traffic should be diverted once the target is in place.
     /// False is the rollback landing zone, not an error.
     pub want_steer: bool,
@@ -734,8 +731,7 @@ impl SupervisionService {
     pub fn apply_steering(
         &self,
         targets: Vec<(String, u32, crate::steer::RuleSet)>,
-        exempts: Vec<packetframe_common::config::Ipv4Prefix>,
-        dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
+        scope: crate::drift::DriftScope,
         want_steer: bool,
         lever_moved: bool,
     ) -> Result<(), String> {
@@ -750,8 +746,7 @@ impl SupervisionService {
             .replace(SteeringRequest {
                 seq,
                 targets,
-                exempts,
-                dst_only,
+                scope,
                 want_steer,
                 lever_moved,
             });
@@ -1130,13 +1125,13 @@ fn apply_steering(
     runtime.retarget(req.targets.clone());
     // Beside the retarget, not the staged scope: the first-steer gate
     // judges the exemptions the steer about to happen installs.
-    runtime.set_steer_exempts(req.exempts.clone());
+    runtime.set_steer_exempts(req.scope.exempts.clone());
     // STAGED here, committed where a steering action succeeds. The
     // NIC has the previous rules until then — and this request may
     // never reach one synchronously: a deferred first steer is
     // retried by the driver on its own, with nobody replaying this
     // function (review finding).
-    runtime.stage_drift_scope(req.exempts.clone(), req.dst_only.clone());
+    runtime.stage_drift_scope(req.scope.clone());
 
     let steered = driver.supervisor().is_steered();
     // INTENDED, not steered. The two differ in exactly the case an
@@ -1424,6 +1419,7 @@ fn run_loop(
             rs.drift_pending,
             rs.drift_unreadable,
             rs.drift_scope_stale,
+            rs.drift_v6,
         );
         let report = snap.report();
         let episode_over = snap.failure_episode_over();

@@ -1362,7 +1362,10 @@ fn the_neighbours_adj_fib_is_never_adopted_or_withdrawn() {
 
 use fake_vpp::{BVI_BASE, SUBIF_BASE};
 use packetframe_vpp_offload::topology::{BridgeL3, DevKind, FdbSnapshot, PortVlans, Topology};
-use packetframe_vpp_offload::LocalRoute;
+use packetframe_vpp_offload::vpp_api::generated::{
+    FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_NH_PROTO_IP6,
+};
+use packetframe_vpp_offload::{LocalRoute, LocalRoutePrefix};
 
 /// A kernel view for the bridge tests: fixed device shapes, bridge
 /// membership and L3 MACs, and an FDB and bridge-port VLAN table the test
@@ -1430,10 +1433,10 @@ fn fdb_with(entries: &[(u16, [u8; 6], &str)]) -> FdbSnapshot {
 
 fn local_route() -> LocalRoute {
     LocalRoute {
-        prefix: packetframe_common::config::Ipv4Prefix {
+        prefix: LocalRoutePrefix::V4(packetframe_common::config::Ipv4Prefix {
             addr: Ipv4Addr::new(203, 0, 113, 0),
             prefix_len: 24,
-        },
+        }),
         port: "eth4".into(),
         vlan: 1337,
         kernel_dev: "br1337".into(),
@@ -1707,6 +1710,317 @@ fn a_stale_install_inside_the_local_prefix_is_withdrawn() {
         deletes.iter().any(|r| r.addr == [203, 0, 113, 7]),
         "the stale in-prefix install must be withdrawn from VPP: {deletes:?}"
     );
+}
+
+// --- local-route6: the IPv6 attached route ------------------------------
+
+/// The customer /64 a `local-route6` delivers, as declared.
+fn local_route6() -> LocalRoute {
+    LocalRoute {
+        prefix: LocalRoutePrefix::V6(packetframe_common::config::Ipv6Prefix {
+            addr: "2001:db8:1::".parse().unwrap(),
+            prefix_len: 64,
+        }),
+        port: "eth4".into(),
+        vlan: 1337,
+        kernel_dev: "br1337".into(),
+    }
+}
+
+/// `2001:db8:1::<last>/<len>`: inside the `local-route6` footprint.
+fn cust6(last: u8, len: u8) -> IpPrefix {
+    let mut addr = [0u8; 16];
+    addr[..6].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 1]);
+    addr[15] = last;
+    IpPrefix::V6 {
+        addr,
+        prefix_len: len,
+    }
+}
+
+/// A customer host on the bridged VLAN, and the MAC neigh-snoop would
+/// have installed for it.
+const CUST_HOST6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 7));
+const CUST_MAC6: [u8; 6] = [0x02, 0, 0, 0, 0xc0, 0x07];
+/// The transit next hop, on the member port.
+const TRANSIT_NH6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xff, 0, 0, 0, 0, 1));
+
+/// `2001:db8:<i>00::/40`: transit, outside every local route.
+fn transit6(i: u8) -> IpPrefix {
+    let mut addr = [0u8; 16];
+    addr[..5].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, i]);
+    IpPrefix::V6 {
+        addr,
+        prefix_len: 40,
+    }
+}
+
+/// The worst a mirror can carry inside a customer /64: the prefix
+/// itself through a foreign next hop (which would replace the attached
+/// route's path) and a host route inside it (next hop: the host) — plus
+/// transit, the host's neighbour on the kernel bridge, and the transit
+/// neighbour on the port.
+struct Customer6;
+
+impl RouteSource for Customer6 {
+    fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+        visit(cust6(0, 64), &[TRANSIT_NH6]);
+        visit(cust6(7, 128), &[CUST_HOST6]);
+        visit(transit6(1), &[TRANSIT_NH6]);
+        visit(transit6(2), &[TRANSIT_NH6]);
+        visit(v4(0, 0), &[nh()]);
+    }
+    fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+        visit(nh(), "eth4", MAC);
+        visit(TRANSIT_NH6, "eth4", MAC);
+        visit(CUST_HOST6, "br1337", CUST_MAC6);
+    }
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("static source")
+    }
+    fn route_count(&self) -> u64 {
+        5
+    }
+    fn change_seq(&self) -> u64 {
+        0
+    }
+}
+
+/// `v6 on` with a v4 and a v6 local route on the same bridged VLAN.
+fn engine_with_local_route6(fake: &Fake) -> ConvergenceEngine {
+    ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            mtu: None,
+            vlans: vec![1337],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::Both,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_local_routes(vec![local_route(), local_route6()])
+    .with_topology(Box::new(Kernel {
+        kinds: vec![("br1337", bridge_vlan(1337))],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[
+            (1337, MAC, "eth4"),
+            (1337, CUST_MAC6, "eth4"),
+        ])))),
+        vlans: Default::default(),
+        masters: vec![("eth4", "switch0")],
+        l3: vec![("switch0", 1337, BRIDGE_MAC)],
+    }))
+}
+
+fn routes_of(events: &[Event]) -> Vec<WireRoute> {
+    events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Route(r) => Some(r.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn addr16_of(p: IpPrefix) -> [u8; 16] {
+    match p {
+        IpPrefix::V6 { addr, .. } => addr,
+        IpPrefix::V4 { .. } => unreachable!("a v6 prefix"),
+    }
+}
+
+/// The v6 attached route goes out at attach onto the BVI, as an IPv6
+/// path with no next hop — VPP's attached route, whose glean solicits
+/// hosts from the BVI's link-local — and only after ip6 is enabled
+/// there, since glean drops on an interface without it. The v4 local
+/// route beside it is exactly what it was.
+#[test]
+fn a_local_route6_installs_attached_on_the_bvi_after_ip6() {
+    let fake = Fake::start("local-route6");
+    let mut e = engine_with_local_route6(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let events = fake.drain_events();
+
+    let at_attach = routes_of(&events);
+    assert_eq!(
+        at_attach.len(),
+        2,
+        "one attached route per family: {at_attach:?}"
+    );
+    let v4r = at_attach.iter().find(|r| !r.is_ip6).expect("the v4 one");
+    assert!(v4r.is_add);
+    assert_eq!((v4r.addr, v4r.len), ([203, 0, 113, 0], 24));
+    assert_eq!(v4r.path_indices, vec![BVI_BASE]);
+    let v6r = at_attach.iter().find(|r| r.is_ip6).expect("the v6 one");
+    assert!(v6r.is_add);
+    assert_eq!((v6r.addr16, v6r.len), (addr16_of(cust6(0, 64)), 64));
+    assert_eq!(
+        v6r.path_indices,
+        vec![BVI_BASE],
+        "the v6 attached route lands on the BVI too — the bridge's MAC, so \
+         the NA a glean draws is addressed to the kernel bridge"
+    );
+
+    // What VPP holds: an IPv6 path, attached (no next hop), on the BVI.
+    // An IPv4 next-hop protocol here would install a route VPP resolves
+    // through the wrong family's adjacencies.
+    let v6_table = fake.routes6.lock().unwrap();
+    let paths = v6_table
+        .get(&(addr16_of(cust6(0, 64)), 64))
+        .expect("the attached route is in VPP's v6 FIB");
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].proto, FIB_API_PATH_NH_PROTO_IP6);
+    assert_eq!(paths[0].sw_if_index, BVI_BASE);
+    assert!(
+        paths[0].nh.address.0.iter().all(|b| *b == 0),
+        "attached: no next hop"
+    );
+    drop(v6_table);
+    let v4_table = fake.routes.lock().unwrap();
+    assert_eq!(
+        v4_table
+            .get(&([203, 0, 113, 0], 24))
+            .expect("the v4 attached route")[0]
+            .proto,
+        FIB_API_PATH_NH_PROTO_IP4
+    );
+    drop(v4_table);
+
+    // Ordering: ip6 on the BVI before the v6 attached route reaches it.
+    let enable_bvi = events
+        .iter()
+        .position(|ev| matches!(ev, Event::Msg(m) if *m == format!("ip6 enable if={BVI_BASE} enable=true")))
+        .expect("ip6 enabled on the BVI");
+    let v6_route = events
+        .iter()
+        .position(|ev| matches!(ev, Event::Route(r) if r.is_ip6))
+        .unwrap();
+    assert!(enable_bvi < v6_route, "{events:?}");
+}
+
+/// Inside the customer /64 the mirror is shadowed — the /64 itself,
+/// which would otherwise REPLACE the attached route's path, and a host
+/// route — while transit v6 installs as always. The host itself
+/// arrives as a static neighbour on the BVI, which under the attached
+/// cover is what delivers to it.
+#[test]
+fn a_local_route6_shadows_the_mirror_and_carries_the_host_as_a_neighbour() {
+    let fake = Fake::start("local-route6-shadow");
+    let mut e = engine_with_local_route6(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    fake.drain_events();
+
+    let plan = e.begin_resync(&Customer6);
+    assert_eq!(plan.shadowed, 2, "the /64 and the /128");
+    assert_eq!(plan.upserts, 3, "two transit v6, one v4");
+    e.program_neighbours(&Customer6).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.shadowed_routes(), 2);
+    let c = e.counts();
+    assert_eq!(c.installed, 1);
+    assert_eq!(c.v6.expect("v6 carried").installed, 2);
+
+    let events = fake.drain_events();
+    let sent6: Vec<WireRoute> = routes_of(&events)
+        .into_iter()
+        .filter(|r| r.is_ip6)
+        .collect();
+    let footprint = [addr16_of(cust6(0, 64)), addr16_of(cust6(7, 128))];
+    assert!(
+        sent6.iter().all(|r| !footprint.contains(&r.addr16)),
+        "nothing inside the customer /64 may reach the wire: {sent6:?}"
+    );
+    assert_eq!(sent6.len(), 2, "the transit routes: {sent6:?}");
+    // The attached route is still exactly the attached route.
+    assert_eq!(
+        fake.routes6.lock().unwrap()[&(addr16_of(cust6(0, 64)), 64)][0].sw_if_index,
+        BVI_BASE
+    );
+
+    let host = events
+        .iter()
+        .find_map(|ev| match ev {
+            Event::Neighbour {
+                ip,
+                sw_if_index,
+                mac,
+                is_add: true,
+                ..
+            } if *ip == CUST_HOST6 => Some((*sw_if_index, *mac)),
+            _ => None,
+        })
+        .expect("the customer host's neighbour reaches VPP");
+    assert_eq!(
+        host,
+        (BVI_BASE, CUST_MAC6),
+        "static, on the BVI: {events:?}"
+    );
+}
+
+/// A daemon restarting over a live VPP (`--keep-vpp`) re-sends the
+/// attached route as an add, never adopts it into the ledger (it has no
+/// next hop, so it never looks self-installed), and its resync
+/// withdraws nothing of it: the route outlives the restart untouched.
+/// Removing it takes a VPP restart, which the adoption record forces
+/// when the `local-route6` line is gone (`restart_only`).
+#[test]
+fn a_local_route6_survives_adoption_without_entering_the_ledger() {
+    let fake = Fake::start_behaving(
+        "local-route6-adopt",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let mut first = engine_with_local_route6(&fake);
+    assert!(first.api_ready());
+    first.attach_devices(AttachMode::Fresh).expect("attach");
+    first.begin_resync(&Customer6);
+    first.program_neighbours(&Customer6).expect("neighbours");
+    drain_to_empty(&mut first);
+    let indices = first.attached_indices();
+    drop(first);
+    fake.drain_events();
+
+    let mut second = engine_with_local_route6(&fake).with_recorded_indices(indices);
+    assert!(second.api_ready());
+    second
+        .attach_devices(AttachMode::Adopted)
+        .expect("re-attach over the live VPP");
+    let resent: Vec<WireRoute> = routes_of(&fake.drain_events())
+        .into_iter()
+        .filter(|r| r.is_ip6)
+        .collect();
+    assert_eq!(resent.len(), 1, "{resent:?}");
+    assert!(resent[0].is_add && resent[0].addr16 == addr16_of(cust6(0, 64)));
+
+    // Adopted: the two transit v6 and the v4 route. Not the attached
+    // routes, and not the host's adj-fib.
+    assert_eq!(second.adopt_vpp_fib().expect("dump"), 3);
+    let plan = second.begin_resync(&Customer6);
+    assert_eq!(plan.withdrawals, 0, "nothing adopted is withdrawn");
+    drain_to_empty(&mut second);
+    let deletes: Vec<WireRoute> = routes_of(&fake.drain_events())
+        .into_iter()
+        .filter(|r| !r.is_add)
+        .collect();
+    assert!(deletes.is_empty(), "{deletes:?}");
+    assert!(fake
+        .routes6
+        .lock()
+        .unwrap()
+        .contains_key(&(addr16_of(cust6(0, 64)), 64)));
 }
 
 /// The null-drop sample end to end: `cli_inband` over the real socket,
@@ -2297,10 +2611,10 @@ fn a_local_route_on_an_untagged_vlan_lands_on_the_vf() {
         },
     )
     .with_local_routes(vec![LocalRoute {
-        prefix: packetframe_common::config::Ipv4Prefix {
+        prefix: LocalRoutePrefix::V4(packetframe_common::config::Ipv4Prefix {
             addr: Ipv4Addr::new(192, 0, 2, 0),
             prefix_len: 24,
-        },
+        }),
         port: "eth4".into(),
         vlan: 1,
         kernel_dev: "br0".into(),
