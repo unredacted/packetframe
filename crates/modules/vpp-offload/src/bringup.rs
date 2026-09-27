@@ -1311,9 +1311,10 @@ fn finish(
     let engine_exempts = steer_exempts.to_vec();
     let factory: LoopFactory = Box::new(move || {
         // What VPP can egress, for the exemption tripwire: the member
-        // ports, the kernel bridges `local-route` delivers into, and the
-        // VLAN and bridge devices a member reaches (next hops placed per
-        // neighbour) — the last recomputed by the watch on every scan,
+        // ports, the kernel bridges `local-route` and `local-route6`
+        // deliver into (each family's apart), and the VLAN and bridge
+        // devices a member reaches (next hops placed per neighbour) —
+        // the last recomputed by the watch on every scan,
         // since a trunk's VLANs change under a running daemon.
         // Everything else the kernel routes through is a path VPP cannot
         // take.
@@ -1334,6 +1335,16 @@ fn finish(
             local_devices: local_routes
                 .iter()
                 .filter(|lr| !lr.prefix.is_v6())
+                .map(|lr| lr.kernel_dev.clone())
+                .collect(),
+            // And the v6 scan's, the mirror filter: without them a
+            // `local-route6` bridge's connected v6 subnet, which VPP
+            // delivers, reads as a path VPP cannot take (a permanent
+            // `exempt-drift-v6`). Restart-only like the v4 set, so fixed
+            // for the life of the loop.
+            local_devices_v6: local_routes
+                .iter()
+                .filter(|lr| lr.prefix.is_v6())
                 .map(|lr| lr.kernel_dev.clone())
                 .collect(),
             bridged_devices: Vec::new(),
