@@ -5,7 +5,8 @@
 //! router, or a copy pulled off one onto a laptop with `--file` — needs
 //! nothing Linux-specific, and the tests run on every host gate.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
@@ -177,6 +178,106 @@ fn resolve_path(args: &EventsArgs) -> Result<PathBuf, (u8, String)> {
     })
 }
 
+/// Stream the matching records to `out` as they are read — memory stays
+/// at one record however large the files are. Returns `(shown, skipped)`.
+fn print_matching(
+    path: &Path,
+    args: &EventsArgs,
+    out: &mut impl Write,
+) -> std::io::Result<(usize, usize)> {
+    let mut shown = 0usize;
+    let mut write_err = None;
+    let skipped = events::read_each(path, |r| {
+        if write_err.is_some() || !keep(&r, args.since, args.module.as_deref()) {
+            return;
+        }
+        shown += 1;
+        let line = if args.json {
+            serde_json::to_string(&r).unwrap_or_default()
+        } else {
+            render(&r)
+        };
+        if let Err(e) = writeln!(out, "{line}") {
+            write_err = Some(e);
+        }
+    })?;
+    match write_err {
+        Some(e) => Err(e),
+        None => Ok((shown, skipped)),
+    }
+}
+
+/// The event-log section of `packetframe status`.
+///
+/// `running` is the daemon writer's status from its health snapshot:
+/// when there is one, it names the file actually being written, and the
+/// section describes THAT file — `event-log` is restart-only, so after
+/// an edit and a reload the config names a file nobody is writing yet.
+/// The configured target is then shown separately, as what the next
+/// restart will use.
+pub fn status_lines(
+    configured: Option<(PathBuf, u64)>,
+    running: Option<&events::Status>,
+    size: impl Fn(&Path) -> Option<u64>,
+) -> Vec<String> {
+    let describe = |path: &Path, max: u64| {
+        let rotated = events::rotated_path(path);
+        format!(
+            "event log: {} ({} of {} per file{}); `packetframe events` reads it",
+            path.display(),
+            size(path).map_or_else(|| "not yet written".to_string(), human_bytes),
+            human_bytes(max),
+            if size(&rotated).is_some() {
+                ", plus the rotated .1"
+            } else {
+                ""
+            }
+        )
+    };
+    let Some(st) = running else {
+        return vec![match &configured {
+            Some((path, max)) => describe(path, *max),
+            None => "event log: off (`event-log off`)".to_string(),
+        }];
+    };
+    let mut lines = vec![
+        describe(&st.path, st.max_bytes),
+        format!(
+            "  daemon writer: {} written, {} dropped (queue full), {} lost (write failed)",
+            st.written, st.dropped, st.lost
+        ),
+    ];
+    if configured.as_ref() != Some(&(st.path.clone(), st.max_bytes)) {
+        lines.push(format!(
+            "  after restart: {} (the config changed; event-log is restart-only, and \
+             `packetframe events` reads the configured file — `--file {}` reads this one)",
+            match &configured {
+                Some((p, m)) => format!("{} at {} per file", p.display(), human_bytes(*m)),
+                None => "off".to_string(),
+            },
+            st.path.display()
+        ));
+    }
+    if let Some(e) = &st.last_error {
+        lines.push(format!(
+            "  WARNING: the daemon cannot write the event log: {}",
+            scrub_for_terminal(e)
+        ));
+    }
+    lines
+}
+
+fn human_bytes(n: u64) -> String {
+    const K: u64 = 1024;
+    if n >= K * K {
+        format!("{:.1} MiB", n as f64 / (K * K) as f64)
+    } else if n >= K {
+        format!("{:.1} KiB", n as f64 / K as f64)
+    } else {
+        format!("{n} B")
+    }
+}
+
 pub fn run(args: EventsArgs) -> ExitCode {
     let path = match resolve_path(&args) {
         Ok(p) => p,
@@ -185,9 +286,11 @@ pub fn run(args: EventsArgs) -> ExitCode {
             return ExitCode::from(code);
         }
     };
-    let (records, skipped) = match events::read(&path) {
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    let (shown, skipped) = match print_matching(&path, &args, &mut out) {
         Ok(r) => r,
         Err(e) => {
+            let _ = out.flush();
             eprintln!(
                 "could not read {}: {}",
                 path.display(),
@@ -196,21 +299,7 @@ pub fn run(args: EventsArgs) -> ExitCode {
             return ExitCode::from(EXIT_RUNTIME_ERROR);
         }
     };
-    let mut shown = 0usize;
-    for r in records
-        .iter()
-        .filter(|r| keep(r, args.since, args.module.as_deref()))
-    {
-        shown += 1;
-        if args.json {
-            match serde_json::to_string(r) {
-                Ok(line) => println!("{line}"),
-                Err(e) => eprintln!("could not re-serialise a record: {e}"),
-            }
-        } else {
-            println!("{}", render(r));
-        }
-    }
+    let _ = out.flush();
     if skipped > 0 {
         eprintln!(
             "note: {skipped} line(s) in {} did not parse and were skipped",
@@ -332,6 +421,155 @@ mod tests {
         assert_eq!(
             render(&r),
             "2026-09-27T12:00:00.000Z  INFO   fast-path     reconfigure_applied"
+        );
+    }
+
+    fn args(since: Option<SystemTime>, module: Option<&str>, json: bool) -> EventsArgs {
+        EventsArgs {
+            config: None,
+            file: None,
+            since,
+            module: module.map(str::to_string),
+            json,
+        }
+    }
+
+    #[test]
+    fn prints_matching_records_as_it_streams() {
+        let dir = std::env::temp_dir().join(format!("pf-events-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.log");
+        let line = |r: Record| format!("{}\n", serde_json::to_string(&r).unwrap());
+        std::fs::write(
+            events::rotated_path(&path),
+            line(rec(
+                "2026-09-27T01:00:00.000Z",
+                "daemon",
+                kind::PROCESS_START,
+            )),
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}not json\n{}",
+                line(rec(
+                    "2026-09-27T03:00:00.000Z",
+                    "vpp-offload",
+                    kind::STEERING_UP
+                )),
+                line(rec(
+                    "2026-09-27T05:00:00.000Z",
+                    "daemon",
+                    kind::PROCESS_STOP
+                )),
+            ),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let (shown, skipped) = print_matching(&path, &args(None, None, false), &mut out).unwrap();
+        assert_eq!((shown, skipped), (3, 1));
+        let text = String::from_utf8(out).unwrap();
+        let events: Vec<&str> = text
+            .lines()
+            .map(|l| l.split_whitespace().nth(3).unwrap())
+            .collect();
+        assert_eq!(
+            events,
+            [kind::PROCESS_START, kind::STEERING_UP, kind::PROCESS_STOP],
+            "rotated generation first"
+        );
+
+        let mut out = Vec::new();
+        let since = parse_rfc3339("2026-09-27T02:00:00Z");
+        let (shown, _) =
+            print_matching(&path, &args(since, Some("daemon"), true), &mut out).unwrap();
+        assert_eq!(shown, 1);
+        let back: Record = serde_json::from_slice(out.trim_ascii_end()).unwrap();
+        assert_eq!(back.event, kind::PROCESS_STOP);
+    }
+
+    fn writer(path: &str, max: u64) -> events::Status {
+        events::Status {
+            path: PathBuf::from(path),
+            max_bytes: max,
+            written: 7,
+            dropped: 0,
+            lost: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn status_describes_the_running_writer_not_an_edited_config() {
+        let running = writer("/var/lib/packetframe/state/events.log", 10 << 20);
+        let size = |_: &Path| Some(2048);
+        // Unchanged config: the running file, no restart note.
+        let same = status_lines(
+            Some((running.path.clone(), running.max_bytes)),
+            Some(&running),
+            size,
+        );
+        assert!(
+            same[0].contains("/var/lib/packetframe/state/events.log"),
+            "{same:?}"
+        );
+        assert!(
+            !same.iter().any(|l| l.contains("after restart")),
+            "{same:?}"
+        );
+
+        // Edited and reloaded: the section still names the file being
+        // written, and the edit shows as what a restart will do.
+        let edited = status_lines(
+            Some((PathBuf::from("/persist/pf/events.log"), 1 << 20)),
+            Some(&running),
+            size,
+        );
+        assert!(
+            edited[0].starts_with(
+                "event log: /var/lib/packetframe/state/events.log (2.0 KiB of 10.0 MiB"
+            ),
+            "{edited:?}"
+        );
+        let after = edited.iter().find(|l| l.contains("after restart")).unwrap();
+        assert!(
+            after.contains("/persist/pf/events.log at 1.0 MiB"),
+            "{after}"
+        );
+
+        let off = status_lines(None, Some(&running), size);
+        assert!(
+            off.iter().any(|l| l.contains("after restart: off")),
+            "{off:?}"
+        );
+
+        // No daemon snapshot: the config is all there is.
+        let idle = status_lines(
+            Some((PathBuf::from("/persist/pf/events.log"), 1 << 20)),
+            None,
+            |_| None,
+        );
+        assert_eq!(
+            idle,
+            ["event log: /persist/pf/events.log (not yet written of 1.0 MiB per file); `packetframe events` reads it"]
+        );
+        assert_eq!(
+            status_lines(None, None, size),
+            ["event log: off (`event-log off`)"]
+        );
+
+        let failing = events::Status {
+            last_error: Some("No space left on device\x1b[2J".into()),
+            ..running
+        };
+        let lines = status_lines(None, Some(&failing), size);
+        let warn = lines.iter().find(|l| l.contains("WARNING")).unwrap();
+        assert!(
+            warn.contains("No space left") && !warn.contains('\x1b'),
+            "{warn}"
         );
     }
 

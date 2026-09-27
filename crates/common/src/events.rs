@@ -40,10 +40,15 @@
 //!
 //! When the next line would take the file past its bound it is renamed to
 //! `<path>.1` (replacing the previous one) and a fresh file is started,
-//! so the log never holds more than twice the bound on disk.
+//! so the log never holds more than twice the bound on disk. Whenever the
+//! writer opens the file — at start, after a rotation, on recovery — a
+//! generation already over the bound (left by a larger `event-log-max`)
+//! is trimmed to its newest whole lines within it, and a line torn by a
+//! failed write is truncated away, so the next record starts on a line
+//! of its own.
 
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{BufRead, BufReader, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -76,6 +81,16 @@ const RETRY_EVERY: Duration = Duration::from_secs(30);
 /// Longest string a field keeps. A message quoting a whole error chain is
 /// still useful at this length; a line per event stays small.
 const FIELD_MAX_CHARS: usize = 1024;
+/// Floor on the failing writer's wake-up, so a zero retry interval (the
+/// tests') cannot spin.
+const MIN_RETRY_POLL: Duration = Duration::from_millis(10);
+/// Longest line the reader will buffer. Records are far smaller (every
+/// string field is capped); a longer line is not one of ours, and is
+/// skipped without being held in memory.
+const READ_LINE_MAX: usize = 64 * 1024;
+/// How many times the reader re-opens the pair of files when a rotation
+/// lands between its two opens.
+const READ_OPEN_ATTEMPTS: usize = 5;
 /// How long [`EventLog::flush`] and [`EventLog::shutdown`] wait for the
 /// writer. Bounded because shutdown must not hang on a wedged disk.
 const FLUSH_BUDGET: Duration = Duration::from_secs(2);
@@ -471,7 +486,28 @@ impl Writer {
     }
 
     fn run(mut self, rx: Receiver<Msg>) {
-        while let Ok(msg) = rx.recv() {
+        loop {
+            // While failing, wake on the retry schedule even with nothing
+            // to write: recovery is probed when the backoff says, not
+            // when the next event happens to arrive — which in steady
+            // state can be hours, all of it reported as failing.
+            let msg = if self.failing {
+                match rx.recv_timeout(self.sink.retry_every.max(MIN_RETRY_POLL)) {
+                    Ok(m) => m,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if self.try_recover() {
+                            self.handle_dropped();
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match rx.recv() {
+                    Ok(m) => m,
+                    Err(_) => break,
+                }
+            };
             match msg {
                 Msg::Event(ev) => self.handle(*ev),
                 Msg::Flush(ack) => {
@@ -608,9 +644,8 @@ struct FileSink {
 
 struct OpenFile {
     file: File,
-    /// The walked parent directory, for the rotation's `renameat`.
-    #[cfg(target_os = "linux")]
-    dir: File,
+    /// The parent directory, for the rotation's rename.
+    dir: LogDir,
 }
 
 impl FileSink {
@@ -653,21 +688,32 @@ impl FileSink {
         // One write(2) for the whole line: an O_APPEND write of a small
         // buffer lands contiguously, so a concurrent writer (a `detach`
         // run while nothing else is) cannot interleave inside a line.
+        // A write that fails part-way leaves a fragment; the reopen that
+        // follows truncates it (`repair_tail`).
         f.file.write_all(line)?;
         self.size += line.len() as u64;
         Ok(())
     }
 
+    /// Open the current file for append, first bringing both
+    /// generations within the bound and the current file's end to a
+    /// line boundary.
     fn reopen(&mut self) -> std::io::Result<()> {
-        let open = open_append(&self.path)?;
-        self.size = open.file.metadata()?.len();
-        self.open = Some(open);
+        let name = file_name(&self.path)?;
+        let dir = LogDir::open(parent_of(&self.path), true)?;
+        trim_to_newest(&dir, &rotated_name(name), self.max_bytes)?;
+        trim_to_newest(&dir, name, self.max_bytes)?;
+        let file = dir.open_append(name)?;
+        let len = file.metadata()?.len();
+        self.size = repair_tail(&file, len)?;
+        self.open = Some(OpenFile { file, dir });
         Ok(())
     }
 
     fn rotate(&mut self) -> std::io::Result<()> {
         let open = self.open.take().expect("rotate needs an open file");
-        rename_to_rotated(&open, &self.path)?;
+        let name = file_name(&self.path)?;
+        open.dir.rename(name, &rotated_name(name))?;
         drop(open);
         self.reopen()
     }
@@ -677,6 +723,101 @@ impl FileSink {
             let _ = o.file.sync_all();
         }
     }
+}
+
+/// Rewrite `name` to its newest whole lines within `max` bytes, if it is
+/// larger — what a generation written under a larger `event-log-max`
+/// needs, or it would sit over the new bound until it rotated out.
+/// The newest lines are kept because they are the ones an operator reads
+/// the log for; the older ones were already past the bound's promise.
+/// Streamed through a temp file and renamed over the original, so memory
+/// stays bounded and a crash mid-trim leaves the old file intact.
+fn trim_to_newest(dir: &LogDir, name: &str, max: u64) -> std::io::Result<()> {
+    let Some(mut f) = dir.open_read(name)? else {
+        return Ok(());
+    };
+    let size = f.metadata()?.len();
+    if size <= max {
+        return Ok(());
+    }
+    // From one byte before the cut, discarding through the first
+    // newline: a line that starts exactly at the cut is kept, a line
+    // the cut splits is dropped whole.
+    f.seek(SeekFrom::Start(size - max - 1))?;
+    let mut r = BufReader::new(f);
+    skip_through_newline(&mut r)?;
+    let tmp = format!("{name}.tmp");
+    {
+        let mut out = dir.create_tmp(&tmp)?;
+        std::io::copy(&mut r, &mut out)?;
+        out.sync_all()?;
+    }
+    dir.rename(&tmp, name)
+}
+
+/// Consume up to and including the next `\n` (or to EOF).
+fn skip_through_newline(r: &mut impl BufRead) -> std::io::Result<()> {
+    loop {
+        let (used, found) = {
+            let buf = r.fill_buf()?;
+            if buf.is_empty() {
+                return Ok(());
+            }
+            match buf.iter().position(|b| *b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (buf.len(), false),
+            }
+        };
+        r.consume(used);
+        if found {
+            return Ok(());
+        }
+    }
+}
+
+/// If the file does not end in `\n`, truncate it back to the last one
+/// (or to empty) and return the new length.
+///
+/// A write that fails part-way — ENOSPC mid-line — leaves a fragment,
+/// and appending the next record to it would weld the two into one line
+/// that parses as neither. Truncating rather than writing a newline
+/// after it keeps the file all whole records: the fragment was an event
+/// already counted as lost.
+fn repair_tail(file: &File, len: u64) -> std::io::Result<u64> {
+    const CHUNK: u64 = 4096;
+    let mut end = len;
+    let mut buf = vec![0u8; CHUNK as usize];
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let chunk = &mut buf[..(end - start) as usize];
+        read_exact_at(file, chunk, start)?;
+        if end == len && chunk.last() == Some(&b'\n') {
+            return Ok(len);
+        }
+        if let Some(i) = chunk.iter().rposition(|b| *b == b'\n') {
+            let keep = start + i as u64 + 1;
+            file.set_len(keep)?;
+            return Ok(keep);
+        }
+        end = start;
+    }
+    if len > 0 {
+        file.set_len(0)?;
+    }
+    Ok(0)
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+#[cfg(not(unix))]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::io::Read as _;
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read_exact(buf)
 }
 
 /// `<path>.1`: the one rotated file kept.
@@ -689,60 +830,133 @@ pub fn rotated_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+fn rotated_name(name: &str) -> String {
+    format!("{name}.1")
+}
+
 fn file_name(path: &Path) -> std::io::Result<&str> {
     path.file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))
 }
 
-/// Open for append without following a symlink anywhere in the path —
-/// the daemon is root and `state-dir` may be writable by others (the
-/// discipline of [`crate::statefile`]). The directory is created if
-/// missing, as the state records' writers do.
-#[cfg(target_os = "linux")]
-fn open_append(path: &Path) -> std::io::Result<OpenFile> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
-    let name = file_name(path)?;
-    let dir = crate::statefile::create_and_open_dir_no_follow(parent)?;
-    let c = std::ffi::CString::new(name)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
-    let flags =
-        libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o640 as libc::c_uint) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` was just returned by openat and is owned by nothing
-    // else.
-    let file = unsafe { File::from_raw_fd(fd) };
-    Ok(OpenFile { file, dir })
+fn parent_of(path: &Path) -> &Path {
+    path.parent().unwrap_or_else(|| Path::new("/"))
+}
+
+/// The log's directory, and every file operation the log does in it.
+///
+/// On Linux, a descriptor from [`crate::statefile`]'s no-follow walk,
+/// with every open relative to it and `O_NOFOLLOW` on the final
+/// component: the daemon is root and `state-dir` may be writable by
+/// others, so a symlink anywhere in the path is refused, never followed.
+/// Elsewhere (the macOS dev loop, where no daemon runs) plain paths.
+struct LogDir {
+    #[cfg(target_os = "linux")]
+    fd: File,
+    #[cfg(not(target_os = "linux"))]
+    path: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
-fn rename_to_rotated(open: &OpenFile, path: &Path) -> std::io::Result<()> {
-    let name = file_name(path)?;
-    crate::statefile::renameat_within(&open.dir, name, &format!("{name}.1"))
-}
-
-/// The portable fallback, for the macOS dev loop and its tests. No
-/// daemon runs here, so the no-follow walk has nothing to protect.
-#[cfg(not(target_os = "linux"))]
-fn open_append(path: &Path) -> std::io::Result<OpenFile> {
-    let _ = file_name(path)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+impl LogDir {
+    fn open(path: &Path, create: bool) -> std::io::Result<Self> {
+        let fd = if create {
+            crate::statefile::create_and_open_dir_no_follow(path)?
+        } else {
+            crate::statefile::open_dir_no_follow(path)?
+        };
+        Ok(Self { fd })
     }
-    let file = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)?;
-    Ok(OpenFile { file })
+
+    fn openat(&self, name: &str, flags: libc::c_int) -> std::io::Result<File> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let c = std::ffi::CString::new(name).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name")
+        })?;
+        let flags = flags | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c.as_ptr(),
+                flags,
+                0o640 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by openat and is owned by
+        // nothing else.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Read-write so [`repair_tail`] can read the end it truncates.
+    fn open_append(&self, name: &str) -> std::io::Result<File> {
+        self.openat(name, libc::O_RDWR | libc::O_APPEND | libc::O_CREAT)
+    }
+
+    fn open_read(&self, name: &str) -> std::io::Result<Option<File>> {
+        match self.openat(name, libc::O_RDONLY) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn create_tmp(&self, name: &str) -> std::io::Result<File> {
+        crate::statefile::openat_excl_with_retry(&self.fd, name)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        crate::statefile::renameat_within(&self.fd, from, to)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rename_to_rotated(_open: &OpenFile, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(path, rotated_path(path))
+impl LogDir {
+    fn open(path: &Path, create: bool) -> std::io::Result<Self> {
+        if create {
+            std::fs::create_dir_all(path)?;
+        } else if !path.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such directory",
+            ));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn open_append(&self, name: &str) -> std::io::Result<File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(self.path.join(name))
+    }
+
+    fn open_read(&self, name: &str) -> std::io::Result<Option<File>> {
+        match File::open(self.path.join(name)) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn create_tmp(&self, name: &str) -> std::io::Result<File> {
+        let p = self.path.join(name);
+        let _ = std::fs::remove_file(&p);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        std::fs::rename(self.path.join(from), self.path.join(to))
+    }
 }
 
 // --- the process's log ---
@@ -780,41 +994,127 @@ pub fn shutdown() {
 
 // --- reading ---
 
-/// Every parseable record in the log, oldest first: the rotated file,
-/// then the current one. The second value counts lines that did not
-/// parse (a line torn by a crash mid-write, or a file that is not an
-/// event log). A missing file is empty, not an error.
-pub fn read(path: &Path) -> std::io::Result<(Vec<Record>, usize)> {
-    let mut records = Vec::new();
+/// Stream every parseable record in the log to `on`, oldest first: the
+/// rotated file, then the current one. Returns how many lines did not
+/// parse (a line torn by a crash, one longer than any record, or a file
+/// that is not an event log). A missing file is empty, not an error.
+///
+/// Memory is bounded by one line whatever the files' sizes: nothing is
+/// collected, so a caller that prints as it goes holds one record.
+///
+/// The two generations are opened before either is read, and the pair
+/// is accepted only if the rotated file is still the one opened after
+/// the current one is — otherwise a rotation landed between the opens,
+/// the pair would skip a whole generation (old `.1` plus a fresh current,
+/// missing the file that became `.1`), and the opens are retried. A
+/// rotation after that is harmless: the open descriptors keep reading
+/// the files they named.
+pub fn read_each(path: &Path, on: impl FnMut(Record)) -> std::io::Result<usize> {
+    read_each_with(path, &mut || {}, on)
+}
+
+/// [`read_each`], with a hook between opening the rotated file and the
+/// current one — where a rotation is a race — so the test can put one
+/// there.
+fn read_each_with(
+    path: &Path,
+    between_opens: &mut dyn FnMut(),
+    mut on: impl FnMut(Record),
+) -> std::io::Result<usize> {
     let mut skipped = 0;
-    for p in [rotated_path(path), path.to_path_buf()] {
-        let Some(body) = read_file(&p)? else {
-            continue;
-        };
-        for line in body.split(|b| *b == b'\n') {
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            match serde_json::from_slice::<Record>(line) {
-                Ok(r) => records.push(r),
+    for file in open_generations(path, between_opens)?.into_iter().flatten() {
+        for_each_line(BufReader::new(file), |line| match line {
+            Some(l) if l.iter().all(u8::is_ascii_whitespace) => {}
+            Some(l) => match serde_json::from_slice::<Record>(l) {
+                Ok(r) => on(r),
                 Err(_) => skipped += 1,
-            }
+            },
+            None => skipped += 1,
+        })?;
+    }
+    Ok(skipped)
+}
+
+/// `[rotated, current]`, opened as a consistent pair; see [`read_each`].
+fn open_generations(
+    path: &Path,
+    between_opens: &mut dyn FnMut(),
+) -> std::io::Result<[Option<File>; 2]> {
+    let name = file_name(path)?;
+    let rotated = rotated_name(name);
+    for _ in 0..READ_OPEN_ATTEMPTS {
+        let dir = match LogDir::open(parent_of(path), false) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok([None, None]),
+            Err(e) => return Err(e),
+        };
+        let old = dir.open_read(&rotated)?;
+        between_opens();
+        let current = dir.open_read(name)?;
+        let again = dir.open_read(&rotated)?;
+        if identity(old.as_ref())? == identity(again.as_ref())? {
+            return Ok([old, current]);
         }
     }
-    Ok((records, skipped))
+    Err(std::io::Error::other(
+        "the event log kept rotating while it was being opened; try again",
+    ))
 }
 
-#[cfg(target_os = "linux")]
-fn read_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    crate::statefile::read_no_follow(path)
+/// What names a file across renames: device and inode.
+#[cfg(unix)]
+fn identity(f: Option<&File>) -> std::io::Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    f.map(|f| f.metadata().map(|m| (m.dev(), m.ino())))
+        .transpose()
 }
 
-#[cfg(not(target_os = "linux"))]
-fn read_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    match std::fs::read(path) {
-        Ok(b) => Ok(Some(b)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+#[cfg(not(unix))]
+fn identity(f: Option<&File>) -> std::io::Result<Option<(u64, u64)>> {
+    Ok(f.map(|_| (0, 0)))
+}
+
+/// Call `on` once per line, without the newline: `Some(line)`, or `None`
+/// for a line longer than [`READ_LINE_MAX`], which is skipped without
+/// being buffered. A final line without a newline is still a line.
+fn for_each_line(mut r: impl BufRead, mut on: impl FnMut(Option<&[u8]>)) -> std::io::Result<()> {
+    let mut line = Vec::new();
+    let mut overlong = false;
+    loop {
+        let (used, ended) = {
+            let buf = r.fill_buf()?;
+            if buf.is_empty() {
+                if overlong {
+                    on(None);
+                } else if !line.is_empty() {
+                    on(Some(&line));
+                }
+                return Ok(());
+            }
+            let (part, used, ended) = match buf.iter().position(|b| *b == b'\n') {
+                Some(i) => (&buf[..i], i + 1, true),
+                None => (buf, buf.len(), false),
+            };
+            if !overlong {
+                if line.len() + part.len() > READ_LINE_MAX {
+                    overlong = true;
+                    line.clear();
+                } else {
+                    line.extend_from_slice(part);
+                }
+            }
+            (used, ended)
+        };
+        r.consume(used);
+        if ended {
+            if overlong {
+                on(None);
+            } else {
+                on(Some(&line));
+            }
+            line.clear();
+            overlong = false;
+        }
     }
 }
 
@@ -854,7 +1154,7 @@ pub fn parse_rfc3339(s: &str) -> Option<SystemTime> {
         return None;
     }
     let (y, mo, d) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo as u32) {
         return None;
     }
     let days = days_from_civil(y, mo as u32, d as u32);
@@ -904,6 +1204,18 @@ pub fn parse_rfc3339(s: &str) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::new(secs as u64, nanos))
 }
 
+/// Feb 29 exists only in leap years, and the 31st only in the long
+/// months: a date that is not in the calendar is refused, not rolled over
+/// into the next month.
+fn days_in_month(y: i64, m: u32) -> i64 {
+    match m {
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
 /// Days since the epoch to a proleptic Gregorian date (Hinnant's
 /// `civil_from_days`).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -951,8 +1263,30 @@ mod tests {
         }
     }
 
+    fn read_all(path: &Path) -> (Vec<Record>, usize) {
+        let mut v = Vec::new();
+        let skipped = read_each(path, |r| v.push(r)).unwrap();
+        (v, skipped)
+    }
+
     fn lines(path: &Path) -> Vec<Record> {
-        read(path).unwrap().0
+        read_all(path).0
+    }
+
+    fn line(ev: Event) -> String {
+        String::from_utf8(line_for(ev)).unwrap()
+    }
+
+    /// Poll `cond` for up to two seconds.
+    fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
     }
 
     #[test]
@@ -1020,6 +1354,23 @@ mod tests {
             parse_rfc3339("2026-09-27"),
             parse_rfc3339("2026-09-27T00:00:00Z")
         );
+        // Leap years by the Gregorian rule.
+        assert!(parse_rfc3339("2000-02-29").is_some());
+        assert!(parse_rfc3339("2024-02-29").is_some());
+        for bad in [
+            "2026-02-29",
+            "1900-02-29",
+            "2100-02-29",
+            "2026-02-31",
+            "2026-04-31",
+            "2026-06-31",
+            "2026-09-31",
+            "2026-11-31",
+            "2026-01-00",
+            "2026-01-32",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
         for bad in [
             "",
             "yesterday",
@@ -1099,7 +1450,9 @@ mod tests {
     fn rotation_resumes_from_an_existing_file_size() {
         let dir = tmpdir("resume");
         let path = dir.join("events.log");
-        std::fs::write(&path, vec![b'x'; 1000]).unwrap();
+        // Ten whole 100-byte lines: a tail without a newline would be
+        // truncated as a torn write before the size is taken.
+        std::fs::write(&path, format!("{}\n", "x".repeat(99)).repeat(10)).unwrap();
         let log = EventLog::start_with(opts(path.clone(), 1024));
         log.emit(Event::info("daemon", kind::PROCESS_START).detail("a line that does not fit"));
         assert!(log.flush());
@@ -1230,14 +1583,176 @@ mod tests {
         let b = String::from_utf8(line_for(Event::info("daemon", kind::PROCESS_STOP))).unwrap();
         std::fs::write(rotated_path(&path), &a).unwrap();
         std::fs::write(&path, format!("{b}{{\"ts\":\"torn\n\n")).unwrap();
-        let (got, skipped) = read(&path).unwrap();
+        let (got, skipped) = read_all(&path);
         assert_eq!(skipped, 1);
         assert_eq!(
             got.iter().map(|r| r.event.as_str()).collect::<Vec<_>>(),
             [kind::PROCESS_START, kind::PROCESS_STOP]
         );
-        // Neither file existing is an empty log.
-        assert_eq!(read(&dir.join("nothing")).unwrap().0.len(), 0);
+        // Neither file existing is an empty log, and so is a missing
+        // directory.
+        assert_eq!(read_all(&dir.join("nothing")).0.len(), 0);
+        assert_eq!(read_all(&dir.join("no-dir").join("events.log")).0.len(), 0);
+    }
+
+    /// A rotation between the two opens would pair the OLD `.1` with a
+    /// fresh current file and skip the generation that became `.1`. The
+    /// hook rotates exactly there, once; the reader must notice and
+    /// re-open.
+    #[test]
+    fn a_rotation_between_the_opens_is_retried_not_skipped() {
+        let dir = tmpdir("read-race");
+        let path = dir.join("events.log");
+        let a = line(Event::info("daemon", kind::PROCESS_START).field("gen", "a"));
+        let b = line(Event::info("daemon", kind::PROCESS_START).field("gen", "b"));
+        let c = line(Event::info("daemon", kind::PROCESS_START).field("gen", "c"));
+        std::fs::write(rotated_path(&path), &a).unwrap();
+        std::fs::write(&path, &b).unwrap();
+        let mut rotated = false;
+        let mut got = Vec::new();
+        let skipped = read_each_with(
+            &path,
+            &mut || {
+                if !rotated {
+                    rotated = true;
+                    std::fs::rename(&path, rotated_path(&path)).unwrap();
+                    std::fs::write(&path, &c).unwrap();
+                }
+            },
+            |r| got.push(r.fields["gen"].as_str().unwrap().to_string()),
+        )
+        .unwrap();
+        assert!(rotated);
+        assert_eq!(skipped, 0);
+        // `a` rotated out for real; `b` must not be skipped.
+        assert_eq!(got, ["b", "c"]);
+    }
+
+    /// Streaming: records arrive oldest first, one at a time, and a line
+    /// longer than any record is skipped and counted, not buffered.
+    #[test]
+    fn reading_streams_and_skips_overlong_lines() {
+        let dir = tmpdir("read-stream");
+        let path = dir.join("events.log");
+        let first = line(Event::info("daemon", kind::PROCESS_START));
+        let last = line(Event::info("daemon", kind::PROCESS_STOP));
+        let huge = "x".repeat(READ_LINE_MAX + 10);
+        std::fs::write(&path, format!("{first}{huge}\n{last}")).unwrap();
+        let mut seen = Vec::new();
+        let skipped = read_each(&path, |r| seen.push(r.event)).unwrap();
+        assert_eq!(skipped, 1);
+        assert_eq!(seen, [kind::PROCESS_START, kind::PROCESS_STOP]);
+        // The line splitter itself: a final line without a newline counts,
+        // and an overlong one at EOF is reported as skipped.
+        let mut out = Vec::new();
+        for_each_line(&b"a\n\nbb"[..], |l| out.push(l.map(<[u8]>::to_vec))).unwrap();
+        assert_eq!(
+            out,
+            [Some(b"a".to_vec()), Some(vec![]), Some(b"bb".to_vec())]
+        );
+        let tail = vec![b'y'; READ_LINE_MAX + 1];
+        let mut out = Vec::new();
+        for_each_line(&tail[..], |l| out.push(l.is_none())).unwrap();
+        assert_eq!(out, [true]);
+    }
+
+    /// A write that failed part-way left a fragment with no newline. The
+    /// next record must start on its own line, not be welded to it.
+    #[test]
+    fn a_torn_tail_is_truncated_before_the_next_record() {
+        let dir = tmpdir("torn");
+        let path = dir.join("events.log");
+        let whole = line(Event::info("daemon", kind::PROCESS_START));
+        std::fs::write(&path, format!("{whole}{{\"ts\":\"2026-09-27T0")).unwrap();
+        let log = EventLog::start_with(opts(path.clone(), DEFAULT_MAX_BYTES));
+        log.emit(Event::info("daemon", kind::PROCESS_STOP));
+        assert!(log.flush());
+        let (got, skipped) = read_all(&path);
+        assert_eq!(skipped, 0, "the fragment must be gone, not welded");
+        assert_eq!(
+            got.iter().map(|r| r.event.as_str()).collect::<Vec<_>>(),
+            [kind::PROCESS_START, kind::PROCESS_STOP]
+        );
+        log.shutdown();
+
+        // A file that is ALL fragment is emptied.
+        let path2 = dir.join("only-fragment.log");
+        std::fs::write(&path2, "{\"ts\":").unwrap();
+        let log = EventLog::start_with(opts(path2.clone(), DEFAULT_MAX_BYTES));
+        log.emit(Event::info("daemon", kind::PROCESS_STOP));
+        assert!(log.flush());
+        assert_eq!(read_all(&path2), (lines(&path2), 0));
+        assert_eq!(lines(&path2).len(), 1);
+        log.shutdown();
+    }
+
+    /// Generations left over-size by a larger `event-log-max` are trimmed
+    /// to their newest whole lines on open, not carried for months.
+    #[test]
+    fn oversized_generations_are_trimmed_to_their_newest_lines() {
+        let dir = tmpdir("trim");
+        let path = dir.join("events.log");
+        let max = 2048u64;
+        let body = |gen: &str| {
+            (0..100u64)
+                .map(|i| {
+                    line(
+                        Event::info("daemon", kind::MODULE_HEALTH)
+                            .field("gen", gen)
+                            .field("i", i),
+                    )
+                })
+                .collect::<String>()
+        };
+        std::fs::write(rotated_path(&path), body("old")).unwrap();
+        std::fs::write(&path, body("cur")).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 4 * max);
+
+        let log = EventLog::start_with(opts(path.clone(), max));
+        log.emit(Event::info("daemon", kind::PROCESS_START));
+        assert!(log.flush());
+        log.shutdown();
+        for p in [path.clone(), rotated_path(&path)] {
+            let len = std::fs::metadata(&p).unwrap().len();
+            assert!(len <= max, "{} is {len} > {max}", p.display());
+        }
+        let (got, skipped) = read_all(&path);
+        assert_eq!(skipped, 0, "trimming keeps whole lines only");
+        // The newest line of the old current file survived the trim.
+        assert!(got
+            .iter()
+            .any(|r| r.fields.get("gen") == Some(&"cur".into()) && r.fields["i"] == 99));
+        assert!(!got.iter().any(|r| r.fields.get("i") == Some(&0.into())));
+        assert_eq!(got.last().unwrap().event, kind::PROCESS_START);
+        assert!(!dir.join("events.log.tmp").exists());
+    }
+
+    /// With nothing to write, a failing writer still probes on its
+    /// retry schedule and records its recovery.
+    #[test]
+    fn recovery_is_probed_on_schedule_without_new_events() {
+        let dir = tmpdir("timed-recover");
+        let blocker = dir.join("sub");
+        std::fs::write(&blocker, b"").unwrap();
+        let path = blocker.join("events.log");
+        let log = EventLog::start_with(opts(path.clone(), DEFAULT_MAX_BYTES));
+        log.emit(Event::info("daemon", kind::MODULE_ATTACHED));
+        assert!(log.flush());
+        assert!(log.status().last_error.is_some());
+
+        std::fs::remove_file(&blocker).unwrap();
+        std::fs::create_dir_all(&blocker).unwrap();
+        // No emit: only the timer can notice.
+        assert!(
+            eventually(|| log.status().last_error.is_none()),
+            "{:?}",
+            log.status()
+        );
+        let got = lines(&path);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].event, kind::EVENT_LOG_RECOVERED);
+        assert_eq!(got[0].fields["lost"], 1);
+        log.shutdown();
     }
 
     #[cfg(target_os = "linux")]

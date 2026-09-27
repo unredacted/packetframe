@@ -186,14 +186,25 @@ fn steering_event(ev: events::Event, key: &str) {
 }
 
 fn steer_failed(action: &str, why: &str, rules_remain: bool) {
-    steering_event(
-        events::Event::warn(crate::MODULE_NAME, kind::STEER_FAILED)
-            .field("action", action)
-            .field("reason", why)
-            .field("rules_remain", rules_remain)
-            .detail("steering was not installed as asked; traffic stays on the eBPF tier"),
-        why,
-    );
+    steering_event(steer_failed_event(action, why, rules_remain), why);
+}
+
+/// The `steer_failed` record. What it says about where traffic is
+/// follows `rules_remain`: a rollback that could not delete every rule
+/// leaves some traffic diverted to VPP, and "traffic stays on the eBPF
+/// tier" would then be false exactly when it matters (review finding on
+/// #289).
+fn steer_failed_event(action: &str, why: &str, rules_remain: bool) -> events::Event {
+    events::Event::warn(crate::MODULE_NAME, kind::STEER_FAILED)
+        .field("action", action)
+        .field("reason", why)
+        .field("rules_remain", rules_remain)
+        .detail(if rules_remain {
+            "steering was not installed as asked, and the rollback left rules in the NIC: \
+             traffic matching them is still diverted to VPP"
+        } else {
+            "steering was not installed as asked; traffic stays on the eBPF tier"
+        })
 }
 
 /// Execute `actions` in order, in full.
@@ -452,6 +463,24 @@ fn step_failed(out: &mut Outcome, action: Action, step: ConvergenceStep, e: Step
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record must not say traffic is on the eBPF tier when the
+    /// rollback left rules diverting it.
+    #[test]
+    fn steer_failed_says_where_traffic_is() {
+        let clean = steer_failed_event("steer", "ntuple insert refused", false).into_record();
+        assert_eq!(clean.fields["rules_remain"], false);
+        assert!(clean.fields["detail"]
+            .as_str()
+            .unwrap()
+            .contains("traffic stays on the eBPF tier"));
+
+        let left = steer_failed_event("steer", "ntuple delete refused", true).into_record();
+        assert_eq!(left.fields["rules_remain"], true);
+        let detail = left.fields["detail"].as_str().unwrap();
+        assert!(!detail.contains("stays on the eBPF tier"), "{detail}");
+        assert!(detail.contains("still diverted to VPP"), "{detail}");
+    }
 
     /// Records calls in order and fails whichever ones it is told to.
     #[derive(Default)]
