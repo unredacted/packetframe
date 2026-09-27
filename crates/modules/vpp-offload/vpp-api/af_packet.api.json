@@ -1,0 +1,624 @@
+{
+    "module": "af_packet",
+    "types": [],
+    "messages": [
+        [
+            "af_packet_create",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "hw_addr"
+            ],
+            [
+                "bool",
+                "use_random_hw_addr"
+            ],
+            [
+                "string",
+                "host_if_name",
+                64
+            ],
+            {
+                "crc": "0xa190415f",
+                "options": {
+                    "deprecated": null
+                },
+                "comment": "/** \\brief Create host-interface\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param hw_addr - interface MAC\n    @param use_random_hw_addr - use random generated MAC\n    @param host_if_name - interface name\n*/"
+            }
+        ],
+        [
+            "af_packet_create_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0x5383d31f",
+                "options": {
+                    "deprecated": null
+                },
+                "comment": "/** \\brief Create host-interface response\n    @param context - sender context, to match reply w/ request\n    @param retval - return value for request\n*/"
+            }
+        ],
+        [
+            "af_packet_create_v2",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "hw_addr"
+            ],
+            [
+                "bool",
+                "use_random_hw_addr"
+            ],
+            [
+                "string",
+                "host_if_name",
+                64
+            ],
+            [
+                "u32",
+                "rx_frame_size"
+            ],
+            [
+                "u32",
+                "tx_frame_size"
+            ],
+            [
+                "u32",
+                "rx_frames_per_block"
+            ],
+            [
+                "u32",
+                "tx_frames_per_block"
+            ],
+            [
+                "u32",
+                "flags"
+            ],
+            [
+                "u16",
+                "num_rx_queues",
+                {
+                    "default": 1
+                }
+            ],
+            {
+                "crc": "0x4aff0436",
+                "options": {
+                    "deprecated": null
+                },
+                "comment": "/** \\brief Create host-interface\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param hw_addr - interface MAC\n    @param use_random_hw_addr - use random generated MAC\n    @param host_if_name - interface name\n    @param rx_frame_size - frame size for RX\n    @param tx_frame_size - frame size for TX\n    @param rx_frames_per_block - frames per block for RX\n    @param tx_frames_per_block - frames per block for TX\n    @param flags - flags for the af_packet interface creation\n    @param num_rx_queues - number of rx queues\n*/"
+            }
+        ],
+        [
+            "af_packet_create_v2_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0x5383d31f",
+                "options": {
+                    "deprecated": null
+                },
+                "comment": "/** \\brief Create host-interface response\n    @param context - sender context, to match reply w/ request\n    @param retval - return value for request\n*/"
+            }
+        ],
+        [
+            "af_packet_create_v3",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_af_packet_mode_t",
+                "mode"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "hw_addr"
+            ],
+            [
+                "bool",
+                "use_random_hw_addr"
+            ],
+            [
+                "string",
+                "host_if_name",
+                64
+            ],
+            [
+                "u32",
+                "rx_frame_size"
+            ],
+            [
+                "u32",
+                "tx_frame_size"
+            ],
+            [
+                "u32",
+                "rx_frames_per_block"
+            ],
+            [
+                "u32",
+                "tx_frames_per_block"
+            ],
+            [
+                "vl_api_af_packet_flags_t",
+                "flags"
+            ],
+            [
+                "u16",
+                "num_rx_queues",
+                {
+                    "default": 1
+                }
+            ],
+            [
+                "u16",
+                "num_tx_queues",
+                {
+                    "default": 1
+                }
+            ],
+            {
+                "crc": "0xb3a809d4",
+                "options": {},
+                "comment": "/** \\brief Create host-interface\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param mode - 1 - Ethernet, 2 - IP\n    @param hw_addr - interface MAC\n    @param use_random_hw_addr - use random generated MAC\n    @param host_if_name - interface name\n    @param rx_frame_size - frame size for RX\n    @param tx_frame_size - frame size for TX\n    @param rx_frames_per_block - frames per block for RX\n    @param tx_frames_per_block - frames per block for TX\n    @param flags - flags for the af_packet interface creation\n    @param num_rx_queues - number of rx queues\n    @param num_tx_queues - number of tx queues\n*/"
+            }
+        ],
+        [
+            "af_packet_create_v3_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0x5383d31f",
+                "options": {},
+                "comment": "/** \\brief Create host-interface response\n    @param context - sender context, to match reply w/ request\n    @param retval - return value for request\n*/"
+            }
+        ],
+        [
+            "af_packet_delete",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "string",
+                "host_if_name",
+                64
+            ],
+            {
+                "crc": "0x863fa648",
+                "options": {},
+                "comment": "/** \\brief Delete host-interface\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param host_if_name - interface name\n*/"
+            }
+        ],
+        [
+            "af_packet_delete_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "af_packet_set_l4_cksum_offload",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "bool",
+                "set"
+            ],
+            {
+                "crc": "0x319cd5c8",
+                "options": {},
+                "comment": "/** \\brief Set l4 offload checksum calculation\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n*/"
+            }
+        ],
+        [
+            "af_packet_set_l4_cksum_offload_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "af_packet_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {},
+                "comment": "/** \\brief Dump af_packet interfaces request */"
+            }
+        ],
+        [
+            "af_packet_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "string",
+                "host_if_name",
+                64
+            ],
+            {
+                "crc": "0x58c7c042",
+                "options": {},
+                "comment": "/** \\brief Reply for af_packet dump request\n    @param sw_if_index - software index of af_packet interface\n    @param host_if_name - interface name\n*/"
+            }
+        ]
+    ],
+    "unions": [],
+    "enums": [
+        [
+            "if_status_flags",
+            [
+                "IF_STATUS_API_FLAG_ADMIN_UP",
+                1
+            ],
+            [
+                "IF_STATUS_API_FLAG_LINK_UP",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "mtu_proto",
+            [
+                "MTU_PROTO_API_L3",
+                0
+            ],
+            [
+                "MTU_PROTO_API_IP4",
+                1
+            ],
+            [
+                "MTU_PROTO_API_IP6",
+                2
+            ],
+            [
+                "MTU_PROTO_API_MPLS",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "link_duplex",
+            [
+                "LINK_DUPLEX_API_UNKNOWN",
+                0
+            ],
+            [
+                "LINK_DUPLEX_API_HALF",
+                1
+            ],
+            [
+                "LINK_DUPLEX_API_FULL",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "sub_if_flags",
+            [
+                "SUB_IF_API_FLAG_NO_TAGS",
+                1
+            ],
+            [
+                "SUB_IF_API_FLAG_ONE_TAG",
+                2
+            ],
+            [
+                "SUB_IF_API_FLAG_TWO_TAGS",
+                4
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AD",
+                8
+            ],
+            [
+                "SUB_IF_API_FLAG_EXACT_MATCH",
+                16
+            ],
+            [
+                "SUB_IF_API_FLAG_DEFAULT",
+                32
+            ],
+            [
+                "SUB_IF_API_FLAG_OUTER_VLAN_ID_ANY",
+                64
+            ],
+            [
+                "SUB_IF_API_FLAG_INNER_VLAN_ID_ANY",
+                128
+            ],
+            [
+                "SUB_IF_API_FLAG_MASK_VNET",
+                254
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AH",
+                256
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "rx_mode",
+            [
+                "RX_MODE_API_UNKNOWN",
+                0
+            ],
+            [
+                "RX_MODE_API_POLLING",
+                1
+            ],
+            [
+                "RX_MODE_API_INTERRUPT",
+                2
+            ],
+            [
+                "RX_MODE_API_ADAPTIVE",
+                3
+            ],
+            [
+                "RX_MODE_API_DEFAULT",
+                4
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "if_type",
+            [
+                "IF_API_TYPE_HARDWARE",
+                0
+            ],
+            [
+                "IF_API_TYPE_SUB",
+                1
+            ],
+            [
+                "IF_API_TYPE_P2P",
+                2
+            ],
+            [
+                "IF_API_TYPE_PIPE",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "direction",
+            [
+                "RX",
+                0
+            ],
+            [
+                "TX",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "af_packet_mode",
+            [
+                "AF_PACKET_API_MODE_ETHERNET",
+                1
+            ],
+            [
+                "AF_PACKET_API_MODE_IP",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "af_packet_flags",
+            [
+                "AF_PACKET_API_FLAG_QDISC_BYPASS",
+                1
+            ],
+            [
+                "AF_PACKET_API_FLAG_CKSUM_GSO",
+                2
+            ],
+            [
+                "AF_PACKET_API_FLAG_VERSION_2",
+                8
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ]
+    ],
+    "enumflags": [],
+    "services": {
+        "af_packet_create": {
+            "reply": "af_packet_create_reply"
+        },
+        "af_packet_create_v2": {
+            "reply": "af_packet_create_v2_reply"
+        },
+        "af_packet_create_v3": {
+            "reply": "af_packet_create_v3_reply"
+        },
+        "af_packet_delete": {
+            "reply": "af_packet_delete_reply"
+        },
+        "af_packet_set_l4_cksum_offload": {
+            "reply": "af_packet_set_l4_cksum_offload_reply"
+        },
+        "af_packet_dump": {
+            "reply": "af_packet_details",
+            "stream": true
+        }
+    },
+    "options": {
+        "version": "2.0.0"
+    },
+    "aliases": {
+        "interface_index": {
+            "type": "u32"
+        },
+        "mac_address": {
+            "type": "u8",
+            "length": 6
+        }
+    },
+    "vl_api_version": "0x5b12de21",
+    "imports": [
+        "vnet/interface_types.api",
+        "vnet/ethernet/ethernet_types.api"
+    ],
+    "counters": [],
+    "paths": []
+}

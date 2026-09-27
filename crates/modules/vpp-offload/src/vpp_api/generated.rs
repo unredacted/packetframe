@@ -85,11 +85,26 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "dev_remove_port_if_reply", crc: "0xc8d74455", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "cli_inband", crc: "0xf8377302", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "cli_inband_reply", crc: "0x05879051", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "af_packet_create_v3", crc: "0xb3a809d4", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "af_packet_create_v3_reply", crc: "0x5383d31f", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "af_packet_delete", crc: "0x863fa648", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "af_packet_delete_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "af_packet_dump", crc: "0x51077d14", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "af_packet_details", crc: "0x58c7c042", context_offset: 2, client_index_prefix: false },
 ];
 
 // enum address_family : u8
 pub const ADDRESS_IP4: u8 = 0;
 pub const ADDRESS_IP6: u8 = 1;
+
+// enum af_packet_flags : u32
+pub const AF_PACKET_API_FLAG_QDISC_BYPASS: u32 = 1;
+pub const AF_PACKET_API_FLAG_CKSUM_GSO: u32 = 2;
+pub const AF_PACKET_API_FLAG_VERSION_2: u32 = 8;
+
+// enum af_packet_mode : u32
+pub const AF_PACKET_API_MODE_ETHERNET: u32 = 1;
+pub const AF_PACKET_API_MODE_IP: u32 = 2;
 
 // enum dev_flags : u32
 pub const VL_API_DEV_FLAG_NO_STATS: u32 = 1;
@@ -3444,6 +3459,275 @@ impl Decode for CliInbandReply {
 impl Message for CliInbandReply {
     const NAME: &'static str = "cli_inband_reply";
     const CRC: &'static str = "0x05879051";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `af_packet_create_v3` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AfPacketCreateV3 {
+    pub context: u32,
+    pub mode: u32,
+    pub hw_addr: [u8; 6],
+    pub use_random_hw_addr: bool,
+    pub host_if_name: String,
+    pub rx_frame_size: u32,
+    pub tx_frame_size: u32,
+    pub rx_frames_per_block: u32,
+    pub tx_frames_per_block: u32,
+    pub flags: u32,
+    pub num_rx_queues: u16,
+    pub num_tx_queues: u16,
+}
+
+impl Encode for AfPacketCreateV3 {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.mode as u32).to_be_bytes());
+        buf.extend_from_slice(&self.hw_addr[..]);
+        buf.push(if self.use_random_hw_addr { 1u8 } else { 0u8 });
+        {
+            let mut tmp = [0u8; 64];
+            let b = self.host_if_name.as_bytes();
+            let k = b.len().min(64);
+            tmp[..k].copy_from_slice(&b[..k]);
+            buf.extend_from_slice(&tmp);
+        }
+        buf.extend_from_slice(&(self.rx_frame_size).to_be_bytes());
+        buf.extend_from_slice(&(self.tx_frame_size).to_be_bytes());
+        buf.extend_from_slice(&(self.rx_frames_per_block).to_be_bytes());
+        buf.extend_from_slice(&(self.tx_frames_per_block).to_be_bytes());
+        buf.extend_from_slice(&(self.flags as u32).to_be_bytes());
+        buf.extend_from_slice(&(self.num_rx_queues).to_be_bytes());
+        buf.extend_from_slice(&(self.num_tx_queues).to_be_bytes());
+    }
+}
+
+impl Decode for AfPacketCreateV3 {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let mode = d.u32()?;
+        let hw_addr = d.bytes::<6>()?;
+        let use_random_hw_addr = d.bool()?;
+        let host_if_name = d.string_fixed(64)?;
+        let rx_frame_size = d.u32()?;
+        let tx_frame_size = d.u32()?;
+        let rx_frames_per_block = d.u32()?;
+        let tx_frames_per_block = d.u32()?;
+        let flags = d.u32()?;
+        let num_rx_queues = d.u16()?;
+        let num_tx_queues = d.u16()?;
+        Ok(Self {
+            context,
+            mode,
+            hw_addr,
+            use_random_hw_addr,
+            host_if_name,
+            rx_frame_size,
+            tx_frame_size,
+            rx_frames_per_block,
+            tx_frames_per_block,
+            flags,
+            num_rx_queues,
+            num_tx_queues,
+        })
+    }
+}
+
+impl Message for AfPacketCreateV3 {
+    const NAME: &'static str = "af_packet_create_v3";
+    const CRC: &'static str = "0xb3a809d4";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `af_packet_create_v3_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AfPacketCreateV3Reply {
+    pub context: u32,
+    pub retval: i32,
+    pub sw_if_index: u32,
+}
+
+impl Encode for AfPacketCreateV3Reply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+    }
+}
+
+impl Decode for AfPacketCreateV3Reply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        let sw_if_index = d.u32()?;
+        Ok(Self {
+            context,
+            retval,
+            sw_if_index,
+        })
+    }
+}
+
+impl Message for AfPacketCreateV3Reply {
+    const NAME: &'static str = "af_packet_create_v3_reply";
+    const CRC: &'static str = "0x5383d31f";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `af_packet_delete` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AfPacketDelete {
+    pub context: u32,
+    pub host_if_name: String,
+}
+
+impl Encode for AfPacketDelete {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        {
+            let mut tmp = [0u8; 64];
+            let b = self.host_if_name.as_bytes();
+            let k = b.len().min(64);
+            tmp[..k].copy_from_slice(&b[..k]);
+            buf.extend_from_slice(&tmp);
+        }
+    }
+}
+
+impl Decode for AfPacketDelete {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let host_if_name = d.string_fixed(64)?;
+        Ok(Self {
+            context,
+            host_if_name,
+        })
+    }
+}
+
+impl Message for AfPacketDelete {
+    const NAME: &'static str = "af_packet_delete";
+    const CRC: &'static str = "0x863fa648";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `af_packet_delete_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AfPacketDeleteReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for AfPacketDeleteReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for AfPacketDeleteReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for AfPacketDeleteReply {
+    const NAME: &'static str = "af_packet_delete_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `af_packet_dump` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AfPacketDump {
+    pub context: u32,
+}
+
+impl Encode for AfPacketDump {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+    }
+}
+
+impl Decode for AfPacketDump {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        Ok(Self {
+            context,
+        })
+    }
+}
+
+impl Message for AfPacketDump {
+    const NAME: &'static str = "af_packet_dump";
+    const CRC: &'static str = "0x51077d14";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `af_packet_details` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AfPacketDetails {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub host_if_name: String,
+}
+
+impl Encode for AfPacketDetails {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        {
+            let mut tmp = [0u8; 64];
+            let b = self.host_if_name.as_bytes();
+            let k = b.len().min(64);
+            tmp[..k].copy_from_slice(&b[..k]);
+            buf.extend_from_slice(&tmp);
+        }
+    }
+}
+
+impl Decode for AfPacketDetails {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let host_if_name = d.string_fixed(64)?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            host_if_name,
+        })
+    }
+}
+
+impl Message for AfPacketDetails {
+    const NAME: &'static str = "af_packet_details";
+    const CRC: &'static str = "0x58c7c042";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;
     fn set_context(&mut self, context: u32) { self.context = context; }

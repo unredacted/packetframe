@@ -32,7 +32,7 @@ route is programmed. Two consequences that are easy to miss:
 
 - **The whitelist is the contract, not the VPP release.** A new VPP
   can change a hundred messages this module never speaks and remain
-  fully compatible; compatibility is defined over the ~66 messages the
+  fully compatible; compatibility is defined over the ~72 messages the
   module actually uses. This is why the vendored bundle stays a small
   whitelist rather than the whole API surface — every vendored file
   widens what counts as a breaking change.

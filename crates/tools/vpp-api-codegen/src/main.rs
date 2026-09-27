@@ -207,6 +207,20 @@ const MESSAGES: &[&str] = &[
     //   that debt's entry fee.
     "cli_inband",
     "cli_inband_reply",
+    //   The IPv6 hand-back path (`af_packet.api.json`): VPP's end of the
+    //   veth pair router-owned IPv6 leaves VPP by, back to the kernel
+    //   (`crate::handback`). af_packet rather than tap because tap needs
+    //   vhost-net, and the host interface is a plain AF_PACKET socket on
+    //   a veth this module creates. `_v3` is the only create not marked
+    //   deprecated in v26.06; the dump is how adoption finds the
+    //   interface a surviving VPP already has, by host interface name,
+    //   instead of creating a second socket on the same veth.
+    "af_packet_create_v3",
+    "af_packet_create_v3_reply",
+    "af_packet_delete",
+    "af_packet_delete_reply",
+    "af_packet_dump",
+    "af_packet_details",
 ];
 
 const FILES: &[&str] = &[
@@ -223,6 +237,7 @@ const FILES: &[&str] = &[
     "vlib",
     "l2",
     "ip6_nd",
+    "af_packet",
 ];
 
 /// One field of a message or composite type.
