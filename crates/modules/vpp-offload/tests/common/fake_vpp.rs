@@ -154,7 +154,8 @@ pub struct WireRoute {
     pub is_ip6: bool,
     pub addr16: [u8; 16],
     /// Adds or removes just the paths sent, rather than replacing the
-    /// prefix's whole path set — the make-before-break move's shape.
+    /// prefix's whole path set — which an attached route's move must NOT
+    /// be: two steps leave a window holding both paths, or a stale one.
     pub is_multipath: bool,
 }
 
@@ -343,6 +344,10 @@ pub struct Behaviour {
     /// `None` keeps the loopback out of the dump, which every older test
     /// relies on (each attach creates it afresh).
     pub existing_loopback6: Option<&'static [([u8; 16], u8)]>,
+    /// Refuse the route op at this 0-based position on a connection, if
+    /// it is an add, with a non-zero retval and WITHOUT applying it — one
+    /// route VPP will not take at one moment, the connection unharmed.
+    pub reject_route_add_at: Option<usize>,
     /// Acknowledge IPv6 address adds with retval 0 WITHOUT applying them,
     /// so a readback finds nothing — the acknowledged-but-absent shape.
     pub drop_v6_address_adds: bool,
@@ -867,14 +872,17 @@ fn serve(
                     addr16,
                     is_multipath: r.is_multipath,
                 }));
-                let refuse_v6 = is_ip6 && behaviour.reject_v6_routes;
+                let refuse = (is_ip6 && behaviour.reject_v6_routes)
+                    || (r.is_add && behaviour.reject_route_add_at == Some(routes_seen));
                 // A real VPP applies before it answers — unless it refuses.
-                if is_ip6 && !refuse_v6 {
-                    let mut routes = table6.lock().unwrap();
-                    apply_route_op(&mut routes, (addr16, r.route.prefix.len), &r);
-                } else if !is_ip6 {
-                    let mut routes = table.lock().unwrap();
-                    apply_route_op(&mut routes, (addr, r.route.prefix.len), &r);
+                if !refuse {
+                    if is_ip6 {
+                        let mut routes = table6.lock().unwrap();
+                        apply_route_op(&mut routes, (addr16, r.route.prefix.len), &r);
+                    } else {
+                        let mut routes = table.lock().unwrap();
+                        apply_route_op(&mut routes, (addr, r.route.prefix.len), &r);
+                    }
                 }
 
                 routes_seen += 1;
@@ -884,7 +892,7 @@ fn serve(
                 // Reject deletes for a while, so the retry path is
                 // exercised against a per-route refusal rather than a
                 // connection fault.
-                let retval = if refuse_v6 {
+                let retval = if refuse {
                     -1
                 } else if !r.is_add && behaviour.reject_deletes > 0 {
                     behaviour.reject_deletes -= 1;

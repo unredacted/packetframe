@@ -546,12 +546,13 @@ pub struct ConvergenceEngine {
     /// against fast-path's `local-prefix` (`local-prefix6` for a
     /// `local-route6`) for the kernel device. Both families.
     local_routes: Vec<crate::LocalRoute>,
-    /// Where each local route's attached route sits in THIS VPP — the
-    /// interface VPP acknowledged it on, keyed by the prefix as sent.
-    /// Written only on acknowledgement, and cleared with the process.
-    /// What [`Self::rehome_attached_routes`] compares against the
+    /// Where each local route's attached route sits in THIS VPP, keyed by
+    /// the prefix as sent: the interface VPP acknowledged it on, or
+    /// `None` once a send for it failed without an answer VPP can be
+    /// trusted on. Absent until attach first sends it; cleared with the
+    /// process. What [`Self::rehome_attached_routes`] compares against the
     /// interface the route belongs on now.
-    attached_at: std::collections::HashMap<IpPrefix, u32>,
+    attached_at: std::collections::HashMap<IpPrefix, Option<u32>>,
     /// Mirror prefixes currently suppressed by a `local-route` — kept
     /// as a set so health can report a count that means "routes the
     /// mirror carries that VPP deliberately does not", not a
@@ -2391,11 +2392,10 @@ impl ConvergenceEngine {
                     detail: format!("no subif index for {}.{}", lr.port, lr.vlan),
                 });
             };
-            // A REPLACE (`is_multipath` false): whatever this prefix held —
-            // an adopted VPP's route on an interface it no longer belongs
-            // on, or both halves of a move a previous daemon died inside —
-            // leaves as the one path lands, in one message.
-            self.send_attached(&lr, sw_if_index, true, false)?;
+            // A REPLACE: whatever this prefix held — an adopted VPP's
+            // route on an interface it no longer belongs on — leaves as
+            // the one path lands, in one message.
+            self.send_attached(&lr, sw_if_index)?;
             tracing::info!(
                 prefix = %lr.prefix,
                 port = %lr.port,
@@ -2412,9 +2412,22 @@ impl ConvergenceEngine {
     /// behind any member); a trunk's untagged VLAN with no BVI through the
     /// VF, which the bridge sends it bare on; a plain port's VLAN through
     /// the subif. `None` when that interface does not exist.
+    ///
+    /// The BVI only when it is the BVI of `lr`'s own bridge — the one its
+    /// port is enslaved to, which is how [`Self::ensure_bridges`] assigns
+    /// domains. A second VLAN-aware bridge reusing the vid gets no BVI of
+    /// its own, and borrowing the first bridge's would deliver its prefix
+    /// into another L2 domain; it stays on its subif or VF, exactly as the
+    /// resolver keeps its neighbours off that BVI
+    /// ([`crate::sink::NexthopMap::set_bvi`]).
     fn attached_target(&self, lr: &crate::LocalRoute) -> Option<u32> {
         let bvi = crate::sink::NexthopTarget::Bvi { vlan: lr.vlan };
-        let target = if self.port_index.get(&bvi).is_some() {
+        let own_bvi = self.port_index.get(&bvi).is_some()
+            && self
+                .nexthops
+                .bvi_bridge(lr.vlan)
+                .is_some_and(|owner| self.topology.master_of(&lr.port).as_deref() == Some(owner));
+        let target = if own_bvi {
             bvi
         } else if self.nexthops.is_untagged(&lr.port, lr.vlan) {
             crate::sink::NexthopTarget::Vf {
@@ -2429,7 +2442,7 @@ impl ConvergenceEngine {
         self.port_index.get(&target)
     }
 
-    /// Move every attached route whose interface has changed since it was
+    /// Put every attached route whose interface has changed since it was
     /// installed onto the one it belongs on now
     /// ([`Self::attached_target`]).
     ///
@@ -2443,16 +2456,16 @@ impl ConvergenceEngine {
     /// way — until a restart. The same holds for a VLAN that turns
     /// untagged or tagged under a route on the VF or subif.
     ///
-    /// Make-before-break: the path on the new interface is ADDED to the
-    /// prefix first, then the old one removed, so the prefix is never
-    /// without a path (for the instant between, VPP spreads over both).
-    /// The route is recorded moved only once both are acknowledged: a
-    /// refused removal leaves it recorded where it was, and the next
-    /// refresh repeats the move — adding a path the prefix already has
-    /// changes nothing in VPP. Nothing is sent for a route already where
-    /// it belongs, one attach has not installed on this VPP yet (attach
-    /// owns the first install), or one whose right interface does not
-    /// exist.
+    /// A move is the replacing add attach sends: VPP swaps the prefix's
+    /// whole path set for the one path in one update, so the prefix is
+    /// never pathless and never holds two. A send that fails in any way —
+    /// refused, or its reply lost with VPP perhaps having applied it —
+    /// leaves the route recorded as unconfirmed, and the next refresh
+    /// sends it again wherever it belongs then, even if that is where it
+    /// was last confirmed. Nothing is sent for a confirmed route already
+    /// where it belongs, one attach has not installed on this VPP yet
+    /// (attach owns the first install), or one whose right interface does
+    /// not exist.
     fn rehome_attached_routes(&mut self) -> Result<(), EngineError> {
         for lr in self.local_routes.clone() {
             let prefix = lr.prefix.network();
@@ -2462,17 +2475,15 @@ impl ConvergenceEngine {
             let Some(to) = self.attached_target(&lr) else {
                 continue;
             };
-            if from == to {
+            if from == Some(to) {
                 continue;
             }
-            self.send_attached(&lr, to, true, true)?;
-            self.send_attached(&lr, from, false, true)?;
-            self.attached_at.insert(prefix, to);
+            self.send_attached(&lr, to)?;
             tracing::info!(
                 prefix = %lr.prefix,
                 port = %lr.port,
                 vlan = lr.vlan,
-                from_sw_if_index = from,
+                from_sw_if_index = ?from,
                 to_sw_if_index = to,
                 "attached route moved to the interface its VLAN is delivered through now"
             );
@@ -2480,17 +2491,17 @@ impl ConvergenceEngine {
         Ok(())
     }
 
-    /// Send one attached path for `lr` on `sw_if_index` — the nexthop-less
-    /// NORMAL path VPP resolves via the interface. With `is_multipath` it
-    /// adds or removes just this path; without, an add replaces every path
-    /// the prefix has, and is recorded in `attached_at` once acknowledged.
+    /// Put `lr`'s attached route on `sw_if_index` alone: one nexthop-less
+    /// NORMAL path, which VPP resolves via the interface, sent as a
+    /// REPLACING add (`is_multipath` false) so whatever paths the prefix
+    /// held go in the same update. Recorded in `attached_at` — the
+    /// interface once acknowledged, unconfirmed on any failure.
     fn send_attached(
         &mut self,
         lr: &crate::LocalRoute,
         sw_if_index: u32,
-        is_add: bool,
-        is_multipath: bool,
     ) -> Result<(), EngineError> {
+        let prefix = lr.prefix.network();
         let path = FibPath {
             sw_if_index,
             table_id: 0,
@@ -2510,14 +2521,17 @@ impl ConvergenceEngine {
             label_stack: Default::default(),
         };
         let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+        // In doubt from the moment it is written: a lost reply may still
+        // have been applied.
+        self.attached_at.insert(prefix, None);
         let reply: IpRouteAddDelReply = match t.request(IpRouteAddDel {
             context: 0,
-            is_add,
-            is_multipath,
+            is_add: true,
+            is_multipath: false,
             route: IpRoute {
                 table_id: 0,
                 stats_index: 0,
-                prefix: crate::fib_sync::to_prefix(lr.prefix.network()),
+                prefix: crate::fib_sync::to_prefix(prefix),
                 n_paths: 1,
                 paths: vec![path],
             },
@@ -2532,16 +2546,10 @@ impl ConvergenceEngine {
         if reply.retval != 0 {
             return Err(EngineError::AttachedRouteFailed {
                 prefix: lr.prefix.to_string(),
-                detail: format!(
-                    "{} on sw_if_index {sw_if_index}: retval {}",
-                    if is_add { "add" } else { "remove" },
-                    reply.retval
-                ),
+                detail: format!("on sw_if_index {sw_if_index}: retval {}", reply.retval),
             });
         }
-        if is_add && !is_multipath {
-            self.attached_at.insert(lr.prefix.network(), sw_if_index);
-        }
+        self.attached_at.insert(prefix, Some(sw_if_index));
         Ok(())
     }
 

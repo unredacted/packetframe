@@ -2171,8 +2171,8 @@ fn attached_paths(fake: &Fake) -> (Vec<u32>, Vec<u32>) {
 
 /// A bridged VLAN whose BVI could not be built at attach puts its attached
 /// routes on the member subif; when the BVI appears at runtime both
-/// families move onto it — the new path added before the old one is
-/// removed, so the prefix is never without one — and a refresh with
+/// families move onto it — one replacing add each, so VPP holds exactly
+/// one path, on the BVI, and never none or two — and a refresh with
 /// nothing changed sends nothing.
 #[test]
 fn attached_routes_move_onto_a_bvi_built_after_attach() {
@@ -2217,11 +2217,8 @@ fn attached_routes_move_onto_a_bvi_built_after_attach() {
             .collect();
         assert_eq!(
             ops,
-            vec![
-                (true, true, vec![BVI_BASE]),
-                (false, true, vec![SUBIF_BASE])
-            ],
-            "v6={is_ip6}: add on the BVI, THEN remove from the subif"
+            vec![(true, false, vec![BVI_BASE])],
+            "v6={is_ip6}: one replacing add onto the BVI"
         );
     }
     assert_eq!(
@@ -2289,9 +2286,44 @@ fn adoption_corrects_attached_routes_left_on_the_wrong_interface() {
     assert!(routes_of(&fake.drain_events()).is_empty());
 }
 
+/// The v4 local route on VLAN 1337 over a bridge with no L3 device on it
+/// (never a BVI), whose port-VLAN table the test changes through `vlans`.
+fn engine_without_bvi(
+    fake: &Fake,
+    vlans: std::sync::Arc<std::sync::Mutex<PortVlans>>,
+) -> ConvergenceEngine {
+    engine_with_local_route(fake).with_topology(Box::new(Kernel {
+        kinds: vec![("br1337", bridge_vlan(1337))],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1337, MAC, "eth4")])))),
+        vlans,
+        masters: vec![("eth4", "switch0")],
+        l3: vec![],
+    }))
+}
+
+/// The paths VPP holds for the v4 attached route, by interface.
+fn attached_paths_v4(fake: &Fake) -> Vec<u32> {
+    fake.routes.lock().unwrap()[&([203, 0, 113, 0], 24)]
+        .iter()
+        .map(|p| p.sw_if_index)
+        .collect()
+}
+
+/// Every route op on the wire as `(is_add, is_multipath, interfaces)`.
+fn route_ops(events: &[Event]) -> Vec<(bool, bool, Vec<u32>)> {
+    routes_of(events)
+        .into_iter()
+        .map(|r| (r.is_add, r.is_multipath, r.path_indices))
+        .collect()
+}
+
+fn set_untagged(vlans: &std::sync::Mutex<PortVlans>, untagged: bool) {
+    *vlans.lock().unwrap() = PortVlans::from_entries([("eth4".to_string(), 1337, untagged)]);
+}
+
 /// The same rule in both directions on a VLAN with no BVI: the port starts
 /// sending it untagged and the attached route moves from the subif to the
-/// VF, then back when it is tagged again — make-before-break each way.
+/// VF, then back when it is tagged again — one replacing add each way.
 #[test]
 fn an_attached_route_follows_its_vlan_between_subif_and_vf() {
     let fake = Fake::start_behaving(
@@ -2302,55 +2334,191 @@ fn an_attached_route_follows_its_vlan_between_subif_and_vf() {
         },
     );
     let vlans: std::sync::Arc<std::sync::Mutex<PortVlans>> = Default::default();
-    let mut e = engine_with_local_route(&fake).with_topology(Box::new(Kernel {
-        kinds: vec![("br1337", bridge_vlan(1337))],
-        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1337, MAC, "eth4")])))),
-        vlans: vlans.clone(),
-        masters: vec![("eth4", "switch0")],
-        // No L3 device on the VLAN: never a BVI.
-        l3: vec![],
+    let mut e = engine_without_bvi(&fake, vlans.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    fake.drain_events();
+    assert_eq!(attached_paths_v4(&fake), vec![SUBIF_BASE]);
+    let none = Mirror { routes: vec![] };
+
+    set_untagged(&vlans, true);
+    e.refresh_placement(&none).expect("refresh");
+    assert_eq!(
+        route_ops(&fake.drain_events()),
+        vec![(true, false, vec![ASSIGNED_INDEX])]
+    );
+    assert_eq!(attached_paths_v4(&fake), vec![ASSIGNED_INDEX]);
+
+    set_untagged(&vlans, false);
+    e.refresh_placement(&none).expect("refresh");
+    assert_eq!(
+        route_ops(&fake.drain_events()),
+        vec![(true, false, vec![SUBIF_BASE])]
+    );
+    assert_eq!(attached_paths_v4(&fake), vec![SUBIF_BASE]);
+}
+
+/// A move VPP refuses leaves the route where it was, unconfirmed: the
+/// refresh reports the refusal, and the next one sends the move again.
+#[test]
+fn a_refused_attached_route_move_is_retried() {
+    let fake = Fake::start_behaving(
+        "attached-move-refused",
+        Behaviour {
+            track_routes: true,
+            // Op 0 is attach's install; op 1 the move.
+            reject_route_add_at: Some(1),
+            ..Default::default()
+        },
+    );
+    let vlans: std::sync::Arc<std::sync::Mutex<PortVlans>> = Default::default();
+    let mut e = engine_without_bvi(&fake, vlans.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    fake.drain_events();
+
+    set_untagged(&vlans, true);
+    let none = Mirror { routes: vec![] };
+    assert!(
+        e.refresh_placement(&none).is_err(),
+        "the refusal is reported"
+    );
+    assert_eq!(attached_paths_v4(&fake), vec![SUBIF_BASE], "VPP refused it");
+    fake.drain_events();
+
+    e.refresh_placement(&none).expect("retry");
+    assert_eq!(
+        route_ops(&fake.drain_events()),
+        vec![(true, false, vec![ASSIGNED_INDEX])]
+    );
+    assert_eq!(attached_paths_v4(&fake), vec![ASSIGNED_INDEX]);
+    e.refresh_placement(&none).expect("settled");
+    assert!(routes_of(&fake.drain_events()).is_empty());
+}
+
+/// A move whose reply is lost may have been applied, so the route is
+/// unconfirmed — and stays owed even when its VLAN flips back before the
+/// retry, which puts its target back on the interface it was last
+/// CONFIRMED on. Trusting that record would leave VPP holding the route on
+/// the interface the lost move reached, with nothing ever correcting it.
+#[test]
+fn an_attached_route_move_with_a_lost_reply_is_resent_even_when_the_target_flips_back() {
+    let fake = Fake::start_behaving(
+        "attached-move-lost",
+        Behaviour {
+            track_routes: true,
+            // Attach's install is answered; the move is applied and the
+            // connection dropped before the reply. Counted per connection,
+            // so the reconnect's sends are answered.
+            hangup_after: Some(1),
+            ..Default::default()
+        },
+    );
+    let vlans: std::sync::Arc<std::sync::Mutex<PortVlans>> = Default::default();
+    let mut e = engine_without_bvi(&fake, vlans.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    fake.drain_events();
+
+    set_untagged(&vlans, true);
+    let none = Mirror { routes: vec![] };
+    assert!(e.refresh_placement(&none).is_err(), "the reply never came");
+    assert_eq!(
+        attached_paths_v4(&fake),
+        vec![ASSIGNED_INDEX],
+        "VPP applied the move"
+    );
+    fake.drain_events();
+
+    // Tagged again before the retry: the target is the subif, where the
+    // route was last confirmed.
+    set_untagged(&vlans, false);
+    assert!(e.api_ready(), "reconnects");
+    e.refresh_placement(&none).expect("retry");
+    assert_eq!(
+        route_ops(&fake.drain_events()),
+        vec![(true, false, vec![SUBIF_BASE])]
+    );
+    assert_eq!(attached_paths_v4(&fake), vec![SUBIF_BASE]);
+    e.refresh_placement(&none).expect("settled");
+    assert!(routes_of(&fake.drain_events()).is_empty());
+}
+
+/// Two VLAN-aware bridges reusing a vid: only the first gets a BVI
+/// (`ensure_bridges`), and a local route on the SECOND bridge's port must
+/// not borrow it — that would deliver its prefix into the other bridge's
+/// L2 domain. It stays on its own port's subif, at attach and on every
+/// refresh, while the first bridge's local route uses the BVI.
+#[test]
+fn a_local_route_never_borrows_another_bridges_bvi() {
+    let fake = Fake::start_behaving(
+        "attached-shared-vid",
+        Behaviour {
+            track_routes: true,
+            // Sequential indices, so the second port is a port of its own.
+            dark_extra_ports: true,
+            ..Default::default()
+        },
+    );
+    let port = |name: &str, n: u8| PortAttach {
+        port: name.into(),
+        pci_addr: format!("0002:07:00.{n}"),
+        port_id: n.into(),
+        num_rx_queues: 1,
+        pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, n],
+        accept_macs: vec![],
+        mtu: None,
+        vlans: vec![100],
+    };
+    let route = |a: u8, b: u8, c: u8, name: &str| LocalRoute {
+        prefix: LocalRoutePrefix::V4(packetframe_common::config::Ipv4Prefix {
+            addr: Ipv4Addr::new(a, b, c, 0),
+            prefix_len: 24,
+        }),
+        port: name.into(),
+        vlan: 100,
+        kernel_dev: format!("br-{name}"),
+    };
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![port("eth4", 1), port("eth5", 2)],
+        vec!["eth4".into(), "eth5".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_local_routes(vec![route(192, 0, 2, "eth4"), route(203, 0, 113, "eth5")])
+    .with_topology(Box::new(Kernel {
+        kinds: vec![],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(FdbSnapshot::default()))),
+        vlans: Default::default(),
+        masters: vec![("eth4", "switch0"), ("eth5", "switch1")],
+        l3: vec![("switch0", 100, BRIDGE_MAC), ("switch1", 100, BRIDGE_MAC)],
     }));
     assert!(e.api_ready());
     e.attach_devices(AttachMode::Fresh).expect("attach");
     fake.drain_events();
-    let held = |fake: &Fake| -> Vec<u32> {
-        fake.routes.lock().unwrap()[&([203, 0, 113, 0], 24)]
+    let held = |fake: &Fake, a: [u8; 4]| -> Vec<u32> {
+        fake.routes.lock().unwrap()[&(a, 24)]
             .iter()
             .map(|p| p.sw_if_index)
             .collect()
     };
-    assert_eq!(held(&fake), vec![SUBIF_BASE]);
-    let none = Mirror { routes: vec![] };
-
-    *vlans.lock().unwrap() = PortVlans::from_entries([("eth4".to_string(), 1337, true)]);
-    e.refresh_placement(&none).expect("refresh");
-    let ops: Vec<(bool, bool, Vec<u32>)> = routes_of(&fake.drain_events())
-        .into_iter()
-        .map(|r| (r.is_add, r.is_multipath, r.path_indices))
-        .collect();
-    assert_eq!(
-        ops,
-        vec![
-            (true, true, vec![ASSIGNED_INDEX]),
-            (false, true, vec![SUBIF_BASE])
-        ]
+    assert_eq!(held(&fake, [192, 0, 2, 0]), vec![BVI_BASE], "switch0's BVI");
+    let eth5_subif = held(&fake, [203, 0, 113, 0]);
+    assert_eq!(eth5_subif.len(), 1);
+    assert!(
+        (SUBIF_BASE..BVI_BASE).contains(&eth5_subif[0]),
+        "switch1's route on eth5's subif, not switch0's BVI: {eth5_subif:?}"
     );
-    assert_eq!(held(&fake), vec![ASSIGNED_INDEX]);
 
-    *vlans.lock().unwrap() = PortVlans::from_entries([("eth4".to_string(), 1337, false)]);
-    e.refresh_placement(&none).expect("refresh");
-    let ops: Vec<(bool, bool, Vec<u32>)> = routes_of(&fake.drain_events())
-        .into_iter()
-        .map(|r| (r.is_add, r.is_multipath, r.path_indices))
-        .collect();
-    assert_eq!(
-        ops,
-        vec![
-            (true, true, vec![SUBIF_BASE]),
-            (false, true, vec![ASSIGNED_INDEX])
-        ]
-    );
-    assert_eq!(held(&fake), vec![SUBIF_BASE]);
+    e.refresh_placement(&Mirror { routes: vec![] })
+        .expect("refresh");
+    assert!(routes_of(&fake.drain_events()).is_empty());
+    assert_eq!(held(&fake, [203, 0, 113, 0]), eth5_subif);
 }
 
 /// The null-drop sample end to end: `cli_inband` over the real socket,
