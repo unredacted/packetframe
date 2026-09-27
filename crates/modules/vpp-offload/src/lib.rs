@@ -116,6 +116,13 @@ pub struct VppOffloadConfig {
     /// check and forwards nothing, which is the failure this whole
     /// module is built to make impossible.
     pub loopback_address: Option<packetframe_common::config::Ipv4Prefix>,
+    /// `loopback-address6`: the global IPv6 address the same loopback
+    /// holds as a /128 under `v6 on` — the source of every ICMPv6 error
+    /// VPP originates, through the owned interfaces' unnumbered borrow
+    /// ([`attach::ensure_loopback_address6`] has the VPP evidence).
+    /// `None` leaves VPP with no global v6 source, so those errors are
+    /// dropped inside VPP. Restart-only, like `loopback_address`.
+    pub loopback_address6: Option<std::net::Ipv6Addr>,
     /// Destinations that stay on the kernel path while steering is on
     /// (`steer-exempt`, repeatable) — installed as higher-priority
     /// MCAM rules toward the PF. Broadcast and multicast are built in;
@@ -289,6 +296,7 @@ impl VppOffloadConfig {
                 ModuleDirective::VppRequireTableComplete(v) => out.require_table_complete = *v,
                 ModuleDirective::VppV6(v) => out.v6 = *v,
                 ModuleDirective::VppLoopbackAddress(p) => out.loopback_address = Some(*p),
+                ModuleDirective::VppLoopbackAddress6(a) => out.loopback_address6 = Some(*a),
                 ModuleDirective::VppSteerExempt(p) => out.steer_exempts.push(*p),
                 ModuleDirective::VppSteerDirection(d) => out.steer_direction = *d,
                 ModuleDirective::VppLocalRoute {
@@ -428,6 +436,14 @@ impl VppOffloadConfig {
                 self.loopback_address, new.loopback_address
             ));
         }
+        if self.loopback_address6 != new.loopback_address6 {
+            return Err(format!(
+                "`loopback-address6` changed ({:?} → {:?}); the /128 is added to the \
+                 loopback and read back at attach, and nothing re-programs it while VPP runs \
+                 — restart to apply",
+                self.loopback_address6, new.loopback_address6
+            ));
+        }
         if self.vpp_binary != new.vpp_binary {
             return Err(format!(
                 "`vpp-binary` changed ({:?} → {:?}); the running VPP is the one that was \
@@ -520,6 +536,18 @@ impl VppOffloadConfig {
         .chain(
             (!self.local_routes6.is_empty())
                 .then(|| ("local-route6", format!("{:?}", self.local_routes6))),
+        )
+        // `loopback-address6`, recorded only when set, for the same
+        // reason: every record written before it existed matches a config
+        // without it. Recorded at all so a change is refused here, naming
+        // the field, before anything is adopted: past this point the
+        // loopback readback would find the OLD /128 and refuse the attach
+        // over a foreign address — the right verdict, reached after the
+        // VPP was already taken over, with a message about the loopback
+        // rather than about the edit.
+        .chain(
+            self.loopback_address6
+                .map(|a| ("loopback-address6", a.to_string())),
         )
         .map(|(k, v)| (k.to_string(), v))
         .collect()
@@ -2458,6 +2486,7 @@ mod tests {
             steer_keeps6: vec![],
             v6: false,
             steer_direction: Default::default(),
+            loopback_address6: None,
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
                 prefix_len: 32,
@@ -3045,6 +3074,9 @@ mod tests {
         let mut c = base.clone();
         c.local_routes6.push((doc_v6_64(), "eth4".into(), 1337));
         changes.push(c);
+        let mut c = base.clone();
+        c.loopback_address6 = Some("2001:db8::1".parse().unwrap());
+        changes.push(c);
         for c in &changes {
             assert!(
                 base.restart_only_delta(c).is_err(),
@@ -3188,6 +3220,46 @@ mod tests {
             addr: [0x20, 0x01, 0x0d, 0xb8],
             prefix_len: 32
         }));
+    }
+
+    /// `loopback-address6` on both doors: the reload refuses any change
+    /// to it by name (set, cleared, moved), and the adoption record
+    /// carries it only when set — so a record written before the
+    /// directive existed still adopts under a config without it.
+    #[test]
+    fn loopback_address6_is_restart_only_and_unset_records_nothing_new() {
+        let mut unset = cfg(&[("eth4", 1, false)], 1_600_000);
+        unset.v6 = true;
+        let a: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let b: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let mut set_a = unset.clone();
+        set_a.loopback_address6 = Some(a);
+        let mut set_b = unset.clone();
+        set_b.loopback_address6 = Some(b);
+        for (from, to) in [(&unset, &set_a), (&set_a, &unset), (&set_a, &set_b)] {
+            let e = from
+                .restart_only_delta(to)
+                .expect_err("a loopback-address6 change must refuse");
+            assert!(
+                e.contains("`loopback-address6` changed") && e.contains("restart"),
+                "{e}"
+            );
+        }
+        assert!(set_a.restart_only_delta(&set_a.clone()).is_ok());
+        assert!(!unset.restart_only().contains_key("loopback-address6"));
+        assert_eq!(
+            set_a
+                .restart_only()
+                .get("loopback-address6")
+                .map(String::as_str),
+            Some("2001:db8::1")
+        );
+        let parsed = VppOffloadConfig::from_directives(&[ModuleDirective::VppLoopbackAddress6(a)]);
+        assert_eq!(parsed.loopback_address6, Some(a));
+        assert_eq!(
+            VppOffloadConfig::from_directives(&[]).loopback_address6,
+            None
+        );
     }
 
     /// A reordered port list is a change, not a permutation.

@@ -580,6 +580,15 @@ pub struct ConvergenceEngine {
     /// pass — and reset with the transport, because an index from a VPP
     /// that has since died names nothing.
     loop_index: Option<u32>,
+    /// `loopback-address6`: the /128 the loopback must hold, sourcing
+    /// VPP's ICMPv6 errors. `None` when unset, which leaves VPP with no
+    /// global v6 source.
+    loopback6: Option<std::net::Ipv6Addr>,
+    /// The address `ensure_loopback_address6` last READ BACK on this
+    /// VPP's loopback — the observation behind the status row, never the
+    /// configured value. Cleared at the start of every attach pass and
+    /// with the process, whose loopback it describes.
+    icmp6_source: Option<std::net::Ipv6Addr>,
     /// `(port, sw_if_index)` recorded from a previous run, for adoption.
     recorded_indices: Vec<(String, u32)>,
     attached: Vec<AttachedPort>,
@@ -773,6 +782,8 @@ impl ConvergenceEngine {
             steer_exempts: Vec::new(),
             loopback,
             loop_index: None,
+            loopback6: None,
+            icmp6_source: None,
             recorded_indices: Vec::new(),
             attached: Vec::new(),
             port_index: PortIndex::default(),
@@ -839,6 +850,14 @@ impl ConvergenceEngine {
     /// Declare the `vlans all` ports ([`crate::VppOffloadConfig::trunk_ports`]).
     pub fn with_trunk_ports(mut self, ports: Vec<String>) -> Self {
         self.trunk_ports = ports;
+        self
+    }
+
+    /// Declare `loopback-address6`
+    /// ([`crate::VppOffloadConfig::loopback_address6`]): every attach pass
+    /// puts it on the loopback and reads it back.
+    pub fn with_loopback6(mut self, addr: Option<std::net::Ipv6Addr>) -> Self {
+        self.loopback6 = addr;
         self
     }
 
@@ -2063,12 +2082,12 @@ impl ConvergenceEngine {
             // assigning the same address fails ADDRESS_IN_USE, and the
             // attach step never completes.
             //
-            // Adoption re-asserts admin-up and trusts the address. The
-            // address CANNOT be probed: re-adding it answers -105
-            // through the members' unnumbered borrow on every healthy
-            // adoption (hardware, 2026-08-08), and no whitelisted
-            // message dumps addresses. See `adopt_loopback` for the
-            // full argument and the accepted crash window.
+            // Adoption re-asserts admin-up and trusts the v4 address.
+            // Re-adding it cannot probe it: that answers -105 on every
+            // healthy adoption (hardware, 2026-08-08). See
+            // `adopt_loopback` for the full argument and the accepted
+            // crash window. The v6 address (`loopback-address6`) is not
+            // trusted: it is read back below, on every path.
             None => match crate::attach::find_loopback(t) {
                 Ok(Some(idx)) => {
                     tracing::info!(
@@ -2081,6 +2100,25 @@ impl ConvergenceEngine {
                 Err(e) => Err(e.into()),
             },
         };
+        // `loopback-address6`, on the loopback just created, adopted or
+        // already known: one routine for all three, because it reads the
+        // loopback back rather than assuming what a path left there — an
+        // adopted VPP whose previous daemon died between creating the
+        // loopback and adding the /128 is repaired here, not trusted.
+        // Before the ports: an owned interface sources its ICMPv6 errors
+        // from whatever the loopback holds from the moment it is
+        // unnumbered to it.
+        // `icmp6_source` is written only once the readback has seen the
+        // address, and cleared first so a failed pass cannot leave an
+        // earlier one standing.
+        self.icmp6_source = None;
+        let loop_index = loop_index.and_then(|idx| {
+            if let Some(addr) = self.loopback6 {
+                crate::attach::ensure_loopback_address6(t, idx, addr)?;
+                self.icmp6_source = Some(addr);
+            }
+            Ok(idx)
+        });
         let result = match loop_index {
             Ok(idx) => {
                 self.loop_index = Some(idx);
@@ -2179,6 +2217,14 @@ impl ConvergenceEngine {
     /// `V4Only`.
     pub fn ip6_interfaces(&self) -> Vec<u32> {
         self.ip6_ready.iter().copied().collect()
+    }
+
+    /// The global address VPP sources its ICMPv6 errors from, as read
+    /// back on this VPP's loopback — `None` without `loopback-address6`,
+    /// before the first attach pass completes it, and after the process
+    /// is gone.
+    pub fn icmp6_source(&self) -> Option<std::net::Ipv6Addr> {
+        self.icmp6_source
     }
 
     /// Install one attached route per `local-route` and `local-route6`,
@@ -3373,6 +3419,8 @@ impl ConvergenceEngine {
         // attach unnumber every member to an interface that no longer
         // exists — which VPP would refuse, or worse accept.
         self.loop_index = None;
+        // And the address read back on it.
+        self.icmp6_source = None;
         // The neighbour ledger describes the dead instance's table.
         self.neighbours_installed.clear();
         self.moved_from.clear();
