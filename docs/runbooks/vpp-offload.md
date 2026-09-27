@@ -213,6 +213,7 @@ current value without a mapping table:
 | `packetframe_vpp_source_backlog` | sustained non-zero — deltas are not draining |
 | `packetframe_vpp_drain_failing` | `1` — the steady-state delta apply is retrying |
 | `packetframe_vpp_exempt_drift` | `> 0` — a kernel path VPP cannot take has no `steer-exempt`; steered traffic for it is (or will be) blackholed. ALSO alarm on `absent()` while attached: the gauge is omitted, never zeroed, when the scan cannot read the kernel |
+| `packetframe_vpp_exempt_drift_v6` | `> 0` — an IPv6 kernel path VPP cannot take while a port carries `v6-outbound`; diverted v6 for it is (or will be) blackholed. Present ONLY while some port carries `v6-outbound` under `v6 on`, so alarm on `absent()` only on boxes configured that way: it is omitted, never zeroed, when the v6 scan cannot read |
 | `packetframe_vpp_neighbours_unplaced` | `> 0` — a bridge neighbour the kernel FDB has not placed behind any member port; routes through it are unresolvable |
 | `packetframe_vpp_neighbour_moves` | a step — spanning tree moved neighbours between trunks and VPP followed; worth correlating with switch events |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
@@ -1194,7 +1195,9 @@ announces a remote host route and the hole re-opens with nobody
 touching packetframe. So it is watched on a clock rather than
 validated once: every 60 s the module dumps the kernel's IPv4 routes
 across all tables and reports any path VPP cannot take that no
-`steer-exempt` covers.
+`steer-exempt` covers — and, while a port diverts IPv6, the kernel's
+IPv6 routes too ([IPv6 findings](#ipv6-findings-exempt-drift-v6)
+below).
 
 ```
 exempt-drift: degraded — kernel path(s) VPP cannot take, with no
@@ -1319,6 +1322,91 @@ NIC diverts.
 It is detection only. Deriving the exemptions automatically was
 considered and rejected for v1: it would change forwarding without an
 operator asking and could exhaust the MCAM budget silently.
+
+#### IPv6 findings (`exempt-drift-v6`)
+
+A `v6-outbound` diversion matches by FRAME (TCP/UDP over IPv6 to the
+router's MAC on a listed VLAN), never by address, so once one exists
+any IPv6 destination can reach VPP. A kernel-only IPv6 route VPP lacks
+— an overlay's ULA via its tunnel device, a static route out an
+interface VPP does not own, a route added by hand — is then silently
+black-holed there. So the scan also dumps the kernel's IPv6 routes, on
+the same thread and cadence, but **only while VPP carries IPv6 (`v6
+on`) AND some port line carries `v6-outbound`** — from config, not the
+lever, so a `v6-outbound` staged behind `steer off` is already scanned
+(the same reason the v4 scan runs before the canary). Drop
+`v6-outbound` from every port and the half, its row and its gauge go
+away.
+
+```
+exempt-drift-v6: degraded — IPv6 kernel path(s) VPP cannot take, while
+  a port diverts IPv6 (`v6-outbound`): 2001:db8:100::/48 via tun0
+  (table 52) — diverted IPv6 for these dies in VPP, or leaves by a less
+  specific route VPP holds, instead of taking the kernel path. …
+```
+
+It is the same judgement as v4 — a route is covered when some next hop
+leaves by a member port, or via a gateway on a bridge VLAN a member
+carries — with these differences:
+
+- **Nothing exempts.** The NIC cannot match a v6 address, so there is
+  no IPv6 `steer-exempt` and every finding stands until its cause
+  goes. That is why it has its own row: its remedies are not
+  `exempt-drift`'s.
+- **A link-local kernel next hop is judged by VPP's table, not the
+  kernel's.** Under FRR, a peer that sends both a global and a
+  link-local next hop gets its kernel route installed via the `fe80::`
+  one ("(used)" in `show bgp`), while the feed also carries the global
+  one and VPP installs the prefix through it — VPP refuses only routes
+  whose EVERY feed next hop is link-local (`fib-v6` counts those). So a
+  kernel route whose owned-device hops are all link-local is covered
+  when VPP holds the prefix (installed or in flight), and reported only
+  when VPP does not: refused as link-local-only, or never in the feed
+  (an RA-learned default via `fe80::1` on a member). Those are **one
+  summary line**, counting every such route and naming the first
+  three. The check runs when each scan lands, so in the first scan
+  after an attach — before the v6 table has loaded — they are reported
+  until the next one. A route with any global next hop on an owned
+  device is covered by its device. An ECMP route mixing a link-local
+  member hop with a hop out a device VPP does not own is, when VPP
+  lacks the prefix, an ordinary finding naming that device.
+- **`local-route` bridges are no v6 reach.** `local-route` delivers an
+  IPv4 subnet; VPP has no route onto that bridge for its v6 subnet, so
+  a connected v6 route there is a finding.
+- **Not paths, never findings:** link-local destinations (routers
+  never forward `fe80::/10`), multicast destinations (a `33:33` frame
+  no diversion's unicast MAC matches), and the router's own addresses
+  (local and anycast). The v4 scan reports router addresses on the
+  steered segments because a `steer-exempt` fixes them; v6 has no
+  address rule, and what reaches the router over a diverted VLAN stays
+  on the kernel by port (the built-in DNS keeps and `steer-keep6`), a
+  match this scan cannot relate to a route.
+- **Tables** are filtered by the v6 policy rules (`ip -6 rule`), a set
+  separate from the v4 rules; nexthop-object routes and routes the
+  kernel drops are handled as for v4.
+
+The remedy depends on which kind of route it is:
+
+- **A route VPP should carry** (it leaves by a device VPP owns or
+  should own): fix the feed so VPP learns it with a usable next hop, or
+  declare the VLAN on the port (`port … vlans`) so VPP reaches the
+  device.
+- **A kernel-only route** (a tunnel, an overlay, anything VPP will
+  never own): either accept the black-hole risk knowingly (the row
+  stays Degraded while it stands); or keep that traffic on the kernel
+  by port with `steer-keep6`, when it is identifiable by port; or drop
+  `v6-outbound` from the ports whose hosts reach that destination.
+
+`packetframe_vpp_exempt_drift_v6` carries the route count, as its own
+series: `packetframe_vpp_exempt_drift` keeps its single, unlabelled
+series and counts IPv4 alone, so every query written against it reads
+exactly as before. The v6 gauge follows the same absent-not-zero rule —
+omitted while the v6 dump cannot read, while the tripwire is pending or
+cannot tell which config the NIC holds (the `exempt-drift` row speaks
+for both halves then), and whenever no port carries `v6-outbound`. A v6
+dump that fails does not discard the v4 verdict, and the other way
+round: a failed v4 dump leaves the v6 half blind too, since it runs
+second.
 
 ### The null-drop gauge
 
@@ -1503,9 +1591,13 @@ The steering audit reads every v6 rule back like a v4 one: a keep or
 diversion removed or altered out of band shows as `steering DEGRADED`,
 and the readback compares every field that decides the match (the flow
 type — TCP or UDP — MAC, VLAN id and mask, L4 port, the `FLOW_EXT` /
-`FLOW_MAC_EXT` bits). The **exemption tripwire (`exempt-drift`) is
-v4-only** and stays that way: a v6 diversion's correctness rests on VPP's
-v6 FIB, and the keeps are what protect the router's own services.
+`FLOW_MAC_EXT` bits). The **exemption tripwire scans IPv6 too** while
+any port carries `v6-outbound`: a kernel v6 route VPP cannot take is an
+`exempt-drift-v6` finding, counted on `packetframe_vpp_exempt_drift_v6`
+(see [IPv6 findings](#ipv6-findings-exempt-drift-v6) for what it
+reports and the remedies — there is no v6 exemption). The keeps are
+what protect the router's own services; the tripwire does not judge
+them.
 
 ### Rollback
 
