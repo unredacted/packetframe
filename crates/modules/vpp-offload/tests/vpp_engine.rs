@@ -2105,6 +2105,254 @@ fn a_local_route6_survives_adoption_without_entering_the_ledger() {
         .contains_key(&(addr16_of(cust6(0, 64)), 64)));
 }
 
+// --- attached routes follow their VLAN's interface -----------------------
+
+/// [`Kernel`], with the router's L3 device on the bridged VLAN switched on
+/// and off under the engine — the BVI `ensure_bridges` skips at attach and
+/// builds once the device exists.
+struct LateL3 {
+    kernel: Kernel,
+    up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Topology for LateL3 {
+    fn classify(&self, dev: &str) -> Result<Option<DevKind>, String> {
+        self.kernel.classify(dev)
+    }
+    fn fdb(&self) -> Result<FdbSnapshot, String> {
+        self.kernel.fdb()
+    }
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        self.kernel.port_vlans()
+    }
+    fn master_of(&self, port: &str) -> Option<String> {
+        self.kernel.master_of(port)
+    }
+    fn bridge_l3(&self, bridge: &str, vid: u16) -> Option<BridgeL3> {
+        if self.up.load(std::sync::atomic::Ordering::SeqCst) {
+            self.kernel.bridge_l3(bridge, vid)
+        } else {
+            None
+        }
+    }
+}
+
+/// [`engine_with_local_route6`]'s engine — a v4 and a v6 local route on
+/// bridged VLAN 1337 — over a kernel whose L3 device on it comes and goes
+/// with `up`.
+fn engine_with_late_bvi(
+    fake: &Fake,
+    up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> ConvergenceEngine {
+    engine_with_local_route6(fake).with_topology(Box::new(LateL3 {
+        kernel: Kernel {
+            kinds: vec![("br1337", bridge_vlan(1337))],
+            fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1337, MAC, "eth4")])))),
+            vlans: Default::default(),
+            masters: vec![("eth4", "switch0")],
+            l3: vec![("switch0", 1337, BRIDGE_MAC)],
+        },
+        up,
+    }))
+}
+
+/// The paths VPP holds for the v4 and v6 attached routes, by interface.
+fn attached_paths(fake: &Fake) -> (Vec<u32>, Vec<u32>) {
+    let v4 = fake.routes.lock().unwrap()[&([203, 0, 113, 0], 24)]
+        .iter()
+        .map(|p| p.sw_if_index)
+        .collect();
+    let v6 = fake.routes6.lock().unwrap()[&(addr16_of(cust6(0, 64)), 64)]
+        .iter()
+        .map(|p| p.sw_if_index)
+        .collect();
+    (v4, v6)
+}
+
+/// A bridged VLAN whose BVI could not be built at attach puts its attached
+/// routes on the member subif; when the BVI appears at runtime both
+/// families move onto it — the new path added before the old one is
+/// removed, so the prefix is never without one — and a refresh with
+/// nothing changed sends nothing.
+#[test]
+fn attached_routes_move_onto_a_bvi_built_after_attach() {
+    let fake = Fake::start_behaving(
+        "attached-late-bvi",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut e = engine_with_late_bvi(&fake, up.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let at_attach = routes_of(&fake.drain_events());
+    assert_eq!(at_attach.len(), 2, "{at_attach:?}");
+    assert!(at_attach
+        .iter()
+        .all(|r| r.is_add && !r.is_multipath && r.path_indices == vec![SUBIF_BASE]));
+    assert_eq!(
+        attached_paths(&fake),
+        (vec![SUBIF_BASE], vec![SUBIF_BASE]),
+        "no BVI yet: the subif"
+    );
+
+    // The router's L3 device on the VLAN appears; the next placement
+    // refresh builds the domain and BVI, and the routes follow.
+    up.store(true, std::sync::atomic::Ordering::SeqCst);
+    let none = Mirror { routes: vec![] };
+    e.refresh_placement(&none).expect("refresh");
+    let events = fake.drain_events();
+    assert!(
+        msgs_of(&events).contains(&format!("bvi loop1337 mac=02:00:00:00:b0:01 if={BVI_BASE}")),
+        "{events:?}"
+    );
+    let moves = routes_of(&events);
+    for is_ip6 in [false, true] {
+        let ops: Vec<(bool, bool, Vec<u32>)> = moves
+            .iter()
+            .filter(|r| r.is_ip6 == is_ip6)
+            .map(|r| (r.is_add, r.is_multipath, r.path_indices.clone()))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                (true, true, vec![BVI_BASE]),
+                (false, true, vec![SUBIF_BASE])
+            ],
+            "v6={is_ip6}: add on the BVI, THEN remove from the subif"
+        );
+    }
+    assert_eq!(
+        attached_paths(&fake),
+        (vec![BVI_BASE], vec![BVI_BASE]),
+        "one path each, on the BVI"
+    );
+    // The v6 path lands on an interface ip6 is already enabled on.
+    let enable_bvi = events
+        .iter()
+        .position(
+            |ev| matches!(ev, Event::Msg(m) if *m == format!("ip6 enable if={BVI_BASE} enable=true")),
+        )
+        .expect("ip6 enabled on the new BVI");
+    let v6_add = events
+        .iter()
+        .position(|ev| matches!(ev, Event::Route(r) if r.is_ip6 && r.is_add))
+        .unwrap();
+    assert!(enable_bvi < v6_add, "{events:?}");
+
+    // Already where they belong: no churn.
+    e.refresh_placement(&none).expect("refresh");
+    e.refresh_placement(&none).expect("refresh");
+    assert!(routes_of(&fake.drain_events()).is_empty());
+}
+
+/// A daemon adopting a VPP whose attached routes a previous run left on
+/// the subif (its BVI could not be built then) puts them on the BVI this
+/// attach builds — one replace per family, so no stale subif path survives
+/// beside it — and has nothing left to move afterwards.
+#[test]
+fn adoption_corrects_attached_routes_left_on_the_wrong_interface() {
+    let fake = Fake::start_behaving(
+        "attached-adopt-rehome",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut first = engine_with_late_bvi(&fake, up.clone());
+    assert!(first.api_ready());
+    first.attach_devices(AttachMode::Fresh).expect("attach");
+    assert_eq!(attached_paths(&fake), (vec![SUBIF_BASE], vec![SUBIF_BASE]));
+    let indices = first.attached_indices();
+    drop(first);
+    fake.drain_events();
+
+    up.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut second = engine_with_late_bvi(&fake, up).with_recorded_indices(indices);
+    assert!(second.api_ready());
+    second
+        .attach_devices(AttachMode::Adopted)
+        .expect("re-attach over the live VPP");
+    let sent = routes_of(&fake.drain_events());
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent
+        .iter()
+        .all(|r| r.is_add && !r.is_multipath && r.path_indices == vec![BVI_BASE]));
+    assert_eq!(attached_paths(&fake), (vec![BVI_BASE], vec![BVI_BASE]));
+
+    second
+        .refresh_placement(&Mirror { routes: vec![] })
+        .expect("refresh");
+    assert!(routes_of(&fake.drain_events()).is_empty());
+}
+
+/// The same rule in both directions on a VLAN with no BVI: the port starts
+/// sending it untagged and the attached route moves from the subif to the
+/// VF, then back when it is tagged again — make-before-break each way.
+#[test]
+fn an_attached_route_follows_its_vlan_between_subif_and_vf() {
+    let fake = Fake::start_behaving(
+        "attached-vf-subif",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let vlans: std::sync::Arc<std::sync::Mutex<PortVlans>> = Default::default();
+    let mut e = engine_with_local_route(&fake).with_topology(Box::new(Kernel {
+        kinds: vec![("br1337", bridge_vlan(1337))],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1337, MAC, "eth4")])))),
+        vlans: vlans.clone(),
+        masters: vec![("eth4", "switch0")],
+        // No L3 device on the VLAN: never a BVI.
+        l3: vec![],
+    }));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    fake.drain_events();
+    let held = |fake: &Fake| -> Vec<u32> {
+        fake.routes.lock().unwrap()[&([203, 0, 113, 0], 24)]
+            .iter()
+            .map(|p| p.sw_if_index)
+            .collect()
+    };
+    assert_eq!(held(&fake), vec![SUBIF_BASE]);
+    let none = Mirror { routes: vec![] };
+
+    *vlans.lock().unwrap() = PortVlans::from_entries([("eth4".to_string(), 1337, true)]);
+    e.refresh_placement(&none).expect("refresh");
+    let ops: Vec<(bool, bool, Vec<u32>)> = routes_of(&fake.drain_events())
+        .into_iter()
+        .map(|r| (r.is_add, r.is_multipath, r.path_indices))
+        .collect();
+    assert_eq!(
+        ops,
+        vec![
+            (true, true, vec![ASSIGNED_INDEX]),
+            (false, true, vec![SUBIF_BASE])
+        ]
+    );
+    assert_eq!(held(&fake), vec![ASSIGNED_INDEX]);
+
+    *vlans.lock().unwrap() = PortVlans::from_entries([("eth4".to_string(), 1337, false)]);
+    e.refresh_placement(&none).expect("refresh");
+    let ops: Vec<(bool, bool, Vec<u32>)> = routes_of(&fake.drain_events())
+        .into_iter()
+        .map(|r| (r.is_add, r.is_multipath, r.path_indices))
+        .collect();
+    assert_eq!(
+        ops,
+        vec![
+            (true, true, vec![SUBIF_BASE]),
+            (false, true, vec![ASSIGNED_INDEX])
+        ]
+    );
+    assert_eq!(held(&fake), vec![SUBIF_BASE]);
+}
+
 /// The null-drop sample end to end: `cli_inband` over the real socket,
 /// VPP's text parsed, the total cached — and absent again once the
 /// process the counters lived in is gone.

@@ -546,6 +546,12 @@ pub struct ConvergenceEngine {
     /// against fast-path's `local-prefix` (`local-prefix6` for a
     /// `local-route6`) for the kernel device. Both families.
     local_routes: Vec<crate::LocalRoute>,
+    /// Where each local route's attached route sits in THIS VPP — the
+    /// interface VPP acknowledged it on, keyed by the prefix as sent.
+    /// Written only on acknowledgement, and cleared with the process.
+    /// What [`Self::rehome_attached_routes`] compares against the
+    /// interface the route belongs on now.
+    attached_at: std::collections::HashMap<IpPrefix, u32>,
     /// Mirror prefixes currently suppressed by a `local-route` — kept
     /// as a set so health can report a count that means "routes the
     /// mirror carries that VPP deliberately does not", not a
@@ -778,6 +784,7 @@ impl ConvergenceEngine {
             transport: None,
             ports,
             local_routes: Vec::new(),
+            attached_at: std::collections::HashMap::new(),
             shadowed: HashSet::new(),
             self_addrs: HashSet::new(),
             self_nets: Vec::new(),
@@ -1012,7 +1019,11 @@ impl ConvergenceEngine {
         self.ensure_bridges()?;
         // And a new subif or BVI gets ip6 before any v6 neighbour or route
         // is placed on it — also nothing sent when nothing is new.
-        self.ensure_ip6()
+        self.ensure_ip6()?;
+        // A BVI built just now, or a VLAN that turned untagged or tagged,
+        // changes where a local route's attached route belongs. After
+        // ip6, which a v6 attached route's new interface needs first.
+        self.rehome_attached_routes()
     }
 
     /// Take the members' untagged VLANs from the kernel bridge, and hand
@@ -2325,8 +2336,10 @@ impl ConvergenceEngine {
     }
 
     /// Install one attached route per `local-route` and `local-route6`,
-    /// straight onto the subif — deliberately OUTSIDE the pending/ledger
-    /// path.
+    /// straight onto the interface its VLAN is delivered through
+    /// ([`Self::attached_target`]) — deliberately OUTSIDE the
+    /// pending/ledger path. That interface can change while VPP runs;
+    /// [`Self::rehome_attached_routes`] follows it.
     ///
     /// These are module-owned topology, not mirror state: the resync
     /// diff withdraws whatever the ledger holds that the source no
@@ -2366,29 +2379,8 @@ impl ConvergenceEngine {
     /// address therefore solicits up to ~1000 times a second per worker;
     /// the runbook says what that costs and how to see it.
     fn install_attached_routes(&mut self) -> Result<(), EngineError> {
-        if self.local_routes.is_empty() {
-            return Ok(());
-        }
-        let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
-        for lr in &self.local_routes {
-            // A bridged VLAN delivers through its BVI (the bridge's MAC,
-            // hosts behind any member); a trunk's untagged VLAN with no
-            // BVI through the VF, which the bridge sends it bare on; a
-            // plain port's VLAN through the subif.
-            let bvi = crate::sink::NexthopTarget::Bvi { vlan: lr.vlan };
-            let target = if self.port_index.get(&bvi).is_some() {
-                bvi
-            } else if self.nexthops.is_untagged(&lr.port, lr.vlan) {
-                crate::sink::NexthopTarget::Vf {
-                    port: lr.port.clone(),
-                }
-            } else {
-                crate::sink::NexthopTarget::Subif {
-                    port: lr.port.clone(),
-                    vlan: lr.vlan,
-                }
-            };
-            let Some(sw_if_index) = self.port_index.get(&target) else {
+        for lr in self.local_routes.clone() {
+            let Some(sw_if_index) = self.attached_target(&lr) else {
                 // Config guarantees the port declares this vlan (or
                 // carries it, for `vlans all`), and attach just created
                 // every subif — a miss here is an ordering bug, not an
@@ -2399,43 +2391,11 @@ impl ConvergenceEngine {
                     detail: format!("no subif index for {}.{}", lr.port, lr.vlan),
                 });
             };
-            let mut path = FibPath {
-                sw_if_index,
-                table_id: 0,
-                rpf_id: 0,
-                weight: 1,
-                preference: 0,
-                r#type: FIB_API_PATH_TYPE_NORMAL,
-                flags: FIB_API_PATH_FLAG_NONE,
-                proto: if lr.prefix.is_v6() {
-                    FIB_API_PATH_NH_PROTO_IP6
-                } else {
-                    FIB_API_PATH_NH_PROTO_IP4
-                },
-                nh: Default::default(),
-                n_labels: 0,
-                label_stack: Default::default(),
-            };
-            // Zero nexthop = attached: resolve via the interface.
-            path.nh = Default::default();
-            let reply: IpRouteAddDelReply = t.request(IpRouteAddDel {
-                context: 0,
-                is_add: true,
-                is_multipath: false,
-                route: IpRoute {
-                    table_id: 0,
-                    stats_index: 0,
-                    prefix: crate::fib_sync::to_prefix(lr.prefix.network()),
-                    n_paths: 1,
-                    paths: vec![path],
-                },
-            })?;
-            if reply.retval != 0 {
-                return Err(EngineError::AttachedRouteFailed {
-                    prefix: lr.prefix.to_string(),
-                    detail: format!("retval {}", reply.retval),
-                });
-            }
+            // A REPLACE (`is_multipath` false): whatever this prefix held —
+            // an adopted VPP's route on an interface it no longer belongs
+            // on, or both halves of a move a previous daemon died inside —
+            // leaves as the one path lands, in one message.
+            self.send_attached(&lr, sw_if_index, true, false)?;
             tracing::info!(
                 prefix = %lr.prefix,
                 port = %lr.port,
@@ -2443,6 +2403,144 @@ impl ConvergenceEngine {
                 sw_if_index,
                 "attached route installed — VPP delivers this prefix itself"
             );
+        }
+        Ok(())
+    }
+
+    /// The interface `lr`'s attached route belongs on as things stand: a
+    /// bridged VLAN delivers through its BVI (the bridge's MAC, hosts
+    /// behind any member); a trunk's untagged VLAN with no BVI through the
+    /// VF, which the bridge sends it bare on; a plain port's VLAN through
+    /// the subif. `None` when that interface does not exist.
+    fn attached_target(&self, lr: &crate::LocalRoute) -> Option<u32> {
+        let bvi = crate::sink::NexthopTarget::Bvi { vlan: lr.vlan };
+        let target = if self.port_index.get(&bvi).is_some() {
+            bvi
+        } else if self.nexthops.is_untagged(&lr.port, lr.vlan) {
+            crate::sink::NexthopTarget::Vf {
+                port: lr.port.clone(),
+            }
+        } else {
+            crate::sink::NexthopTarget::Subif {
+                port: lr.port.clone(),
+                vlan: lr.vlan,
+            }
+        };
+        self.port_index.get(&target)
+    }
+
+    /// Move every attached route whose interface has changed since it was
+    /// installed onto the one it belongs on now
+    /// ([`Self::attached_target`]).
+    ///
+    /// Attach places each route on the interface that exists at that
+    /// moment, and a bridged VLAN's BVI may not: [`Self::ensure_bridges`]
+    /// skips a VLAN the router has no L3 device on yet, or whose members
+    /// are not enslaved to the bridge yet. Its route then lands on the
+    /// member's subif, and when the domain and BVI appear at runtime the
+    /// connected subnet would stay bound to that one trunk — hosts behind
+    /// every other member, and the glean that finds them, sent the wrong
+    /// way — until a restart. The same holds for a VLAN that turns
+    /// untagged or tagged under a route on the VF or subif.
+    ///
+    /// Make-before-break: the path on the new interface is ADDED to the
+    /// prefix first, then the old one removed, so the prefix is never
+    /// without a path (for the instant between, VPP spreads over both).
+    /// The route is recorded moved only once both are acknowledged: a
+    /// refused removal leaves it recorded where it was, and the next
+    /// refresh repeats the move — adding a path the prefix already has
+    /// changes nothing in VPP. Nothing is sent for a route already where
+    /// it belongs, one attach has not installed on this VPP yet (attach
+    /// owns the first install), or one whose right interface does not
+    /// exist.
+    fn rehome_attached_routes(&mut self) -> Result<(), EngineError> {
+        for lr in self.local_routes.clone() {
+            let prefix = lr.prefix.network();
+            let Some(&from) = self.attached_at.get(&prefix) else {
+                continue;
+            };
+            let Some(to) = self.attached_target(&lr) else {
+                continue;
+            };
+            if from == to {
+                continue;
+            }
+            self.send_attached(&lr, to, true, true)?;
+            self.send_attached(&lr, from, false, true)?;
+            self.attached_at.insert(prefix, to);
+            tracing::info!(
+                prefix = %lr.prefix,
+                port = %lr.port,
+                vlan = lr.vlan,
+                from_sw_if_index = from,
+                to_sw_if_index = to,
+                "attached route moved to the interface its VLAN is delivered through now"
+            );
+        }
+        Ok(())
+    }
+
+    /// Send one attached path for `lr` on `sw_if_index` — the nexthop-less
+    /// NORMAL path VPP resolves via the interface. With `is_multipath` it
+    /// adds or removes just this path; without, an add replaces every path
+    /// the prefix has, and is recorded in `attached_at` once acknowledged.
+    fn send_attached(
+        &mut self,
+        lr: &crate::LocalRoute,
+        sw_if_index: u32,
+        is_add: bool,
+        is_multipath: bool,
+    ) -> Result<(), EngineError> {
+        let path = FibPath {
+            sw_if_index,
+            table_id: 0,
+            rpf_id: 0,
+            weight: 1,
+            preference: 0,
+            r#type: FIB_API_PATH_TYPE_NORMAL,
+            flags: FIB_API_PATH_FLAG_NONE,
+            proto: if lr.prefix.is_v6() {
+                FIB_API_PATH_NH_PROTO_IP6
+            } else {
+                FIB_API_PATH_NH_PROTO_IP4
+            },
+            // Zero nexthop = attached: resolve via the interface.
+            nh: Default::default(),
+            n_labels: 0,
+            label_stack: Default::default(),
+        };
+        let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+        let reply: IpRouteAddDelReply = match t.request(IpRouteAddDel {
+            context: 0,
+            is_add,
+            is_multipath,
+            route: IpRoute {
+                table_id: 0,
+                stats_index: 0,
+                prefix: crate::fib_sync::to_prefix(lr.prefix.network()),
+                n_paths: 1,
+                paths: vec![path],
+            },
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                // The reply may still be on the stream; see `attach_devices`.
+                self.disconnect();
+                return Err(e.into());
+            }
+        };
+        if reply.retval != 0 {
+            return Err(EngineError::AttachedRouteFailed {
+                prefix: lr.prefix.to_string(),
+                detail: format!(
+                    "{} on sw_if_index {sw_if_index}: retval {}",
+                    if is_add { "add" } else { "remove" },
+                    reply.retval
+                ),
+            });
+        }
+        if is_add && !is_multipath {
+            self.attached_at.insert(lr.prefix.network(), sw_if_index);
         }
         Ok(())
     }
@@ -3518,6 +3616,8 @@ impl ConvergenceEngine {
         self.loop_index = None;
         // And the address read back on it.
         self.icmp6_source = None;
+        // The attached routes died with the FIB they sat in.
+        self.attached_at.clear();
         // The neighbour ledger describes the dead instance's table.
         self.neighbours_installed.clear();
         self.moved_from.clear();
