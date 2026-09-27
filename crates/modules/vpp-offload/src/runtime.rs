@@ -439,6 +439,17 @@ pub trait Steering {
     /// for every rule that ever reaches the NIC, so a reconfigure cannot
     /// grow its own, subtly different, installation path.
     fn retarget(&mut self, targets: Vec<(String, u32, crate::steer::RuleSet)>);
+    /// Whether the IPv6 half of the target may be installed: the IPv6
+    /// hand-back path is whole ([`crate::handback`]), so router-owned
+    /// traffic a v6 diversion takes has a way back to the kernel.
+    ///
+    /// Intent only, like [`Self::retarget`]: the next `steer` is what
+    /// makes the NIC agree. A default no-op because only a seam that
+    /// plans IPv6 has anything to withhold — every test double here plans
+    /// none — and [`crate::ntuple::NtupleSteering`], which does, starts
+    /// withheld, so a forgotten call fails closed: v6 is held back,
+    /// never diverted without a way home.
+    fn set_v6_ready(&mut self, _ready: bool) {}
     /// How many ports the CONFIG asks to steer, whether or not any rule
     /// is installed.
     ///
@@ -698,6 +709,10 @@ struct Core {
     /// ([`crate::supervisor::convergence_budget`]). Survives the process:
     /// it describes this host and this table, not one VPP.
     last_dump_took: Option<Duration>,
+    /// The IPv6 hand-back path's readiness as last handed to the steering
+    /// ([`Steering::set_v6_ready`]) — the gate on the v6 half of steering.
+    /// A change is what re-steers ([`Core::service_handback`]).
+    v6_gate: bool,
 }
 
 /// The loaded-and-quiet release gate, shared by both deferral stages.
@@ -1534,6 +1549,7 @@ impl Runtime {
                 seeded: None,
                 last_drain_took: Duration::ZERO,
                 last_dump_took: None,
+                v6_gate: false,
             })),
         }
     }
@@ -1969,11 +1985,12 @@ impl Runtime {
             drain_error: c.last_drain_error.clone(),
             source_backlog: c.source.backlog(),
             steer_configured_ports: c.steering.configured_ports(),
-            steer_v6_outbound: v6_outbound_summary(&c.steering.installed_plan()),
+            steer_v6_divert: v6_divert_summary(&c.steering.installed_plan()),
             steer_v6_only: {
                 let plan = c.steering.installed_plan();
-                !v6_outbound_summary(&plan).is_empty() && !installs_v4_diversion(&plan)
+                !v6_divert_summary(&plan).is_empty() && !installs_v4_diversion(&plan)
             },
+            handback: c.engine.handback_status(),
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
@@ -2145,13 +2162,13 @@ pub enum AuthorityPosture {
     AwaitingAuthority,
 }
 
-/// `"<port> vlan <ids>"` for every port whose plan diverts outbound
+/// `"<port> vlan <ids>"` for every port whose plan diverts
 /// IPv6, in plan order — the phrase the steering row prints.
-pub fn v6_outbound_summary(plans: &[(String, u32, crate::steer::RuleSet)]) -> Vec<String> {
+pub fn v6_divert_summary(plans: &[(String, u32, crate::steer::RuleSet)]) -> Vec<String> {
     plans
         .iter()
         .filter_map(|(iface, _, plan)| {
-            let vlans = plan.v6_outbound_vlans();
+            let vlans = plan.v6_divert_vlans();
             (!vlans.is_empty()).then(|| {
                 format!(
                     "{iface} {}",
@@ -2189,15 +2206,18 @@ pub struct RuntimeStatus {
     /// How many ports the config asks to steer. See
     /// [`Steering::configured_ports`].
     pub steer_configured_ports: usize,
-    /// Where the INSTALLED steering diverts outbound IPv6, one
+    /// Where the INSTALLED steering diverts IPv6, one
     /// `"<port> vlan <ids>"` / `"<port> untagged"` per port — read from
     /// [`Steering::installed_plan`], so it names what reached the NIC,
     /// not what the config wants. Empty when no v6 is diverted.
-    pub steer_v6_outbound: Vec<String>,
+    pub steer_v6_divert: Vec<String>,
     /// The installed plan diverts IPv6 and no IPv4 at all (a v6-only
-    /// allowlist beside `v6-outbound`), so the steering row must not
+    /// allowlist beside `v6-divert`), so the steering row must not
     /// claim allowlisted IPv4 is diverted. See [`installs_v4_diversion`].
     pub steer_v6_only: bool,
+    /// The IPv6 hand-back path, while it is wanted or built
+    /// ([`crate::handback`]).
+    pub handback: Option<crate::handback::HandbackStatus>,
     /// Changes the source is holding that the engine has not pulled yet.
     ///
     /// Distinct from `pending_ops`, which is what the engine has pulled
@@ -2392,8 +2412,67 @@ impl Core {
     /// operator who had just been told the steer was refused could read
     /// `steering healthy` in the same breath (review finding).
     fn retarget(&mut self, targets: Vec<(String, u32, crate::steer::RuleSet)>) {
+        // The hand-back path is wanted exactly while the target diverts
+        // IPv6; a new want is built by the steer this retarget precedes.
+        self.engine
+            .set_handback_wanted(crate::handback::plans_divert_v6(&targets));
         self.steering.retarget(targets);
         self.last_steer_audit = None;
+    }
+
+    /// Service the IPv6 hand-back path and hand its readiness to the
+    /// steering as the gate on the v6 half.
+    ///
+    /// With `resteer`, a gate that CHANGED under installed rules asks the
+    /// supervisor for a reconcile (`SteerRequested`, which from `Steered`
+    /// re-steers without moving the state): ready, the v6 half goes in;
+    /// broken, it comes out and IPv4 stays. Only where rules are in the
+    /// NIC and the target diverts v6 — never a first steer, which stays
+    /// the operator's, and a v6-only port waiting on the path is retried
+    /// by the refused steer's own paced retry. The steer path passes
+    /// `false`: the steer it precedes already reads the new gate.
+    fn service_handback(&mut self, sync: bool, resteer: bool) -> Result<(), EngineError> {
+        let served = self.engine.service_handback(sync);
+        self.apply_v6_gate(resteer);
+        served
+    }
+
+    /// Hand the path's readiness to the steering; see
+    /// [`Self::service_handback`] for `resteer`.
+    fn apply_v6_gate(&mut self, resteer: bool) {
+        let ready = self.engine.handback_ready();
+        if ready != self.v6_gate {
+            self.v6_gate = ready;
+            self.steering.set_v6_ready(ready);
+            tracing::info!(
+                ready,
+                "IPv6 hand-back path {}; the IPv6 half of steering is {}",
+                if ready { "ready" } else { "not ready" },
+                if ready { "permitted" } else { "held back" }
+            );
+            if resteer
+                && self.engine.steered()
+                && self.engine.handback_wanted()
+                && !self.steering.installed().is_empty()
+            {
+                self.pending.push(Event::SteerRequested);
+            }
+        }
+    }
+
+    /// Bring the hand-back path up to date and set the v6 gate from it,
+    /// immediately before a steer — the chokepoint every steer passes, so
+    /// no v6 diversion is ever installed ahead of the /128s that hand the
+    /// router's own traffic back. A failure here never stops the steer:
+    /// IPv4 does not wait on the path, the gate stays as it was, and a
+    /// lost socket surfaces on the next drain.
+    fn gate_v6_for_steer(&mut self) {
+        if let Err(e) = self.service_handback(true, false) {
+            tracing::warn!(
+                error = %e,
+                "the IPv6 hand-back path could not be serviced before the steer"
+            );
+        }
     }
 
     /// Hand the exemption tripwire the reloaded `steer-exempt` set.
@@ -3310,6 +3389,15 @@ impl ObserveView {
                 }
             }
         }
+        // The IPv6 hand-back path, every tick with a live API: the kernel's
+        // address watch is drained here, so a new or removed router
+        // address reaches VPP's /128s within a tick. Only a lost socket
+        // fails the drain — a path that is not ready is held on its own
+        // status and gates only the v6 half of steering.
+        if let Err(e) = c.service_handback(true, true) {
+            c.last_drain_error = Some(e.to_string());
+            return Err(step_error(&mut c.engine, e));
+        }
         // Live changes are pulled in FIRST, so a route learned while VPP
         // was already converged goes out in this same batch rather than
         // waiting for a resync that may never come. The engine's pending
@@ -3479,6 +3567,7 @@ impl Effects for EffectsView {
         // revocation). Reachable only through Action::RestoreSteer,
         // which only (AdoptedResyncing, FallbackRevoked) emits.
         let mut c = self.core.borrow_mut();
+        c.gate_v6_for_steer();
         let outcome = c.steering.steer();
         c.record_steering();
         // One of the places every steer passes through — the
@@ -3605,6 +3694,7 @@ impl Effects for EffectsView {
                 }
             }
         }
+        c.gate_v6_for_steer();
         let outcome = c.steering.steer();
         c.record_steering();
         // One of the places every steer passes through — the
@@ -3652,6 +3742,11 @@ impl Effects for EffectsView {
         if let Err(e) = c.engine.attach_devices(mode) {
             return Err(step_error(&mut c.engine, e));
         }
+        // The attach built or adopted the hand-back path; an adopted one
+        // that already holds every /128 is ready now, so the steering's
+        // audit judges inherited v6 rules against a target that includes
+        // them. No re-steer from here: nothing reconciles mid-attach.
+        c.apply_v6_gate(false);
         let indices = c.engine.attached_indices();
         // Unlike spawn, do not tear anything down: the interfaces exist
         // and work. The cost of a lost record is one refused adoption
@@ -3981,7 +4076,20 @@ impl Effects for EffectsView {
         // [`ResourceRelease`]. The executor only ever calls this after
         // teardown reported clean, so a live VPP cannot be DMAing into
         // what it releases.
-        self.core.borrow_mut().resources.release()
+        let mut c = self.core.borrow_mut();
+        let released = c.resources.release();
+        // The IPv6 hand-back path's kernel half — its VPP half died with
+        // the process. Reported, never fatal: the VFs are the resources
+        // whose release must not be blocked, and `packetframe detach
+        // --all` removes the veth and the guard by name.
+        if let Err(e) = c.engine.teardown_handback() {
+            tracing::warn!(
+                error = %e,
+                "could not remove the IPv6 hand-back path; `packetframe detach --all` \
+                 removes it"
+            );
+        }
+        released
     }
 }
 

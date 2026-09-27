@@ -80,7 +80,7 @@ running badly.
 - [What a keep-vpp restart costs now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)
 - [Rung 0 for IPv6: `v6 on`](#rung-0-for-ipv6-v6-on)
 - [Bidirectional offload: local-route and direction dst](#bidirectional-offload-local-route-and-direction-dst)
-- [v6 outbound steering](#v6-outbound-steering)
+- [v6-divert steering](#v6-divert-steering)
 - [Triage by symptom](#triage-by-symptom)
 - [Numbers: measured vs published-on-faith](#numbers-measured-vs-published-on-faith)
 - [Install and upgrade on the router](#install-and-upgrade-on-the-router)
@@ -124,10 +124,10 @@ per-port and is the canary lever.
 suppression holds by construction rather than by knob: MCAM rules match
 IPv4 fields, so ARP frames (0x0806) can never be steered — VPP
 physically cannot receive an ARP request. The IPv6 diversion
-(`v6-outbound`) keeps the same property for neighbour discovery by a
+(`v6-divert`) keeps the same property for neighbour discovery by a
 different route: it matches TCP and UDP only, so no ICMPv6 frame —
 solicitation, advertisement or echo, multicast or unicast — can reach
-VPP — see [v6 outbound steering](#v6-outbound-steering).
+VPP — see [v6-divert steering](#v6-divert-steering).
 
 **Only IPv4 neighbours are programmed.** VPP carries v4 routes only (no
 v6 packet can be steered in; see gate 0b below), so the resolver's IPv6
@@ -793,9 +793,9 @@ VPP from a dump. A mismatch on THAT pass is an ordinary `VerifyFailed`.
 
 ## Rung 0 for IPv6: `v6 on`
 
-Phase A of the IPv6 offload steers **outbound** customer IPv6 — frames
-from a customer VLAN addressed to the router's MAC — into VPP, which
-routes them out the transit/IX ports. That needs VPP to carry the v6
+Phase A of the IPv6 offload steers customer IPv6 — frames addressed to
+the router's MAC on a VLAN the operator names — into VPP, which routes
+them out the transit/IX ports (and, on transit/IX ports, the reverse). That needs VPP to carry the v6
 table correctly first. `v6 on` is that and only that: **it steers no
 IPv6**. It exists so the v6 table's cost can be measured, and its
 correctness verified, while every v6 packet still rides the eBPF tier.
@@ -812,7 +812,7 @@ correctness verified, while every v6 packet still rides the eBPF tier.
   global v6 address is added anywhere. The link-local equals the
   kernel's for the same MAC (a VF carries its PF's MAC, a BVI the
   bridge's), with no DAD — harmless, because no ICMPv6 is ever steered
-  to VPP (not at rung 0, and not under `v6-outbound`, which takes TCP
+  to VPP (not at rung 0, and not under `v6-divert`, which takes TCP
   and UDP only), so nothing solicits it and the kernel keeps answering
   for the address on the wire. Enabling is idempotent (a re-enable answers
   `VALUE_EXIST`), so an adopted VPP is simply asked again.
@@ -1358,7 +1358,7 @@ replies, undeliverable by anyone") until the destination profile
 showed ~a third of it was live inter-site traffic. Profile before
 declaring a floor harmless.
 
-## v6 outbound steering
+## v6-divert steering
 
 The NIC cannot match an IPv6 **address** — every `ip6`/`tcp6`/`udp6`
 rule naming one fails with AF error 710 (spike doc, gate 0b round 4).
@@ -1367,15 +1367,19 @@ the ethertype, the destination MAC, the outer VLAN id and TCP/UDP
 (`tcp6`/`udp6` rules, with or without a port). It **cannot** match the
 v6 next header: an `ip6 l4proto N` rule inserts, reads back as asked,
 and matches every v6 frame (rig, 2026-09-27). That is enough for one
-address-free policy: **TCP and UDP over IPv6 that a customer sends to
-the router, on a VLAN you name, goes to VPP.**
+address-free policy: **TCP and UDP over IPv6 addressed to the router's
+MAC, on a VLAN you name, goes to VPP.** On a customer VLAN that is the
+customers' outbound traffic; on a transit or IX port it is inbound
+traffic toward them. Either way the router's own IPv6 on that port
+arrives on the same MAC, so it goes to VPP too — and VPP hands it back
+to the kernel over the [hand-back path](#the-hand-back-path).
 
 ```
 module vpp-offload
   v6 on
-  port eth4 cores 1 steer on vlans 100,200 direction src v6-outbound 100,200
+  port eth4 cores 1 steer on vlans 100,200 direction src v6-divert 100,200
   steer-keep6 udp 123
-  steer-keep6 tcp 179 both
+  steer-keep6 tcp 22
 ```
 
 ### What it diverts
@@ -1383,7 +1387,7 @@ module vpp-offload
 Two rules per (listed VLAN × receive MAC), `tcp6` and `udp6` with no
 port: destination MAC = one the router's L3 devices answer to on that
 port (the same set the v4 rules are scoped to), outer VLAN id = the
-listed VID (PCP and DEI ignored). Into the port's VF. `v6-outbound
+listed VID (PCP and DEI ignored). Into the port's VF. `v6-divert
 untagged` drops the VLAN term and is refused on any port that declares
 VLANs, because the NIC has no untagged-only match — a rule without a
 VLAN term matches every VLAN.
@@ -1395,26 +1399,31 @@ kernel's own re-resolution of a customer neighbour all passed; the
 `udp6` twin blocked DNS and left TCP and echo alone.
 Neighbour discovery runs both ways over unicast to the router MAC:
 customers' NUD probes of their gateway, and — the one that would hurt
-most — the NA a customer sends back to the **kernel's** own
+most — the NA a neighbour sends back to the **kernel's** own
 solicitation. A diversion that took ICMPv6 would starve the kernel's
-neighbour table on that VLAN, and with it every inbound v6 packet the
-kernel or the fast path forwards to those customers. Echo to the
-router, PMTUD's Packet Too Big, and every other ICMPv6 a customer sends
-stay on the kernel path too. So do other next headers (ESP, GRE, …) and
-fragments the parser does not classify as TCP/UDP: they forward as they
-do today.
+neighbour table on that VLAN, and with it every v6 packet the kernel
+or the fast path forwards there. Echo to the router, PMTUD's Packet
+Too Big, and every other ICMPv6 stay on the kernel path too. So do
+other next headers (ESP, GRE, …) and fragments the parser does not
+classify as TCP/UDP: they forward as they do today.
 
-Three consequences to decide on before listing a VLAN:
+Four consequences to decide on before listing a VLAN:
 
 - **The allowlist does not scope it.** Every v6 source on the VLAN rides
   VPP, allowlisted or not — the NIC cannot read the source address that
   would narrow it. The kernel's netfilter never sees that traffic (as
-  with anything the fast-path takes), so v6 firewall policy for those
-  VLANs no longer applies to their outbound traffic.
-- **Anything the router terminates for those customers must be kept**,
-  or it dies in VPP, which has no local delivery. That is the w23 lesson
-  in IPv6 form. See the keeps below.
-- **VPP must carry v6** (`v6 on`; validation refuses `v6-outbound`
+  with anything the fast-path takes), so v6 forward-path firewall policy
+  for those VLANs no longer applies to it.
+- **New sessions to the router are refused unless kept.** VPP hands the
+  router's own traffic back to the kernel, where the hand-back guard
+  admits only established and related traffic: replies to what the
+  router opened work, a new inbound SSH/NTP/DHCPv6 session does not.
+  Every service that must accept new inbound connections on a diverted
+  VLAN or port needs a `steer-keep6`, so it never enters VPP at all. That
+  is the w23 lesson in IPv6 form, refused on purpose instead of lost.
+- **BGP never enters VPP.** It is a built-in keep in both directions —
+  see the keeps below and the hop-limit note under the hand-back path.
+- **VPP must carry v6** (`v6 on`; validation refuses `v6-divert`
   without it). The steer itself checks too, against the policy the
   running engine was BUILT with rather than the config flag: a target
   carrying a v6 diversion into a VPP started without v6 is refused whole,
@@ -1433,7 +1442,11 @@ this NIC — so they are matched first:
 | Keep | Why |
 | --- | --- |
 | TCP 53, UDP 53 (`dst-port`) — built in | The router's resolver. |
-| `steer-keep6 <tcp\|udp> <port> [dst\|src\|both]` | Everything else the router terminates: NTP 123, DHCPv6 relay 547, SSH, SNMP, BGP 179, BFD. `src` keeps replies to sessions the ROUTER opened (BGP where it is the active side). |
+| TCP 179 `dst-port` and `src-port` — built in | BGP, whichever end opened the session. eBGP to a directly connected peer arrives at hop limit 1 (255 under GTSM, which must arrive as 255); the hop VPP's hand-back costs would drop every segment. |
+| `steer-keep6 <tcp\|udp> <port> [dst\|src\|both]` | Every other service that accepts NEW sessions: NTP 123, unicast DHCPv6 547, SSH, SNMP. `src` keeps replies to sessions the ROUTER opened when they must not take the hand-back hop. |
+
+A `steer-keep6 tcp 53 …` (dst) or any `steer-keep6 tcp 179 …` restates a
+built-in and is refused by validation.
 
 There is **no ICMPv6 keep, and there must never be one**: on this NIC
 it would be an `ip6 l4proto 58` rule, which matches every v6 frame and,
@@ -1444,12 +1457,12 @@ take it. TCP/UDP port keeps were proven port-specific on the rig
 `dst-port 443` kept it).
 
 They carry **protocol and port only** — no address, no MAC, no VLAN — so
-they apply port-wide and also keep customer DNS toward **external**
+they apply port-wide and also keep DNS and BGP toward **external**
 hosts on the eBPF tier. That is intended: correct, and a
 small slice. Two costs to know: they occupy MCAM slots only while some
-port diverts v6 (a port with `steer-keep6` lines and no `v6-outbound`
+port diverts v6 (a port with `steer-keep6` lines and no `v6-divert`
 plans none), and everything they match lands on PF queue 0 rather than
-RSS — all of the port's DNS, every VLAN. If queue 0's softirq
+RSS — all of the port's DNS and BGP, every VLAN. If queue 0's softirq
 core shows it, per-VLAN keeps are the remedy (`tcp6 dst-port N vlan
 <vid> m 0xf000` inserts on this kernel too); they are not built yet
 because they multiply slots by the VLAN count.
@@ -1457,10 +1470,83 @@ because they multiply slots by the VLAN count.
 ### Budget
 
 Per port, beside the v4 rules: 2 × (VLANs × receive MACs) diversions +
-2 built-in keeps + one per `steer-keep6` rule (`both` counts two). The
-example above on a port with one receive MAC: 4 + 2 + 3 = 9 slots. The
-refusal text names every term, and the whole port is refused — v4 and
-v6 — when the total does not fit.
+4 built-in keeps (TCP 53, UDP 53, TCP 179 dst, TCP 179 src) + one per
+`steer-keep6` rule (`both` counts two). The example above on a port
+with one receive MAC: 4 + 4 + 2 = 10 slots. The refusal text names
+every term, and the whole port is refused — v4 and v6 — when the total
+does not fit.
+
+### The hand-back path
+
+Whenever VPP carries v6 and the steering target diverts IPv6 on any
+port, PacketFrame builds a way back into the kernel for the router's
+own traffic:
+
+- **A veth pair.** `pfpunt0` is the kernel's end: up, IPv6 on with only
+  its link-local (`accept_ra 0`, `autoconf 0`, no router
+  solicitations), no global address, MTU = the largest member port's.
+  `pfpunt0-vpp` is VPP's end, opened by VPP as an af_packet host
+  interface (`host-pfpunt0-vpp`, wearing that end's MAC); the kernel
+  keeps IPv6 off on it. In VPP the interface gets ip6 (link-local only)
+  with router advertisements suppressed, like every owned interface.
+- **A /128 per router-owned address.** Every global-scope IPv6 address
+  the host holds, on any interface but the veth — transit /127s and
+  /64s, IX addresses, the customer gateway, a tunnel's /128 — becomes a
+  /128 in VPP's IPv6 table via the kernel veth's link-local on
+  `host-pfpunt0-vpp`, resolved by a static neighbour (VPP never
+  solicits). Link-local addresses and addresses whose DAD failed are
+  left out. The set follows the kernel live: an RTM_NEWADDR/DELADDR
+  watch triggers a re-read within a tick, and a full re-read runs every
+  5 minutes regardless. These routes are PacketFrame's own topology,
+  never in the route ledger: adoption does not read them back as mirror
+  routes, the resync diff does not withdraw them, verify does not sample
+  them and the drift tripwire does not see them.
+- **The guard.** `table inet packetframe_handback`: on input,
+  established/related traffic arriving on `pfpunt0` is accepted and
+  everything else arriving there is dropped; on forward, nothing
+  arriving on `pfpunt0` is forwarded. Why it exists: packets arriving on
+  the veth bypass the vendor's WAN_LOCAL rules, which key on the
+  physical WAN ports — without it a new inbound connection to the
+  router over IPv6 through VPP would meet no firewall at all. With it,
+  such connections are refused by default; services that need them use
+  `steer-keep6`.
+
+**What it needs from the box.** VPP's `af_packet_plugin.so` (the
+vpp-unifi build loads it by default; the module's API handshake names
+`af_packet_create_v3` if it is missing, whatever `v6` says), `nft` in
+`/usr/sbin`, `/sbin` or `/usr/bin`, and no foreign interface named
+`pfpunt0` or `pfpunt0-vpp` — an existing one that is not PacketFrame's
+veth pair is refused by name and left untouched.
+
+**The order is enforced.** The v6 half of steering — every v6 diversion
+and keep — is held back until the path is whole: veth up, guard
+loaded, VPP's interface up, and a /128 in VPP for every address the
+host holds. IPv4 steering never waits for it. On a port with IPv4 to
+steer, IPv4 installs and the v6 half follows on its own once the path
+is ready; a port that diverts only IPv6 refuses the steer (so the want
+is kept) and the paced retry installs it once the path is ready. If the
+path breaks while steered, the v6 half is taken out and IPv4 stays.
+
+**Hop limit.** VPP decrements the hop limit of what it hands back.
+Anything router-owned that arrives at hop limit 1 reaches the kernel at
+0 and is dropped. eBGP to a directly connected peer is exactly that,
+which is why BGP is a built-in keep. Single-hop BFD would be too — it is
+not running on the fleet; add a `steer-keep6 udp 3784` before enabling
+it on a diverted port. Nothing else router-owned is known to arrive at
+hop limit 1.
+
+**Lifetime.** Built on the first target that diverts IPv6 (at start, or
+by the `packetframe reconfigure` that adds `v6-divert`), and kept until
+the module stops or `packetframe detach --all`, both of which remove the
+/128s, the VPP host interface, the veth and the nft table. A
+`--keep-vpp` restart leaves all of it in place, and the next daemon
+re-verifies it rather than trusting it: it finds the host interface by
+name (never a second socket on the veth), re-asserts its settings,
+re-adds the neighbour only if VPP lacks it, and brings the /128s to the
+host's current addresses. One side effect: the first `--keep-vpp`
+restart after `v6-divert` is first enabled builds the interface on the
+adopted VPP, which can change the FIB summary the preserved ledger is
+checked against — that restart may take the dump path.
 
 ### Verifying on the box
 
@@ -1468,11 +1554,12 @@ v6 — when the total does not fit.
 # The rules the NIC holds. The diversions read "TCP over IPv6" / "UDP
 # over IPv6" with no ports, the router MAC as the destination MAC and
 # the VLAN, "Action: Direct to VF 0 queue 0"; the keeps "TCP over IPv6"
-# / "UDP over IPv6" with a port and no MAC, "Action: Direct to queue 0".
-# No rule may read "Flow Type: Raw Ethernet" or name an L4 protocol
-# number. Every keep's location must be LOWER than every diversion's.
-# Masks print complemented (ethtool shows ignored bits), as for the v4
-# rules.
+# / "UDP over IPv6" with a port and no MAC, "Action: Direct to queue 0"
+# — four built-ins (TCP 53, UDP 53, TCP dst 179, TCP src 179) plus
+# yours. No rule may read "Flow Type: Raw Ethernet" or name an L4
+# protocol number. Every keep's location must be LOWER than every
+# diversion's. Masks print complemented (ethtool shows ignored bits), as
+# for the v4 rules.
 ethtool -n eth4
 ```
 
@@ -1482,8 +1569,28 @@ ethtool -n eth4
 jq '.steer_plans[] | .[2].rules_v6' /var/lib/packetframe/state/vpp-offload.json
 ```
 
-`packetframe status`'s steering row names the diverted ports and VLANs
-("outbound IPv6 on eth4 vlan 100,200"), read from the installed plan.
+```bash
+# The hand-back path, kernel side: a veth whose peer is pfpunt0-vpp,
+# state UP, no global address; the guard table with both chains.
+ip -d link show pfpunt0
+ip -6 addr show dev pfpunt0
+nft list table inet packetframe_handback
+
+# VPP side: the host interface up, a /128 for each of the router's
+# global addresses via host-pfpunt0-vpp, the static neighbour, and the
+# tx counter climbing as the router's own replies are handed back.
+vppctl show interface host-pfpunt0-vpp
+vppctl show ip6 fib 2001:db8:ffff::1/128
+vppctl show ip6 neighbors host-pfpunt0-vpp
+```
+
+`packetframe status` names the diverted ports and VLANs on the steering
+row ("IPv6 on eth4 vlan 100,200"), read from the installed plan, and
+has a `v6-handback` row: `ready — veth up, guard loaded, VPP interface
+host-pfpunt0-vpp up, N router-owned /128(s) handed back`, or Degraded
+with `IPv6 diversion held back` and what is missing. The metrics add
+`packetframe_vpp_handback_ready`, `packetframe_vpp_handback_routes` and
+`packetframe_vpp_handback_tx_packets` (absent until sampled).
 
 From a customer host on a diverted VLAN: ping the gateway's v6 address
 and resolve a name through it (ICMPv6 is never diverted and DNS is
@@ -1491,11 +1598,17 @@ kept, so both must work); `ip -6 neigh` must show the gateway
 `REACHABLE`, not `FAILED`; TCP and UDP to an external v6 destination
 must work (VPP forwarding). On the router, `ip -6 neigh show dev <the
 VLAN's bridge device>` must keep that customer `REACHABLE`/`STALE`
-across a few minutes — `FAILED` means ICMPv6 is reaching VPP. Then
-check the diversion is real rather than shadowed: TCP to a router port
-you did **not** keep (say SSH without a keep) must fail. If it
-succeeds, something above the diversions matches all of TCP, and
-nothing is being diverted (safe, but the feature is off).
+across a few minutes — `FAILED` means ICMPv6 is reaching VPP. From the
+router itself, sessions it opens over IPv6 must keep working
+(`curl -6` to an external host, a DNS lookup over TCP, the vendor's
+cloud session) — they ride the hand-back path, and `vppctl show
+interface host-pfpunt0-vpp`'s tx counter moves with them. BGP sessions
+on diverted ports must stay Established. Then check the diversion is
+real rather than shadowed: a new TCP session to a router port you did
+**not** keep (say SSH without a keep) must fail — refused by the guard
+after the hand-back. If it succeeds, something above the diversions
+matches all of TCP (safe, but the feature is off) — or the guard is not
+loaded, which the `v6-handback` row would say.
 
 ### What watches it, and what does not
 
@@ -1503,23 +1616,30 @@ The steering audit reads every v6 rule back like a v4 one: a keep or
 diversion removed or altered out of band shows as `steering DEGRADED`,
 and the readback compares every field that decides the match (the flow
 type — TCP or UDP — MAC, VLAN id and mask, L4 port, the `FLOW_EXT` /
-`FLOW_MAC_EXT` bits). The **exemption tripwire (`exempt-drift`) is
-v4-only** and stays that way: a v6 diversion's correctness rests on VPP's
-v6 FIB, and the keeps are what protect the router's own services.
+`FLOW_MAC_EXT` bits). A v6 half held back for the hand-back path is not
+drift: the audit compares against what may be installed, and the
+`v6-handback` row carries the reason. The hand-back path is re-checked
+every 30 s — veth, guard, VPP interface — and rebuilt when a part has
+gone. The **exemption tripwire (`exempt-drift`) is v4-only**: a v6
+diversion's correctness rests on VPP's v6 FIB, and the keeps are what
+protect the router's own services.
 
 ### Rollback
 
 ```bash
-# Drop `v6-outbound` from the port line (or set the port `steer off`),
+# Drop `v6-divert` from the port line (or set the port `steer off`),
 # then:
 packetframe reconfigure
 ```
 
 Hot, like any steering change: the reconcile removes the v6 diversions
-and, with no port left diverting v6, the v6 keeps. `v6-outbound` on a
+and, with no port left diverting v6, the v6 keeps. `v6-divert` on a
 `steer off` port is accepted and inert on purpose, so the one-token
-rollback never needs a second edit. Turning `v6` itself off comes after
-(its own rules apply there).
+rollback never needs a second edit. The hand-back path stays built (and
+harmless: VPP is sent no IPv6 to hand back) until the module stops or
+`packetframe detach --all`; to remove it by hand:
+`nft delete table inet packetframe_handback` and `ip link del pfpunt0`.
+Turning `v6` itself off comes after (its own rules apply there).
 
 **Before downgrading to a build without v6 steering, roll back first.**
 An older build reads the state file (the v6 rules sit in a field it
@@ -1528,7 +1648,8 @@ recognise the v6 keeps: it disowns them, drops them from its ledger with
 a warning, and leaves them in the MCAM — kernel-delivery rules, so
 nothing is blackholed, but they hold slots. If that already happened:
 `ethtool -n <iface>`, then `ethtool -N <iface> delete <loc>` for each
-leftover IPv6 keep.
+leftover IPv6 keep. An older build does not know the hand-back path
+either: remove it by hand as above.
 
 ## Triage by symptom
 
@@ -2941,7 +3062,7 @@ against the counts printed beside it before acting on the verdict.
   every UniFi kernel bump; the MKEX profile ships with the AF driver.
   What the profile does extract (ethertype, MAC, VLAN id, v6 L4
   protocol and ports; probed 2026-09-26) carries the address-free
-  outbound diversion — see [v6 outbound steering](#v6-outbound-steering).
+  address-free diversion — see [v6-divert steering](#v6-divert-steering).
 - **`rx-mode adaptive` is unsupported** by the native octeon driver.
   The heat goal is dead: **one hot core per VPP worker, 24/7**, as a
   permanent recorded cost. Budget power and thermals for it.

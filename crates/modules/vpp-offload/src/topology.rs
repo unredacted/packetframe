@@ -89,7 +89,7 @@ pub fn kernel_receive_macs_in(
 
 /// The VLANs the kernel bridge carries TAGGED on `port` right now — the
 /// set a `vlans all` trunk's VPP subinterfaces follow, and so the set a
-/// `v6-outbound` VID on such a trunk must fall inside.
+/// `v6-divert` VID on such a trunk must fall inside.
 pub fn kernel_tagged_vlans(port: &str) -> Result<Vec<u16>, String> {
     #[cfg(target_os = "linux")]
     {

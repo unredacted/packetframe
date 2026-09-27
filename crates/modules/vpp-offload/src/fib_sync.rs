@@ -249,7 +249,7 @@ pub fn build_paths(paths: &[ResolvedPath], ports: &PortIndex) -> Option<Vec<FibP
 
 /// The wire path this module installs for one resolved nexthop — the
 /// single place every attribute of it is chosen.
-fn wire_path(nexthop: IpAddr, sw_if_index: u32) -> FibPath {
+pub(crate) fn wire_path(nexthop: IpAddr, sw_if_index: u32) -> FibPath {
     {
         let proto = match nexthop {
             IpAddr::V4(_) => FIB_API_PATH_NH_PROTO_IP4,

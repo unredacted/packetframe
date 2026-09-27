@@ -682,6 +682,11 @@ pub struct ConvergenceEngine {
     /// idempotent in VPP, which is what makes asking an adopted VPP
     /// again free of consequence.
     ip6_ready: std::collections::BTreeSet<u32>,
+    /// The IPv6 hand-back path ([`crate::handback`]): `Some` under `v6 on`
+    /// only. Its VPP interface is deliberately NOT in `port_index`, which
+    /// is what keeps its /128s out of adoption's readback, the ledger,
+    /// verify and every egress scan.
+    handback: Option<crate::handback::Handback>,
     drainer: Drainer,
 
     /// Whether MCAM rules are diverting traffic right now.
@@ -792,6 +797,7 @@ impl ConvergenceEngine {
             neighbours_installed: std::collections::HashMap::new(),
             neighbours_unacked: std::collections::HashSet::new(),
             ip6_ready: std::collections::BTreeSet::new(),
+            handback: None,
             drainer: Drainer::new(DEFAULT_WINDOW).with_families(families),
             steered: false,
             last_api_error: None,
@@ -824,6 +830,76 @@ impl ConvergenceEngine {
     pub fn with_recorded_indices(mut self, known: Vec<(String, u32)>) -> Self {
         self.recorded_indices = known;
         self
+    }
+
+    /// Give the engine the IPv6 hand-back path's kernel half. Bring-up
+    /// does so under `v6 on` only: a v4-only VPP diverts no IPv6, so it
+    /// has nothing to hand back.
+    pub fn with_handback(mut self, host: Box<dyn crate::handback::HostSide>) -> Self {
+        self.handback = Some(crate::handback::Handback::new(host));
+        self
+    }
+
+    /// Whether the steering target diverts IPv6 — the hand-back path's
+    /// want. See [`crate::handback::Handback::set_wanted`].
+    pub fn set_handback_wanted(&mut self, wanted: bool) {
+        if let Some(hb) = self.handback.as_mut() {
+            hb.set_wanted(wanted);
+        }
+    }
+
+    /// One pass over the hand-back path: build what is missing, re-check
+    /// what is built, and with `sync` bring its /128s to the host's
+    /// addresses. Only a transport failure is an error — it drops the
+    /// socket like every other; a refusal leaves the path not ready and is
+    /// on its status.
+    pub fn service_handback(&mut self, sync: bool) -> Result<(), EngineError> {
+        if self.handback.is_none() {
+            return Ok(());
+        }
+        self.arm_timeout();
+        let hb = self.handback.as_mut().expect("checked just above");
+        match hb.service(self.transport.as_mut(), std::time::Instant::now(), sync) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.disconnect();
+                Err(EngineError::Transport(e))
+            }
+        }
+    }
+
+    /// Whether the hand-back path is whole and in sync — the gate on the
+    /// IPv6 half of steering. `false` with no path at all.
+    pub fn handback_ready(&self) -> bool {
+        self.handback
+            .as_ref()
+            .is_some_and(crate::handback::Handback::ready)
+    }
+
+    /// Whether the steering target diverts IPv6 (and so needs the path).
+    pub fn handback_wanted(&self) -> bool {
+        self.handback
+            .as_ref()
+            .is_some_and(crate::handback::Handback::wanted)
+    }
+
+    /// The path for status: `None` when there is none, or it is neither
+    /// wanted nor built.
+    pub fn handback_status(&self) -> Option<crate::handback::HandbackStatus> {
+        self.handback
+            .as_ref()
+            .filter(|hb| hb.wanted() || hb.built())
+            .map(crate::handback::Handback::status)
+    }
+
+    /// Tear the hand-back path down — the module's stop. VPP's half is
+    /// asked for only while there is a transport (after the kill there
+    /// is none, and it died with the process); the kernel's always.
+    pub fn teardown_handback(&mut self) -> Result<(), String> {
+        let Some(hb) = self.handback.as_mut() else {
+            return Ok(());
+        };
+        hb.teardown(self.transport.as_mut())
     }
 
     /// Declare the locally terminated prefixes this engine delivers:
@@ -1045,7 +1121,7 @@ impl ConvergenceEngine {
     /// of the box: a silent misroute. Neither half holds for v6:
     ///
     /// - Phase A diverts IPv6 by ethertype, destination MAC and ingress
-    ///   VLAN — outbound customer traffic addressed to the router — never
+    ///   VLAN — traffic addressed to the router's MAC — never
     ///   by destination prefix, so there is no prefix set for an
     ///   exemption to carve a hole in. What that slice owes instead is
     ///   that VPP never routes to a destination only the kernel can
@@ -1887,6 +1963,11 @@ impl ConvergenceEngine {
             .unwrap_or_default()
     }
 
+    /// Whether the supervisor last said traffic is steered.
+    pub fn steered(&self) -> bool {
+        self.steered
+    }
+
     /// Tell the engine whether traffic is currently steered.
     ///
     /// Only affects the socket timeout, which must match the liveness
@@ -2104,7 +2185,12 @@ impl ConvergenceEngine {
         // supervisor orders after this step: a v6 adjacency or route on an
         // interface without ip6 has nothing to leave by.
         self.ensure_ip6()?;
-        self.install_attached_routes()
+        self.install_attached_routes()?;
+        // The hand-back interface, created or adopted with every device
+        // attach — a new VPP needs a new one — but its /128s are left for
+        // the next tick: an adopted FIB must reach the preserved ledger's
+        // fingerprint check unchanged.
+        self.service_handback(false)
     }
 
     /// Enable IPv6, with router advertisements suppressed, on every owned
@@ -3341,6 +3427,10 @@ impl ConvergenceEngine {
         self.neighbours_unacked.clear();
         // The ip6 state belonged to the dead process too.
         self.ip6_ready.clear();
+        // And the hand-back path's VPP half; the kernel half stays.
+        if let Some(hb) = self.handback.as_mut() {
+            hb.vpp_gone();
+        }
         self.pending = PendingMap::new();
         self.ledger = RouteLedger::new(self.ledger_capacity());
         self.phase = None;

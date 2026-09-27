@@ -31,7 +31,7 @@
 //!
 //! ## IPv4 only, deliberately
 //!
-//! A `v6-outbound` diversion ([`crate::steer::RuleMatch::V6Frame`]) is
+//! A `v6-divert` diversion ([`crate::steer::RuleMatch::V6Frame`]) is
 //! outside this scan. It relies on VPP's v6 FIB for correctness, and the
 //! router's own v6 services are protected by the keeps the planner puts
 //! above it ([`crate::steer::BUILTIN_KEEPS6`] and `steer-keep6`), not by

@@ -2305,6 +2305,19 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
         }
     }
 
+    // The IPv6 hand-back path's kernel half — the veth pair and its nft
+    // guard. Its VPP half went with the process just killed. By name, as
+    // the daemon's own teardown does, since this process has no engine
+    // and no record of it; a leftover is reported, never a reason to keep
+    // the VFs bound.
+    let handback = packetframe_vpp_offload::handback::teardown_host();
+    match &handback {
+        Ok(()) => tracing::info!("vpp-offload: IPv6 hand-back path removed (if it existed)"),
+        Err(e) => {
+            tracing::warn!(error = %e, "vpp-offload: could not remove the IPv6 hand-back path")
+        }
+    }
+
     // Point release at the pool the state file RECORDS, not the pool that
     // happens to be the default now.
     //
@@ -2325,7 +2338,14 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
     let paths = SysPaths::live(state_dir, pool_bytes);
     release(&paths, state).map_err(|e| format!("vpp-offload: {e}"))?;
     tracing::info!("vpp-offload: VFs rebound and hugepages restored");
-    Ok(())
+    handback.map_err(|e| {
+        format!(
+            "vpp-offload: VFs and hugepages released, but the IPv6 hand-back path could not be \
+             removed ({e}); by hand: `nft delete table inet {}` and `ip link del {}`",
+            packetframe_vpp_offload::handback::NFT_TABLE,
+            packetframe_vpp_offload::handback::KERNEL_IF
+        )
+    })
 }
 
 pub fn status(config_path: &Path) -> Result<(), String> {

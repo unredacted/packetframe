@@ -45,6 +45,7 @@ use packetframe_vpp_offload::vpp_api::generated::{
     ADDRESS_IP4, ADDRESS_IP6, FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
 };
 use packetframe_vpp_offload::vpp_api::generated::{
+    AfPacketCreateV3, AfPacketCreateV3Reply, AfPacketDelete, AfPacketDeleteReply, AfPacketDetails,
     IpRouteDump, SwInterfaceIp6EnableDisable, SwInterfaceIp6EnableDisableReply,
     SwInterfaceIp6ndRaConfig, SwInterfaceIp6ndRaConfigReply,
 };
@@ -64,6 +65,16 @@ pub const LOOPBACK_INDEX: u32 = 11;
 
 /// Base index for `create_loopback_instance` (a bridged VLAN's BVI).
 pub const BVI_BASE: u32 = 200;
+
+/// Base index for `af_packet_create_v3` (the IPv6 hand-back interface).
+pub const AF_PACKET_BASE: u32 = 300;
+
+/// What the fake's `show interface <name>` reports as `tx packets`.
+pub const AF_PACKET_TX: u64 = 42;
+
+/// The fake's af_packet host interfaces: `(host_if_name, sw_if_index,
+/// mac)`. VPP state, so it outlives a connection.
+pub type AfPackets = std::sync::Arc<std::sync::Mutex<Vec<(String, u32, [u8; 6])>>>;
 
 /// Link-layer address the fake mirror hands out for its one neighbour.
 pub const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -148,6 +159,9 @@ pub struct Fake {
     /// Interfaces VPP has ip6 enabled on — VPP state, so it outlives a
     /// connection like the route and neighbour tables.
     pub ip6_enabled: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>>,
+    /// Host interfaces (`af_packet_create_v3`). Seeding it before the
+    /// client connects models a surviving VPP that already has one.
+    pub af_packets: AfPackets,
     _dir: tempdir::TempDir,
     events: Receiver<Event>,
 }
@@ -278,6 +292,12 @@ pub struct Behaviour {
     /// applying it — a VPP that will not take some v6 route, whatever the
     /// reason, which must never stall IPv4's convergence.
     pub reject_v6_routes: bool,
+    /// Refuse `af_packet_create_v3`, forever — a VPP without the
+    /// af_packet plugin, as the client sees it.
+    pub reject_af_packet_create: bool,
+    /// Static v6 neighbours a surviving VPP holds, `(ip, sw_if_index, mac,
+    /// flags)`.
+    pub existing_neighbours6: &'static [([u8; 16], u32, [u8; 6], u8)],
 }
 
 /// One `Behaviour::existing_via` route:
@@ -368,6 +388,8 @@ impl Fake {
         let ip6_enabled: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
             Default::default();
         let ip6 = ip6_enabled.clone();
+        let af_packets: AfPackets = Default::default();
+        let afp = af_packets.clone();
         thread::spawn(move || {
             let mut b = behaviour;
             // VPP's neighbour table, OUTSIDE the accept loop, because it
@@ -378,7 +400,8 @@ impl Fake {
             let mut neighbours: Vec<([u8; 4], u32, [u8; 6], u8)> = b.existing_neighbours.to_vec();
             // The v6 neighbour table, kept apart for the same reason the
             // route tables are.
-            let mut neighbours6: Vec<([u8; 16], u32, [u8; 6], u8)> = Vec::new();
+            let mut neighbours6: Vec<([u8; 16], u32, [u8; 6], u8)> =
+                b.existing_neighbours6.to_vec();
             // Likewise the route table, for `track_routes`.
             {
                 let mut routes = table.lock().unwrap();
@@ -407,6 +430,7 @@ impl Fake {
                     &table,
                     &table6,
                     &ip6,
+                    &afp,
                     &mut stall,
                 );
                 // One-shot hangup: the point of that test is that a fresh
@@ -421,6 +445,7 @@ impl Fake {
             routes,
             routes6,
             ip6_enabled,
+            af_packets,
             _dir: dir,
             events: rx,
         }
@@ -445,6 +470,7 @@ fn serve(
     table: &std::sync::Mutex<RouteTable>,
     table6: &std::sync::Mutex<RouteTable6>,
     ip6_enabled: &std::sync::Mutex<std::collections::BTreeSet<u32>>,
+    af_packets: &AfPackets,
     stall: &mut Option<(&'static str, usize)>,
 ) -> Option<()> {
     // What `sw_interface_set_mac_address` last set, per interface. The
@@ -1085,6 +1111,67 @@ fn serve(
                         write_frame(sock, &d);
                     }
                 }
+                // Host interfaces, named as VPP names them, admin- and
+                // link-up.
+                let hosts = af_packets.lock().unwrap().clone();
+                for (name, idx, mac) in hosts {
+                    let mut d = reply_head("sw_interface_details");
+                    let mut det = details(idx, &format!("host-{name}"), 3, ctx);
+                    det.l2_address = mac;
+                    det.encode(&mut d);
+                    write_frame(sock, &d);
+                }
+                continue;
+            }
+            "af_packet_create_v3" => {
+                let mut d = Decoder::new(&req);
+                let r = AfPacketCreateV3::decode(&mut d).expect("decodes as an af_packet create");
+                let (retval, idx) = if behaviour.reject_af_packet_create {
+                    (-1, 0)
+                } else {
+                    let mut afp = af_packets.lock().unwrap();
+                    let idx = AF_PACKET_BASE + afp.len() as u32;
+                    afp.push((r.host_if_name.clone(), idx, r.hw_addr));
+                    (0, idx)
+                };
+                let _ = tx.send(Event::Msg(format!(
+                    "af_packet_create {} mac={:02x} mode={} flags={} rx_queues={}",
+                    r.host_if_name, r.hw_addr[5], r.mode, r.flags, r.num_rx_queues
+                )));
+                out = reply_head("af_packet_create_v3_reply");
+                AfPacketCreateV3Reply {
+                    context: ctx,
+                    retval,
+                    sw_if_index: idx,
+                }
+                .encode(&mut out);
+            }
+            "af_packet_delete" => {
+                let mut d = Decoder::new(&req);
+                let r = AfPacketDelete::decode(&mut d).expect("decodes as an af_packet delete");
+                let mut afp = af_packets.lock().unwrap();
+                let before = afp.len();
+                afp.retain(|(name, _, _)| *name != r.host_if_name);
+                let _ = tx.send(Event::Msg(format!("af_packet_delete {}", r.host_if_name)));
+                out = reply_head("af_packet_delete_reply");
+                AfPacketDeleteReply {
+                    context: ctx,
+                    retval: if afp.len() < before { 0 } else { -1 },
+                }
+                .encode(&mut out);
+            }
+            "af_packet_dump" => {
+                let snapshot = af_packets.lock().unwrap().clone();
+                for (name, idx, _) in snapshot {
+                    let mut d = reply_head("af_packet_details");
+                    AfPacketDetails {
+                        context: ctx,
+                        sw_if_index: idx,
+                        host_if_name: name,
+                    }
+                    .encode(&mut d);
+                    write_frame(sock, &d);
+                }
                 continue;
             }
             "sw_interface_set_mac_address" => {
@@ -1142,7 +1229,13 @@ fn serve(
                     .expect("decodes as a CLI request")
                     .cmd;
                 let _ = tx.send(Event::Msg(format!("cli {cmd}")));
-                let reply = if cmd.contains("ip6 fib summary") && behaviour.track_routes {
+                let reply = if let Some(name) = cmd.strip_prefix("show interface ") {
+                    format!(
+                        "              Name               Idx    State  MTU (L3/IP4/IP6/MPLS)     \
+                         Counter          Count     \n{name}                  4      up          \
+                         1500/0/0/0     tx packets {AF_PACKET_TX:>21}\n"
+                    )
+                } else if cmd.contains("ip6 fib summary") && behaviour.track_routes {
                     fib6_summary(&table6.lock().unwrap())
                 } else if cmd.contains("fib summary") && behaviour.track_routes {
                     fib_summary(&table.lock().unwrap())
