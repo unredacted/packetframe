@@ -1724,14 +1724,14 @@ mod tests {
             "eth2".to_string(),
             0u32,
             crate::steer::RuleSet {
-                rules: vec![crate::steer::SteerRule {
-                    prefix: std::net::Ipv4Addr::new(198, 51, 100, 0),
-                    prefix_len: 24,
-                    side: crate::steer::Side::Dst,
-                    location: 1024,
-                    action: crate::steer::RuleAction::Keep,
-                    dmac: None,
-                }],
+                rules: vec![crate::steer::SteerRule::v4(
+                    std::net::Ipv4Addr::new(198, 51, 100, 0),
+                    24,
+                    crate::steer::Side::Dst,
+                    1024,
+                    crate::steer::RuleAction::Keep,
+                    None,
+                )],
                 skipped_v6: 0,
             },
         )];

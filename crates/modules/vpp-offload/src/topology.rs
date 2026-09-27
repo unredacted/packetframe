@@ -87,6 +87,24 @@ pub fn kernel_receive_macs_in(
     sysfs_receive_macs(sysfs_net, &vlans, carried.as_deref(), port)
 }
 
+/// The VLANs the kernel bridge carries TAGGED on `port` right now — the
+/// set a `vlans all` trunk's VPP subinterfaces follow, and so the set a
+/// `v6-outbound` VID on such a trunk must fall inside.
+pub fn kernel_tagged_vlans(port: &str) -> Result<Vec<u16>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::fdb::dump_port_vlans().map(|entries| {
+            PortVlans::from_entries(entries.into_iter().map(|e| (e.port, e.vid, e.untagged)))
+                .tagged(port)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = port;
+        Err("bridge VLANs are read over netlink, which is Linux-only".into())
+    }
+}
+
 /// [`kernel_receive_macs_in`] against the live kernel.
 pub fn kernel_receive_macs(port: &str) -> Vec<[u8; 6]> {
     kernel_receive_macs_in(

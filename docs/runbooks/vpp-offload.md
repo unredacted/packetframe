@@ -79,6 +79,7 @@ running badly.
 - [The adopted-reconciliation release gate](#the-adopted-reconciliation-release-gate-what-it-needs-and-when-it-refuses)
 - [What a keep-vpp restart costs now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)
 - [Bidirectional offload: local-route and direction dst](#bidirectional-offload-local-route-and-direction-dst)
+- [v6 outbound steering](#v6-outbound-steering)
 - [Triage by symptom](#triage-by-symptom)
 - [Numbers: measured vs published-on-faith](#numbers-measured-vs-published-on-faith)
 - [Install and upgrade on the router](#install-and-upgrade-on-the-router)
@@ -121,7 +122,12 @@ per-port and is the canary lever.
 **VPP never ARPs.** Neighbours are static, from the resolver. ARP
 suppression holds by construction rather than by knob: MCAM rules match
 IPv4 fields, so ARP frames (0x0806) can never be steered — VPP
-physically cannot receive an ARP request.
+physically cannot receive an ARP request. The IPv6 diversion
+(`v6-outbound`) keeps the same property for neighbour discovery by a
+different route: solicitations to multicast MACs never match its
+router-MAC term, and the unicast rest of ICMPv6 is carved out by a
+built-in keep at higher priority — see
+[v6 outbound steering](#v6-outbound-steering).
 
 **Only IPv4 neighbours are programmed.** VPP carries v4 routes only (no
 v6 packet can be steered in; see gate 0b below), so the resolver's IPv6
@@ -1200,6 +1206,143 @@ steady rate was misread as harmless for three windows ("spoofed
 replies, undeliverable by anyone") until the destination profile
 showed ~a third of it was live inter-site traffic. Profile before
 declaring a floor harmless.
+
+## v6 outbound steering
+
+The NIC cannot match an IPv6 **address** — every `ip6`/`tcp6`/`udp6`
+rule naming one fails with AF error 710 (spike doc, gate 0b round 4).
+What it can match, probed on the production kernel on 2026-09-26, is
+the ethertype, the destination MAC, the outer VLAN id, the v6 L4
+protocol and TCP/UDP ports. That is enough for one address-free policy:
+**IPv6 a customer sends to the router, on a VLAN you name, goes to VPP.**
+
+```
+module vpp-offload
+  v6 on
+  port eth4 cores 1 steer on vlans 100,200 direction src v6-outbound 100,200
+  steer-keep6 udp 123
+  steer-keep6 tcp 179 both
+```
+
+### What it diverts
+
+One rule per (listed VLAN × receive MAC): ethertype 0x86DD, destination
+MAC = one the router's L3 devices answer to on that port (the same set
+the v4 rules are scoped to), outer VLAN id = the listed VID (PCP and DEI
+ignored). Into the port's VF. `v6-outbound untagged` drops the VLAN term
+and is refused on any port that declares VLANs, because the NIC has no
+untagged-only match — a rule without a VLAN term matches every VLAN.
+
+Three consequences to decide on before listing a VLAN:
+
+- **The allowlist does not scope it.** Every v6 source on the VLAN rides
+  VPP, allowlisted or not — the NIC cannot read the source address that
+  would narrow it. The kernel's netfilter never sees that traffic (as
+  with anything the fast-path takes), so v6 firewall policy for those
+  VLANs no longer applies to their outbound traffic.
+- **Anything the router terminates for those customers must be kept**,
+  or it dies in VPP, which has no local delivery. That is the w23 lesson
+  in IPv6 form. See the keeps below.
+- **VPP must carry v6** (`v6 on`; validation refuses `v6-outbound`
+  without it), and each VID must be a subinterface VPP has: in the
+  port's `vlans` list (validation), or carried tagged by the kernel
+  bridge on a `vlans all` trunk (checked when the rules are planned; an
+  unreadable bridge refuses the plan).
+
+### The keeps
+
+Kernel-delivery rules (`ring_cookie` 0, PF queue 0) at **lower
+locations than every diversion** — lower location is higher priority on
+this NIC — so they are matched first:
+
+| Keep | Why |
+| --- | --- |
+| ICMPv6 (`ip6 l4proto 58`) — built in | Unicast NUD probes and solicitations for the gateway arrive on the router MAC. Diverted, VPP never answers and customers lose their gateway. Also keeps echo to the router answerable. |
+| TCP 53, UDP 53 (`dst-port`) — built in | The router's resolver. |
+| `steer-keep6 <tcp\|udp> <port> [dst\|src\|both]` | Everything else the router terminates: NTP 123, DHCPv6 relay 547, SSH, SNMP, BGP 179, BFD. `src` keeps replies to sessions the ROUTER opened (BGP where it is the active side). |
+
+They carry **protocol and port only** — no address, no MAC, no VLAN — so
+they apply port-wide and also keep customer ICMPv6 and DNS toward
+**external** hosts on the eBPF tier. That is intended: correct, and a
+small slice. Two costs to know: they occupy MCAM slots only while some
+port diverts v6 (a port with `steer-keep6` lines and no `v6-outbound`
+plans none), and everything they match lands on PF queue 0 rather than
+RSS — all of the port's ICMPv6 and DNS, every VLAN. If queue 0's softirq
+core shows it, per-VLAN keeps are the remedy (`tcp6 dst-port N vlan
+<vid> m 0xf000` inserts on this kernel too); they are not built yet
+because they multiply slots by the VLAN count.
+
+### Budget
+
+Per port, beside the v4 rules: (VLANs × receive MACs) diversions + 3
+built-in keeps + one per `steer-keep6` rule (`both` counts two). The
+example above on a port with one receive MAC: 2 + 3 + 3 = 8 slots. The
+refusal text names every term, and the whole port is refused — v4 and
+v6 — when the total does not fit.
+
+### Verifying on the box
+
+```bash
+# The rules the NIC holds. The diversions read "Flow Type: Raw Ethernet"
+# with the router MAC, ethertype 0x86DD and the VLAN, "Action: Direct to
+# VF 0 queue 0"; the keeps "Flow Type: IPv6 ..." / "TCP over IPv6" /
+# "UDP over IPv6" with "Action: Direct to queue 0". Every keep's
+# location must be LOWER than every diversion's. Masks print
+# complemented (ethtool shows ignored bits), as for the v4 rules.
+ethtool -n eth4
+```
+
+```bash
+# What the teardown will match the keeps against: the plan's v6 rules
+# sit in `rules_v6` beside the v4 `rules`.
+jq '.steer_plans[] | .[2].rules_v6' /var/lib/packetframe/state/vpp-offload.json
+```
+
+`packetframe status`'s steering row names the diverted ports and VLANs
+("outbound IPv6 on eth4 vlan 100,200"), read from the installed plan.
+
+From a customer host on a diverted VLAN: ping the gateway's v6 address
+and resolve a name through it (both kept, both must work); `ip -6 neigh`
+must show the gateway `REACHABLE`, not `FAILED`; a traceroute to an
+external v6 destination must still work (VPP forwarding). Then check
+the diversion is real rather than shadowed: TCP to a router port you
+did **not** keep (say SSH without a keep) must fail. If it succeeds,
+something above the diversion matches all v6 — see the owed hardware
+check on `ip6 l4proto` in the PR notes — and nothing is being diverted
+(safe, but the feature is off).
+
+### What watches it, and what does not
+
+The steering audit reads every v6 rule back like a v4 one: a keep or
+diversion removed or altered out of band shows as `steering DEGRADED`,
+and the readback compares every field that decides the match (ethertype,
+MAC, VLAN id and mask, L4 port or protocol, the `FLOW_EXT` /
+`FLOW_MAC_EXT` bits). The **exemption tripwire (`exempt-drift`) is
+v4-only** and stays that way: a v6 diversion's correctness rests on VPP's
+v6 FIB, and the keeps are what protect the router's own services.
+
+### Rollback
+
+```bash
+# Drop `v6-outbound` from the port line (or set the port `steer off`),
+# then:
+packetframe reconfigure
+```
+
+Hot, like any steering change: the reconcile removes the v6 diversions
+and, with no port left diverting v6, the v6 keeps. `v6-outbound` on a
+`steer off` port is accepted and inert on purpose, so the one-token
+rollback never needs a second edit. Turning `v6` itself off comes after
+(its own rules apply there).
+
+**Before downgrading to a build without v6 steering, roll back first.**
+An older build reads the state file (the v6 rules sit in a field it
+ignores) and removes the v6 diversions by their VF cookie, but it cannot
+recognise the v6 keeps: it disowns them, drops them from its ledger with
+a warning, and leaves them in the MCAM — kernel-delivery rules, so
+nothing is blackholed, but they hold slots. If that already happened:
+`ethtool -n <iface>`, then `ethtool -N <iface> delete <loc>` for each
+leftover IPv6 keep.
 
 ## Triage by symptom
 
@@ -2605,11 +2748,14 @@ against the counts printed beside it before acting on the verdict.
 
 **Failed, and shaping the design:**
 
-- **`ip6` ntuple is rejected by the AF** (error 710) while the v4
-  control inserts cleanly — the vendor NPC profile has no v6
-  extraction. No IPv6 packet can be MCAM-steered into VPP, so v6 stays
-  on the XDP custom-FIB path. Retest at every UniFi kernel bump; the
-  MKEX profile ships with the AF driver.
+- **`ip6` ntuple naming an address is rejected by the AF** (error 710)
+  while the v4 control inserts cleanly — the vendor NPC profile has no
+  v6 L3 address extraction. No IPv6 packet can be MCAM-steered by
+  prefix, so allowlisted v6 stays on the XDP custom-FIB path. Retest at
+  every UniFi kernel bump; the MKEX profile ships with the AF driver.
+  What the profile does extract (ethertype, MAC, VLAN id, v6 L4
+  protocol and ports; probed 2026-09-26) carries the address-free
+  outbound diversion — see [v6 outbound steering](#v6-outbound-steering).
 - **`rx-mode adaptive` is unsupported** by the native octeon driver.
   The heat goal is dead: **one hot core per VPP worker, 24/7**, as a
   permanent recorded cost. Budget power and thermals for it.

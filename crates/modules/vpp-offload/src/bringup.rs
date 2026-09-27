@@ -490,14 +490,22 @@ pub fn bring_up(
         // and settling that needs no NIC — so it is settled BEFORE the
         // table query. Otherwise the operator's answer is whatever the
         // ioctl said (on a down port, `EOPNOTSUPP`), which names the
-        // wrong problem entirely.
+        // wrong problem entirely. Per port: a `v6-outbound` port has
+        // something to divert whatever the allowlist holds.
         let steerable = crate::steer::steerable_count(allowlist);
-        if steerable == 0 {
+        let idle: Vec<&str> = cfg
+            .ports
+            .iter()
+            .filter(|(iface, _, steer, _, _)| *steer && !cfg.diverts_v6(iface))
+            .map(|(iface, _, _, _, _)| iface.as_str())
+            .collect();
+        if steerable == 0 && !idle.is_empty() {
             return Err(format!(
-                "port(s) are configured `steer on`, but the allowlist produces no steerable \
-                 rules ({} IPv6 prefix(es) skipped — `ip6` ntuple is rejected by this NIC). \
-                 Steering would divert nothing while reporting Healthy; set the ports \
-                 `steer off` or give fast-path a v4 `allow-prefix`",
+                "port(s) {idle:?} are configured `steer on`, but the allowlist produces no \
+                 steerable rules for them ({} IPv6 prefix(es) skipped — `ip6` ntuple cannot \
+                 match a v6 address on this NIC) and they have no `v6-outbound`. Steering \
+                 would divert nothing while reporting Healthy; set the ports `steer off` or \
+                 give fast-path a v4 `allow-prefix`",
                 allowlist.len() - steerable
             ));
         }
@@ -511,9 +519,19 @@ pub fn bring_up(
     // derivation reconfigure uses too, so attach and reload cannot
     // disagree about what fits — each divert rule scoped to the MACs the
     // router receives on for that port.
-    let steer_targets = crate::plan_targets(cfg, allowlist, budget, &|port: &str| {
-        crate::topology::kernel_receive_macs_in(&paths.sys.sysfs_net, &paths.sys.vlan_config, port)
-    })?;
+    let steer_targets = crate::plan_targets(
+        cfg,
+        allowlist,
+        budget,
+        &|port: &str| {
+            crate::topology::kernel_receive_macs_in(
+                &paths.sys.sysfs_net,
+                &paths.sys.vlan_config,
+                port,
+            )
+        },
+        &crate::topology::kernel_tagged_vlans,
+    )?;
     // Every member port, unfiltered, so removal can attribute a
     // location's occupant on a port this config leaves unsteered. That
     // is not a hypothetical: a restart whose config turned a port off
@@ -1593,6 +1611,8 @@ mod completeness_gate_tests {
             local_routes: vec![],
             steer_capacity: None,
             trunk_ports: vec![],
+            v6_outbound: vec![],
+            steer_keeps6: vec![],
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),

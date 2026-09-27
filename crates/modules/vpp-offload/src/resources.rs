@@ -783,22 +783,22 @@ mod tests {
 
         let plan = RuleSet {
             rules: vec![
-                SteerRule {
-                    prefix: std::net::Ipv4Addr::new(198, 51, 100, 0),
-                    prefix_len: 24,
-                    side: Side::Dst,
-                    location: 15,
-                    action: RuleAction::Divert,
-                    dmac: None,
-                },
-                SteerRule {
-                    prefix: std::net::Ipv4Addr::new(203, 0, 113, 7),
-                    prefix_len: 32,
-                    side: Side::Dst,
-                    location: 1,
-                    action: RuleAction::Keep,
-                    dmac: None,
-                },
+                SteerRule::v4(
+                    std::net::Ipv4Addr::new(198, 51, 100, 0),
+                    24,
+                    Side::Dst,
+                    15,
+                    RuleAction::Divert,
+                    None,
+                ),
+                SteerRule::v4(
+                    std::net::Ipv4Addr::new(203, 0, 113, 7),
+                    32,
+                    Side::Dst,
+                    1,
+                    RuleAction::Keep,
+                    None,
+                ),
             ],
             skipped_v6: 2,
         };
@@ -835,6 +835,171 @@ mod tests {
             old.steer_plans.is_empty(),
             "no plan on record — the teardown then removes what cookies identify and \
              says so, which is what such a file honestly supports"
+        );
+    }
+
+    /// A state file written by the pre-v6 build — v4 rules as flat
+    /// records, one of them from before `dmac` existed — adopts under
+    /// this build, at the SAME `STATE_VERSION`, into exactly the rules it
+    /// described.
+    ///
+    /// The upgrade that ships v6 steering restarts over steered boxes.
+    /// A parse failure there refuses adoption AND `detach --all`, which
+    /// is why the rule record did not change shape and the version did
+    /// not move.
+    #[test]
+    fn a_pre_v6_state_file_adopts_unchanged() {
+        use crate::steer::{RuleAction, RuleMatch, Side, SteerRule};
+        let dir = tmpdir();
+        let written_by_the_previous_build = serde_json::json!({
+            "version": STATE_VERSION,
+            "expected_routes": 1_600_000,
+            "hugepage_pool_bytes": 0, "hugepage_pages": 0,
+            "ports": [], "vpp_pid": null, "vpp_start_ticks": null,
+            "steer_rules": [["eth4", [15, 14, 0]]],
+            "steer_plans": [["eth4", 0, {
+                "rules": [
+                    { "prefix": "198.51.100.0", "prefix_len": 24, "side": "Src",
+                      "location": 15, "action": "Divert", "dmac": [2, 0, 0, 0, 0, 1] },
+                    { "prefix": "198.51.100.0", "prefix_len": 24, "side": "Src",
+                      "location": 14, "action": "Divert" },
+                    { "prefix": "255.255.255.255", "prefix_len": 32, "side": "Dst",
+                      "location": 0, "action": "Keep", "dmac": null }
+                ],
+                "skipped_v6": 1
+            }]]
+        });
+        fs::write(
+            ResourceState::path_in(&dir),
+            serde_json::to_string(&written_by_the_previous_build).unwrap(),
+        )
+        .unwrap();
+        let st = ResourceState::load(&dir)
+            .expect("adoption must not fail on a file the previous build wrote")
+            .expect("present");
+        let (iface, vf, plan) = &st.steer_plans[0];
+        assert_eq!((iface.as_str(), *vf, plan.skipped_v6), ("eth4", 0, 1));
+        assert_eq!(
+            plan.rules,
+            vec![
+                SteerRule::v4(
+                    "198.51.100.0".parse().unwrap(),
+                    24,
+                    Side::Src,
+                    15,
+                    RuleAction::Divert,
+                    Some([2, 0, 0, 0, 0, 1])
+                ),
+                SteerRule::v4(
+                    "198.51.100.0".parse().unwrap(),
+                    24,
+                    Side::Src,
+                    14,
+                    RuleAction::Divert,
+                    None
+                ),
+                SteerRule::v4(
+                    "255.255.255.255".parse().unwrap(),
+                    32,
+                    Side::Dst,
+                    0,
+                    RuleAction::Keep,
+                    None
+                ),
+            ]
+        );
+        assert!(plan
+            .rules
+            .iter()
+            .all(|r| matches!(r.shape, RuleMatch::V4 { .. })));
+    }
+
+    /// A plan carrying v6 rules round-trips through the file, and its v4
+    /// half is still readable by the pre-v6 build's record — the
+    /// downgrade half of the format argument on [`crate::steer::RuleSet`].
+    #[test]
+    fn a_v6_plan_round_trips_and_stays_readable_by_the_previous_build() {
+        use crate::steer::{L4Match, L4Proto, RuleAction, RuleMatch, RuleSet, Side, SteerRule};
+        let dir = tmpdir();
+        let v6 = |shape, location, action| SteerRule {
+            shape,
+            location,
+            action,
+        };
+        let plan = RuleSet {
+            rules: vec![
+                SteerRule::v4(
+                    "198.51.100.0".parse().unwrap(),
+                    24,
+                    Side::Src,
+                    15,
+                    RuleAction::Divert,
+                    Some([2, 0, 0, 0, 0, 1]),
+                ),
+                v6(
+                    RuleMatch::V6Frame {
+                        dmac: [2, 0, 0, 0, 0, 1],
+                        vlan: Some(100),
+                    },
+                    14,
+                    RuleAction::Divert,
+                ),
+                v6(
+                    RuleMatch::V6Frame {
+                        dmac: [2, 0, 0, 0, 0, 1],
+                        vlan: None,
+                    },
+                    13,
+                    RuleAction::Divert,
+                ),
+                v6(RuleMatch::V6L4(L4Match::Proto(58)), 0, RuleAction::Keep),
+                v6(
+                    RuleMatch::V6L4(L4Match::Port {
+                        proto: L4Proto::Udp,
+                        side: Side::Src,
+                        port: 123,
+                    }),
+                    1,
+                    RuleAction::Keep,
+                ),
+            ],
+            skipped_v6: 0,
+        };
+        let mut st = ResourceState::empty();
+        st.steer_rules.push(("eth4".into(), vec![15, 14, 13, 0, 1]));
+        st.steer_plans.push(("eth4".into(), 0, plan.clone()));
+        st.save(&dir).unwrap();
+        let back = ResourceState::load(&dir).unwrap().unwrap();
+        assert_eq!(back.steer_plans[0].2, plan, "every shape survives the file");
+
+        // The pre-v6 build's types, verbatim: no deny_unknown_fields, so
+        // `rules_v6` is ignored and `rules` must parse as it always did.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct OldRule {
+            prefix: std::net::Ipv4Addr,
+            prefix_len: u8,
+            side: Side,
+            location: u32,
+            action: RuleAction,
+            #[serde(default)]
+            dmac: Option<[u8; 6]>,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldSet {
+            rules: Vec<OldRule>,
+            #[allow(dead_code)]
+            skipped_v6: u32,
+        }
+        let raw = fs::read_to_string(ResourceState::path_in(&dir)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let old: OldSet = serde_json::from_value(v["steer_plans"][0][2].clone())
+            .expect("the previous build still reads the plan");
+        assert_eq!(old.rules.len(), 1, "it sees the v4 rule");
+        assert_eq!(old.rules[0].location, 15);
+        assert!(
+            v["steer_plans"][0][2]["rules_v6"].is_array(),
+            "and the v6 rules sit beside it, where it does not look"
         );
     }
 

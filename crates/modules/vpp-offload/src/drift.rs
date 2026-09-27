@@ -28,6 +28,14 @@
 //! re-opens — which is exactly the argument for CONTINUOUS detection
 //! rather than a one-time audit. So this names what is uncovered and
 //! degrades health; installing the rule stays the operator's decision.
+//!
+//! ## IPv4 only, deliberately
+//!
+//! A `v6-outbound` diversion ([`crate::steer::RuleMatch::V6Frame`]) is
+//! outside this scan. It relies on VPP's v6 FIB for correctness, and the
+//! router's own v6 services are protected by the keeps the planner puts
+//! above it ([`crate::steer::BUILTIN_KEEPS6`] and `steer-keep6`), not by
+//! a tripwire. Extending the scan to v6 kernel routes is its own change.
 
 use packetframe_common::config::Ipv4Prefix;
 
