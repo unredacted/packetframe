@@ -433,6 +433,11 @@ pub struct StatusSnapshot {
     /// before declaring any floor benign (runbook, "The null-drop
     /// gauge").
     pub null_drops: Option<u64>,
+    /// VPP's glean and ARP-reply transmit counters, absent until
+    /// sampled. Metrics only: rendered as gauges, never a health input —
+    /// a glean burst is a scan or a new host, not a fault. Not an
+    /// `observe_parts` argument; the service sets it on the snapshot.
+    pub neighbour_counters: Option<crate::engine::NeighbourCounters>,
     /// Bridge neighbours the FDB has never placed behind a member port
     /// (`"<nexthop> on <device>"`): VPP cannot reach them, so their
     /// routes are unresolvable. Degraded, neighbour named.
@@ -635,6 +640,7 @@ impl StatusSnapshot {
             shadowed_routes,
             kernel_delivered_routes,
             null_drops,
+            neighbour_counters: None,
             neighbours_unplaced,
             neighbour_moves,
             neighbours_flooded,
@@ -2377,6 +2383,44 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
             "cumulative VPP null-node drops (undeliverable traffic; absent until sampled)",
         );
         let _ = writeln!(out, "packetframe_vpp_null_drops{{module=\"{module}\"}} {n}");
+    }
+
+    // Cumulative, ABSENT until sampled — the null-drop rule. The
+    // family label mirrors `packetframe_vpp_family_routes`.
+    if let Some(c) = &snap.neighbour_counters {
+        gauge(
+            &mut out,
+            "packetframe_vpp_glean_sent",
+            "cumulative ARP requests (ipv4) / neighbour solicitations (ipv6) VPP's glean sent for local-route hosts it holds no neighbour for (absent until sampled)",
+        );
+        for (family, n) in [("ipv4", c.arp_requests_sent), ("ipv6", c.ns_sent)] {
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_glean_sent{{module=\"{module}\",family=\"{family}\"}} {n}"
+            );
+        }
+        gauge(
+            &mut out,
+            "packetframe_vpp_glean_throttled",
+            "cumulative glean requests VPP's per-destination 1 ms throttle suppressed (absent until sampled)",
+        );
+        for (family, n) in [("ipv4", c.arp_requests_throttled), ("ipv6", c.ns_throttled)] {
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_glean_throttled{{module=\"{module}\",family=\"{family}\"}} {n}"
+            );
+        }
+        if let Some(n) = c.arp_replies_sent {
+            gauge(
+                &mut out,
+                "packetframe_vpp_arp_replies_sent",
+                "cumulative ARP replies VPP transmitted, all for its loopback-address (absent until sampled)",
+            );
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_arp_replies_sent{{module=\"{module}\"}} {n}"
+            );
+        }
     }
 
     // ABSENT while the scan cannot read the kernel, never zero — the
@@ -5509,6 +5553,52 @@ mod tests {
         let m = render_metrics(&s, "vpp-offload");
         assert!(
             m.contains("packetframe_vpp_null_drops{module=\"vpp-offload\"} 117015"),
+            "{m}"
+        );
+    }
+
+    /// The glean gauges: absent until sampled, one series per family,
+    /// the reply gauge absent on its own when only its read failed —
+    /// and never a health input.
+    #[test]
+    fn the_glean_gauges_are_absent_until_sampled_and_informational() {
+        let mut s = snap_of(
+            &Supervisor::new(),
+            &ledger_with(0, 0, 0),
+            ApiHealth::NoProcess,
+            FibSync::NeverVerified,
+            Vec::new(),
+        );
+        let before = format!("{:?}", s.report());
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(!m.contains("packetframe_vpp_glean"), "{m}");
+        assert!(!m.contains("packetframe_vpp_arp_replies_sent"), "{m}");
+        s.neighbour_counters = Some(crate::engine::NeighbourCounters {
+            arp_requests_sent: 1380,
+            arp_requests_throttled: 97,
+            ns_sent: 4,
+            ns_throttled: 2,
+            arp_replies_sent: None,
+        });
+        let m = render_metrics(&s, "vpp-offload");
+        for line in [
+            "packetframe_vpp_glean_sent{module=\"vpp-offload\",family=\"ipv4\"} 1380",
+            "packetframe_vpp_glean_sent{module=\"vpp-offload\",family=\"ipv6\"} 4",
+            "packetframe_vpp_glean_throttled{module=\"vpp-offload\",family=\"ipv4\"} 97",
+            "packetframe_vpp_glean_throttled{module=\"vpp-offload\",family=\"ipv6\"} 2",
+        ] {
+            assert!(m.contains(line), "missing {line}:\n{m}");
+        }
+        assert!(!m.contains("packetframe_vpp_arp_replies_sent"), "{m}");
+        assert_eq!(
+            format!("{:?}", s.report()),
+            before,
+            "metrics only, never a health input"
+        );
+        s.neighbour_counters.as_mut().unwrap().arp_replies_sent = Some(3);
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(
+            m.contains("packetframe_vpp_arp_replies_sent{module=\"vpp-offload\"} 3"),
             "{m}"
         );
     }
