@@ -153,6 +153,10 @@ pub struct WireRoute {
     /// would fold a v6 prefix into four bytes of a bogus v4 one.
     pub is_ip6: bool,
     pub addr16: [u8; 16],
+    /// Adds or removes just the paths sent, rather than replacing the
+    /// prefix's whole path set — which an attached route's move must NOT
+    /// be: two steps leave a window holding both paths, or a stale one.
+    pub is_multipath: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -340,6 +344,10 @@ pub struct Behaviour {
     /// `None` keeps the loopback out of the dump, which every older test
     /// relies on (each attach creates it afresh).
     pub existing_loopback6: Option<&'static [([u8; 16], u8)]>,
+    /// Refuse the route op at this 0-based position on a connection, if
+    /// it is an add, with a non-zero retval and WITHOUT applying it — one
+    /// route VPP will not take at one moment, the connection unharmed.
+    pub reject_route_add_at: Option<usize>,
     /// Acknowledge IPv6 address adds with retval 0 WITHOUT applying them,
     /// so a readback finds nothing — the acknowledged-but-absent shape.
     pub drop_v6_address_adds: bool,
@@ -862,22 +870,18 @@ fn serve(
                     path_indices: r.route.paths.iter().map(|p| p.sw_if_index).collect(),
                     is_ip6,
                     addr16,
+                    is_multipath: r.is_multipath,
                 }));
-                let refuse_v6 = is_ip6 && behaviour.reject_v6_routes;
+                let refuse = (is_ip6 && behaviour.reject_v6_routes)
+                    || (r.is_add && behaviour.reject_route_add_at == Some(routes_seen));
                 // A real VPP applies before it answers — unless it refuses.
-                if is_ip6 && !refuse_v6 {
-                    let mut routes = table6.lock().unwrap();
-                    if r.is_add {
-                        routes.insert((addr16, r.route.prefix.len), r.route.paths.clone());
+                if !refuse {
+                    if is_ip6 {
+                        let mut routes = table6.lock().unwrap();
+                        apply_route_op(&mut routes, (addr16, r.route.prefix.len), &r);
                     } else {
-                        routes.remove(&(addr16, r.route.prefix.len));
-                    }
-                } else if !is_ip6 {
-                    let mut routes = table.lock().unwrap();
-                    if r.is_add {
-                        routes.insert((addr, r.route.prefix.len), r.route.paths.clone());
-                    } else {
-                        routes.remove(&(addr, r.route.prefix.len));
+                        let mut routes = table.lock().unwrap();
+                        apply_route_op(&mut routes, (addr, r.route.prefix.len), &r);
                     }
                 }
 
@@ -888,7 +892,7 @@ fn serve(
                 // Reject deletes for a while, so the retry path is
                 // exercised against a per-route refusal rather than a
                 // connection fault.
-                let retval = if refuse_v6 {
+                let retval = if refuse {
                     -1
                 } else if !r.is_add && behaviour.reject_deletes > 0 {
                     behaviour.reject_deletes -= 1;
@@ -1614,6 +1618,45 @@ fn serve(
 /// is what the readback filter looks for. Leaving it zero produces the
 /// shape of a connected route — attached, no nexthop — which must NOT be
 /// adopted.
+/// One `ip_route_add_del` applied to a table as VPP's API source would:
+/// without `is_multipath` an add REPLACES the prefix's paths and a delete
+/// removes the prefix; with it, an add appends each path the prefix does
+/// not already have (VPP dedups an identical path) and a delete removes
+/// the matching paths, the prefix going with its last one.
+fn apply_route_op<K: Ord>(
+    routes: &mut std::collections::BTreeMap<K, Vec<FibPath>>,
+    key: K,
+    r: &IpRouteAddDel,
+) {
+    let same = |a: &FibPath, b: &FibPath| {
+        a.sw_if_index == b.sw_if_index && a.nh.address.0 == b.nh.address.0 && a.proto == b.proto
+    };
+    match (r.is_add, r.is_multipath) {
+        (true, false) => {
+            routes.insert(key, r.route.paths.clone());
+        }
+        (false, false) => {
+            routes.remove(&key);
+        }
+        (true, true) => {
+            let held = routes.entry(key).or_default();
+            for p in &r.route.paths {
+                if !held.iter().any(|h| same(h, p)) {
+                    held.push(p.clone());
+                }
+            }
+        }
+        (false, true) => {
+            if let Some(held) = routes.get_mut(&key) {
+                held.retain(|h| !r.route.paths.iter().any(|p| same(h, p)));
+                if held.is_empty() {
+                    routes.remove(&key);
+                }
+            }
+        }
+    }
+}
+
 fn existing_route(addr: [u8; 4], len: u8, sw_if_index: u32, has_nh: bool, nh: [u8; 4]) -> IpRoute {
     let mut un = [0u8; 16];
     un[..4].copy_from_slice(&addr);

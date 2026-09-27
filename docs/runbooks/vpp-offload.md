@@ -959,10 +959,18 @@ module vpp-offload
 
 One line does three things at attach:
 
-1. **An attached route** for the prefix onto the port's dot1q subif —
-   `show ip fib 192.0.2.0/24` shows the subif adjacency, not a
-   drop. Installed outside the route ledger (module-owned topology,
-   like the loopback), so resyncs never withdraw it.
+1. **An attached route** for the prefix onto the VLAN's BVI when it is
+   bridged (the BVI of the port's own bridge — a second bridge reusing
+   the vid gets none), else the port's VF if the port sends the VLAN
+   untagged, else its dot1q subif — `show ip fib 192.0.2.0/24` shows
+   that adjacency, not a drop. Installed outside the route ledger
+   (module-owned topology, like the loopback), so resyncs never
+   withdraw it. The choice is re-made while VPP runs: a BVI built after
+   attach (the router had no L3 device on the VLAN yet), or a VLAN that
+   turns untagged or tagged on the port, moves the route within seconds
+   in one replacing route update (`attached route moved` in the
+   journal, with both interface indices). A move VPP refused or never
+   answered is re-sent on the next placement pass.
 2. **The neighbour mirror**: kernel neighbours on the backing bridge
    (the `via` of the covering fast-path `local-prefix`) become VPP
    static neighbours, each on the subif of the member port the bridge
