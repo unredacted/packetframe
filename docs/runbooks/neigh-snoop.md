@@ -301,6 +301,68 @@ purpose:
 `packetframe status` prints each bridge's persisted table size and
 age without a daemon.
 
+## Customer VLANs behind a vpp-offload `local-route6`
+
+The module has a second job besides IX fabrics. On a customer VLAN
+whose inbound IPv6 is delivered by VPP, it is the only thing on the box
+that learns a host VPP had to go looking for. The whole chain is in the
+vpp-offload runbook's `local-route6` section. This module's part:
+
+- VPP's glean sends a neighbour solicitation from the bridge's own
+  link-local and MAC (the BVI shares the bridge's MAC). The host answers
+  with a **solicited NA unicast to the router**. ICMPv6 is never
+  diverted, so the answer lands on the kernel bridge, and the kernel
+  discards it: it never asked, holds no INCOMPLETE entry, and 5.15 has
+  no `accept_untracked_na`.
+- The capture socket sees it as `PACKET_HOST`, and the parser takes the
+  target and target link-layer option from any NA, solicited or not,
+  unicast or multicast. A global target inside the bridge's `prefix` is
+  admitted and installed `STALE` like any learned pair. fast-path's
+  `local-prefix6` then registers the host and VPP gets it as a static
+  neighbour.
+- The solicitation itself, should the bridge see it, is never learned:
+  its source is the bridge's own address and MAC (`own_address`, or
+  `own_mac` if the address is not yet known).
+
+Config, per customer VLAN:
+
+```
+module neigh-snoop
+  bridge br1337                       # RESTART-ONLY; no ix-mode
+  prefix br1337 2001:db8:0:1337::/64  # the customer /64, the one local-route6 names
+```
+
+- **No `ix-mode`.** It only silences fast-path's proactive probes, which
+  a fabric ACL drops. On a customer LAN they are harmless and useful.
+- **No `fe80::/10`.** VPP never carries a link-local neighbour, and
+  fast-path never synthesizes a route for one. The host's link-local,
+  learned from the NA's source, is refused as `outside_prefix`, which is
+  expected.
+- **`table-max`** (default 4096) is per bridge. Size it for hosts ×
+  addresses per host: privacy addressing keeps several addresses per host
+  alive at once, and least-recently-seen entries are evicted past it.
+- **Promiscuous mode on a customer bridge** makes the bridge pass every
+  frame it forwards up to its own stack, where the socket filter drops
+  everything but ARP/ND before userspace. That costs nothing extra on a
+  bridge whose hosts reach each other through an external switch.
+  Measure it before enabling on a bridge that switches heavy
+  host-to-host traffic itself.
+
+**DAD probes are not learned from**, not even their target, though the
+Ethernet source names the host claiming it. The address is tentative.
+If DAD fails, the claimant is the duplicate, and a STALE entry written
+for it would pin the owner's address to the loser's MAC. The owner's
+defending NA would then sit behind the 30 s install holddown. The probe
+also carries no link-layer option for the anti-spoof check to bind.
+Hosts that complete DAD are learned the first time VPP solicits them,
+which costs the one packet glean always costs. `parse_rejects_total
+{reason="dad_source"}` counts the probes.
+
+Verify on the box: `ip -6 neigh show dev br1337 nud stale` lists
+the installed hosts. `frames_total{kind="na"}` and
+`install_total{outcome="confirmed"}` for `iface="br1337"` climb as VPP
+reaches new hosts, alongside `vppctl show errors | grep -i glean`.
+
 ## Coexistence
 
 - **guard** polices the kernel's *own* ARP/NS emission on the same
@@ -312,7 +374,8 @@ age without a daemon.
 - **vpp-offload**: VPP's adjacencies are mirrored from the kernel
   neighbour table through the resolver, so seeded entries reach VPP
   too. ARP/ND are not prefix-steered, so the tap keeps seeing them
-  under steering.
+  under steering, and ICMPv6 is never diverted by `v6-outbound`, so
+  the same holds for IPv6 (see the customer-VLAN section above).
 - **HA standby**: the same config runs on the standby; its bridges are
   down, so the module idles with `link absent`. Its persisted cache is
   **empty on first failover** and fills from the fabric within minutes.

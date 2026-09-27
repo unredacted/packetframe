@@ -1006,6 +1006,137 @@ fast-path `local-prefix` (tier agreement — a failover must not change
 what is delivered), and overlapping declarations. Restart-only; the
 reload names it.
 
+### local-route6: a customer VLAN VPP can deliver IPv6 to
+
+`local-route` is enough for IPv4 service hosts, which are static and
+which the kernel has resolved. A customer VLAN's IPv6 hosts are
+neither: customers talk to the router from their link-locals, so the
+kernel rarely holds their global addresses, and privacy addresses
+rotate daily. Before inbound IPv6 for a customer VLAN is steered into
+VPP, VPP must be able to reach a host it has never been told about.
+Three modules take part, and all three lines are required:
+
+```
+module fast-path
+  allow-prefix6 2001:db8:0:1337::/64
+  local-prefix6 2001:db8:0:1337::/64 via br1337
+
+module vpp-offload
+  v6 on
+  port eth4 cores 1 steer on vlans 88,1337
+  local-route6 2001:db8:0:1337::/64 port eth4 vlan 1337
+
+module neigh-snoop
+  bridge br1337                       # not ix-mode
+  prefix br1337 2001:db8:0:1337::/64  # the customer /64; no fe80::/10 needed
+```
+
+How a never-seen host becomes reachable:
+
+1. **`local-route6`** installs an attached `/64` on the VLAN's BVI (or
+   subif / VF, chosen as for `local-route`), and shadows the mirror
+   inside it, including a route for the `/64` itself, which would
+   otherwise replace the attached route's path. This is also what makes
+   customer hosts deliverable in VPP at all, even ones the kernel knows:
+   `local-prefix6`'s `/128`s are local-ARP routes and never reach VPP,
+   and a static neighbour becomes a usable host route only under an
+   attached cover on its own interface.
+2. **VPP gleans.** A packet for a host VPP holds no neighbour for hits
+   the attached route's glean adjacency, and `ip6-glean` sends a
+   neighbour solicitation to the host's solicited-node group out the
+   bridge domain. VPP v26.06 always sources it from the interface's
+   link-local, so nothing beyond the ip6 enable `v6 on` already does
+   is configured: no global address, no connected prefix. The BVI
+   carries the kernel bridge's MAC, so its EUI-64 link-local is the
+   bridge's own (assuming the bridge uses the default EUI-64 address
+   generation) and so is the solicitation's source link-layer address.
+   The packet that triggered it is **dropped**: glean does not queue.
+3. **The host answers the router**: a solicited NA, unicast to the
+   bridge's MAC. It is ICMPv6, which the MCAM never diverts, so it
+   reaches the kernel bridge. The kernel discards it: it holds no
+   INCOMPLETE entry for the target, and 5.15 has no
+   `accept_untracked_na`.
+4. **neigh-snoop learns it** (target + target link-layer option; the
+   Solicited flag and unicast destination are not consulted) and
+   installs it `STALE`, at its `install-rate`.
+5. **fast-path's `local-prefix6`** sees the `RTM_NEWNEIGH`, registers
+   the host as a `/128` next hop, and the programmer hands the
+   neighbour to vpp-offload's feed.
+6. **VPP gets a static neighbour** on the BVI, placed per host from the
+   bridge FDB like any bridge neighbour. The next packet is delivered.
+
+The known cost: the first packet to an address VPP has never had is
+lost, and so is every packet until steps 3-6 finish (not yet measured
+on hardware; neigh-snoop's install pacing is one term of it).
+IPv4 makes the same trade under `local-route`. TCP retransmits a lost
+SYN; a one-shot UDP query to a quiet host can be lost.
+
+**Solicitation rate.** VPP throttles glean per destination and
+interface: at most one solicitation per millisecond per worker
+(`nd_throttle`, compiled in, with no API to tune it). The kernel, for
+comparison, sends `mcast_solicit` (3) solicitations a second apart per
+resolution attempt. So a sustained stream to an
+address that never answers (a departed host, a typo, a scan) makes VPP
+solicit up to ~1000 times a second per worker toward that address's
+solicited-node group, and a scan across the `/64` solicits about once
+per scanned packet. On a switch without MLD snooping each one floods
+the VLAN. That is the price of delivering IPv6 in VPP at all, and it is
+not a stall risk: glean runs in VPP's data plane and never reaches the
+API, and what comes back is paced by neigh-snoop's `install-rate`
+(default 50/s, daemon-wide). A customer host has no routes resolving
+through it, so a neighbour add is not the dependent-FIB walk an IX
+next hop's is. Watch `ip6-glean`'s counters (below). If the rate matters
+on a VLAN, the rollback is dropping its `local-route6` (restart).
+
+Entries age out with the kernel's: an unused `STALE` entry is removed
+by neighbour GC (`gc_stale_time`, once the table is above
+`gc_thresh1`), `RTM_DELNEIGH` reaches VPP as a lost neighbour, and the
+next inbound packet gleans again. neigh-snoop's `table-max` (default
+4096) bounds what it remembers per bridge. Size it for hosts ×
+addresses per host, because privacy addressing keeps several per host
+alive at once.
+
+Delivery is designed for bridged VLANs (the BVI case). On a plain
+port's subif or an untagged VF the solicitation carries the port's own
+MAC, and whether the NA reaches the kernel or the VF on the reference
+NIC has not been measured.
+
+Validation refuses `local-route6` without `v6 on`, outside every
+fast-path `local-prefix6` (the v4 `local-prefix` is no cover), on a
+port or vlan the section does not declare, and overlapping another
+`local-route6`. Restart-only on both doors: a reload names it, and a
+`--keep-vpp` restart across an added or removed line refuses adoption
+and restarts VPP. That restart is what removes an attached route,
+since the route is kept outside the ledger. A config without any
+`local-route6` records exactly what earlier builds recorded, so an
+upgrade still adopts.
+
+Verifying on the box (`vppctl` is fine for these; they are not bulk
+reads):
+
+```sh
+# The attached /64, on the BVI (loop1337), and no drop or mirror path.
+vppctl show ip6 fib 2001:db8:0:1337::/64
+# Static neighbours VPP holds for the VLAN's hosts ("S" flag).
+vppctl show ip6 neighbors loop1337
+# Glean at work: "neighbor solicitations sent" climbing when new hosts
+# are reached; "throttled" is the rate limit; "address overflow drops"
+# means link down or ip6 not enabled on the interface; "no source
+# address" means it has no link-local (ip6 enable failed).
+vppctl show errors | grep -i glean
+# What neigh-snoop installed on the kernel side.
+ip -6 neigh show dev br1337 nud stale
+# The learning side, per bridge.
+grep 'neigh_snoop_.*iface="br1337"' /var/lib/node_exporter/textfile/packetframe.prom
+```
+
+A healthy VLAN shows solicitations sent roughly tracking new addresses,
+`STALE` entries appearing for the customer `/64`, and the same hosts as
+static neighbours on `loop1337`. If solicitations climb but no `STALE`
+entry appears, the NA is not reaching neigh-snoop: check the `bridge`
+and `prefix` lines, and that `frames_total{kind="na"}` counts on the
+bridge.
+
 ### direction dst: steering inbound
 
 Per-port, because the bidirectional service edge is asymmetric by
