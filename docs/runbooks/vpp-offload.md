@@ -126,8 +126,9 @@ IPv4 fields, so ARP frames (0x0806) can never be steered — VPP
 physically cannot receive an ARP request. The IPv6 diversion
 (`v6-outbound`) keeps the same property for neighbour discovery by a
 different route: solicitations to multicast MACs never match its
-router-MAC term, and the unicast rest of ICMPv6 is carved out by a
-built-in keep at higher priority — see
+router-MAC term, and the unicast rest (probes and echo to the gateway's
+link-local) is answered by VPP's bridge interface, which carries the
+bridge's MAC and so the same link-local — see
 [v6 outbound steering](#v6-outbound-steering).
 
 **Only IPv4 neighbours are programmed.** VPP carries v4 routes only (no
@@ -1380,9 +1381,15 @@ module vpp-offload
 One rule per (listed VLAN × receive MAC): ethertype 0x86DD, destination
 MAC = one the router's L3 devices answer to on that port (the same set
 the v4 rules are scoped to), outer VLAN id = the listed VID (PCP and DEI
-ignored). Into the port's VF. `v6-outbound untagged` drops the VLAN term
-and is refused on any port that declares VLANs, because the NIC has no
-untagged-only match — a rule without a VLAN term matches every VLAN.
+ignored). Into the port's VF. Every listed VID must be carried
+**tagged by a kernel bridge** on that port (checked when planned),
+because of neighbour discovery: customers probe their gateway's
+link-local with unicast NS to the router MAC, and no keep can carve those
+out (next section). VPP answers them itself — from the VLAN's bridge
+interface, which carries the bridge's MAC and therefore the same
+link-local as the kernel. A plain port reaches VPP through its VF, whose
+MAC and link-local differ, so `v6-outbound` there (and the `untagged`
+form, which only a port with no VLANs can declare) is refused.
 
 Three consequences to decide on before listing a VLAN:
 
@@ -1412,17 +1419,26 @@ this NIC — so they are matched first:
 
 | Keep | Why |
 | --- | --- |
-| ICMPv6 (`ip6 l4proto 58`) — built in | Unicast NUD probes and solicitations for the gateway arrive on the router MAC. Diverted, VPP never answers and customers lose their gateway. Also keeps echo to the router answerable. |
 | TCP 53, UDP 53 (`dst-port`) — built in | The router's resolver. |
 | `steer-keep6 <tcp\|udp> <port> [dst\|src\|both]` | Everything else the router terminates: NTP 123, DHCPv6 relay 547, SSH, SNMP, BGP 179, BFD. `src` keeps replies to sessions the ROUTER opened (BGP where it is the active side). |
 
+**There is no ICMPv6 keep, and there must never be one.** This NIC's
+driver accepts `ip6 l4proto 58` but ignores the next-header value, so the
+rule matches EVERY v6 frame: on hardware (2026-09-27) a drop-all-v6
+divert beside an `l4proto 58` keep let TCP through. Installed above the
+diversion it would silently switch v6 steering off, and the readback
+cannot see it (the driver echoes the spec back). TCP/UDP **port** keeps
+were proven port-specific the same day (`tcp6 dst-port 80` left TCP 443
+blocked; `dst-port 443` passed it). Unicast neighbour discovery and echo
+with the gateway are answered by VPP instead (see above).
+
 They carry **protocol and port only** — no address, no MAC, no VLAN — so
-they apply port-wide and also keep customer ICMPv6 and DNS toward
+they apply port-wide and also keep customer DNS toward
 **external** hosts on the eBPF tier. That is intended: correct, and a
 small slice. Two costs to know: they occupy MCAM slots only while some
 port diverts v6 (a port with `steer-keep6` lines and no `v6-outbound`
 plans none), and everything they match lands on PF queue 0 rather than
-RSS — all of the port's ICMPv6 and DNS, every VLAN. If queue 0's softirq
+RSS — all of the port's DNS, every VLAN. If queue 0's softirq
 core shows it, per-VLAN keeps are the remedy (`tcp6 dst-port N vlan
 <vid> m 0xf000` inserts on this kernel too); they are not built yet
 because they multiply slots by the VLAN count.
@@ -1456,15 +1472,17 @@ jq '.steer_plans[] | .[2].rules_v6' /var/lib/packetframe/state/vpp-offload.json
 `packetframe status`'s steering row names the diverted ports and VLANs
 ("outbound IPv6 on eth4 vlan 100,200"), read from the installed plan.
 
-From a customer host on a diverted VLAN: ping the gateway's v6 address
-and resolve a name through it (both kept, both must work); `ip -6 neigh`
-must show the gateway `REACHABLE`, not `FAILED`; a traceroute to an
-external v6 destination must still work (VPP forwarding). Then check
-the diversion is real rather than shadowed: TCP to a router port you
-did **not** keep (say SSH without a keep) must fail. If it succeeds,
-something above the diversion matches all v6 — see the owed hardware
-check on `ip6 l4proto` in the PR notes — and nothing is being diverted
-(safe, but the feature is off).
+From a customer host on a diverted VLAN: ping the gateway's
+**link-local** (VPP answers it) and resolve a name through the router
+(DNS is kept); `ip -6 neigh` must show the gateway `REACHABLE`, not
+`FAILED`, well past its reachable time (VPP answering the unicast NUD
+probes); a traceroute to an external v6 destination must still work (VPP
+forwarding). Then check the diversion is real rather than shadowed: TCP
+to a router port you did **not** keep (say SSH without a keep) must
+fail. If it succeeds, something above the diversion matches all v6 and
+nothing is being diverted (safe, but the feature is off). Traffic to the
+gateway's GLOBAL address on the diverted VLAN reaches VPP, which does
+not own it: keep any service customers use there with `steer-keep6`.
 
 ### What watches it, and what does not
 

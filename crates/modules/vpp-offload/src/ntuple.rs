@@ -4304,11 +4304,7 @@ mod tests {
         sys::reset();
         let plan = plan_both_families();
         let v6 = plan.rules.iter().filter(|r| r.is_v6()).count();
-        assert_eq!(
-            v6,
-            2 + 4,
-            "2 VLAN diversions + ICMPv6, TCP 53, UDP 53, UDP 123"
-        );
+        assert_eq!(v6, 2 + 3, "2 VLAN diversions + TCP 53, UDP 53, UDP 123");
 
         let mut s = steering(vec![("eth0".into(), 0)], plan.clone());
         s.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
@@ -4352,8 +4348,17 @@ mod tests {
         let keep_loc = plan
             .rules
             .iter()
-            .find(|r| matches!(r.shape, RuleMatch::V6L4(L4Match::Proto(58))))
-            .expect("the ICMPv6 keep")
+            .find(|r| {
+                matches!(
+                    r.shape,
+                    RuleMatch::V6L4(L4Match::Port {
+                        proto: crate::steer::L4Proto::Udp,
+                        port: 53,
+                        ..
+                    })
+                )
+            })
+            .expect("the UDP 53 keep")
             .location;
         let mut s = steering_v6(vec![("eth0".into(), 0)], plan);
         s.steer().expect("steer");
@@ -4423,7 +4428,7 @@ mod tests {
             .filter(|r| r.action == crate::steer::RuleAction::Keep)
             .map(|r| r.location)
             .collect();
-        assert!(keeps.len() >= 2 + 4, "v4 and v6 keeps both in play");
+        assert!(keeps.len() >= 2 + 3, "v4 and v6 keeps both in play");
         // Insertion order is plan order; the last rule is a v6 keep, so
         // failing there leaves every other rule — v4 and v6 keeps and
         // diversions — already written.

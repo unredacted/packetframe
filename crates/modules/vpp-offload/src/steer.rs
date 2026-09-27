@@ -41,16 +41,19 @@
 //!
 //! What the profile DOES extract was probed on 2026-09-26 against the
 //! production kernel: the ethertype, the destination MAC, the outer VLAN
-//! id, the v6 L4 protocol and TCP/UDP ports. That is enough for one
+//! id and TCP/UDP ports (an `ip6 l4proto` rule inserts but matches every
+//! v6 frame — see [`BUILTIN_KEEPS6`]). That is enough for one
 //! policy that needs no address: **outbound IPv6** — a frame of
 //! ethertype 0x86DD addressed to one of the router's receive MACs, on a
 //! VLAN the operator named (`port … v6-outbound <vid>,…`), is a customer
 //! sending through (or to) the router, and is diverted to the VF
 //! ([`RuleMatch::V6Frame`]). What the ROUTER terminates arrives on that
 //! same MAC, so it is carved back out by higher-priority kernel-delivery
-//! rules keyed on L4 alone ([`RuleMatch::V6L4`]): ICMPv6 (neighbour
-//! discovery with the gateway), DNS, and whatever the operator adds with
-//! `steer-keep6`. See [`BUILTIN_KEEPS6`].
+//! rules keyed on L4 ports alone ([`RuleMatch::V6L4`]): DNS, and whatever
+//! the operator adds with `steer-keep6`. Neighbour discovery and echo
+//! with the gateway are answered by VPP, not kept — the driver ignores
+//! the v6 next-header field, so a protocol keep would match everything.
+//! See [`BUILTIN_KEEPS6`].
 //!
 //! The allowlist does not scope a v6 diversion — the NIC cannot read the
 //! source address that would. Every IPv6 frame to the router on a listed
@@ -133,7 +136,11 @@ pub enum RuleMatch {
 /// The L4 half of a v6 keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum L4Match {
-    /// `ip6 l4proto N` (`IPV6_USER_FLOW`).
+    /// `ip6 l4proto N` (`IPV6_USER_FLOW`). NEVER planned: this NIC's
+    /// driver accepts the rule but ignores the next-header value, so it
+    /// matches every IPv6 frame (see [`BUILTIN_KEEPS6`]). The variant
+    /// stays so the encoder, the readback and state files written by the
+    /// build that planned one can still describe and remove it.
     Proto(u8),
     /// `tcp6`/`udp6` `src-port`/`dst-port N` (`TCP_V6_FLOW`/`UDP_V6_FLOW`).
     Port {
@@ -263,24 +270,34 @@ pub enum RuleAction {
 }
 
 /// The v6 keeps every port that diverts IPv6 carries regardless of
-/// config, at higher priority than the diversion.
+/// config, at higher priority than the diversion: DNS, TCP and UDP 53,
+/// the router's resolver.
 ///
-/// - **ICMPv6** — neighbour discovery with the gateway. Unicast NUD
-///   probes and solicitations for the router's address arrive on its
-///   MAC; diverted into VPP (which never answers NDP — neighbours are
-///   static, from the resolver), a customer's cache entry for its
-///   gateway fails and its whole v6 goes with it. Also keeps echo to
-///   the router answerable.
-/// - **DNS, TCP and UDP 53** — the router's resolver.
+/// There is deliberately NO ICMPv6 keep, and none may ever be planned.
+/// This NIC's key-extraction profile carries no IPv6 L3 fields, and the
+/// driver accepts an `ip6 l4proto N` rule while ignoring the next-header
+/// value: on hardware (2026-09-27), a drop-all-v6 divert beside an
+/// `l4proto 58` keep let TCP through, so the "ICMPv6" keep matched every
+/// v6 frame and would have disabled the diversion entirely. The readback
+/// cannot catch it — the driver echoes the spec back. TCP/UDP PORT keeps
+/// were proven port-specific the same day (a `tcp6 dst-port 80` keep left
+/// TCP 443 blocked; `dst-port 443` let it through), so they stay.
 ///
-/// Matched on L4 alone, so they also keep customer ICMPv6 and DNS to
-/// EXTERNAL destinations on the eBPF tier. That is intended: correct,
-/// and a small slice. Anything else the router terminates for customers
-/// on a diverted VLAN (NTP 123, DHCPv6 547, BGP 179, SSH …) is the
-/// operator's `steer-keep6`, and without it that traffic dies in VPP —
-/// the w23 lesson in IPv6 form.
-pub const BUILTIN_KEEPS6: [L4Match; 3] = [
-    L4Match::Proto(58),
+/// What an ICMPv6 keep was for — customers' unicast neighbour probes and
+/// echo to their gateway — is answered by VPP instead: the diversion is
+/// only planned on VLANs a kernel bridge carries tagged, where VPP's
+/// bridge interface carries the bridge's MAC and so the same link-local
+/// as the kernel (see `VppOffloadConfig::v6_steering`). Multicast
+/// neighbour discovery never matches the diversion (its destination MAC
+/// is not the router's) and stays with the kernel.
+///
+/// Matched on L4 alone, so they also keep customer DNS to EXTERNAL
+/// destinations on the eBPF tier. That is intended: correct, and a small
+/// slice. Anything else the router terminates for customers on a
+/// diverted VLAN (NTP 123, DHCPv6 547, SSH …) is the operator's
+/// `steer-keep6`, and without it that traffic dies in VPP — the w23
+/// lesson in IPv6 form.
+pub const BUILTIN_KEEPS6: [L4Match; 2] = [
     L4Match::Port {
         proto: L4Proto::Tcp,
         side: Side::Dst,
@@ -733,7 +750,7 @@ impl RuleSet {
             if !v6_diverts.is_empty() {
                 parts.push(format!(
                     "{} IPv6 outbound diversion(s) ({} × {} receive MAC(s)), plus {} IPv6 \
-                     keep(s): 3 built-in [ICMPv6, TCP 53, UDP 53] + {operator_keeps6} \
+                     keep(s): 2 built-in [TCP 53, UDP 53] + {operator_keeps6} \
                      `steer-keep6`",
                     v6_diverts.len(),
                     V6Steering::describe_vlans(&v6.vlans),
@@ -1206,6 +1223,32 @@ mod tests {
     /// EVERY keep — v4 and v6 — sits below every diversion, so ICMPv6 and
     /// DNS to the router are delivered to the kernel before the v6
     /// diversion can see them.
+    /// No planned IPv6 keep is ever a protocol match: this NIC's driver
+    /// ignores the next-header value of an `ip6 l4proto` rule, so one
+    /// would match every v6 frame, sit above the diversion and switch it
+    /// off without the readback noticing (hardware, 2026-09-27).
+    #[test]
+    fn no_v6_keep_is_ever_a_protocol_match() {
+        assert!(BUILTIN_KEEPS6
+            .iter()
+            .all(|k| matches!(k, L4Match::Port { .. })));
+        let set = RuleSet::plan_with_v6(
+            &[],
+            &[],
+            McamBudget {
+                free: (0..64).rev().collect(),
+            },
+            VppSteerDirection::Both,
+            &[M1],
+            &v6_on(&[100], &[]),
+        )
+        .expect("fits");
+        assert!(set
+            .rules
+            .iter()
+            .all(|r| !matches!(r.shape, RuleMatch::V6L4(L4Match::Proto(_)))));
+    }
+
     #[test]
     fn v6_keeps_outrank_every_diversion_on_the_port() {
         let set = RuleSet::plan_with_v6(
@@ -1275,7 +1318,7 @@ mod tests {
         locs.sort_unstable();
         locs.dedup();
         assert_eq!(locs.len(), set.rules.len(), "every rule has its own slot");
-        assert_eq!(set.rules.len(), 2 + 2 + 4 + 4);
+        assert_eq!(set.rules.len(), 2 + 2 + 4 + 3);
         assert_eq!(set.v6_outbound_vlans(), vec![Some(100), Some(200)]);
         // v4 first, then v6 — the order the state file round trip keeps.
         let first_v6 = set.rules.iter().position(|r| r.is_v6()).unwrap();
@@ -1296,13 +1339,16 @@ mod tests {
             &[M1, M2],
             &v6_on(&[100, 200], &[]),
         )
-        .expect_err("2 + 2 + 4 + 3 = 11 cannot fit 9");
-        assert!(e.contains("needs 11 MCAM rule(s)"), "{e}");
+        .expect_err("2 + 2 + 4 + 2 = 10 cannot fit 9");
+        assert!(e.contains("needs 10 MCAM rule(s)"), "{e}");
         assert!(
             e.contains("4 IPv6 outbound diversion(s) (vlan 100,200 × 2 receive MAC(s))"),
             "{e}"
         );
-        assert!(e.contains("3 IPv6 keep(s): 3 built-in"), "{e}");
+        assert!(
+            e.contains("2 IPv6 keep(s): 2 built-in [TCP 53, UDP 53]"),
+            "{e}"
+        );
         assert!(e.contains("0 `steer-keep6`"), "{e}");
         assert!(e.contains("none is installed"), "{e}");
 
@@ -1315,8 +1361,8 @@ mod tests {
             &[M1],
             &v6_on(&[100], &[ntp()]),
         )
-        .expect_err("1 + 4 cannot fit 2");
-        assert!(e.contains("needs 5 MCAM rule(s)"), "{e}");
+        .expect_err("1 + 3 cannot fit 2");
+        assert!(e.contains("needs 4 MCAM rule(s)"), "{e}");
         assert!(e.contains("1 `steer-keep6`"), "{e}");
         assert!(!e.contains("steerable prefix"), "{e}");
     }
@@ -1354,8 +1400,8 @@ mod tests {
         );
         assert_eq!(
             v6_only.rules.len(),
-            1 + 3,
-            "the restated TCP 53 is not a 4th keep"
+            1 + 2,
+            "the restated TCP 53 is not a 3rd keep"
         );
         assert_eq!(
             v6_only.skipped_v6, 1,
@@ -1417,7 +1463,7 @@ mod tests {
         .expect("fits");
         let json = serde_json::to_value(&set).unwrap();
         assert_eq!(json["rules"].as_array().unwrap().len(), 2 + 2);
-        assert_eq!(json["rules_v6"].as_array().unwrap().len(), 1 + 4);
+        assert_eq!(json["rules_v6"].as_array().unwrap().len(), 1 + 3);
         let back: RuleSet = serde_json::from_value(json).unwrap();
         assert_eq!(back, set);
         // A v4-only set writes no `rules_v6` at all: byte-identical to
