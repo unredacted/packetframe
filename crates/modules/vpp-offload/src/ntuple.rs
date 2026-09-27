@@ -368,13 +368,21 @@ pub fn mask_for(prefix_len: u8) -> u32 {
 /// Each is the stored form of a CLI rule inserted on the production
 /// kernel on 2026-09-26, under the same mask rule: a set bit compares.
 ///
-/// - [`RuleMatch::V6Frame`] ← `flow-type ether proto 0x86dd dst <MAC>
-///   vlan <vid> m 0xf000`: `ETHER_FLOW | FLOW_EXT`; the MAC in the
-///   union's `ethhdr.h_dest` (NOT `h_ext` — `ETHER_FLOW` carries its own
+/// - [`RuleMatch::V6Frame`] with `l4: Some(p)` ← `flow-type tcp6|udp6
+///   dst-mac <MAC> vlan <vid> m 0xf000`: `TCP_V6_FLOW`/`UDP_V6_FLOW |
+///   FLOW_EXT | FLOW_MAC_EXT`; the union and its mask all zero (no
+///   address, no port — the flow type alone carries the L4 term), the
+///   MAC in `h_ext.h_dest` under an all-ones `m_ext.h_dest` exactly as
+///   the v4 divert scopes it, and `h_ext.vlan_tci` = the VID under
+///   `m_ext.vlan_tci` = 0x0FFF. Untagged drops `FLOW_EXT` and the VLAN
+///   term. All be16 fields are written big-endian.
+/// - [`RuleMatch::V6Frame`] with `l4: None` ← `flow-type ether proto
+///   0x86dd dst <MAC> vlan <vid> m 0xf000`, the whole-ethertype rule
+///   (never planned now; encoded so a recorded one is still recognised
+///   on readback): `ETHER_FLOW | FLOW_EXT`; the MAC in the union's
+///   `ethhdr.h_dest` (NOT `h_ext` — `ETHER_FLOW` carries its own
 ///   destination, and `FLOW_MAC_EXT` stays clear) under an all-ones
-///   mask, `h_proto` 0x86DD under 0xFFFF, and `h_ext.vlan_tci` = the VID
-///   under `m_ext.vlan_tci` = 0x0FFF. Untagged drops `FLOW_EXT` and the
-///   VLAN term. All be16 fields are written big-endian.
+///   mask, `h_proto` 0x86DD under 0xFFFF, the VLAN as above.
 /// - [`RuleMatch::V6L4`] `Proto(n)` ← `flow-type ip6 l4proto n`:
 ///   `IPV6_USER_FLOW`, `l4_proto` = n under 0xFF, nothing else.
 /// - [`RuleMatch::V6L4`] `Port` ← `flow-type tcp6|udp6 dst-port|src-port
@@ -425,13 +433,26 @@ fn flow_spec(rule: &SteerRule, vf_index: u32) -> RxFlowSpec {
                 fs.m_ext.h_dest = [0xff; 6];
             }
         }
-        RuleMatch::V6Frame { dmac, vlan } => {
-            fs.flow_type = ETHER_FLOW;
-            fs.h_u.hdata[ETH_DEST_OFFSET..ETH_DEST_OFFSET + 6].copy_from_slice(&dmac);
-            fs.m_u.hdata[ETH_DEST_OFFSET..ETH_DEST_OFFSET + 6].copy_from_slice(&[0xff; 6]);
-            fs.h_u.hdata[ETH_PROTO_OFFSET..ETH_PROTO_OFFSET + 2]
-                .copy_from_slice(&ETH_P_IPV6.to_be_bytes());
-            fs.m_u.hdata[ETH_PROTO_OFFSET..ETH_PROTO_OFFSET + 2].copy_from_slice(&[0xff; 2]);
+        RuleMatch::V6Frame { dmac, vlan, l4 } => {
+            match l4 {
+                Some(proto) => {
+                    fs.flow_type = match proto {
+                        L4Proto::Tcp => TCP_V6_FLOW,
+                        L4Proto::Udp => UDP_V6_FLOW,
+                    } | FLOW_MAC_EXT;
+                    fs.h_ext.h_dest = dmac;
+                    fs.m_ext.h_dest = [0xff; 6];
+                }
+                None => {
+                    fs.flow_type = ETHER_FLOW;
+                    fs.h_u.hdata[ETH_DEST_OFFSET..ETH_DEST_OFFSET + 6].copy_from_slice(&dmac);
+                    fs.m_u.hdata[ETH_DEST_OFFSET..ETH_DEST_OFFSET + 6].copy_from_slice(&[0xff; 6]);
+                    fs.h_u.hdata[ETH_PROTO_OFFSET..ETH_PROTO_OFFSET + 2]
+                        .copy_from_slice(&ETH_P_IPV6.to_be_bytes());
+                    fs.m_u.hdata[ETH_PROTO_OFFSET..ETH_PROTO_OFFSET + 2]
+                        .copy_from_slice(&[0xff; 2]);
+                }
+            }
             if let Some(vid) = vlan {
                 fs.flow_type |= FLOW_EXT;
                 // `__be16` in the uapi; the struct field is a plain u16,
@@ -2397,9 +2418,13 @@ mod tests {
 
     const MAC6: [u8; 6] = [0x02, 0, 0, 0, 0x06, 0x01];
 
-    fn v6_divert(vlan: Option<u16>, loc: u32) -> SteerRule {
+    fn v6_divert(l4: Option<L4Proto>, vlan: Option<u16>, loc: u32) -> SteerRule {
         SteerRule {
-            shape: RuleMatch::V6Frame { dmac: MAC6, vlan },
+            shape: RuleMatch::V6Frame {
+                dmac: MAC6,
+                vlan,
+                l4,
+            },
             location: loc,
             action: crate::steer::RuleAction::Divert,
         }
@@ -2455,9 +2480,49 @@ mod tests {
         w
     }
 
-    /// The outbound-v6 diversion is the stored form of the rule probed on
-    /// 2026-09-26 — `ether proto 0x86dd dst <MAC> vlan <vid> m 0xf000`
-    /// into our VF — byte for byte at the uapi offsets.
+    /// The outbound-v6 diversion as planned: `tcp6`/`udp6 dst-mac <MAC>
+    /// vlan <vid> m 0xf000` into our VF, byte for byte at the uapi
+    /// offsets. The union and its mask stay all zero — no address (710),
+    /// no port — so the flow type is the only L4 term, and the MAC scope
+    /// is the `h_ext` one the v4 divert has carried in production since
+    /// the DMAC fix, not the union's `ethhdr`.
+    #[test]
+    fn the_v6_divert_encodes_as_a_portless_tcp_or_udp_rule() {
+        for (proto, flow) in [(L4Proto::Tcp, TCP_V6_FLOW), (L4Proto::Udp, UDP_V6_FLOW)] {
+            let fs = flow_spec(&v6_divert(Some(proto), Some(100), 9), 0);
+            let w = wire(&fs);
+            assert_eq!(fs.flow_type, flow | FLOW_EXT | FLOW_MAC_EXT);
+            assert_eq!(&w[0..4], &(flow | 0xc000_0000).to_ne_bytes(), "flow_type");
+            assert_eq!(&w[4..56], &[0; 52][..], "h_u: nothing");
+            assert_eq!(&w[76..128], &[0; 52][..], "m_u: nothing");
+            assert_eq!(&w[56 + 2..56 + 8], &MAC6, "h_ext.h_dest");
+            assert_eq!(&w[128 + 2..128 + 8], &[0xff; 6], "m_ext.h_dest");
+            assert_eq!(
+                &w[56 + 10..56 + 12],
+                &100u16.to_be_bytes(),
+                "h_ext.vlan_tci"
+            );
+            assert_eq!(&w[128 + 8..128 + 10], &[0; 2], "m_ext.vlan_etype: none");
+            assert_eq!(
+                &w[128 + 10..128 + 12],
+                &[0x0f, 0xff],
+                "m_ext.vlan_tci: the VID bits"
+            );
+            assert_eq!(&w[128 + 12..128 + 20], &[0; 8], "m_ext.data: none");
+            assert_eq!(fs.ring_cookie, ring_cookie(0), "into the VF");
+            assert_eq!(fs.location, 9);
+
+            let bare = flow_spec(&v6_divert(Some(proto), None, 9), 0);
+            assert_eq!(bare.flow_type, flow | FLOW_MAC_EXT, "untagged: no FLOW_EXT");
+            assert_eq!((bare.h_ext.vlan_tci, bare.m_ext.vlan_tci), (0, 0));
+            assert_eq!(bare.h_ext.h_dest, MAC6);
+        }
+    }
+
+    /// The whole-ethertype diversion the first v6-outbound build planned
+    /// (`l4: None`, never planned now) is still the stored form of the
+    /// rule probed on 2026-09-26 — `ether proto 0x86dd dst <MAC> vlan
+    /// <vid> m 0xf000` into our VF — so a recorded one reads back as ours.
     ///
     /// The two places this could go quietly wrong are both pinned: the
     /// MAC lives in the UNION's `ethhdr.h_dest` (byte 4 of the spec), not
@@ -2466,8 +2531,8 @@ mod tests {
     /// the VID bits 0x0FFF that the CLI's inverted `m 0xf000` stores —
     /// the only non-zero mask the v5.15 driver accepts there.
     #[test]
-    fn the_v6_divert_encodes_as_the_probed_ether_rule() {
-        let fs = flow_spec(&v6_divert(Some(100), 9), 0);
+    fn the_legacy_v6_divert_encodes_as_the_probed_ether_rule() {
+        let fs = flow_spec(&v6_divert(None, Some(100), 9), 0);
         let w = wire(&fs);
         assert_eq!(fs.flow_type, ETHER_FLOW | FLOW_EXT);
         assert_eq!(&w[0..4], &0x8000_0012u32.to_ne_bytes(), "flow_type");
@@ -2499,7 +2564,7 @@ mod tests {
         assert_eq!(fs.flow_type & FLOW_MAC_EXT, 0);
 
         // Untagged: no FLOW_EXT, no VLAN term at all.
-        let bare = flow_spec(&v6_divert(None, 9), 0);
+        let bare = flow_spec(&v6_divert(None, None, 9), 0);
         assert_eq!(bare.flow_type, ETHER_FLOW);
         assert_eq!((bare.h_ext.vlan_tci, bare.m_ext.vlan_tci), (0, 0));
         assert_eq!(bare.h_u.hdata, fs.h_u.hdata);
@@ -2563,7 +2628,35 @@ mod tests {
 
     #[test]
     fn the_readback_rejects_a_v6_rule_that_matches_differently() {
-        let divert = flow_spec(&v6_divert(Some(100), 9), 0);
+        let tcp = flow_spec(&v6_divert(Some(L4Proto::Tcp), Some(100), 9), 0);
+        assert!(matches(&tcp, &tcp));
+        let rejected_tcp: [(&str, Mutation); 9] = [
+            ("UDP instead of TCP", |f| {
+                f.flow_type = UDP_V6_FLOW | FLOW_EXT | FLOW_MAC_EXT
+            }),
+            ("FLOW_MAC_EXT dropped", |f| f.flow_type &= !FLOW_MAC_EXT),
+            ("another MAC", |f| f.h_ext.h_dest[5] = 0x02),
+            ("MAC mask narrowed", |f| f.m_ext.h_dest[0] = 0),
+            ("another VLAN", |f| f.h_ext.vlan_tci = 200u16.to_be()),
+            ("VLAN mask lost", |f| f.m_ext.vlan_tci = 0),
+            ("FLOW_EXT dropped", |f| f.flow_type &= !FLOW_EXT),
+            ("narrowed to a port", |f| {
+                f.h_u.hdata[34..36].copy_from_slice(&443u16.to_be_bytes());
+                f.m_u.hdata[34..36].copy_from_slice(&[0xff; 2]);
+            }),
+            ("default-action word set", |f| {
+                f.h_ext.data[1] = 1u32.to_be();
+                f.m_ext.data[1] = u32::MAX;
+            }),
+        ];
+        for (what, mutate) in rejected_tcp {
+            let mut got = tcp;
+            mutate(&mut got);
+            assert!(!matches(&tcp, &got), "must reject: {what}");
+            assert!(!audit_matches(&tcp, &got), "the audit too: {what}");
+        }
+
+        let divert = flow_spec(&v6_divert(None, Some(100), 9), 0);
         assert!(matches(&divert, &divert));
         let rejected: [(&str, Mutation); 11] = [
             ("h_proto → IPv4", |f| {
@@ -4304,7 +4397,11 @@ mod tests {
         sys::reset();
         let plan = plan_both_families();
         let v6 = plan.rules.iter().filter(|r| r.is_v6()).count();
-        assert_eq!(v6, 2 + 3, "2 VLAN diversions + TCP 53, UDP 53, UDP 123");
+        assert_eq!(
+            v6,
+            4 + 3,
+            "2 VLANs × [TCP, UDP] diversions + TCP 53, UDP 53, UDP 123"
+        );
 
         let mut s = steering(vec![("eth0".into(), 0)], plan.clone());
         s.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
@@ -4363,7 +4460,7 @@ mod tests {
         let mut s = steering_v6(vec![("eth0".into(), 0)], plan);
         s.steer().expect("steer");
         assert!(audit(&s).is_empty());
-        // Narrowed: an address constraint added to the ICMPv6 keep.
+        // Narrowed: an address constraint added to the UDP 53 keep.
         sys::narrow_behind_back("eth0", keep_loc);
         assert_eq!(audit(&s), vec![("eth0".to_string(), keep_loc)]);
     }

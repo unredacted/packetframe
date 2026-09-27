@@ -518,50 +518,27 @@ impl VppOffloadConfig {
         let Some((_, v6)) = self.v6_outbound.iter().find(|(i, _)| i == iface) else {
             return Ok(steer::V6Steering::default());
         };
-        // Every diverted VLAN must be one a kernel BRIDGE carries tagged
-        // on this port. Two reasons, both hard requirements:
-        // - a VID the bridge does not carry has no VPP subinterface, so
-        //   every diverted frame would be punted and dropped;
-        // - the frames the diversion catches include customers'
-        //   unicast neighbour probes and echo to their gateway. No keep
-        //   can carve those back out: this NIC ignores the IPv6
-        //   next-header field, so an `ip6 l4proto 58` keep matches ALL
-        //   v6 (hardware, 2026-09-27) and would disable the diversion.
-        //   VPP answers them itself instead, and it can only do that for
-        //   the gateway's link-local when the interface receiving the
-        //   VLAN is a bridge interface carrying the bridge's MAC — the
-        //   link-local is derived from that MAC, so VPP's and the
-        //   kernel's are the same address. A plain port reaches VPP
-        //   through its VF, whose MAC (and link-local) differ, so its
-        //   customers' gateway would stop answering.
         let vlans = match v6 {
-            VppV6Outbound::Untagged => {
-                return Err(format!(
-                    "`port {iface}` diverts untagged IPv6 (`v6-outbound untagged`), which \
-                     only a port with no VLANs can declare. Such a port reaches VPP through \
-                     its VF, whose link-local is not the gateway address customers use, so \
-                     their neighbour probes for the gateway would go unanswered once \
-                     diverted. Divert IPv6 only on a VLAN a kernel bridge carries tagged on \
-                     a member port"
-                ));
-            }
+            VppV6Outbound::Untagged => vec![None],
             VppV6Outbound::Vlans(vids) => {
-                let carried = tagged_vlans(iface).map_err(|e| {
-                    format!(
-                        "`port {iface}` diverts IPv6 (`v6-outbound`), and which VLANs a \
-                         kernel bridge carries tagged on it could not be read ({e}); \
-                         nothing is planned"
-                    )
-                })?;
-                if let Some(missing) = vids.iter().find(|v| !carried.contains(v)) {
-                    return Err(format!(
-                        "`port {iface}` diverts IPv6 on vlan {missing} (`v6-outbound`), \
-                         but no kernel bridge carries it tagged on {iface} (carries \
-                         {carried:?}). Without that, VPP has no subinterface for it, and no \
-                         bridge interface sharing the gateway's link-local to answer \
-                         customers' neighbour probes. Drop it from `v6-outbound`, or carry \
-                         the VLAN tagged on a bridge port first"
-                    ));
+                if self.trunk_ports.iter().any(|t| t == iface) {
+                    let carried = tagged_vlans(iface).map_err(|e| {
+                        format!(
+                            "`port {iface}` diverts IPv6 on `vlans all` VLANs, and whether \
+                             the kernel bridge carries them could not be read ({e}); a VID it \
+                             does not carry has no VPP subinterface and every frame diverted \
+                             on it would be dropped, so nothing is planned"
+                        )
+                    })?;
+                    if let Some(missing) = vids.iter().find(|v| !carried.contains(v)) {
+                        return Err(format!(
+                            "`port {iface}` diverts IPv6 on vlan {missing} (`v6-outbound`), \
+                             but the kernel bridge does not carry it tagged on {iface} \
+                             (carries {carried:?}), so VPP has no subinterface for it and \
+                             every diverted frame would be punted and dropped. Drop it from \
+                             `v6-outbound`, or add the VLAN to the bridge port first"
+                        ));
+                    }
                 }
                 vids.iter().copied().map(Some).collect()
             }
@@ -3284,27 +3261,29 @@ mod tests {
         use crate::steer::{L4Match, RuleMatch};
         sys_reset();
         let c = v6_cfg();
-        let carries_both = |p: &str| -> Result<Vec<u16>, String> {
-            Ok(match p {
-                "eth3" => vec![100],
-                "eth4" => vec![200],
-                _ => vec![],
-            })
+        let carries_200 = |p: &str| -> Result<Vec<u16>, String> {
+            Ok(if p == "eth4" { vec![200] } else { vec![] })
         };
-        let t = steering_target(&c, &doc4(), ntuple::rule_table, &test_macs, &carries_both)
+        let t = steering_target(&c, &doc4(), ntuple::rule_table, &test_macs, &carries_200)
             .expect("fits");
         for (iface, vid) in [("eth3", 100), ("eth4", 200)] {
             let plan = &t.targets.iter().find(|(i, _, _)| i == iface).unwrap().2;
             assert_eq!(plan.v6_outbound_vlans(), vec![Some(vid)], "{iface}");
-            let frames: Vec<[u8; 6]> = plan
-                .rules
-                .iter()
-                .filter_map(|r| match r.shape {
-                    RuleMatch::V6Frame { dmac, .. } => Some(dmac),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(frames, test_macs(iface), "{iface}: scoped to its own MAC");
+            for proto in crate::steer::V6_DIVERT_PROTOS {
+                let frames: Vec<[u8; 6]> = plan
+                    .rules
+                    .iter()
+                    .filter_map(|r| match r.shape {
+                        RuleMatch::V6Frame { dmac, l4, .. } if l4 == Some(proto) => Some(dmac),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    frames,
+                    test_macs(iface),
+                    "{iface}: {proto:?} scoped to its own MAC"
+                );
+            }
             let bgp = plan
                 .rules
                 .iter()
@@ -3313,21 +3292,12 @@ mod tests {
             assert_eq!(bgp, 2, "{iface}: `both` is dst + src");
         }
 
-        let only_100 = |p: &str| -> Result<Vec<u16>, String> {
-            Ok(if p == "eth3" { vec![100] } else { vec![] })
-        };
-        let e = steering_target(&c, &doc4(), ntuple::rule_table, &test_macs, &only_100)
+        let e = steering_target(&c, &doc4(), ntuple::rule_table, &test_macs, &no_vlans)
             .expect_err("the trunk no longer carries 200");
         assert!(
-            e.contains("vlan 200") && e.contains("no kernel bridge carries it tagged"),
+            e.contains("vlan 200") && e.contains("does not carry"),
             "{e}"
         );
-        // A port with explicit `vlans` is held to the bridge the same way:
-        // a VID no bridge carries tagged (a plain port carries none) has
-        // no bridge interface to answer customers' gateway probes.
-        let e = steering_target(&c, &doc4(), ntuple::rule_table, &test_macs, &no_vlans)
-            .expect_err("eth3 is not a bridge member here");
-        assert!(e.contains("vlan 100"), "{e}");
         let e = steering_target(&c, &doc4(), ntuple::rule_table, &test_macs, &|_: &str| {
             Err("netlink said no".to_string())
         })
@@ -3350,15 +3320,14 @@ mod tests {
         c.trunk_ports.clear();
         c.ports[1].3 = vec![200];
         assert_eq!(ifaces_to_query(&c, &v6_only_allow), vec!["eth3", "eth4"]);
-        let carried = |p: &str| -> Result<Vec<u16>, String> {
-            Ok(match p {
-                "eth3" => vec![100],
-                "eth4" => vec![200],
-                _ => vec![],
-            })
-        };
-        let t = steering_target(&c, &v6_only_allow, ntuple::rule_table, &test_macs, &carried)
-            .expect("both ports divert v6");
+        let t = steering_target(
+            &c,
+            &v6_only_allow,
+            ntuple::rule_table,
+            &test_macs,
+            &no_vlans,
+        )
+        .expect("both ports divert v6");
         assert!(t
             .targets
             .iter()
@@ -3366,8 +3335,14 @@ mod tests {
 
         c.v6_outbound.retain(|(i, _)| i == "eth3");
         assert_eq!(ifaces_to_query(&c, &v6_only_allow), vec!["eth3"]);
-        let e = steering_target(&c, &v6_only_allow, ntuple::rule_table, &test_macs, &carried)
-            .expect_err("eth4 would steer nothing");
+        let e = steering_target(
+            &c,
+            &v6_only_allow,
+            ntuple::rule_table,
+            &test_macs,
+            &no_vlans,
+        )
+        .expect_err("eth4 would steer nothing");
         assert!(e.contains("\"eth4\"") && !e.contains("\"eth3\""), "{e}");
 
         c.ports[1].2 = false; // eth4 `steer off`

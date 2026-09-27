@@ -1165,10 +1165,10 @@ mod steering_probe_tests {
 
     /// Each port is planned with its OWN receive MACs and v6 VLANs. One
     /// port with two MACs and no v6 beside another with one MAC and two
-    /// v6 VLANs needs at most 8 slots (the second port: 1 + 2 v4, 2 + 3
-    /// v6); crossing the first's MACs with the second's VLANs would ask
-    /// for 11, a rule set no real port needs, and fail an 8-slot table
-    /// attach accepts.
+    /// v6 VLANs needs at most 9 slots (the second port: 1 + 2 v4, 2 × 2
+    /// [TCP, UDP] + 2 v6); crossing the first's MACs with the second's
+    /// VLANs would ask for 14, a rule set no real port needs, and fail a
+    /// 9-slot table attach accepts.
     #[test]
     fn the_budget_probe_plans_each_ports_own_macs_and_vlans() {
         use crate::ntuple::sys;
@@ -1195,18 +1195,18 @@ mod steering_probe_tests {
         let allow = [v4(0, 24)];
         for (steering, what) in [(&both[..], "steering"), (&[][..], "staging")] {
             sys::reset();
-            sys::set_table_size(8);
+            sys::set_table_size(9);
             let cap =
                 probe_steering_budget_v6(&both, steering, &allow, &src, &[], None, &macs, &v6);
             assert_eq!(cap.status, CapabilityStatus::Pass, "{what}: {cap:?}");
             assert!(
-                cap.detail.contains("8 rule(s)") && cap.detail.contains("on eth5, the largest"),
+                cap.detail.contains("9 rule(s)") && cap.detail.contains("on eth5, the largest"),
                 "{what}: the worst REAL port is reported: {}",
                 cap.detail
             );
             // One slot fewer and the worst real port no longer fits.
             sys::reset();
-            sys::set_table_size(7);
+            sys::set_table_size(8);
             let short =
                 probe_steering_budget_v6(&both, steering, &allow, &src, &[], None, &macs, &v6);
             assert_eq!(short.status, CapabilityStatus::Fail, "{what}: {short:?}");

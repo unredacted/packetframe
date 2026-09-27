@@ -1680,8 +1680,8 @@ impl StatusSnapshot {
                     }
                 } else if self.steer_v6_only {
                     format!(
-                        "steered — MCAM rules are diverting outbound IPv6 on {} (every v6 \
-                         frame to the router there except ICMPv6, DNS and `steer-keep6`) to \
+                        "steered — MCAM rules are diverting outbound IPv6 on {} (every TCP \
+                         and UDP frame to the router there except DNS and `steer-keep6`) to \
                          VPP; no IPv4 is diverted (nothing in the allowlist is steerable \
                          IPv4), and other IPv6 stays on the eBPF tier. `ethtool -n <iface>` \
                          lists the rules",
@@ -1690,8 +1690,8 @@ impl StatusSnapshot {
                 } else {
                     format!(
                         "steered — MCAM rules are diverting allowlisted IPv4 traffic, and \
-                         outbound IPv6 on {} (every v6 frame to the router there except \
-                         ICMPv6, DNS and `steer-keep6`), to VPP; other IPv6 stays on the \
+                         outbound IPv6 on {} (every TCP and UDP frame to the router there \
+                         except DNS and `steer-keep6`), to VPP; other IPv6 stays on the \
                          eBPF tier. `ethtool -n <iface>` lists the rules",
                         self.steer_v6_outbound.join(", ")
                     )
