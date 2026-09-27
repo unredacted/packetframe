@@ -197,11 +197,12 @@ pub enum ModuleDirective {
     /// = the global setting.
     ///
     /// `v6-outbound <vid>[,<vid>…]|untagged` diverts OUTBOUND IPv6 on this
-    /// port into VPP: every frame of ethertype 0x86DD addressed to one of
+    /// port into VPP: every TCP or UDP frame over IPv6 addressed to one of
     /// the port's receive MACs, arriving on a listed VLAN. By frame, not
     /// by prefix — the NIC cannot match a v6 address — so the allowlist
-    /// does not scope it; ICMPv6, DNS and every `steer-keep6` stay on the
-    /// kernel at higher priority. Requires `v6 on`; each VID must be one
+    /// does not scope it. ICMPv6 (neighbour discovery included) is never
+    /// diverted; DNS and every `steer-keep6` stay on the kernel at higher
+    /// priority. Requires `v6 on`; each VID must be one
     /// the port's `vlans` carries (or the port is `vlans all`, checked
     /// against the kernel bridge when the rules are planned); `untagged`
     /// only on a port that declares no VLANs, because the NIC has no
@@ -223,8 +224,8 @@ pub enum ModuleDirective {
     /// `steer-keep6 <tcp|udp> <port> [dst|src|both]` — a customer→router
     /// IPv6 service that stays on the kernel while a port diverts
     /// outbound v6, installed at higher MCAM priority than the diversion.
-    /// Repeatable; hot-reloadable. ICMPv6 and DNS (TCP/UDP 53) are built
-    /// in. Protocol + port only, no address (the NIC has no v6 address
+    /// Repeatable; hot-reloadable. DNS (TCP/UDP 53) is built in, and
+    /// ICMPv6 is never diverted at all. Protocol + port only, no address (the NIC has no v6 address
     /// match): it also keeps that protocol and port toward EXTERNAL
     /// destinations on the eBPF tier, which is intended. Anything the
     /// router terminates for customers on a diverted VLAN and that is not
@@ -1847,8 +1848,8 @@ impl Config {
                     return Err(ConfigError::parse(
                         0,
                         format!(
-                            "`steer-keep6 {} 53` is built in (ICMPv6 and DNS over TCP and \
-                             UDP are always kept); drop the line",
+                            "`steer-keep6 {} 53` is built in (DNS over TCP and UDP is \
+                             always kept); drop the line",
                             k.proto
                         ),
                     ));

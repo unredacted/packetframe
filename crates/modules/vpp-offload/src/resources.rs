@@ -940,14 +940,17 @@ mod tests {
                     RuleMatch::V6Frame {
                         dmac: [2, 0, 0, 0, 0, 1],
                         vlan: Some(100),
+                        l4: Some(L4Proto::Tcp),
                     },
                     14,
                     RuleAction::Divert,
                 ),
                 v6(
+                    // The whole-ethertype shape, as its build recorded it.
                     RuleMatch::V6Frame {
                         dmac: [2, 0, 0, 0, 0, 1],
                         vlan: None,
+                        l4: None,
                     },
                     13,
                     RuleAction::Divert,

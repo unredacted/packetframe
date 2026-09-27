@@ -3269,15 +3269,21 @@ mod tests {
         for (iface, vid) in [("eth3", 100), ("eth4", 200)] {
             let plan = &t.targets.iter().find(|(i, _, _)| i == iface).unwrap().2;
             assert_eq!(plan.v6_outbound_vlans(), vec![Some(vid)], "{iface}");
-            let frames: Vec<[u8; 6]> = plan
-                .rules
-                .iter()
-                .filter_map(|r| match r.shape {
-                    RuleMatch::V6Frame { dmac, .. } => Some(dmac),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(frames, test_macs(iface), "{iface}: scoped to its own MAC");
+            for proto in crate::steer::V6_DIVERT_PROTOS {
+                let frames: Vec<[u8; 6]> = plan
+                    .rules
+                    .iter()
+                    .filter_map(|r| match r.shape {
+                        RuleMatch::V6Frame { dmac, l4, .. } if l4 == Some(proto) => Some(dmac),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    frames,
+                    test_macs(iface),
+                    "{iface}: {proto:?} scoped to its own MAC"
+                );
+            }
             let bgp = plan
                 .rules
                 .iter()
