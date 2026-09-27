@@ -299,6 +299,18 @@ pub enum ModuleDirective {
     /// Broadcast and multicast exemptions are built in and need no
     /// directive.
     VppSteerExempt(Ipv4Prefix),
+    /// `drift-accept6 <ipv6-prefix>` — an `exempt-drift-v6` finding the
+    /// operator has examined and accepted. A v6 finding whose destination
+    /// is this prefix or inside it stops degrading health and is counted
+    /// apart (`packetframe_vpp_exempt_drift_v6_accepted`). An
+    /// acknowledgement, not a fix: diverted traffic to the prefix still
+    /// dies in VPP. IPv6 only, because v6 has no `steer-exempt` to offer
+    /// as the remedy v4 has. Repeatable; hot-reloadable; needs `v6 on`.
+    /// Host bits must be zero and `/0` is refused.
+    VppDriftAccept6 {
+        prefix: Ipv6Prefix,
+        line: usize,
+    },
     /// `require-table-complete on|off` — whether a first steer waits
     /// for the route mirror to be confirmed converged against bird.
     ///
@@ -2000,6 +2012,52 @@ impl Config {
         Ok(())
     }
 
+    /// `drift-accept6`: `v6 on`, and no line twice. (Host bits and `/0`
+    /// are refused where the line is parsed.)
+    ///
+    /// `v6 on` is required because without it the IPv6 half of the
+    /// tripwire never runs, so the accept could match nothing and would
+    /// sit in the file reading as a decision that is being honoured. It
+    /// is NOT tied to `v6-divert`: an accept kept across a `v6-divert`
+    /// taken off and put back is exactly the case the operator wants to
+    /// stay decided.
+    fn validate_vpp_drift_accepts6(vpp: &ModuleSection) -> Result<(), ConfigError> {
+        let v6_on = vpp
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::VppV6(v) => Some(*v),
+                _ => None,
+            })
+            .next_back()
+            .unwrap_or(false);
+        let mut seen: Vec<&Ipv6Prefix> = Vec::new();
+        for d in &vpp.directives {
+            let ModuleDirective::VppDriftAccept6 { prefix, line } = d else {
+                continue;
+            };
+            let cidr = format!("{}/{}", prefix.addr, prefix.prefix_len);
+            if !v6_on {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!(
+                        "`drift-accept6 {cidr}` needs `v6 on` in module vpp-offload: without \
+                         it the IPv6 half of the exemption tripwire never runs, so there is no \
+                         finding for the line to accept. Add `v6 on`, or drop the line"
+                    ),
+                ));
+            }
+            if seen.contains(&prefix) {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!("duplicate `drift-accept6 {cidr}` in module vpp-offload; drop one"),
+                ));
+            }
+            seen.push(prefix);
+        }
+        Ok(())
+    }
+
     /// `local-route6` structural rules: `local-route`'s, per family, plus
     /// `v6 on`. Like those they hold whether or not anything steers — the
     /// attached route is installed at attach.
@@ -2121,6 +2179,7 @@ impl Config {
     ///   table VPP mirrors comes from the custom-FIB route pipeline);
     /// - duplicate `port` lines for one interface are rejected;
     /// - the IPv6 steering rules ([`Self::validate_vpp_v6_steering`]);
+    /// - `drift-accept6` ([`Self::validate_vpp_drift_accepts6`]);
     /// - `local-route6` ([`Self::validate_vpp_local_routes6`]).
     pub fn validate_vpp_offload(&self) -> Result<(), ConfigError> {
         let Some(vpp) = self.modules.iter().find(|m| m.name == "vpp-offload") else {
@@ -2226,6 +2285,7 @@ impl Config {
         }
 
         self.validate_vpp_v6_steering(vpp)?;
+        Self::validate_vpp_drift_accepts6(vpp)?;
 
         let Some(fp) = fast_path else {
             return Err(ConfigError::parse(
@@ -3919,6 +3979,28 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 .parse()
                 .map_err(|e: String| format!("steer-exempt: {e}"))?;
             Ok(ModuleDirective::VppSteerExempt(p))
+        }),
+        "drift-accept6" => parse_single_arg(line, rest, "drift-accept6", |t| {
+            let prefix: Ipv6Prefix = t.parse()?;
+            // Written as the prefix it matches, never a host inside it:
+            // the status line echoes the accept back, and one that reads
+            // differently from what it matches is how an accept is later
+            // misjudged as stale or as covering something it does not.
+            if prefix.addr != prefix.network() {
+                return Err(format!(
+                    "`{t}` has host bits set; write the prefix as {}/{}",
+                    prefix.network(),
+                    prefix.prefix_len
+                ));
+            }
+            if prefix.prefix_len == 0 {
+                return Err(
+                    "a /0 would accept every IPv6 finding and silence the tripwire; to stop \
+                     watching IPv6 entirely, drop `v6-divert` from the ports instead"
+                        .to_string(),
+                );
+            }
+            Ok(ModuleDirective::VppDriftAccept6 { prefix, line })
         }),
         "require-table-complete" => {
             parse_single_arg(line, rest, "require-table-complete", |t| match t {
@@ -6957,6 +7039,74 @@ module vpp-offload
             check("  v6 on\n  loopback-address6 2001:db8::1\n  loopback-address6 2001:db8::2\n")
                 .unwrap_err();
         assert!(e.contains("2 `loopback-address6` lines"), "{e}");
+    }
+
+    /// `drift-accept6` parses a normalised, non-default IPv6 prefix and
+    /// nothing else: host bits and `/0` are refused where the line is
+    /// read, with the fix in the message.
+    #[test]
+    fn drift_accept6_parses_a_normalised_prefix_only() {
+        let c = Config::parse("module vpp-offload\n  drift-accept6 2001:db8:100::/48\n").unwrap();
+        assert_eq!(
+            c.modules[0].directives[0],
+            ModuleDirective::VppDriftAccept6 {
+                prefix: v6("2001:db8:100::/48"),
+                line: 2,
+            }
+        );
+        // A /128 is a prefix too — one host route accepted.
+        assert!(Config::parse("module vpp-offload\n  drift-accept6 2001:db8::1/128\n").is_ok());
+
+        let refused = |arg: &str| {
+            Config::parse(&format!("module vpp-offload\n  drift-accept6 {arg}\n"))
+                .expect_err(arg)
+                .to_string()
+        };
+        let e = refused("2001:db8:100::1/48");
+        assert!(
+            e.contains("host bits") && e.contains("2001:db8:100::/48"),
+            "{e}"
+        );
+        let e = refused("::/0");
+        assert!(e.contains("/0") && e.contains("v6-divert"), "{e}");
+        for bad in [
+            "192.0.2.0/24",
+            "2001:db8::",
+            "2001:db8::/129",
+            "not-a-prefix",
+        ] {
+            refused(bad);
+        }
+        let e = refused("2001:db8::/32 2001:db8:1::/48");
+        assert!(e.contains("exactly one argument"), "{e}");
+    }
+
+    /// Cross-validation: `drift-accept6` needs `v6 on` (the v6 half never
+    /// runs without it) and refuses an exact duplicate; nested accepts
+    /// are allowed.
+    #[test]
+    fn drift_accept6_needs_v6_on_and_refuses_duplicates() {
+        let base = "module fast-path\n  forwarding-mode custom-fib\n  attach eth3 generic\n  \
+                    allow-prefix 192.0.2.0/24\n\n\
+                    module vpp-offload\n  loopback-address 198.51.100.254/32\n  \
+                    port eth3 cores 1 steer off\n";
+        let check = |body: &str| {
+            Config::parse(&format!("{base}{body}"))
+                .unwrap()
+                .validate_vpp_offload()
+                .map_err(|e| format!("{e}"))
+        };
+        check("  v6 on\n  drift-accept6 2001:db8::/32\n  drift-accept6 2001:db8:100::/48\n")
+            .unwrap();
+
+        let e = check("  drift-accept6 2001:db8::/32\n").unwrap_err();
+        assert!(e.contains("needs `v6 on`"), "{e}");
+        let e = check("  v6 off\n  drift-accept6 2001:db8::/32\n").unwrap_err();
+        assert!(e.contains("needs `v6 on`"), "{e}");
+
+        let e = check("  v6 on\n  drift-accept6 2001:db8::/32\n  drift-accept6 2001:db8::/32\n")
+            .unwrap_err();
+        assert!(e.contains("duplicate `drift-accept6 2001:db8::/32`"), "{e}");
     }
 
     #[test]

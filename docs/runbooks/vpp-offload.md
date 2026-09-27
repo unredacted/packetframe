@@ -233,7 +233,8 @@ current value without a mapping table:
 | `packetframe_vpp_source_backlog` | sustained non-zero — deltas are not draining |
 | `packetframe_vpp_drain_failing` | `1` — the steady-state delta apply is retrying |
 | `packetframe_vpp_exempt_drift` | `> 0` — a kernel path VPP cannot take has no `steer-exempt`; steered traffic for it is (or will be) blackholed. ALSO alarm on `absent()` while attached: the gauge is omitted, never zeroed, when the scan cannot read the kernel |
-| `packetframe_vpp_exempt_drift_v6` | `> 0` — an IPv6 kernel path VPP cannot take while a port carries `v6-divert`; diverted v6 for it is (or will be) blackholed. Present ONLY while some port carries `v6-divert` under `v6 on`, so alarm on `absent()` only on boxes configured that way: it is omitted, never zeroed, when the v6 scan cannot read |
+| `packetframe_vpp_exempt_drift_v6` | `> 0` — an IPv6 kernel path VPP cannot take while a port carries `v6-divert`; diverted v6 for it is (or will be) blackholed. Present ONLY while some port carries `v6-divert` under `v6 on`, so alarm on `absent()` only on boxes configured that way: it is omitted, never zeroed, when the v6 scan cannot read. Counts only findings no `drift-accept6` covers |
+| `packetframe_vpp_exempt_drift_v6_accepted` | not an alarm — v6 findings a `drift-accept6` covers (still blackholed if diverted). Present exactly when the series above is; a step up means a new route appeared under an accepted prefix |
 | `packetframe_vpp_neighbours_unplaced` | `> 0` — a bridge neighbour the kernel FDB has not placed behind any member port; routes through it are unresolvable |
 | `packetframe_vpp_neighbour_moves` | a step — spanning tree moved neighbours between trunks and VPP followed; worth correlating with switch events |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
@@ -1530,7 +1531,8 @@ differences:
 
 - **Nothing exempts.** The NIC cannot match a v6 address, so there is
   no IPv6 `steer-exempt` and every finding stands until its cause
-  goes. That is why it has its own row: its remedies are not
+  goes, or until you accept it ([`drift-accept6`](#accepting-a-finding-drift-accept6)).
+  That is why it has its own row: its remedies are not
   `exempt-drift`'s.
 - **A link-local kernel next hop is judged by VPP's table, not the
   kernel's.** Under FRR, a peer that sends both a global and a
@@ -1575,10 +1577,65 @@ The remedy depends on which kind of route it is:
   declare the VLAN on the port (`port … vlans`) so VPP reaches the
   device.
 - **A kernel-only route** (a tunnel, an overlay, anything VPP will
-  never own): either accept the black-hole risk knowingly (the row
-  stays Degraded while it stands); or keep that traffic on the kernel
-  by port with `steer-keep6`, when it is identifiable by port; or drop
-  `v6-divert` from the ports whose hosts reach that destination.
+  never own): keep that traffic on the kernel by port with
+  `steer-keep6`, when it is identifiable by port; or drop `v6-divert`
+  from the ports whose hosts reach that destination; or accept the
+  black-hole risk knowingly with `drift-accept6` (below).
+
+##### Accepting a finding (`drift-accept6`)
+
+Some findings are examined and then deliberately left standing: an
+overlay VPN's ULA routes via its tunnel device when no diverted host
+talks to the overlay, an IX LAN /64 VPP deliberately holds no connected
+route for, a stale kernel route the routing daemon left behind that
+nothing uses. With no v6 exemption to install, such a finding would
+keep `exempt-drift-v6` — and overall health — Degraded forever, and a
+permanently red row hides the NEXT finding behind it. So:
+
+```
+module vpp-offload
+  v6 on
+  drift-accept6 2001:db8:ff00::/40
+```
+
+A v6 finding whose destination prefix equals or lies inside an accepted
+prefix is **accepted**: it no longer degrades the row or overall health
+and is not counted in `packetframe_vpp_exempt_drift_v6`; it is counted
+in `packetframe_vpp_exempt_drift_v6_accepted` instead (same
+absent-not-zero rule, so the two always sum to every v6 finding) and
+still listed on the row. A finding LESS specific than the accept (a
+`::/0` via a tunnel, under an accept for one /48 inside it) is not
+covered. Every category is matched per route prefix — paths,
+nexthop-object routes, and the link-local summary, whose accepted and
+unaccepted routes are counted and summarised separately.
+
+```
+exempt-drift-v6: healthy — accepted: 2001:db8:ff00::/48 via tun0
+  (table 52) (`drift-accept6` — acknowledged, not fixed: diverted IPv6
+  for these still dies in VPP)
+```
+
+With unaccepted findings too, the row is Degraded and names them first,
+the accepted ones after. An accept that matches no finding at all adds
+`drift-accept6 2001:db8:ff00::/40 matches nothing` to the row, without
+degrading it: the finding it was written for is gone (the tunnel was
+torn down, the feed was fixed), so drop the line before it silently
+accepts whatever appears under that prefix next.
+
+**Accept, or fix?** Accept only what you have looked at and decided to
+live with, as narrowly as the finding (the finding's own prefix, not a
+covering /32). Accepting is an acknowledgement, **not a fix**: diverted
+IPv6 to an accepted prefix still dies in VPP, exactly as before the
+line — the tripwire just stops shouting about it. If any diverted host
+needs that destination, fix it instead: the feed, the port's `vlans`,
+a `steer-keep6`, or dropping `v6-divert`. Validation: a valid IPv6
+prefix with host bits zero, `v6 on` required, an exact duplicate
+refused, and `/0` refused (it would silence the whole v6 half — drop
+`v6-divert` instead if that is what you mean). Hot-reloadable without
+the supervision loop: a reload takes effect when the next scan lands
+(within a minute), in either direction. There is deliberately **no IPv4
+form**: a v4 finding has a real remedy, `steer-exempt`, which keeps the
+traffic working instead of merely silencing the report.
 
 `packetframe_vpp_exempt_drift_v6` carries the route count, as its own
 series: `packetframe_vpp_exempt_drift` keeps its single, unlabelled

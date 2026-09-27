@@ -167,6 +167,12 @@ pub struct VppOffloadConfig {
     pub v6_divert: Vec<(String, packetframe_common::config::VppV6Divert)>,
     /// `steer-keep6` lines, in config order. Hot, like `steer-exempt`.
     pub steer_keeps6: Vec<packetframe_common::config::VppSteerKeep6>,
+    /// `drift-accept6` lines, in config order: `exempt-drift-v6` findings
+    /// the operator has accepted ([`drift::DriftAccepts6`]). Hot, and
+    /// applied without the supervision loop — it changes what the
+    /// tripwire reports, never what the NIC holds, so it does not wait on
+    /// a steer the way the drift scope does.
+    pub drift_accepts6: Vec<packetframe_common::config::Ipv6Prefix>,
     /// `v6 on`: VPP carries IPv6 routes and neighbours
     /// ([`fib_sync::FamilyPolicy::Both`]). Default off. Restart-only —
     /// it sizes the segments VPP fixes at start, and decides what the
@@ -290,6 +296,7 @@ impl VppOffloadConfig {
                     }
                 }
                 ModuleDirective::VppSteerKeep6(k) => out.steer_keeps6.push(*k),
+                ModuleDirective::VppDriftAccept6 { prefix, .. } => out.drift_accepts6.push(*prefix),
                 ModuleDirective::VppBinary(p) => out.vpp_binary = Some(p.clone()),
                 ModuleDirective::ExpectedRoutes(n) => out.expected_routes = *n,
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
@@ -1620,6 +1627,13 @@ impl Module for VppOffloadModule {
             self.cfg = new;
             return Ok(());
         };
+        // Before anything below can return: `drift-accept6` is hot on its
+        // own terms. It changes only what the tripwire reports, so it
+        // neither waits for the loop nor for the steering outcome — a
+        // first steer refused by the completeness gate, say, must not
+        // leave an accepted finding degrading health. The loop reads it
+        // when the next scan lands ([`drift::DriftAccepts6`]).
+        attached.drift_accepts6.publish(new.drift_accepts6.clone());
 
         let allowlist = self.allowlist.get();
         let target = steering_target(
@@ -2485,6 +2499,7 @@ mod tests {
             trunk_ports: vec![],
             v6_divert: vec![],
             steer_keeps6: vec![],
+            drift_accepts6: vec![],
             v6: false,
             steer_direction: Default::default(),
             loopback_address6: None,
@@ -2687,6 +2702,9 @@ mod tests {
             adopted_process: false,
             held_steering: Some(held),
             control_plane: None,
+            drift_accepts6: std::sync::Arc::new(drift::DriftAccepts6::new(
+                m.cfg.drift_accepts6.clone(),
+            )),
         });
         m
     }
@@ -2794,6 +2812,47 @@ mod tests {
         m.allowlist.publish(vec![doc_prefix(1), doc_prefix(2)]);
         let e = reload(&mut m, &section).expect_err("the watcher's scope moved");
         assert!(e.to_string().contains("did not pick up"), "{e}");
+        m.detach().expect("the stand-in loop stops");
+    }
+
+    /// `drift-accept6` is hot WITHOUT the loop: it is no steering input,
+    /// so a reload that edits only it is answered at once — even behind a
+    /// loop that would never pick up a request — and lands in the handle
+    /// the loop reads each scan, in both directions.
+    #[test]
+    fn a_drift_accept6_edit_reaches_the_loop_handle_without_asking_the_loop() {
+        let accept = packetframe_common::config::Ipv6Prefix {
+            addr: "2001:db8:100::".parse().unwrap(),
+            prefix_len: 48,
+        };
+        let section = resend_section(vec![]);
+        let accepting = resend_section(vec![
+            packetframe_common::config::ModuleDirective::VppDriftAccept6 {
+                prefix: accept,
+                line: 2,
+            },
+        ]);
+        let mut m = behind_a_wedged_loop(&section, healthy_published(), true);
+        let handle = m
+            .attached
+            .as_ref()
+            .expect("attached")
+            .drift_accepts6
+            .clone();
+        assert!(handle.get().is_empty());
+
+        let started = std::time::Instant::now();
+        reload(&mut m, &accepting).expect("an accept is not a steering change");
+        assert!(
+            started.elapsed() < service::STEERING_BUDGET / 2,
+            "answered in {:?} — that is the loop's budget, so it was asked",
+            started.elapsed()
+        );
+        assert_eq!(handle.get(), [accept]);
+        assert_eq!(m.cfg.drift_accepts6, [accept]);
+
+        reload(&mut m, &section).expect("and taking it away is not either");
+        assert!(handle.get().is_empty());
         m.detach().expect("the stand-in loop stops");
     }
 
