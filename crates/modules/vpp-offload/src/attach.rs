@@ -1497,8 +1497,13 @@ pub fn l2fib_set(
 /// Setting the VPP port promiscuous flips the VF's STORED vote, so
 /// every future re-evaluation — whoever triggers it — lands on
 /// enabled. The entries forward to the PF, not to us, so this does not
-/// divert bridge traffic into VPP; it stops VPP's default from
-/// un-forwarding it. Asserted on both the fresh and reuse paths for
+/// divert bridge unicast into VPP; it stops VPP's default from
+/// un-forwarding it. Broadcast is another matter: the NIC replicates it
+/// to every function on the LMAC, this VF included, so VPP does see the
+/// segment's broadcast ARP — its bridge domain floods it to the BVI and
+/// on to `arp-reply`, which rejects nearly all of it as not-local and
+/// answers only requests for the loopback's address
+/// ([`crate::bringup::loopback_collision`]). Asserted on both the fresh and reuse paths for
 /// the same reason the MAC is: this is the reconcile point.
 fn set_promisc_on(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result<(), AttachError> {
     let reply =

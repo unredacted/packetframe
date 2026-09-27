@@ -404,9 +404,9 @@ fn a_refused_derived_delete_is_retried() {
 /// Static neighbours must be programmed, on the index VPP assigned, and
 /// **before** the routes that depend on them.
 ///
-/// VPP starts without `linux-cp` and MCAM rules match IP fields, so an
-/// ARP frame can never be steered to it — VPP physically cannot learn a
-/// neighbour. Skip this and route installs are still acknowledged and
+/// VPP starts without `linux-cp` and MCAM rules match IP fields, so the
+/// unicast reply to any ARP it sends lands on the kernel — VPP cannot
+/// learn a nexthop's neighbour. Skip this and route installs are still acknowledged and
 /// readback verification still passes (it checks a path exists on an
 /// interface we own, not that the adjacency resolves) while every packet
 /// is dropped on an incomplete adjacency. Nothing else in the module
@@ -908,8 +908,8 @@ fn a_refused_neighbour_hands_the_whole_delta_batch_back() {
 /// This is why the fix cannot simply queue the batch's routes and return
 /// the error. `set_device` alone makes `resolve` answer `Some`, so every
 /// route through the nexthop classifies installable and installs — while
-/// VPP, which runs without linux-cp and can never ARP for the adjacency,
-/// has nothing to send them to. Readback verification checks that a route
+/// VPP, which runs without linux-cp and cannot resolve a nexthop
+/// adjacency itself, has nothing to send them to. Readback verification checks that a route
 /// exists on an interface we own, deliberately not that its adjacency
 /// resolves, so it passes. That is #115's worst finding: "a route through
 /// an unprogrammed adjacency installs cleanly, verifies cleanly, and drops
@@ -2105,6 +2105,422 @@ fn a_local_route6_survives_adoption_without_entering_the_ledger() {
         .contains_key(&(addr16_of(cust6(0, 64)), 64)));
 }
 
+// --- attached routes follow their VLAN's interface -----------------------
+
+/// [`Kernel`], with the router's L3 device on the bridged VLAN switched on
+/// and off under the engine — the BVI `ensure_bridges` skips at attach and
+/// builds once the device exists.
+struct LateL3 {
+    kernel: Kernel,
+    up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Topology for LateL3 {
+    fn classify(&self, dev: &str) -> Result<Option<DevKind>, String> {
+        self.kernel.classify(dev)
+    }
+    fn fdb(&self) -> Result<FdbSnapshot, String> {
+        self.kernel.fdb()
+    }
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        self.kernel.port_vlans()
+    }
+    fn master_of(&self, port: &str) -> Option<String> {
+        self.kernel.master_of(port)
+    }
+    fn bridge_l3(&self, bridge: &str, vid: u16) -> Option<BridgeL3> {
+        if self.up.load(std::sync::atomic::Ordering::SeqCst) {
+            self.kernel.bridge_l3(bridge, vid)
+        } else {
+            None
+        }
+    }
+}
+
+/// [`engine_with_local_route6`]'s engine — a v4 and a v6 local route on
+/// bridged VLAN 1337 — over a kernel whose L3 device on it comes and goes
+/// with `up`.
+fn engine_with_late_bvi(
+    fake: &Fake,
+    up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> ConvergenceEngine {
+    engine_with_local_route6(fake).with_topology(Box::new(LateL3 {
+        kernel: Kernel {
+            kinds: vec![("br1337", bridge_vlan(1337))],
+            fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1337, MAC, "eth4")])))),
+            vlans: Default::default(),
+            masters: vec![("eth4", "switch0")],
+            l3: vec![("switch0", 1337, BRIDGE_MAC)],
+        },
+        up,
+    }))
+}
+
+/// The paths VPP holds for the v4 and v6 attached routes, by interface.
+fn attached_paths(fake: &Fake) -> (Vec<u32>, Vec<u32>) {
+    let v4 = fake.routes.lock().unwrap()[&([203, 0, 113, 0], 24)]
+        .iter()
+        .map(|p| p.sw_if_index)
+        .collect();
+    let v6 = fake.routes6.lock().unwrap()[&(addr16_of(cust6(0, 64)), 64)]
+        .iter()
+        .map(|p| p.sw_if_index)
+        .collect();
+    (v4, v6)
+}
+
+/// A bridged VLAN whose BVI could not be built at attach puts its attached
+/// routes on the member subif; when the BVI appears at runtime both
+/// families move onto it — one replacing add each, so VPP holds exactly
+/// one path, on the BVI, and never none or two — and a refresh with
+/// nothing changed sends nothing.
+#[test]
+fn attached_routes_move_onto_a_bvi_built_after_attach() {
+    let fake = Fake::start_behaving(
+        "attached-late-bvi",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut e = engine_with_late_bvi(&fake, up.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let at_attach = routes_of(&fake.drain_events());
+    assert_eq!(at_attach.len(), 2, "{at_attach:?}");
+    assert!(at_attach
+        .iter()
+        .all(|r| r.is_add && !r.is_multipath && r.path_indices == vec![SUBIF_BASE]));
+    assert_eq!(
+        attached_paths(&fake),
+        (vec![SUBIF_BASE], vec![SUBIF_BASE]),
+        "no BVI yet: the subif"
+    );
+
+    // The router's L3 device on the VLAN appears; the next placement
+    // refresh builds the domain and BVI, and the routes follow.
+    up.store(true, std::sync::atomic::Ordering::SeqCst);
+    let none = Mirror { routes: vec![] };
+    e.refresh_placement(&none).expect("refresh");
+    let events = fake.drain_events();
+    assert!(
+        msgs_of(&events).contains(&format!("bvi loop1337 mac=02:00:00:00:b0:01 if={BVI_BASE}")),
+        "{events:?}"
+    );
+    let moves = routes_of(&events);
+    for is_ip6 in [false, true] {
+        let ops: Vec<(bool, bool, Vec<u32>)> = moves
+            .iter()
+            .filter(|r| r.is_ip6 == is_ip6)
+            .map(|r| (r.is_add, r.is_multipath, r.path_indices.clone()))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![(true, false, vec![BVI_BASE])],
+            "v6={is_ip6}: one replacing add onto the BVI"
+        );
+    }
+    assert_eq!(
+        attached_paths(&fake),
+        (vec![BVI_BASE], vec![BVI_BASE]),
+        "one path each, on the BVI"
+    );
+    // The v6 path lands on an interface ip6 is already enabled on.
+    let enable_bvi = events
+        .iter()
+        .position(
+            |ev| matches!(ev, Event::Msg(m) if *m == format!("ip6 enable if={BVI_BASE} enable=true")),
+        )
+        .expect("ip6 enabled on the new BVI");
+    let v6_add = events
+        .iter()
+        .position(|ev| matches!(ev, Event::Route(r) if r.is_ip6 && r.is_add))
+        .unwrap();
+    assert!(enable_bvi < v6_add, "{events:?}");
+
+    // Already where they belong: no churn.
+    e.refresh_placement(&none).expect("refresh");
+    e.refresh_placement(&none).expect("refresh");
+    assert!(routes_of(&fake.drain_events()).is_empty());
+}
+
+/// A daemon adopting a VPP whose attached routes a previous run left on
+/// the subif (its BVI could not be built then) puts them on the BVI this
+/// attach builds — one replace per family, so no stale subif path survives
+/// beside it — and has nothing left to move afterwards.
+#[test]
+fn adoption_corrects_attached_routes_left_on_the_wrong_interface() {
+    let fake = Fake::start_behaving(
+        "attached-adopt-rehome",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut first = engine_with_late_bvi(&fake, up.clone());
+    assert!(first.api_ready());
+    first.attach_devices(AttachMode::Fresh).expect("attach");
+    assert_eq!(attached_paths(&fake), (vec![SUBIF_BASE], vec![SUBIF_BASE]));
+    let indices = first.attached_indices();
+    drop(first);
+    fake.drain_events();
+
+    up.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut second = engine_with_late_bvi(&fake, up).with_recorded_indices(indices);
+    assert!(second.api_ready());
+    second
+        .attach_devices(AttachMode::Adopted)
+        .expect("re-attach over the live VPP");
+    let sent = routes_of(&fake.drain_events());
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent
+        .iter()
+        .all(|r| r.is_add && !r.is_multipath && r.path_indices == vec![BVI_BASE]));
+    assert_eq!(attached_paths(&fake), (vec![BVI_BASE], vec![BVI_BASE]));
+
+    second
+        .refresh_placement(&Mirror { routes: vec![] })
+        .expect("refresh");
+    assert!(routes_of(&fake.drain_events()).is_empty());
+}
+
+/// The v4 local route on VLAN 1337 over a bridge with no L3 device on it
+/// (never a BVI), whose port-VLAN table the test changes through `vlans`.
+fn engine_without_bvi(
+    fake: &Fake,
+    vlans: std::sync::Arc<std::sync::Mutex<PortVlans>>,
+) -> ConvergenceEngine {
+    engine_with_local_route(fake).with_topology(Box::new(Kernel {
+        kinds: vec![("br1337", bridge_vlan(1337))],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1337, MAC, "eth4")])))),
+        vlans,
+        masters: vec![("eth4", "switch0")],
+        l3: vec![],
+    }))
+}
+
+/// The paths VPP holds for the v4 attached route, by interface.
+fn attached_paths_v4(fake: &Fake) -> Vec<u32> {
+    fake.routes.lock().unwrap()[&([203, 0, 113, 0], 24)]
+        .iter()
+        .map(|p| p.sw_if_index)
+        .collect()
+}
+
+/// Every route op on the wire as `(is_add, is_multipath, interfaces)`.
+fn route_ops(events: &[Event]) -> Vec<(bool, bool, Vec<u32>)> {
+    routes_of(events)
+        .into_iter()
+        .map(|r| (r.is_add, r.is_multipath, r.path_indices))
+        .collect()
+}
+
+fn set_untagged(vlans: &std::sync::Mutex<PortVlans>, untagged: bool) {
+    *vlans.lock().unwrap() = PortVlans::from_entries([("eth4".to_string(), 1337, untagged)]);
+}
+
+/// The same rule in both directions on a VLAN with no BVI: the port starts
+/// sending it untagged and the attached route moves from the subif to the
+/// VF, then back when it is tagged again — one replacing add each way.
+#[test]
+fn an_attached_route_follows_its_vlan_between_subif_and_vf() {
+    let fake = Fake::start_behaving(
+        "attached-vf-subif",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let vlans: std::sync::Arc<std::sync::Mutex<PortVlans>> = Default::default();
+    let mut e = engine_without_bvi(&fake, vlans.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    fake.drain_events();
+    assert_eq!(attached_paths_v4(&fake), vec![SUBIF_BASE]);
+    let none = Mirror { routes: vec![] };
+
+    set_untagged(&vlans, true);
+    e.refresh_placement(&none).expect("refresh");
+    assert_eq!(
+        route_ops(&fake.drain_events()),
+        vec![(true, false, vec![ASSIGNED_INDEX])]
+    );
+    assert_eq!(attached_paths_v4(&fake), vec![ASSIGNED_INDEX]);
+
+    set_untagged(&vlans, false);
+    e.refresh_placement(&none).expect("refresh");
+    assert_eq!(
+        route_ops(&fake.drain_events()),
+        vec![(true, false, vec![SUBIF_BASE])]
+    );
+    assert_eq!(attached_paths_v4(&fake), vec![SUBIF_BASE]);
+}
+
+/// A move VPP refuses leaves the route where it was, unconfirmed: the
+/// refresh reports the refusal, and the next one sends the move again.
+#[test]
+fn a_refused_attached_route_move_is_retried() {
+    let fake = Fake::start_behaving(
+        "attached-move-refused",
+        Behaviour {
+            track_routes: true,
+            // Op 0 is attach's install; op 1 the move.
+            reject_route_add_at: Some(1),
+            ..Default::default()
+        },
+    );
+    let vlans: std::sync::Arc<std::sync::Mutex<PortVlans>> = Default::default();
+    let mut e = engine_without_bvi(&fake, vlans.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    fake.drain_events();
+
+    set_untagged(&vlans, true);
+    let none = Mirror { routes: vec![] };
+    assert!(
+        e.refresh_placement(&none).is_err(),
+        "the refusal is reported"
+    );
+    assert_eq!(attached_paths_v4(&fake), vec![SUBIF_BASE], "VPP refused it");
+    fake.drain_events();
+
+    e.refresh_placement(&none).expect("retry");
+    assert_eq!(
+        route_ops(&fake.drain_events()),
+        vec![(true, false, vec![ASSIGNED_INDEX])]
+    );
+    assert_eq!(attached_paths_v4(&fake), vec![ASSIGNED_INDEX]);
+    e.refresh_placement(&none).expect("settled");
+    assert!(routes_of(&fake.drain_events()).is_empty());
+}
+
+/// A move whose reply is lost may have been applied, so the route is
+/// unconfirmed — and stays owed even when its VLAN flips back before the
+/// retry, which puts its target back on the interface it was last
+/// CONFIRMED on. Trusting that record would leave VPP holding the route on
+/// the interface the lost move reached, with nothing ever correcting it.
+#[test]
+fn an_attached_route_move_with_a_lost_reply_is_resent_even_when_the_target_flips_back() {
+    let fake = Fake::start_behaving(
+        "attached-move-lost",
+        Behaviour {
+            track_routes: true,
+            // Attach's install is answered; the move is applied and the
+            // connection dropped before the reply. Counted per connection,
+            // so the reconnect's sends are answered.
+            hangup_after: Some(1),
+            ..Default::default()
+        },
+    );
+    let vlans: std::sync::Arc<std::sync::Mutex<PortVlans>> = Default::default();
+    let mut e = engine_without_bvi(&fake, vlans.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    fake.drain_events();
+
+    set_untagged(&vlans, true);
+    let none = Mirror { routes: vec![] };
+    assert!(e.refresh_placement(&none).is_err(), "the reply never came");
+    assert_eq!(
+        attached_paths_v4(&fake),
+        vec![ASSIGNED_INDEX],
+        "VPP applied the move"
+    );
+    fake.drain_events();
+
+    // Tagged again before the retry: the target is the subif, where the
+    // route was last confirmed.
+    set_untagged(&vlans, false);
+    assert!(e.api_ready(), "reconnects");
+    e.refresh_placement(&none).expect("retry");
+    assert_eq!(
+        route_ops(&fake.drain_events()),
+        vec![(true, false, vec![SUBIF_BASE])]
+    );
+    assert_eq!(attached_paths_v4(&fake), vec![SUBIF_BASE]);
+    e.refresh_placement(&none).expect("settled");
+    assert!(routes_of(&fake.drain_events()).is_empty());
+}
+
+/// Two VLAN-aware bridges reusing a vid: only the first gets a BVI
+/// (`ensure_bridges`), and a local route on the SECOND bridge's port must
+/// not borrow it — that would deliver its prefix into the other bridge's
+/// L2 domain. It stays on its own port's subif, at attach and on every
+/// refresh, while the first bridge's local route uses the BVI.
+#[test]
+fn a_local_route_never_borrows_another_bridges_bvi() {
+    let fake = Fake::start_behaving(
+        "attached-shared-vid",
+        Behaviour {
+            track_routes: true,
+            // Sequential indices, so the second port is a port of its own.
+            dark_extra_ports: true,
+            ..Default::default()
+        },
+    );
+    let port = |name: &str, n: u8| PortAttach {
+        port: name.into(),
+        pci_addr: format!("0002:07:00.{n}"),
+        port_id: n.into(),
+        num_rx_queues: 1,
+        pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, n],
+        accept_macs: vec![],
+        mtu: None,
+        vlans: vec![100],
+    };
+    let route = |a: u8, b: u8, c: u8, name: &str| LocalRoute {
+        prefix: LocalRoutePrefix::V4(packetframe_common::config::Ipv4Prefix {
+            addr: Ipv4Addr::new(a, b, c, 0),
+            prefix_len: 24,
+        }),
+        port: name.into(),
+        vlan: 100,
+        kernel_dev: format!("br-{name}"),
+    };
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![port("eth4", 1), port("eth5", 2)],
+        vec!["eth4".into(), "eth5".into()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_local_routes(vec![route(192, 0, 2, "eth4"), route(203, 0, 113, "eth5")])
+    .with_topology(Box::new(Kernel {
+        kinds: vec![],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(FdbSnapshot::default()))),
+        vlans: Default::default(),
+        masters: vec![("eth4", "switch0"), ("eth5", "switch1")],
+        l3: vec![("switch0", 100, BRIDGE_MAC), ("switch1", 100, BRIDGE_MAC)],
+    }));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    fake.drain_events();
+    let held = |fake: &Fake, a: [u8; 4]| -> Vec<u32> {
+        fake.routes.lock().unwrap()[&(a, 24)]
+            .iter()
+            .map(|p| p.sw_if_index)
+            .collect()
+    };
+    assert_eq!(held(&fake, [192, 0, 2, 0]), vec![BVI_BASE], "switch0's BVI");
+    let eth5_subif = held(&fake, [203, 0, 113, 0]);
+    assert_eq!(eth5_subif.len(), 1);
+    assert!(
+        (SUBIF_BASE..BVI_BASE).contains(&eth5_subif[0]),
+        "switch1's route on eth5's subif, not switch0's BVI: {eth5_subif:?}"
+    );
+
+    e.refresh_placement(&Mirror { routes: vec![] })
+        .expect("refresh");
+    assert!(routes_of(&fake.drain_events()).is_empty());
+    assert_eq!(held(&fake, [203, 0, 113, 0]), eth5_subif);
+}
+
 /// The null-drop sample end to end: `cli_inband` over the real socket,
 /// VPP's text parsed, the total cached — and absent again once the
 /// process the counters lived in is gone.
@@ -2122,13 +2538,135 @@ fn null_drops_sample_over_cli_inband() {
     let mut e = engine_for(&fake);
     assert!(e.api_ready());
     assert_eq!(e.null_drops(), None, "absent until sampled");
-    e.sample_null_drops();
+    e.sample_error_counters();
     assert_eq!(e.null_drops(), Some(117_015));
     e.on_process_gone();
     assert_eq!(
         e.null_drops(),
         None,
         "the counters died with the process; a stale total would read as quiet"
+    );
+}
+
+/// The glean and ARP-reply sample, one read per call: glean rows out of
+/// `show errors` on the first, the real reply count out of
+/// `show ip neighbor-stats` (summed over interfaces) on the next — and
+/// all of it absent again once the process is gone.
+#[test]
+fn glean_counters_sample_over_cli_inband() {
+    let fake = Fake::start_behaving(
+        "glean",
+        Behaviour {
+            show_errors: "   Count            Node            Reason        Severity\n\
+                          1380            ip4-glean       ARP requests sent          info\n\
+                          97              ip4-glean       ARP requests throttled     info\n\
+                          4               ip6-glean       neighbor solicitations sent info\n\
+                          2               ip6-glean       throttled                  info\n\
+                          5000            arp-reply       ARP replies sent           info\n",
+            neighbor_stats: "  loop0\n\
+                             \x20   arp: rx:[reply:0 request:0 gratuitous:0 ] tx:[reply:0 request:0 gratuitous:0 ]\n\
+                             \x20   nd:  rx:[reply:0 request:0 gratuitous:0 ] tx:[reply:0 request:0 gratuitous:0 ]\n\
+                             \x20 bvi100\n\
+                             \x20   arp: rx:[reply:9 request:40 gratuitous:0 ] tx:[reply:3 request:0 gratuitous:0 ]\n\
+                             \x20   nd:  rx:[reply:1 request:0 gratuitous:0 ] tx:[reply:0 request:4 gratuitous:0 ]\n",
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    assert_eq!(e.neighbour_counters(), None, "absent until sampled");
+    fake.drain_events();
+    e.sample_error_counters();
+    assert_eq!(cli_commands(&fake), ["show errors"], "one read per call");
+    let c = e.neighbour_counters().expect("sampled");
+    assert_eq!(c.arp_requests_sent, 1380);
+    assert_eq!(c.arp_requests_throttled, 97);
+    assert_eq!(c.ns_sent, 4);
+    assert_eq!(c.ns_throttled, 2);
+    assert_eq!(
+        c.arp_replies_sent, None,
+        "not read yet: that is the next call"
+    );
+    e.sample_error_counters();
+    assert_eq!(
+        cli_commands(&fake),
+        ["show ip neighbor-stats"],
+        "one read per call"
+    );
+    assert_eq!(
+        e.neighbour_counters()
+            .expect("still sampled")
+            .arp_replies_sent,
+        Some(3),
+        "the transmit counter, not arp-reply's over-counting error row"
+    );
+    assert_eq!(e.null_drops(), Some(0), "kept from the previous call");
+    e.on_process_gone();
+    assert_eq!(e.neighbour_counters(), None);
+}
+
+/// The `cli_inband` commands the fake received since the last drain.
+fn cli_commands(fake: &Fake) -> Vec<String> {
+    fake.drain_events()
+        .into_iter()
+        .filter_map(|ev| match ev {
+            Event::Msg(m) => m.strip_prefix("cli ").map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A slow read must not be followed by another in the same call: the
+/// sample runs on the supervision thread, and a second read after one
+/// that used the whole socket deadline would double what a tick can
+/// block the steering path (review finding). A stalled `show errors`
+/// costs exactly that one deadline and drops every error-counter gauge
+/// rather than leaving the other read's value looking current.
+#[test]
+fn a_stalled_error_read_is_not_followed_by_a_second_read() {
+    let fake = Fake::start_behaving(
+        "glean-stall",
+        Behaviour {
+            show_errors: "   Count            Node            Reason        Severity\n\
+                          1380            ip4-glean       ARP requests sent          info\n",
+            neighbor_stats: "  bvi100\n    arp: rx:[reply:0 request:0 gratuitous:0 ] \
+                             tx:[reply:3 request:0 gratuitous:0 ]\n",
+            // The third cli_inband: the first two calls answer, the
+            // third call's `show errors` never does.
+            stall_on: Some(("cli_inband", 2)),
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.sample_error_counters();
+    e.sample_error_counters();
+    assert_eq!(
+        e.neighbour_counters().and_then(|c| c.arp_replies_sent),
+        Some(3)
+    );
+    fake.drain_events();
+    e.sample_error_counters();
+    let events = fake.drain_events();
+    let reads = events
+        .iter()
+        // Counted by message name: the stalled request never reaches
+        // the handler that logs its command text.
+        .filter(|ev| matches!(ev, Event::Msg(m) if m == "cli_inband"))
+        .count();
+    assert_eq!(reads, 1, "one read, and nothing after it: {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Event::Msg(m) if m == "stalled on cli_inband")),
+        "{events:?}"
+    );
+    assert!(!e.is_connected(), "a timed-out stream is not reused");
+    assert_eq!(e.null_drops(), None);
+    assert_eq!(
+        e.neighbour_counters(),
+        None,
+        "the reply count from the last call must not survive as current"
     );
 }
 

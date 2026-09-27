@@ -187,8 +187,13 @@ pub(crate) fn iommu_active(dir: &Path) -> std::io::Result<Option<std::ffi::OsStr
     }
 }
 
-/// VPP's arp node answers requests targeting its loopback's address,
-/// sourcing the member VF's MAC. If that address is a LIVE kernel
+/// VPP's arp node answers requests targeting its loopback's address —
+/// the only address it answers for — sourcing the MAC of the interface
+/// the request arrived on (the kernel bridge's, on a BVI). Broadcast
+/// ARP does reach it: every VF on the LMAC gets a copy. And since every
+/// interface is unnumbered to the loopback, `arp_unnumbered` waives the
+/// sender-subnet check, so it answers on ANY bridged VLAN — an IX VLAN
+/// included — if anyone there asks. If that address is a LIVE kernel
 /// address — the gateway, in the reference incident — two responders
 /// fight over it and hosts learn whichever answered last. Measured on
 /// the primary (w22, 2026-08-14): loop0 held 192.0.2.1, the

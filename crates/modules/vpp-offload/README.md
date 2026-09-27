@@ -38,9 +38,13 @@ Three rules shape the design:
   *every* port a best path might leave by before *any* port is steered.
   Membership is all-or-nothing and checked when the config loads.
   `steer on|off` is per port and is the canary lever.
-- **VPP never ARPs.** Neighbours are installed statically from the
-  fast-path resolver. The steering rules match IPv4 fields only, so ARP
-  frames never reach VPP.
+- **Neighbours are static.** They are installed from the fast-path
+  resolver. The steering rules match IP fields only, so the unicast
+  reply to anything VPP sends lands on the kernel and VPP cannot learn
+  or refresh a neighbour itself. VPP is not ARP-silent, though: it
+  receives broadcast ARP, answers requests for its `loopback-address`,
+  and gleans (ARPs / solicits) unknown hosts inside a `local-route` or
+  `local-route6` prefix — see the runbook's "Glean and ARP counters".
 
 VPP keeps running across a PacketFrame restart and is adopted again on
 start. The resources it holds are recorded in a state file for that
