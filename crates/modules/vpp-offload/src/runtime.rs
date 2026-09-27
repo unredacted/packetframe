@@ -644,6 +644,10 @@ struct Core {
     /// The IPv6 half of the tripwire, retained by the same rules as the
     /// v4 fields above — see [`crate::drift::V6DriftState`].
     drift_v6: crate::drift::V6DriftState,
+    /// The `drift-accept6` set, read each time a v6 verdict lands. The
+    /// module's handle, so a reload reaches it without this loop — see
+    /// [`crate::drift::DriftAccepts6`] for why it is not in the scope.
+    drift_accepts6: std::sync::Arc<crate::drift::DriftAccepts6>,
     /// Set when a steering change failed PARTWAY and left rules on
     /// the NIC, so neither the old exemption set nor the new one
     /// describes what is installed.
@@ -1555,6 +1559,7 @@ impl Runtime {
                 drift_scope_stale: None,
                 pending_drift_scope: None,
                 drift_v6: crate::drift::V6DriftState::default(),
+                drift_accepts6: std::sync::Arc::default(),
                 steer_missing: 0,
                 steer_stray: 0,
                 steer_audit_error: None,
@@ -1683,6 +1688,12 @@ impl Runtime {
     /// Install the kernel rx-mode kick. The attach wiring installs the
     /// ioctl-backed [`AllmultiKick`] on Linux; everything else keeps
     /// [`NoKick`]. See [`RxModeKick`] for why this exists.
+    /// Attach the `drift-accept6` handle the module publishes reloads
+    /// into. Without one the set is empty: every v6 finding degrades.
+    pub fn drift_accepts6(&self, handle: std::sync::Arc<crate::drift::DriftAccepts6>) {
+        self.core.borrow_mut().drift_accepts6 = handle;
+    }
+
     /// Install the exemption tripwire. Same wiring rule as the others.
     pub fn drift_watch(&self, w: Box<dyn crate::drift::DriftWatch + Send>) {
         self.core.borrow_mut().drift_scanner =
@@ -1972,7 +1983,10 @@ impl Runtime {
                         // holds a prefix is the engine's to say.
                         let core = &mut *c;
                         let engine = &core.engine;
-                        if let Some(lines) = core.drift_v6.absorb(found.v6, |p| engine.holds_v6(p))
+                        let accepts = core.drift_accepts6.get();
+                        if let Some(lines) =
+                            core.drift_v6
+                                .absorb(found.v6, |p| engine.holds_v6(p), &accepts)
                         {
                             tracing::warn!(
                                 paths = ?lines,
@@ -1980,7 +1994,8 @@ impl Runtime {
                                  IPv6; diverted traffic for them dies in VPP instead of \
                                  reaching the kernel path. No IPv6 exemption exists: fix the \
                                  feed if VPP should carry the route, or keep the traffic \
-                                 with `steer-keep6`, or stop diverting the port"
+                                 with `steer-keep6`, or stop diverting the port, or accept \
+                                 the risk with `drift-accept6`"
                             );
                         }
                     }
