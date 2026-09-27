@@ -64,6 +64,10 @@ pub const SUBSYS_STATE_FILE: &str = "state-file";
 pub const SUBSYS_FDB: &str = "fdb";
 /// Only present when the exemption tripwire has findings.
 pub const SUBSYS_EXEMPT_DRIFT: &str = "exempt-drift";
+/// The tripwire's IPv6 half, only present while some port diverts IPv6
+/// and the half has something to say. Its own row because its remedies
+/// are not `exempt-drift`'s: no v6 exemption exists.
+pub const SUBSYS_EXEMPT_DRIFT_V6: &str = "exempt-drift-v6";
 /// Subsystem name for the cross-tier route feed.
 pub const SUBSYS_ROUTE_FEED: &str = "route-feed";
 /// The IPv6 table, present only under `v6 on`. Its own row because every
@@ -459,6 +463,12 @@ pub struct StatusSnapshot {
     /// Degraded for the same reason an unreadable scan is: neither
     /// answer it could give would be true.
     pub drift_scope_stale: Option<String>,
+    /// The tripwire's IPv6 half: kernel v6 paths VPP cannot take while
+    /// some port diverts IPv6. Degraded when it has findings or cannot
+    /// read, and silent — no row, no gauge — while inactive. Pending and
+    /// scope staleness are the whole tripwire's and speak through the v4
+    /// fields above.
+    pub drift_v6: crate::drift::V6DriftState,
 }
 
 /// The steering audit, as the health surface consumes it.
@@ -533,6 +543,7 @@ impl StatusSnapshot {
             false,
             None,
             None,
+            crate::drift::V6DriftState::default(),
         )
     }
 
@@ -571,6 +582,7 @@ impl StatusSnapshot {
         drift_pending: bool,
         drift_unreadable: Option<String>,
         drift_scope_stale: Option<String>,
+        drift_v6: crate::drift::V6DriftState,
     ) -> Self {
         Self {
             state: sup.state(),
@@ -609,6 +621,7 @@ impl StatusSnapshot {
             drift_pending,
             drift_unreadable,
             drift_scope_stale,
+            drift_v6,
         }
     }
 
@@ -773,6 +786,7 @@ impl StatusSnapshot {
                 last_success_age_seconds: None,
             });
         }
+        subsystems.extend(self.drift_v6_health());
         if !self.neighbours_unplaced.is_empty() || self.fdb_unreadable.is_some() {
             let mut parts = Vec::new();
             if !self.neighbours_unplaced.is_empty() {
@@ -925,6 +939,60 @@ impl StatusSnapshot {
             // nor one that has not yet looked at this config at all.
             && self.drift_scope_stale.is_none()
             && !self.drift_pending
+            // The IPv6 half, the same way — while it runs at all, which
+            // is only while some port diverts IPv6.
+            && self.drift_v6.quiet()
+    }
+
+    /// The `exempt-drift-v6` row, when the IPv6 half has something to say.
+    ///
+    /// Silent while inactive: no port diverts v6, so no v6 destination
+    /// can reach VPP and there is no v6 verdict to give. Silent too while
+    /// the whole tripwire is pending or cannot tell which config the NIC
+    /// holds — the `exempt-drift` row already says so, for both halves,
+    /// and a second row repeating it would only double the noise.
+    fn drift_v6_health(&self) -> Option<SubsystemHealth> {
+        let v6 = &self.drift_v6;
+        if !v6.active || self.drift_scope_stale.is_some() || self.drift_pending {
+            return None;
+        }
+        let message = if !v6.lines.is_empty() {
+            // Retained across a failed read, so the failure travels with
+            // them — the same rule, and the same reason, as the v4 row.
+            let stale = v6.unreadable.as_ref().map(|why| {
+                format!(
+                    ". NOTE: the latest IPv6 scan could not read the kernel ({why}), so this \
+                     list is the last good one — newly added routes are invisible and a named \
+                     one may already be gone"
+                )
+            });
+            format!(
+                "IPv6 kernel path(s) VPP cannot take, while a port diverts IPv6 \
+                 (`v6-outbound`): {} — diverted IPv6 for these dies in VPP, or leaves by a less \
+                 specific route VPP holds, instead of taking the kernel path. There is no \
+                 IPv6 `steer-exempt` (the NIC cannot match a v6 address). If VPP should carry \
+                 the route, fix the feed or the port's `vlans` so it can; if it is kernel-only, \
+                 accept the risk knowingly, keep its traffic on the kernel by port with \
+                 `steer-keep6`, or drop `v6-outbound` from the ports whose hosts reach it{}",
+                v6.lines.join("; "),
+                stale.unwrap_or_default()
+            )
+        } else if let Some(why) = &v6.unreadable {
+            format!(
+                "the exemption tripwire could not read the kernel's IPv6 routes ({why}), so it \
+                 is not watching for v6 paths VPP cannot take while a port diverts IPv6 — an \
+                 uncovered one would blackhole diverted traffic unreported. The scan retries \
+                 every minute; a persistent failure needs looking at"
+            )
+        } else {
+            return None;
+        };
+        Some(SubsystemHealth {
+            name: SUBSYS_EXEMPT_DRIFT_V6.into(),
+            state: HealthState::Degraded,
+            message: Some(message),
+            last_success_age_seconds: None,
+        })
     }
 
     /// Whether the CURRENT failure episode is over — the release
@@ -2103,6 +2171,28 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
             out,
             "packetframe_vpp_exempt_drift{{module=\"{module}\"}} {}",
             snap.drift_routes
+        );
+    }
+    // The IPv6 half as its own series, not a `family` label on the one
+    // above: that series stays the only one of its metric, so every query
+    // and alert written against it returns exactly what it did. Absent by
+    // the same rule — never zeroed — and absent while no port diverts v6,
+    // since a scan that did not run has no count to publish.
+    let v6 = &snap.drift_v6;
+    if v6.active
+        && v6.unreadable.is_none()
+        && snap.drift_scope_stale.is_none()
+        && !snap.drift_pending
+    {
+        gauge(
+            &mut out,
+            "packetframe_vpp_exempt_drift_v6",
+            "IPv6 kernel paths VPP cannot take while a port diverts IPv6 (diverted = blackholed)",
+        );
+        let _ = writeln!(
+            out,
+            "packetframe_vpp_exempt_drift_v6{{module=\"{module}\"}} {}",
+            v6.routes
         );
     }
 
@@ -4737,6 +4827,155 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 1, "one row, not two: {rows:?}");
         assert!(rows[0].message.as_deref().unwrap_or("").contains("vti64"));
+    }
+
+    fn quiet_snap() -> StatusSnapshot {
+        snap_of(
+            &ready_supervisor(),
+            &ledger_with(1, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(1),
+            },
+            verified(1),
+            ports_up(),
+        )
+    }
+
+    fn v6_row(s: &StatusSnapshot) -> Option<SubsystemHealth> {
+        s.report()
+            .subsystems
+            .into_iter()
+            .find(|x| x.name == SUBSYS_EXEMPT_DRIFT_V6)
+    }
+
+    /// With no port diverting IPv6 the v6 half says nothing at all — no
+    /// row, no gauge, not even a zero — and the v4 series is exactly what
+    /// it was before the half existed: same HELP, same single series, no
+    /// `family` label. Dashboards key on that line.
+    #[test]
+    fn the_v6_half_is_silent_while_no_port_diverts_v6_and_v4_is_unchanged() {
+        let s = quiet_snap();
+        assert!(v6_row(&s).is_none());
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(!m.contains("packetframe_vpp_exempt_drift_v6"), "{m}");
+        let v4: Vec<&str> = m
+            .lines()
+            .filter(|l| l.contains("packetframe_vpp_exempt_drift"))
+            .collect();
+        assert_eq!(
+            v4,
+            [
+                "# HELP packetframe_vpp_exempt_drift kernel paths VPP cannot take that no \
+                 steer-exempt covers (steered = blackholed)",
+                "# TYPE packetframe_vpp_exempt_drift gauge",
+                "packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 0",
+            ]
+        );
+        assert_eq!(s.report().overall, HealthState::Healthy);
+    }
+
+    /// v6 findings degrade health on their OWN row — whose remedies are
+    /// not `steer-exempt`, which has no v6 form — and are counted on their
+    /// own gauge, while the v4 row stays absent and the v4 gauge reads 0.
+    /// Both surfaces or neither, as for v4.
+    #[test]
+    fn v6_findings_degrade_on_their_own_row_and_gauge() {
+        let mut s = quiet_snap();
+        s.drift_v6 = crate::drift::V6DriftState {
+            active: true,
+            lines: vec!["2001:db8:100::/48 via tun0 (table 52)".into()],
+            routes: 1,
+            unreadable: None,
+        };
+        let report = s.report();
+        assert!(!report
+            .subsystems
+            .iter()
+            .any(|x| x.name == SUBSYS_EXEMPT_DRIFT));
+        let row = v6_row(&s).expect("the v6 row");
+        assert_eq!(row.state, HealthState::Degraded);
+        let msg = row.message.unwrap_or_default();
+        assert!(msg.contains("2001:db8:100::/48 via tun0"), "{msg}");
+        assert!(
+            msg.contains("steer-keep6") && msg.contains("v6-outbound") && msg.contains("feed"),
+            "names the three remedies: {msg}"
+        );
+        assert!(msg.contains("no IPv6 `steer-exempt`"), "{msg}");
+        assert_ne!(report.overall, HealthState::Healthy);
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(m.contains("packetframe_vpp_exempt_drift_v6{module=\"vpp-offload\"} 1"));
+        assert!(m.contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 0"));
+
+        // Active and clean: a zero it earned, no row, healthy.
+        s.drift_v6.lines.clear();
+        s.drift_v6.routes = 0;
+        assert!(v6_row(&s).is_none());
+        assert!(render_metrics(&s, "vpp-offload")
+            .contains("packetframe_vpp_exempt_drift_v6{module=\"vpp-offload\"} 0"));
+        assert_eq!(s.report().overall, HealthState::Healthy);
+    }
+
+    /// A v6 scan that cannot read is Degraded and publishes NO v6 count —
+    /// omitted, never zeroed — while the v4 count it did not affect stays.
+    /// Retained v6 findings say they are stale.
+    #[test]
+    fn an_unreadable_v6_scan_omits_its_gauge_and_degrades() {
+        let mut s = quiet_snap();
+        s.drift_v6 = crate::drift::V6DriftState {
+            active: true,
+            unreadable: Some("netlink recv: EIO".into()),
+            ..Default::default()
+        };
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(!m.contains("packetframe_vpp_exempt_drift_v6"), "{m}");
+        assert!(m.contains("packetframe_vpp_exempt_drift{module=\"vpp-offload\"} 0"));
+        let row = v6_row(&s).expect("a blind half still says so");
+        assert_eq!(row.state, HealthState::Degraded);
+        assert!(
+            row.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("could not read the kernel's IPv6 routes"),
+            "{row:?}"
+        );
+        assert_ne!(s.report().overall, HealthState::Healthy);
+
+        s.drift_v6.lines = vec!["2001:db8:100::/48 via tun0 (table 52)".into()];
+        s.drift_v6.routes = 1;
+        let msg = v6_row(&s).and_then(|r| r.message).unwrap_or_default();
+        assert!(
+            msg.contains("tun0") && msg.contains("last good one"),
+            "{msg}"
+        );
+        assert!(!render_metrics(&s, "vpp-offload").contains("packetframe_vpp_exempt_drift_v6"));
+    }
+
+    /// Pending and scope-stale belong to the whole tripwire: the
+    /// `exempt-drift` row speaks for both halves, the v6 row stays out of
+    /// it, and neither gauge is published.
+    #[test]
+    fn a_pending_or_stale_tripwire_publishes_no_v6_verdict() {
+        for stale in [false, true] {
+            let mut s = quiet_snap();
+            s.drift_v6 = crate::drift::V6DriftState {
+                active: true,
+                lines: vec!["2001:db8:100::/48 via tun0 (table 52)".into()],
+                routes: 1,
+                unreadable: None,
+            };
+            if stale {
+                s.drift_scope_stale = Some("a steering change failed partway".into());
+            } else {
+                s.drift_pending = true;
+            }
+            assert!(v6_row(&s).is_none(), "stale={stale}");
+            assert!(s
+                .report()
+                .subsystems
+                .iter()
+                .any(|x| x.name == SUBSYS_EXEMPT_DRIFT));
+            assert!(!render_metrics(&s, "vpp-offload").contains("packetframe_vpp_exempt_drift"));
+        }
     }
 
     /// Placement: all placed = no subsystem row (nothing for an operator

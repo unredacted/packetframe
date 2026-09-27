@@ -607,15 +607,16 @@ pub fn bring_up(
     // exemption slot for it would spend a scarce resource on nothing.
     // Any src (or `both`) port anywhere means any destination is
     // reachable — the conservative default, including when the config
-    // declares no direction at all.
-    let dst_only_scope = crate::drift::divertible_scope(&cfg.ports, cfg.steer_direction, allowlist);
+    // declares no direction at all. The same holds for whether the IPv6
+    // half runs: `v6-outbound` on any port line, lever or not
+    // ([`crate::drift::DriftScope::scans_v6`]).
+    //
     // Exactly what the runtime is built with below — the target, the
     // engine's and the watcher's exemptions, the watcher's scope — so the
     // first reload can tell whether it changes any of it.
     let held_steering = crate::SteeringInputs {
         targets: steer_targets.clone(),
-        exempts: cfg.steer_exempts.clone(),
-        dst_only: dst_only_scope.clone(),
+        scope: crate::drift::DriftScope::from_config(cfg, allowlist),
         want_steer: wants_steer,
     };
     let steering = NtupleSteering::new(member_ports, steer_targets);
@@ -839,7 +840,6 @@ pub fn bring_up(
         &cfg.trunk_ports,
         local_routes,
         &cfg.steer_exempts,
-        dst_only_scope,
         held_steering,
         cfg.families(),
     ) {
@@ -917,7 +917,6 @@ fn finish(
     trunk_ports: &[String],
     local_routes: &[crate::LocalRoute],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
-    dst_only_scope: Option<Vec<packetframe_common::fib::IpPrefix>>,
     held_steering: crate::SteeringInputs,
     families: FamilyPolicy,
 ) -> Result<Attached, String> {
@@ -1308,7 +1307,7 @@ fn finish(
     } else {
         Vec::new()
     };
-    let drift_exempts = steer_exempts.to_vec();
+    let drift_scope = held_steering.scope.clone();
     let engine_exempts = steer_exempts.to_vec();
     let factory: LoopFactory = Box::new(move || {
         // What VPP can egress, for the exemption tripwire: the member
@@ -1396,8 +1395,7 @@ fn finish(
             reach: drift_reach,
             port_vlans: drift_port_vlans,
             trunk_ports: drift_trunks,
-            exempts: drift_exempts,
-            dst_only: dst_only_scope,
+            scope: drift_scope,
         }));
         // Rules from a previous process are adopted below, and the
         // config on disk may have been edited while the daemon was
@@ -1409,7 +1407,7 @@ fn finish(
             runtime.note_inherited_steering();
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = (drift_reach, drift_exempts, dst_only_scope);
+        let _ = (drift_reach, drift_scope);
         let initial = match adopted {
             Some(p) => {
                 // The API handshake MUST happen before the adoption is
