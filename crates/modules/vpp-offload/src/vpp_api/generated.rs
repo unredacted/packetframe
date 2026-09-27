@@ -91,7 +91,22 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "af_packet_delete_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "af_packet_dump", crc: "0x51077d14", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "af_packet_details", crc: "0x58c7c042", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "acl_add_replace", crc: "0xee5c2f18", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "acl_add_replace_reply", crc: "0xac407b0c", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "acl_del", crc: "0xef34fea4", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "acl_del_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "acl_dump", crc: "0xef34fea4", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "acl_details", crc: "0x95babae0", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "acl_interface_set_acl_list", crc: "0x473982bd", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "acl_interface_set_acl_list_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "acl_interface_list_dump", crc: "0xf9e6675e", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "acl_interface_list_details", crc: "0xe695d256", context_offset: 2, client_index_prefix: false },
 ];
+
+// enum acl_action : u8
+pub const ACL_ACTION_API_DENY: u8 = 0;
+pub const ACL_ACTION_API_PERMIT: u8 = 1;
+pub const ACL_ACTION_API_PERMIT_REFLECT: u8 = 2;
 
 // enum address_family : u8
 pub const ADDRESS_IP4: u8 = 0;
@@ -154,6 +169,21 @@ pub const IP_API_NEIGHBOR_FLAG_NONE: u8 = 0;
 pub const IP_API_NEIGHBOR_FLAG_STATIC: u8 = 1;
 pub const IP_API_NEIGHBOR_FLAG_NO_FIB_ENTRY: u8 = 2;
 
+// enum ip_proto : u8
+pub const IP_API_PROTO_HOPOPT: u8 = 0;
+pub const IP_API_PROTO_ICMP: u8 = 1;
+pub const IP_API_PROTO_IGMP: u8 = 2;
+pub const IP_API_PROTO_TCP: u8 = 6;
+pub const IP_API_PROTO_UDP: u8 = 17;
+pub const IP_API_PROTO_GRE: u8 = 47;
+pub const IP_API_PROTO_ESP: u8 = 50;
+pub const IP_API_PROTO_AH: u8 = 51;
+pub const IP_API_PROTO_ICMP6: u8 = 58;
+pub const IP_API_PROTO_EIGRP: u8 = 88;
+pub const IP_API_PROTO_OSPF: u8 = 89;
+pub const IP_API_PROTO_SCTP: u8 = 132;
+pub const IP_API_PROTO_RESERVED: u8 = 255;
+
 // enum l2_port_type : u32
 pub const L2_API_PORT_TYPE_NORMAL: u32 = 0;
 pub const L2_API_PORT_TYPE_BVI: u32 = 1;
@@ -190,6 +220,63 @@ impl Encode for AddressUnion {
 
 impl Decode for AddressUnion {
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> { Ok(Self(d.bytes::<16>()?)) }
+}
+
+/// `acl_rule` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AclRule {
+    pub is_permit: u8,
+    pub src_prefix: Prefix,
+    pub dst_prefix: Prefix,
+    pub proto: u8,
+    pub srcport_or_icmptype_first: u16,
+    pub srcport_or_icmptype_last: u16,
+    pub dstport_or_icmpcode_first: u16,
+    pub dstport_or_icmpcode_last: u16,
+    pub tcp_flags_mask: u8,
+    pub tcp_flags_value: u8,
+}
+
+impl Encode for AclRule {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.is_permit as u8).to_be_bytes());
+        self.src_prefix.encode(buf);
+        self.dst_prefix.encode(buf);
+        buf.extend_from_slice(&(self.proto as u8).to_be_bytes());
+        buf.extend_from_slice(&(self.srcport_or_icmptype_first).to_be_bytes());
+        buf.extend_from_slice(&(self.srcport_or_icmptype_last).to_be_bytes());
+        buf.extend_from_slice(&(self.dstport_or_icmpcode_first).to_be_bytes());
+        buf.extend_from_slice(&(self.dstport_or_icmpcode_last).to_be_bytes());
+        buf.extend_from_slice(&(self.tcp_flags_mask).to_be_bytes());
+        buf.extend_from_slice(&(self.tcp_flags_value).to_be_bytes());
+    }
+}
+
+impl Decode for AclRule {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let is_permit = d.u8()?;
+        let src_prefix = Prefix::decode(d)?;
+        let dst_prefix = Prefix::decode(d)?;
+        let proto = d.u8()?;
+        let srcport_or_icmptype_first = d.u16()?;
+        let srcport_or_icmptype_last = d.u16()?;
+        let dstport_or_icmpcode_first = d.u16()?;
+        let dstport_or_icmpcode_last = d.u16()?;
+        let tcp_flags_mask = d.u8()?;
+        let tcp_flags_value = d.u8()?;
+        Ok(Self {
+            is_permit,
+            src_prefix,
+            dst_prefix,
+            proto,
+            srcport_or_icmptype_first,
+            srcport_or_icmptype_last,
+            dstport_or_icmpcode_first,
+            dstport_or_icmpcode_last,
+            tcp_flags_mask,
+            tcp_flags_value,
+        })
+    }
 }
 
 /// `address` — generated from the pinned .api.json.
@@ -3728,6 +3815,451 @@ impl Decode for AfPacketDetails {
 impl Message for AfPacketDetails {
     const NAME: &'static str = "af_packet_details";
     const CRC: &'static str = "0x58c7c042";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `acl_add_replace` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AclAddReplace {
+    pub context: u32,
+    pub acl_index: u32,
+    pub tag: String,
+    pub count: u32,
+    pub r: Vec<AclRule>,
+}
+
+impl Encode for AclAddReplace {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.acl_index).to_be_bytes());
+        {
+            let mut tmp = [0u8; 64];
+            let b = self.tag.as_bytes();
+            let k = b.len().min(64);
+            tmp[..k].copy_from_slice(&b[..k]);
+            buf.extend_from_slice(&tmp);
+        }
+        buf.extend_from_slice(&(self.r.len() as u32).to_be_bytes());
+        for it in &self.r {
+        it.encode(buf);
+        }
+    }
+}
+
+impl Decode for AclAddReplace {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let acl_index = d.u32()?;
+        let tag = d.string_fixed(64)?;
+        let count = d.u32()?;
+        let r = {
+            let n = count as usize;
+            let mut v = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                v.push(AclRule::decode(d)?);
+            }
+            v
+        };
+        Ok(Self {
+            context,
+            acl_index,
+            tag,
+            count,
+            r,
+        })
+    }
+}
+
+impl Message for AclAddReplace {
+    const NAME: &'static str = "acl_add_replace";
+    const CRC: &'static str = "0xee5c2f18";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `acl_add_replace_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AclAddReplaceReply {
+    pub context: u32,
+    pub acl_index: u32,
+    pub retval: i32,
+}
+
+impl Encode for AclAddReplaceReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.acl_index).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for AclAddReplaceReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let acl_index = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            acl_index,
+            retval,
+        })
+    }
+}
+
+impl Message for AclAddReplaceReply {
+    const NAME: &'static str = "acl_add_replace_reply";
+    const CRC: &'static str = "0xac407b0c";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `acl_del` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AclDel {
+    pub context: u32,
+    pub acl_index: u32,
+}
+
+impl Encode for AclDel {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.acl_index).to_be_bytes());
+    }
+}
+
+impl Decode for AclDel {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let acl_index = d.u32()?;
+        Ok(Self {
+            context,
+            acl_index,
+        })
+    }
+}
+
+impl Message for AclDel {
+    const NAME: &'static str = "acl_del";
+    const CRC: &'static str = "0xef34fea4";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `acl_del_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AclDelReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for AclDelReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for AclDelReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for AclDelReply {
+    const NAME: &'static str = "acl_del_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `acl_dump` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AclDump {
+    pub context: u32,
+    pub acl_index: u32,
+}
+
+impl Encode for AclDump {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.acl_index).to_be_bytes());
+    }
+}
+
+impl Decode for AclDump {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let acl_index = d.u32()?;
+        Ok(Self {
+            context,
+            acl_index,
+        })
+    }
+}
+
+impl Message for AclDump {
+    const NAME: &'static str = "acl_dump";
+    const CRC: &'static str = "0xef34fea4";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `acl_details` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AclDetails {
+    pub context: u32,
+    pub acl_index: u32,
+    pub tag: String,
+    pub count: u32,
+    pub r: Vec<AclRule>,
+}
+
+impl Encode for AclDetails {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.acl_index).to_be_bytes());
+        {
+            let mut tmp = [0u8; 64];
+            let b = self.tag.as_bytes();
+            let k = b.len().min(64);
+            tmp[..k].copy_from_slice(&b[..k]);
+            buf.extend_from_slice(&tmp);
+        }
+        buf.extend_from_slice(&(self.r.len() as u32).to_be_bytes());
+        for it in &self.r {
+        it.encode(buf);
+        }
+    }
+}
+
+impl Decode for AclDetails {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let acl_index = d.u32()?;
+        let tag = d.string_fixed(64)?;
+        let count = d.u32()?;
+        let r = {
+            let n = count as usize;
+            let mut v = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                v.push(AclRule::decode(d)?);
+            }
+            v
+        };
+        Ok(Self {
+            context,
+            acl_index,
+            tag,
+            count,
+            r,
+        })
+    }
+}
+
+impl Message for AclDetails {
+    const NAME: &'static str = "acl_details";
+    const CRC: &'static str = "0x95babae0";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `acl_interface_set_acl_list` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AclInterfaceSetAclList {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub count: u8,
+    pub n_input: u8,
+    pub acls: Vec<u32>,
+}
+
+impl Encode for AclInterfaceSetAclList {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.acls.len() as u8).to_be_bytes());
+        buf.extend_from_slice(&(self.n_input).to_be_bytes());
+        for it in &self.acls {
+        buf.extend_from_slice(&(*it).to_be_bytes());
+        }
+    }
+}
+
+impl Decode for AclInterfaceSetAclList {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let count = d.u8()?;
+        let n_input = d.u8()?;
+        let acls = {
+            let n = count as usize;
+            let mut v = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                v.push(d.u32()?);
+            }
+            v
+        };
+        Ok(Self {
+            context,
+            sw_if_index,
+            count,
+            n_input,
+            acls,
+        })
+    }
+}
+
+impl Message for AclInterfaceSetAclList {
+    const NAME: &'static str = "acl_interface_set_acl_list";
+    const CRC: &'static str = "0x473982bd";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `acl_interface_set_acl_list_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AclInterfaceSetAclListReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for AclInterfaceSetAclListReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for AclInterfaceSetAclListReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for AclInterfaceSetAclListReply {
+    const NAME: &'static str = "acl_interface_set_acl_list_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `acl_interface_list_dump` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AclInterfaceListDump {
+    pub context: u32,
+    pub sw_if_index: u32,
+}
+
+impl Encode for AclInterfaceListDump {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+    }
+}
+
+impl Decode for AclInterfaceListDump {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+        })
+    }
+}
+
+impl Message for AclInterfaceListDump {
+    const NAME: &'static str = "acl_interface_list_dump";
+    const CRC: &'static str = "0xf9e6675e";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `acl_interface_list_details` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AclInterfaceListDetails {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub count: u8,
+    pub n_input: u8,
+    pub acls: Vec<u32>,
+}
+
+impl Encode for AclInterfaceListDetails {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.acls.len() as u8).to_be_bytes());
+        buf.extend_from_slice(&(self.n_input).to_be_bytes());
+        for it in &self.acls {
+        buf.extend_from_slice(&(*it).to_be_bytes());
+        }
+    }
+}
+
+impl Decode for AclInterfaceListDetails {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let count = d.u8()?;
+        let n_input = d.u8()?;
+        let acls = {
+            let n = count as usize;
+            let mut v = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                v.push(d.u32()?);
+            }
+            v
+        };
+        Ok(Self {
+            context,
+            sw_if_index,
+            count,
+            n_input,
+            acls,
+        })
+    }
+}
+
+impl Message for AclInterfaceListDetails {
+    const NAME: &'static str = "acl_interface_list_details";
+    const CRC: &'static str = "0xe695d256";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;
     fn set_context(&mut self, context: u32) { self.context = context; }

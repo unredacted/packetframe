@@ -221,6 +221,22 @@ const MESSAGES: &[&str] = &[
     "af_packet_delete_reply",
     "af_packet_dump",
     "af_packet_details",
+    //   The hand-back path's guard (`acl.api.json`): a stateless ACL, as
+    //   the OUTPUT ACL of the hand-back interface, admitting only what the
+    //   router-owned traffic VPP hands the kernel may be. In VPP because
+    //   PacketFrame owns VPP, while the vendor controller flushes and
+    //   rewrites the kernel's netfilter on every config apply. The dumps
+    //   are the readback every check compares against.
+    "acl_add_replace",
+    "acl_add_replace_reply",
+    "acl_del",
+    "acl_del_reply",
+    "acl_dump",
+    "acl_details",
+    "acl_interface_set_acl_list",
+    "acl_interface_set_acl_list_reply",
+    "acl_interface_list_dump",
+    "acl_interface_list_details",
 ];
 
 const FILES: &[&str] = &[
@@ -238,6 +254,8 @@ const FILES: &[&str] = &[
     "l2",
     "ip6_nd",
     "af_packet",
+    "acl_types",
+    "acl",
 ];
 
 /// One field of a message or composite type.
