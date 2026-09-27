@@ -30,6 +30,11 @@ mod wire;
 use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 
 use packetframe_vpp_offload::vpp_api::generated::{
+    AclAddReplace, AclAddReplaceReply, AclDel, AclDelReply, AclDetails, AclDump,
+    AclInterfaceListDetails, AclInterfaceListDump, AclInterfaceSetAclList,
+    AclInterfaceSetAclListReply, AclRule,
+};
+use packetframe_vpp_offload::vpp_api::generated::{
     Address, AddressUnion, BridgeDomainAddDelV2, BridgeDomainAddDelV2Reply, BridgeDomainDetails,
     BridgeDomainSwIf, CliInband, CliInbandReply, ControlPingReply, CreateLoopbackInstance,
     CreateLoopbackInstanceReply, CreateLoopbackReply, CreateVlanSubif, CreateVlanSubifReply,
@@ -45,6 +50,7 @@ use packetframe_vpp_offload::vpp_api::generated::{
     ADDRESS_IP4, ADDRESS_IP6, FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
 };
 use packetframe_vpp_offload::vpp_api::generated::{
+    AfPacketCreateV3, AfPacketCreateV3Reply, AfPacketDelete, AfPacketDeleteReply, AfPacketDetails,
     IpAddressDetails, IpAddressDump, IpRouteDump, SwInterfaceAddDelAddress,
     SwInterfaceIp6EnableDisable, SwInterfaceIp6EnableDisableReply, SwInterfaceIp6ndRaConfig,
     SwInterfaceIp6ndRaConfigReply, SwInterfaceSetUnnumbered,
@@ -65,6 +71,37 @@ pub const LOOPBACK_INDEX: u32 = 11;
 
 /// Base index for `create_loopback_instance` (a bridged VLAN's BVI).
 pub const BVI_BASE: u32 = 200;
+
+/// Base index for `af_packet_create_v3` (the IPv6 hand-back interface).
+pub const AF_PACKET_BASE: u32 = 300;
+
+/// What the fake's `show interface <name>` reports as `tx packets`.
+pub const AF_PACKET_TX: u64 = 42;
+
+/// The fake's af_packet host interfaces: `(host_if_name, sw_if_index,
+/// mac)`. VPP state, so it outlives a connection.
+pub type AfPackets = std::sync::Arc<std::sync::Mutex<Vec<(String, u32, [u8; 6])>>>;
+
+/// The fake's ACLs: index → `(tag, rules)`, and per interface the bound
+/// `(n_input, acls)`. VPP state, so both outlive a connection.
+#[derive(Default)]
+pub struct AclState {
+    pub acls: std::collections::BTreeMap<u32, (String, Vec<AclRule>)>,
+    pub next: u32,
+    pub bound: std::collections::BTreeMap<u32, (u8, Vec<u32>)>,
+    /// Refuse every ACL change (add/replace and binding) while set — a
+    /// repair VPP will not take.
+    pub refuse: bool,
+}
+
+/// Shared [`AclState`].
+pub type Acls = std::sync::Arc<std::sync::Mutex<AclState>>;
+
+/// One v6 neighbour: `(ip, sw_if_index, mac, flags)`.
+pub type Neighbour6 = ([u8; 16], u32, [u8; 6], u8);
+
+/// The fake's v6 neighbour table.
+pub type Neighbours6 = std::sync::Arc<std::sync::Mutex<Vec<Neighbour6>>>;
 
 /// Link-layer address the fake mirror hands out for its one neighbour.
 pub const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -149,6 +186,14 @@ pub struct Fake {
     /// Interfaces VPP has ip6 enabled on — VPP state, so it outlives a
     /// connection like the route and neighbour tables.
     pub ip6_enabled: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>>,
+    /// Host interfaces (`af_packet_create_v3`). Seeding it before the
+    /// client connects models a surviving VPP that already has one.
+    pub af_packets: AfPackets,
+    /// The v6 neighbour table — shared so a test can play another client
+    /// removing an entry behind the module's back.
+    pub neighbours6: Neighbours6,
+    /// The ACL plugin's state — shared so a test can drift it.
+    pub acls: Acls,
     /// IPv6 interface addresses per `sw_if_index` — VPP state, so it
     /// outlives a connection. See the `sw_interface_add_del_address`
     /// handler for what is and is not modelled.
@@ -283,6 +328,12 @@ pub struct Behaviour {
     /// applying it — a VPP that will not take some v6 route, whatever the
     /// reason, which must never stall IPv4's convergence.
     pub reject_v6_routes: bool,
+    /// Refuse `af_packet_create_v3`, forever — a VPP without the
+    /// af_packet plugin, as the client sees it.
+    pub reject_af_packet_create: bool,
+    /// Static v6 neighbours a surviving VPP holds, `(ip, sw_if_index, mac,
+    /// flags)`.
+    pub existing_neighbours6: &'static [([u8; 16], u32, [u8; 6], u8)],
     /// A router loopback a surviving VPP already has: `sw_interface_dump`
     /// lists `loop0` at `LOOPBACK_INDEX`, holding these IPv6 addresses
     /// `(octets, len)` — the adoption shape for `loopback-address6`.
@@ -386,6 +437,14 @@ impl Fake {
         let ip6_enabled: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
             Default::default();
         let ip6 = ip6_enabled.clone();
+        let af_packets: AfPackets = Default::default();
+        let afp = af_packets.clone();
+        let neighbours6: Neighbours6 = std::sync::Arc::new(std::sync::Mutex::new(
+            behaviour.existing_neighbours6.to_vec(),
+        ));
+        let n6 = neighbours6.clone();
+        let acls: Acls = Default::default();
+        let acl_state = acls.clone();
         let addresses6: std::sync::Arc<std::sync::Mutex<Addresses6>> = Default::default();
         if let Some(held) = behaviour.existing_loopback6 {
             addresses6
@@ -404,7 +463,6 @@ impl Fake {
             let mut neighbours: Vec<([u8; 4], u32, [u8; 6], u8)> = b.existing_neighbours.to_vec();
             // The v6 neighbour table, kept apart for the same reason the
             // route tables are.
-            let mut neighbours6: Vec<([u8; 16], u32, [u8; 6], u8)> = Vec::new();
             // Likewise the route table, for `track_routes`.
             {
                 let mut routes = table.lock().unwrap();
@@ -429,10 +487,12 @@ impl Fake {
                     &tx,
                     b,
                     &mut neighbours,
-                    &mut neighbours6,
+                    &n6,
                     &table,
                     &table6,
                     &ip6,
+                    &afp,
+                    &acl_state,
                     &addrs6,
                     &mut stall,
                 );
@@ -448,6 +508,9 @@ impl Fake {
             routes,
             routes6,
             ip6_enabled,
+            af_packets,
+            neighbours6,
+            acls,
             addresses6,
             _dir: dir,
             events: rx,
@@ -469,10 +532,12 @@ fn serve(
     tx: &Sender<Event>,
     mut behaviour: Behaviour,
     neighbours: &mut Vec<([u8; 4], u32, [u8; 6], u8)>,
-    neighbours6: &mut Vec<([u8; 16], u32, [u8; 6], u8)>,
+    neighbours6: &std::sync::Mutex<Vec<Neighbour6>>,
     table: &std::sync::Mutex<RouteTable>,
     table6: &std::sync::Mutex<RouteTable6>,
     ip6_enabled: &std::sync::Mutex<std::collections::BTreeSet<u32>>,
+    af_packets: &AfPackets,
+    acls: &Acls,
     addresses6: &std::sync::Mutex<Addresses6>,
     stall: &mut Option<(&'static str, usize)>,
 ) -> Option<()> {
@@ -851,7 +916,8 @@ fn serve(
                     .expect("decodes as a neighbour dump")
                     .af;
                 if want == ADDRESS_IP6 {
-                    for &(ip, sw_if_index, mac, flags) in neighbours6.iter() {
+                    let snapshot = neighbours6.lock().unwrap().clone();
+                    for &(ip, sw_if_index, mac, flags) in snapshot.iter() {
                         let mut d = reply_head("ip_neighbor_details");
                         IpNeighborDetails {
                             context: ctx,
@@ -920,6 +986,7 @@ fn serve(
                 // bytes would surface as a bogus v4 neighbour.
                 if retval == 0 && n.neighbor.ip_address.af == ADDRESS_IP6 {
                     let key = n.neighbor.ip_address.un.0;
+                    let mut neighbours6 = neighbours6.lock().unwrap();
                     neighbours6
                         .retain(|(ip, idx, _, _)| !(*ip == key && *idx == n.neighbor.sw_if_index));
                     if n.is_add {
@@ -1119,6 +1186,195 @@ fn serve(
                         write_frame(sock, &d);
                     }
                 }
+                // Host interfaces, named as VPP names them, admin- and
+                // link-up.
+                let hosts = af_packets.lock().unwrap().clone();
+                for (name, idx, mac) in hosts {
+                    let mut d = reply_head("sw_interface_details");
+                    let mut det = details(idx, &format!("host-{name}"), 3, ctx);
+                    det.l2_address = mac;
+                    det.encode(&mut d);
+                    write_frame(sock, &d);
+                }
+                continue;
+            }
+            "acl_add_replace" => {
+                let mut d = Decoder::new(&req);
+                let r = AclAddReplace::decode(&mut d).expect("decodes as an ACL add/replace");
+                let mut st = acls.lock().unwrap();
+                let (retval, idx) = if st.refuse {
+                    (-1, r.acl_index)
+                } else if r.acl_index == u32::MAX {
+                    let idx = st.next;
+                    st.next += 1;
+                    st.acls.insert(idx, (r.tag.clone(), r.r.clone()));
+                    (0, idx)
+                } else if let Some(entry) = st.acls.get_mut(&r.acl_index) {
+                    *entry = (r.tag.clone(), r.r.clone());
+                    (0, r.acl_index)
+                } else {
+                    // VNET_API_ERROR_NO_SUCH_ENTRY.
+                    (-6, r.acl_index)
+                };
+                let _ = tx.send(Event::Msg(format!(
+                    "acl_add_replace idx={idx} rules={} tag={}",
+                    r.r.len(),
+                    r.tag
+                )));
+                out = reply_head("acl_add_replace_reply");
+                AclAddReplaceReply {
+                    context: ctx,
+                    acl_index: idx,
+                    retval,
+                }
+                .encode(&mut out);
+            }
+            "acl_del" => {
+                let mut d = Decoder::new(&req);
+                let r = AclDel::decode(&mut d).expect("decodes as an ACL delete");
+                let mut st = acls.lock().unwrap();
+                let in_use = st.bound.values().any(|(_, a)| a.contains(&r.acl_index));
+                let retval = if in_use {
+                    -142
+                } else if st.acls.remove(&r.acl_index).is_some() {
+                    0
+                } else {
+                    -6
+                };
+                let _ = tx.send(Event::Msg(format!("acl_del idx={}", r.acl_index)));
+                out = reply_head("acl_del_reply");
+                AclDelReply {
+                    context: ctx,
+                    retval,
+                }
+                .encode(&mut out);
+            }
+            "acl_dump" => {
+                let mut d = Decoder::new(&req);
+                let want = AclDump::decode(&mut d)
+                    .expect("decodes as an ACL dump")
+                    .acl_index;
+                let snapshot: Vec<(u32, (String, Vec<AclRule>))> = acls
+                    .lock()
+                    .unwrap()
+                    .acls
+                    .iter()
+                    .filter(|(i, _)| want == u32::MAX || **i == want)
+                    .map(|(i, v)| (*i, v.clone()))
+                    .collect();
+                for (idx, (tag, rules)) in snapshot {
+                    let mut d = reply_head("acl_details");
+                    AclDetails {
+                        context: ctx,
+                        acl_index: idx,
+                        tag,
+                        count: rules.len() as u32,
+                        r: rules,
+                    }
+                    .encode(&mut d);
+                    write_frame(sock, &d);
+                }
+                continue;
+            }
+            "acl_interface_set_acl_list" => {
+                let mut d = Decoder::new(&req);
+                let r = AclInterfaceSetAclList::decode(&mut d).expect("decodes as an ACL binding");
+                let mut st = acls.lock().unwrap();
+                let retval = if st.refuse { -1 } else { 0 };
+                if !st.refuse {
+                    if r.acls.is_empty() {
+                        st.bound.remove(&r.sw_if_index);
+                    } else {
+                        st.bound.insert(r.sw_if_index, (r.n_input, r.acls.clone()));
+                    }
+                }
+                let _ = tx.send(Event::Msg(format!(
+                    "acl_interface_set_acl_list if={} input={} acls={:?}",
+                    r.sw_if_index, r.n_input, r.acls
+                )));
+                out = reply_head("acl_interface_set_acl_list_reply");
+                AclInterfaceSetAclListReply {
+                    context: ctx,
+                    retval,
+                }
+                .encode(&mut out);
+            }
+            "acl_interface_list_dump" => {
+                let mut d = Decoder::new(&req);
+                let want = AclInterfaceListDump::decode(&mut d)
+                    .expect("decodes as an ACL binding dump")
+                    .sw_if_index;
+                let snapshot: Vec<(u32, (u8, Vec<u32>))> = acls
+                    .lock()
+                    .unwrap()
+                    .bound
+                    .iter()
+                    .filter(|(i, _)| want == u32::MAX || **i == want)
+                    .map(|(i, v)| (*i, v.clone()))
+                    .collect();
+                for (sw_if_index, (n_input, list)) in snapshot {
+                    let mut d = reply_head("acl_interface_list_details");
+                    AclInterfaceListDetails {
+                        context: ctx,
+                        sw_if_index,
+                        count: list.len() as u8,
+                        n_input,
+                        acls: list,
+                    }
+                    .encode(&mut d);
+                    write_frame(sock, &d);
+                }
+                continue;
+            }
+            "af_packet_create_v3" => {
+                let mut d = Decoder::new(&req);
+                let r = AfPacketCreateV3::decode(&mut d).expect("decodes as an af_packet create");
+                let (retval, idx) = if behaviour.reject_af_packet_create {
+                    (-1, 0)
+                } else {
+                    let mut afp = af_packets.lock().unwrap();
+                    let idx = AF_PACKET_BASE + afp.len() as u32;
+                    afp.push((r.host_if_name.clone(), idx, r.hw_addr));
+                    (0, idx)
+                };
+                let _ = tx.send(Event::Msg(format!(
+                    "af_packet_create {} mac={:02x} mode={} flags={} rx_queues={}",
+                    r.host_if_name, r.hw_addr[5], r.mode, r.flags, r.num_rx_queues
+                )));
+                out = reply_head("af_packet_create_v3_reply");
+                AfPacketCreateV3Reply {
+                    context: ctx,
+                    retval,
+                    sw_if_index: idx,
+                }
+                .encode(&mut out);
+            }
+            "af_packet_delete" => {
+                let mut d = Decoder::new(&req);
+                let r = AfPacketDelete::decode(&mut d).expect("decodes as an af_packet delete");
+                let mut afp = af_packets.lock().unwrap();
+                let before = afp.len();
+                afp.retain(|(name, _, _)| *name != r.host_if_name);
+                let _ = tx.send(Event::Msg(format!("af_packet_delete {}", r.host_if_name)));
+                out = reply_head("af_packet_delete_reply");
+                AfPacketDeleteReply {
+                    context: ctx,
+                    retval: if afp.len() < before { 0 } else { -1 },
+                }
+                .encode(&mut out);
+            }
+            "af_packet_dump" => {
+                let snapshot = af_packets.lock().unwrap().clone();
+                for (name, idx, _) in snapshot {
+                    let mut d = reply_head("af_packet_details");
+                    AfPacketDetails {
+                        context: ctx,
+                        sw_if_index: idx,
+                        host_if_name: name,
+                    }
+                    .encode(&mut d);
+                    write_frame(sock, &d);
+                }
                 continue;
             }
             "sw_interface_set_mac_address" => {
@@ -1248,7 +1504,13 @@ fn serve(
                     .expect("decodes as a CLI request")
                     .cmd;
                 let _ = tx.send(Event::Msg(format!("cli {cmd}")));
-                let reply = if cmd.contains("ip6 fib summary") && behaviour.track_routes {
+                let reply = if let Some(name) = cmd.strip_prefix("show interface ") {
+                    format!(
+                        "              Name               Idx    State  MTU (L3/IP4/IP6/MPLS)     \
+                         Counter          Count     \n{name}                  4      up          \
+                         1500/0/0/0     tx packets {AF_PACKET_TX:>21}\n"
+                    )
+                } else if cmd.contains("ip6 fib summary") && behaviour.track_routes {
                     fib6_summary(&table6.lock().unwrap())
                 } else if cmd.contains("fib summary") && behaviour.track_routes {
                     fib_summary(&table.lock().unwrap())

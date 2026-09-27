@@ -63,6 +63,7 @@ pub mod executor;
 pub mod fdb;
 pub mod feed;
 pub mod fib_sync;
+pub mod handback;
 pub mod ledger_record;
 pub mod liveness;
 pub mod ntuple;
@@ -157,13 +158,13 @@ pub struct VppOffloadConfig {
     /// no restart. Their `vlans` entry in [`Self::ports`] stays empty;
     /// bring-up fills the attach-time set from the kernel.
     pub trunk_ports: Vec<String>,
-    /// `(port, v6-outbound)` for every port line carrying the tail, in
+    /// `(port, v6-divert)` for every port line carrying the tail, in
     /// config order. Hot, like `direction`: it selects among subifs VPP
     /// already has (`vlans` is restart-only and validation holds every
     /// VID to it; a `vlans all` trunk is checked against the kernel
     /// bridge when planned), so a change is an MCAM delta and nothing
     /// else — `steer` reconciles it like an allowlist edit.
-    pub v6_outbound: Vec<(String, packetframe_common::config::VppV6Outbound)>,
+    pub v6_divert: Vec<(String, packetframe_common::config::VppV6Divert)>,
     /// `steer-keep6` lines, in config order. Hot, like `steer-exempt`.
     pub steer_keeps6: Vec<packetframe_common::config::VppSteerKeep6>,
     /// `v6 on`: VPP carries IPv6 routes and neighbours
@@ -276,7 +277,7 @@ impl VppOffloadConfig {
                     vlans,
                     vlans_all,
                     direction,
-                    v6_outbound,
+                    v6_divert,
                     ..
                 } => {
                     out.ports
@@ -284,8 +285,8 @@ impl VppOffloadConfig {
                     if *vlans_all {
                         out.trunk_ports.push(iface.clone());
                     }
-                    if let Some(v6) = v6_outbound {
-                        out.v6_outbound.push((iface.clone(), v6.clone()));
+                    if let Some(v6) = v6_divert {
+                        out.v6_divert.push((iface.clone(), v6.clone()));
                     }
                 }
                 ModuleDirective::VppSteerKeep6(k) => out.steer_keeps6.push(*k),
@@ -578,10 +579,10 @@ impl VppOffloadConfig {
         )
     }
 
-    /// Whether `iface` carries a `v6-outbound` tail — i.e. would plan v6
+    /// Whether `iface` carries a `v6-divert` tail — i.e. would plan v6
     /// rules the moment it steers, whatever the allowlist holds.
     pub fn diverts_v6(&self, iface: &str) -> bool {
-        self.v6_outbound.iter().any(|(i, _)| i == iface)
+        self.v6_divert.iter().any(|(i, _)| i == iface)
     }
 
     /// The `steer-keep6` lines as the matches the planner takes, `both`
@@ -610,7 +611,7 @@ impl VppOffloadConfig {
         out
     }
 
-    /// The v6 half of `iface`'s plan: its `v6-outbound` VLANs and the
+    /// The v6 half of `iface`'s plan: its `v6-divert` VLANs and the
     /// section's keeps. Empty when the port diverts no v6.
     ///
     /// A `vlans all` trunk's VIDs are held to the VLANs the kernel
@@ -625,13 +626,13 @@ impl VppOffloadConfig {
         iface: &str,
         tagged_vlans: &dyn Fn(&str) -> Result<Vec<u16>, String>,
     ) -> Result<steer::V6Steering, String> {
-        use packetframe_common::config::VppV6Outbound;
-        let Some((_, v6)) = self.v6_outbound.iter().find(|(i, _)| i == iface) else {
+        use packetframe_common::config::VppV6Divert;
+        let Some((_, v6)) = self.v6_divert.iter().find(|(i, _)| i == iface) else {
             return Ok(steer::V6Steering::default());
         };
         let vlans = match v6 {
-            VppV6Outbound::Untagged => vec![None],
-            VppV6Outbound::Vlans(vids) => {
+            VppV6Divert::Untagged => vec![None],
+            VppV6Divert::Vlans(vids) => {
                 if self.trunk_ports.iter().any(|t| t == iface) {
                     let carried = tagged_vlans(iface).map_err(|e| {
                         format!(
@@ -643,11 +644,11 @@ impl VppOffloadConfig {
                     })?;
                     if let Some(missing) = vids.iter().find(|v| !carried.contains(v)) {
                         return Err(format!(
-                            "`port {iface}` diverts IPv6 on vlan {missing} (`v6-outbound`), \
+                            "`port {iface}` diverts IPv6 on vlan {missing} (`v6-divert`), \
                              but the kernel bridge does not carry it tagged on {iface} \
                              (carries {carried:?}), so VPP has no subinterface for it and \
                              every diverted frame would be punted and dropped. Drop it from \
-                             `v6-outbound`, or add the VLAN to the bridge port first"
+                             `v6-divert`, or add the VLAN to the bridge port first"
                         ));
                     }
                 }
@@ -842,7 +843,7 @@ impl SharedAllowlist {
 ///
 /// A named function, so the rule is testable without a NIC.
 ///
-/// "Can steer" is per port now: a `v6-outbound` port plans v6 rules
+/// "Can steer" is per port now: a `v6-divert` port plans v6 rules
 /// whatever the allowlist holds, so it is asked even when no v4 prefix
 /// is steerable — and a port with neither is still not.
 fn ifaces_to_query<'a>(
@@ -1006,7 +1007,7 @@ fn planning_table(
 /// A steering port whose receive MACs cannot be read is refused: rules
 /// without them would divert frames the kernel is only bridging.
 ///
-/// The port's `v6-outbound` joins the plan key: two ports share a plan
+/// The port's `v6-divert` joins the plan key: two ports share a plan
 /// only when their v6 diversion is the same too. `tagged_vlans` answers
 /// which VLANs a `vlans all` trunk's kernel bridge carries tagged — see
 /// [`VppOffloadConfig::v6_steering`].
@@ -1087,7 +1088,7 @@ fn steering_target(
     // `steer on` with nothing steerable is refused for the same reason
     // `bring_up` refuses it: steering would divert nothing while every
     // surface reported it on. Per PORT, now that plans differ by more
-    // than the shared allowlist: a `v6-outbound` port has rules with no
+    // than the shared allowlist: a `v6-divert` port has rules with no
     // v4 to steer, and a port beside it without the tail has none —
     // which `steer` would refuse for the whole target anyway, so it is
     // refused here, naming the port, before anything reaches the loop.
@@ -1101,7 +1102,7 @@ fn steering_target(
         return Err(format!(
             "port(s) {empty:?} are configured `steer on`, but the allowlist produces no \
              steerable rules for them ({skipped} IPv6 prefix(es) skipped — `ip6` ntuple \
-             cannot match a v6 address on this NIC) and they have no `v6-outbound`. \
+             cannot match a v6 address on this NIC) and they have no `v6-divert`. \
              Steering would divert nothing while reporting Healthy"
         ));
     }
@@ -1650,7 +1651,7 @@ impl Module for VppOffloadModule {
             targets: target.targets,
             // The SAME derivation attach uses, run against the config
             // just accepted — exemptions, allowlist, directions and
-            // `v6-outbound` are all hot, so a scope captured at attach
+            // `v6-divert` are all hot, so a scope captured at attach
             // goes stale the moment any of them moves.
             scope: drift::DriftScope::from_config(&new, &allowlist),
             want_steer: target.want_steer,
@@ -2482,7 +2483,7 @@ mod tests {
             local_routes6: vec![],
             steer_capacity: None,
             trunk_ports: vec![],
-            v6_outbound: vec![],
+            v6_divert: vec![],
             steer_keeps6: vec![],
             v6: false,
             steer_direction: Default::default(),
@@ -2582,7 +2583,7 @@ mod tests {
                     vlans: vec![],
                     vlans_all: false,
                     direction: None,
-                    v6_outbound: None,
+                    v6_divert: None,
                     line: 1,
                 },
                 ModuleDirective::VppRequireTableComplete(require),
@@ -2635,7 +2636,7 @@ mod tests {
             vlans: vec![],
             vlans_all: false,
             direction: Some(VppSteerDirection::Dst),
-            v6_outbound: None,
+            v6_divert: None,
             line: 1,
         }];
         directives.extend(extra);
@@ -3489,13 +3490,13 @@ mod tests {
     }
 
     fn v6_cfg() -> VppOffloadConfig {
-        use packetframe_common::config::{VppL4Proto, VppSteerKeep6, VppV6Outbound};
+        use packetframe_common::config::{VppL4Proto, VppSteerKeep6, VppV6Divert};
         let mut c = cfg(&[("eth3", 1, true), ("eth4", 1, true)], 1_600_000);
         c.ports[0].3 = vec![100];
         c.trunk_ports = vec!["eth4".into()];
-        c.v6_outbound = vec![
-            ("eth3".into(), VppV6Outbound::Vlans(vec![100])),
-            ("eth4".into(), VppV6Outbound::Vlans(vec![200])),
+        c.v6_divert = vec![
+            ("eth3".into(), VppV6Divert::Vlans(vec![100])),
+            ("eth4".into(), VppV6Divert::Vlans(vec![200])),
         ];
         c.steer_keeps6 = vec![VppSteerKeep6 {
             proto: VppL4Proto::Tcp,
@@ -3512,12 +3513,12 @@ mod tests {
         }]
     }
 
-    /// Each `v6-outbound` port gets its own VLANs in its own plan, scoped
+    /// Each `v6-divert` port gets its own VLANs in its own plan, scoped
     /// to its own MAC, with the section's keeps (`both` expanded into two
     /// rules) — and a `vlans all` trunk's VID is held to what the kernel
     /// bridge carries tagged, since that is the set VPP's subifs follow.
     #[test]
-    fn v6_outbound_plans_per_port_and_holds_trunk_vids_to_the_bridge() {
+    fn v6_divert_plans_per_port_and_holds_trunk_vids_to_the_bridge() {
         use crate::steer::{L4Match, RuleMatch};
         sys_reset();
         let c = v6_cfg();
@@ -3528,7 +3529,7 @@ mod tests {
             .expect("fits");
         for (iface, vid) in [("eth3", 100), ("eth4", 200)] {
             let plan = &t.targets.iter().find(|(i, _, _)| i == iface).unwrap().2;
-            assert_eq!(plan.v6_outbound_vlans(), vec![Some(vid)], "{iface}");
+            assert_eq!(plan.v6_divert_vlans(), vec![Some(vid)], "{iface}");
             for proto in crate::steer::V6_DIVERT_PROTOS {
                 let frames: Vec<[u8; 6]> = plan
                     .rules
@@ -3565,12 +3566,12 @@ mod tests {
         assert!(e.contains("netlink said no"), "{e}");
     }
 
-    /// With nothing v4 to steer, a `v6-outbound` port still has rules and
+    /// With nothing v4 to steer, a `v6-divert` port still has rules and
     /// is still asked for its table; a `steer on` port beside it with no
     /// v6 has none, and is refused by name. `steer off` plans nothing
     /// whatever its tail says — the rollback lever stays one token.
     #[test]
-    fn v6_outbound_steers_without_v4_and_steer_off_stays_inert() {
+    fn v6_divert_steers_without_v4_and_steer_off_stays_inert() {
         sys_reset();
         let v6_only_allow = vec![packetframe_common::fib::IpPrefix::V6 {
             addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -3593,7 +3594,7 @@ mod tests {
             .iter()
             .all(|(_, _, p)| p.rules.iter().all(|r| r.is_v6())));
 
-        c.v6_outbound.retain(|(i, _)| i == "eth3");
+        c.v6_divert.retain(|(i, _)| i == "eth3");
         assert_eq!(ifaces_to_query(&c, &v6_only_allow), vec!["eth3"]);
         let e = steering_target(
             &c,
@@ -3606,7 +3607,7 @@ mod tests {
         assert!(e.contains("\"eth4\"") && !e.contains("\"eth3\""), "{e}");
 
         c.ports[1].2 = false; // eth4 `steer off`
-        c.ports[0].2 = false; // and eth3, v6-outbound and all
+        c.ports[0].2 = false; // and eth3, v6-divert and all
         let t = steering_target(
             &c,
             &v6_only_allow,
@@ -3618,14 +3619,14 @@ mod tests {
         assert!(t.targets.is_empty() && !t.want_steer);
     }
 
-    /// `v6-outbound` and `steer-keep6` are steering inputs, applied by the
+    /// `v6-divert` and `steer-keep6` are steering inputs, applied by the
     /// reconcile like `direction` and `steer-exempt` — not restart-only.
     #[test]
     fn v6_steering_changes_are_not_a_restart() {
         let before = cfg(&[("eth3", 1, true)], 1_600_000);
         let after = v6_cfg();
         let mut after_one = cfg(&[("eth3", 1, true)], 1_600_000);
-        after_one.v6_outbound = after.v6_outbound[..1].to_vec();
+        after_one.v6_divert = after.v6_divert[..1].to_vec();
         after_one.steer_keeps6 = after.steer_keeps6.clone();
         before
             .restart_only_delta(&after_one)

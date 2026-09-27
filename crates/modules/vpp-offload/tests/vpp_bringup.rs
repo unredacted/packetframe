@@ -177,7 +177,7 @@ impl Host {
             local_routes6: vec![],
             steer_capacity: None,
             trunk_ports: vec![],
-            v6_outbound: vec![],
+            v6_divert: vec![],
             steer_keeps6: vec![],
             v6: false,
             // These fixtures have no route authority to compare

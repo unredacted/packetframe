@@ -38,13 +38,13 @@
 //! tunnel device, a static route out an interface VPP does not own) is
 //! silently black-holed there. So the scan walks the kernel's IPv6 routes
 //! too, but only while that can happen: VPP carries the family AND some
-//! port line carries `v6-outbound` ([`DriftScope::scans_v6`]). Same
+//! port line carries `v6-divert` ([`DriftScope::scans_v6`]). Same
 //! judgement ([`reach_clears`]), with four differences, each forced by
 //! the v6 steering shape ([`uncovered_paths_v6`]):
 //!
 //! - nothing exempts. There is no v6 address rule to install (the NIC
 //!   cannot match one), so `steer-exempt` does not apply and the remedy
-//!   is the feed, a `steer-keep6`, or dropping `v6-outbound`;
+//!   is the feed, a `steer-keep6`, or dropping `v6-divert`;
 //! - a kernel route whose owned-device hops are link-local is judged by
 //!   what VPP HOLDS, not by its hops: zebra installs the `fe80::` hop
 //!   while the feed also carries a global one VPP installs through, and
@@ -223,13 +223,13 @@ pub struct DriftScope {
     /// [`divertible_scope`]'s answer.
     pub dst_only: Option<Vec<packetframe_common::fib::IpPrefix>>,
     /// Whether the IPv6 half runs: VPP carries IPv6 AND some port line
-    /// carries `v6-outbound`.
+    /// carries `v6-divert`.
     ///
     /// From CONFIG, not the `steer` lever, for the reason the v4 scan is
     /// installed before any port steers: the hole opens the instant the
     /// lever moves, and the operator wants it named before then. A
-    /// `v6-outbound` on a `steer off` port is the staged form of exactly
-    /// that; dropping `v6-outbound` is what switches the half off.
+    /// `v6-divert` on a `steer off` port is the staged form of exactly
+    /// that; dropping `v6-divert` is what switches the half off.
     pub scans_v6: bool,
 }
 
@@ -243,7 +243,7 @@ impl DriftScope {
         Self {
             exempts: cfg.steer_exempts.clone(),
             dst_only: divertible_scope(&cfg.ports, cfg.steer_direction, allowlist),
-            scans_v6: cfg.v6 && !cfg.v6_outbound.is_empty(),
+            scans_v6: cfg.v6 && !cfg.v6_divert.is_empty(),
         }
     }
 }
@@ -1305,7 +1305,7 @@ pub struct KernelDriftWatch {
     /// covered (the blackhole this exists to catch) and, worse, keep
     /// reporting a path the operator had just exempted BECAUSE the
     /// health message told them to (review finding) — and the same goes
-    /// for a `v6-outbound` added or dropped under a running daemon.
+    /// for a `v6-divert` added or dropped under a running daemon.
     pub scope: DriftScope,
 }
 
@@ -3045,17 +3045,17 @@ mod tests {
     }
 
     /// The v6 half runs only while VPP carries IPv6 AND some port line
-    /// carries `v6-outbound` — from config, so a `steer off` port with
-    /// `v6-outbound` (the staged form) already turns it on, as the v4
+    /// carries `v6-divert` — from config, so a `steer off` port with
+    /// `v6-divert` (the staged form) already turns it on, as the v4
     /// scan runs before any lever moves.
     #[test]
     fn the_v6_half_runs_only_with_v6_on_and_a_diverting_port() {
-        use packetframe_common::config::VppV6Outbound;
+        use packetframe_common::config::VppV6Divert;
         let cfg = |v6: bool, divert: bool, steer: bool| crate::VppOffloadConfig {
             v6,
             ports: vec![("eth4".into(), 1, steer, vec![100], None)],
-            v6_outbound: if divert {
-                vec![("eth4".into(), VppV6Outbound::Vlans(vec![100]))]
+            v6_divert: if divert {
+                vec![("eth4".into(), VppV6Divert::Vlans(vec![100]))]
             } else {
                 Vec::new()
             },
@@ -3143,7 +3143,7 @@ mod tests {
         assert_eq!(s, V6DriftState::default(), "no port diverts v6 any more");
     }
 
-    /// A reload that drops the last `v6-outbound` switches the v6 half off
+    /// A reload that drops the last `v6-divert` switches the v6 half off
     /// the moment its scope commits — not when the scanner next answers
     /// `Inactive`. A v4 dump failing in between must not be recorded as a
     /// v6 failure, or `exempt-drift-v6` claims a disabled scan is

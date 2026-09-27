@@ -196,13 +196,15 @@ pub enum ModuleDirective {
     /// (inbound rides VPP once `local-route` delivery exists). Absent
     /// = the global setting.
     ///
-    /// `v6-outbound <vid>[,<vid>…]|untagged` diverts OUTBOUND IPv6 on this
-    /// port into VPP: every TCP or UDP frame over IPv6 addressed to one of
-    /// the port's receive MACs, arriving on a listed VLAN. By frame, not
-    /// by prefix — the NIC cannot match a v6 address — so the allowlist
-    /// does not scope it. ICMPv6 (neighbour discovery included) is never
-    /// diverted; DNS and every `steer-keep6` stay on the kernel at higher
-    /// priority. Requires `v6 on`; each VID must be one
+    /// `v6-divert <vid>[,<vid>…]|untagged` diverts IPv6 on this port into
+    /// VPP: every TCP or UDP frame over IPv6 addressed to one of the
+    /// port's receive MACs, arriving on a listed VLAN — outbound on a
+    /// customer VLAN, inbound on a transit or IX port. By frame, not by
+    /// prefix — the NIC cannot match a v6 address — so the allowlist does
+    /// not scope it. ICMPv6 (neighbour discovery included) is never
+    /// diverted; DNS, BGP and every `steer-keep6` stay on the kernel at
+    /// higher priority, and the router's other own traffic is handed back
+    /// to the kernel by VPP. Requires `v6 on`; each VID must be one
     /// the port's `vlans` carries (or the port is `vlans all`, checked
     /// against the kernel bridge when the rules are planned); `untagged`
     /// only on a port that declares no VLANs, because the NIC has no
@@ -218,18 +220,21 @@ pub enum ModuleDirective {
         /// VPP runs. `vlans` is empty when this is set.
         vlans_all: bool,
         direction: Option<VppSteerDirection>,
-        v6_outbound: Option<VppV6Outbound>,
+        v6_divert: Option<VppV6Divert>,
         line: usize,
     },
-    /// `steer-keep6 <tcp|udp> <port> [dst|src|both]` — a customer→router
-    /// IPv6 service that stays on the kernel while a port diverts
-    /// outbound v6, installed at higher MCAM priority than the diversion.
-    /// Repeatable; hot-reloadable. DNS (TCP/UDP 53) is built in, and
-    /// ICMPv6 is never diverted at all. Protocol + port only, no address (the NIC has no v6 address
+    /// `steer-keep6 <tcp|udp> <port> [dst|src|both]` — an IPv6 service
+    /// the router terminates that stays on the kernel while a port
+    /// diverts v6, installed at higher MCAM priority than the diversion.
+    /// Repeatable; hot-reloadable. DNS (TCP/UDP 53) and BGP (TCP 179,
+    /// both port fields) are built in, and ICMPv6 is never diverted at
+    /// all. Protocol + port only, no address (the NIC has no v6 address
     /// match): it also keeps that protocol and port toward EXTERNAL
-    /// destinations on the eBPF tier, which is intended. Anything the
-    /// router terminates for customers on a diverted VLAN and that is not
-    /// kept dies in VPP. Installed only while some port diverts v6.
+    /// destinations on the eBPF tier, which is intended. A new session to
+    /// the router on a diverted VLAN or port that is not kept is refused by
+    /// the guard on VPP's hand-back path (it admits only replies: TCP with
+    /// ACK or RST set, UDP from a DNS or NTP server to an ephemeral port).
+    /// Installed only while some port diverts v6.
     VppSteerKeep6(VppSteerKeep6),
     /// `vpp-binary <path>` — override the probed VPP binary path.
     VppBinary(String),
@@ -1179,17 +1184,17 @@ impl std::fmt::Display for VppSteerDirection {
     }
 }
 
-/// Which frames a port's `v6-outbound` tail diverts. See
+/// Which frames a port's `v6-divert` tail diverts. See
 /// [`ModuleDirective::VppPort`].
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum VppV6Outbound {
-    /// `v6-outbound untagged` — frames with no VLAN tag. The NIC has no
+pub enum VppV6Divert {
+    /// `v6-divert untagged` — frames with no VLAN tag. The NIC has no
     /// untagged-ONLY match (a rule without a VLAN term matches every
     /// VLAN), so validation admits this only on a port that declares no
     /// VLANs at all.
     Untagged,
-    /// `v6-outbound <vid>[,<vid>…]` — frames tagged with one of these.
+    /// `v6-divert <vid>[,<vid>…]` — frames tagged with one of these.
     Vlans(Vec<u16>),
 }
 
@@ -1830,9 +1835,9 @@ impl Config {
         Ok(())
     }
 
-    /// The outbound-IPv6 steering rules (`v6-outbound`, `steer-keep6`).
+    /// The IPv6 steering rules (`v6-divert`, `steer-keep6`).
     ///
-    /// Checked whatever the `steer` levers say. A `v6-outbound` on a
+    /// Checked whatever the `steer` levers say. A `v6-divert` on a
     /// `steer off` port is accepted and inert — refusing it would turn
     /// the one-token rollback (`steer on` → `off`) into a two-edit one,
     /// and a reload that refused the rollback is the failure the rollback
@@ -1887,7 +1892,7 @@ impl Config {
                 iface,
                 vlans,
                 vlans_all,
-                v6_outbound: Some(v6),
+                v6_divert: Some(v6),
                 line,
                 ..
             } = d
@@ -1898,15 +1903,15 @@ impl Config {
                 return Err(ConfigError::parse(
                     *line,
                     format!(
-                        "`port {iface}` has `v6-outbound` but module vpp-offload does not say \
+                        "`port {iface}` has `v6-divert` but module vpp-offload does not say \
                          `v6 on`: VPP would receive the diverted IPv6 with no v6 table to \
                          forward it by, and drop every frame. Add `v6 on`, or drop \
-                         `v6-outbound`"
+                         `v6-divert`"
                     ),
                 ));
             }
             match v6 {
-                VppV6Outbound::Vlans(vids) => {
+                VppV6Divert::Vlans(vids) => {
                     // `vlans all` follows the kernel bridge; whether it
                     // carries the vid is settled when the rules are
                     // planned, against the bridge itself.
@@ -1916,27 +1921,27 @@ impl Config {
                                 *line,
                                 format!(
                                     "`port {iface}` diverts IPv6 on vlan {missing} \
-                                     (`v6-outbound`), but its `vlans` list does not carry \
+                                     (`v6-divert`), but its `vlans` list does not carry \
                                      it: VPP has no subinterface for that tag, so every \
                                      diverted frame would be punted at ethernet-input and \
                                      dropped (the w20 blackhole). Add it to `vlans` — a \
-                                     restart — or drop it from `v6-outbound`"
+                                     restart — or drop it from `v6-divert`"
                                 ),
                             ));
                         }
                     }
                 }
-                VppV6Outbound::Untagged => {
+                VppV6Divert::Untagged => {
                     if *vlans_all || !vlans.is_empty() {
                         return Err(ConfigError::parse(
                             *line,
                             format!(
-                                "`port {iface}` has `v6-outbound untagged` on a port that \
+                                "`port {iface}` has `v6-divert untagged` on a port that \
                                  carries VLANs: the NIC has no untagged-only match — a rule \
                                  without a VLAN term matches frames on EVERY vlan of the \
                                  port — so it would divert tagged IPv6 too, including on \
                                  VLANs it was never asked to. List the VLANs instead \
-                                 (`v6-outbound <id>,…`); `untagged` is for a port that \
+                                 (`v6-divert <id>,…`); `untagged` is for a port that \
                                  declares no VLANs"
                             ),
                         ));
@@ -1968,6 +1973,14 @@ impl Config {
                              always kept); drop the line",
                             k.proto
                         ),
+                    ));
+                }
+                if k.proto == VppL4Proto::Tcp && k.port == 179 {
+                    return Err(ConfigError::parse(
+                        0,
+                        "`steer-keep6 tcp 179` is built in (BGP is always kept, in both \
+                         directions — eBGP to a directly connected peer arrives at hop \
+                         limit 1 and must never enter VPP); drop the line",
                     ));
                 }
                 let entry = (k.proto, *side, k.port);
@@ -2107,7 +2120,7 @@ impl Config {
     /// - steering requires `forwarding-mode custom-fib` (the full
     ///   table VPP mirrors comes from the custom-FIB route pipeline);
     /// - duplicate `port` lines for one interface are rejected;
-    /// - the outbound-IPv6 rules ([`Self::validate_vpp_v6_steering`]);
+    /// - the IPv6 steering rules ([`Self::validate_vpp_v6_steering`]);
     /// - `local-route6` ([`Self::validate_vpp_local_routes6`]).
     pub fn validate_vpp_offload(&self) -> Result<(), ConfigError> {
         let Some(vpp) = self.modules.iter().find(|m| m.name == "vpp-offload") else {
@@ -3684,7 +3697,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 .ok_or_else(|| ConfigError::parse(line, "port requires an interface"))?;
             validate_iface_name(line, "port", iface)?;
             let usage = "port takes: <iface> cores <n> steer on|off [vlans <id>[,<id>...]|all] \
-                         [direction src|dst|both] [v6-outbound <id>[,<id>...]|untagged]";
+                         [direction src|dst|both] [v6-divert <id>[,<id>...]|untagged]";
             if rest.next() != Some("cores") {
                 return Err(ConfigError::parse(line, usage));
             }
@@ -3745,34 +3758,34 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 direction = Some(d);
                 tail = rest.next();
             }
-            let mut v6_outbound: Option<VppV6Outbound> = None;
-            if tail == Some("v6-outbound") {
+            let mut v6_divert: Option<VppV6Divert> = None;
+            if tail == Some("v6-divert") {
                 let tok = rest.next().ok_or_else(|| {
                     ConfigError::parse(
                         line,
-                        "v6-outbound requires a comma-separated vlan id list or `untagged`",
+                        "v6-divert requires a comma-separated vlan id list or `untagged`",
                     )
                 })?;
-                v6_outbound = Some(if tok == "untagged" {
-                    VppV6Outbound::Untagged
+                v6_divert = Some(if tok == "untagged" {
+                    VppV6Divert::Untagged
                 } else {
                     let mut vids: Vec<u16> = Vec::new();
                     for t in tok.split(',') {
                         let vid: u16 = t.parse().map_err(|_| {
                             ConfigError::parse(
                                 line,
-                                "v6-outbound ids must be integers 1-4094 (or `untagged`)",
+                                "v6-divert ids must be integers 1-4094 (or `untagged`)",
                             )
                         })?;
                         if !(1..=4094).contains(&vid) {
-                            return Err(ConfigError::parse(line, "v6-outbound ids must be 1-4094"));
+                            return Err(ConfigError::parse(line, "v6-divert ids must be 1-4094"));
                         }
                         if vids.contains(&vid) {
-                            return Err(ConfigError::parse(line, "duplicate v6-outbound vlan id"));
+                            return Err(ConfigError::parse(line, "duplicate v6-divert vlan id"));
                         }
                         vids.push(vid);
                     }
-                    VppV6Outbound::Vlans(vids)
+                    VppV6Divert::Vlans(vids)
                 });
                 tail = rest.next();
             }
@@ -3786,7 +3799,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 vlans,
                 vlans_all,
                 direction,
-                v6_outbound,
+                v6_divert,
                 line,
             })
         }
@@ -6434,31 +6447,31 @@ module vpp-offload
         }
     }
 
-    /// `v6-outbound` rides the end of a `port` line — after `vlans` and
+    /// `v6-divert` rides the end of a `port` line — after `vlans` and
     /// `direction`, in that order — as a VID list or `untagged`; `v6` and
     /// `steer-keep6` parse on their own lines.
     #[test]
     fn v6_steering_directives_parse_and_reject_malformed() {
         let s = "module vpp-offload\n  \
-                 port eth3 cores 1 steer on vlans 100,200 direction src v6-outbound 100,200\n  \
-                 port eth4 cores 1 steer off v6-outbound untagged\n  \
+                 port eth3 cores 1 steer on vlans 100,200 direction src v6-divert 100,200\n  \
+                 port eth4 cores 1 steer off v6-divert untagged\n  \
                  port eth5 cores 1 steer off\n  \
-                 v6 on\n  steer-keep6 udp 123\n  steer-keep6 tcp 179 both\n  \
+                 v6 on\n  steer-keep6 udp 123\n  steer-keep6 tcp 830 both\n  \
                  steer-keep6 tcp 22 src\n";
         let c = Config::parse(s).unwrap();
         let d = &c.modules[0].directives;
         let v6_of = |i: usize| match &d[i] {
-            ModuleDirective::VppPort { v6_outbound, .. } => v6_outbound.clone(),
+            ModuleDirective::VppPort { v6_divert, .. } => v6_divert.clone(),
             other => panic!("expected VppPort, got {other:?}"),
         };
-        assert_eq!(v6_of(0), Some(VppV6Outbound::Vlans(vec![100, 200])));
-        assert_eq!(v6_of(1), Some(VppV6Outbound::Untagged));
+        assert_eq!(v6_of(0), Some(VppV6Divert::Vlans(vec![100, 200])));
+        assert_eq!(v6_of(1), Some(VppV6Divert::Untagged));
         assert_eq!(v6_of(2), None);
         assert_eq!(d[3], ModuleDirective::VppV6(true));
         let keep =
             |proto, port, side| ModuleDirective::VppSteerKeep6(VppSteerKeep6 { proto, port, side });
         assert_eq!(d[4], keep(VppL4Proto::Udp, 123, VppSteerDirection::Dst));
-        assert_eq!(d[5], keep(VppL4Proto::Tcp, 179, VppSteerDirection::Both));
+        assert_eq!(d[5], keep(VppL4Proto::Tcp, 830, VppSteerDirection::Both));
         assert_eq!(d[6], keep(VppL4Proto::Tcp, 22, VppSteerDirection::Src));
         assert_eq!(
             Config::parse("module vpp-offload\n  v6 off\n")
@@ -6469,16 +6482,16 @@ module vpp-offload
         );
 
         for bad in [
-            "module vpp-offload\n  port eth3 cores 1 steer on v6-outbound\n",
-            "module vpp-offload\n  port eth3 cores 1 steer on v6-outbound 0\n",
-            "module vpp-offload\n  port eth3 cores 1 steer on v6-outbound 4095\n",
-            "module vpp-offload\n  port eth3 cores 1 steer on v6-outbound 100,100\n",
-            "module vpp-offload\n  port eth3 cores 1 steer on v6-outbound 100,\n",
-            "module vpp-offload\n  port eth3 cores 1 steer on v6-outbound tagged\n",
-            "module vpp-offload\n  port eth3 cores 1 steer on v6-outbound 100 extra\n",
-            // Fixed order: v6-outbound last.
-            "module vpp-offload\n  port eth3 cores 1 steer on v6-outbound 100 vlans 100\n",
-            "module vpp-offload\n  port eth3 cores 1 steer on v6-outbound 100 direction src\n",
+            "module vpp-offload\n  port eth3 cores 1 steer on v6-divert\n",
+            "module vpp-offload\n  port eth3 cores 1 steer on v6-divert 0\n",
+            "module vpp-offload\n  port eth3 cores 1 steer on v6-divert 4095\n",
+            "module vpp-offload\n  port eth3 cores 1 steer on v6-divert 100,100\n",
+            "module vpp-offload\n  port eth3 cores 1 steer on v6-divert 100,\n",
+            "module vpp-offload\n  port eth3 cores 1 steer on v6-divert tagged\n",
+            "module vpp-offload\n  port eth3 cores 1 steer on v6-divert 100 extra\n",
+            // Fixed order: v6-divert last.
+            "module vpp-offload\n  port eth3 cores 1 steer on v6-divert 100 vlans 100\n",
+            "module vpp-offload\n  port eth3 cores 1 steer on v6-divert 100 direction src\n",
             "module vpp-offload\n  v6\n",
             "module vpp-offload\n  v6 maybe\n",
             "module vpp-offload\n  steer-keep6\n",
@@ -6494,7 +6507,7 @@ module vpp-offload
         }
     }
 
-    /// Every way a `v6-outbound` would be wrong the moment its lever
+    /// Every way a `v6-divert` would be wrong the moment its lever
     /// moves is refused on the config alone — and `steer off` is NOT one
     /// of them, so the rollback stays a one-token edit.
     #[test]
@@ -6512,20 +6525,20 @@ module vpp-offload
         // Happy: listed VLAN, `vlans all` (settled at planning), and an
         // access port's `untagged`.
         check(
-            "  v6 on\n  port eth3 cores 1 steer on vlans 100,200 v6-outbound 200\n  \
-             port eth4 cores 1 steer on vlans all v6-outbound 300\n",
+            "  v6 on\n  port eth3 cores 1 steer on vlans 100,200 v6-divert 200\n  \
+             port eth4 cores 1 steer on vlans all v6-divert 300\n",
         )
         .unwrap();
-        check("  v6 on\n  port eth3 cores 1 steer on v6-outbound untagged\n  port eth4 cores 1 steer off\n")
+        check("  v6 on\n  port eth3 cores 1 steer on v6-divert untagged\n  port eth4 cores 1 steer off\n")
             .unwrap();
         // `steer off` with the tail: accepted, and inert.
-        check("  v6 on\n  port eth3 cores 1 steer off vlans 100 v6-outbound 100\n  port eth4 cores 1 steer off\n")
+        check("  v6 on\n  port eth3 cores 1 steer off vlans 100 v6-divert 100\n  port eth4 cores 1 steer off\n")
             .unwrap();
 
         // No `v6 on` (absent, or `off`).
         for v6 in ["", "  v6 off\n"] {
             let e = check(&format!(
-                "{v6}  port eth3 cores 1 steer on vlans 100 v6-outbound 100\n  \
+                "{v6}  port eth3 cores 1 steer on vlans 100 v6-divert 100\n  \
                  port eth4 cores 1 steer off\n"
             ))
             .unwrap_err();
@@ -6533,7 +6546,7 @@ module vpp-offload
         }
         // A VID the port's `vlans` does not carry.
         let e = check(
-            "  v6 on\n  port eth3 cores 1 steer on vlans 100 v6-outbound 100,200\n  \
+            "  v6 on\n  port eth3 cores 1 steer on vlans 100 v6-divert 100,200\n  \
              port eth4 cores 1 steer off\n",
         )
         .unwrap_err();
@@ -6541,8 +6554,10 @@ module vpp-offload
             e.contains("vlan 200") && e.contains("does not carry"),
             "{e}"
         );
-        let e = check("  v6 on\n  port eth3 cores 1 steer on v6-outbound 100\n  port eth4 cores 1 steer off\n")
-            .unwrap_err();
+        let e = check(
+            "  v6 on\n  port eth3 cores 1 steer on v6-divert 100\n  port eth4 cores 1 steer off\n",
+        )
+        .unwrap_err();
         assert!(
             e.contains("vlan 100"),
             "a port with no vlans carries none: {e}"
@@ -6550,7 +6565,7 @@ module vpp-offload
         // `untagged` on a port that carries VLANs.
         for vlans in ["vlans 100", "vlans all"] {
             let e = check(&format!(
-                "  v6 on\n  port eth3 cores 1 steer on {vlans} v6-outbound untagged\n  \
+                "  v6 on\n  port eth3 cores 1 steer on {vlans} v6-divert untagged\n  \
                  port eth4 cores 1 steer off\n"
             ))
             .unwrap_err();
@@ -6561,12 +6576,16 @@ module vpp-offload
         for (keeps, want) in [
             ("  steer-keep6 udp 53\n", "built in"),
             ("  steer-keep6 tcp 53 both\n", "built in"),
+            // BGP is built in both ways, so every spelling is redundant.
+            ("  steer-keep6 tcp 179\n", "BGP is always kept"),
+            ("  steer-keep6 tcp 179 src\n", "BGP is always kept"),
+            ("  steer-keep6 tcp 179 both\n", "BGP is always kept"),
             (
                 "  steer-keep6 udp 123\n  steer-keep6 udp 123\n",
                 "duplicate",
             ),
             (
-                "  steer-keep6 tcp 179\n  steer-keep6 tcp 179 both\n",
+                "  steer-keep6 tcp 830\n  steer-keep6 tcp 830 both\n",
                 "duplicate",
             ),
         ] {
@@ -6576,7 +6595,7 @@ module vpp-offload
         // Distinct sides of the same port are two rules, not a repeat;
         // src-port 53 is not the built-in.
         check(&format!(
-            "{two_ports}  steer-keep6 tcp 179\n  steer-keep6 tcp 179 src\n  \
+            "{two_ports}  steer-keep6 tcp 830\n  steer-keep6 tcp 830 src\n  \
              steer-keep6 udp 53 src\n"
         ))
         .unwrap();

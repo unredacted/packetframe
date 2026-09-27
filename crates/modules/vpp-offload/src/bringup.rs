@@ -579,7 +579,7 @@ pub fn bring_up(
         // and settling that needs no NIC — so it is settled BEFORE the
         // table query. Otherwise the operator's answer is whatever the
         // ioctl said (on a down port, `EOPNOTSUPP`), which names the
-        // wrong problem entirely. Per port: a `v6-outbound` port has
+        // wrong problem entirely. Per port: a `v6-divert` port has
         // something to divert whatever the allowlist holds.
         let steerable = crate::steer::steerable_count(allowlist);
         let idle: Vec<&str> = cfg
@@ -592,7 +592,7 @@ pub fn bring_up(
             return Err(format!(
                 "port(s) {idle:?} are configured `steer on`, but the allowlist produces no \
                  steerable rules for them ({} IPv6 prefix(es) skipped — `ip6` ntuple cannot \
-                 match a v6 address on this NIC) and they have no `v6-outbound`. Steering \
+                 match a v6 address on this NIC) and they have no `v6-divert`. Steering \
                  would divert nothing while reporting Healthy; set the ports `steer off` or \
                  give fast-path a v4 `allow-prefix`",
                 allowlist.len() - steerable
@@ -642,7 +642,7 @@ pub fn bring_up(
     // Any src (or `both`) port anywhere means any destination is
     // reachable — the conservative default, including when the config
     // declares no direction at all. The same holds for whether the IPv6
-    // half runs: `v6-outbound` on any port line, lever or not
+    // half runs: `v6-divert` on any port line, lever or not
     // ([`crate::drift::DriftScope::scans_v6`]).
     //
     // Exactly what the runtime is built with below — the target, the
@@ -1351,6 +1351,16 @@ fn finish(
     };
     let drift_scope = held_steering.scope.clone();
     let engine_exempts = steer_exempts.to_vec();
+    // The IPv6 hand-back path's sizing and want, from the same inputs the
+    // runtime starts with: the veth takes the largest member MTU, so any
+    // router-owned packet a port accepted fits back through it.
+    let handback_mtu = port_attach
+        .iter()
+        .filter_map(|p| p.mtu)
+        .max()
+        .unwrap_or(1500)
+        .max(1500);
+    let handback_wanted = crate::handback::plans_divert_v6(&held_steering.targets);
     let factory: LoopFactory = Box::new(move || {
         // What VPP can egress, for the exemption tripwire: the member
         // ports, the kernel bridges `local-route` and `local-route6`
@@ -1411,6 +1421,15 @@ fn finish(
         // default elsewhere treats every device as plain.
         #[cfg(target_os = "linux")]
         let engine = engine.with_topology(Box::new(crate::topology::KernelTopology::start()));
+        // The IPv6 hand-back path ([`crate::handback`]), under `v6 on`
+        // only: a v4-only VPP is never sent IPv6 to hand back. Built on
+        // the first want, which is this target's if it diverts v6.
+        let mut engine = engine;
+        if families.carries_v6() {
+            engine =
+                engine.with_handback(Box::new(crate::handback::KernelHostSide::new(handback_mtu)));
+            engine.set_handback_wanted(handback_wanted);
+        }
         // Counted before the record moves into the owner: the log line
         // below needs it, and reaching for it afterwards is what the
         // borrow checker just refused.
@@ -1779,7 +1798,7 @@ mod completeness_gate_tests {
             local_routes6: vec![],
             steer_capacity: None,
             trunk_ports: vec![],
-            v6_outbound: vec![],
+            v6_divert: vec![],
             steer_keeps6: vec![],
             v6: false,
             steer_direction: Default::default(),

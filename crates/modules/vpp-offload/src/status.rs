@@ -74,6 +74,9 @@ pub const SUBSYS_ROUTE_FEED: &str = "route-feed";
 /// count on `fib-synced` is IPv4's — the family steering diverts (see
 /// [`SinkCounts`]).
 pub const SUBSYS_FIB_V6: &str = "fib-v6";
+/// The IPv6 hand-back path ([`crate::handback`]), present only while it
+/// is wanted or built.
+pub const SUBSYS_HANDBACK: &str = "v6-handback";
 /// Present only while some port diverts IPv6 and VPP has no global
 /// IPv6 address to source ICMPv6 errors from (`loopback-address6`
 /// unset). See [`StatusSnapshot::v6_errors_unsourced`].
@@ -325,12 +328,15 @@ pub struct StatusSnapshot {
     /// Why the last steering audit could not read the NIC, if so. See
     /// [`crate::runtime::RuntimeStatus::steer_audit_error`].
     pub steer_audit_unreadable: Option<String>,
-    /// Where the installed rules divert outbound IPv6. See
-    /// [`crate::runtime::RuntimeStatus::steer_v6_outbound`].
-    pub steer_v6_outbound: Vec<String>,
+    /// Where the installed rules divert IPv6. See
+    /// [`crate::runtime::RuntimeStatus::steer_v6_divert`].
+    pub steer_v6_divert: Vec<String>,
     /// The installed rules divert IPv6 and no IPv4. See
     /// [`crate::runtime::RuntimeStatus::steer_v6_only`].
     pub steer_v6_only: bool,
+    /// The IPv6 hand-back path, while it is wanted or built. See
+    /// [`crate::runtime::RuntimeStatus::handback`].
+    pub handback: Option<crate::handback::HandbackStatus>,
     /// Where VPP's ICMPv6 errors come from. See
     /// [`crate::runtime::RuntimeStatus::icmp6_source`] and
     /// [`Self::v6_errors_unsourced`].
@@ -487,16 +493,19 @@ pub struct StatusSnapshot {
 /// catch.
 ///
 /// Also carries what the installed rules divert beyond allowlisted IPv4 —
-/// [`crate::runtime::RuntimeStatus::steer_v6_outbound`] — because the
+/// [`crate::runtime::RuntimeStatus::steer_v6_divert`] — because the
 /// steering row names it and it is a fact about the same installed set.
 #[derive(Debug, Default, Clone)]
 pub struct SteerAudit {
     pub missing: usize,
     pub stray: usize,
     pub unreadable: Option<String>,
-    pub v6_outbound: Vec<String>,
+    pub v6_divert: Vec<String>,
     /// See [`crate::runtime::RuntimeStatus::steer_v6_only`].
     pub v6_only: bool,
+    /// See [`crate::runtime::RuntimeStatus::handback`]. Carried here
+    /// because it gates the v6 half of the same installed set.
+    pub handback: Option<crate::handback::HandbackStatus>,
     /// See [`crate::runtime::RuntimeStatus::icmp6_source`]. Carried here
     /// because it only matters for the diverted IPv6 above — the
     /// `icmp6-source` row judges the two together.
@@ -604,8 +613,9 @@ impl StatusSnapshot {
             steer_missing: audit.missing,
             steer_stray: audit.stray,
             steer_audit_unreadable: audit.unreadable,
-            steer_v6_outbound: audit.v6_outbound,
+            steer_v6_divert: audit.v6_divert,
             steer_v6_only: audit.v6_only,
+            handback: audit.handback,
             icmp6_source: audit.icmp6_source,
             undead: sup.is_undead(),
             failures: sup.failures(),
@@ -717,6 +727,7 @@ impl StatusSnapshot {
             self.ports_health(),
         ];
         subsystems.extend(self.fib_v6_health());
+        subsystems.extend(self.handback_health());
         // Only present when the runtime actually failed to persist
         // something, so the subsystem list does not carry a permanent
         // "state-file: fine" row nobody reads.
@@ -963,6 +974,81 @@ impl StatusSnapshot {
             // MTU shrinks at VPP, and a `*` hop in every traceroute. The
             // `icmp6-source` row says so, from the same predicate.
             && !self.v6_errors_unsourced()
+            // A v6 diversion held back for the hand-back path is traffic
+            // the operator asked to divert and the module is not — the
+            // `v6-handback` row says Degraded, and overall must not
+            // outrank it.
+            && !self.handback_withholding()
+    }
+
+    /// The target diverts IPv6 and the hand-back path is not ready, so the
+    /// v6 half of steering is held back.
+    fn handback_withholding(&self) -> bool {
+        self.handback.as_ref().is_some_and(|h| h.wanted && !h.ready)
+    }
+
+    /// The `v6-handback` row: absent unless the path is wanted or built.
+    fn handback_health(&self) -> Option<SubsystemHealth> {
+        let h = self.handback.as_ref()?;
+        let parts = format!(
+            "veth {} ({}), guard ACL {} (VPP ACL tag {}), VPP interface {}, {} router-owned \
+             /128(s) handed back{}",
+            if h.veth { "up" } else { "missing or down" },
+            crate::handback::KERNEL_IF,
+            if h.guard {
+                "in place"
+            } else {
+                "missing or drifted"
+            },
+            crate::handback::ACL_TAG,
+            match (&h.vpp_if, h.vpp_up) {
+                (Some(name), true) => format!("{name} up"),
+                (Some(name), false) => format!("{name} DOWN"),
+                (None, _) => "absent".to_string(),
+            },
+            h.routes,
+            match h.owned {
+                Some(n) if n != h.routes => format!(" of {n} the host holds"),
+                _ => String::new(),
+            },
+        );
+        let (state, message) = if h.wanted && !h.ready {
+            (
+                HealthState::Degraded,
+                format!(
+                    "IPv6 diversion held back: the hand-back path is not ready — {parts}{}. \
+                     Without it the router's own IPv6 arriving on a diverted port would be \
+                     dropped in VPP, so no `v6-divert` rule is installed; IPv4 steering is \
+                     unaffected. Retried every {}s",
+                    h.error
+                        .as_ref()
+                        .map(|e| format!("; last error: {e}"))
+                        .unwrap_or_default(),
+                    crate::handback::RETRY_EVERY.as_secs()
+                ),
+            )
+        } else if h.wanted {
+            (
+                HealthState::Healthy,
+                format!(
+                    "ready — {parts}{}",
+                    h.tx_packets
+                        .map(|n| format!(", {n} packet(s) handed to the kernel"))
+                        .unwrap_or_default()
+                ),
+            )
+        } else {
+            (
+                HealthState::Healthy,
+                format!("built but not in use (no port diverts IPv6) — {parts}"),
+            )
+        };
+        Some(SubsystemHealth {
+            name: SUBSYS_HANDBACK.into(),
+            state,
+            message: Some(message),
+            last_success_age_seconds: None,
+        })
     }
 
     /// Some port diverts IPv6 into VPP (the INSTALLED rules say so, not
@@ -975,7 +1061,7 @@ impl StatusSnapshot {
     /// One predicate for the row and for [`Self::nominal`], so the two
     /// cannot disagree about it.
     fn v6_errors_unsourced(&self) -> bool {
-        !self.steer_v6_outbound.is_empty() && self.icmp6_source.is_none()
+        !self.steer_v6_divert.is_empty() && self.icmp6_source.is_none()
     }
 
     /// The `icmp6-source` row: present only while
@@ -1004,8 +1090,8 @@ impl StatusSnapshot {
                  that traffic: traceroutes through the router show `*` at its hop, and PMTUD \
                  breaks for any flow whose path MTU shrinks there. Set `loopback-address6 \
                  <address>` (a /128 from your own global space that no host interface holds; \
-                 restart-only) — docs/runbooks/vpp-offload.md, v6 outbound steering",
-                self.steer_v6_outbound.join(", ")
+                 restart-only) — docs/runbooks/vpp-offload.md, v6-divert steering",
+                self.steer_v6_divert.join(", ")
             )),
             last_success_age_seconds: None,
         })
@@ -1035,12 +1121,12 @@ impl StatusSnapshot {
             });
             format!(
                 "IPv6 kernel path(s) VPP cannot take, while a port diverts IPv6 \
-                 (`v6-outbound`): {} — diverted IPv6 for these dies in VPP, or leaves by a less \
+                 (`v6-divert`): {} — diverted IPv6 for these dies in VPP, or leaves by a less \
                  specific route VPP holds, instead of taking the kernel path. There is no \
                  IPv6 `steer-exempt` (the NIC cannot match a v6 address). If VPP should carry \
                  the route, fix the feed or the port's `vlans` so it can; if it is kernel-only, \
                  accept the risk knowingly, keep its traffic on the kernel by port with \
-                 `steer-keep6`, or drop `v6-outbound` from the ports whose hosts reach it{}",
+                 `steer-keep6`, or drop `v6-divert` from the ports whose hosts reach it{}",
                 v6.lines.join("; "),
                 stale.unwrap_or_default()
             )
@@ -1459,7 +1545,7 @@ impl StatusSnapshot {
     /// named when it is not — withheld (the v6 pool outgrew its budget)
     /// and unresolvable (a v6 next hop VPP cannot reach) page differently,
     /// as on the v4 row. What an incomplete table COSTS depends on whether
-    /// the installed rules divert IPv6 (`v6-outbound`): unsteered, nothing
+    /// the installed rules divert IPv6 (`v6-divert`): unsteered, nothing
     /// v6 reaches VPP and nothing is dropped; diverted, a packet whose
     /// prefix VPP lacks follows a less specific VPP route or is dropped,
     /// and the row says so — and an empty v6 table under a live diversion
@@ -1471,8 +1557,7 @@ impl StatusSnapshot {
         let v6 = self.counts.v6?;
         // Read from the installed plan, like the steering row: what the
         // NIC diverts, not what the config wants.
-        let diverted =
-            (!self.steer_v6_outbound.is_empty()).then(|| self.steer_v6_outbound.join(", "));
+        let diverted = (!self.steer_v6_divert.is_empty()).then(|| self.steer_v6_divert.join(", "));
         let (state, message) = if v6.degraded() {
             // Every condition that holds, each named, because each has a
             // different remedy; the counts that are zero stay out of the
@@ -1537,7 +1622,7 @@ impl StatusSnapshot {
                     format!(
                         "no IPv6 routes in VPP yet ({} in flight) while outbound IPv6 is \
                          diverted into VPP on {on}: every diverted IPv6 packet is dropped \
-                         until the table loads. Drop `v6-outbound` (or set the port `steer \
+                         until the table loads. Drop `v6-divert` (or set the port `steer \
                          off`) and `packetframe reconfigure` to put it back on the eBPF \
                          tier meanwhile",
                         v6.installing
@@ -1831,42 +1916,42 @@ impl StatusSnapshot {
             //
             // The IPv6 clause says what the installed plan does with v6,
             // per port and VLAN, because "IPv4 only" stopped being a
-            // constant the day `v6-outbound` shipped — and a row that
+            // constant the day `v6-divert` shipped — and a row that
             // still claimed it would hide exactly the traffic an operator
             // just moved. The IPv4 clause is read from the same installed
-            // rules: a v6-only allowlist beside `v6-outbound` diverts no
+            // rules: a v6-only allowlist beside `v6-divert` diverts no
             // IPv4, and the row must not say it does.
             (true, _) => (
                 HealthState::Healthy,
-                Some(if self.steer_v6_outbound.is_empty() {
+                Some(if self.steer_v6_divert.is_empty() {
                     if self.counts.v6.is_some() {
                         "steered — MCAM rules are diverting allowlisted IPv4 traffic to VPP \
                          (IPv6 routes are loaded in VPP by `v6 on`, but no IPv6 is steered: \
-                         no port has `v6-outbound`, so it stays on the eBPF tier); \
+                         no port has `v6-divert`, so it stays on the eBPF tier); \
                          `ethtool -n <iface>` lists the rules"
                             .into()
                     } else {
                         "steered — MCAM rules are diverting allowlisted IPv4 traffic to VPP \
-                         (IPv6 stays on the eBPF tier: no port has `v6-outbound`); \
+                         (IPv6 stays on the eBPF tier: no port has `v6-divert`); \
                          `ethtool -n <iface>` lists the rules"
                             .into()
                     }
                 } else if self.steer_v6_only {
                     format!(
-                        "steered — MCAM rules are diverting outbound IPv6 on {} (every TCP \
-                         and UDP frame to the router there except DNS and `steer-keep6`) to \
+                        "steered — MCAM rules are diverting IPv6 on {} (every TCP and UDP \
+                         frame to the router there except DNS, BGP and `steer-keep6`) to \
                          VPP; no IPv4 is diverted (nothing in the allowlist is steerable \
                          IPv4), and other IPv6 stays on the eBPF tier. `ethtool -n <iface>` \
                          lists the rules",
-                        self.steer_v6_outbound.join(", ")
+                        self.steer_v6_divert.join(", ")
                     )
                 } else {
                     format!(
                         "steered — MCAM rules are diverting allowlisted IPv4 traffic, and \
-                         outbound IPv6 on {} (every TCP and UDP frame to the router there \
-                         except DNS and `steer-keep6`), to VPP; other IPv6 stays on the \
+                         IPv6 on {} (every TCP and UDP frame to the router there except \
+                         DNS, BGP and `steer-keep6`), to VPP; other IPv6 stays on the \
                          eBPF tier. `ethtool -n <iface>` lists the rules",
-                        self.steer_v6_outbound.join(", ")
+                        self.steer_v6_divert.join(", ")
                     )
                 }),
             ),
@@ -2247,6 +2332,41 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
                     "packetframe_vpp_family_routes{{module=\"{module}\",family=\"{family}\",state=\"{label}\"}} {value}"
                 );
             }
+        }
+    }
+
+    if let Some(h) = &snap.handback {
+        gauge(
+            &mut out,
+            "packetframe_vpp_handback_ready",
+            "1 when the IPv6 hand-back path is complete and in sync (the v6 half of steering may be installed)",
+        );
+        let _ = writeln!(
+            out,
+            "packetframe_vpp_handback_ready{{module=\"{module}\"}} {}",
+            u8::from(h.ready)
+        );
+        gauge(
+            &mut out,
+            "packetframe_vpp_handback_routes",
+            "router-owned IPv6 /128s VPP hands back to the kernel",
+        );
+        let _ = writeln!(
+            out,
+            "packetframe_vpp_handback_routes{{module=\"{module}\"}} {}",
+            h.routes
+        );
+        // ABSENT until sampled, never zero — the null-drop rule.
+        if let Some(n) = h.tx_packets {
+            gauge(
+                &mut out,
+                "packetframe_vpp_handback_tx_packets",
+                "cumulative packets VPP has sent the kernel over the hand-back path (absent until sampled)",
+            );
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_handback_tx_packets{{module=\"{module}\"}} {n}"
+            );
         }
     }
 
@@ -2833,7 +2953,7 @@ mod tests {
             "steer off",
             // The steered row names the v6 directives: whether any port
             // diverts v6, and what stays kept when one does.
-            "v6-outbound",
+            "v6-divert",
             "steer-keep6",
         ];
         let mut seen: Vec<String> = Vec::new();
@@ -3860,7 +3980,7 @@ mod tests {
 
         // With v6 diverted, the row says where — port and VLANs — and
         // stops claiming v6 stays put.
-        snap.steer_v6_outbound = vec!["eth4 vlan 100,200".into(), "eth5 untagged".into()];
+        snap.steer_v6_divert = vec!["eth4 vlan 100,200".into(), "eth5 untagged".into()];
         let msg = snap
             .report()
             .subsystems
@@ -3870,10 +3990,10 @@ mod tests {
             .message
             .unwrap();
         assert!(
-            msg.contains("outbound IPv6 on eth4 vlan 100,200, eth5 untagged"),
+            msg.contains("IPv6 on eth4 vlan 100,200, eth5 untagged"),
             "{msg}"
         );
-        assert!(!msg.contains("no port has `v6-outbound`"), "{msg}");
+        assert!(!msg.contains("no port has `v6-divert`"), "{msg}");
         assert!(msg.contains("allowlisted IPv4"), "both families: {msg}");
 
         // v6 only: the row stops claiming IPv4 is diverted.
@@ -3886,7 +4006,7 @@ mod tests {
             .unwrap()
             .message
             .unwrap();
-        assert!(msg.contains("outbound IPv6 on eth4 vlan 100,200"), "{msg}");
+        assert!(msg.contains("IPv6 on eth4 vlan 100,200"), "{msg}");
         assert!(!msg.contains("allowlisted IPv4"), "{msg}");
         assert!(msg.contains("no IPv4 is diverted"), "{msg}");
     }
@@ -3937,7 +4057,7 @@ mod tests {
         assert!(row(&snap).is_none(), "no v6 diverted, no row");
         assert!(gauge(&snap).ends_with(" 0"), "{}", gauge(&snap));
 
-        snap.steer_v6_outbound = vec!["eth4 vlan 100".into()];
+        snap.steer_v6_divert = vec!["eth4 vlan 100".into()];
         let r = row(&snap).expect("diverted v6 with no source must be reported");
         assert_eq!(r.state, HealthState::Degraded);
         let msg = r.message.unwrap();
@@ -3959,7 +4079,7 @@ mod tests {
     /// themselves: v4 only, v6 only, or both.
     #[test]
     fn the_families_diverted_are_read_from_the_installed_rules() {
-        use crate::runtime::{installs_v4_diversion, v6_outbound_summary};
+        use crate::runtime::{installs_v4_diversion, v6_divert_summary};
         use crate::steer::{McamBudget, RuleSet, V6Steering};
         let plan = |allow: Vec<packetframe_common::fib::IpPrefix>, vlans| {
             let set = RuleSet::plan_with_v6(
@@ -3989,9 +4109,9 @@ mod tests {
         let v4_only = plan(v4(), vec![]);
         let both = plan(v4(), vec![Some(100)]);
         let v6_only = plan(v6_prefix, vec![Some(100)]);
-        assert!(installs_v4_diversion(&v4_only) && v6_outbound_summary(&v4_only).is_empty());
-        assert!(installs_v4_diversion(&both) && !v6_outbound_summary(&both).is_empty());
-        assert!(!installs_v4_diversion(&v6_only) && !v6_outbound_summary(&v6_only).is_empty());
+        assert!(installs_v4_diversion(&v4_only) && v6_divert_summary(&v4_only).is_empty());
+        assert!(installs_v4_diversion(&both) && !v6_divert_summary(&both).is_empty());
+        assert!(!installs_v4_diversion(&v6_only) && !v6_divert_summary(&v6_only).is_empty());
     }
 
     /// The summary the row prints comes from the INSTALLED plan's v6
@@ -4022,7 +4142,7 @@ mod tests {
             ("eth5".to_string(), 0, plan(vec![None])),
         ];
         assert_eq!(
-            crate::runtime::v6_outbound_summary(&plans),
+            crate::runtime::v6_divert_summary(&plans),
             vec!["eth4 vlan 100,200".to_string(), "eth5 untagged".to_string()]
         );
     }
@@ -4656,6 +4776,96 @@ mod tests {
         assert!(m.contains("packetframe_vpp_fib_verified{module=\"vpp-offload\"} 0"));
     }
 
+    /// The `v6-handback` row exists only while the path is wanted or
+    /// built; a target whose v6 half is held back for it is Degraded, row
+    /// and overall alike, naming what is missing; a ready path is Healthy
+    /// and says what it carries. The gauges follow, the tx counter absent
+    /// until sampled.
+    #[test]
+    fn the_handback_row_reports_the_path_and_a_held_back_v6_half_degrades() {
+        use crate::handback::HandbackStatus;
+        let mut s = StatusSnapshot::observe(
+            &steered_supervisor(),
+            ledger_with(5, 0, 0).counts(),
+            &PendingMap::new(),
+            ApiHealth::Answering {
+                silent_for: Duration::from_millis(1),
+            },
+            verified(1),
+            ports_up(),
+            true,
+        );
+        let row = |s: &StatusSnapshot| {
+            s.report()
+                .subsystems
+                .into_iter()
+                .find(|x| x.name == SUBSYS_HANDBACK)
+        };
+        // No path (v6 off, or never wanted): no row, no gauge.
+        assert!(row(&s).is_none());
+        assert!(!render_metrics(&s, "vpp-offload").contains("handback"));
+        assert_eq!(s.report().overall, HealthState::Healthy);
+
+        // Wanted and not ready: Degraded, named, and overall follows.
+        s.handback = Some(HandbackStatus {
+            wanted: true,
+            veth: true,
+            guard: false,
+            error: Some("VPP refused acl_add_replace (retval -1)".into()),
+            ..Default::default()
+        });
+        let r = row(&s).expect("row");
+        assert_eq!(r.state, HealthState::Degraded);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains("IPv6 diversion held back")
+                && msg.contains("guard ACL missing or drifted")
+                && msg.contains("acl_add_replace")
+                && msg.contains("IPv4 steering is unaffected"),
+            "{msg}"
+        );
+        assert_eq!(s.report().overall, HealthState::Degraded);
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(
+            m.contains("packetframe_vpp_handback_ready{module=\"vpp-offload\"} 0"),
+            "{m}"
+        );
+        assert!(
+            !m.contains("packetframe_vpp_handback_tx_packets"),
+            "absent until sampled"
+        );
+
+        // Ready: Healthy, with what it is carrying.
+        s.handback = Some(HandbackStatus {
+            wanted: true,
+            ready: true,
+            veth: true,
+            guard: true,
+            vpp_if: Some("host-pfpunt0-vpp".into()),
+            vpp_up: true,
+            routes: 4,
+            owned: Some(4),
+            tx_packets: Some(1234),
+            error: None,
+        });
+        let r = row(&s).expect("row");
+        assert_eq!(r.state, HealthState::Healthy);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains("host-pfpunt0-vpp up") && msg.contains("4 router-owned /128(s)"),
+            "{msg}"
+        );
+        assert_eq!(s.report().overall, HealthState::Healthy);
+        let m = render_metrics(&s, "vpp-offload");
+        for want in [
+            "packetframe_vpp_handback_ready{module=\"vpp-offload\"} 1",
+            "packetframe_vpp_handback_routes{module=\"vpp-offload\"} 4",
+            "packetframe_vpp_handback_tx_packets{module=\"vpp-offload\"} 1234",
+        ] {
+            assert!(m.contains(want), "missing {want}: {m}");
+        }
+    }
+
     /// `v6 off` renders exactly what it always did — no `fib-v6` row, no
     /// family gauge, the old steering line — and `v6 on` adds a row and a
     /// per-family gauge that say v6 is loaded and NOT steered, while every
@@ -4692,7 +4902,7 @@ mod tests {
         assert_eq!(r.overall, HealthState::Healthy);
         let m = render_metrics(&off, "vpp-offload");
         assert!(!m.contains("packetframe_vpp_family_routes"), "{m}");
-        assert!(steering_line(&off).contains("no port has `v6-outbound`"));
+        assert!(steering_line(&off).contains("no port has `v6-divert`"));
 
         let mut on = v4;
         on.v6 = Some(crate::sink::FamilyCounts {
@@ -4817,7 +5027,7 @@ mod tests {
                 ports_up(),
                 true,
             );
-            s.steer_v6_outbound = vec!["eth4 vlan 100".into()];
+            s.steer_v6_divert = vec!["eth4 vlan 100".into()];
             s.report()
                 .subsystems
                 .into_iter()
@@ -5130,7 +5340,7 @@ mod tests {
         let msg = row.message.unwrap_or_default();
         assert!(msg.contains("2001:db8:100::/48 via tun0"), "{msg}");
         assert!(
-            msg.contains("steer-keep6") && msg.contains("v6-outbound") && msg.contains("feed"),
+            msg.contains("steer-keep6") && msg.contains("v6-divert") && msg.contains("feed"),
             "names the three remedies: {msg}"
         );
         assert!(msg.contains("no IPv6 `steer-exempt`"), "{msg}");

@@ -1,0 +1,1808 @@
+{
+    "module": "acl",
+    "types": [
+        [
+            "address",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "vl_api_address_union_t",
+                "un",
+                {
+                    "discriminator": "af"
+                }
+            ]
+        ],
+        [
+            "prefix",
+            [
+                "vl_api_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_address_and_mask",
+            [
+                "vl_api_ip4_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip4_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "ip6_address_and_mask",
+            [
+                "vl_api_ip6_address_t",
+                "addr"
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "mask"
+            ]
+        ],
+        [
+            "mprefix",
+            [
+                "vl_api_address_family_t",
+                "af"
+            ],
+            [
+                "u16",
+                "grp_address_length"
+            ],
+            [
+                "vl_api_address_union_t",
+                "grp_address"
+            ],
+            [
+                "vl_api_address_union_t",
+                "src_address"
+            ]
+        ],
+        [
+            "ip6_prefix",
+            [
+                "vl_api_ip6_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "ip4_prefix",
+            [
+                "vl_api_ip4_address_t",
+                "address"
+            ],
+            [
+                "u8",
+                "len"
+            ]
+        ],
+        [
+            "prefix_matcher",
+            [
+                "u8",
+                "le"
+            ],
+            [
+                "u8",
+                "ge"
+            ],
+            {
+                "comment": "/** \\brief A context for matching prefixes against.  (Think ip prefix list.)\n    The meaning (exact match / want subnets) of an unset matcher is left to the implementer.\n    @param le - le mut be <= to prefix.len. Default: 255 (not set).\n    @param ge - ge must be greater than le and <= max_size of prefix. Default: 255 (not set).\n\n*/"
+            }
+        ],
+        [
+            "acl_rule",
+            [
+                "vl_api_acl_action_t",
+                "is_permit"
+            ],
+            [
+                "vl_api_prefix_t",
+                "src_prefix"
+            ],
+            [
+                "vl_api_prefix_t",
+                "dst_prefix"
+            ],
+            [
+                "vl_api_ip_proto_t",
+                "proto"
+            ],
+            [
+                "u16",
+                "srcport_or_icmptype_first"
+            ],
+            [
+                "u16",
+                "srcport_or_icmptype_last"
+            ],
+            [
+                "u16",
+                "dstport_or_icmpcode_first"
+            ],
+            [
+                "u16",
+                "dstport_or_icmpcode_last"
+            ],
+            [
+                "u8",
+                "tcp_flags_mask"
+            ],
+            [
+                "u8",
+                "tcp_flags_value"
+            ]
+        ],
+        [
+            "macip_acl_rule",
+            [
+                "vl_api_acl_action_t",
+                "is_permit"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "src_mac"
+            ],
+            [
+                "vl_api_mac_address_t",
+                "src_mac_mask"
+            ],
+            [
+                "vl_api_prefix_t",
+                "src_prefix"
+            ]
+        ]
+    ],
+    "messages": [
+        [
+            "acl_plugin_get_version",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {}
+            }
+        ],
+        [
+            "acl_plugin_get_version_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "major"
+            ],
+            [
+                "u32",
+                "minor"
+            ],
+            {
+                "crc": "0x9b32cf86",
+                "options": {}
+            }
+        ],
+        [
+            "acl_plugin_control_ping",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {},
+                "comment": "/** \\brief Control ping from client to api server request\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n*/"
+            }
+        ],
+        [
+            "acl_plugin_control_ping_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "vpe_pid"
+            ],
+            {
+                "crc": "0xf6b0b8ca",
+                "options": {},
+                "comment": "/** \\brief Control ping from the client to the server response\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param retval - return code for the request\n    @param vpe_pid - the pid of the vpe, returned by the server\n*/"
+            }
+        ],
+        [
+            "acl_plugin_get_conn_table_max_entries",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {}
+            }
+        ],
+        [
+            "acl_plugin_get_conn_table_max_entries_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u64",
+                "conn_table_max_entries"
+            ],
+            {
+                "crc": "0x7a096d3d",
+                "options": {},
+                "comment": "/** \\brief Reply to get connection table max entries\n    @param context - sender context, to match reply w/ request\n    @param conn_table_max_entries - the value of maximum entries of connection table\n*/"
+            }
+        ],
+        [
+            "acl_add_replace",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "acl_index"
+            ],
+            [
+                "string",
+                "tag",
+                64
+            ],
+            [
+                "u32",
+                "count"
+            ],
+            [
+                "vl_api_acl_rule_t",
+                "r",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0xee5c2f18",
+                "options": {
+                    "vat_help": "<acl-idx> <permit|permit+reflect|deny|action N> [src IP/plen] [dst IP/plen] [sport X-Y] [dport X-Y] [proto P] [tcpflags FL MASK], ... , ..."
+                }
+            }
+        ],
+        [
+            "acl_add_replace_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "acl_index"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xac407b0c",
+                "options": {}
+            }
+        ],
+        [
+            "acl_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "acl_index"
+            ],
+            {
+                "crc": "0xef34fea4",
+                "options": {
+                    "vat_help": "<acl-idx>"
+                }
+            }
+        ],
+        [
+            "acl_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "vat_help": "<acl-idx>"
+                }
+            }
+        ],
+        [
+            "acl_interface_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "bool",
+                "is_input"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u32",
+                "acl_index"
+            ],
+            {
+                "crc": "0x4b54bebd",
+                "options": {
+                    "vat_help": "<intfc> | sw_if_index <if-idx> [add|del] [input|output] acl <acl-idx>"
+                }
+            }
+        ],
+        [
+            "acl_interface_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "vat_help": "<intfc> | sw_if_index <if-idx> [add|del] [input|output] acl <acl-idx>"
+                }
+            }
+        ],
+        [
+            "acl_interface_set_acl_list",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u8",
+                "count"
+            ],
+            [
+                "u8",
+                "n_input"
+            ],
+            [
+                "u32",
+                "acls",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0x473982bd",
+                "options": {
+                    "vat_help": "<intfc> | sw_if_index <if-idx> input [acl-idx list] output [acl-idx list]"
+                }
+            }
+        ],
+        [
+            "acl_interface_set_acl_list_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "vat_help": "<intfc> | sw_if_index <if-idx> input [acl-idx list] output [acl-idx list]"
+                }
+            }
+        ],
+        [
+            "acl_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "acl_index"
+            ],
+            {
+                "crc": "0xef34fea4",
+                "options": {
+                    "vat_help": "[<acl-idx>]"
+                }
+            }
+        ],
+        [
+            "acl_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "acl_index"
+            ],
+            [
+                "string",
+                "tag",
+                64
+            ],
+            [
+                "u32",
+                "count"
+            ],
+            [
+                "vl_api_acl_rule_t",
+                "r",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0x95babae0",
+                "options": {}
+            }
+        ],
+        [
+            "acl_interface_list_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index",
+                {
+                    "default": 4294967295
+                }
+            ],
+            {
+                "crc": "0xf9e6675e",
+                "options": {
+                    "vat_help": "[<intfc> | sw_if_index <if-idx>]"
+                }
+            }
+        ],
+        [
+            "acl_interface_list_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u8",
+                "count"
+            ],
+            [
+                "u8",
+                "n_input"
+            ],
+            [
+                "u32",
+                "acls",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0xe695d256",
+                "options": {}
+            }
+        ],
+        [
+            "macip_acl_add",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "string",
+                "tag",
+                64
+            ],
+            [
+                "u32",
+                "count"
+            ],
+            [
+                "vl_api_macip_acl_rule_t",
+                "r",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0xce6fbad0",
+                "options": {
+                    "vat_help": "..."
+                }
+            }
+        ],
+        [
+            "macip_acl_add_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "acl_index"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xac407b0c",
+                "options": {}
+            }
+        ],
+        [
+            "macip_acl_add_replace",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "acl_index",
+                {
+                    "default": 4294967295
+                }
+            ],
+            [
+                "string",
+                "tag",
+                64
+            ],
+            [
+                "u32",
+                "count"
+            ],
+            [
+                "vl_api_macip_acl_rule_t",
+                "r",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0x2a461dd4",
+                "options": {
+                    "vat_help": "<acl-idx> <permit|deny|action N> [count <count>] [src] ip <ipaddress/[plen]> mac <mac> mask <mac_mask>, ... , ..."
+                }
+            }
+        ],
+        [
+            "macip_acl_add_replace_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "acl_index"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xac407b0c",
+                "options": {}
+            }
+        ],
+        [
+            "macip_acl_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "acl_index"
+            ],
+            {
+                "crc": "0xef34fea4",
+                "options": {
+                    "vat_help": "<acl-idx>"
+                }
+            }
+        ],
+        [
+            "macip_acl_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "vat_help": "<acl-idx>"
+                }
+            }
+        ],
+        [
+            "macip_acl_interface_add_del",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "is_add",
+                {
+                    "default": "true"
+                }
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u32",
+                "acl_index"
+            ],
+            {
+                "crc": "0x4b8690b1",
+                "options": {
+                    "vat_help": "<intfc> | sw_if_index <if-idx> [add|del] acl <acl-idx>"
+                }
+            }
+        ],
+        [
+            "macip_acl_interface_add_del_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "vat_help": "<intfc> | sw_if_index <if-idx> [add|del] acl <acl-idx>"
+                }
+            }
+        ],
+        [
+            "macip_acl_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "acl_index",
+                {
+                    "default": 4294967295
+                }
+            ],
+            {
+                "crc": "0xef34fea4",
+                "options": {
+                    "vat_help": "[<acl-idx>]"
+                }
+            }
+        ],
+        [
+            "macip_acl_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "acl_index"
+            ],
+            [
+                "string",
+                "tag",
+                64
+            ],
+            [
+                "u32",
+                "count"
+            ],
+            [
+                "vl_api_macip_acl_rule_t",
+                "r",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0x27135b59",
+                "options": {}
+            }
+        ],
+        [
+            "macip_acl_interface_get",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {}
+            }
+        ],
+        [
+            "macip_acl_interface_get_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "u32",
+                "count"
+            ],
+            [
+                "u32",
+                "acls",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0xaccf9b05",
+                "options": {}
+            }
+        ],
+        [
+            "macip_acl_interface_list_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0xf9e6675e",
+                "options": {}
+            }
+        ],
+        [
+            "macip_acl_interface_list_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u8",
+                "count"
+            ],
+            [
+                "u32",
+                "acls",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0xa0c5d56d",
+                "options": {}
+            }
+        ],
+        [
+            "acl_interface_set_etype_whitelist",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u8",
+                "count"
+            ],
+            [
+                "u8",
+                "n_input"
+            ],
+            [
+                "u16",
+                "whitelist",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0x3f5c2d2d",
+                "options": {
+                    "vat_help": "<intfc> | sw_if_index <if-idx> input [ethertype list] output [ethertype list]"
+                }
+            }
+        ],
+        [
+            "acl_interface_set_etype_whitelist_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "vat_help": "<intfc> | sw_if_index <if-idx> input [ethertype list] output [ethertype list]"
+                }
+            }
+        ],
+        [
+            "acl_interface_etype_whitelist_dump",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0xf9e6675e",
+                "options": {
+                    "vat_help": "[<intfc> | sw_if_index <if-idx>]"
+                }
+            }
+        ],
+        [
+            "acl_interface_etype_whitelist_details",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u8",
+                "count"
+            ],
+            [
+                "u8",
+                "n_input"
+            ],
+            [
+                "u16",
+                "whitelist",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0xcc2bfded",
+                "options": {}
+            }
+        ],
+        [
+            "acl_stats_intf_counters_enable",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "enable"
+            ],
+            {
+                "crc": "0xb3e225d2",
+                "options": {
+                    "vat_help": "[disable]"
+                }
+            }
+        ],
+        [
+            "acl_stats_intf_counters_enable_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "vat_help": "[disable]"
+                }
+            }
+        ],
+        [
+            "acl_plugin_use_hash_lookup_set",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "enable"
+            ],
+            {
+                "crc": "0xb3e225d2",
+                "options": {
+                    "status": "in_progress"
+                }
+            }
+        ],
+        [
+            "acl_plugin_use_hash_lookup_set_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {
+                    "status": "in_progress"
+                }
+            }
+        ],
+        [
+            "acl_plugin_use_hash_lookup_get",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            {
+                "crc": "0x51077d14",
+                "options": {
+                    "status": "in_progress"
+                }
+            }
+        ],
+        [
+            "acl_plugin_use_hash_lookup_get_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "bool",
+                "enable"
+            ],
+            {
+                "crc": "0x5392ad31",
+                "options": {
+                    "status": "in_progress"
+                }
+            }
+        ]
+    ],
+    "unions": [
+        [
+            "address_union",
+            [
+                "vl_api_ip4_address_t",
+                "ip4",
+                {
+                    "case": "ADDRESS_IP4"
+                }
+            ],
+            [
+                "vl_api_ip6_address_t",
+                "ip6",
+                {
+                    "case": "ADDRESS_IP6"
+                }
+            ]
+        ]
+    ],
+    "enums": [
+        [
+            "address_family",
+            [
+                "ADDRESS_IP4",
+                0
+            ],
+            [
+                "ADDRESS_IP6",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_feature_location",
+            [
+                "IP_API_FEATURE_INPUT",
+                0
+            ],
+            [
+                "IP_API_FEATURE_OUTPUT",
+                1
+            ],
+            [
+                "IP_API_FEATURE_LOCAL",
+                2
+            ],
+            [
+                "IP_API_FEATURE_PUNT",
+                3
+            ],
+            [
+                "IP_API_FEATURE_DROP",
+                4
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_ecn",
+            [
+                "IP_API_ECN_NONE",
+                0
+            ],
+            [
+                "IP_API_ECN_ECT0",
+                1
+            ],
+            [
+                "IP_API_ECN_ECT1",
+                2
+            ],
+            [
+                "IP_API_ECN_CE",
+                3
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_dscp",
+            [
+                "IP_API_DSCP_CS0",
+                0
+            ],
+            [
+                "IP_API_DSCP_CS1",
+                8
+            ],
+            [
+                "IP_API_DSCP_AF11",
+                10
+            ],
+            [
+                "IP_API_DSCP_AF12",
+                12
+            ],
+            [
+                "IP_API_DSCP_AF13",
+                14
+            ],
+            [
+                "IP_API_DSCP_CS2",
+                16
+            ],
+            [
+                "IP_API_DSCP_AF21",
+                18
+            ],
+            [
+                "IP_API_DSCP_AF22",
+                20
+            ],
+            [
+                "IP_API_DSCP_AF23",
+                22
+            ],
+            [
+                "IP_API_DSCP_CS3",
+                24
+            ],
+            [
+                "IP_API_DSCP_AF31",
+                26
+            ],
+            [
+                "IP_API_DSCP_AF32",
+                28
+            ],
+            [
+                "IP_API_DSCP_AF33",
+                30
+            ],
+            [
+                "IP_API_DSCP_CS4",
+                32
+            ],
+            [
+                "IP_API_DSCP_AF41",
+                34
+            ],
+            [
+                "IP_API_DSCP_AF42",
+                36
+            ],
+            [
+                "IP_API_DSCP_AF43",
+                38
+            ],
+            [
+                "IP_API_DSCP_CS5",
+                40
+            ],
+            [
+                "IP_API_DSCP_EF",
+                46
+            ],
+            [
+                "IP_API_DSCP_CS6",
+                48
+            ],
+            [
+                "IP_API_DSCP_CS7",
+                50
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "ip_proto",
+            [
+                "IP_API_PROTO_HOPOPT",
+                0
+            ],
+            [
+                "IP_API_PROTO_ICMP",
+                1
+            ],
+            [
+                "IP_API_PROTO_IGMP",
+                2
+            ],
+            [
+                "IP_API_PROTO_TCP",
+                6
+            ],
+            [
+                "IP_API_PROTO_UDP",
+                17
+            ],
+            [
+                "IP_API_PROTO_GRE",
+                47
+            ],
+            [
+                "IP_API_PROTO_ESP",
+                50
+            ],
+            [
+                "IP_API_PROTO_AH",
+                51
+            ],
+            [
+                "IP_API_PROTO_ICMP6",
+                58
+            ],
+            [
+                "IP_API_PROTO_EIGRP",
+                88
+            ],
+            [
+                "IP_API_PROTO_OSPF",
+                89
+            ],
+            [
+                "IP_API_PROTO_SCTP",
+                132
+            ],
+            [
+                "IP_API_PROTO_RESERVED",
+                255
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "acl_action",
+            [
+                "ACL_ACTION_API_DENY",
+                0
+            ],
+            [
+                "ACL_ACTION_API_PERMIT",
+                1
+            ],
+            [
+                "ACL_ACTION_API_PERMIT_REFLECT",
+                2
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ],
+        [
+            "if_status_flags",
+            [
+                "IF_STATUS_API_FLAG_ADMIN_UP",
+                1
+            ],
+            [
+                "IF_STATUS_API_FLAG_LINK_UP",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "mtu_proto",
+            [
+                "MTU_PROTO_API_L3",
+                0
+            ],
+            [
+                "MTU_PROTO_API_IP4",
+                1
+            ],
+            [
+                "MTU_PROTO_API_IP6",
+                2
+            ],
+            [
+                "MTU_PROTO_API_MPLS",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "link_duplex",
+            [
+                "LINK_DUPLEX_API_UNKNOWN",
+                0
+            ],
+            [
+                "LINK_DUPLEX_API_HALF",
+                1
+            ],
+            [
+                "LINK_DUPLEX_API_FULL",
+                2
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "sub_if_flags",
+            [
+                "SUB_IF_API_FLAG_NO_TAGS",
+                1
+            ],
+            [
+                "SUB_IF_API_FLAG_ONE_TAG",
+                2
+            ],
+            [
+                "SUB_IF_API_FLAG_TWO_TAGS",
+                4
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AD",
+                8
+            ],
+            [
+                "SUB_IF_API_FLAG_EXACT_MATCH",
+                16
+            ],
+            [
+                "SUB_IF_API_FLAG_DEFAULT",
+                32
+            ],
+            [
+                "SUB_IF_API_FLAG_OUTER_VLAN_ID_ANY",
+                64
+            ],
+            [
+                "SUB_IF_API_FLAG_INNER_VLAN_ID_ANY",
+                128
+            ],
+            [
+                "SUB_IF_API_FLAG_MASK_VNET",
+                254
+            ],
+            [
+                "SUB_IF_API_FLAG_DOT1AH",
+                256
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "rx_mode",
+            [
+                "RX_MODE_API_UNKNOWN",
+                0
+            ],
+            [
+                "RX_MODE_API_POLLING",
+                1
+            ],
+            [
+                "RX_MODE_API_INTERRUPT",
+                2
+            ],
+            [
+                "RX_MODE_API_ADAPTIVE",
+                3
+            ],
+            [
+                "RX_MODE_API_DEFAULT",
+                4
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "if_type",
+            [
+                "IF_API_TYPE_HARDWARE",
+                0
+            ],
+            [
+                "IF_API_TYPE_SUB",
+                1
+            ],
+            [
+                "IF_API_TYPE_P2P",
+                2
+            ],
+            [
+                "IF_API_TYPE_PIPE",
+                3
+            ],
+            {
+                "enumtype": "u32"
+            }
+        ],
+        [
+            "direction",
+            [
+                "RX",
+                0
+            ],
+            [
+                "TX",
+                1
+            ],
+            {
+                "enumtype": "u8"
+            }
+        ]
+    ],
+    "enumflags": [],
+    "services": {
+        "acl_plugin_get_version": {
+            "reply": "acl_plugin_get_version_reply"
+        },
+        "acl_plugin_control_ping": {
+            "reply": "acl_plugin_control_ping_reply"
+        },
+        "acl_plugin_get_conn_table_max_entries": {
+            "reply": "acl_plugin_get_conn_table_max_entries_reply"
+        },
+        "acl_add_replace": {
+            "reply": "acl_add_replace_reply"
+        },
+        "acl_del": {
+            "reply": "acl_del_reply"
+        },
+        "acl_interface_add_del": {
+            "reply": "acl_interface_add_del_reply"
+        },
+        "acl_interface_set_acl_list": {
+            "reply": "acl_interface_set_acl_list_reply"
+        },
+        "acl_dump": {
+            "reply": "acl_details",
+            "stream": true
+        },
+        "acl_interface_list_dump": {
+            "reply": "acl_interface_list_details",
+            "stream": true
+        },
+        "macip_acl_add": {
+            "reply": "macip_acl_add_reply"
+        },
+        "macip_acl_add_replace": {
+            "reply": "macip_acl_add_replace_reply"
+        },
+        "macip_acl_del": {
+            "reply": "macip_acl_del_reply"
+        },
+        "macip_acl_interface_add_del": {
+            "reply": "macip_acl_interface_add_del_reply"
+        },
+        "macip_acl_dump": {
+            "reply": "macip_acl_details",
+            "stream": true
+        },
+        "macip_acl_interface_get": {
+            "reply": "macip_acl_interface_get_reply"
+        },
+        "macip_acl_interface_list_dump": {
+            "reply": "macip_acl_interface_list_details",
+            "stream": true
+        },
+        "acl_interface_set_etype_whitelist": {
+            "reply": "acl_interface_set_etype_whitelist_reply"
+        },
+        "acl_interface_etype_whitelist_dump": {
+            "reply": "acl_interface_etype_whitelist_details",
+            "stream": true
+        },
+        "acl_stats_intf_counters_enable": {
+            "reply": "acl_stats_intf_counters_enable_reply"
+        },
+        "acl_plugin_use_hash_lookup_set": {
+            "reply": "acl_plugin_use_hash_lookup_set_reply"
+        },
+        "acl_plugin_use_hash_lookup_get": {
+            "reply": "acl_plugin_use_hash_lookup_get_reply"
+        }
+    },
+    "options": {
+        "version": "2.0.1"
+    },
+    "aliases": {
+        "ip4_address": {
+            "type": "u8",
+            "length": 4
+        },
+        "ip6_address": {
+            "type": "u8",
+            "length": 16
+        },
+        "address_with_prefix": {
+            "type": "vl_api_prefix_t"
+        },
+        "ip4_address_with_prefix": {
+            "type": "vl_api_ip4_prefix_t"
+        },
+        "ip6_address_with_prefix": {
+            "type": "vl_api_ip6_prefix_t"
+        },
+        "mac_address": {
+            "type": "u8",
+            "length": 6
+        },
+        "interface_index": {
+            "type": "u32"
+        }
+    },
+    "vl_api_version": "0x5133bba0",
+    "imports": [
+        "plugins/acl/acl_types.api",
+        "vnet/ip/ip_types.api",
+        "vnet/ethernet/ethernet_types.api",
+        "vnet/interface_types.api"
+    ],
+    "counters": [],
+    "paths": []
+}

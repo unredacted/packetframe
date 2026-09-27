@@ -487,7 +487,7 @@ pub struct VppProbeInputs {
     pub steer_exempts: Vec<packetframe_common::config::Ipv4Prefix>,
     pub steer_capacity: Option<u16>,
     /// The vpp-offload section's directives, for the v6 half of the
-    /// steering plan (`v6-outbound`, `steer-keep6`, `vlans all`) — derived
+    /// steering plan (`v6-divert`, `steer-keep6`, `vlans all`) — derived
     /// by the module from the section exactly as attach derives it, rather
     /// than re-extracted here field by field.
     pub section: Vec<ModuleDirective>,

@@ -1268,7 +1268,7 @@ pub struct NtupleSteering {
     ///
     /// A v6 diversion into a VPP with no v6 table is a blackhole: every
     /// diverted frame misses the FIB and dies. Config validation holds
-    /// `v6-outbound` to `v6 on`, but the config flag and the engine's
+    /// `v6-divert` to `v6 on`, but the config flag and the engine's
     /// policy are two different facts — a build whose flag is parsed and
     /// not wired, or a wiring that drifts, would pass validation and
     /// build a v4-only engine anyway. So `steer` asks the engine's own
@@ -1281,6 +1281,20 @@ pub struct NtupleSteering {
     /// which is where this is called. The default is `V4Only` so the
     /// forgotten call fails CLOSED: v6 is refused, never blackholed.
     families: crate::fib_sync::FamilyPolicy,
+    /// The target as configured — `targets` above is what may be
+    /// installed of it right now.
+    ///
+    /// They differ only while the IPv6 hand-back path is not ready
+    /// (`v6_ready` false): then every IPv6 rule, diversion and keep, is
+    /// held back, and a port with nothing else to install leaves the
+    /// effective target. The router's own IPv6 arrives on the MAC a v6
+    /// diversion matches, so a diversion installed before VPP can hand
+    /// that traffic back would drop it — while IPv4 steering has nothing
+    /// to wait for, so it never does ([`Self::effective`]).
+    configured: Vec<(String, u32, RuleSet)>,
+    /// Whether the hand-back path is ready ([`crate::runtime::Steering::set_v6_ready`]).
+    /// Starts false: withheld until the runtime says otherwise.
+    v6_ready: bool,
 }
 
 impl NtupleSteering {
@@ -1293,11 +1307,57 @@ impl NtupleSteering {
     pub fn new(members: Vec<(String, u32)>, targets: Vec<(String, u32, RuleSet)>) -> Self {
         Self {
             members,
-            targets,
+            targets: Self::effective(&targets, false),
+            configured: targets,
             installed: Vec::new(),
             installed_as: None,
             families: crate::fib_sync::FamilyPolicy::V4Only,
+            v6_ready: false,
         }
+    }
+
+    /// What of `configured` may be installed: all of it once the IPv6
+    /// hand-back path is ready; otherwise every plan without its IPv6
+    /// rules, and without a port whose plan was nothing BUT IPv6 rules
+    /// (leaving it in would read as a port with an empty plan, which
+    /// `steer` refuses as a broken allowlist — a different fault).
+    fn effective(
+        configured: &[(String, u32, RuleSet)],
+        v6_ready: bool,
+    ) -> Vec<(String, u32, RuleSet)> {
+        if v6_ready {
+            return configured.to_vec();
+        }
+        configured
+            .iter()
+            .filter_map(|(iface, vf, plan)| {
+                let rules: Vec<SteerRule> =
+                    plan.rules.iter().filter(|r| !r.is_v6()).copied().collect();
+                if rules.is_empty() && !plan.rules.is_empty() {
+                    return None;
+                }
+                Some((
+                    iface.clone(),
+                    *vf,
+                    RuleSet {
+                        rules,
+                        skipped_v6: plan.skipped_v6,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Ports whose configured IPv6 diversion is being held back.
+    fn withheld_v6(&self) -> Vec<&str> {
+        if self.v6_ready {
+            return Vec::new();
+        }
+        self.configured
+            .iter()
+            .filter(|(_, _, plan)| plan.rules.iter().any(SteerRule::is_v6))
+            .map(|(i, _, _)| i.as_str())
+            .collect()
     }
 
     /// Adopt the family policy of the engine this steering feeds. See
@@ -1312,7 +1372,7 @@ impl NtupleSteering {
         if self.families.dump_families().contains(&true) {
             return Vec::new();
         }
-        self.targets
+        self.configured
             .iter()
             .filter(|(_, _, plan)| {
                 plan.rules.iter().any(|r| {
@@ -1758,7 +1818,66 @@ impl NtupleSteering {
 
 impl crate::runtime::Steering for NtupleSteering {
     fn configured_ports(&self) -> usize {
-        self.targets.len()
+        self.configured.len()
+    }
+
+    fn set_v6_ready(&mut self, ready: bool) {
+        self.v6_ready = ready;
+        self.targets = Self::effective(&self.configured, ready);
+    }
+
+    /// The installed plan says which ledger locations hold IPv6 rules —
+    /// adopted from the state file on a restart — so exactly those come
+    /// out, through the same ownership-checked removal as everything else,
+    /// and the plan forgets them. With no installed plan nothing can be
+    /// attributed, and the adoption's own steer reconciles instead.
+    fn drop_held_v6(&mut self) -> Result<usize, String> {
+        if self.v6_ready {
+            return Ok(0);
+        }
+        let Some(plans) = self.installed_as.as_mut() else {
+            return Ok(0);
+        };
+        let v6_locs: Vec<(String, u32)> = plans
+            .iter()
+            .flat_map(|(iface, _, plan)| {
+                plan.rules
+                    .iter()
+                    .filter(|r| r.is_v6())
+                    .map(move |r| (iface.clone(), r.location))
+            })
+            .collect();
+        let victims: Vec<(String, u32)> = self
+            .installed
+            .iter()
+            .filter(|e| v6_locs.contains(e))
+            .cloned()
+            .collect();
+        if victims.is_empty() {
+            return Ok(0);
+        }
+        self.installed.retain(|e| !victims.contains(e));
+        let n = victims.len();
+        let failed = self.remove_all(victims);
+        // The plan keeps describing what is still in the NIC: the v6 rules
+        // that would not come out stay in it (and in the ledger, which
+        // `remove_all` put them back into).
+        let remaining = self.installed.clone();
+        if let Some(plans) = self.installed_as.as_mut() {
+            for (iface, _, plan) in plans.iter_mut() {
+                plan.rules
+                    .retain(|r| !r.is_v6() || remaining.contains(&(iface.clone(), r.location)));
+            }
+        }
+        if failed.is_empty() {
+            Ok(n)
+        } else {
+            Err(format!(
+                "{} IPv6 steering rule(s) could not be removed ({})",
+                failed.len(),
+                failed.join(", ")
+            ))
+        }
     }
 
     fn steer(&mut self) -> Result<SteerOutcome, String> {
@@ -1806,10 +1925,10 @@ impl crate::runtime::Steering for NtupleSteering {
         let blackholes = self.v6_without_a_table();
         if !blackholes.is_empty() {
             return Err(format!(
-                "port(s) {blackholes:?} would divert IPv6 (`v6-outbound`) into a VPP whose \
+                "port(s) {blackholes:?} would divert IPv6 (`v6-divert`) into a VPP whose \
                  engine carries no IPv6 table: every diverted frame would miss the FIB and be \
                  dropped. Nothing was installed or changed. VPP carries v6 only with `v6 on`, \
-                 applied at start — restart with it, or drop `v6-outbound`"
+                 applied at start — restart with it, or drop `v6-divert`"
             ));
         }
         // Clear anything the ledger holds that the current target does
@@ -1902,6 +2021,31 @@ impl crate::runtime::Steering for NtupleSteering {
         // that is what made a second refused reconfigure disown rules
         // that were really there.
         self.installed_as = Some(self.targets.clone());
+        // The IPv6 half held back for the hand-back path. With IPv4
+        // installed beside it that is a steer — the v6 half follows once
+        // the path is ready (the runtime re-steers on that change). With
+        // NOTHING installed it is a refusal, after the reconcile above has
+        // taken out whatever v6 rules an earlier, ready steer left:
+        // `NothingToSteer` would retire the want, and nothing would ever
+        // install the v6 half; a refusal keeps it, and the paced retry
+        // steers once the path is ready.
+        let withheld = self.withheld_v6();
+        if !withheld.is_empty() {
+            if self.installed.is_empty() {
+                return Err(format!(
+                    "port(s) {withheld:?} divert only IPv6, and the IPv6 half is held back \
+                     until the hand-back path is ready (`packetframe status`, row \
+                     v6-handback, says what is missing): without it, the router's own IPv6 \
+                     arriving on those ports would be dropped in VPP. Nothing is diverted; \
+                     the steer is retried on its own once the path is ready"
+                ));
+            }
+            tracing::info!(
+                ports = ?withheld,
+                "IPv4 steering installed; the IPv6 half is held back until the hand-back \
+                 path is ready"
+            );
+        }
         // From the LEDGER, not from `ports.is_empty()`. The ledger is
         // the postcondition the caller acts on — it is what
         // `steering_in_place` reads and what the state file records —
@@ -2244,7 +2388,8 @@ impl crate::runtime::Steering for NtupleSteering {
     }
 
     fn retarget(&mut self, targets: Vec<(String, u32, RuleSet)>) {
-        self.targets = targets;
+        self.targets = Self::effective(&targets, self.v6_ready);
+        self.configured = targets;
     }
 }
 
@@ -2480,7 +2625,7 @@ mod tests {
         w
     }
 
-    /// The outbound-v6 diversion as planned: `tcp6`/`udp6 dst-mac <MAC>
+    /// The v6 diversion as planned: `tcp6`/`udp6 dst-mac <MAC>
     /// vlan <vid> m 0xf000` into our VF, byte for byte at the uapi
     /// offsets. The union and its mask stay all zero — no address (710),
     /// no port — so the flow type is the only L4 term, and the MAC scope
@@ -2519,7 +2664,7 @@ mod tests {
         }
     }
 
-    /// The whole-ethertype diversion the first v6-outbound build planned
+    /// The whole-ethertype diversion the first IPv6-diversion build planned
     /// (`l4: None`, never planned now) is still the stored form of the
     /// rule probed on 2026-09-26 — `ether proto 0x86dd dst <MAC> vlan
     /// <vid> m 0xf000` into our VF — so a recorded one reads back as ours.
@@ -4213,10 +4358,13 @@ mod tests {
     }
 
     /// [`steering`] feeding an engine that carries v6 — what a VPP started
-    /// with `v6 on` hands over.
+    /// with `v6 on` hands over — with the IPv6 hand-back path ready, the
+    /// state in which the v6 half installs.
     fn steering_v6(ports: Vec<(String, u32)>, plan: RuleSet) -> NtupleSteering {
+        use crate::runtime::Steering as _;
         let mut s = steering(ports, plan);
         s.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
+        s.set_v6_ready(true);
         s
     }
 
@@ -4358,7 +4506,7 @@ mod tests {
         );
     }
 
-    /// A port steering both families: one v4 prefix, v6 outbound on two
+    /// A port steering both families: one v4 prefix, v6 diverted on two
     /// VLANs, the built-in v6 keeps plus one operator keep.
     fn plan_both_families() -> RuleSet {
         RuleSet::plan_with_v6(
@@ -4399,12 +4547,11 @@ mod tests {
         let v6 = plan.rules.iter().filter(|r| r.is_v6()).count();
         assert_eq!(
             v6,
-            4 + 3,
-            "2 VLANs × [TCP, UDP] diversions + TCP 53, UDP 53, UDP 123"
+            4 + 5,
+            "2 VLANs × [TCP, UDP] diversions + TCP 53, UDP 53, TCP 179 dst and src, UDP 123"
         );
 
-        let mut s = steering(vec![("eth0".into(), 0)], plan.clone());
-        s.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
+        let mut s = steering_v6(vec![("eth0".into(), 0)], plan.clone());
         s.steer().expect("every shape passes its readback");
         assert_eq!(sys::rules().len(), plan.rules.len());
         assert!(
@@ -4465,13 +4612,13 @@ mod tests {
         assert_eq!(audit(&s), vec![("eth0".to_string(), keep_loc)]);
     }
 
-    /// `v6-outbound` over an engine that carries no v6 installs NO v6
+    /// `v6-divert` over an engine that carries no v6 installs NO v6
     /// diversion — and no rule at all: the whole steer is refused before
     /// the NIC is touched, so what was installed stays exactly as it was.
     /// The default is that engine (`V4Only`), so a steering whose engine
     /// policy was never handed over fails closed.
     #[test]
-    fn v6_outbound_into_a_v4_only_engine_installs_no_v6_diversion() {
+    fn v6_divert_into_a_v4_only_engine_installs_no_v6_diversion() {
         use crate::runtime::Steering as _;
         sys::reset();
         // Already steering v4.
@@ -4479,7 +4626,7 @@ mod tests {
         s.steer().expect("v4 installs");
         let before = sys::rules_with_cookies();
 
-        // A reconfigure adds v6-outbound; the engine is v4-only.
+        // A reconfigure adds v6-divert; the engine is v4-only.
         s.retarget(uniform(vec![("eth0".into(), 0)], plan_both_families()));
         let e = s
             .steer()
@@ -4500,10 +4647,131 @@ mod tests {
         fresh.steer().expect_err("fails closed");
         assert!(sys::rules().is_empty());
 
-        // The engine says v6: it installs.
+        // The engine says v6 (and the hand-back path is ready): it
+        // installs.
         fresh.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
+        fresh.set_v6_ready(true);
         fresh.steer().expect("v6 carried");
         assert_eq!(sys::rules().len(), plan_both_families().rules.len());
+    }
+
+    /// The IPv6 half waits for the hand-back path and IPv4 does not: with
+    /// the path not ready a both-families port installs its v4 rules
+    /// alone and reports `Steered`; ready, the next steer adds the v6
+    /// half; not ready again (the path broke), the next steer takes the
+    /// v6 half out and leaves v4 standing. The installed plan — what the
+    /// state file and the status row read — says which half is in.
+    #[test]
+    fn the_v6_half_waits_for_the_handback_path_and_v4_does_not() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_both_families();
+        let v4_rules = plan.rules.iter().filter(|r| !r.is_v6()).count();
+        let mut s = steering(vec![("eth0".into(), 0)], plan.clone());
+        s.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
+
+        assert_eq!(s.steer(), Ok(SteerOutcome::Steered), "v4 never waits");
+        assert_eq!(sys::rules().len(), v4_rules, "no v6 rule before the path");
+        assert!(s.installed_plan()[0].2.rules.iter().all(|r| !r.is_v6()));
+        assert!(audit(&s).is_empty(), "held back is not missing");
+
+        s.set_v6_ready(true);
+        assert_eq!(s.steer(), Ok(SteerOutcome::Steered));
+        assert_eq!(sys::rules().len(), plan.rules.len(), "the v6 half follows");
+        assert_eq!(s.installed_plan()[0].2, plan);
+
+        s.set_v6_ready(false);
+        assert_eq!(s.steer(), Ok(SteerOutcome::Steered));
+        assert_eq!(sys::rules().len(), v4_rules, "v6 out, v4 standing");
+        assert!(sys::rules_with_cookies()
+            .iter()
+            .all(|(_, loc, _)| plan.rules.iter().any(|r| r.location == *loc && !r.is_v6())));
+        assert_eq!(s.configured_ports(), 1);
+    }
+
+    /// A port that diverts ONLY IPv6 installs nothing while the path is
+    /// not ready — and says so with a refusal, never `NothingToSteer`,
+    /// which would retire the want and leave nothing to install the v6
+    /// half once the path is ready. A path that breaks after the fact
+    /// takes the installed v6 rules out before refusing.
+    #[test]
+    fn a_v6_only_port_refuses_until_the_path_is_ready() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = RuleSet::plan_with_v6(
+            &[],
+            &[],
+            McamBudget::default(),
+            VppSteerDirection::Src,
+            &[MAC6],
+            &crate::steer::V6Steering {
+                vlans: vec![Some(100)],
+                keeps: vec![],
+            },
+        )
+        .expect("fits");
+        let mut s = steering(vec![("eth0".into(), 0)], plan.clone());
+        s.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
+
+        let e = s.steer().expect_err("nothing may be installed yet");
+        assert!(e.contains("held back") && e.contains("eth0"), "{e}");
+        assert!(sys::rules().is_empty() && s.installed().is_empty());
+
+        s.set_v6_ready(true);
+        assert_eq!(s.steer(), Ok(SteerOutcome::Steered));
+        assert_eq!(sys::rules().len(), plan.rules.len());
+
+        s.set_v6_ready(false);
+        s.steer().expect_err("held back again");
+        assert!(
+            sys::rules().is_empty() && s.installed().is_empty(),
+            "the v6 rules came out before the refusal: {:?}",
+            sys::rules_with_cookies()
+        );
+    }
+
+    /// IPv6 rules the NIC holds while the v6 half is held back come out on
+    /// demand, IPv4 untouched — both in this process and from a record a
+    /// previous one left (the keep-VPP adoption, whose gate starts closed
+    /// with the target already withholding v6, so no transition fires).
+    #[test]
+    fn held_v6_rules_are_dropped_and_v4_stays() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_both_families();
+        let v4_rules = plan.rules.iter().filter(|r| !r.is_v6()).count();
+        let v6_rules = plan.rules.len() - v4_rules;
+
+        // Installed with the path ready, then the path breaks.
+        let mut s = steering_v6(vec![("eth0".into(), 0)], plan.clone());
+        s.steer().expect("both families");
+        s.set_v6_ready(false);
+        assert_eq!(s.drop_held_v6(), Ok(v6_rules));
+        assert_eq!(sys::rules().len(), v4_rules, "v4 stays");
+        assert!(s.installed_plan()[0].2.rules.iter().all(|r| !r.is_v6()));
+        assert_eq!(s.drop_held_v6(), Ok(0), "nothing left to drop");
+
+        // A restart adopting that record with the path not ready.
+        sys::reset();
+        let mut daemon = steering_v6(vec![("eth0".into(), 0)], plan.clone());
+        daemon.steer().expect("both families");
+        let (rules, plans) = (daemon.installed(), daemon.installed_plan());
+        drop(daemon);
+        let mut adopted = steering(vec![("eth0".into(), 0)], plan.clone());
+        adopted.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
+        adopted.adopt_record(rules, plans);
+        assert_eq!(adopted.drop_held_v6(), Ok(v6_rules));
+        assert_eq!(sys::rules().len(), v4_rules);
+        assert!(sys::rules_with_cookies()
+            .iter()
+            .all(|(_, loc, _)| plan.rules.iter().any(|r| r.location == *loc && !r.is_v6())));
+
+        // With the path ready nothing is dropped.
+        sys::reset();
+        let mut ready = steering_v6(vec![("eth0".into(), 0)], plan.clone());
+        ready.steer().unwrap();
+        assert_eq!(ready.drop_held_v6(), Ok(0));
+        assert_eq!(sys::rules().len(), plan.rules.len());
     }
 
     /// A steer that fails partway removes every rule it wrote — the keeps
@@ -4525,7 +4793,7 @@ mod tests {
             .filter(|r| r.action == crate::steer::RuleAction::Keep)
             .map(|r| r.location)
             .collect();
-        assert!(keeps.len() >= 2 + 3, "v4 and v6 keeps both in play");
+        assert!(keeps.len() >= 2 + 5, "v4 and v6 keeps both in play");
         // Insertion order is plan order; the last rule is a v6 keep, so
         // failing there leaves every other rule — v4 and v6 keeps and
         // diversions — already written.

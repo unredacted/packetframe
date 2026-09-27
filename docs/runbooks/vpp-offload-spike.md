@@ -372,8 +372,8 @@ keeps (`ip6 l4proto 58`, `tcp6 dst-port 443`, action 0) restored them.
 That answers the objection above without a punt path: the ethertype
 rule is scoped to the router MAC and a VLAN, and the control plane is
 carved back out by higher-priority kernel-delivery keeps (ICMPv6, DNS,
-operator-listed services). Built as `v6-outbound` / `steer-keep6`; see
-the operations runbook's "v6 outbound steering" section.
+operator-listed services). Built as `v6-divert` / `steer-keep6`; see
+the operations runbook's "v6-divert steering" section.
 
 Consequences:
 - **v6 cannot be MCAM-steered into VPP.** The per-family split from
