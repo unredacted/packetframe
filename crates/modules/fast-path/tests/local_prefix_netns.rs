@@ -683,3 +683,73 @@ fn local_prefix6_seed_resolves_preexisting_neighbour_without_resolve_queue() {
          got {neigh_events:?}"
     );
 }
+
+/// The entry neigh-snoop writes for a customer host the kernel never
+/// resolved — `RTM_NEWNEIGH`, `NLM_F_CREATE | NLM_F_REPLACE`,
+/// `NUD_STALE`, a global inside the `local-prefix6` — registers the
+/// host exactly like a kernel-resolved one: the `/128` Add with the host
+/// as its own next hop, and a `Learned` with the snooped MAC. That
+/// `Learned` is what the programmer forwards to vpp-offload's feed as
+/// `neighbour_resolved`, which is how a host VPP's glean solicited comes
+/// back to VPP as a static neighbour (the vpp-offload runbook's
+/// `local-route6` section). STALE is enough on purpose: nothing on the
+/// box confirms the entry until something sends to the host.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn local_prefix6_registers_a_snooped_stale_global() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let _nsfd = enter_netns(&names.netns);
+    let ifindex = if_nametoindex(&names.veth_a);
+    let host: IpAddr = "2001:db8:0:1::51".parse().unwrap();
+    let host_mac = [0x02, 0, 0, 0, 0xc0, 0x51];
+
+    let veth_a = names.veth_a.clone();
+    let (events, neigh_events) = collect_events(
+        &names.netns,
+        vec![spec("2001:db8:0:1::", 64, &names.veth_a)],
+        |ns| {
+            // neigh-snoop's `install_stale`, as the `ip` equivalent.
+            ns_run(
+                ns,
+                &[
+                    "ip",
+                    "-6",
+                    "neigh",
+                    "replace",
+                    "2001:db8:0:1::51",
+                    "dev",
+                    &veth_a,
+                    "lladdr",
+                    "02:00:00:00:c0:51",
+                    "nud",
+                    "stale",
+                ],
+            );
+        },
+    );
+
+    let add = events
+        .iter()
+        .find(
+            |e| matches!(e, RouteEvent::Add { prefix, .. } if prefix_to_ip(prefix) == (host, 128)),
+        )
+        .unwrap_or_else(|| panic!("a STALE entry must register the /128; got {events:?}"));
+    match add {
+        RouteEvent::Add {
+            peer_id, nexthops, ..
+        } => {
+            assert_eq!(*peer_id, PeerId::local_arp(ifindex));
+            assert_eq!(nexthops, &vec![host], "nexthop must be the host itself");
+        }
+        other => panic!("expected Add, got {other:?}"),
+    }
+    assert!(
+        neigh_events.iter().any(|e| matches!(
+            e,
+            NeighEvent::Learned { ip, mac, ifindex: ifi, .. }
+                if *ip == host && *mac == host_mac && *ifi == ifindex
+        )),
+        "the STALE entry must resolve the host with the snooped MAC; got {neigh_events:?}"
+    );
+}

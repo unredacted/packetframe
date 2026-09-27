@@ -337,6 +337,36 @@ pub enum ModuleDirective {
         vlan: u16,
         line: usize,
     },
+    /// `local-route6 <v6-cidr> port <iface> vlan <vid>` — the IPv6
+    /// counterpart of [`Self::VppLocalRoute`]: an attached route for a
+    /// customer prefix onto the same BVI / subif / VF, with the same
+    /// shadowing of the mirror's view inside it. Repeatable;
+    /// restart-only.
+    ///
+    /// Two things hang off it. First, delivery at all: `local-prefix6`'s
+    /// `/128`s are local-ARP routes, which never reach VPP, so a
+    /// customer host's static neighbour is VPP's only way to it — and a
+    /// static neighbour becomes a usable host route (its adj-fib) only
+    /// under an attached cover on the same interface. Second, the hosts
+    /// the kernel has never resolved. Customers talk to the router from
+    /// link-local addresses, so the kernel rarely holds their globals
+    /// (and privacy addresses rotate daily). With the attached route, a
+    /// packet for such a host takes VPP's glean, which solicits it from
+    /// the interface's link-local; the reply is ICMPv6, which is never
+    /// diverted, so it reaches the kernel bridge, where neigh-snoop
+    /// learns it and installs it `STALE` — and from there it enters VPP
+    /// as a static neighbour like any other.
+    ///
+    /// Same structural rules as `local-route`, with the cover a
+    /// fast-path `local-prefix6` (the kernel bridge device comes from
+    /// its `via`), and it requires `v6 on`: without it VPP carries no
+    /// IPv6 and has ip6 enabled on no interface.
+    VppLocalRoute6 {
+        prefix: Ipv6Prefix,
+        iface: String,
+        vlan: u16,
+        line: usize,
+    },
     AllowPrefix4(Ipv4Prefix),
     AllowPrefix6(Ipv6Prefix),
     /// Connected/local prefix the operator wants packetframe to
@@ -1871,6 +1901,112 @@ impl Config {
         Ok(())
     }
 
+    /// `local-route6` structural rules: `local-route`'s, per family, plus
+    /// `v6 on`. Like those they hold whether or not anything steers — the
+    /// attached route is installed at attach.
+    ///
+    /// `v6 on` is required rather than the line being inert without it:
+    /// under `v6 off` VPP enables ip6 on no interface and carries no v6
+    /// route, so the attached route could not be installed usefully, and
+    /// a line that silently does nothing is the config an operator
+    /// debugs for an hour.
+    fn validate_vpp_local_routes6(
+        vpp: &ModuleSection,
+        fp: &ModuleSection,
+    ) -> Result<(), ConfigError> {
+        let v6_on = vpp
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::VppV6(v) => Some(*v),
+                _ => None,
+            })
+            .next_back()
+            .unwrap_or(false);
+        let mut seen: Vec<&Ipv6Prefix> = Vec::new();
+        for d in &vpp.directives {
+            let ModuleDirective::VppLocalRoute6 {
+                prefix,
+                iface,
+                vlan,
+                line,
+            } = d
+            else {
+                continue;
+            };
+            let cidr = format!("{}/{}", prefix.addr, prefix.prefix_len);
+            if !v6_on {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!(
+                        "local-route6 {cidr} needs `v6 on` in module vpp-offload: without it \
+                         VPP carries no IPv6 and has ip6 enabled on no interface, so there is \
+                         nothing for the attached route to deliver by"
+                    ),
+                ));
+            }
+            if let Some(p) = seen
+                .iter()
+                .find(|p| p.contains_prefix(prefix) || prefix.contains_prefix(p))
+            {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!(
+                        "local-route6 {cidr} duplicates or overlaps local-route6 {}/{}: one \
+                         attached route owns a prefix",
+                        p.addr, p.prefix_len
+                    ),
+                ));
+            }
+            let port_vlans = vpp.directives.iter().find_map(|d| match d {
+                ModuleDirective::VppPort {
+                    iface: pi,
+                    vlans,
+                    vlans_all,
+                    ..
+                } if pi == iface => Some((vlans, *vlans_all)),
+                _ => None,
+            });
+            let Some((port_vlans, port_vlans_all)) = port_vlans else {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!(
+                        "local-route6 names port `{iface}` but module vpp-offload has no \
+                         `port {iface}` line"
+                    ),
+                ));
+            };
+            if !port_vlans_all && !port_vlans.contains(vlan) {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!(
+                        "local-route6 {cidr}: `port {iface}` does not declare vlan {vlan} in \
+                         its `vlans` list — the dot1q subinterface the attached route lands \
+                         on is created from that list"
+                    ),
+                ));
+            }
+            // Tier agreement, and the source of the kernel bridge device
+            // whose neighbours reach VPP: fast-path's `local-prefix6`.
+            let covered = fp.directives.iter().any(|d| {
+                matches!(d, ModuleDirective::LocalPrefix6 { cidr, .. }
+                    if cidr.contains_prefix(prefix))
+            });
+            if !covered {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!(
+                        "local-route6 {cidr} is not inside any fast-path `local-prefix6`: \
+                         local delivery must agree across tiers, and the kernel bridge device \
+                         whose neighbours VPP is given comes from `local-prefix6 ... via <dev>`"
+                    ),
+                ));
+            }
+            seen.push(prefix);
+        }
+        Ok(())
+    }
+
     /// vpp-offload cross-section validation (phase 4). Pure config
     /// logic — no sysfs — so it runs everywhere `parse` does.
     ///
@@ -1885,7 +2021,8 @@ impl Config {
     /// - steering requires `forwarding-mode custom-fib` (the full
     ///   table VPP mirrors comes from the custom-FIB route pipeline);
     /// - duplicate `port` lines for one interface are rejected;
-    /// - the outbound-IPv6 rules ([`Self::validate_vpp_v6_steering`]).
+    /// - the outbound-IPv6 rules ([`Self::validate_vpp_v6_steering`]);
+    /// - `local-route6` ([`Self::validate_vpp_local_routes6`]).
     pub fn validate_vpp_offload(&self) -> Result<(), ConfigError> {
         let Some(vpp) = self.modules.iter().find(|m| m.name == "vpp-offload") else {
             return Ok(());
@@ -2079,6 +2216,7 @@ impl Config {
                 local_routes.push((prefix, *line));
             }
         }
+        Self::validate_vpp_local_routes6(vpp, fp)?;
 
         // `require-table-complete on` demands a completeness authority,
         // and `integrity-authority none` declares there is none. The two
@@ -3613,31 +3751,34 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
         }),
         "local-route" => {
             // local-route <v4-cidr> port <iface> vlan <vid>
-            let usage = "local-route takes: <v4-cidr> port <iface> vlan <vid>";
-            let cidr_tok = rest.next().ok_or_else(|| ConfigError::parse(line, usage))?;
-            if rest.next() != Some("port") {
-                return Err(ConfigError::parse(line, usage));
-            }
-            let iface = rest.next().ok_or_else(|| ConfigError::parse(line, usage))?;
-            validate_iface_name(line, "local-route", iface)?;
-            if rest.next() != Some("vlan") {
-                return Err(ConfigError::parse(line, usage));
-            }
-            let vid: u16 = rest
-                .next()
-                .ok_or_else(|| ConfigError::parse(line, usage))?
-                .parse()
-                .map_err(|_| ConfigError::parse(line, "vlan id must be an integer 1-4094"))?;
-            if !(1..=4094).contains(&vid) {
-                return Err(ConfigError::parse(line, "vlan id must be 1-4094"));
-            }
-            if rest.next().is_some() {
-                return Err(ConfigError::parse(line, usage));
-            }
+            let (cidr_tok, iface, vid) = parse_local_route_tail(
+                line,
+                rest,
+                "local-route",
+                "local-route takes: <v4-cidr> port <iface> vlan <vid>",
+            )?;
             let prefix: Ipv4Prefix = cidr_tok
                 .parse()
                 .map_err(|e: String| ConfigError::parse(line, format!("local-route: {e}")))?;
             Ok(ModuleDirective::VppLocalRoute {
+                prefix,
+                iface: iface.to_string(),
+                vlan: vid,
+                line,
+            })
+        }
+        "local-route6" => {
+            // local-route6 <v6-cidr> port <iface> vlan <vid>
+            let (cidr_tok, iface, vid) = parse_local_route_tail(
+                line,
+                rest,
+                "local-route6",
+                "local-route6 takes: <v6-cidr> port <iface> vlan <vid>",
+            )?;
+            let prefix: Ipv6Prefix = cidr_tok
+                .parse()
+                .map_err(|e: String| ConfigError::parse(line, format!("local-route6: {e}")))?;
+            Ok(ModuleDirective::VppLocalRoute6 {
                 prefix,
                 iface: iface.to_string(),
                 vlan: vid,
@@ -3789,6 +3930,39 @@ const BCAST_MCAST_RATELIMIT_USAGE: &str =
 /// overflow without runtime checks in the datapath.
 const GUARD_RATELIMIT_MAX_PER: Duration = Duration::from_secs(3600);
 const GUARD_RATELIMIT_MAX_BURST: u32 = 65_535;
+
+/// Shared tail parser for `local-route` and `local-route6`:
+/// `<cidr> port <iface> vlan <vid>`. Returns the CIDR token unparsed,
+/// since each family parses its own; the grammar and its errors are
+/// otherwise the same line.
+fn parse_local_route_tail<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+    directive: &'static str,
+    usage: &'static str,
+) -> Result<(&'a str, &'a str, u16), ConfigError> {
+    let cidr_tok = rest.next().ok_or_else(|| ConfigError::parse(line, usage))?;
+    if rest.next() != Some("port") {
+        return Err(ConfigError::parse(line, usage));
+    }
+    let iface = rest.next().ok_or_else(|| ConfigError::parse(line, usage))?;
+    validate_iface_name(line, directive, iface)?;
+    if rest.next() != Some("vlan") {
+        return Err(ConfigError::parse(line, usage));
+    }
+    let vid: u16 = rest
+        .next()
+        .ok_or_else(|| ConfigError::parse(line, usage))?
+        .parse()
+        .map_err(|_| ConfigError::parse(line, "vlan id must be an integer 1-4094"))?;
+    if !(1..=4094).contains(&vid) {
+        return Err(ConfigError::parse(line, "vlan id must be 1-4094"));
+    }
+    if rest.next().is_some() {
+        return Err(ConfigError::parse(line, usage));
+    }
+    Ok((cidr_tok, iface, vid))
+}
 
 /// Shared tail parser for the two guard ratelimit directives:
 /// `<iface> rate <n>/<dur> [burst <m>] [monitor]`.
@@ -6388,6 +6562,90 @@ module vpp-offload
             .validate_vpp_offload()
             .unwrap_err();
         assert!(format!("{e}").contains("overlaps"), "{e}");
+    }
+
+    #[test]
+    fn local_route6_parses_and_rejects_malformed() {
+        let s = "module vpp-offload\n  local-route6 2001:db8:1::/64 port eth4 vlan 1337\n";
+        let c = Config::parse(s).unwrap();
+        match &c.modules[0].directives[0] {
+            ModuleDirective::VppLocalRoute6 {
+                prefix,
+                iface,
+                vlan,
+                ..
+            } => {
+                assert_eq!(prefix.addr, "2001:db8:1::".parse::<Ipv6Addr>().unwrap());
+                assert_eq!(prefix.prefix_len, 64);
+                assert_eq!(iface, "eth4");
+                assert_eq!(*vlan, 1337);
+            }
+            other => panic!("expected VppLocalRoute6, got {other:?}"),
+        }
+        for bad in [
+            "module vpp-offload\n  local-route6\n",
+            "module vpp-offload\n  local-route6 2001:db8:1::/64\n",
+            "module vpp-offload\n  local-route6 2001:db8:1::/64 port eth4\n",
+            "module vpp-offload\n  local-route6 2001:db8:1::/64 port eth4 vlan 0\n",
+            "module vpp-offload\n  local-route6 2001:db8:1::/64 vlan 1337 port eth4\n",
+            "module vpp-offload\n  local-route6 2001:db8:1::/64 port eth4 vlan 1337 x\n",
+            // Each family parses its own: a v4 CIDR is not a v6 one, and
+            // the v4 directive still refuses a v6 CIDR.
+            "module vpp-offload\n  local-route6 192.0.2.0/24 port eth4 vlan 1337\n",
+            "module vpp-offload\n  local-route 2001:db8:1::/64 port eth4 vlan 1337\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "should reject: {bad}");
+        }
+    }
+
+    /// `local-route`'s structural rules, per family, plus `v6 on`.
+    #[test]
+    fn local_route6_cross_validation() {
+        let base = "module fast-path\n  attach eth4 generic\n  \
+                    local-prefix6 2001:db8:1::/64 via br1337\n\n\
+                    module vpp-offload\n  loopback-address 198.51.100.254/32\n";
+        let port = "  port eth4 cores 1 steer off vlans 88,1337\n";
+        let check = |tail: &str| {
+            Config::parse(&format!("{base}{port}{tail}"))
+                .unwrap()
+                .validate_vpp_offload()
+        };
+
+        check("  v6 on\n  local-route6 2001:db8:1::/64 port eth4 vlan 1337\n").unwrap();
+
+        let e = check("  local-route6 2001:db8:1::/64 port eth4 vlan 1337\n").unwrap_err();
+        assert!(format!("{e}").contains("needs `v6 on`"), "{e}");
+        let e =
+            check("  v6 off\n  local-route6 2001:db8:1::/64 port eth4 vlan 1337\n").unwrap_err();
+        assert!(format!("{e}").contains("needs `v6 on`"), "{e}");
+
+        let e = check("  v6 on\n  local-route6 2001:db8:1::/64 port eth9 vlan 1337\n").unwrap_err();
+        assert!(format!("{e}").contains("no `port eth9` line"), "{e}");
+
+        let e = check("  v6 on\n  local-route6 2001:db8:1::/64 port eth4 vlan 7\n").unwrap_err();
+        assert!(format!("{e}").contains("does not declare vlan 7"), "{e}");
+
+        // Covered by a v4 `local-prefix` is no cover: the bridge device
+        // comes from the v6 one.
+        let e = check("  v6 on\n  local-route6 2001:db8:2::/64 port eth4 vlan 1337\n").unwrap_err();
+        assert!(format!("{e}").contains("local-prefix6"), "{e}");
+
+        let e = check(
+            "  v6 on\n  local-route6 2001:db8:1::/64 port eth4 vlan 1337\n  \
+             local-route6 2001:db8:1::/65 port eth4 vlan 88\n",
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("overlaps"), "{e}");
+
+        // A v4 and a v6 local route on the same VLAN are independent.
+        let dual = "module fast-path\n  attach eth4 generic\n  \
+                    local-prefix 192.0.2.0/24 via br1337\n  \
+                    local-prefix6 2001:db8:1::/64 via br1337\n\n\
+                    module vpp-offload\n  loopback-address 198.51.100.254/32\n  v6 on\n  \
+                    port eth4 cores 1 steer off vlans 1337\n  \
+                    local-route 192.0.2.0/24 port eth4 vlan 1337\n  \
+                    local-route6 2001:db8:1::/64 port eth4 vlan 1337\n";
+        Config::parse(dual).unwrap().validate_vpp_offload().unwrap();
     }
 
     /// dst steering into VPP without local delivery for a steerable

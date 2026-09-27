@@ -336,14 +336,14 @@ pub fn vpp_steer_capacity_from_config(config: &Config) -> Option<u16> {
         .next_back()
 }
 
-/// The `local-route` lines joined with the fast-path `local-prefix`
-/// that covers each one — the join only the loader can perform, since
-/// `Module` methods see one section. The covering prefix's `via` is the
-/// kernel bridge device whose neighbours mirror onto the subif; the
-/// longest cover wins, matching every other most-specific rule in the
-/// config. `validate_vpp_offload` guarantees a cover exists, so the
-/// error arm is a programming-order guard (extractor called on an
-/// unvalidated config), not an operator surface.
+/// The `local-route` and `local-route6` lines joined with the fast-path
+/// `local-prefix` / `local-prefix6` that covers each one — the join only
+/// the loader can perform, since `Module` methods see one section. The
+/// covering prefix's `via` is the kernel bridge device whose neighbours
+/// mirror onto the subif; the longest cover wins, matching every other
+/// most-specific rule in the config. `validate_vpp_offload` guarantees a
+/// cover exists, so the error arm is a programming-order guard
+/// (extractor called on an unvalidated config), not an operator surface.
 ///
 /// Gated like [`crate::loader`]'s `feed_wiring` — its only caller is
 /// the Linux module-wiring path, and a laxer gate reads as dead code on
@@ -352,13 +352,24 @@ pub fn vpp_steer_capacity_from_config(config: &Config) -> Option<u16> {
 pub fn vpp_local_routes_from_config(
     config: &Config,
 ) -> Result<Vec<packetframe_vpp_offload::LocalRoute>, String> {
-    let covers: Vec<(&packetframe_common::config::Ipv4Prefix, &String)> = config
+    use packetframe_vpp_offload::LocalRoutePrefix;
+    let fp: Vec<&ModuleDirective> = config
         .modules
         .iter()
         .filter(|m| m.name == "fast-path")
         .flat_map(|m| &m.directives)
+        .collect();
+    let covers: Vec<(&packetframe_common::config::Ipv4Prefix, &String)> = fp
+        .iter()
         .filter_map(|d| match d {
             ModuleDirective::LocalPrefix { cidr, iface, .. } => Some((cidr, iface)),
+            _ => None,
+        })
+        .collect();
+    let covers6: Vec<(&packetframe_common::config::Ipv6Prefix, &String)> = fp
+        .iter()
+        .filter_map(|d| match d {
+            ModuleDirective::LocalPrefix6 { cidr, iface, .. } => Some((cidr, iface)),
             _ => None,
         })
         .collect();
@@ -369,32 +380,56 @@ pub fn vpp_local_routes_from_config(
         .filter(|m| m.name == "vpp-offload")
         .flat_map(|m| &m.directives)
     {
-        if let ModuleDirective::VppLocalRoute {
+        let (prefix, iface, vlan, kernel_dev) = match d {
+            ModuleDirective::VppLocalRoute {
+                prefix,
+                iface,
+                vlan,
+                ..
+            } => (
+                LocalRoutePrefix::V4(*prefix),
+                iface,
+                vlan,
+                covers
+                    .iter()
+                    .filter(|(c, _)| c.contains_prefix(prefix))
+                    .max_by_key(|(c, _)| c.prefix_len)
+                    .map(|(_, i)| (*i).clone()),
+            ),
+            ModuleDirective::VppLocalRoute6 {
+                prefix,
+                iface,
+                vlan,
+                ..
+            } => (
+                LocalRoutePrefix::V6(*prefix),
+                iface,
+                vlan,
+                covers6
+                    .iter()
+                    .filter(|(c, _)| c.contains_prefix(prefix))
+                    .max_by_key(|(c, _)| c.prefix_len)
+                    .map(|(_, i)| (*i).clone()),
+            ),
+            _ => continue,
+        };
+        let kernel_dev = kernel_dev.ok_or_else(|| {
+            let (directive, cover) = if prefix.is_v6() {
+                ("local-route6", "local-prefix6")
+            } else {
+                ("local-route", "local-prefix")
+            };
+            format!(
+                "{directive} {prefix} matches no fast-path {cover} — \
+                 validate_vpp_offload should have refused this config"
+            )
+        })?;
+        out.push(packetframe_vpp_offload::LocalRoute {
             prefix,
-            iface,
-            vlan,
-            ..
-        } = d
-        {
-            let kernel_dev = covers
-                .iter()
-                .filter(|(c, _)| c.contains_prefix(prefix))
-                .max_by_key(|(c, _)| c.prefix_len)
-                .map(|(_, i)| (*i).clone())
-                .ok_or_else(|| {
-                    format!(
-                        "local-route {}/{} matches no fast-path local-prefix — \
-                         validate_vpp_offload should have refused this config",
-                        prefix.addr, prefix.prefix_len
-                    )
-                })?;
-            out.push(packetframe_vpp_offload::LocalRoute {
-                prefix: *prefix,
-                port: iface.clone(),
-                vlan: *vlan,
-                kernel_dev,
-            });
-        }
+            port: iface.clone(),
+            vlan: *vlan,
+            kernel_dev,
+        });
     }
     Ok(out)
 }
@@ -1421,6 +1456,38 @@ module neigh-snoop
         assert_eq!(
             summary_lines(&report, &[]),
             vec!["Result: PASS, all required capabilities present.".to_string()]
+        );
+    }
+
+    /// Each family's local route takes its kernel device from its own
+    /// family's cover — a `local-route6` from `local-prefix6`, never
+    /// from a v4 `local-prefix` on another bridge — in config order,
+    /// into the one list the module is handed.
+    #[cfg(all(target_os = "linux", feature = "fast-path", feature = "vpp-offload"))]
+    #[test]
+    fn local_routes_join_each_family_to_its_own_cover() {
+        use packetframe_vpp_offload::LocalRoutePrefix;
+        let config = Config::parse(
+            "module fast-path\n  attach eth4 generic\n  \
+             local-prefix 192.0.2.0/24 via br88\n  \
+             local-prefix6 2001:db8:0:1337::/64 via br1337\n\n\
+             module vpp-offload\n  loopback-address 198.51.100.254/32\n  v6 on\n  \
+             port eth4 cores 1 steer off vlans 88,1337\n  \
+             local-route 192.0.2.0/24 port eth4 vlan 88\n  \
+             local-route6 2001:db8:0:1337::/64 port eth4 vlan 1337\n",
+        )
+        .expect("parse");
+        let routes = vpp_local_routes_from_config(&config).expect("resolved");
+        assert_eq!(routes.len(), 2);
+        assert!(matches!(routes[0].prefix, LocalRoutePrefix::V4(_)));
+        assert_eq!(
+            (routes[0].vlan, routes[0].kernel_dev.as_str()),
+            (88, "br88")
+        );
+        assert!(matches!(routes[1].prefix, LocalRoutePrefix::V6(_)));
+        assert_eq!(
+            (routes[1].vlan, routes[1].kernel_dev.as_str()),
+            (1337, "br1337")
         );
     }
 }

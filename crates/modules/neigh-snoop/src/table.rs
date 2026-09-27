@@ -727,6 +727,78 @@ mod tests {
         assert!(m.get(4, &ip(1)).is_some());
     }
 
+    /// A customer VLAN behind a vpp-offload `local-route6`, frame to
+    /// install decision: VPP's glean solicitation (the router's MAC and
+    /// link-local, since the BVI shares the bridge's) is never learned,
+    /// and the host's solicited answer is — a global inside the bridge's
+    /// `prefix`, on a non-ix-mode bridge (ix-mode changes nothing here;
+    /// it only silences fast-path's probes), installed because the
+    /// kernel holds nothing for it or holds it FAILED.
+    #[test]
+    fn a_glean_answer_on_a_customer_bridge_is_learned_and_installed() {
+        use crate::frame::testframes::{
+            ll, na_solicited_to_router, ns_with_sllao, router_ll, v6, MAC_A, ROUTER_MAC,
+        };
+        use crate::frame::{parse_frame, Source};
+
+        // `prefix br1337 2001:db8:1::/64` — v6(n) is 2001:db8:1::n.
+        let prefixes: Vec<ipnet::IpNet> = vec!["2001:db8:1::/64".parse().unwrap()];
+        let own_addrs: HashSet<IpAddr> = [IpAddr::V6(router_ll())].into_iter().collect();
+        let own_mac = Some(ROUTER_MAC);
+
+        // VPP's NS, should the bridge see it: the router's own address
+        // and MAC, refused before anything else is asked.
+        let glean = ns_with_sllao(ROUTER_MAC, router_ll(), v6(0x10));
+        let pairs = parse_frame(&glean).expect("a well-formed NS");
+        for l in pairs {
+            assert_eq!(
+                admit(l.ip, l.mac, &prefixes, &own_addrs, own_mac, &[]),
+                Err(FilterReject::OwnAddress)
+            );
+        }
+
+        // The answer, from the host's link-local: the global target is
+        // admitted; the link-local is outside the prefix, and not needed
+        // (VPP never carries link-local neighbours).
+        let answer = na_solicited_to_router(MAC_A, ll(0x10), v6(0x10));
+        let pairs = parse_frame(&answer).expect("a well-formed NA");
+        let target = pairs
+            .iter()
+            .find(|l| l.ip == IpAddr::V6(v6(0x10)))
+            .expect("the target is taught");
+        assert_eq!(target.source, Source::NeighborAdvertisement);
+        assert_eq!(
+            admit(target.ip, target.mac, &prefixes, &own_addrs, own_mac, &[]),
+            Ok(())
+        );
+        let src = pairs.iter().find(|l| l.ip == IpAddr::V6(ll(0x10))).unwrap();
+        assert_eq!(
+            admit(src.ip, src.mac, &prefixes, &own_addrs, own_mac, &[]),
+            Err(FilterReject::OutsidePrefix)
+        );
+
+        // Kernel side: nothing held (it discarded the NA), or FAILED
+        // from an earlier probe — both install STALE.
+        let now = Instant::now();
+        assert_eq!(
+            install_decision(None, MAC_A, None, now, DEFAULT_HOLDDOWN),
+            Decision::Install(InstallReason::Absent)
+        );
+        assert_eq!(
+            install_decision(
+                Some(&MirrorEntry {
+                    state: NudState::Failed,
+                    mac: None
+                }),
+                MAC_A,
+                None,
+                now,
+                DEFAULT_HOLDDOWN
+            ),
+            Decision::Install(InstallReason::Unusable)
+        );
+    }
+
     #[test]
     fn admit_filters_in_order() {
         let prefixes: Vec<ipnet::IpNet> = vec![
