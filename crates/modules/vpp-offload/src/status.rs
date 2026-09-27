@@ -317,6 +317,12 @@ pub struct StatusSnapshot {
     /// Why the last steering audit could not read the NIC, if so. See
     /// [`crate::runtime::RuntimeStatus::steer_audit_error`].
     pub steer_audit_unreadable: Option<String>,
+    /// Where the installed rules divert outbound IPv6. See
+    /// [`crate::runtime::RuntimeStatus::steer_v6_outbound`].
+    pub steer_v6_outbound: Vec<String>,
+    /// The installed rules divert IPv6 and no IPv4. See
+    /// [`crate::runtime::RuntimeStatus::steer_v6_only`].
+    pub steer_v6_only: bool,
     pub undead: bool,
     pub failures: u32,
     pub counts: SinkCounts,
@@ -461,11 +467,18 @@ pub struct StatusSnapshot {
 /// that point OPPOSITE ways — install versus remove — and adjacent
 /// positional counts of the same type are a transposition nothing would
 /// catch.
+///
+/// Also carries what the installed rules divert beyond allowlisted IPv4 —
+/// [`crate::runtime::RuntimeStatus::steer_v6_outbound`] — because the
+/// steering row names it and it is a fact about the same installed set.
 #[derive(Debug, Default, Clone)]
 pub struct SteerAudit {
     pub missing: usize,
     pub stray: usize,
     pub unreadable: Option<String>,
+    pub v6_outbound: Vec<String>,
+    /// See [`crate::runtime::RuntimeStatus::steer_v6_only`].
+    pub v6_only: bool,
 }
 
 impl StatusSnapshot {
@@ -567,6 +580,8 @@ impl StatusSnapshot {
             steer_missing: audit.missing,
             steer_stray: audit.stray,
             steer_audit_unreadable: audit.unreadable,
+            steer_v6_outbound: audit.v6_outbound,
+            steer_v6_only: audit.v6_only,
             undead: sup.is_undead(),
             failures: sup.failures(),
             counts,
@@ -1640,18 +1655,46 @@ impl StatusSnapshot {
             // did not say what it was: the rig's first steer
             // (2026-09-23) read `steering healthy` beside four rules in
             // the NIC, and only `ethtool -n` said traffic was diverted.
+            //
+            // The IPv6 clause says what the installed plan does with v6,
+            // per port and VLAN, because "IPv4 only" stopped being a
+            // constant the day `v6-outbound` shipped — and a row that
+            // still claimed it would hide exactly the traffic an operator
+            // just moved. The IPv4 clause is read from the same installed
+            // rules: a v6-only allowlist beside `v6-outbound` diverts no
+            // IPv4, and the row must not say it does.
             (true, _) => (
                 HealthState::Healthy,
-                Some(if self.counts.v6.is_some() {
-                    "steered — MCAM rules are diverting allowlisted IPv4 traffic to VPP \
-                     (IPv6 routes are loaded in VPP by `v6 on`, but no IPv6 is steered: it \
-                     stays on the eBPF tier); `ethtool -n <iface>` lists the rules"
-                        .into()
+                Some(if self.steer_v6_outbound.is_empty() {
+                    if self.counts.v6.is_some() {
+                        "steered — MCAM rules are diverting allowlisted IPv4 traffic to VPP \
+                         (IPv6 routes are loaded in VPP by `v6 on`, but no IPv6 is steered: \
+                         no port has `v6-outbound`, so it stays on the eBPF tier); \
+                         `ethtool -n <iface>` lists the rules"
+                            .into()
+                    } else {
+                        "steered — MCAM rules are diverting allowlisted IPv4 traffic to VPP \
+                         (IPv6 stays on the eBPF tier: no port has `v6-outbound`); \
+                         `ethtool -n <iface>` lists the rules"
+                            .into()
+                    }
+                } else if self.steer_v6_only {
+                    format!(
+                        "steered — MCAM rules are diverting outbound IPv6 on {} (every v6 \
+                         frame to the router there except ICMPv6, DNS and `steer-keep6`) to \
+                         VPP; no IPv4 is diverted (nothing in the allowlist is steerable \
+                         IPv4), and other IPv6 stays on the eBPF tier. `ethtool -n <iface>` \
+                         lists the rules",
+                        self.steer_v6_outbound.join(", ")
+                    )
                 } else {
-                    "steered — MCAM rules are diverting allowlisted IPv4 traffic to VPP \
-                     (IPv6 stays on the eBPF tier: this NIC cannot steer it); \
-                     `ethtool -n <iface>` lists the rules"
-                        .into()
+                    format!(
+                        "steered — MCAM rules are diverting allowlisted IPv4 traffic, and \
+                         outbound IPv6 on {} (every v6 frame to the router there except \
+                         ICMPv6, DNS and `steer-keep6`), to VPP; other IPv6 stays on the \
+                         eBPF tier. `ethtool -n <iface>` lists the rules",
+                        self.steer_v6_outbound.join(", ")
+                    )
                 }),
             ),
             // Intended but absent: a failed steer, or steering torn down
@@ -2593,6 +2636,10 @@ mod tests {
             // matrix covered the unsteered postures.
             "steer on",
             "steer off",
+            // The steered row names the v6 directives: whether any port
+            // diverts v6, and what stays kept when one does.
+            "v6-outbound",
+            "steer-keep6",
         ];
         let mut seen: Vec<String> = Vec::new();
         for state in [
@@ -3614,6 +3661,111 @@ mod tests {
         // Scoped to what steering covers: `RuleSet::plan` skips every v6
         // prefix, so "allowlisted traffic" alone would overstate it.
         assert!(msg.contains("IPv4"), "{msg}");
+        assert!(msg.contains("IPv6 stays on the eBPF tier"), "{msg}");
+
+        // With v6 diverted, the row says where — port and VLANs — and
+        // stops claiming v6 stays put.
+        snap.steer_v6_outbound = vec!["eth4 vlan 100,200".into(), "eth5 untagged".into()];
+        let msg = snap
+            .report()
+            .subsystems
+            .into_iter()
+            .find(|x| x.name == SUBSYS_STEERING)
+            .unwrap()
+            .message
+            .unwrap();
+        assert!(
+            msg.contains("outbound IPv6 on eth4 vlan 100,200, eth5 untagged"),
+            "{msg}"
+        );
+        assert!(!msg.contains("no port has `v6-outbound`"), "{msg}");
+        assert!(msg.contains("allowlisted IPv4"), "both families: {msg}");
+
+        // v6 only: the row stops claiming IPv4 is diverted.
+        snap.steer_v6_only = true;
+        let msg = snap
+            .report()
+            .subsystems
+            .into_iter()
+            .find(|x| x.name == SUBSYS_STEERING)
+            .unwrap()
+            .message
+            .unwrap();
+        assert!(msg.contains("outbound IPv6 on eth4 vlan 100,200"), "{msg}");
+        assert!(!msg.contains("allowlisted IPv4"), "{msg}");
+        assert!(msg.contains("no IPv4 is diverted"), "{msg}");
+    }
+
+    /// Which families the installed rules divert, read from the rules
+    /// themselves: v4 only, v6 only, or both.
+    #[test]
+    fn the_families_diverted_are_read_from_the_installed_rules() {
+        use crate::runtime::{installs_v4_diversion, v6_outbound_summary};
+        use crate::steer::{McamBudget, RuleSet, V6Steering};
+        let plan = |allow: Vec<packetframe_common::fib::IpPrefix>, vlans| {
+            let set = RuleSet::plan_with_v6(
+                &allow,
+                &[],
+                McamBudget::default(),
+                packetframe_common::config::VppSteerDirection::Src,
+                &[[0x02, 0, 0, 0, 0, 1]],
+                &V6Steering {
+                    vlans,
+                    keeps: vec![],
+                },
+            )
+            .unwrap();
+            vec![("eth4".to_string(), 0, set)]
+        };
+        let v4 = || {
+            vec![packetframe_common::fib::IpPrefix::V4 {
+                addr: [192, 0, 2, 0],
+                prefix_len: 24,
+            }]
+        };
+        let v6_prefix = vec![packetframe_common::fib::IpPrefix::V6 {
+            addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            prefix_len: 48,
+        }];
+        let v4_only = plan(v4(), vec![]);
+        let both = plan(v4(), vec![Some(100)]);
+        let v6_only = plan(v6_prefix, vec![Some(100)]);
+        assert!(installs_v4_diversion(&v4_only) && v6_outbound_summary(&v4_only).is_empty());
+        assert!(installs_v4_diversion(&both) && !v6_outbound_summary(&both).is_empty());
+        assert!(!installs_v4_diversion(&v6_only) && !v6_outbound_summary(&v6_only).is_empty());
+    }
+
+    /// The summary the row prints comes from the INSTALLED plan's v6
+    /// diversions, per port, and says nothing for a v4-only port.
+    #[test]
+    fn the_v6_summary_names_each_port_and_its_vlans() {
+        use crate::steer::{McamBudget, RuleSet, V6Steering};
+        let plan = |vlans: Vec<Option<u16>>| {
+            RuleSet::plan_with_v6(
+                &[packetframe_common::fib::IpPrefix::V4 {
+                    addr: [192, 0, 2, 0],
+                    prefix_len: 24,
+                }],
+                &[],
+                McamBudget::default(),
+                packetframe_common::config::VppSteerDirection::Src,
+                &[[0x02, 0, 0, 0, 0, 1], [0x02, 0, 0, 0, 0, 2]],
+                &V6Steering {
+                    vlans,
+                    keeps: vec![],
+                },
+            )
+            .unwrap()
+        };
+        let plans = vec![
+            ("eth3".to_string(), 0, plan(vec![])),
+            ("eth4".to_string(), 0, plan(vec![Some(100), Some(200)])),
+            ("eth5".to_string(), 0, plan(vec![None])),
+        ];
+        assert_eq!(
+            crate::runtime::v6_outbound_summary(&plans),
+            vec!["eth4 vlan 100,200".to_string(), "eth5 untagged".to_string()]
+        );
     }
 
     /// The two ways to be unsteered must not print the same line.
@@ -4281,7 +4433,7 @@ mod tests {
         assert_eq!(r.overall, HealthState::Healthy);
         let m = render_metrics(&off, "vpp-offload");
         assert!(!m.contains("packetframe_vpp_family_routes"), "{m}");
-        assert!(steering_line(&off).contains("this NIC cannot steer it"));
+        assert!(steering_line(&off).contains("no port has `v6-outbound`"));
 
         let mut on = v4;
         on.v6 = Some(crate::sink::FamilyCounts {

@@ -360,6 +360,21 @@ the linux-cp-shaped complexity this design refuses (a VPP crash would
 take the v6 control plane down with it, breaking the failover tier's
 premise). Recorded as a door that exists and was not walked through.
 
+**Update (2026-09-26, production kernel `5.15.72-ui-cn9670`): the door
+is walked through, narrowed.** A second probe mapped what DOES insert
+without an address: `ether proto 0x86dd dst <MAC>` with and without
+`vlan <vid> m 0xf000`, `ip4 dst-ip X vlan <vid> m 0xf000`, `tcp6
+dst-port N` / `src-port N`, `udp6 dst-port N`, `ip6 l4proto 58`, `ip6
+l4proto 6`, and `tcp6 dst-port N vlan <vid> m 0xf000`. A functional
+test with real frames confirmed a drop rule on `ether proto 0x86dd dst
+<router MAC>` blocked v6 ping and TCP to the router, and lower-location
+keeps (`ip6 l4proto 58`, `tcp6 dst-port 443`, action 0) restored them.
+That answers the objection above without a punt path: the ethertype
+rule is scoped to the router MAC and a VLAN, and the control plane is
+carved back out by higher-priority kernel-delivery keeps (ICMPv6, DNS,
+operator-listed services). Built as `v6-outbound` / `steer-keep6`; see
+the operations runbook's "v6 outbound steering" section.
+
 Consequences:
 - **v6 cannot be MCAM-steered into VPP.** The per-family split from
   the plan activates: v6 stays on the XDP custom-FIB path (already

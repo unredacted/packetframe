@@ -34,6 +34,7 @@ pub(crate) fn run(
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
     steer_capacity: Option<u16>,
+    section: &[packetframe_common::config::ModuleDirective],
 ) -> Vec<Capability> {
     let mut caps = Vec::with_capacity(6 + ports.len());
     caps.push(probe_iommu());
@@ -52,7 +53,12 @@ pub(crate) fn run(
     for iface in ports {
         caps.push(probe_sriov(iface));
     }
-    caps.push(probe_steering_budget(
+    // The v6 half of each port's plan, from the section exactly as attach
+    // derives it — `VppOffloadConfig::v6_steering`, `vlans all` VIDs held
+    // to the kernel bridge included.
+    let v6cfg = crate::VppOffloadConfig::from_directives(section);
+    let v6_for = |port: &str| v6cfg.v6_steering(port, &crate::topology::kernel_tagged_vlans);
+    caps.push(probe_steering_budget_v6(
         ports,
         steer_ports,
         allowlist,
@@ -60,6 +66,7 @@ pub(crate) fn run(
         steer_exempts,
         steer_capacity,
         &crate::topology::kernel_receive_macs,
+        &v6_for,
     ));
     caps
 }
@@ -169,9 +176,11 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
 /// cannot be steered at all (partially steering it would split the
 /// allowlist across both forwarding tiers, which is a policy nobody
 /// chose, so it is refused whole). And **how much of it is v6**, which
-/// cannot be steered on this NIC at any size: `ip6` ntuple is rejected
-/// by the AF, so a v6-heavy allowlist means the offload covers far less
-/// traffic than the config reads like it does.
+/// cannot be steered BY PREFIX on this NIC at any size: an `ip6` rule
+/// naming an address is rejected by the AF, so a v6-heavy allowlist
+/// means the offload covers far less traffic than the config reads like
+/// it does. (`v6-outbound` diverts v6 by frame instead, per port; its
+/// rules are planned here too — see [`probe_steering_budget_v6`].)
 ///
 /// Read-only, like every probe here: it computes the plan the module
 /// would install, and installs nothing. Required exactly when a port
@@ -187,6 +196,7 @@ fn probe_irq_affinity(ports: &[String], workers: u32) -> Capability {
 /// module would issue was rejected, because the constant named a slot
 /// 1008 past the end of the table. A probe whose answer cannot disagree
 /// with the code it is probing is not a probe.
+#[cfg(test)]
 fn probe_steering_budget(
     member_ports: &[String],
     steer_ports: &[String],
@@ -195,6 +205,35 @@ fn probe_steering_budget(
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
     steer_capacity: Option<u16>,
     receive_macs: &dyn Fn(&str) -> Vec<[u8; 6]>,
+) -> Capability {
+    probe_steering_budget_v6(
+        member_ports,
+        steer_ports,
+        allowlist,
+        directions,
+        steer_exempts,
+        steer_capacity,
+        receive_macs,
+        &|_: &str| Ok(crate::steer::V6Steering::default()),
+    )
+}
+
+/// [`probe_steering_budget`] with each port's `v6-outbound` half
+/// (`v6_for`), planned as attach plans it: a port with v6 to divert has
+/// something to steer whatever the allowlist holds, and its v6 rules
+/// count against the same slots. Planned with the largest v6 set among
+/// the candidate ports, the same conservative stand-in the receive-MAC
+/// set already is.
+#[allow(clippy::too_many_arguments)]
+fn probe_steering_budget_v6(
+    member_ports: &[String],
+    steer_ports: &[String],
+    allowlist: &[packetframe_common::fib::IpPrefix],
+    directions: &[packetframe_common::config::VppSteerDirection],
+    steer_exempts: &[packetframe_common::config::Ipv4Prefix],
+    steer_capacity: Option<u16>,
+    receive_macs: &dyn Fn(&str) -> Vec<[u8; 6]>,
+    v6_for: &dyn Fn(&str) -> Result<crate::steer::V6Steering, String>,
 ) -> Capability {
     use crate::steer::McamBudget;
 
@@ -220,19 +259,61 @@ fn probe_steering_budget(
     // operator who wrote `steer on` against a v6-only allowlist must
     // read about their allowlist, not about whatever the ioctl said.
     let steerable = crate::steer::steerable_count(allowlist);
-    if steerable == 0 {
+    // `v6-outbound` is the other thing a port can steer, and it too needs
+    // no NIC to settle — only the kernel bridge, for a `vlans all` trunk.
+    let candidates: &[String] = if gating { steer_ports } else { member_ports };
+    let mut v6_of: Vec<(&str, crate::steer::V6Steering)> = Vec::new();
+    let mut v6_ports: Vec<&str> = Vec::new();
+    for port in candidates {
+        match v6_for(port) {
+            Ok(s) => {
+                if !s.vlans.is_empty() {
+                    v6_ports.push(port.as_str());
+                }
+                v6_of.push((port.as_str(), s));
+            }
+            Err(e) => return Capability::fail(name, e, gating),
+        }
+    }
+    let v6_for_port = |port: &str| {
+        v6_of
+            .iter()
+            .find(|(p, _)| *p == port)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default()
+    };
+    // Attach refuses a `steer on` port with nothing to divert, per port;
+    // staging advises only when no candidate could divert anything.
+    let idle: Vec<&str> = candidates
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !v6_ports.contains(p))
+        .collect();
+    let refuses = if gating {
+        !idle.is_empty()
+    } else {
+        v6_ports.is_empty()
+    };
+    if steerable == 0 && refuses {
+        let also = if v6_ports.is_empty() {
+            String::new()
+        } else {
+            format!("; {v6_ports:?} divert IPv6 (`v6-outbound`) but {idle:?} would steer nothing")
+        };
         return Capability::fail(
             name,
             if allowlist.is_empty() {
-                "the fast-path allowlist is empty, so there is nothing to steer. Steered \
-                 prefixes are inherited from fast-path's `allow-prefix`/`allow-prefix6`; \
-                 without any, the offload would forward nothing while reporting healthy"
-                    .to_string()
+                format!(
+                    "the fast-path allowlist is empty, so there is nothing to steer. Steered \
+                     prefixes are inherited from fast-path's `allow-prefix`/`allow-prefix6`; \
+                     without any, the offload would forward nothing while reporting \
+                     healthy{also}"
+                )
             } else {
                 format!(
                     "none of the allowlist can be steered: all {} prefix(es) are IPv6, and \
-                     `ip6` ntuple is rejected by this NIC's AF (gate 0b round 4). The \
-                     offload would forward nothing while reporting healthy",
+                     `ip6` ntuple cannot match a v6 address on this NIC's AF (gate 0b round \
+                     4). The offload would forward nothing while reporting healthy{also}",
                     allowlist.len()
                 )
             },
@@ -267,9 +348,12 @@ fn probe_steering_budget(
             }
         };
         // The receive MACs attach will scope each port's diversions to,
-        // and its refusal when a port's cannot be read. Planned with the
-        // largest set, whose copies cost the most slots.
-        let mut dmacs: Vec<[u8; 6]> = Vec::new();
+        // and its refusal when a port's cannot be read. Each port is
+        // planned with ITS OWN MACs and v6 VLANs, as `plan_targets` plans
+        // it: the largest MAC set of one port times the most VLANs of
+        // another is a rule set no real port needs, and failing on it
+        // refused configs attach accepts (review finding).
+        let mut ports: Vec<PortPlanInputs> = Vec::new();
         for port in steer_ports {
             let macs = receive_macs(port);
             if macs.is_empty() {
@@ -283,9 +367,7 @@ fn probe_steering_budget(
                     true,
                 );
             }
-            if macs.len() > dmacs.len() {
-                dmacs = macs;
-            }
+            ports.push((port.as_str(), macs, v6_for_port(port)));
         }
         return plan_and_report(
             name,
@@ -297,7 +379,7 @@ fn probe_steering_budget(
             allowlist,
             directions,
             steer_exempts,
-            &dmacs,
+            &ports,
         );
     }
 
@@ -357,13 +439,12 @@ fn probe_steering_budget(
             false,
         );
     };
-    // Any consulted member could be the one turned on: plan with the
-    // largest receive-MAC set among them.
-    let dmacs = consulted
+    // Any consulted member could be the one turned on: plan each with its
+    // own receive MACs and v6 VLANs, and report the worst real port.
+    let ports: Vec<PortPlanInputs> = consulted
         .iter()
-        .map(|p| receive_macs(p))
-        .max_by_key(Vec::len)
-        .unwrap_or_default();
+        .map(|p| (*p, receive_macs(p), v6_for_port(p)))
+        .collect();
     plan_and_report(
         name,
         budget,
@@ -374,9 +455,12 @@ fn probe_steering_budget(
         allowlist,
         directions,
         steer_exempts,
-        &dmacs,
+        &ports,
     )
 }
+
+/// One port's planning inputs: its name, receive MACs and v6 half.
+type PortPlanInputs<'a> = (&'a str, Vec<[u8; 6]>, crate::steer::V6Steering);
 
 /// Said whenever the budget above rests on a size `steer-capacity` has
 /// yet to obtain, because the shared pool can give fewer at attach.
@@ -405,7 +489,7 @@ fn plan_and_report(
     allowlist: &[packetframe_common::fib::IpPrefix],
     directions: &[packetframe_common::config::VppSteerDirection],
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
-    dmacs: &[[u8; 6]],
+    ports: &[PortPlanInputs],
 ) -> Capability {
     use crate::steer::{RuleAction, RuleSet};
 
@@ -432,25 +516,68 @@ fn plan_and_report(
     // actions: the old `rules / 2` was right only for `both` with no
     // exemptions, since rule counts include the Keep rules and src/dst
     // plans carry one divert per prefix.
+    //
+    // Per PORT as well: each is planned with its own receive MACs and v6
+    // VLANs, as attach plans it, and the largest real plan is reported.
+    // No ports (only the tests' synthetic empty call) plans once with
+    // no port facts.
+    let no_port = [("", Vec::new(), crate::steer::V6Steering::default())];
+    let ports = if ports.is_empty() {
+        &no_port[..]
+    } else {
+        ports
+    };
     let mut details = Vec::with_capacity(directions.len());
     let mut skipped_v6 = 0u32;
     for direction in directions {
-        match RuleSet::plan(allowlist, steer_exempts, budget.clone(), *direction, dmacs) {
-            Ok(set) => {
-                skipped_v6 = set.skipped_v6;
-                let diverts = set
-                    .rules
-                    .iter()
-                    .filter(|r| r.action == RuleAction::Divert)
-                    .count();
-                details.push(format!(
-                    "direction {direction}: {} rule(s) ({diverts} divert + {} keep)",
-                    set.rules.len(),
-                    set.rules.len() - diverts,
-                ));
+        let mut worst: Option<(&str, RuleSet, &crate::steer::V6Steering)> = None;
+        for (port, macs, v6) in ports {
+            match RuleSet::plan_with_v6(
+                allowlist,
+                steer_exempts,
+                budget.clone(),
+                *direction,
+                macs,
+                v6,
+            ) {
+                Ok(set) => {
+                    if worst
+                        .as_ref()
+                        .is_none_or(|(_, w, _)| set.rules.len() > w.rules.len())
+                    {
+                        worst = Some((port, set, v6));
+                    }
+                }
+                Err(e) if port.is_empty() => return Capability::fail(name, e, required),
+                Err(e) => return Capability::fail(name, format!("port {port}: {e}"), required),
             }
-            Err(e) => return Capability::fail(name, e, required),
         }
+        let (port, set, v6) = worst.expect("at least one port planned");
+        skipped_v6 = set.skipped_v6;
+        let diverts = set
+            .rules
+            .iter()
+            .filter(|r| r.action == RuleAction::Divert)
+            .count();
+        let v6_rules = set.rules.iter().filter(|r| r.is_v6()).count();
+        details.push(format!(
+            "direction {direction}: {} rule(s) ({diverts} divert + {} keep{}){}",
+            set.rules.len(),
+            set.rules.len() - diverts,
+            if v6_rules > 0 {
+                format!(
+                    "; {v6_rules} of them IPv6 outbound on {}",
+                    crate::steer::V6Steering::describe_vlans(&v6.vlans)
+                )
+            } else {
+                String::new()
+            },
+            if ports.len() > 1 {
+                format!(" on {port}, the largest")
+            } else {
+                String::new()
+            },
+        ));
     }
     let detail = format!(
         "{}; {} free slot(s) across {} {}{}{}{}",
@@ -966,6 +1093,129 @@ mod steering_probe_tests {
             unscoped.detail
         );
         assert!(unscoped.required, "{unscoped:?}");
+    }
+
+    /// The v6 half is planned as attach plans it: a `v6-outbound` port
+    /// steers with no v4 to divert, a port beside it without the tail
+    /// fails as attach refuses it, and the v6 rules count against the
+    /// same slots — so a table that fits v4 alone can still fail here.
+    #[test]
+    fn the_budget_probe_plans_the_v6_half() {
+        use crate::ntuple::sys;
+        use crate::steer::V6Steering;
+        let dirs: &[packetframe_common::config::VppSteerDirection] = Default::default();
+        let v6_on_eth4 = |p: &str| -> Result<V6Steering, String> {
+            Ok(if p == "eth4" {
+                V6Steering {
+                    vlans: vec![Some(100), Some(200)],
+                    keeps: vec![],
+                }
+            } else {
+                V6Steering::default()
+            })
+        };
+        let eth4 = ["eth4".to_string()];
+        let both = ["eth4".to_string(), "eth5".to_string()];
+
+        // No v4 at all, v6 on the steering port: a pass naming the v6.
+        sys::reset();
+        let ok =
+            probe_steering_budget_v6(&eth4, &eth4, &[], dirs, &[], None, &one_mac, &v6_on_eth4);
+        assert_eq!(ok.status, CapabilityStatus::Pass, "{ok:?}");
+        assert!(
+            ok.detail.contains("IPv6 outbound on vlan 100,200"),
+            "{}",
+            ok.detail
+        );
+
+        // A second steering port with nothing to divert: attach refuses.
+        sys::reset();
+        let idle =
+            probe_steering_budget_v6(&both, &both, &[], dirs, &[], None, &one_mac, &v6_on_eth4);
+        assert_eq!(idle.status, CapabilityStatus::Fail, "{idle:?}");
+        assert!(idle.required && idle.detail.contains("eth5"), "{idle:?}");
+
+        // v4 fits a 4-slot table alone (1 divert + 2 keeps); with v6
+        // (2 diversions + 3 keeps) it does not.
+        sys::reset();
+        sys::set_table_size(4);
+        let v4 = [v4(0, 24)];
+        let src = [packetframe_common::config::VppSteerDirection::Src];
+        let alone = probe_steering_budget(&eth4, &eth4, &v4, &src, &[], None, &one_mac);
+        assert_eq!(alone.status, CapabilityStatus::Pass, "{alone:?}");
+        let with_v6 =
+            probe_steering_budget_v6(&eth4, &eth4, &v4, &src, &[], None, &one_mac, &v6_on_eth4);
+        assert_eq!(with_v6.status, CapabilityStatus::Fail, "{with_v6:?}");
+        assert!(
+            with_v6.detail.contains("IPv6 outbound diversion"),
+            "{}",
+            with_v6.detail
+        );
+
+        // A trunk whose bridge VLANs cannot be read: attach refuses, and
+        // so does this.
+        sys::reset();
+        let dark =
+            probe_steering_budget_v6(&eth4, &eth4, &v4, dirs, &[], None, &one_mac, &|_: &str| {
+                Err("bridge VLANs unreadable".to_string())
+            });
+        assert_eq!(dark.status, CapabilityStatus::Fail, "{dark:?}");
+        assert!(dark.required, "{dark:?}");
+    }
+
+    /// Each port is planned with its OWN receive MACs and v6 VLANs. One
+    /// port with two MACs and no v6 beside another with one MAC and two
+    /// v6 VLANs needs at most 8 slots (the second port: 1 + 2 v4, 2 + 3
+    /// v6); crossing the first's MACs with the second's VLANs would ask
+    /// for 11, a rule set no real port needs, and fail an 8-slot table
+    /// attach accepts.
+    #[test]
+    fn the_budget_probe_plans_each_ports_own_macs_and_vlans() {
+        use crate::ntuple::sys;
+        use crate::steer::V6Steering;
+        let macs = |p: &str| -> Vec<[u8; 6]> {
+            if p == "eth4" {
+                vec![[0x02, 0, 0, 0, 0, 1], [0x02, 0, 0, 0, 0, 2]]
+            } else {
+                vec![[0x02, 0, 0, 0, 0, 3]]
+            }
+        };
+        let v6 = |p: &str| -> Result<V6Steering, String> {
+            Ok(if p == "eth5" {
+                V6Steering {
+                    vlans: vec![Some(100), Some(200)],
+                    keeps: vec![],
+                }
+            } else {
+                V6Steering::default()
+            })
+        };
+        let both = ["eth4".to_string(), "eth5".to_string()];
+        let src = [packetframe_common::config::VppSteerDirection::Src];
+        let allow = [v4(0, 24)];
+        for (steering, what) in [(&both[..], "steering"), (&[][..], "staging")] {
+            sys::reset();
+            sys::set_table_size(8);
+            let cap =
+                probe_steering_budget_v6(&both, steering, &allow, &src, &[], None, &macs, &v6);
+            assert_eq!(cap.status, CapabilityStatus::Pass, "{what}: {cap:?}");
+            assert!(
+                cap.detail.contains("8 rule(s)") && cap.detail.contains("on eth5, the largest"),
+                "{what}: the worst REAL port is reported: {}",
+                cap.detail
+            );
+            // One slot fewer and the worst real port no longer fits.
+            sys::reset();
+            sys::set_table_size(7);
+            let short =
+                probe_steering_budget_v6(&both, steering, &allow, &src, &[], None, &macs, &v6);
+            assert_eq!(short.status, CapabilityStatus::Fail, "{what}: {short:?}");
+            assert!(
+                short.detail.contains("port eth5"),
+                "{what}: {}",
+                short.detail
+            );
+        }
     }
 
     /// The SR-IOV probe answers the question attach asks, not just the

@@ -308,6 +308,19 @@ pub fn vpp_steer_exempts_from_config(
         .collect()
 }
 
+/// Every directive of the vpp-offload section(s), in order — the input
+/// `VppOffloadConfig::from_directives` takes, so the budget probe plans
+/// the v6 half from what attach reads rather than from a second copy of
+/// its extraction.
+pub fn vpp_section_from_config(config: &Config) -> Vec<ModuleDirective> {
+    config
+        .modules
+        .iter()
+        .filter(|m| m.name == "vpp-offload")
+        .flat_map(|m| m.directives.iter().cloned())
+        .collect()
+}
+
 /// The `steer-capacity` the budget probe plans against; the last line
 /// wins, as it does in the module's own section parse.
 pub fn vpp_steer_capacity_from_config(config: &Config) -> Option<u16> {
@@ -438,6 +451,11 @@ pub struct VppProbeInputs {
     pub steer_directions: Vec<VppSteerDirection>,
     pub steer_exempts: Vec<packetframe_common::config::Ipv4Prefix>,
     pub steer_capacity: Option<u16>,
+    /// The vpp-offload section's directives, for the v6 half of the
+    /// steering plan (`v6-outbound`, `steer-keep6`, `vlans all`) — derived
+    /// by the module from the section exactly as attach derives it, rather
+    /// than re-extracted here field by field.
+    pub section: Vec<ModuleDirective>,
 }
 
 /// Everything `probe_and_render` needs from the config, in one named
@@ -495,6 +513,7 @@ impl FeasibilityInputs {
                 steer_directions: vpp_steer_directions_from_config(config),
                 steer_exempts: vpp_steer_exempts_from_config(config),
                 steer_capacity: vpp_steer_capacity_from_config(config),
+                section: vpp_section_from_config(config),
             },
             snoop: neigh_snoop_probe_inputs_from_config(config),
             frr_authority: frr_authority_from_config(config),
@@ -554,6 +573,7 @@ pub fn probe_and_render(inputs: &FeasibilityInputs, human: bool) -> Rendered {
                 &vpp.steer_directions,
                 &vpp.steer_exempts,
                 vpp.steer_capacity,
+                &vpp.section,
             ) {
                 names.push(cap.name.clone());
                 report.capabilities.push(cap);

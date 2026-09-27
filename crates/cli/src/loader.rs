@@ -3035,14 +3035,14 @@ mod vpp_detach_tests {
             "eth5".to_string(),
             0,
             packetframe_vpp_offload::steer::RuleSet {
-                rules: vec![packetframe_vpp_offload::steer::SteerRule {
-                    prefix: std::net::Ipv4Addr::new(198, 51, 100, 0),
-                    prefix_len: 24,
-                    side: packetframe_vpp_offload::steer::Side::Dst,
-                    location: 0,
-                    action: packetframe_vpp_offload::steer::RuleAction::Keep,
-                    dmac: None,
-                }],
+                rules: vec![packetframe_vpp_offload::steer::SteerRule::v4(
+                    std::net::Ipv4Addr::new(198, 51, 100, 0),
+                    24,
+                    packetframe_vpp_offload::steer::Side::Dst,
+                    0,
+                    packetframe_vpp_offload::steer::RuleAction::Keep,
+                    None,
+                )],
                 skipped_v6: 0,
             },
         )];

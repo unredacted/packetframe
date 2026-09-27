@@ -1408,6 +1408,8 @@ fn run_loop(
                 missing: rs.steer_missing,
                 stray: rs.steer_stray,
                 unreadable: rs.steer_audit_error.clone(),
+                v6_outbound: rs.steer_v6_outbound.clone(),
+                v6_only: rs.steer_v6_only,
             },
             rs.shadowed_routes,
             rs.kernel_delivered_routes,
