@@ -51,8 +51,10 @@
 //!   VPP refuses only routes whose every feed next hop is link-local
 //!   (the engine's `link_local_refused`). Only prefixes VPP holds no
 //!   route for are reported, as one summary line ([`V6Scan::settle`]);
-//! - `local-route` bridges are not reach. `local-route` is IPv4
-//!   ([`crate::LocalRoute::prefix`]), so VPP delivers no v6 subnet there;
+//! - a bridge is v6 reach by `local-route6`, not `local-route`. Each
+//!   delivers its own family's subnet ([`crate::LocalRoutePrefix`]), so a
+//!   bridge with only a v4 `local-route` gets no v6 route from VPP, and
+//!   one with a `local-route6` does ([`VppReach::local_devices_v6`]);
 //! - link-local and multicast destinations, and the router's own
 //!   addresses, are not paths at all.
 
@@ -166,7 +168,7 @@ pub struct KernelRoute<P = Ipv4Prefix> {
 }
 
 /// What VPP can actually egress, from config: member ports and the
-/// kernel bridge devices `local-route` delivers into.
+/// kernel bridge devices `local-route` and `local-route6` deliver into.
 #[derive(Debug, Clone, Default)]
 pub struct VppReach {
     /// `port` lines — VPP owns a VF on each.
@@ -175,6 +177,10 @@ pub struct VppReach {
     /// delivers those prefixes on a subif, so a kernel route out the
     /// bridge is covered.
     pub local_devices: Vec<String>,
+    /// The same for `local-route6`: the bridges VPP delivers a v6
+    /// subnet into. IPv6 reach only ([`Self::for_v6`]); the v4 scan never
+    /// reads it.
+    pub local_devices_v6: Vec<String>,
     /// VLAN and bridge devices VPP reaches through a member's subif
     /// ([`crate::topology::reachable_devices`]): an IX LAN bridge, say,
     /// whose next hops VPP places per neighbour. A route VIA A GATEWAY
@@ -190,14 +196,17 @@ impl VppReach {
             || (gatewayed && self.bridged_devices.iter().any(|d| d == dev))
     }
 
-    /// The reach IPv6 has: the same devices minus the `local-route`
-    /// bridges. A `local-route` names an IPv4 prefix, so VPP delivers
-    /// that bridge's v4 subnet and no v6 one — counting the bridge as v6
-    /// reach would clear exactly the connected v6 subnet VPP has no
-    /// route for.
+    /// The reach IPv6 has: the same members and bridged devices, with the
+    /// `local-route6` bridges in place of the `local-route` ones. Each
+    /// names its own family's prefix, so VPP delivers a `local-route`
+    /// bridge's v4 subnet and no v6 one — counting it as v6 reach would
+    /// clear exactly the connected v6 subnet VPP has no route for — and a
+    /// `local-route6` bridge's v6 subnet, which is covered on the same
+    /// per-device terms a `local-route` bridge is for v4. Idempotent: the
+    /// dump and [`classify_v6`] each apply it.
     fn for_v6(&self) -> Self {
         Self {
-            local_devices: Vec::new(),
+            local_devices: self.local_devices_v6.clone(),
             ..self.clone()
         }
     }
@@ -1907,6 +1916,7 @@ mod tests {
         VppReach {
             members: vec!["eth3".into(), "eth4".into()],
             local_devices: vec!["br1337".into()],
+            local_devices_v6: vec!["br100".into()],
             bridged_devices: vec!["br3998".into()],
         }
     }
@@ -2739,6 +2749,46 @@ mod tests {
         assert_eq!(lines6(&found), ["2001:db8:1::/64 via br1337 (table 254)"]);
     }
 
+    /// `local-route6` installs an attached v6 route on the bridge's
+    /// BVI/subif/VF, so VPP delivers into that subnet: the kernel's
+    /// connected route for it is covered, where without the line it is
+    /// the permanent false finding this reach exists to prevent. The
+    /// bridge is v6 reach on the terms a `local-route` bridge is v4
+    /// reach — by device — and v4 reach not at all.
+    #[test]
+    fn a_local_route6_bridge_is_v6_reach_and_only_v6() {
+        let connected = route6(p6("2001:db8:0:100::", 64), "br100");
+        assert!(find6(std::slice::from_ref(&connected)).is_empty());
+
+        // The same route with no `local-route6` naming the bridge.
+        let without = VppReach {
+            local_devices_v6: Vec::new(),
+            ..reach()
+        };
+        let found = uncovered_paths_v6(&[connected], &without, None, |_| false);
+        assert_eq!(
+            lines6(&found),
+            ["2001:db8:0:100::/64 via br100 (table 254)"]
+        );
+
+        // A route on that bridge outside the declared prefix is judged as
+        // the v4 half judges one outside a `local-route` prefix on its
+        // bridge: by the device, which VPP reaches. The v4 twin pins the
+        // parity.
+        assert!(find6(&[route6(p6("2001:db8:0:200::", 64), "br100")]).is_empty());
+        assert!(find(&[route(p(198, 51, 100, 0, 24), "br1337")], &[]).is_empty());
+
+        // v4 never reads the v6 set: a v4 connected route out a bridge only
+        // `local-route6` names is a finding, as before.
+        let found = find(&[route(p(203, 0, 113, 0, 24), "br100")], &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].to_string(), "203.0.113.0/24 via br100 (table 100)");
+
+        // Applied twice (the dump, then `classify_v6`), still the v6 set.
+        let twice = reach().for_v6().for_v6();
+        assert_eq!(twice.local_devices, ["br100"]);
+    }
+
     /// A kernel route with only link-local hops on owned devices, for a
     /// prefix VPP holds no route for (refused as link-local-only, or
     /// never in the feed), is a finding. Reported as ONE summary line
@@ -2899,7 +2949,8 @@ mod tests {
     /// routes, and neither may change a v6 finding — the same invariant
     /// the v4 dump rests on, over the v6 shapes: a member-gatewayed bulk,
     /// a link-local bulk (the FRR mesh), a local-route bridge that is not
-    /// v6 reach, and the router's own addresses. Checked against a VPP
+    /// v6 reach, a local-route6 bridge that is, and the router's own
+    /// addresses. Checked against a VPP
     /// that holds the link-local bulk but not the default.
     #[test]
     fn splitting_v6_routes_at_the_dump_never_changes_the_findings() {
@@ -2923,6 +2974,7 @@ mod tests {
             via(route6(p6("::", 0), "eth3"), true),
             via(route6(p6("2001:db8:fff0::", 48), "tun0"), false),
             route6(p6("2001:db8:fff1::", 64), "br1337"),
+            route6(p6("2001:db8:fff4::", 64), "br100"),
             route6(p6("fe80::", 64), "tun0"),
             ll_parked,
             mixed,

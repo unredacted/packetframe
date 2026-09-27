@@ -1112,6 +1112,11 @@ since the route is kept outside the ledger. A config without any
 `local-route6` records exactly what earlier builds recorded, so an
 upgrade still adopts.
 
+The bridge a `local-route6` names is IPv6 reach for the exemption
+tripwire, so its connected `/64` is not an `exempt-drift-v6` finding
+([IPv6 findings](#ipv6-findings-exempt-drift-v6)). Without the line,
+the same connected route is one while a port carries `v6-outbound`.
+
 Verifying on the box (`vppctl` is fine for these; they are not bulk
 reads):
 
@@ -1477,8 +1482,9 @@ exempt-drift-v6: degraded — IPv6 kernel path(s) VPP cannot take, while
 ```
 
 It is the same judgement as v4 — a route is covered when some next hop
-leaves by a member port, or via a gateway on a bridge VLAN a member
-carries — with these differences:
+leaves by a member port, by a bridge VPP delivers this family into, or
+via a gateway on a bridge VLAN a member carries — with these
+differences:
 
 - **Nothing exempts.** The NIC cannot match a v6 address, so there is
   no IPv6 `steer-exempt` and every finding stands until its cause
@@ -1501,9 +1507,13 @@ carries — with these differences:
   device is covered by its device. An ECMP route mixing a link-local
   member hop with a hop out a device VPP does not own is, when VPP
   lacks the prefix, an ordinary finding naming that device.
-- **`local-route` bridges are no v6 reach.** `local-route` delivers an
-  IPv4 subnet; VPP has no route onto that bridge for its v6 subnet, so
-  a connected v6 route there is a finding.
+- **A bridge is v6 reach by `local-route6`, not `local-route`.**
+  `local-route` delivers an IPv4 subnet; VPP has no route onto that
+  bridge for its v6 subnet, so a connected v6 route there is a finding.
+  A [`local-route6`](#local-route6-a-customer-vlan-vpp-can-deliver-ipv6-to)
+  installs the v6 attached route, so its bridge counts exactly as a
+  `local-route` bridge does for v4: by device, any route out it
+  covered. Each line counts for its own family only.
 - **Not paths, never findings:** link-local destinations (routers
   never forward `fe80::/10`), multicast destinations (a `33:33` frame
   no diversion's unicast MAC matches), and the router's own addresses
