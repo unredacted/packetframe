@@ -12,6 +12,7 @@ mod atomic;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod breaker;
 mod daemon_presence;
+mod events_cli;
 mod feasibility;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod fib_cli;
@@ -141,6 +142,12 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+
+    /// Print the persistent event log: steering, verify, restarts and
+    /// adoption, reconfigure outcomes, health transitions — the history
+    /// the journal does not keep. Reads the current file and its rotated
+    /// `.1`; works without the daemon running.
+    Events(events_cli::EventsArgs),
 
     /// Direct BPF map ops for debugging. Not yet implemented; both
     /// this and `reconfigure` need live map handles from the running
@@ -365,6 +372,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Events(args) => events_cli::run(args),
         Command::Map { .. } => not_implemented("map"),
         #[cfg(all(target_os = "linux", feature = "fast-path"))]
         Command::Fib { op } => fib_cli::run(op),

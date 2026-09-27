@@ -76,9 +76,38 @@ pub struct GlobalConfig {
     /// L2 loop. Default 2s. `0s` disables.
     #[serde(with = "duration_seconds_serde")]
     pub attach_settle_time: Duration,
+    /// `event-log <path>|off`: where the persistent event log lives
+    /// ([`crate::events`]). Restart-only.
+    pub event_log: EventLogTarget,
+    /// `event-log-max <size>`: the per-file bound before rotation, in
+    /// bytes. Restart-only.
+    pub event_log_max: u64,
 }
 
 pub const DEFAULT_ATTACH_SETTLE_TIME: Duration = Duration::from_secs(2);
+
+/// The `event-log` directive.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EventLogTarget {
+    /// Not configured: `<state-dir>/events.log`.
+    #[default]
+    Default,
+    Path(PathBuf),
+    /// `event-log off`.
+    Off,
+}
+
+impl GlobalConfig {
+    /// The event log's file, or `None` when it is turned off.
+    pub fn event_log_path(&self) -> Option<PathBuf> {
+        match &self.event_log {
+            EventLogTarget::Default => Some(self.state_dir.join(crate::events::DEFAULT_FILE_NAME)),
+            EventLogTarget::Path(p) => Some(p.clone()),
+            EventLogTarget::Off => None,
+        }
+    }
+}
 
 impl Default for GlobalConfig {
     fn default() -> Self {
@@ -88,6 +117,8 @@ impl Default for GlobalConfig {
             bpffs_root: PathBuf::from(DEFAULT_BPFFS_ROOT),
             state_dir: PathBuf::from(DEFAULT_STATE_DIR),
             attach_settle_time: DEFAULT_ATTACH_SETTLE_TIME,
+            event_log: EventLogTarget::Default,
+            event_log_max: crate::events::DEFAULT_MAX_BYTES,
         }
     }
 }
@@ -3292,6 +3323,48 @@ fn parse_global_directive(line: usize, s: &str, g: &mut GlobalConfig) -> Result<
             }
             g.attach_settle_time = parse_duration(line, tok, "attach-settle-time")?;
         }
+        "event-log" => {
+            let tok = rest
+                .next()
+                .ok_or_else(|| ConfigError::parse(line, "event-log requires a path or `off`"))?;
+            if rest.next().is_some() {
+                return Err(ConfigError::parse(
+                    line,
+                    "event-log takes exactly one argument",
+                ));
+            }
+            g.event_log = if tok == "off" {
+                EventLogTarget::Off
+            } else {
+                let p = validate_safe_path(line, "event-log", tok)?;
+                if p.file_name().is_none() || tok.ends_with('/') {
+                    return Err(ConfigError::parse(
+                        line,
+                        format!("event-log: `{tok}` names a directory; give the file's path"),
+                    ));
+                }
+                EventLogTarget::Path(p)
+            };
+        }
+        "event-log-max" => {
+            let tok = rest.next().ok_or_else(|| {
+                ConfigError::parse(line, "event-log-max requires a size (e.g. `10M`)")
+            })?;
+            if rest.next().is_some() {
+                return Err(ConfigError::parse(
+                    line,
+                    "event-log-max takes exactly one argument",
+                ));
+            }
+            let n = parse_size(line, tok, "event-log-max")?;
+            if !(crate::events::MIN_MAX_BYTES..=crate::events::MAX_MAX_BYTES).contains(&n) {
+                return Err(ConfigError::parse(
+                    line,
+                    format!("event-log-max: `{tok}` is outside 64K..=1G"),
+                ));
+            }
+            g.event_log_max = n;
+        }
         other => {
             return Err(ConfigError::parse(
                 line,
@@ -5400,6 +5473,31 @@ fn parse_duration(line: usize, tok: &str, context: &str) -> Result<Duration, Con
             format!("{context}: duration must end in `s` or `ms`, got `{tok}`"),
         ))
     }
+}
+
+/// Parse a byte size: a bare count, or one with a binary `K`/`M`/`G`
+/// suffix (case-insensitive, 1024-based).
+fn parse_size(line: usize, tok: &str, context: &str) -> Result<u64, ConfigError> {
+    let bad = |why: &str| {
+        ConfigError::parse(
+            line,
+            format!("{context}: bad size `{tok}` ({why}; expected e.g. `10M`, `512K`, `1G`)"),
+        )
+    };
+    let (digits, mult) = match tok.chars().last() {
+        Some('k' | 'K') => (&tok[..tok.len() - 1], 1024u64),
+        Some('m' | 'M') => (&tok[..tok.len() - 1], 1024 * 1024),
+        Some('g' | 'G') => (&tok[..tok.len() - 1], 1024 * 1024 * 1024),
+        _ => (tok, 1),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad("not a whole number"));
+    }
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| bad("too large"))
 }
 
 fn strip_comment(s: &str) -> &str {
@@ -7775,6 +7873,76 @@ module fast-path
                 assert!(message.contains(".."), "msg was: {message}");
             }
             other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    // --- event-log ----------------------------------------------------
+
+    #[test]
+    fn event_log_defaults_under_the_state_dir() {
+        let c = Config::parse("global\n  state-dir /srv/pf/state\n").unwrap();
+        assert_eq!(c.global.event_log, EventLogTarget::Default);
+        assert_eq!(
+            c.global.event_log_path(),
+            Some(PathBuf::from("/srv/pf/state/events.log"))
+        );
+        assert_eq!(c.global.event_log_max, crate::events::DEFAULT_MAX_BYTES);
+        // No global section at all: still on, at the built-in state dir.
+        let c = Config::parse("").unwrap();
+        assert_eq!(
+            c.global.event_log_path(),
+            Some(PathBuf::from(DEFAULT_STATE_DIR).join("events.log"))
+        );
+    }
+
+    #[test]
+    fn event_log_path_off_and_max_parse() {
+        let c = Config::parse(
+            "global\n  event-log /persist/packetframe/events.log\n  event-log-max 512K\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.global.event_log_path(),
+            Some(PathBuf::from("/persist/packetframe/events.log"))
+        );
+        assert_eq!(c.global.event_log_max, 512 * 1024);
+
+        let c = Config::parse("global\n  event-log off\n").unwrap();
+        assert_eq!(c.global.event_log, EventLogTarget::Off);
+        assert_eq!(c.global.event_log_path(), None);
+
+        for (tok, want) in [
+            ("65536", 65_536u64),
+            ("64k", 65_536),
+            ("10M", 10 * 1024 * 1024),
+            ("1G", 1024 * 1024 * 1024),
+        ] {
+            let c = Config::parse(&format!("global\n  event-log-max {tok}\n")).unwrap();
+            assert_eq!(c.global.event_log_max, want, "{tok}");
+        }
+    }
+
+    #[test]
+    fn event_log_rejects_what_it_cannot_use() {
+        for body in [
+            "global\n  event-log\n",
+            "global\n  event-log relative/events.log\n",
+            "global\n  event-log /var/lib/../../etc/shadow\n",
+            "global\n  event-log /var/lib/packetframe/\n",
+            "global\n  event-log /a /b\n",
+            "global\n  event-log-max\n",
+            "global\n  event-log-max 10MB\n",
+            "global\n  event-log-max -1\n",
+            "global\n  event-log-max 1K\n",
+            "global\n  event-log-max 2G\n",
+            "global\n  event-log-max 99999999999999999999\n",
+        ] {
+            match Config::parse(body) {
+                Err(ConfigError::Parse { message, .. }) => {
+                    assert!(message.contains("event-log"), "{body:?} → {message}")
+                }
+                other => panic!("{body:?} should be refused, got {other:?}"),
+            }
         }
     }
 

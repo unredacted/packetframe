@@ -30,6 +30,7 @@
 
 #![cfg(feature = "fast-path")]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -74,6 +75,11 @@ pub struct Snapshot {
     /// Unix seconds at write time, for the age.
     pub written_at: u64,
     pub modules: Vec<ModuleEntry>,
+    /// The event-log writer's counters and last error, so `status` can
+    /// say when the log is not being written. `None` when it is off, or
+    /// from a daemon that predates it.
+    #[serde(default)]
+    pub event_log: Option<packetframe_common::events::Status>,
 }
 
 impl Snapshot {
@@ -242,8 +248,134 @@ pub fn poll(
         Ok(mut slot) => *slot = rendered,
         Err(e) => tracing::warn!(error = %e, "module gauge slot is poisoned"),
     }
+    // Running modules only: one that never came up is recorded once, as
+    // `module_start_failed`, and its row here never changes.
+    record_transitions(
+        &mut TRANSITIONS.lock().unwrap_or_else(|e| e.into_inner()),
+        entries
+            .iter()
+            .filter(|e| !not_attached.iter().any(|n| n.module == e.module)),
+    );
     if let Err(e) = publish(state_dir, entries) {
         tracing::warn!(error = %e, "could not publish the module health snapshot");
+    }
+}
+
+/// The daemon's health-transition tracker. One per process, like the
+/// poll loop that feeds it.
+static TRANSITIONS: Mutex<Transitions> = Mutex::new(Transitions::new());
+
+/// How many consecutive polls a new state must hold before it is
+/// recorded. Two polls is ten seconds: a state that flickers for one
+/// poll is the journal's business, and without this a subsystem that
+/// flaps would fill the event log with pairs.
+const TRANSITION_CONFIRM_POLLS: u8 = 2;
+
+/// Each module's overall health as last recorded in the event log.
+#[derive(Debug, Default)]
+pub struct Transitions {
+    modules: BTreeMap<String, Tracked>,
+}
+
+#[derive(Debug, Default)]
+struct Tracked {
+    /// `None` until the first state is established.
+    recorded: Option<&'static str>,
+    /// A different state seen on the most recent polls, and how many.
+    candidate: Option<(&'static str, u8)>,
+}
+
+/// A confirmed change, for the event log.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Transition {
+    /// `None` for the first state recorded for this module.
+    pub from: Option<&'static str>,
+    pub to: &'static str,
+}
+
+impl Transitions {
+    pub const fn new() -> Self {
+        Self {
+            modules: BTreeMap::new(),
+        }
+    }
+
+    /// Feed one poll's observation. A module whose first observation is
+    /// healthy is simply established — "came up healthy" is what
+    /// `module_attached` already said.
+    pub fn observe(&mut self, module: &str, state: &'static str) -> Option<Transition> {
+        let t = self.modules.entry(module.to_string()).or_default();
+        if t.recorded == Some(state) || (t.recorded.is_none() && state == HEALTHY) {
+            t.recorded = Some(state);
+            t.candidate = None;
+            return None;
+        }
+        let seen = match t.candidate {
+            Some((s, n)) if s == state => n.saturating_add(1),
+            _ => 1,
+        };
+        if seen < TRANSITION_CONFIRM_POLLS {
+            t.candidate = Some((state, seen));
+            return None;
+        }
+        let from = t.recorded.replace(state);
+        t.candidate = None;
+        Some(Transition { from, to: state })
+    }
+}
+
+const HEALTHY: &str = "healthy";
+
+/// The label a health entry is tracked under. A check that could not
+/// run is its own state, not an unhealthy report (see [`ModuleEntry`]).
+fn state_label(e: &ModuleEntry) -> &'static str {
+    match e.report.as_ref().map(|r| r.overall) {
+        Some(HealthState::Healthy) => HEALTHY,
+        Some(HealthState::Degraded) => "degraded",
+        Some(HealthState::Unhealthy) => "unhealthy",
+        None => "unknown",
+    }
+}
+
+/// Why a module is not healthy, in one line: its failing subsystems and
+/// their messages, or the reason the check could not run.
+fn state_detail(e: &ModuleEntry) -> Option<String> {
+    if let Some(err) = &e.error {
+        return Some(format!("health check could not run: {err}"));
+    }
+    let parts: Vec<String> = e
+        .report
+        .as_ref()?
+        .subsystems
+        .iter()
+        .filter(|s| s.state != HealthState::Healthy)
+        .map(|s| match &s.message {
+            Some(m) => format!("{}: {m}", s.name),
+            None => s.name.clone(),
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+fn record_transitions<'a>(t: &mut Transitions, entries: impl Iterator<Item = &'a ModuleEntry>) {
+    use packetframe_common::events::{kind, Event, Level};
+    for e in entries {
+        let to = state_label(e);
+        let Some(tr) = t.observe(&e.module, to) else {
+            continue;
+        };
+        let level = match to {
+            HEALTHY => Level::Info,
+            "unhealthy" => Level::Error,
+            _ => Level::Warn,
+        };
+        let mut ev = Event::new(level, &e.module, kind::MODULE_HEALTH)
+            .field("from", tr.from.unwrap_or("none"))
+            .field("to", to);
+        if let Some(d) = state_detail(e) {
+            ev = ev.detail(d);
+        }
+        ev.emit();
     }
 }
 
@@ -259,6 +391,7 @@ pub fn publish(state_dir: &Path, modules: Vec<ModuleEntry>) -> Result<(), String
         boot_id: crate::daemon_presence::self_boot_id(),
         written_at: unix_now(),
         modules,
+        event_log: packetframe_common::events::status(),
     };
     let body = serde_json::to_vec_pretty(&snapshot).map_err(|e| format!("serialise: {e}"))?;
     std::fs::create_dir_all(state_dir).map_err(|e| format!("create state dir: {e}"))?;
@@ -423,8 +556,86 @@ mod tests {
             boot_id: None,
             written_at: unix_now() + 3600,
             modules: Vec::new(),
+            event_log: None,
         };
         assert!(age_seconds(&s).is_none());
+    }
+
+    #[test]
+    fn a_health_change_is_recorded_once_it_holds_for_two_polls() {
+        let mut t = Transitions::new();
+        // Came up healthy: established, not an event.
+        assert_eq!(t.observe("vpp-offload", "healthy"), None);
+        // One poll of degraded is a flicker.
+        assert_eq!(t.observe("vpp-offload", "degraded"), None);
+        assert_eq!(t.observe("vpp-offload", "healthy"), None);
+        // Two in a row is a transition, recorded once.
+        assert_eq!(t.observe("vpp-offload", "degraded"), None);
+        assert_eq!(
+            t.observe("vpp-offload", "degraded"),
+            Some(Transition {
+                from: Some("healthy"),
+                to: "degraded"
+            })
+        );
+        assert_eq!(t.observe("vpp-offload", "degraded"), None);
+        // A candidate that changes restarts the count.
+        assert_eq!(t.observe("vpp-offload", "unhealthy"), None);
+        assert_eq!(t.observe("vpp-offload", "healthy"), None);
+        assert_eq!(
+            t.observe("vpp-offload", "healthy"),
+            Some(Transition {
+                from: Some("degraded"),
+                to: "healthy"
+            })
+        );
+        // Modules are tracked independently; a first state that is not
+        // healthy is recorded from `none`.
+        assert_eq!(t.observe("fast-path", "unknown"), None);
+        assert_eq!(
+            t.observe("fast-path", "unknown"),
+            Some(Transition {
+                from: None,
+                to: "unknown"
+            })
+        );
+    }
+
+    #[test]
+    fn transition_detail_names_the_failing_subsystems() {
+        let e = ModuleEntry {
+            module: "fast-path".into(),
+            report: Some(HealthReport {
+                overall: HealthState::Degraded,
+                subsystems: vec![
+                    SubsystemHealth {
+                        name: "fib-programmer".into(),
+                        state: HealthState::Healthy,
+                        message: None,
+                        last_success_age_seconds: None,
+                    },
+                    SubsystemHealth {
+                        name: "bgp-listener".into(),
+                        state: HealthState::Degraded,
+                        message: Some("session down".into()),
+                        last_success_age_seconds: None,
+                    },
+                ],
+            }),
+            error: None,
+        };
+        assert_eq!(state_label(&e), "degraded");
+        assert_eq!(
+            state_detail(&e).as_deref(),
+            Some("bgp-listener: session down")
+        );
+        let failed = ModuleEntry {
+            module: "guard".into(),
+            report: None,
+            error: Some("map read failed".into()),
+        };
+        assert_eq!(state_label(&failed), "unknown");
+        assert!(state_detail(&failed).unwrap().contains("map read failed"));
     }
 
     use packetframe_common::module::{

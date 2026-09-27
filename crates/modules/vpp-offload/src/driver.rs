@@ -1002,6 +1002,17 @@ impl Driver {
                         to_state = ?self.sup.state(),
                         "supervisor ordered VPP teardown — the event is the cause"
                     );
+                    packetframe_common::events::Event::warn(
+                        crate::MODULE_NAME,
+                        packetframe_common::events::kind::VPP_TEARDOWN,
+                    )
+                    .field("cause", format!("{e:?}"))
+                    .field("from_state", format!("{prior:?}"))
+                    .field("to_state", format!("{:?}", self.sup.state()))
+                    .detail(
+                        "the supervisor ordered VPP torn down; `cause` is the event that did it",
+                    )
+                    .emit();
                 }
                 applied.push(e);
                 // Re-arm from the supervisor's own view after EVERY
