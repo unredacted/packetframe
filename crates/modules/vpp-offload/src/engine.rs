@@ -510,8 +510,8 @@ pub struct NeighbourCounters {
     /// `show ip neighbor-stats` `arp: tx:[reply:N]`. NOT `arp-reply`'s
     /// "ARP replies sent" error row: in v26.06 a request dropped before
     /// its error code is reassigned is booked under that same row, so it
-    /// over-counts by every such drop. `None` when that second read
-    /// failed or did not parse.
+    /// over-counts by every such drop. `None` until that read's tick
+    /// has come round, or when it failed or did not parse.
     pub arp_replies_sent: Option<u64>,
 }
 
@@ -848,9 +848,16 @@ pub struct ConvergenceEngine {
     /// Metrics only; nothing here feeds a forwarding or supervision
     /// decision.
     null_drops: Option<u64>,
-    /// VPP's glean and ARP-reply transmit counters from the same
-    /// sample, absent by the same rule. Metrics only.
+    /// VPP's glean counters from the same `show errors` sample, absent
+    /// by the same rule. `arp_replies_sent` inside it is always `None`
+    /// here; the accessor fills it from [`Self::arp_replies_sent`].
+    /// Metrics only.
     neighbour_counters: Option<NeighbourCounters>,
+    /// Transmitted ARP replies from `show ip neighbor-stats`, read on
+    /// the OTHER sample ticks (see [`Self::sample_error_counters`]).
+    arp_replies_sent: Option<u64>,
+    /// Which read the next [`Self::sample_error_counters`] call makes.
+    sample_neighbor_stats_next: bool,
 
     /// Advanced once per verify so each pass samples a different set.
     ///
@@ -923,6 +930,8 @@ impl ConvergenceEngine {
             test_dead_members: None,
             null_drops: None,
             neighbour_counters: None,
+            arp_replies_sent: None,
+            sample_neighbor_stats_next: false,
             verify_seed: 0,
         }
     }
@@ -1951,14 +1960,29 @@ impl ConvergenceEngine {
         self.null_drops
     }
 
-    /// The last sampled glean / ARP-reply counters, if any.
+    /// The last sampled glean / ARP-reply counters, if any. Present once
+    /// `show errors` has answered; `arp_replies_sent` inside it fills in
+    /// from the next tick's `show ip neighbor-stats`.
     pub fn neighbour_counters(&self) -> Option<NeighbourCounters> {
-        self.neighbour_counters
+        self.neighbour_counters.map(|c| NeighbourCounters {
+            arp_replies_sent: self.arp_replies_sent,
+            ..c
+        })
     }
 
-    /// Sample VPP's error counters: the null-node total and the glean
-    /// rows out of one `show errors`, then the real ARP-reply count out
-    /// of `show ip neighbor-stats`.
+    /// Sample VPP's error counters — exactly ONE `cli_inband` round trip
+    /// per call, alternating: `show errors` (the null-node total and the
+    /// glean rows) on one call, `show ip neighbor-stats` (the real
+    /// ARP-reply count) on the next.
+    ///
+    /// One read, never two, because this runs on the supervision thread
+    /// inside `Runtime::status()`, and each read may take the whole
+    /// socket deadline. Two back to back could cost twice that — enough
+    /// to exhaust the steering budget and have a valid reconfigure
+    /// withdrawn as timed out (review finding). Alternating keeps the
+    /// worst case this call adds to a tick at what the null-drop sample
+    /// alone cost; the runtime ticks it twice as often so each read
+    /// keeps its old cadence.
     ///
     /// Metrics only, so every failure degrades the gauges to absent and
     /// none escalates: a counter read must not be able to restart a
@@ -1966,66 +1990,49 @@ impl ConvergenceEngine {
     /// reply may be partly read, and every other path here refuses to
     /// leave a poisoned stream looking healthy to `api_ready`.
     pub fn sample_error_counters(&mut self) {
+        let neighbor_stats = self.sample_neighbor_stats_next;
+        self.sample_neighbor_stats_next = !neighbor_stats;
         self.arm_timeout();
         let Some(t) = self.transport.as_mut() else {
             self.null_drops = None;
             self.neighbour_counters = None;
+            self.arp_replies_sent = None;
             return;
         };
-        match t.request::<CliInband, CliInbandReply>(CliInband {
+        let cmd = if neighbor_stats {
+            "show ip neighbor-stats"
+        } else {
+            "show errors"
+        };
+        let reply = match t.request::<CliInband, CliInbandReply>(CliInband {
             context: 0,
-            cmd: "show errors".into(),
+            cmd: cmd.into(),
         }) {
-            Ok(r) if r.retval == 0 => {
-                self.null_drops = Some(parse_null_drops(&r.reply));
-                self.neighbour_counters = Some(parse_glean_counters(&r.reply));
-            }
+            Ok(r) if r.retval == 0 => Some(r.reply),
             Ok(r) => {
                 tracing::debug!(
                     retval = r.retval,
-                    "`show errors` refused; the null-drop and glean gauges go absent"
-                );
-                self.null_drops = None;
-                self.neighbour_counters = None;
-                return;
-            }
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "`show errors` failed; the null-drop and glean gauges go absent"
-                );
-                self.disconnect();
-                self.null_drops = None;
-                self.neighbour_counters = None;
-                return;
-            }
-        }
-        let Some(t) = self.transport.as_mut() else {
-            return;
-        };
-        let replies = match t.request::<CliInband, CliInbandReply>(CliInband {
-            context: 0,
-            cmd: "show ip neighbor-stats".into(),
-        }) {
-            Ok(r) if r.retval == 0 => parse_arp_replies_sent(&r.reply),
-            Ok(r) => {
-                tracing::debug!(
-                    retval = r.retval,
-                    "`show ip neighbor-stats` refused; the ARP-reply gauge goes absent"
+                    "`{cmd}` refused; the gauges it feeds go absent"
                 );
                 None
             }
             Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "`show ip neighbor-stats` failed; the ARP-reply gauge goes absent"
-                );
+                tracing::debug!(error = %e, "`{cmd}` failed; the error-counter gauges go absent");
                 self.disconnect();
-                None
+                // All of them, not just this read's: the runtime samples
+                // only while connected, so the other read's last value
+                // would otherwise sit there looking current.
+                self.null_drops = None;
+                self.neighbour_counters = None;
+                self.arp_replies_sent = None;
+                return;
             }
         };
-        if let Some(c) = self.neighbour_counters.as_mut() {
-            c.arp_replies_sent = replies;
+        if neighbor_stats {
+            self.arp_replies_sent = reply.as_deref().and_then(parse_arp_replies_sent);
+        } else {
+            self.null_drops = reply.as_deref().map(parse_null_drops);
+            self.neighbour_counters = reply.as_deref().map(parse_glean_counters);
         }
     }
 
@@ -2519,8 +2526,10 @@ impl ConvergenceEngine {
     /// VPP rate-limits glean itself (`arp_throttle` / `nd_throttle`): at
     /// most one request per (destination, interface) per millisecond per
     /// worker, the rest counted as `throttled`. A stream to a silent
-    /// address therefore gleans up to ~1000 times a second per worker —
-    /// far above the kernel's ~3/s — out the BVI, flooding every member
+    /// address therefore gleans up to ~1000 times a second PER WORKER —
+    /// the throttle state is per worker and RSS spreads one address's
+    /// flows across them, so ~workers x 1000/s in aggregate, far above
+    /// the kernel's ~3/s — out the BVI, flooding every member
     /// of that VLAN, and past the kernel-side `guard` policer, which
     /// only sees frames the kernel transmits. The counters are exported
     /// ([`NeighbourCounters`]); the runbook says what normal looks like.
@@ -3664,6 +3673,8 @@ impl ConvergenceEngine {
         // as "no new drops" across a restart that reset it to zero.
         self.null_drops = None;
         self.neighbour_counters = None;
+        self.arp_replies_sent = None;
+        self.sample_neighbor_stats_next = false;
         self.port_index = PortIndex::default();
         // The state file's recorded indices belong to the dead instance
         // too. Keeping them meant the replacement process was handed

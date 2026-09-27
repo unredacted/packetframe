@@ -2132,10 +2132,10 @@ fn null_drops_sample_over_cli_inband() {
     );
 }
 
-/// The glean and ARP-reply sample rides the same tick: glean rows out of
-/// the one `show errors`, the real reply count out of a second
-/// `show ip neighbor-stats` summed over interfaces — and all of it
-/// absent again once the process is gone.
+/// The glean and ARP-reply sample, one read per call: glean rows out of
+/// `show errors` on the first, the real reply count out of
+/// `show ip neighbor-stats` (summed over interfaces) on the next — and
+/// all of it absent again once the process is gone.
 #[test]
 fn glean_counters_sample_over_cli_inband() {
     let fake = Fake::start_behaving(
@@ -2159,19 +2159,99 @@ fn glean_counters_sample_over_cli_inband() {
     let mut e = engine_for(&fake);
     assert!(e.api_ready());
     assert_eq!(e.neighbour_counters(), None, "absent until sampled");
+    fake.drain_events();
     e.sample_error_counters();
+    assert_eq!(cli_commands(&fake), ["show errors"], "one read per call");
     let c = e.neighbour_counters().expect("sampled");
     assert_eq!(c.arp_requests_sent, 1380);
     assert_eq!(c.arp_requests_throttled, 97);
     assert_eq!(c.ns_sent, 4);
     assert_eq!(c.ns_throttled, 2);
     assert_eq!(
-        c.arp_replies_sent,
+        c.arp_replies_sent, None,
+        "not read yet: that is the next call"
+    );
+    e.sample_error_counters();
+    assert_eq!(
+        cli_commands(&fake),
+        ["show ip neighbor-stats"],
+        "one read per call"
+    );
+    assert_eq!(
+        e.neighbour_counters()
+            .expect("still sampled")
+            .arp_replies_sent,
         Some(3),
         "the transmit counter, not arp-reply's over-counting error row"
     );
+    assert_eq!(e.null_drops(), Some(0), "kept from the previous call");
     e.on_process_gone();
     assert_eq!(e.neighbour_counters(), None);
+}
+
+/// The `cli_inband` commands the fake received since the last drain.
+fn cli_commands(fake: &Fake) -> Vec<String> {
+    fake.drain_events()
+        .into_iter()
+        .filter_map(|ev| match ev {
+            Event::Msg(m) => m.strip_prefix("cli ").map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A slow read must not be followed by another in the same call: the
+/// sample runs on the supervision thread, and a second read after one
+/// that used the whole socket deadline would double what a tick can
+/// block the steering path (review finding). A stalled `show errors`
+/// costs exactly that one deadline and drops every error-counter gauge
+/// rather than leaving the other read's value looking current.
+#[test]
+fn a_stalled_error_read_is_not_followed_by_a_second_read() {
+    let fake = Fake::start_behaving(
+        "glean-stall",
+        Behaviour {
+            show_errors: "   Count            Node            Reason        Severity\n\
+                          1380            ip4-glean       ARP requests sent          info\n",
+            neighbor_stats: "  bvi100\n    arp: rx:[reply:0 request:0 gratuitous:0 ] \
+                             tx:[reply:3 request:0 gratuitous:0 ]\n",
+            // The third cli_inband: the first two calls answer, the
+            // third call's `show errors` never does.
+            stall_on: Some(("cli_inband", 2)),
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.sample_error_counters();
+    e.sample_error_counters();
+    assert_eq!(
+        e.neighbour_counters().and_then(|c| c.arp_replies_sent),
+        Some(3)
+    );
+    fake.drain_events();
+    e.sample_error_counters();
+    let events = fake.drain_events();
+    let reads = events
+        .iter()
+        // Counted by message name: the stalled request never reaches
+        // the handler that logs its command text.
+        .filter(|ev| matches!(ev, Event::Msg(m) if m == "cli_inband"))
+        .count();
+    assert_eq!(reads, 1, "one read, and nothing after it: {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Event::Msg(m) if m == "stalled on cli_inband")),
+        "{events:?}"
+    );
+    assert!(!e.is_connected(), "a timed-out stream is not reused");
+    assert_eq!(e.null_drops(), None);
+    assert_eq!(
+        e.neighbour_counters(),
+        None,
+        "the reply count from the last call must not survive as current"
+    );
 }
 
 /// B3 v2 through a BVI: an IX peer's neighbour and routes sit on the

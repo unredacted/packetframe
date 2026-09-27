@@ -145,7 +145,8 @@ It does NOT make VPP deaf or mute on ARP:
   between two MACs for the gateway").
 - **It sends ARP requests and neighbour solicitations (glean)** for
   unknown hosts inside a `local-route` / `local-route6` prefix, up to
-  ~1000/s per address, past the `guard` policer. See
+  ~1000/s per address PER WORKER (so ~workers × 1000/s for one silent
+  address in aggregate), past the `guard` policer. See
   [Glean and ARP counters](#glean-and-arp-counters).
 
 **Only IPv4 neighbours are programmed.** VPP carries v4 routes only (no
@@ -1108,8 +1109,9 @@ interface: at most one solicitation per millisecond per worker
 comparison, sends `mcast_solicit` (3) solicitations a second apart per
 resolution attempt. So a sustained stream to an
 address that never answers (a departed host, a typo, a scan) makes VPP
-solicit up to ~1000 times a second per worker toward that address's
-solicited-node group, and a scan across the `/64` solicits about once
+solicit up to ~1000 times a second per worker — roughly workers ×
+1000/s in aggregate, since that address's packets can land on every
+worker — toward its solicited-node group, and a scan across the `/64` solicits about once
 per scanned packet. On a switch without MLD snooping each one floods
 the VLAN. That is the price of delivering IPv6 in VPP at all, and it is
 not a stall risk: glean runs in VPP's data plane and never reaches the
@@ -1637,8 +1639,10 @@ in `guard`:
   vpp-offload (see local-route / local-route6 above).
 - **Rate.** VPP throttles glean per destination (and interface) per
   worker at 1 ms, compiled in with no knob: up to ~1000 requests a
-  second per silent address per worker, against the kernel's ~3 per
-  resolution. Requests past the throttle are counted `throttled`, not
+  second per silent address PER WORKER. The throttle is per worker, and
+  RSS spreads one address's flows across workers, so the aggregate
+  ceiling for one silent address is roughly workers × 1000/s — against
+  the kernel's ~3 per resolution. Requests past the throttle are counted `throttled`, not
   sent.
 - **The `guard` bypass.** `guard`'s `arp-ns-ratelimit` polices frames
   the kernel transmits (tc egress on the bridge). Glean leaves through
@@ -1650,9 +1654,13 @@ in `guard`:
   expected where glean runs; anywhere else, a step means something is
   asking for an address it should not know.
 
-Exported every 60 s from VPP's own counters (summed across workers),
-absent until the first sample and after any read trouble, the
-null-drop rule. All cumulative since VPP started; all informational —
+Exported from VPP's own counters (summed across workers), absent until
+the first sample and after any read trouble, the null-drop rule. The
+sampler makes one API read per 30 s tick, alternating `show errors`
+(null-drop and glean) with `show ip neighbor-stats` (replies), so each
+refreshes every 60 s and the reply gauge appears one tick after the
+glean ones; a tick never blocks the supervision loop longer than a
+single read. All cumulative since VPP started; all informational —
 no status condition reads them:
 
 | series | source |
@@ -1680,10 +1688,11 @@ prefix gleans about once per scanned address, so
 `rate(packetframe_vpp_glean_sent{family="ipv4"}[1m])` jumps from tens
 to hundreds or thousands per second while `throttled` stays flat — many
 distinct addresses, one request each. The other shape is a sustained
-flow to one departed or silent host: `sent` near ~1000/s per worker for
-that address and `throttled` climbing much faster, since every packet
-after the first in each millisecond is throttled. Either way each
-request is a broadcast on that VLAN's trunks. A `local-route6` `/64`
+flow to one departed or silent host: `sent` near ~1000/s for each
+worker that host's traffic lands on (up to workers × 1000/s) and
+`throttled` climbing much faster, since every packet after the first in
+each millisecond on each worker is throttled. Either way each request is
+a broadcast on every member port of that VLAN. A `local-route6` `/64`
 behaves the same way per scanned address, toward solicited-node groups.
 
 **When to worry.** A sustained rate in the hundreds per second or more

@@ -1905,7 +1905,7 @@ impl Runtime {
             let now = std::time::Instant::now();
             let due = c
                 .last_null_sample
-                .is_none_or(|t| now.duration_since(t) >= NULL_DROPS_EVERY);
+                .is_none_or(|t| now.duration_since(t) >= ERROR_COUNTERS_EVERY);
             if due && c.engine.is_connected() {
                 c.last_null_sample = Some(now);
                 c.engine.sample_error_counters();
@@ -2099,13 +2099,18 @@ impl Runtime {
 /// gone indefinitely.
 const STEER_AUDIT_EVERY: Duration = Duration::from_secs(30);
 
-/// How often to read VPP's error counters for the null-drop gauge.
+/// How often to take one error-counter read (null-drop, glean and
+/// ARP-reply gauges).
 ///
-/// One `cli_inband "show errors"` round trip on the API socket, which
-/// shares VPP's main thread with the route batches — 60 s keeps it
-/// invisible next to the liveness ping while still giving Prometheus a
-/// usable rate.
-const NULL_DROPS_EVERY: Duration = Duration::from_secs(60);
+/// Each tick is ONE `cli_inband` round trip on the API socket, which
+/// shares VPP's main thread with the route batches, alternating between
+/// `show errors` and `show ip neighbor-stats`
+/// ([`crate::engine::ConvergenceEngine::sample_error_counters`]). So a
+/// tick never blocks this thread longer than the single null-drop read
+/// did, and at 30 s each read keeps the 60 s cadence the null-drop
+/// gauge always had — invisible next to the liveness ping while still
+/// giving Prometheus a usable rate.
+const ERROR_COUNTERS_EVERY: Duration = Duration::from_secs(30);
 
 /// How often the bridge-FDB tripwire scans for hosts behind a port
 /// other than their `local-route` declaration. One netlink dump; a
