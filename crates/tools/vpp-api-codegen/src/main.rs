@@ -129,6 +129,22 @@ const MESSAGES: &[&str] = &[
     "sw_interface_add_del_address_reply",
     "sw_interface_set_unnumbered",
     "sw_interface_set_unnumbered_reply",
+    //   IPv6 on an egress interface (`v6 on` only). Unnumbered borrows
+    //   the loopback's v4 address and nothing else: a v6 route or static
+    //   neighbour on an interface without an `ip6_link` has no ip6
+    //   rewrite to leave by. Enabling it gives the interface only its
+    //   EUI-64 link-local — never a global address — and VPP answers a
+    //   re-enable with `VALUE_EXIST` (-81) while bumping a lock count, so
+    //   it is idempotent across adoptions (VPP v26.06 `ip6_link.c`).
+    "sw_interface_ip6_enable_disable",
+    "sw_interface_ip6_enable_disable_reply",
+    //   Router advertisements suppressed on every interface ip6 is
+    //   enabled on (`ip6_nd.api.json`). VPP 26.06 does not send them by
+    //   default (`ip6_ra_link_enable` leaves `send_radv` zero) — asserted
+    //   anyway, so a future default cannot make hosts on an IX or
+    //   service VLAN adopt VPP as a default router.
+    "sw_interface_ip6nd_ra_config",
+    "sw_interface_ip6nd_ra_config_reply",
     //   SECONDARY acceptance MACs. The member's PRIMARY MAC must stay
     //   its own PF address: on this NIC the primary is programmed into
     //   the VF's hardware filter, so setting it to the bridge's MAC
@@ -206,6 +222,7 @@ const FILES: &[&str] = &[
     "mfib_types",
     "vlib",
     "l2",
+    "ip6_nd",
 ];
 
 /// One field of a message or composite type.

@@ -27,9 +27,11 @@
 //!   that outlived a downgrade, or any other adopter, no longer matches.
 //! - *Nobody changed VPP's FIB since.* The record carries VPP's own
 //!   per-prefix-length route counts (`show ip fib summary`, O(1) per
-//!   length inside VPP), read at the stop, and the adoption re-reads
-//!   them before seeding. A `vppctl` edit, a second client, anything
-//!   that added or removed a route shows up as a count.
+//!   length inside VPP; under `v6 on` also `show ip6 fib summary`, which
+//!   VPP answers by walking its v6 table), read at the stop, and the
+//!   adoption re-reads them before seeding. A `vppctl` edit, a second
+//!   client, anything that added or removed a route shows up as a count.
+//!   Either summary unreadable means the record is not used.
 //! - *And the routes are really there, through those paths.* The
 //!   adoption's verify probes VPP against the seeded ledger with the
 //!   PATHS compared too ([`crate::verify::verify_paths`]); a
@@ -97,6 +99,15 @@ impl FibFingerprint {
     }
 
     /// Fold one `show ip[6] fib summary` output into the fingerprint.
+    ///
+    /// Both families' outputs are the same shape, checked against VPP
+    /// v26.06's source (`ip4_fib.c` / `ip6_fib.c`): a `%v`-formatted table
+    /// header naming the table (`ipv4-VRF:0` / `ipv6-VRF:0`, its
+    /// `ft_desc`), a `Prefix length  Count` title, then one row per
+    /// populated length — right-aligned `%20d%16d` for v4, centred
+    /// `%=20d%=16lld` for v6, which whitespace splitting reads alike. The
+    /// v6 command skips the per-interface link-local tables, so no
+    /// `IP6-link-local:` header appears to be misattributed.
     ///
     /// Tolerant of layout, strict about meaning: a table header is a
     /// line starting `ipv4-`/`ipv6-` (its name is everything before the
@@ -933,6 +944,85 @@ mod tests {
         );
         assert!(!LedgerRecord::path_in(&dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record of a dual-stack ledger — v6 prefixes through v6 next
+    /// hops, beside v4 — round-trips exactly, with both families'
+    /// fingerprints.
+    #[test]
+    fn a_dual_stack_record_round_trips() {
+        let dir = tmpdir("dual");
+        let v6nh = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1));
+        let mut r = record();
+        r.body.fingerprint = FibFingerprint {
+            counts: vec![
+                ("ipv4-VRF:0".into(), 24, 2),
+                ("ipv6-VRF:0".into(), 48, 1),
+                ("ipv6-VRF:0".into(), 128, 3),
+            ],
+        };
+        r.body
+            .path_sets
+            .push(vec![crate::fib_sync::installed_path_key(v6nh, 3)]);
+        let v6_set = (r.body.path_sets.len() - 1) as u32;
+        r.body.entries.push((
+            IpPrefix::V6 {
+                addr: [
+                    0x20, 0x01, 0x0d, 0xb8, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+                prefix_len: 48,
+            },
+            Some(v6_set),
+        ));
+        r.write(&dir).unwrap();
+        let back = LedgerRecord::take(&dir).unwrap().expect("the record");
+        assert_eq!(back, r);
+        let p = &back.body.path_sets[v6_set as usize][0];
+        assert_eq!(p.nexthop, v6nh);
+        assert_eq!(
+            p.proto,
+            crate::vpp_api::generated::FIB_API_PATH_NH_PROTO_IP6
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `show ip6 fib summary` exactly as VPP v26.06 prints it —
+    /// `ip6_fib_table_show`'s header, then `%=20s%=16s` and
+    /// `%=20d%=16lld` rows (centred, where v4's are right-aligned) — reads
+    /// into the same fingerprint shape as v4's.
+    #[test]
+    fn the_ip6_fib_summary_parses_in_vpps_own_layout() {
+        let row = |len: u32, n: u64| format!("{:^20}{:^16}\n", len, n);
+        let mut text = String::from(
+            "ipv6-VRF:0, fib_index:0, flow hash:[src dst sport dport proto flowlabel ] \
+             epoch:0 flags:none locks:[default-route:1, ]\n",
+        );
+        text.push_str(&format!("{:^20}{:^16}\n", "Prefix length", "Count"));
+        text.push_str(&row(128, 12));
+        text.push_str(&row(48, 251_000));
+        text.push_str(&row(10, 1));
+        text.push_str(&row(0, 1));
+        let mut fp = FibFingerprint::default();
+        assert_eq!(fp.absorb(&text), 4);
+        assert_eq!(
+            fp.counts,
+            vec![
+                ("ipv6-VRF:0".into(), 0, 1),
+                ("ipv6-VRF:0".into(), 10, 1),
+                ("ipv6-VRF:0".into(), 48, 251_000),
+                ("ipv6-VRF:0".into(), 128, 12),
+            ]
+        );
+        // Folded after a v4 summary, the two families stay apart.
+        let mut both = FibFingerprint::default();
+        both.absorb(
+            "ipv4-VRF:0, fib_index:0, flow hash:[] epoch:0 flags:none locks:[]\n\
+             \x20   Prefix length         Count\n\
+             \x20                 24               7\n",
+        );
+        both.absorb(&text);
+        assert_eq!(both.counts.len(), 5);
+        assert!(both.counts.contains(&("ipv4-VRF:0".into(), 24, 7)));
     }
 
     #[test]

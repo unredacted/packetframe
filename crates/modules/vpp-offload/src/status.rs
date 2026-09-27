@@ -66,6 +66,10 @@ pub const SUBSYS_FDB: &str = "fdb";
 pub const SUBSYS_EXEMPT_DRIFT: &str = "exempt-drift";
 /// Subsystem name for the cross-tier route feed.
 pub const SUBSYS_ROUTE_FEED: &str = "route-feed";
+/// The IPv6 table, present only under `v6 on`. Its own row because every
+/// count on `fib-synced` is IPv4's — the family steering diverts (see
+/// [`SinkCounts`]).
+pub const SUBSYS_FIB_V6: &str = "fib-v6";
 
 /// Liveness of the binary API, as observed from ping/pong timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -671,6 +675,7 @@ impl StatusSnapshot {
             self.steering_health(),
             self.ports_health(),
         ];
+        subsystems.extend(self.fib_v6_health());
         // Only present when the runtime actually failed to persist
         // something, so the subsystem list does not carry a permanent
         // "state-file: fine" row nobody reads.
@@ -859,6 +864,11 @@ impl StatusSnapshot {
             // outrank its own subsystems (rig, 2026-09-24: a drained
             // feed read Healthy on a verify 23 minutes old).
             && self.counts.installed > 0
+            // Under `v6 on`, an incomplete v6 table too: the operator
+            // asked for it, and the `fib-v6` row says Degraded for it —
+            // the same don't-outrank-the-subsystems rule. It gates no
+            // steering (see `SinkCounts`); this is honesty, not a gate.
+            && !self.counts.v6.is_some_and(|v| v.degraded())
             // Membership is all-or-nothing, so "no ports" is not a
             // vacuous pass — it means nothing was ever attached.
             && !self.ports.is_empty()
@@ -1293,6 +1303,80 @@ impl StatusSnapshot {
         }
     }
 
+    /// The `fib-v6` row, under `v6 on` only.
+    ///
+    /// Healthy while the v6 table is whole, Degraded with both counts
+    /// named when it is not — withheld (the v6 pool outgrew its budget)
+    /// and unresolvable (a v6 next hop VPP cannot reach) page differently,
+    /// as on the v4 row. Never Unhealthy: nothing v6 is steered, so
+    /// nothing is blackholed however incomplete the table. Verification's
+    /// v6 probes are in the verify summary (`VerifyOutcome::summary`),
+    /// logged with every verdict.
+    fn fib_v6_health(&self) -> Option<SubsystemHealth> {
+        let v6 = self.counts.v6?;
+        let (state, message) = if v6.degraded() {
+            // Every condition that holds, each named, because each has a
+            // different remedy; the counts that are zero stay out of the
+            // line so the one that matters is readable.
+            let mut parts = vec![format!("{} installed", v6.installed)];
+            for (n, what) in [
+                (v6.withheld, "withheld (v6 pool at capacity)"),
+                (v6.unresolvable, "unresolvable (next hop not on a VPP port)"),
+                (
+                    v6.rejected,
+                    "refused by VPP (parked; retried when the route next changes or \
+                     at the next resync)",
+                ),
+                (
+                    v6.link_local_refused,
+                    "left out because every next hop is link-local, whose interface \
+                     the route feed does not carry",
+                ),
+                (
+                    v6.verify_mismatches,
+                    "probe(s) VPP disagreed on at the last verify (the table differs from \
+                     the ledger; verify does not re-run in steady state)",
+                ),
+                (
+                    v6.dark_egress,
+                    "member interface(s) carrying v6 adjacencies with no link",
+                ),
+            ] {
+                if n > 0 {
+                    parts.push(format!("{n} {what}"));
+                }
+            }
+            (
+                HealthState::Degraded,
+                format!(
+                    "IPv6 in VPP is impaired: {}. No IPv6 is steered, so nothing is dropped; \
+                     the IPv4 table and its steering are unaffected",
+                    parts.join(", ")
+                ),
+            )
+        } else if v6.installed == 0 {
+            (
+                HealthState::Healthy,
+                format!(
+                    "v6 on, no IPv6 routes in VPP yet ({} in flight); nothing IPv6 is \
+                     steered",
+                    v6.installing
+                ),
+            )
+        } else {
+            (
+                HealthState::Healthy,
+                format!("{} IPv6 routes loaded in VPP, not steered", v6.installed),
+            )
+        };
+        Some(SubsystemHealth {
+            name: SUBSYS_FIB_V6.into(),
+            state,
+            message: Some(message),
+            last_success_age_seconds: None,
+        })
+    }
+
     fn steering_health(&self) -> SubsystemHealth {
         // Checked before the steered arm: "steered" is a fact about
         // what we asked for, and this is a fact about what the NIC
@@ -1558,12 +1642,17 @@ impl StatusSnapshot {
             // the NIC, and only `ethtool -n` said traffic was diverted.
             (true, _) => (
                 HealthState::Healthy,
-                Some(
+                Some(if self.counts.v6.is_some() {
+                    "steered — MCAM rules are diverting allowlisted IPv4 traffic to VPP \
+                     (IPv6 routes are loaded in VPP by `v6 on`, but no IPv6 is steered: it \
+                     stays on the eBPF tier); `ethtool -n <iface>` lists the rules"
+                        .into()
+                } else {
                     "steered — MCAM rules are diverting allowlisted IPv4 traffic to VPP \
                      (IPv6 stays on the eBPF tier: this NIC cannot steer it); \
                      `ethtool -n <iface>` lists the rules"
-                        .into(),
-                ),
+                        .into()
+                }),
             ),
             // Intended but absent: a failed steer, or steering torn down
             // by trouble and not yet restored.
@@ -1890,6 +1979,59 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
             out,
             "packetframe_vpp_routes{{module=\"{module}\",state=\"{label}\"}} {value}"
         );
+    }
+
+    // Per family, under `v6 on` only — so a `v6 off` box's metrics are
+    // exactly what they were, and `packetframe_vpp_routes` above keeps
+    // meaning IPv4 for every dashboard built on it. Both families are
+    // emitted here, so a panel can sum or split by `family` without
+    // mixing gauge names.
+    if let Some(v6) = c.v6 {
+        gauge(
+            &mut out,
+            "packetframe_vpp_family_routes",
+            "route-ledger entries per address family and state (v6 on only)",
+        );
+        for (family, f) in [
+            (
+                "ipv4",
+                crate::sink::FamilyCounts {
+                    installed: c.installed,
+                    installing: c.installing,
+                    withheld: c.withheld,
+                    unresolvable: c.unresolvable,
+                    ..Default::default()
+                },
+            ),
+            ("ipv6", v6),
+        ] {
+            // The non-gating family's extra states (see `FamilyCounts`)
+            // exist only for it; IPv4's refusals are requeued, not parked.
+            let extra: &[(&str, u64)] = if family == "ipv6" {
+                &[
+                    ("rejected", f.rejected),
+                    ("link_local_refused", f.link_local_refused),
+                    ("verify_mismatch", f.verify_mismatches),
+                    ("dark_egress", f.dark_egress),
+                ]
+            } else {
+                &[]
+            };
+            for &(label, value) in [
+                ("installed", f.installed),
+                ("installing", f.installing),
+                ("withheld", f.withheld),
+                ("unresolvable", f.unresolvable),
+            ]
+            .iter()
+            .chain(extra)
+            {
+                let _ = writeln!(
+                    out,
+                    "packetframe_vpp_family_routes{{module=\"{module}\",family=\"{family}\",state=\"{label}\"}} {value}"
+                );
+            }
+        }
     }
 
     if let Some(n) = snap.null_drops {
@@ -4101,6 +4243,146 @@ mod tests {
         // The boolean is still emitted — "not verified" is a fact worth
         // scraping.
         assert!(m.contains("packetframe_vpp_fib_verified{module=\"vpp-offload\"} 0"));
+    }
+
+    /// `v6 off` renders exactly what it always did — no `fib-v6` row, no
+    /// family gauge, the old steering line — and `v6 on` adds a row and a
+    /// per-family gauge that say v6 is loaded and NOT steered, while every
+    /// v4 surface keeps meaning v4. An incomplete v6 table degrades its
+    /// own row and the overall, and never reads as steered-but-broken.
+    #[test]
+    fn v6_is_reported_on_its_own_surfaces_and_only_under_v6_on() {
+        let steered = |counts: SinkCounts| {
+            StatusSnapshot::observe(
+                &steered_supervisor(),
+                counts,
+                &PendingMap::new(),
+                ApiHealth::Answering {
+                    silent_for: Duration::from_millis(1),
+                },
+                verified(1),
+                ports_up(),
+                true,
+            )
+        };
+        let steering_line = |s: &StatusSnapshot| {
+            s.report()
+                .subsystems
+                .iter()
+                .find(|x| x.name == SUBSYS_STEERING)
+                .and_then(|x| x.message.clone())
+                .unwrap_or_default()
+        };
+        let v4 = ledger_with(5, 0, 0).counts();
+
+        let off = steered(v4);
+        let r = off.report();
+        assert!(!r.subsystems.iter().any(|x| x.name == SUBSYS_FIB_V6));
+        assert_eq!(r.overall, HealthState::Healthy);
+        let m = render_metrics(&off, "vpp-offload");
+        assert!(!m.contains("packetframe_vpp_family_routes"), "{m}");
+        assert!(steering_line(&off).contains("this NIC cannot steer it"));
+
+        let mut on = v4;
+        on.v6 = Some(crate::sink::FamilyCounts {
+            installed: 250,
+            ..Default::default()
+        });
+        let s = steered(on);
+        let r = s.report();
+        let row = r
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_FIB_V6)
+            .expect("row");
+        assert_eq!(row.state, HealthState::Healthy);
+        let msg = row.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("250 IPv6 routes") && msg.contains("not steered"),
+            "{msg}"
+        );
+        assert_eq!(r.overall, HealthState::Healthy);
+        let line = steering_line(&s);
+        assert!(line.contains("no IPv6 is steered"), "{line}");
+        assert!(!line.contains("cannot steer"), "{line}");
+        let m = render_metrics(&s, "vpp-offload");
+        for want in [
+            "packetframe_vpp_routes{module=\"vpp-offload\",state=\"installed\"} 5",
+            "packetframe_vpp_family_routes{module=\"vpp-offload\",family=\"ipv4\",state=\"installed\"} 5",
+            "packetframe_vpp_family_routes{module=\"vpp-offload\",family=\"ipv6\",state=\"installed\"} 250",
+        ] {
+            assert!(m.contains(want), "missing {want}: {m}");
+        }
+
+        let mut holes = on;
+        holes.v6 = Some(crate::sink::FamilyCounts {
+            installed: 200,
+            withheld: 7,
+            unresolvable: 3,
+            ..Default::default()
+        });
+        let s = steered(holes);
+        let r = s.report();
+        let row = r
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_FIB_V6)
+            .expect("row");
+        assert_eq!(row.state, HealthState::Degraded);
+        let msg = row.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("7 withheld") && msg.contains("3 unresolvable"),
+            "{msg}"
+        );
+        assert_eq!(
+            r.overall,
+            HealthState::Degraded,
+            "not Unhealthy: nothing v6 is steered"
+        );
+        let fib = r.subsystems.iter().find(|x| x.name == SUBSYS_FIB).unwrap();
+        assert_eq!(fib.state, HealthState::Healthy, "the v4 row is v4's");
+
+        // A complete v6 table VPP disagrees with, a refused route, a
+        // link-local refusal and a dark v6 egress: each named, each
+        // Degraded on `fib-v6` alone.
+        let mut odd = on;
+        odd.v6 = Some(crate::sink::FamilyCounts {
+            installed: 250,
+            rejected: 1,
+            link_local_refused: 2,
+            verify_mismatches: 3,
+            dark_egress: 1,
+            ..Default::default()
+        });
+        let s = steered(odd);
+        let r = s.report();
+        let row = r
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_FIB_V6)
+            .expect("row");
+        assert_eq!(row.state, HealthState::Degraded);
+        let msg = row.message.as_deref().unwrap_or("");
+        for want in [
+            "1 refused by VPP",
+            "2 left out because every next hop is link-local",
+            "3 probe(s) VPP disagreed",
+            "1 member interface(s)",
+        ] {
+            assert!(msg.contains(want), "missing {want}: {msg}");
+        }
+        assert!(!msg.contains("withheld"), "zero counts stay out: {msg}");
+        assert_eq!(r.overall, HealthState::Degraded);
+        let fib = r.subsystems.iter().find(|x| x.name == SUBSYS_FIB).unwrap();
+        assert_eq!(fib.state, HealthState::Healthy);
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(
+            m.contains(
+                "packetframe_vpp_family_routes{module=\"vpp-offload\",family=\"ipv6\",state=\"verify_mismatch\"} 3"
+            ),
+            "{m}"
+        );
+        assert!(!m.contains("family=\"ipv4\",state=\"rejected\""), "{m}");
     }
 
     /// The exemption tripwire: quiet = no row, firing = Degraded with

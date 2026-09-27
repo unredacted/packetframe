@@ -151,6 +151,17 @@ pub enum RouteState {
 /// a full-table load runs ~1.3M classifications, so an O(n) recount per
 /// route would be quadratic — on the order of 10^12 state visits before
 /// steering could be enabled.
+///
+/// **The top-level counts are IPv4's**, and every gate and gauge that
+/// reads them — the first-steer refusal, verify's pass criteria, the
+/// empty-table alarms, `packetframe_vpp_routes` — means IPv4 by them.
+/// That is not an accident of history: steering diverts IPv4 and nothing
+/// else, so what decides whether traffic may be diverted is whether the
+/// v4 table is whole. A v6 route withheld or unresolvable says nothing
+/// about a steered v4 packet, and letting it block a v4 steer would make
+/// `v6 on` — rung 0, which steers no v6 at all — a way to take v4 off
+/// VPP. IPv6 is counted beside it in [`Self::v6`], reported on its own
+/// rows and gauges, and gates only what diverts v6 (nothing, yet).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SinkCounts {
     pub installed: u64,
@@ -162,6 +173,60 @@ pub struct SinkCounts {
     /// never enter it — the engine fills it in
     /// ([`crate::engine::ConvergenceEngine::unexempted_local`]).
     pub unexempted_local: u64,
+    /// IPv6's counts, when VPP carries the family (`v6 on`); `None`
+    /// under [`crate::fib_sync::FamilyPolicy::V4Only`], which is how
+    /// every surface tells "v6 is not loaded" from "v6 is loaded and
+    /// empty". The ledger does not know the policy, so it reports `None`
+    /// and the engine fills this in
+    /// ([`crate::engine::ConvergenceEngine::counts`]).
+    pub v6: Option<FamilyCounts>,
+}
+
+/// One address family's route-ledger totals. See [`SinkCounts`].
+///
+/// The first four are the ledger's. The rest are conditions only a
+/// NON-GATING family has — IPv6 under `v6 on`, which every surface
+/// reports and nothing lets block, stall or tear down IPv4 — so the
+/// ledger leaves them zero and the engine fills them in
+/// ([`crate::engine::ConvergenceEngine::counts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FamilyCounts {
+    pub installed: u64,
+    pub installing: u64,
+    pub withheld: u64,
+    pub unresolvable: u64,
+    /// Ops VPP refused (a non-zero `ip_route_add_del` retval), parked out
+    /// of the active queue ([`PendingMap::reject`]) rather than retried
+    /// on every drain — a retry loop that kept the drain from ever going
+    /// idle would hold IPv4's convergence hostage.
+    pub rejected: u64,
+    /// Routes left out of VPP because every next hop is link-local, whose
+    /// interface scope the route feed does not carry
+    /// ([`crate::engine::ConvergenceEngine`]'s link-local refusal).
+    pub link_local_refused: u64,
+    /// Probes of this family the last verify found VPP disagreeing on —
+    /// retained here because the family cannot fail the pass, so
+    /// nothing else would keep it.
+    pub verify_mismatches: u64,
+    /// Member interfaces that cannot forward and that this family's
+    /// adjacencies use. Reported here and nowhere that gates: IPv4's link
+    /// gate counts only interfaces IPv4 routes use.
+    pub dark_egress: u64,
+}
+
+impl FamilyCounts {
+    /// Whether this family's table is incomplete or disagrees with VPP —
+    /// the per-family twin of [`SinkCounts::degraded`], wider because a
+    /// non-gating family has more ways to be impaired without blocking
+    /// anything.
+    pub fn degraded(&self) -> bool {
+        self.unresolvable > 0
+            || self.withheld > 0
+            || self.rejected > 0
+            || self.link_local_refused > 0
+            || self.verify_mismatches > 0
+            || self.dark_egress > 0
+    }
 }
 
 impl SinkCounts {
@@ -216,6 +281,12 @@ impl SinkCounts {
     pub fn degraded(&self) -> bool {
         self.unresolvable > 0 || self.withheld > 0
     }
+
+    /// Routes VPP holds in every family it carries: the size of the table
+    /// a convergence moves, for budgets — never a gate (see the type docs).
+    pub fn installed_all(&self) -> u64 {
+        self.installed + self.v6.map_or(0, |v| v.installed)
+    }
 }
 
 /// Capacity policy. The high-water mark is derived from the **measured**
@@ -225,25 +296,58 @@ impl SinkCounts {
 /// sink withholds rather than installing, so DFZ growth (~100k
 /// routes/yr) degrades to "table-incomplete + alarming" instead of a
 /// heap-exhaustion crash loop.
+///
+/// **One pool per address family.** VPP's segments are sized additively
+/// — the v4 table from `expected-routes`, the v6 table from its own
+/// budget on top (`startup_conf::derive_sizing`) — and the ledger
+/// enforces the same split: a v6 route can only ever take a v6 slot. A
+/// shared pool would let the ~250k-route v6 table, loaded first by
+/// nothing more than key order, withhold v4 routes that steered traffic
+/// depends on, which is the one degradation `v6 on` must never cause.
+/// Under `V4Only` the v6 pool is never touched.
 #[derive(Debug, Clone, Copy)]
 pub struct Capacity {
     high_water_routes: u64,
+    high_water_v6: u64,
 }
 
 impl Capacity {
+    /// The same mark for each family's own pool. For callers that size
+    /// one family (every `V4Only` path) or do not care how the split
+    /// falls (fixtures); bring-up states both with [`Self::per_family`].
     pub fn new(high_water_routes: u64) -> Self {
-        Self { high_water_routes }
+        Self::per_family(high_water_routes, high_water_routes)
     }
 
-    /// The high-water route count this policy enforces. Exposed for the
-    /// pre-dump deferral floor, which needs a table-scale number at a
-    /// moment when the adopted table itself cannot yet be read.
+    /// Separate marks for the v4 and v6 pools.
+    pub fn per_family(v4: u64, v6: u64) -> Self {
+        Self {
+            high_water_routes: v4,
+            high_water_v6: v6,
+        }
+    }
+
+    /// The IPv4 high-water route count this policy enforces. Exposed for
+    /// the pre-dump deferral floor, which needs a table-scale number at a
+    /// moment when the adopted table itself cannot yet be read — and
+    /// which is compared against the v4-sized `expected-routes` contract,
+    /// so it stays v4's.
     pub fn high_water(&self) -> u64 {
         self.high_water_routes
     }
 
-    fn has_headroom(&self, installed: u64) -> bool {
-        installed < self.high_water_routes
+    /// The IPv6 pool's mark.
+    pub fn high_water_v6(&self) -> u64 {
+        self.high_water_v6
+    }
+
+    fn has_headroom(&self, v6: bool, occupied: u64) -> bool {
+        occupied
+            < if v6 {
+                self.high_water_v6
+            } else {
+                self.high_water_routes
+            }
     }
 }
 
@@ -572,6 +676,8 @@ pub struct PendingMap {
     /// returns" is unimplementable — the route stays missing until an
     /// unrelated source event happens to touch the same prefix.
     withheld: BTreeMap<PrefixKey, PendingOp>,
+    /// IPv6 ops VPP refused, parked out of `ops` ([`Self::reject`]).
+    rejected: BTreeMap<PrefixKey, PendingOp>,
 }
 
 impl PendingMap {
@@ -611,16 +717,72 @@ impl PendingMap {
         n
     }
 
+    /// Release only one family's parked ops — `v6` or v4 — for a caller
+    /// that has observed headroom return in THAT family's pool.
+    ///
+    /// The drainer releases after every drain that ends with headroom,
+    /// and with one pool per family ([`Capacity`]) headroom is a
+    /// per-family fact. Releasing everything on any headroom would spin
+    /// whenever one family sits at its mark while the other does not:
+    /// every drain re-classifying the full family's parked ops, only to
+    /// park them again. A range split rather than a filter, so a family
+    /// at its mark costs nothing per drain however much of it is parked
+    /// ([`PrefixKey`] orders every v4 key before every v6 one).
+    pub fn release_withheld_family(&mut self, v6: bool) -> usize {
+        let first_v6 = PrefixKey {
+            family: 6,
+            addr: [0; 16],
+            len: 0,
+        };
+        let v6_part = self.withheld.split_off(&first_v6);
+        let released = if v6 {
+            v6_part
+        } else {
+            std::mem::replace(&mut self.withheld, v6_part)
+        };
+        let n = released.len();
+        for (k, op) in released {
+            self.ops.entry(k).or_insert(op);
+        }
+        n
+    }
+
     /// Record an install/replace. Overwrites any pending op for this
     /// prefix, including a pending withdrawal (the newer intent wins).
     pub fn upsert(&mut self, prefix: IpPrefix, nexthops: Vec<IpAddr>) {
-        self.ops
-            .insert(prefix.into(), PendingOp::Upsert { nexthops });
+        let k = PrefixKey::from(prefix);
+        // A newer intent supersedes a refused one outright, and is the
+        // retry: it goes back through the drain like any other op.
+        self.rejected.remove(&k);
+        self.ops.insert(k, PendingOp::Upsert { nexthops });
     }
 
     /// Record a withdrawal, overwriting any pending upsert.
     pub fn withdraw(&mut self, prefix: IpPrefix) {
-        self.ops.insert(prefix.into(), PendingOp::Withdraw);
+        let k = PrefixKey::from(prefix);
+        self.rejected.remove(&k);
+        self.ops.insert(k, PendingOp::Withdraw);
+    }
+
+    /// Park an IPv6 op VPP refused, out of the active map.
+    ///
+    /// IPv4's refusals are requeued, so a transient cause resolves on the
+    /// next drain — and a permanent one keeps the drain busy, which is
+    /// right for the family steering depends on: its table is not
+    /// complete, and "not idle" is how that holds a first steer back.
+    /// IPv6 gates nothing, so the same requeue would make one refused v6
+    /// route keep the drain from ever reporting idle, and with it hold
+    /// back `SyncComplete`, verify and every IPv4 steer. Parked here it is
+    /// counted ([`FamilyCounts::rejected`]) and retried when anything
+    /// newer arrives for the prefix — a source update, or the next resync,
+    /// which re-queues every route VPP is not recorded holding.
+    pub fn reject(&mut self, prefix: IpPrefix, op: PendingOp) {
+        self.rejected.insert(prefix.into(), op);
+    }
+
+    /// How many refused ops are parked.
+    pub fn rejected_len(&self) -> usize {
+        self.rejected.len()
     }
 
     /// Take up to `max` pending ops in key order, removing them from the
@@ -650,6 +812,9 @@ impl PendingMap {
     /// lifecycle, and the resync releases them separately.
     pub fn retain(&mut self, keep: impl Fn(&IpPrefix) -> bool) {
         self.ops.retain(|k, _| keep(&IpPrefix::from(*k)));
+        // Refused ops too: one for a prefix the source has since dropped
+        // is owed nothing, and left parked would keep counting.
+        self.rejected.retain(|k, _| keep(&IpPrefix::from(*k)));
     }
 
     /// Re-queue an op the transport could not apply — but only if the
@@ -671,6 +836,7 @@ impl PendingMap {
         let k = PrefixKey::from(prefix);
         self.ops.remove(&k);
         self.withheld.remove(&k);
+        self.rejected.remove(&k);
     }
 }
 
@@ -810,9 +976,18 @@ struct Slot {
 #[derive(Debug)]
 pub struct RouteLedger {
     state: BTreeMap<PrefixKey, Slot>,
+    /// IPv4's totals (the top-level fields; `v6` stays `None` here).
     counts: SinkCounts,
+    /// IPv6's, kept apart for the same reason [`SinkCounts`] reports them
+    /// apart, and so each family's pool is judged against its own
+    /// occupancy ([`Capacity`]).
+    v6: FamilyCounts,
     capacity: Capacity,
     paths: PathSets,
+    /// How many IPv4 prefixes are recorded holding each path set — so
+    /// the IPv4 link gate can ask which next hops IPv4 routes actually
+    /// use ([`Self::v4_nexthops`]) without walking a million routes.
+    v4_via_refs: std::collections::HashMap<PathSetId, u64>,
 }
 
 impl RouteLedger {
@@ -820,8 +995,10 @@ impl RouteLedger {
         Self {
             state: BTreeMap::new(),
             counts: SinkCounts::default(),
+            v6: FamilyCounts::default(),
             capacity,
             paths: PathSets::default(),
+            v4_via_refs: std::collections::HashMap::new(),
         }
     }
 
@@ -867,9 +1044,16 @@ impl RouteLedger {
             .map(|(k, s)| ((*k).into(), (s.via != UNKNOWN_PATHS).then_some(s.via)))
     }
 
-    /// O(1) — see the type docs.
+    /// IPv4's totals, O(1) — see the type docs. `v6` is `None`: the
+    /// ledger does not know whether the family is carried, so the engine
+    /// fills it in from [`Self::v6_counts`].
     pub fn counts(&self) -> SinkCounts {
         self.counts
+    }
+
+    /// IPv6's totals, O(1).
+    pub fn v6_counts(&self) -> FamilyCounts {
+        self.v6
     }
 
     /// The capacity policy this ledger enforces.
@@ -884,12 +1068,24 @@ impl RouteLedger {
         self.capacity
     }
 
-    fn tally(counts: &mut SinkCounts, st: RouteState, add: bool) {
-        let slot = match st {
-            RouteState::Installed => &mut counts.installed,
-            RouteState::Installing { .. } => &mut counts.installing,
-            RouteState::NotInstalled(NotInstalled::Withheld) => &mut counts.withheld,
-            RouteState::NotInstalled(NotInstalled::Unresolvable) => &mut counts.unresolvable,
+    fn tally(
+        counts: &mut SinkCounts,
+        v6: &mut FamilyCounts,
+        key: &PrefixKey,
+        st: RouteState,
+        add: bool,
+    ) {
+        let slot = match (key.family == 6, st) {
+            (false, RouteState::Installed) => &mut counts.installed,
+            (false, RouteState::Installing { .. }) => &mut counts.installing,
+            (false, RouteState::NotInstalled(NotInstalled::Withheld)) => &mut counts.withheld,
+            (false, RouteState::NotInstalled(NotInstalled::Unresolvable)) => {
+                &mut counts.unresolvable
+            }
+            (true, RouteState::Installed) => &mut v6.installed,
+            (true, RouteState::Installing { .. }) => &mut v6.installing,
+            (true, RouteState::NotInstalled(NotInstalled::Withheld)) => &mut v6.withheld,
+            (true, RouteState::NotInstalled(NotInstalled::Unresolvable)) => &mut v6.unresolvable,
         };
         // Only ever decrements a state just read out of the map, so it
         // cannot underflow; debug_assert makes a future refactor that
@@ -914,9 +1110,11 @@ impl RouteLedger {
             None => UNKNOWN_PATHS,
         };
         if let Some(old) = self.state.insert(key, Slot { state: st, via }) {
-            Self::tally(&mut self.counts, old.state, false);
+            Self::tally(&mut self.counts, &mut self.v6, &key, old.state, false);
+            self.via_ref(&key, old.via, false);
         }
-        Self::tally(&mut self.counts, st, true);
+        Self::tally(&mut self.counts, &mut self.v6, &key, st, true);
+        self.via_ref(&key, via, true);
     }
 
     fn set_state(&mut self, key: PrefixKey, st: RouteState) {
@@ -932,21 +1130,57 @@ impl RouteLedger {
 
     fn clear_state(&mut self, key: PrefixKey) -> Option<RouteState> {
         let old = self.state.remove(&key)?;
-        Self::tally(&mut self.counts, old.state, false);
+        Self::tally(&mut self.counts, &mut self.v6, &key, old.state, false);
+        self.via_ref(&key, old.via, false);
         Some(old.state)
     }
 
-    /// Capacity slots in use: installed plus in-flight. Counting
-    /// in-flight routes is what stops a single drained batch from
-    /// oversubscribing the table before any of it is acknowledged.
-    fn occupied(&self) -> u64 {
-        self.counts.installed + self.counts.installing
+    /// Keep [`Self::v4_via_refs`] in step with one v4 slot's recorded
+    /// paths. A known path set is recorded only while VPP holds a live
+    /// version (see `set_state`), so counting known ids counts live routes.
+    fn via_ref(&mut self, key: &PrefixKey, via: PathSetId, add: bool) {
+        if key.family != 4 || via == UNKNOWN_PATHS {
+            return;
+        }
+        if add {
+            *self.v4_via_refs.entry(via).or_default() += 1;
+        } else if let Some(n) = self.v4_via_refs.get_mut(&via) {
+            *n -= 1;
+            if *n == 0 {
+                self.v4_via_refs.remove(&via);
+            }
+        }
     }
 
-    /// Whether another route would fit under the high-water mark.
-    /// Drives the release of parked (withheld) ops.
-    pub fn has_headroom(&self) -> bool {
-        self.capacity.has_headroom(self.occupied())
+    /// Every next hop an IPv4 route is recorded installed through. Routes
+    /// whose paths were never observed (a dump adoption not yet re-sent)
+    /// contribute nothing; see the link gate for why that is safe.
+    pub fn v4_nexthops(&self) -> std::collections::HashSet<IpAddr> {
+        self.v4_via_refs
+            .keys()
+            .filter_map(|id| self.paths.get(*id))
+            .flatten()
+            .map(|p| p.nexthop)
+            .collect()
+    }
+
+    /// Capacity slots in use in one family's pool: installed plus
+    /// in-flight. Counting in-flight routes is what stops a single
+    /// drained batch from oversubscribing the table before any of it is
+    /// acknowledged.
+    fn occupied(&self, v6: bool) -> u64 {
+        if v6 {
+            self.v6.installed + self.v6.installing
+        } else {
+            self.counts.installed + self.counts.installing
+        }
+    }
+
+    /// Whether another route of the family (`v6`, or v4) would fit under
+    /// that family's high-water mark. Drives the release of parked
+    /// (withheld) ops, per family ([`PendingMap::release_withheld_family`]).
+    pub fn has_headroom(&self, v6: bool) -> bool {
+        self.capacity.has_headroom(v6, self.occupied(v6))
     }
 
     /// Decide the outcome of an upsert and reserve a slot for it.
@@ -997,7 +1231,10 @@ impl RouteLedger {
             Some(RouteState::Installing { replacing: false }) => {
                 RouteState::Installing { replacing: false }
             }
-            _ if self.capacity.has_headroom(self.occupied()) => {
+            _ if self
+                .capacity
+                .has_headroom(key.family == 6, self.occupied(key.family == 6)) =>
+            {
                 RouteState::Installing { replacing: false }
             }
             _ => RouteState::NotInstalled(NotInstalled::Withheld),
@@ -1137,12 +1374,13 @@ impl RouteLedger {
     /// Recompute counts by scanning. Test-only cross-check against the
     /// incrementally maintained figures.
     #[cfg(test)]
-    fn counts_by_scan(&self) -> SinkCounts {
+    fn counts_by_scan(&self) -> (SinkCounts, FamilyCounts) {
         let mut c = SinkCounts::default();
-        for s in self.state.values() {
-            Self::tally(&mut c, s.state, true);
+        let mut v6 = FamilyCounts::default();
+        for (k, s) in &self.state {
+            Self::tally(&mut c, &mut v6, k, s.state, true);
         }
-        c
+        (c, v6)
     }
 }
 
@@ -1656,7 +1894,7 @@ mod tests {
             }
         }
         assert_eq!(
-            led.counts(),
+            (led.counts(), led.v6_counts()),
             led.counts_by_scan(),
             "incremental counters drifted from the ledger contents"
         );
@@ -1731,6 +1969,83 @@ mod tests {
             canonical_paths(vec![y.clone(), x.clone(), y.clone()]),
             canonical_paths(vec![x, y])
         );
+    }
+
+    fn v6p(i: u8) -> IpPrefix {
+        IpPrefix::V6 {
+            addr: [0x20, 0x01, 0x0d, 0xb8, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            prefix_len: 32,
+        }
+    }
+
+    /// Each family fills its own pool: a v6 table at its mark leaves every
+    /// v4 slot free, and the v4 counts — the ones every steering gate
+    /// reads — never see a v6 route.
+    #[test]
+    fn a_full_v6_pool_leaves_v4_its_own() {
+        let mut led = RouteLedger::new(Capacity::per_family(2, 3));
+        for i in 0..5 {
+            led.classify_resolved(v6p(i), 1);
+            led.commit_installed(v6p(i));
+        }
+        let v6 = led.v6_counts();
+        assert_eq!((v6.installed, v6.withheld), (3, 2));
+        assert_eq!(led.counts(), SinkCounts::default(), "v4 saw nothing");
+        assert!(!led.has_headroom(true));
+        assert!(led.has_headroom(false));
+        for i in 0..3u8 {
+            led.classify_resolved(v4(10, i, 0, 0, 24), 1);
+            led.commit_installed(v4(10, i, 0, 0, 24));
+        }
+        let c = led.counts();
+        assert_eq!((c.installed, c.withheld), (2, 1), "v4 stops at ITS mark");
+        assert_eq!(led.v6_counts(), v6, "and v6 is untouched by it");
+        assert_eq!((led.counts(), led.v6_counts()), led.counts_by_scan());
+    }
+
+    /// The v4 next-hop index the IPv4 link gate reads follows exactly the
+    /// paths v4 routes are recorded holding — replaced, forgotten, and
+    /// never a v6 route's.
+    #[test]
+    fn v4_nexthops_follow_the_recorded_v4_paths() {
+        let mut led = RouteLedger::new(Capacity::new(100));
+        let v6nh = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let a = led.intern_paths(&[pk(1, 3)]);
+        let b = led.intern_paths(&[crate::fib_sync::installed_path_key(v6nh, 3)]);
+        let p = v4(10, 0, 0, 0, 24);
+        led.classify_resolved(p, 1);
+        led.commit_installed_via(p, Some(a));
+        led.classify_resolved(v6p(0), 1);
+        led.commit_installed_via(v6p(0), Some(b));
+        assert_eq!(led.v4_nexthops(), [nh(192, 0, 2, 1)].into_iter().collect());
+        // Replaced through a v6 next hop (RFC 8950): the index moves.
+        led.classify_resolved(p, 1);
+        led.commit_installed_via(p, Some(b));
+        assert_eq!(led.v4_nexthops(), [v6nh].into_iter().collect());
+        led.forget(p);
+        assert!(led.v4_nexthops().is_empty(), "the v6 route never counted");
+        assert!(led.v4_via_refs.is_empty());
+    }
+
+    /// Only the family with headroom has its parked ops released.
+    #[test]
+    fn release_is_per_family() {
+        let mut led = RouteLedger::new(Capacity::per_family(10, 1));
+        led.classify_resolved(v6p(0), 1);
+        led.commit_installed(v6p(0));
+        let mut m = PendingMap::new();
+        m.withhold(v6p(1), PendingOp::Withdraw);
+        m.withhold(v4(10, 0, 0, 0, 24), PendingOp::Withdraw);
+        assert!(led.has_headroom(false) && !led.has_headroom(true));
+        assert_eq!(m.release_withheld_family(false), 1);
+        assert_eq!(m.withheld_len(), 1, "the v6 op stays parked");
+        assert_eq!(
+            m.drain_batch(10),
+            vec![(v4(10, 0, 0, 0, 24), PendingOp::Withdraw)]
+        );
+        assert_eq!(m.release_withheld_family(true), 1);
+        assert_eq!(m.withheld_len(), 0);
+        assert_eq!(m.drain_batch(10), vec![(v6p(1), PendingOp::Withdraw)]);
     }
 
     /// The resync skip must be able to drop an older owed op outright.

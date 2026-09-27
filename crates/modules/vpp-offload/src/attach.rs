@@ -39,11 +39,13 @@ use crate::vpp_api::generated::{
     DevCreatePortIf, DevCreatePortIfReply, L2FibTableDetails, L2FibTableDump,
     L2InterfaceVlanTagRewrite, L2InterfaceVlanTagRewriteReply, L2fibAddDel, L2fibAddDelReply,
     Prefix, SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddress,
-    SwInterfaceAddDelMacAddressReply, SwInterfaceDetails, SwInterfaceDump, SwInterfaceSetFlags,
-    SwInterfaceSetFlagsReply, SwInterfaceSetL2Bridge, SwInterfaceSetL2BridgeReply,
-    SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply, SwInterfaceSetMtu,
-    SwInterfaceSetMtuReply, SwInterfaceSetPromisc, SwInterfaceSetPromiscReply,
-    SwInterfaceSetUnnumbered, SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
+    SwInterfaceAddDelMacAddressReply, SwInterfaceDetails, SwInterfaceDump,
+    SwInterfaceIp6EnableDisable, SwInterfaceIp6EnableDisableReply, SwInterfaceIp6ndRaConfig,
+    SwInterfaceIp6ndRaConfigReply, SwInterfaceSetFlags, SwInterfaceSetFlagsReply,
+    SwInterfaceSetL2Bridge, SwInterfaceSetL2BridgeReply, SwInterfaceSetMacAddress,
+    SwInterfaceSetMacAddressReply, SwInterfaceSetMtu, SwInterfaceSetMtuReply,
+    SwInterfaceSetPromisc, SwInterfaceSetPromiscReply, SwInterfaceSetUnnumbered,
+    SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -1377,6 +1379,100 @@ fn set_mtu(t: &mut Transport, p: &PortAttach, sw_if_index: u32) -> Result<(), At
             port: p.port.clone(),
             retval: reply.retval,
             detail: format!("mtu {mtu}"),
+        });
+    }
+    Ok(())
+}
+
+/// VPP's `VNET_API_ERROR_VALUE_EXIST`, which `ip6_link_enable` answers
+/// for an interface that already has ip6 enabled — VPP v26.06
+/// `src/vnet/ip/ip6_link.c`: the link is left exactly as it was, bar a
+/// lock count only a disable would consult (and this module never
+/// disables: a VPP's ip6 state dies with the process).
+const IP6_ALREADY_ENABLED: i32 = -81;
+
+/// Make `sw_if_index` able to carry IPv6, and keep it from advertising
+/// itself as a router. Under `v6 on` only; see
+/// [`crate::engine::ConvergenceEngine`]'s `ensure_ip6` for when.
+///
+/// **Why at all.** Unnumbered borrows the loopback's IPv4 address and
+/// nothing else, so a member, subif or BVI has no `ip6_link` until one is
+/// enabled — and a v6 route or static neighbour egressing an interface
+/// without one has no ip6 rewrite to leave by.
+///
+/// **What enabling gives the interface: a link-local, never a global
+/// address.** `ip6_link_enable` derives an EUI-64 link-local from the
+/// interface's hardware MAC, and this module adds no v6 address to any
+/// VPP interface. That link-local is the same one the kernel derives
+/// for the same MAC — a member VF carries its PF's MAC, a BVI the
+/// bridge's — and VPP enables it without DAD (auto-generated link-locals
+/// skip it, same file). The duplicate is harmless at rung 0: VPP answers
+/// a neighbour solicitation only for an address it owns on the interface
+/// the NS arrived on, and with no IPv6 steered nothing reaches VPP's
+/// interfaces to solicit it — the kernel keeps answering for the address
+/// on the wire. A future rung that steers v6 must revisit this: steered
+/// frames are addressed to the router's MAC, and an NS for the shared
+/// link-local steered into VPP is one VPP would answer too (with the
+/// same MAC, so a peer's cache cannot be confused, but the kernel no
+/// longer sees it).
+///
+/// **Idempotent**, because adoption re-runs it against a VPP that already
+/// has ip6 on these interfaces: a re-enable answers
+/// [`IP6_ALREADY_ENABLED`], which is success here.
+///
+/// **Router advertisements, suppressed explicitly.** VPP 26.06 does not
+/// send them by default (`ip6_ra_link_enable` leaves `send_radv` zero,
+/// `src/vnet/ip6-nd/ip6_ra.c`, matching the rig spike: no RA in 90 s),
+/// but an RA from VPP on an IX or service VLAN would make hosts adopt it
+/// as a default router — a default a VPP build could change. `suppress`
+/// alone, every other field zero, touches nothing else (`ip6_ra_config`
+/// keeps each unset field's current value), and it also stops VPP
+/// answering router solicitations (`send_radv == 0` refuses them).
+///
+/// **MLD, deliberately left alone.** Enabling ip6 makes VPP send one
+/// MLDv2 report per interface as it comes up (`ip6_mld.c`: the
+/// all-hosts, all-routers and MLDv2-routers groups plus the link-local's
+/// solicited-node group — the spike's one packet in 90 s); it answers no
+/// queries and repeats only after an admin down/up. There is no API to
+/// stop it short of disabling ip6, and it is harmless: the groups it
+/// reports are ones the kernel already listens to on the same port for
+/// the same link-local, so a snooping switch forwards nothing new, and it
+/// leaves from the interface's own MAC, so nothing moves. The
+/// solicited-node group's multicast MAC it adds to the interface is a
+/// SECONDARY address, which the octeon driver does not program into
+/// hardware (`src/drivers/octeon/port.c`, `oct_port_add_del_eth_addr`
+/// acts on the primary only), so it cannot pull the kernel's NS traffic
+/// onto the VF.
+pub fn enable_ip6(t: &mut Transport, label: &str, sw_if_index: u32) -> Result<(), AttachError> {
+    let reply = t.request::<SwInterfaceIp6EnableDisable, SwInterfaceIp6EnableDisableReply>(
+        SwInterfaceIp6EnableDisable {
+            context: 0,
+            sw_if_index,
+            enable: true,
+        },
+    )?;
+    if reply.retval != 0 && reply.retval != IP6_ALREADY_ENABLED {
+        return Err(AttachError::Refused {
+            step: "sw_interface_ip6_enable_disable",
+            port: label.to_string(),
+            retval: reply.retval,
+            detail: format!("sw_if_index {sw_if_index}"),
+        });
+    }
+    let reply = t.request::<SwInterfaceIp6ndRaConfig, SwInterfaceIp6ndRaConfigReply>(
+        SwInterfaceIp6ndRaConfig {
+            context: 0,
+            sw_if_index,
+            suppress: 1,
+            ..Default::default()
+        },
+    )?;
+    if reply.retval != 0 {
+        return Err(AttachError::Refused {
+            step: "sw_interface_ip6nd_ra_config",
+            port: label.to_string(),
+            retval: reply.retval,
+            detail: format!("suppress on sw_if_index {sw_if_index}"),
         });
     }
     Ok(())

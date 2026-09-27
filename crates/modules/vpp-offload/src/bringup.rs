@@ -287,6 +287,61 @@ fn kernel_v4_ifaddrs() -> Vec<(String, packetframe_common::config::Ipv4Prefix)> 
     out
 }
 
+/// Every IPv6 address the kernel holds, with its interface and prefix
+/// length — [`kernel_v4_ifaddrs`]'s twin, for the v6 half of the
+/// kernel-delivered classification. Degrades open the same way: an empty
+/// list classifies nothing as the router's own, which leaves such routes
+/// unresolvable and visible rather than hiding anything.
+fn kernel_v6_ifaddrs() -> Vec<(String, std::net::Ipv6Addr, u8)> {
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates the list; freed below on every path
+    // that saw a zero return.
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        return out;
+    }
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: walking the list getifaddrs returned, until null.
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_addr.is_null() {
+            // SAFETY: ifa_addr is non-null and points at a sockaddr for
+            // this entry; only read further when the family says INET6.
+            let family = unsafe { i32::from((*ifa.ifa_addr).sa_family) };
+            if family == libc::AF_INET6 {
+                // SAFETY: AF_INET6 guarantees sockaddr_in6 layout.
+                let raw = unsafe {
+                    (*(ifa.ifa_addr as *const libc::sockaddr_in6))
+                        .sin6_addr
+                        .s6_addr
+                };
+                let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+                    .to_string_lossy()
+                    .into_owned();
+                // A missing netmask reads as a host route, the narrowest
+                // claim — as for v4.
+                let prefix_len = if ifa.ifa_netmask.is_null() {
+                    128
+                } else {
+                    // SAFETY: non-null, and an AF_INET6 entry's netmask
+                    // is a sockaddr_in6.
+                    let mask = unsafe {
+                        (*(ifa.ifa_netmask as *const libc::sockaddr_in6))
+                            .sin6_addr
+                            .s6_addr
+                    };
+                    u128::from_be_bytes(mask).count_ones() as u8
+                };
+                out.push((name, std::net::Ipv6Addr::from(raw), prefix_len));
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+    // SAFETY: the list came from a successful getifaddrs.
+    unsafe { libc::freeifaddrs(ifap) };
+    out
+}
+
 fn hex_mac(m: &[u8; 6]) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -548,7 +603,7 @@ pub fn bring_up(
     let steering = NtupleSteering::new(member_ports, steer_targets);
 
     let workers = cfg.total_workers();
-    let sizing = startup_conf::derive_sizing(cfg.expected_routes, workers)?;
+    let sizing = startup_conf::derive_sizing(cfg.expected_routes, workers, cfg.v6)?;
     let core_map = cores::derive_from_sysfs(&paths.sysfs_cpu, workers)?;
 
     // NIC queue IRQs must not fire on the cores VPP is about to burn.
@@ -768,6 +823,7 @@ pub fn bring_up(
         &cfg.steer_exempts,
         dst_only_scope,
         held_steering,
+        cfg.families(),
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -845,6 +901,7 @@ fn finish(
     steer_exempts: &[packetframe_common::config::Ipv4Prefix],
     dst_only_scope: Option<Vec<packetframe_common::fib::IpPrefix>>,
     held_steering: crate::SteeringInputs,
+    families: FamilyPolicy,
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -1202,6 +1259,9 @@ fn finish(
     );
 
     let capacity = startup_conf::route_capacity(sizing);
+    // The IPv6 pool: the allowance the segments were grown for under
+    // `v6 on`, never touched under `v6 off` (the drainer admits no v6).
+    let capacity_v6 = startup_conf::route_capacity_v6(sizing);
     let api_socket_path = paths.api_socket.clone();
     let startup_conf_path = paths.startup_conf.clone();
     let vpp_binary = vpp_binary.to_path_buf();
@@ -1219,6 +1279,17 @@ fn finish(
     // first steer — loud, not silent.
     let self_nets: Vec<packetframe_common::config::Ipv4Prefix> =
         kernel_v4_ifaddrs().into_iter().map(|(_, p)| p).collect();
+    // IPv6's, read the same way, and only when VPP carries the family:
+    // under `v6 off` no v6 route reaches the diff, so there is nothing
+    // for them to classify.
+    let self_nets6: Vec<(std::net::Ipv6Addr, u8)> = if families.carries_v6() {
+        kernel_v6_ifaddrs()
+            .into_iter()
+            .map(|(_, a, l)| (a, l))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let drift_exempts = steer_exempts.to_vec();
     let engine_exempts = steer_exempts.to_vec();
     let factory: LoopFactory = Box::new(move || {
@@ -1250,13 +1321,15 @@ fn finish(
             port_attach,
             members,
             capacity,
-            FamilyPolicy::V4Only,
+            families,
             loopback,
         )
+        .with_v6_capacity(capacity_v6)
         .with_recorded_indices(recorded)
         .with_local_routes(local_routes)
         .with_trunk_ports(trunk_ports)
-        .with_self_networks(self_nets.clone());
+        .with_self_networks(self_nets.clone())
+        .with_self_networks_v6(self_nets6.clone());
         engine.set_steer_exempts(engine_exempts.clone());
         // Per-neighbour placement reads the live kernel on Linux; the
         // default elsewhere treats every device as plain.
@@ -1593,6 +1666,7 @@ mod completeness_gate_tests {
             local_routes: vec![],
             steer_capacity: None,
             trunk_ports: vec![],
+            v6: false,
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),

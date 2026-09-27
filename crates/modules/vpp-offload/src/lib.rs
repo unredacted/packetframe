@@ -146,6 +146,11 @@ pub struct VppOffloadConfig {
     /// no restart. Their `vlans` entry in [`Self::ports`] stays empty;
     /// bring-up fills the attach-time set from the kernel.
     pub trunk_ports: Vec<String>,
+    /// `v6 on`: VPP carries IPv6 routes and neighbours
+    /// ([`fib_sync::FamilyPolicy::Both`]). Default off. Restart-only —
+    /// it sizes the segments VPP fixes at start, and decides what the
+    /// adopted FIB holds. It steers nothing.
+    pub v6: bool,
 }
 
 /// One `local-route`, resolved for the engine: the config triple plus
@@ -208,6 +213,7 @@ impl VppOffloadConfig {
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
                 ModuleDirective::VppSteerCapacity(n) => out.steer_capacity = Some(*n),
                 ModuleDirective::VppRequireTableComplete(v) => out.require_table_complete = *v,
+                ModuleDirective::VppV6(v) => out.v6 = *v,
                 ModuleDirective::VppLoopbackAddress(p) => out.loopback_address = Some(*p),
                 ModuleDirective::VppSteerExempt(p) => out.steer_exempts.push(*p),
                 ModuleDirective::VppSteerDirection(d) => out.steer_direction = *d,
@@ -291,6 +297,16 @@ impl VppOffloadConfig {
                  subinterface topology is fixed when VPP starts, so this needs a restart \
                  (`packetframe detach --all`, then start). Only `steer on|off` can change \
                  under a running VPP"
+            ));
+        }
+        if self.v6 != new.v6 {
+            let onoff = |v: bool| if v { "on" } else { "off" };
+            return Err(format!(
+                "`v6` changed ({} → {}); it sizes VPP's main heap and stats segment for the \
+                 IPv6 table, both fixed at start, and decides which families the FIB holds \
+                 and which interfaces carry ip6 — restart to apply",
+                onoff(self.v6),
+                onoff(new.v6)
             ));
         }
         if self.expected_routes != new.expected_routes {
@@ -401,8 +417,24 @@ impl VppOffloadConfig {
             ("vlans-all", format!("{:?}", self.trunk_ports)),
         ]
         .into_iter()
+        // `v6`, recorded only when ON: its heap and stats segment are
+        // fixed at start, and a VPP adopted across a flip would hold the
+        // wrong families (v6 routes nothing withdraws, or a v6 table its
+        // segments were not sized for). Absent when off, so every record
+        // written before this directive existed — all `v6 off` by
+        // construction — still matches a `v6 off` config and adopts.
+        .chain(self.v6.then(|| ("v6", "on".to_string())))
         .map(|(k, v)| (k.to_string(), v))
         .collect()
+    }
+
+    /// Which families VPP carries.
+    pub fn families(&self) -> fib_sync::FamilyPolicy {
+        if self.v6 {
+            fib_sync::FamilyPolicy::Both
+        } else {
+            fib_sync::FamilyPolicy::V4Only
+        }
     }
 
     /// Total VPP worker threads the config promises, across all ports:
@@ -1160,9 +1192,12 @@ impl Module for VppOffloadModule {
         // the fast-path section is visible; by load time it has passed.
         // Here: validate the sizing arithmetic so a too-small
         // `hugepages` is a clean startup error, not a VPP init abort.
-        let sizing =
-            startup_conf::derive_sizing(self.cfg.expected_routes, self.cfg.total_workers())
-                .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
+        let sizing = startup_conf::derive_sizing(
+            self.cfg.expected_routes,
+            self.cfg.total_workers(),
+            self.cfg.v6,
+        )
+        .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         if let Some(pages) = self.cfg.hugepages {
             startup_conf::check_hugepage_budget(&sizing, pages, default_hugepage_bytes())
                 .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
@@ -1864,7 +1899,7 @@ mod tests {
         let online: Vec<u16> = (0..12).collect();
         let map = cores::derive_core_map(&online, &[], workers).unwrap();
         assert_eq!(map.workers, vec![8, 9, 10, 11]);
-        let sizing = startup_conf::derive_sizing(DEFAULT_EXPECTED_ROUTES, workers).unwrap();
+        let sizing = startup_conf::derive_sizing(DEFAULT_EXPECTED_ROUTES, workers, false).unwrap();
         let conf = startup_conf::render(&sizing, &map.workers, map.main, "/run/pf/api.sock", 0);
         assert!(conf.contains("main-core 7\n"), "{conf}");
         assert!(conf.contains("corelist-workers 8,9,10,11\n"), "{conf}");
@@ -2202,6 +2237,7 @@ mod tests {
             local_routes: vec![],
             steer_capacity: None,
             trunk_ports: vec![],
+            v6: false,
             steer_direction: Default::default(),
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
@@ -2787,6 +2823,9 @@ mod tests {
         let mut c = base.clone();
         c.trunk_ports = vec!["eth4".into()];
         changes.push(c);
+        let mut c = base.clone();
+        c.v6 = true;
+        changes.push(c);
         for c in &changes {
             assert!(
                 base.restart_only_delta(c).is_err(),
@@ -2799,6 +2838,29 @@ mod tests {
         lever.ports[0].2 = true;
         lever.steer_direction = packetframe_common::config::VppSteerDirection::Both;
         assert_eq!(lever.restart_only(), record);
+    }
+
+    /// `v6` is restart-only in both directions and on both doors — the
+    /// reload refuses it by name, and the adoption record carries it —
+    /// while `v6 off` records exactly what a build that predates the
+    /// directive recorded, so an upgrade still adopts.
+    #[test]
+    fn v6_is_restart_only_and_off_records_nothing_new() {
+        let off = cfg(&[("eth4", 1, false)], 1_600_000);
+        let mut on = off.clone();
+        on.v6 = true;
+        for (a, b) in [(&off, &on), (&on, &off)] {
+            let e = a.restart_only_delta(b).expect_err("a v6 flip must refuse");
+            assert!(e.contains("`v6` changed") && e.contains("restart"), "{e}");
+        }
+        assert!(!off.restart_only().contains_key("v6"));
+        assert_eq!(on.restart_only().get("v6").map(String::as_str), Some("on"));
+        assert_eq!(off.families(), fib_sync::FamilyPolicy::V4Only);
+        assert_eq!(on.families(), fib_sync::FamilyPolicy::Both);
+
+        let parsed = VppOffloadConfig::from_directives(&[ModuleDirective::VppV6(true)]);
+        assert!(parsed.v6);
+        assert!(!VppOffloadConfig::from_directives(&[]).v6, "default off");
     }
 
     /// A reordered port list is a change, not a permutation.
