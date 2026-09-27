@@ -953,12 +953,16 @@ impl StatusSnapshot {
     fn handback_health(&self) -> Option<SubsystemHealth> {
         let h = self.handback.as_ref()?;
         let parts = format!(
-            "veth {} ({}), guard {} (nft table inet {}), VPP interface {}, {} router-owned \
+            "veth {} ({}), guard ACL {} (VPP ACL tag {}), VPP interface {}, {} router-owned \
              /128(s) handed back{}",
             if h.veth { "up" } else { "missing or down" },
             crate::handback::KERNEL_IF,
-            if h.guard { "loaded" } else { "missing" },
-            crate::handback::NFT_TABLE,
+            if h.guard {
+                "in place"
+            } else {
+                "missing or drifted"
+            },
+            crate::handback::ACL_TAG,
             match (&h.vpp_if, h.vpp_up) {
                 (Some(name), true) => format!("{name} up"),
                 (Some(name), false) => format!("{name} DOWN"),
@@ -4549,7 +4553,7 @@ mod tests {
             wanted: true,
             veth: true,
             guard: false,
-            error: Some("kernel side: nft exited 1".into()),
+            error: Some("VPP refused acl_add_replace (retval -1)".into()),
             ..Default::default()
         });
         let r = row(&s).expect("row");
@@ -4557,8 +4561,8 @@ mod tests {
         let msg = r.message.unwrap();
         assert!(
             msg.contains("IPv6 diversion held back")
-                && msg.contains("guard missing")
-                && msg.contains("nft exited 1")
+                && msg.contains("guard ACL missing or drifted")
+                && msg.contains("acl_add_replace")
                 && msg.contains("IPv4 steering is unaffected"),
             "{msg}"
         );

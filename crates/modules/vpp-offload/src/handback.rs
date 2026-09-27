@@ -20,10 +20,14 @@
 //! - a /128 in VPP's IPv6 table for every GLOBAL address the host holds,
 //!   whose path leaves by VPP's end of the veth toward the kernel's
 //!   link-local, resolved by a static neighbour — VPP never solicits;
-//! - an nftables table ([`NFT_TABLE`]) on the kernel side that admits
-//!   only established and related traffic arriving on the veth, because
-//!   that traffic bypasses the vendor's WAN_LOCAL rules, which key on the
-//!   physical WAN ports.
+//! - a guard IN VPP ([`render_guard`]): a stateless ACL bound as the
+//!   hand-back interface's output ACL, admitting only traffic to the
+//!   router's own addresses that is a reply — TCP with ACK or RST set, UDP
+//!   to the kernel's ephemeral ports — because what arrives on the veth
+//!   bypasses the vendor's WAN_LOCAL rules (they key on the physical WAN
+//!   ports), and the vendor controller rewrites the kernel's netfilter on
+//!   every config apply, so no kernel rule would stay put. It needs VPP's
+//!   acl_plugin, which the handshake requires by name like af_packet's.
 //!
 //! The next hop is the EUI-64 link-local of the kernel veth's MAC
 //! ([`eui64_link_local`]) — what the kernel's default `addr_gen_mode`
@@ -69,12 +73,16 @@ use std::time::{Duration, Instant};
 use packetframe_common::fib::IpPrefix;
 
 use crate::vpp_api::generated::{
-    AfPacketCreateV3, AfPacketCreateV3Reply, AfPacketDelete, AfPacketDeleteReply, AfPacketDetails,
-    AfPacketDump, CliInband, CliInbandReply, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply,
-    IpNeighborDetails, IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
-    IpRouteDump, IpRouteLookup, IpRouteLookupReply, IpTable, SwInterfaceSetFlags,
-    SwInterfaceSetFlagsReply, SwInterfaceSetMtu, SwInterfaceSetMtuReply, ADDRESS_IP6,
-    AF_PACKET_API_FLAG_QDISC_BYPASS, AF_PACKET_API_MODE_ETHERNET,
+    AclAddReplace, AclAddReplaceReply, AclDel, AclDelReply, AclDetails, AclDump,
+    AclInterfaceListDetails, AclInterfaceListDump, AclInterfaceSetAclList,
+    AclInterfaceSetAclListReply, AclRule, AfPacketCreateV3, AfPacketCreateV3Reply, AfPacketDelete,
+    AfPacketDeleteReply, AfPacketDetails, AfPacketDump, CliInband, CliInbandReply, IpNeighbor,
+    IpNeighborAddDel, IpNeighborAddDelReply, IpNeighborDetails, IpNeighborDump, IpRoute,
+    IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails, IpRouteDump, IpRouteLookup,
+    IpRouteLookupReply, IpTable, SwInterfaceSetFlags, SwInterfaceSetFlagsReply, SwInterfaceSetMtu,
+    SwInterfaceSetMtuReply, ACL_ACTION_API_DENY, ACL_ACTION_API_PERMIT, ADDRESS_IP6,
+    AF_PACKET_API_FLAG_QDISC_BYPASS, AF_PACKET_API_MODE_ETHERNET, IP_API_PROTO_TCP,
+    IP_API_PROTO_UDP,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -83,13 +91,10 @@ pub const KERNEL_IF: &str = "pfpunt0";
 /// VPP's end: the host interface its af_packet socket opens. VPP names
 /// the resulting interface `host-pfpunt0-vpp`.
 pub const VPP_HOST_IF: &str = "pfpunt0-vpp";
-/// The nftables table the guard lives in (family `inet`), so teardown is
-/// one delete.
-pub const NFT_TABLE: &str = "packetframe_handback";
-
 /// How often a built path is re-checked end to end: the veth still up,
-/// the guard table still loaded, VPP's interface still up. A kernel read,
-/// one `nft` spawn and two API calls — cheap, but not per tick.
+/// VPP's interface, /128s, neighbour and guard ACL still exactly there,
+/// and the kernel's ephemeral port range re-read. A kernel read and a
+/// handful of API calls — cheap, but not per tick.
 pub const CHECK_EVERY: Duration = Duration::from_secs(30);
 /// How long a failed build or sync waits before it is tried again, so a
 /// permanently refusing kernel or VPP costs one attempt per interval
@@ -172,192 +177,273 @@ pub fn eui64_link_local(mac: [u8; 6]) -> Ipv6Addr {
     ])
 }
 
-/// The guard, as one `nft -f` transaction.
+/// The tag the guard ACL carries — how adoption finds it in a surviving
+/// VPP, and how a second copy is recognised as ours to remove.
+pub const ACL_TAG: &str = "packetframe-handback";
+
+/// TCP flag bits, as the ACL's `tcp_flags_mask`/`tcp_flags_value` read them.
+pub const TCP_FLAG_RST: u8 = 0x04;
+pub const TCP_FLAG_ACK: u8 = 0x10;
+
+/// The ports a guard rule's destination may use: the kernel's ephemeral
+/// range, `(first, last)`.
+pub type PortRange = (u16, u16);
+
+/// `/proc/sys/net/ipv4/ip_local_port_range` → `(first, last)`, validated:
+/// two ports, `1 <= first <= last`. The file is IPv4's by name and the
+/// kernel's ephemeral range for IPv6 sockets too.
+pub fn parse_port_range(text: &str) -> Result<PortRange, String> {
+    let mut it = text.split_whitespace().map(str::parse::<u16>);
+    match (it.next(), it.next(), it.next()) {
+        (Some(Ok(first)), Some(Ok(last)), None) if first >= 1 && first <= last => Ok((first, last)),
+        _ => Err(format!(
+            "ip_local_port_range reads {:?}, not two ports `first last` with 1 <= first <= last",
+            text.trim()
+        )),
+    }
+}
+
+fn any_v6() -> crate::vpp_api::generated::Prefix {
+    crate::fib_sync::to_prefix(IpPrefix::V6 {
+        addr: [0; 16],
+        prefix_len: 0,
+    })
+}
+
+fn guard_rule(
+    is_permit: u8,
+    dst: Option<Ipv6Addr>,
+    proto: u8,
+    dports: PortRange,
+    tcp_flags: (u8, u8),
+) -> AclRule {
+    AclRule {
+        is_permit,
+        src_prefix: any_v6(),
+        dst_prefix: dst.map_or_else(any_v6, |a| {
+            crate::fib_sync::to_prefix(IpPrefix::V6 {
+                addr: a.octets(),
+                prefix_len: 128,
+            })
+        }),
+        proto,
+        srcport_or_icmptype_first: 0,
+        srcport_or_icmptype_last: u16::MAX,
+        dstport_or_icmpcode_first: dports.0,
+        dstport_or_icmpcode_last: dports.1,
+        tcp_flags_mask: tcp_flags.0,
+        tcp_flags_value: tcp_flags.1,
+    }
+}
+
+/// The guard: the stateless ACL VPP applies to everything it sends the
+/// kernel through the hand-back interface (its OUTPUT ACL). In VPP rather
+/// than the kernel because PacketFrame owns VPP, while the vendor
+/// controller flushes and rewrites the kernel's netfilter on every config
+/// apply — no kernel rule would stay put.
 ///
-/// Declare-then-delete-then-define makes it idempotent and atomic: a
-/// re-apply (adoption, a check that found it altered) replaces the table
-/// in one transaction, with no instant where the veth is unguarded.
-/// `iifname` rather than `iif`, so a veth recreated with a new ifindex is
-/// still matched without reloading the table.
+/// Per router-owned address `A` (the same set the /128s route; nothing is
+/// handed back for any other destination, defence in depth against a
+/// stray packet Linux would forward — it has no per-interface IPv6
+/// forwarding switch):
 ///
-/// - input: established/related arriving on the veth is accepted —
-///   replies to what the router itself opened, and the ICMPv6 errors
-///   about them (PMTUD included); everything else arriving there is
-///   dropped. That traffic bypasses the vendor's WAN_LOCAL rules (they
-///   key on the physical WAN ports), so without this a new inbound
-///   connection to the router over IPv6 through VPP would be accepted
-///   with no firewall at all. Services that need new inbound
-///   connections are `steer-keep6`'d and never enter VPP.
-/// - forward: nothing arriving on the veth is forwarded. VPP sends the
-///   veth only the router's own /128s, so a packet that would be
-///   forwarded is one for an address the router has just dropped, and
-///   forwarding it would bypass every forward-path rule too.
-pub fn nft_ruleset() -> String {
-    format!(
-        "table inet {NFT_TABLE}\n\
-         delete table inet {NFT_TABLE}\n\
-         table inet {NFT_TABLE} {{\n\
-         \tchain input {{\n\
-         \t\ttype filter hook input priority filter; policy accept;\n\
-         \t\tiifname \"{KERNEL_IF}\" ct state established,related accept\n\
-         \t\tiifname \"{KERNEL_IF}\" drop\n\
-         \t}}\n\
-         \tchain forward {{\n\
-         \t\ttype filter hook forward priority filter; policy accept;\n\
-         \t\tiifname \"{KERNEL_IF}\" drop\n\
-         \t}}\n\
-         }}\n"
-    )
+/// 1. TCP to `A` with ACK set — the classic stateless `established` test
+///    (the `established` keyword of Cisco and Juniper ACLs): every segment
+///    of a connection the router opened, its SYN+ACK included.
+/// 2. TCP to `A` with RST set — the other half of that same test.
+/// 3. UDP to `A` whose destination port is in the kernel's ephemeral range
+///    ([`parse_port_range`]): client sockets receiving replies (the
+///    resolver's upstream queries, an NTP client).
+///
+/// then deny everything. So a pure SYN — every NEW inbound TCP connection
+/// to the router over diverted IPv6 — is refused, and so are NULL,
+/// FIN-only and Xmas-style probes; UDP to a service port outside the
+/// ephemeral range is refused too. A service that must accept new
+/// sessions is `steer-keep6`'d and never enters VPP. The one consequence
+/// the port rule cannot help: a UDP service that listens INSIDE the
+/// ephemeral range (an overlay VPN's listen port, say) is reachable
+/// through the hand-back.
+pub fn render_guard(addrs: &BTreeSet<Ipv6Addr>, ports: PortRange) -> Vec<AclRule> {
+    let all = (0, u16::MAX);
+    let mut rules = Vec::with_capacity(addrs.len() * 3 + 1);
+    for a in addrs {
+        rules.push(guard_rule(
+            ACL_ACTION_API_PERMIT,
+            Some(*a),
+            IP_API_PROTO_TCP,
+            all,
+            (TCP_FLAG_ACK, TCP_FLAG_ACK),
+        ));
+        rules.push(guard_rule(
+            ACL_ACTION_API_PERMIT,
+            Some(*a),
+            IP_API_PROTO_TCP,
+            all,
+            (TCP_FLAG_RST, TCP_FLAG_RST),
+        ));
+        rules.push(guard_rule(
+            ACL_ACTION_API_PERMIT,
+            Some(*a),
+            IP_API_PROTO_UDP,
+            ports,
+            (0, 0),
+        ));
+    }
+    // VPP's ACLs end in an implicit deny; stated, so the readback shows
+    // the whole policy and a rule appended after it would be visible drift.
+    rules.push(guard_rule(ACL_ACTION_API_DENY, None, 0, all, (0, 0)));
+    rules
 }
 
-/// The guard's shape, as the check compares it: per chain, its base-chain
-/// header `(type, hook, priority, policy)` and its rules in order, each a
-/// list of normalized terms.
-type GuardShape = Vec<(String, (String, String, i64, String), Vec<Vec<String>>)>;
+/// Our tagged ACLs in VPP, `(index, rules)`.
+fn our_acls(t: &mut Transport) -> Result<Vec<(u32, Vec<AclRule>)>, TransportError> {
+    let details: Vec<AclDetails> = t.dump(AclDump {
+        context: 0,
+        acl_index: u32::MAX,
+    })?;
+    Ok(details
+        .into_iter()
+        .filter(|d| d.tag == ACL_TAG)
+        .map(|d| (d.acl_index, d.r))
+        .collect())
+}
 
-/// What [`nft_ruleset`] loads, in [`GuardShape`] form — the one shape the
-/// check accepts. Anything else in the table (an extra rule, a reordered
-/// accept, a `policy drop`, another priority, a third chain) is not the
-/// guard: it is a table someone edited, and the guard is reloaded.
-fn expected_guard() -> GuardShape {
-    let on_veth = format!("iifname=={KERNEL_IF}");
-    let hdr = |hook: &str| {
-        (
-            "filter".to_string(),
-            hook.to_string(),
-            0,
-            "accept".to_string(),
-        )
+/// What is bound to `sw_if_index`: `(n_input, acls)`, `None` for nothing.
+fn bound_acls(
+    t: &mut Transport,
+    sw_if_index: u32,
+) -> Result<Option<(u8, Vec<u32>)>, TransportError> {
+    let details: Vec<AclInterfaceListDetails> = t.dump(AclInterfaceListDump {
+        context: 0,
+        sw_if_index,
+    })?;
+    Ok(details
+        .into_iter()
+        .find(|d| d.sw_if_index == sw_if_index && d.count > 0)
+        .map(|d| (d.n_input, d.acls)))
+}
+
+fn bind_output(t: &mut Transport, sw_if_index: u32, acls: Vec<u32>) -> Result<(), HandbackError> {
+    let reply: AclInterfaceSetAclListReply = t.request(AclInterfaceSetAclList {
+        context: 0,
+        sw_if_index,
+        count: acls.len() as u8,
+        n_input: 0,
+        acls,
+    })?;
+    if reply.retval != 0 {
+        return Err(refused(
+            "acl_interface_set_acl_list",
+            reply.retval,
+            "the guard as the hand-back interface's output ACL",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the guard is in VPP EXACTLY as intended for `addrs` and
+/// `ports`: our ACL holding precisely the rendered rules in order, and it
+/// alone bound to the hand-back interface as its output ACL. Any drift —
+/// a rule missing, reordered or widened, the ACL unbound or joined by
+/// another — is `false`.
+pub fn guard_in_place(
+    t: &mut Transport,
+    half: &VppHalf,
+    addrs: &BTreeSet<Ipv6Addr>,
+    ports: PortRange,
+) -> Result<bool, TransportError> {
+    let Some(idx) = half.acl else {
+        return Ok(false);
     };
-    vec![
-        (
-            "input".into(),
-            hdr("input"),
-            vec![
-                vec![
-                    on_veth.clone(),
-                    "ct state in established,related".into(),
-                    "accept".into(),
-                ],
-                vec![on_veth.clone(), "drop".into()],
-            ],
-        ),
-        (
-            "forward".into(),
-            hdr("forward"),
-            vec![vec![on_veth, "drop".into()]],
-        ),
-    ]
-}
-
-/// Whether `nft -j list table inet packetframe_handback` output is exactly
-/// the guard: the two hooked base chains with type, hook, priority and
-/// policy as loaded, and exactly the loaded rules, in order. Compared
-/// structurally from the JSON, never by substring — a listing that merely
-/// CONTAINS the right text (an `accept` rule inserted above the drop, say)
-/// would otherwise pass while guarding nothing.
-pub fn guard_matches_json(listing: &str) -> bool {
-    parse_guard_json(listing).is_some_and(|shape| shape == expected_guard())
-}
-
-fn parse_guard_json(listing: &str) -> Option<GuardShape> {
-    let v: serde_json::Value = serde_json::from_str(listing).ok()?;
-    let mut chains: GuardShape = Vec::new();
-    for item in v.get("nftables")?.as_array()? {
-        if let Some(c) = item.get("chain") {
-            let name = c.get("name")?.as_str()?.to_string();
-            let header = (
-                c.get("type")?.as_str()?.to_string(),
-                c.get("hook")?.as_str()?.to_string(),
-                c.get("prio")?.as_i64()?,
-                c.get("policy")?.as_str()?.to_string(),
-            );
-            chains.push((name, header, Vec::new()));
-        } else if let Some(r) = item.get("rule") {
-            let chain = r.get("chain")?.as_str()?;
-            let terms = r
-                .get("expr")?
-                .as_array()?
-                .iter()
-                .map(json_term)
-                .collect::<Option<Vec<String>>>()?;
-            chains
-                .iter_mut()
-                .find(|(n, _, _)| n == chain)?
-                .2
-                .push(terms);
-        }
+    let want = render_guard(addrs, ports);
+    let ours = our_acls(t)?;
+    if ours.iter().find(|(i, _)| *i == idx).map(|(_, r)| r) != Some(&want) {
+        return Ok(false);
     }
-    Some(chains)
+    Ok(bound_acls(t, half.sw_if_index)? == Some((0, vec![idx])))
 }
 
-/// One rule expression, normalized: `iifname==<name>`, `ct state in
-/// <sorted,states>`, or the verdict. Anything else is kept verbatim, so it
-/// can only ever fail the comparison.
-fn json_term(e: &serde_json::Value) -> Option<String> {
-    if let Some(m) = e.get("match") {
-        let left = m.get("left")?;
-        let right = m.get("right")?;
-        if left.pointer("/meta/key").and_then(|k| k.as_str()) == Some("iifname")
-            && m.get("op")?.as_str()? == "=="
-        {
-            return Some(format!("iifname=={}", right.as_str()?));
+/// Build or repair the guard: reuse our ACL (the one this process knows,
+/// else the one a surviving VPP holds under [`ACL_TAG`]), replace its
+/// rules in place when they are not exactly the intended ones, bind it
+/// alone as the hand-back interface's output ACL, and remove any other
+/// copy. Idempotent: a guard in place is only read.
+pub fn ensure_guard(
+    t: &mut Transport,
+    half: &mut VppHalf,
+    addrs: &BTreeSet<Ipv6Addr>,
+    ports: PortRange,
+) -> Result<(), HandbackError> {
+    let want = render_guard(addrs, ports);
+    let ours = our_acls(t)?;
+    let known = half
+        .acl
+        .filter(|i| ours.iter().any(|(j, _)| j == i))
+        .or_else(|| ours.first().map(|(i, _)| *i));
+    let current = known.and_then(|i| ours.iter().find(|(j, _)| *j == i).map(|(_, r)| r));
+    let idx = if current == Some(&want) {
+        known.expect("current implies known")
+    } else {
+        let reply: AclAddReplaceReply = t.request(AclAddReplace {
+            context: 0,
+            // ~0 creates; an index replaces that ACL's rules in place, so
+            // the binding never points at a missing ACL.
+            acl_index: known.unwrap_or(u32::MAX),
+            tag: ACL_TAG.into(),
+            count: want.len() as u32,
+            r: want,
+        })?;
+        if reply.retval != 0 {
+            return Err(refused(
+                "acl_add_replace",
+                reply.retval,
+                "the hand-back guard ACL",
+            ));
         }
-        if left.pointer("/ct/key").and_then(|k| k.as_str()) == Some("state") {
-            // `established,related` prints as a list, or a set of one
-            // version's shape; `in` and `==` both mean membership here.
-            let list = right.get("set").unwrap_or(right);
-            let mut states: Vec<&str> = match list {
-                serde_json::Value::Array(a) => {
-                    a.iter().map(|s| s.as_str()).collect::<Option<_>>()?
-                }
-                serde_json::Value::String(s) => vec![s.as_str()],
-                _ => return None,
-            };
-            states.sort_unstable();
-            return matches!(m.get("op")?.as_str()?, "in" | "==")
-                .then(|| format!("ct state in {}", states.join(",")));
-        }
-    }
-    for verdict in ["accept", "drop"] {
-        if e.get(verdict).is_some() {
-            return Some(verdict.to_string());
-        }
-    }
-    Some(e.to_string())
-}
-
-/// The text-listing fallback, for an `nft` built without JSON output:
-/// exactly the lines [`nft_ruleset`]'s table lists as, in order, with
-/// whitespace collapsed and blank lines, `# handle` comments and the
-/// table's own braces as the only tolerated differences. Still whole-table
-/// and ordered — not a substring test.
-pub fn guard_matches_text(listing: &str) -> bool {
-    let norm = |s: &str| {
-        let s = s.split(" # ").next().unwrap_or(s);
-        s.split_whitespace().collect::<Vec<_>>().join(" ")
+        reply.acl_index
     };
-    let got: Vec<String> = listing
-        .lines()
-        .map(norm)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let want: Vec<String> = [
-        format!("table inet {NFT_TABLE} {{"),
-        "chain input {".into(),
-        "type filter hook input priority filter; policy accept;".into(),
-        format!("iifname \"{KERNEL_IF}\" ct state established,related accept"),
-        format!("iifname \"{KERNEL_IF}\" drop"),
-        "}".into(),
-        "chain forward {".into(),
-        "type filter hook forward priority filter; policy accept;".into(),
-        format!("iifname \"{KERNEL_IF}\" drop"),
-        "}".into(),
-        "}".into(),
-    ]
-    .into_iter()
-    .collect();
-    got == want
+    half.acl = Some(idx);
+    if bound_acls(t, half.sw_if_index)? != Some((0, vec![idx])) {
+        bind_output(t, half.sw_if_index, vec![idx])?;
+    }
+    for (other, _) in ours.iter().filter(|(i, _)| *i != idx) {
+        let reply: AclDelReply = t.request(AclDel {
+            context: 0,
+            acl_index: *other,
+        })?;
+        if reply.retval != 0 {
+            return Err(refused(
+                "acl_del",
+                reply.retval,
+                format!("a second hand-back guard ACL, index {other}"),
+            ));
+        }
+    }
+    half.guard_for = Some((addrs.clone(), ports));
+    Ok(())
+}
+
+/// Unbind and delete the guard. Absent is success.
+fn remove_guard(t: &mut Transport, half: &mut VppHalf) -> Result<(), HandbackError> {
+    if bound_acls(t, half.sw_if_index)?.is_some() {
+        bind_output(t, half.sw_if_index, Vec::new())?;
+    }
+    for (idx, _) in our_acls(t)? {
+        let reply: AclDelReply = t.request(AclDel {
+            context: 0,
+            acl_index: idx,
+        })?;
+        if reply.retval != 0 {
+            return Err(refused(
+                "acl_del",
+                reply.retval,
+                format!("the hand-back guard ACL, index {idx}"),
+            ));
+        }
+    }
+    half.acl = None;
+    half.guard_for = None;
+    Ok(())
 }
 
 /// `tx packets` for `name` from VPP's `show interface <name>` text.
@@ -403,25 +489,19 @@ pub struct HostFacts {
     pub mtu: u32,
 }
 
-/// One periodic look at the kernel half.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct HostCheck {
-    /// Both veth ends present, with the ifindexes they were built with,
-    /// and up.
-    pub veth: bool,
-    /// The guard table is loaded and is the one [`nft_ruleset`] loads.
-    pub guard: bool,
-}
-
-/// The kernel half: veth, sysctls, guard, and the host's addresses.
+/// The kernel half: veth, sysctls, the host's addresses and its ephemeral
+/// port range.
 /// [`KernelHostSide`] on Linux; tests supply their own.
 pub trait HostSide {
     /// Create — or adopt, when it already exists as built — the veth
-    /// pair, set its sysctls and MTU, bring both ends up and (re)load the
-    /// guard. Idempotent.
+    /// pair, set its sysctls and MTU and bring both ends up. Idempotent.
     fn ensure(&mut self) -> Result<HostFacts, String>;
-    /// Whether what [`Self::ensure`] built is still there, as built.
-    fn check(&mut self, facts: &HostFacts) -> HostCheck;
+    /// Whether both veth ends are still there, with the ifindexes
+    /// [`Self::ensure`] built them with, and up.
+    fn check(&mut self, facts: &HostFacts) -> bool;
+    /// The kernel's ephemeral port range ([`parse_port_range`]), which the
+    /// guard admits UDP replies to.
+    fn ephemeral_ports(&mut self) -> Result<PortRange, String>;
     /// The router-owned addresses ([`router_owned`]) if they may have
     /// changed since the last call — `Some` on the first call, after any
     /// RTM_NEWADDR/RTM_DELADDR, and on a periodic resync; `None` when
@@ -432,7 +512,7 @@ pub trait HostSide {
         &mut self,
         facts: &HostFacts,
     ) -> Result<Option<BTreeSet<Ipv6Addr>>, AddrReadError>;
-    /// Remove the guard table and the veth pair. Absent is success.
+    /// Remove the veth pair. Absent is success.
     fn teardown(&mut self) -> Result<(), String>;
 }
 
@@ -505,6 +585,11 @@ pub struct VppHalf {
     pub next_hop: Ipv6Addr,
     /// The kernel veth's MAC: the static neighbour's link-layer address.
     pub next_hop_mac: [u8; 6],
+    /// The guard ACL's index, once this process has made or found it.
+    pub acl: Option<u32>,
+    /// The `(addresses, port range)` the guard was last programmed or
+    /// verified for; `None` when it must be (re)checked or repaired.
+    pub guard_for: Option<(BTreeSet<Ipv6Addr>, PortRange)>,
     /// The /128s VPP has ACKNOWLEDGED holding through this interface —
     /// an acknowledgement cache, re-read against VPP on every check
     /// ([`revalidate`]), since another client or an operator can remove
@@ -606,6 +691,8 @@ pub fn ensure_vpp(t: &mut Transport, facts: &HostFacts) -> Result<VppHalf, Handb
         bound_to: (facts.kernel_ifindex, facts.vpp_ifindex),
         next_hop,
         next_hop_mac: facts.kernel_mac,
+        acl: None,
+        guard_for: None,
         routes,
     })
 }
@@ -819,7 +906,9 @@ pub fn sync_routes(
 
 /// Take VPP's end down: its routes, its neighbour, the host interface.
 pub fn remove_vpp(t: &mut Transport, half: &mut VppHalf) -> Result<(), HandbackError> {
+    // Routes first, so nothing is handed back while the guard comes off.
     sync_routes(t, half, &BTreeSet::new())?;
+    remove_guard(t, half)?;
     // The static neighbour goes with its interface.
     delete_host_if(t)
 }
@@ -871,7 +960,7 @@ pub struct HandbackStatus {
     pub ready: bool,
     /// The veth pair exists as built and is up.
     pub veth: bool,
-    /// The guard table is loaded.
+    /// The guard ACL is in VPP exactly as intended and bound.
     pub guard: bool,
     /// VPP's interface name, when VPP has one.
     pub vpp_if: Option<String>,
@@ -893,7 +982,11 @@ pub struct Handback {
     host: Box<dyn HostSide>,
     wanted: bool,
     facts: Option<HostFacts>,
-    check: HostCheck,
+    veth_ok: bool,
+    /// The kernel's ephemeral port range, as last read. A failed re-read
+    /// keeps it: the range changes by hand, rarely, and a guard that
+    /// flapped on every unreadable procfs read would churn the v6 rules.
+    ports: Option<PortRange>,
     vpp: Option<VppHalf>,
     /// VPP's routes are in doubt: a transport failure mid-sync may have
     /// applied an op whose acknowledgement never came. Re-read before the
@@ -918,7 +1011,8 @@ impl Handback {
             host,
             wanted: false,
             facts: None,
-            check: HostCheck::default(),
+            veth_ok: false,
+            ports: None,
             vpp: None,
             routes_in_doubt: false,
             vpp_name: None,
@@ -963,8 +1057,8 @@ impl Handback {
     pub fn ready(&self) -> bool {
         self.wanted
             && self.facts.is_some()
-            && self.check.veth
-            && self.check.guard
+            && self.veth_ok
+            && self.guard_ok()
             && self.vpp_up
             && !self.routes_in_doubt
             && !self.addrs_unknown
@@ -974,12 +1068,21 @@ impl Handback {
             }
     }
 
+    /// The guard ACL was last programmed or verified for exactly the
+    /// current addresses and port range.
+    fn guard_ok(&self) -> bool {
+        match (&self.vpp, &self.desired, self.ports) {
+            (Some(v), Some(d), Some(p)) => v.guard_for.as_ref() == Some(&(d.clone(), p)),
+            _ => false,
+        }
+    }
+
     pub fn status(&self) -> HandbackStatus {
         HandbackStatus {
             wanted: self.wanted,
             ready: self.ready(),
-            veth: self.facts.is_some() && self.check.veth,
-            guard: self.facts.is_some() && self.check.guard,
+            veth: self.facts.is_some() && self.veth_ok,
+            guard: self.guard_ok(),
             vpp_if: self.vpp.as_ref().and(self.vpp_name.clone()),
             vpp_up: self.vpp.is_some() && self.vpp_up,
             routes: self.vpp.as_ref().map_or(0, |v| v.routes.len()),
@@ -1070,14 +1173,21 @@ impl Handback {
         if check_due {
             if let Some(facts) = self.facts.clone() {
                 self.checked_at = Some(now);
-                self.check = self.host.check(&facts);
-                if !(self.check.veth && self.check.guard) {
-                    tracing::warn!(
-                        veth = self.check.veth,
-                        guard = self.check.guard,
-                        "the IPv6 hand-back path's kernel side changed under it; rebuilding"
-                    );
+                self.veth_ok = self.host.check(&facts);
+                if !self.veth_ok {
+                    tracing::warn!("the IPv6 hand-back veth changed under the path; rebuilding it");
                     self.facts = None;
+                }
+                // Re-read on the check's cadence; a failure keeps the last
+                // good range (see `ports`), and with none yet the read is
+                // retried below before anything is built on it.
+                match self.host.ephemeral_ports() {
+                    Ok(p) => self.ports = Some(p),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "could not re-read the kernel's ephemeral port range; the guard keeps \
+                         the last one"
+                    ),
                 }
             }
             let sw_if_index = self.vpp.as_ref().map(|v| v.sw_if_index);
@@ -1107,16 +1217,25 @@ impl Handback {
                             return Ok(());
                         }
                     }
+                    // And the guard, compared structurally: any drift
+                    // forgets that it was verified, which closes the gate
+                    // until the repair below.
+                    if let (Some(d), Some(p)) = (&self.desired, self.ports) {
+                        if !guard_in_place(t, v, d, p)? {
+                            tracing::warn!(
+                                "the hand-back guard ACL drifted in VPP (a rule changed, or \
+                                 it is no longer bound); repairing it"
+                            );
+                            v.guard_for = None;
+                        }
+                    }
                 }
             }
         }
         if self.facts.is_none() {
             match self.host.ensure() {
                 Ok(f) => {
-                    self.check = HostCheck {
-                        veth: true,
-                        guard: true,
-                    };
+                    self.veth_ok = true;
                     self.checked_at = Some(now);
                     self.facts = Some(f);
                     // A kernel-side failure is over the moment the kernel
@@ -1200,6 +1319,36 @@ impl Handback {
                 return Ok(());
             }
         }
+        if self.ports.is_none() {
+            match self.host.ephemeral_ports() {
+                Ok(p) => self.ports = Some(p),
+                Err(e) => {
+                    self.fail(
+                        now,
+                        format!("reading the kernel's ephemeral port range: {e}"),
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        // The guard, before any /128 moves — and even without `sync`: it is
+        // ACL state, not FIB, so an adoption's fingerprint check is not
+        // disturbed, and an intact guard is only read. Rendered from the
+        // host's addresses, which the /128s are then brought to: a new
+        // address is admitted before its route exists, a removed one is
+        // refused before its route goes.
+        if let (Some(d), Some(p), Some(v)) = (&self.desired, self.ports, self.vpp.as_mut()) {
+            if v.guard_for.as_ref() != Some(&(d.clone(), p)) {
+                match ensure_guard(t, v, d, p) {
+                    Ok(()) => {}
+                    Err(HandbackError::Transport(e)) => return Err(e),
+                    Err(other) => {
+                        self.fail(now, other.to_string());
+                        return Ok(());
+                    }
+                }
+            }
+        }
         if !sync {
             return Ok(());
         }
@@ -1266,10 +1415,10 @@ pub use kernel::KernelHostSide;
 #[cfg(target_os = "linux")]
 mod kernel {
     //! The real kernel half: rtnetlink on a blocking socket (this crate
-    //! has no async runtime), sysctls through procfs, and `nft -f -`.
+    //! has no async runtime), and sysctls and the ephemeral port range
+    //! through procfs.
 
     use std::collections::BTreeSet;
-    use std::io::Write as _;
     use std::net::{IpAddr, Ipv6Addr};
     use std::time::{Duration, Instant};
 
@@ -1285,8 +1434,8 @@ mod kernel {
     use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 
     use super::{
-        guard_matches_json, guard_matches_text, nft_ruleset, router_owned, AddrReadError, HostAddr,
-        HostCheck, HostFacts, HostSide, KERNEL_IF, NFT_TABLE, VPP_HOST_IF,
+        parse_port_range, router_owned, AddrReadError, HostAddr, HostFacts, HostSide, PortRange,
+        KERNEL_IF, VPP_HOST_IF,
     };
 
     /// `RTMGRP_IPV6_IFADDR`: the multicast group RTM_NEWADDR/RTM_DELADDR
@@ -1469,61 +1618,6 @@ mod kernel {
         std::fs::write(&path, value).map_err(|e| format!("writing {path}: {e}"))
     }
 
-    /// `nft` from the places distributions install it: a daemon's PATH
-    /// may not carry `/usr/sbin`.
-    fn nft_binary() -> &'static str {
-        ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"]
-            .into_iter()
-            .find(|p| std::path::Path::new(p).exists())
-            .unwrap_or("nft")
-    }
-
-    fn nft(args: &[&str], stdin: Option<&str>) -> Result<String, String> {
-        let mut cmd = std::process::Command::new(nft_binary());
-        cmd.args(args)
-            .stdin(if stdin.is_some() {
-                std::process::Stdio::piped()
-            } else {
-                std::process::Stdio::null()
-            })
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("running {}: {e}", nft_binary()))?;
-        if let Some(text) = stdin {
-            let mut pipe = child.stdin.take().expect("piped above");
-            pipe.write_all(text.as_bytes())
-                .map_err(|e| format!("writing the ruleset to nft: {e}"))?;
-        }
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("waiting for nft: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "nft {} exited {}: {}",
-                args.join(" "),
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
-    fn guard_listing() -> Option<String> {
-        nft(&["list", "table", "inet", NFT_TABLE], None).ok()
-    }
-
-    /// Whether the guard is loaded exactly as [`nft_ruleset`] loads it:
-    /// compared structurally from `nft -j`, or — for an `nft` built
-    /// without JSON output — line by line from the text listing.
-    fn guard_as_loaded() -> bool {
-        match nft(&["-j", "list", "table", "inet", NFT_TABLE], None) {
-            Ok(json) => guard_matches_json(&json),
-            Err(_) => guard_listing().is_some_and(|l| guard_matches_text(&l)),
-        }
-    }
-
     /// Ours: a veth named [`KERNEL_IF`] whose peer is [`VPP_HOST_IF`].
     fn find_pair(links: &[Link]) -> Result<Option<(Link, Link)>, String> {
         let k = links.iter().find(|l| l.name == KERNEL_IF);
@@ -1648,10 +1742,6 @@ mod kernel {
                     set_link(l.index, &l.name, mtu_change, true)?;
                 }
             }
-            // The guard is (re)loaded on every ensure: one atomic
-            // transaction, so re-applying it never leaves a gap.
-            nft(&["-f", "-"], Some(&nft_ruleset()))
-                .map_err(|e| format!("loading the hand-back guard: {e}"))?;
             Ok(HostFacts {
                 kernel_ifindex: k.index,
                 kernel_mac: k
@@ -1665,15 +1755,19 @@ mod kernel {
             })
         }
 
-        fn check(&mut self, facts: &HostFacts) -> HostCheck {
-            let veth = match dump_links().map(|l| find_pair(&l)) {
+        fn check(&mut self, facts: &HostFacts) -> bool {
+            match dump_links().map(|l| find_pair(&l)) {
                 Ok(Ok(Some((k, v)))) => {
                     k.index == facts.kernel_ifindex && v.index == facts.vpp_ifindex && k.up && v.up
                 }
                 _ => false,
-            };
-            let guard = guard_as_loaded();
-            HostCheck { veth, guard }
+            }
+        }
+
+        fn ephemeral_ports(&mut self) -> Result<PortRange, String> {
+            let path = "/proc/sys/net/ipv4/ip_local_port_range";
+            let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+            parse_port_range(&text)
         }
 
         fn owned_addrs(
@@ -1720,11 +1814,6 @@ mod kernel {
 
         fn teardown(&mut self) -> Result<(), String> {
             let mut errors = Vec::new();
-            if guard_listing().is_some() {
-                if let Err(e) = nft(&["delete", "table", "inet", NFT_TABLE], None) {
-                    errors.push(e);
-                }
-            }
             match dump_links().and_then(|l| find_pair(&l)) {
                 // Deleting one end deletes both.
                 Ok(Some((k, _))) => {
@@ -1747,7 +1836,7 @@ mod kernel {
     }
 }
 
-/// The non-Linux stand-in: there is no veth, rtnetlink or nftables to
+/// The non-Linux stand-in: there is no veth, rtnetlink or procfs to
 /// build the path from, so every build refuses — which keeps the v6 half
 /// of steering withheld, the safe direction — and teardown has nothing
 /// to remove.
@@ -1764,10 +1853,13 @@ impl KernelHostSide {
 #[cfg(not(target_os = "linux"))]
 impl HostSide for KernelHostSide {
     fn ensure(&mut self) -> Result<HostFacts, String> {
-        Err("the IPv6 hand-back path needs Linux (veth, rtnetlink, nftables)".into())
+        Err("the IPv6 hand-back path needs Linux (veth, rtnetlink, procfs)".into())
     }
-    fn check(&mut self, _facts: &HostFacts) -> HostCheck {
-        HostCheck::default()
+    fn check(&mut self, _facts: &HostFacts) -> bool {
+        false
+    }
+    fn ephemeral_ports(&mut self) -> Result<PortRange, String> {
+        Err("the IPv6 hand-back path needs Linux".into())
     }
     fn owned_addrs(
         &mut self,
@@ -1845,171 +1937,94 @@ mod tests {
         );
     }
 
-    /// One atomic, idempotent transaction: the table is declared, deleted
-    /// and redefined, so a re-apply replaces it with no unguarded instant.
-    /// Established/related accepted on the veth, everything else on it
-    /// dropped at input, and nothing from it forwarded.
+    /// The kernel's ephemeral range, validated at the boundary: two ports,
+    /// tab- or space-separated, `1 <= first <= last`; anything else refused
+    /// with the text it read.
     #[test]
-    fn the_guard_admits_only_established_and_forwards_nothing() {
-        let r = nft_ruleset();
-        let lines: Vec<&str> = r.lines().map(str::trim).collect();
-        assert_eq!(lines[0], "table inet packetframe_handback");
-        assert_eq!(lines[1], "delete table inet packetframe_handback");
-        assert_eq!(lines[2], "table inet packetframe_handback {");
-        let input = r.find("chain input").unwrap();
-        let forward = r.find("chain forward").unwrap();
-        let (input_body, forward_body) = (&r[input..forward], &r[forward..]);
-        let accept = input_body
-            .find("iifname \"pfpunt0\" ct state established,related accept")
-            .unwrap();
-        let drop = input_body.find("iifname \"pfpunt0\" drop").unwrap();
-        assert!(accept < drop, "the accept must precede the drop");
-        assert!(input_body.contains("hook input"));
-        assert!(forward_body.contains("hook forward"));
-        assert!(forward_body.contains("iifname \"pfpunt0\" drop"));
-        assert!(!forward_body.contains("established"));
-    }
-
-    /// `nft -j list table inet packetframe_handback` for the guard as
-    /// loaded, with a `{ruleN}` hole per rule and `{input}`/`{forward}`
-    /// for the chain headers, so each test tampers with one piece.
-    fn guard_json(input_rules: &[&str], forward_rules: &[&str], input_hdr: &str) -> String {
-        let iif =
-            r#"{"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "pfpunt0"}}"#;
-        let rule = |chain: &str, h: usize, exprs: &str| {
-            format!(
-                r#"{{"rule": {{"family": "inet", "table": "packetframe_handback", "chain": "{chain}", "handle": {h}, "expr": [{exprs}]}}}}"#
-            )
-        };
-        let mut items = vec![
-            r#"{"metainfo": {"version": "0.9.8", "release_name": "E.D.S.", "json_schema_version": 1}}"#.to_string(),
-            r#"{"table": {"family": "inet", "name": "packetframe_handback", "handle": 7}}"#.to_string(),
-            format!(
-                r#"{{"chain": {{"family": "inet", "table": "packetframe_handback", "name": "input", "handle": 1, {input_hdr}}}}}"#
-            ),
-            r#"{"chain": {"family": "inet", "table": "packetframe_handback", "name": "forward", "handle": 2, "type": "filter", "hook": "forward", "prio": 0, "policy": "accept"}}"#.to_string(),
-        ];
-        for (i, r) in input_rules.iter().enumerate() {
-            items.push(rule("input", 3 + i, &r.replace("IIF", iif)));
-        }
-        for (i, r) in forward_rules.iter().enumerate() {
-            items.push(rule("forward", 10 + i, &r.replace("IIF", iif)));
-        }
-        format!(r#"{{"nftables": [{}]}}"#, items.join(", "))
-    }
-
-    const HDR: &str = r#""type": "filter", "hook": "input", "prio": 0, "policy": "accept""#;
-    const ACCEPT_EST: &str = r#"IIF, {"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["established", "related"]}}, {"accept": null}"#;
-    const DROP: &str = r#"IIF, {"drop": null}"#;
-
-    /// The guard is recognised by its STRUCTURE: both hooked base chains
-    /// with type, hook, priority and policy as loaded, and exactly the
-    /// loaded rules in order. Every tampering that keeps the telling
-    /// substrings — an accept inserted above the drop, the rules swapped,
-    /// a priority or policy changed, a rule removed or added, the accept
-    /// widened past established/related — is not the guard.
-    #[test]
-    fn the_guard_check_compares_structure_not_substrings() {
-        assert!(guard_matches_json(&guard_json(
-            &[ACCEPT_EST, DROP],
-            &[DROP],
-            HDR
-        )));
-        // nft versions that print the state list as a set are the same guard.
-        let as_set = ACCEPT_EST.replace(
-            r#"["established", "related"]"#,
-            r#"{"set": ["related", "established"]}"#,
-        );
-        assert!(guard_matches_json(&guard_json(
-            &[&as_set, DROP],
-            &[DROP],
-            HDR
-        )));
-
-        let accept_all = r#"IIF, {"accept": null}"#;
-        let only_new = ACCEPT_EST.replace(r#"["established", "related"]"#, r#"["new"]"#);
-        for (what, json) in [
-            (
-                "an accept above the drop",
-                guard_json(&[ACCEPT_EST, accept_all, DROP], &[DROP], HDR),
-            ),
-            (
-                "rules swapped",
-                guard_json(&[DROP, ACCEPT_EST], &[DROP], HDR),
-            ),
-            (
-                "input drop removed",
-                guard_json(&[ACCEPT_EST], &[DROP], HDR),
-            ),
-            (
-                "forward drop removed",
-                guard_json(&[ACCEPT_EST, DROP], &[], HDR),
-            ),
-            (
-                "forward accepts",
-                guard_json(&[ACCEPT_EST, DROP], &[accept_all], HDR),
-            ),
-            (
-                "state widened",
-                guard_json(&[&only_new, DROP], &[DROP], HDR),
-            ),
-            (
-                "another priority",
-                guard_json(
-                    &[ACCEPT_EST, DROP],
-                    &[DROP],
-                    &HDR.replace(r#""prio": 0"#, r#""prio": 100"#),
-                ),
-            ),
-            (
-                "another hook",
-                guard_json(
-                    &[ACCEPT_EST, DROP],
-                    &[DROP],
-                    &HDR.replace(r#""hook": "input""#, r#""hook": "output""#),
-                ),
-            ),
-            (
-                "a regular chain, not hooked",
-                guard_json(
-                    &[ACCEPT_EST, DROP],
-                    &[DROP],
-                    r#""comment": "not a base chain""#,
-                ),
-            ),
+    fn the_ephemeral_range_parses_and_refuses_nonsense() {
+        assert_eq!(parse_port_range("32768\t60999\n"), Ok((32768, 60999)));
+        assert_eq!(parse_port_range("1024 1024"), Ok((1024, 1024)));
+        for bad in [
+            "",
+            "32768",
+            "60999 32768",
+            "0 100",
+            "32768 70000",
+            "a b",
+            "1 2 3",
         ] {
-            assert!(!guard_matches_json(&json), "{what} must not pass");
+            let e = parse_port_range(bad).expect_err(bad);
+            assert!(e.contains("ip_local_port_range"), "{e}");
         }
-        assert!(!guard_matches_json("not json"));
-        assert!(
-            !guard_matches_json(r#"{"nftables": []}"#),
-            "an empty table is no guard"
-        );
     }
 
-    /// The text fallback is whole-table and ordered too.
+    /// Per address: TCP with ACK set, TCP with RST set — the classic
+    /// stateless `established` test — and UDP to the ephemeral range; one
+    /// explicit deny at the end. Every rule is scoped to the address as a
+    /// /128, from any source, with the source port unconstrained, so a
+    /// pure SYN (no ACK, no RST), a NULL or FIN-only probe, and UDP to a
+    /// service port all fall to the deny.
     #[test]
-    fn the_text_fallback_compares_every_line_in_order() {
-        let listing =
-            "table inet packetframe_handback { # handle 7\n\tchain input { # handle 1\n\t\t\
-                       type filter hook input priority filter; policy accept;\n\t\tiifname \
-                       \"pfpunt0\" ct state established,related accept # handle 3\n\t\tiifname \
-                       \"pfpunt0\" drop # handle 4\n\t}\n\n\tchain forward { # handle 2\n\t\ttype \
-                       filter hook forward priority filter; policy accept;\n\t\tiifname \
-                       \"pfpunt0\" drop # handle 5\n\t}\n}\n";
-        assert!(guard_matches_text(listing));
-        let widened = listing.replace(
-            "\t\tiifname \"pfpunt0\" drop # handle 4",
-            "\t\tiifname \"pfpunt0\" accept\n\t\tiifname \"pfpunt0\" drop # handle 4",
+    fn the_guard_renders_the_established_policy_per_address() {
+        let a: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+        let b: Ipv6Addr = "2001:db8:7::7".parse().unwrap();
+        let rules = render_guard(&[a, b].into_iter().collect(), (32768, 60999));
+        assert_eq!(rules.len(), 2 * 3 + 1);
+        let dst = |r: &AclRule| crate::fib_sync::from_prefix(&r.dst_prefix).unwrap();
+        let host = |x: Ipv6Addr| IpPrefix::V6 {
+            addr: x.octets(),
+            prefix_len: 128,
+        };
+        // BTreeSet order: 2001:db8:7::7 first.
+        for (chunk, addr) in rules.chunks(3).zip([b, a]) {
+            assert!(chunk
+                .iter()
+                .all(|r| r.is_permit == ACL_ACTION_API_PERMIT && dst(r) == host(addr)));
+            assert!(chunk
+                .iter()
+                .all(|r| crate::fib_sync::from_prefix(&r.src_prefix)
+                    == Some(IpPrefix::V6 {
+                        addr: [0; 16],
+                        prefix_len: 0
+                    })
+                    && (r.srcport_or_icmptype_first, r.srcport_or_icmptype_last) == (0, u16::MAX)));
+            assert_eq!(
+                (
+                    chunk[0].proto,
+                    chunk[0].tcp_flags_mask,
+                    chunk[0].tcp_flags_value
+                ),
+                (IP_API_PROTO_TCP, TCP_FLAG_ACK, TCP_FLAG_ACK)
+            );
+            assert_eq!(
+                (
+                    chunk[1].proto,
+                    chunk[1].tcp_flags_mask,
+                    chunk[1].tcp_flags_value
+                ),
+                (IP_API_PROTO_TCP, TCP_FLAG_RST, TCP_FLAG_RST)
+            );
+            assert_eq!(
+                (
+                    chunk[2].proto,
+                    chunk[2].dstport_or_icmpcode_first,
+                    chunk[2].dstport_or_icmpcode_last,
+                    chunk[2].tcp_flags_mask
+                ),
+                (IP_API_PROTO_UDP, 32768, 60999, 0)
+            );
+        }
+        let last = rules.last().unwrap();
+        assert_eq!((last.is_permit, last.proto), (ACL_ACTION_API_DENY, 0));
+        assert_eq!(
+            crate::fib_sync::from_prefix(&last.dst_prefix),
+            Some(IpPrefix::V6 {
+                addr: [0; 16],
+                prefix_len: 0
+            })
         );
-        assert!(!guard_matches_text(&widened));
-        assert!(!guard_matches_text(&listing.replace(
-            "policy accept;\n\t\tiifname \"pfpunt0\" ct",
-            "policy drop;\n\t\tiifname \"pfpunt0\" ct"
-        )));
-        assert!(!guard_matches_text(
-            "table inet packetframe_handback {\n\tchain input {\n\t}\n}\n"
-        ));
+        // No address yet: the deny alone.
+        assert_eq!(render_guard(&BTreeSet::new(), (32768, 60999)).len(), 1);
     }
 
     /// VPP's `show interface` layout: counters beside the name row and
@@ -2067,12 +2082,11 @@ mod tests {
                 mtu: 1500,
             })
         }
-        fn check(&mut self, _facts: &HostFacts) -> HostCheck {
-            let s = self.0.lock().unwrap();
-            HostCheck {
-                veth: s.veth_ok,
-                guard: true,
-            }
+        fn check(&mut self, _facts: &HostFacts) -> bool {
+            self.0.lock().unwrap().veth_ok
+        }
+        fn ephemeral_ports(&mut self) -> Result<PortRange, String> {
+            Ok((32768, 60999))
         }
         fn owned_addrs(
             &mut self,
@@ -2103,7 +2117,7 @@ mod tests {
         assert_eq!(host.0.lock().unwrap().ensures, 1);
         let st = hb.status();
         assert!(
-            st.wanted && st.veth && st.guard && !st.vpp_up && !st.ready,
+            st.wanted && st.veth && !st.guard && !st.vpp_up && !st.ready,
             "{st:?}"
         );
         assert!(hb.built());
@@ -2114,14 +2128,18 @@ mod tests {
     #[test]
     fn a_refused_build_is_paced_and_reported() {
         let host = FakeHost::default();
-        host.0.lock().unwrap().refuse = Some("nft: not found".into());
+        host.0.lock().unwrap().refuse = Some("netlink: operation not permitted".into());
         let mut hb = Handback::new(Box::new(host.clone()));
         hb.set_wanted(true);
         let t0 = Instant::now();
         hb.service(None, t0, true).unwrap();
         hb.service(None, t0 + Duration::from_secs(1), true).unwrap();
         assert_eq!(host.0.lock().unwrap().ensures, 1, "paced");
-        assert!(hb.status().error.unwrap().contains("nft: not found"));
+        assert!(hb
+            .status()
+            .error
+            .unwrap()
+            .contains("netlink: operation not permitted"));
 
         host.0.lock().unwrap().refuse = None;
         hb.service(None, t0 + RETRY_EVERY, true).unwrap();

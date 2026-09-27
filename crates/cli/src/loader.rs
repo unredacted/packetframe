@@ -1943,12 +1943,10 @@ mod keep_vpp_tests {
         })
         .expect("nothing else to do");
         assert!(called, "the hand-back teardown ran with no state file");
-        let e = detach_vpp_offload_with(&dir, || Err("nft exited 1".into()))
+        let e = detach_vpp_offload_with(&dir, || Err("deleting pfpunt0: EPERM".into()))
             .expect_err("a leftover is reported");
         assert!(
-            e.contains("nft exited 1")
-                && e.contains("nft delete table inet packetframe_handback")
-                && e.contains("ip link del pfpunt0"),
+            e.contains("deleting pfpunt0: EPERM") && e.contains("ip link del pfpunt0"),
             "{e}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2183,9 +2181,8 @@ fn detach_vpp_offload(state_dir: &Path) -> Result<(), String> {
 #[cfg(feature = "vpp-offload")]
 fn handback_leftover(e: String) -> String {
     format!(
-        "vpp-offload: the IPv6 hand-back path could not be removed ({e}); by hand: `nft delete \
-         table inet {}` and `ip link del {}`",
-        packetframe_vpp_offload::handback::NFT_TABLE,
+        "vpp-offload: the IPv6 hand-back veth could not be removed ({e}); by hand: `ip link del \
+         {}`",
         packetframe_vpp_offload::handback::KERNEL_IF
     )
 }
@@ -2356,8 +2353,8 @@ fn detach_vpp_offload_with(
         }
     }
 
-    // The IPv6 hand-back path's kernel half — the veth pair and its nft
-    // guard. Its VPP half went with the process just killed. By name, as
+    // The IPv6 hand-back path's kernel half — the veth pair. Its VPP
+    // half, guard ACL included, went with the process just killed. By name, as
     // the daemon's own teardown does, since this process has no engine
     // and no record of it; a leftover is reported, never a reason to keep
     // the VFs bound.

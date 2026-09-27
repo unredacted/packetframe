@@ -23,8 +23,8 @@ use packetframe_vpp_offload::attach::{AttachMode, PortAttach};
 use packetframe_vpp_offload::engine::{ConvergenceEngine, RouteSource, SourceChanges};
 use packetframe_vpp_offload::fib_sync::FamilyPolicy;
 use packetframe_vpp_offload::handback::{
-    eui64_link_local, router_owned, AddrReadError, HostAddr, HostCheck, HostFacts, HostSide,
-    CHECK_EVERY, RETRY_EVERY, RT_SCOPE_UNIVERSE, VPP_HOST_IF,
+    eui64_link_local, render_guard, router_owned, AddrReadError, HostAddr, HostFacts, HostSide,
+    PortRange, ACL_TAG, CHECK_EVERY, RETRY_EVERY, RT_SCOPE_UNIVERSE, VPP_HOST_IF,
 };
 use packetframe_vpp_offload::runtime::{NoResources, NullStore, Runtime, SteerOutcome};
 
@@ -58,7 +58,12 @@ struct HostState {
     fail_reads: bool,
     /// Report a periodic re-read as due, with nothing heard.
     periodic_due: bool,
+    /// The kernel's ephemeral range, `None` for the stock one.
+    ports: Option<PortRange>,
 }
+
+/// The stock Linux ephemeral range.
+const EPHEMERAL: PortRange = (32768, 60999);
 
 impl FakeHost {
     fn with(addrs: &[(u32, &str, u8)]) -> Self {
@@ -93,11 +98,11 @@ impl HostSide for FakeHost {
             mtu: 1500,
         })
     }
-    fn check(&mut self, _facts: &HostFacts) -> HostCheck {
-        HostCheck {
-            veth: true,
-            guard: true,
-        }
+    fn check(&mut self, _facts: &HostFacts) -> bool {
+        true
+    }
+    fn ephemeral_ports(&mut self) -> Result<PortRange, String> {
+        Ok(self.0.lock().unwrap().ports.unwrap_or(EPHEMERAL))
     }
     fn owned_addrs(
         &mut self,
@@ -267,6 +272,21 @@ fn held(fake: &Fake) -> BTreeSet<Ipv6Addr> {
         .collect()
 }
 
+/// The guard as VPP holds it: the rules of the one ACL tagged ours, if it
+/// is bound — alone — as the hand-back interface's output ACL.
+fn guard_of(fake: &Fake) -> Option<Vec<packetframe_vpp_offload::vpp_api::generated::AclRule>> {
+    let st = fake.acls.lock().unwrap();
+    let ours: Vec<(&u32, &(String, Vec<_>))> = st
+        .acls
+        .iter()
+        .filter(|(_, (tag, _))| tag == ACL_TAG)
+        .collect();
+    let [(idx, (_, rules))] = ours.as_slice() else {
+        return None;
+    };
+    (st.bound.get(&AF_PACKET_BASE) == Some(&(0, vec![**idx]))).then(|| rules.clone())
+}
+
 fn position(events: &[Event], pred: impl Fn(&Event) -> bool) -> usize {
     events
         .iter()
@@ -334,6 +354,9 @@ fn a_fresh_vpp_gets_the_interface_then_the_neighbour_then_every_owned_128() {
         _ => unreachable!(),
     }
     assert!(handback_ops(&events).is_empty(), "no /128 at device attach");
+    // The guard is ACL state, not FIB, so it is in place from the attach —
+    // bound as the hand-back interface's OUTPUT ACL — before any /128.
+    assert_eq!(guard_of(&fake), Some(render_guard(&owned(), EPHEMERAL)));
     assert!(!e.handback_ready());
 
     e.service_handback(true).expect("sync");
@@ -353,6 +376,11 @@ fn a_fresh_vpp_gets_the_interface_then_the_neighbour_then_every_owned_128() {
     assert_eq!(st.vpp_if.as_deref(), Some("host-pfpunt0-vpp"));
     assert_eq!((st.routes, st.owned), (4, Some(4)));
     assert_eq!(st.tx_packets, Some(AF_PACKET_TX));
+    assert_eq!(
+        guard_of(&fake),
+        Some(render_guard(&owned(), EPHEMERAL)),
+        "the guard admits exactly the owned addresses"
+    );
 
     // The mirror's v4 is exactly what it would have been.
     assert_eq!(e.counts().installed, 3);
@@ -647,6 +675,13 @@ fn an_intact_surviving_path_is_ready_at_attach_without_touching_the_fib() {
             t.insert((a.octets(), 128), vec![p]);
         }
     }
+    {
+        let mut st = fake.acls.lock().unwrap();
+        st.acls
+            .insert(5, (ACL_TAG.into(), render_guard(&owned(), EPHEMERAL)));
+        st.next = 6;
+        st.bound.insert(AF_PACKET_BASE, (0, vec![5]));
+    }
     let host = host();
     let mut e = engine(&fake, &host);
     assert!(e.api_ready());
@@ -654,10 +689,127 @@ fn an_intact_surviving_path_is_ready_at_attach_without_touching_the_fib() {
     assert!(e.handback_ready(), "{:?}", e.handback_status());
     let events = fake.drain_events();
     assert!(handback_ops(&events).is_empty(), "nothing sent to the FIB");
-    assert!(!events.iter().any(|ev| matches!(
-        ev,
-        Event::Msg(m) if m.starts_with("af_packet_create") || m == "ip_neighbor_add_del"
-    )));
+    assert!(
+        !events.iter().any(|ev| matches!(
+            ev,
+            Event::Msg(m) if m.starts_with("af_packet_create")
+                || m == "ip_neighbor_add_del"
+                || m.starts_with("acl_add_replace ")
+                || m.starts_with("acl_interface_set_acl_list ")
+        )),
+        "the surviving guard is read, not rewritten"
+    );
+}
+
+/// The guard ACL is read back and compared structurally on every check.
+/// Each drift — a rule missing, rules reordered, the UDP range widened,
+/// the ACK rule gone, the ACL unbound, another ACL bound beside it — is
+/// found, and repaired in the same pass when VPP takes the repair; while
+/// it will not, the gate stays closed. Once it does, exactly the guard is
+/// back, in place (same ACL index), bound alone.
+#[test]
+fn every_guard_drift_closes_the_gate_and_is_repaired() {
+    let fake = Fake::start_behaving("hb-guard", behaviour());
+    let host = host();
+    let mut e = engine(&fake, &host);
+    converge(&mut e, &Mirror(1));
+    e.service_handback(true).expect("sync");
+    assert!(e.handback_ready());
+    let idx = *fake.acls.lock().unwrap().acls.keys().next().unwrap();
+
+    type Drift = fn(&mut fake_vpp::AclState, u32);
+    let drifts: [(&str, Drift); 6] = [
+        ("a rule missing", |st, i| {
+            st.acls.get_mut(&i).unwrap().1.remove(2);
+        }),
+        ("rules reordered", |st, i| {
+            st.acls.get_mut(&i).unwrap().1.swap(0, 2)
+        }),
+        ("UDP range widened", |st, i| {
+            st.acls.get_mut(&i).unwrap().1[2].dstport_or_icmpcode_first = 1;
+        }),
+        ("the ACK rule gone", |st, i| {
+            st.acls.get_mut(&i).unwrap().1.remove(0);
+        }),
+        ("unbound", |st, _| {
+            st.bound.clear();
+        }),
+        ("another ACL bound beside it", |st, i| {
+            st.acls.insert(99, ("someone-else".into(), Vec::new()));
+            st.bound.insert(AF_PACKET_BASE, (0, vec![i, 99]));
+        }),
+    ];
+    let mut at = std::time::Instant::now();
+    for (what, drift) in drifts {
+        {
+            let mut st = fake.acls.lock().unwrap();
+            drift(&mut st, idx);
+            st.refuse = true;
+        }
+        at += CHECK_EVERY;
+        e.service_handback_at(true, at).expect("check");
+        assert!(!e.handback_ready(), "{what}: the gate closes");
+        assert!(
+            e.handback_status()
+                .unwrap()
+                .error
+                .is_some_and(|m| m.contains("acl_")),
+            "{what}: the refused repair is named"
+        );
+        fake.acls.lock().unwrap().refuse = false;
+        at += RETRY_EVERY;
+        e.service_handback_at(true, at).expect("repair");
+        assert!(e.handback_ready(), "{what}: repaired");
+        assert_eq!(
+            guard_of(&fake),
+            Some(render_guard(&owned(), EPHEMERAL)),
+            "{what}"
+        );
+        assert!(
+            fake.acls.lock().unwrap().acls.contains_key(&idx),
+            "{what}: in place"
+        );
+    }
+}
+
+/// An address change rebuilds the guard in place, and around the /128s in
+/// the safe order: a new address is admitted before its route exists, a
+/// removed one refused before its route goes. A changed ephemeral range
+/// rebuilds it on the next check.
+#[test]
+fn the_guard_follows_the_addresses_and_the_port_range() {
+    let fake = Fake::start_behaving("hb-guard-follow", behaviour());
+    let host = host();
+    let mut e = engine(&fake, &host);
+    converge(&mut e, &Mirror(1));
+    e.service_handback(true).expect("sync");
+    let _ = fake.drain_events();
+
+    host.set(&[
+        (2, "2001:db8:ffff::1", RT_SCOPE_UNIVERSE),
+        (3, "2001:db8:ee::5", RT_SCOPE_UNIVERSE),
+        (4, "2001:db8:100::1", RT_SCOPE_UNIVERSE),
+        (8, "2001:db8:8::8", RT_SCOPE_UNIVERSE),
+    ]);
+    e.service_handback(true).expect("sync");
+    let events = fake.drain_events();
+    let replace = position(
+        &events,
+        |ev| matches!(ev, Event::Msg(m) if m.starts_with("acl_add_replace idx=0 ")),
+    );
+    let route_op = position(&events, |ev| matches!(ev, Event::Route(_)));
+    assert!(replace < route_op, "the guard moves before any /128");
+    let mut want = owned();
+    want.remove(&addr("2001:db8:7::7"));
+    want.insert(addr("2001:db8:8::8"));
+    assert_eq!(guard_of(&fake), Some(render_guard(&want, EPHEMERAL)));
+    assert!(e.handback_ready());
+
+    host.0.lock().unwrap().ports = Some((49152, 65535));
+    let later = std::time::Instant::now() + CHECK_EVERY;
+    e.service_handback_at(true, later).expect("check");
+    assert_eq!(guard_of(&fake), Some(render_guard(&want, (49152, 65535))));
+    assert!(e.handback_ready());
 }
 
 /// The /128s are PF-owned topology, not mirror state: a later daemon's
@@ -744,17 +896,27 @@ fn teardown_removes_both_halves() {
         .iter()
         .any(|ev| matches!(ev, Event::Msg(m) if m == &format!("af_packet_delete {VPP_HOST_IF}"))));
     assert!(fake.af_packets.lock().unwrap().is_empty());
+    let st = fake.acls.lock().unwrap();
+    assert!(
+        st.acls.is_empty() && st.bound.is_empty(),
+        "the guard is unbound and deleted"
+    );
+    drop(st);
     assert!(host.0.lock().unwrap().torn_down);
 }
 
+/// `(v6 permitted, hand-back /128s held, guard bound)` at each steer.
+type Seen = Arc<Mutex<Vec<(bool, usize, bool)>>>;
+
 /// A steering double that records, at the moment `steer` runs, whether it
 /// had been told the v6 half may go in — and how many hand-back /128s the
-/// fake held right then.
+/// fake held, and whether the guard ACL was bound, right then.
 struct GateProbe {
     ready: bool,
     rules: Vec<(String, u32)>,
-    seen: Arc<Mutex<Vec<(bool, usize)>>>,
+    seen: Seen,
     table: Arc<Mutex<fake_vpp::RouteTable6>>,
+    acls: fake_vpp::Acls,
 }
 
 impl packetframe_vpp_offload::runtime::Steering for GateProbe {
@@ -771,7 +933,16 @@ impl packetframe_vpp_offload::runtime::Steering for GateProbe {
                 *len == 128 && p.iter().any(|p| p.sw_if_index == AF_PACKET_BASE)
             })
             .count();
-        self.seen.lock().unwrap().push((self.ready, handed_back));
+        let guarded = self
+            .acls
+            .lock()
+            .unwrap()
+            .bound
+            .contains_key(&AF_PACKET_BASE);
+        self.seen
+            .lock()
+            .unwrap()
+            .push((self.ready, handed_back, guarded));
         self.rules = vec![("eth4".into(), 1)];
         Ok(SteerOutcome::Steered)
     }
@@ -794,7 +965,7 @@ impl packetframe_vpp_offload::runtime::Steering for GateProbe {
     }
 }
 
-fn runtime(fake: &Fake, host: &FakeHost, seen: &Arc<Mutex<Vec<(bool, usize)>>>) -> Runtime {
+fn runtime(fake: &Fake, host: &FakeHost, seen: &Seen) -> Runtime {
     Runtime::new(
         engine(fake, host),
         Box::new(Mirror(2)),
@@ -803,6 +974,7 @@ fn runtime(fake: &Fake, host: &FakeHost, seen: &Arc<Mutex<Vec<(bool, usize)>>>) 
             rules: Vec::new(),
             seen: seen.clone(),
             table: fake.routes6.clone(),
+            acls: fake.acls.clone(),
         }),
         Box::new(NullStore),
         Box::new(NoResources),
@@ -828,7 +1000,7 @@ fn at_the_steer_the_128s_are_in_before_the_v6_half_is_permitted() {
     fx.attach_devices().expect("attach");
     assert!(held(&fake).is_empty(), "none at attach");
     fx.steer().expect("steer");
-    assert_eq!(*seen.lock().unwrap(), vec![(true, owned().len())]);
+    assert_eq!(*seen.lock().unwrap(), vec![(true, owned().len(), true)]);
     let st = rt.status().handback.expect("wanted");
     assert!(st.ready, "{st:?}");
 }
@@ -855,7 +1027,7 @@ fn a_broken_path_holds_back_only_the_v6_half() {
     fx.attach_devices()
         .expect("a refused hand-back does not fail the attach");
     assert_eq!(fx.steer(), Ok(SteerOutcome::Steered));
-    assert_eq!(*seen.lock().unwrap(), vec![(false, 0)]);
+    assert_eq!(*seen.lock().unwrap(), vec![(false, 0, false)]);
     let st = rt.status().handback.expect("wanted");
     assert!(!st.ready && st.error.is_some(), "{st:?}");
 }

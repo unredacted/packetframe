@@ -30,6 +30,11 @@ mod wire;
 use wire::{name_for, read_frame, reply_head, request_context, write_frame};
 
 use packetframe_vpp_offload::vpp_api::generated::{
+    AclAddReplace, AclAddReplaceReply, AclDel, AclDelReply, AclDetails, AclDump,
+    AclInterfaceListDetails, AclInterfaceListDump, AclInterfaceSetAclList,
+    AclInterfaceSetAclListReply, AclRule,
+};
+use packetframe_vpp_offload::vpp_api::generated::{
     Address, AddressUnion, BridgeDomainAddDelV2, BridgeDomainAddDelV2Reply, BridgeDomainDetails,
     BridgeDomainSwIf, CliInband, CliInbandReply, ControlPingReply, CreateLoopbackInstance,
     CreateLoopbackInstanceReply, CreateLoopbackReply, CreateVlanSubif, CreateVlanSubifReply,
@@ -75,6 +80,21 @@ pub const AF_PACKET_TX: u64 = 42;
 /// The fake's af_packet host interfaces: `(host_if_name, sw_if_index,
 /// mac)`. VPP state, so it outlives a connection.
 pub type AfPackets = std::sync::Arc<std::sync::Mutex<Vec<(String, u32, [u8; 6])>>>;
+
+/// The fake's ACLs: index → `(tag, rules)`, and per interface the bound
+/// `(n_input, acls)`. VPP state, so both outlive a connection.
+#[derive(Default)]
+pub struct AclState {
+    pub acls: std::collections::BTreeMap<u32, (String, Vec<AclRule>)>,
+    pub next: u32,
+    pub bound: std::collections::BTreeMap<u32, (u8, Vec<u32>)>,
+    /// Refuse every ACL change (add/replace and binding) while set — a
+    /// repair VPP will not take.
+    pub refuse: bool,
+}
+
+/// Shared [`AclState`].
+pub type Acls = std::sync::Arc<std::sync::Mutex<AclState>>;
 
 /// One v6 neighbour: `(ip, sw_if_index, mac, flags)`.
 pub type Neighbour6 = ([u8; 16], u32, [u8; 6], u8);
@@ -171,6 +191,8 @@ pub struct Fake {
     /// The v6 neighbour table — shared so a test can play another client
     /// removing an entry behind the module's back.
     pub neighbours6: Neighbours6,
+    /// The ACL plugin's state — shared so a test can drift it.
+    pub acls: Acls,
     _dir: tempdir::TempDir,
     events: Receiver<Event>,
 }
@@ -403,6 +425,8 @@ impl Fake {
             behaviour.existing_neighbours6.to_vec(),
         ));
         let n6 = neighbours6.clone();
+        let acls: Acls = Default::default();
+        let acl_state = acls.clone();
         thread::spawn(move || {
             let mut b = behaviour;
             // VPP's neighbour table, OUTSIDE the accept loop, because it
@@ -442,6 +466,7 @@ impl Fake {
                     &table6,
                     &ip6,
                     &afp,
+                    &acl_state,
                     &mut stall,
                 );
                 // One-shot hangup: the point of that test is that a fresh
@@ -458,6 +483,7 @@ impl Fake {
             ip6_enabled,
             af_packets,
             neighbours6,
+            acls,
             _dir: dir,
             events: rx,
         }
@@ -483,6 +509,7 @@ fn serve(
     table6: &std::sync::Mutex<RouteTable6>,
     ip6_enabled: &std::sync::Mutex<std::collections::BTreeSet<u32>>,
     af_packets: &AfPackets,
+    acls: &Acls,
     stall: &mut Option<(&'static str, usize)>,
 ) -> Option<()> {
     // What `sw_interface_set_mac_address` last set, per interface. The
@@ -1133,6 +1160,134 @@ fn serve(
                     let mut det = details(idx, &format!("host-{name}"), 3, ctx);
                     det.l2_address = mac;
                     det.encode(&mut d);
+                    write_frame(sock, &d);
+                }
+                continue;
+            }
+            "acl_add_replace" => {
+                let mut d = Decoder::new(&req);
+                let r = AclAddReplace::decode(&mut d).expect("decodes as an ACL add/replace");
+                let mut st = acls.lock().unwrap();
+                let (retval, idx) = if st.refuse {
+                    (-1, r.acl_index)
+                } else if r.acl_index == u32::MAX {
+                    let idx = st.next;
+                    st.next += 1;
+                    st.acls.insert(idx, (r.tag.clone(), r.r.clone()));
+                    (0, idx)
+                } else if let Some(entry) = st.acls.get_mut(&r.acl_index) {
+                    *entry = (r.tag.clone(), r.r.clone());
+                    (0, r.acl_index)
+                } else {
+                    // VNET_API_ERROR_NO_SUCH_ENTRY.
+                    (-6, r.acl_index)
+                };
+                let _ = tx.send(Event::Msg(format!(
+                    "acl_add_replace idx={idx} rules={} tag={}",
+                    r.r.len(),
+                    r.tag
+                )));
+                out = reply_head("acl_add_replace_reply");
+                AclAddReplaceReply {
+                    context: ctx,
+                    acl_index: idx,
+                    retval,
+                }
+                .encode(&mut out);
+            }
+            "acl_del" => {
+                let mut d = Decoder::new(&req);
+                let r = AclDel::decode(&mut d).expect("decodes as an ACL delete");
+                let mut st = acls.lock().unwrap();
+                let in_use = st.bound.values().any(|(_, a)| a.contains(&r.acl_index));
+                let retval = if in_use {
+                    -142
+                } else if st.acls.remove(&r.acl_index).is_some() {
+                    0
+                } else {
+                    -6
+                };
+                let _ = tx.send(Event::Msg(format!("acl_del idx={}", r.acl_index)));
+                out = reply_head("acl_del_reply");
+                AclDelReply {
+                    context: ctx,
+                    retval,
+                }
+                .encode(&mut out);
+            }
+            "acl_dump" => {
+                let mut d = Decoder::new(&req);
+                let want = AclDump::decode(&mut d)
+                    .expect("decodes as an ACL dump")
+                    .acl_index;
+                let snapshot: Vec<(u32, (String, Vec<AclRule>))> = acls
+                    .lock()
+                    .unwrap()
+                    .acls
+                    .iter()
+                    .filter(|(i, _)| want == u32::MAX || **i == want)
+                    .map(|(i, v)| (*i, v.clone()))
+                    .collect();
+                for (idx, (tag, rules)) in snapshot {
+                    let mut d = reply_head("acl_details");
+                    AclDetails {
+                        context: ctx,
+                        acl_index: idx,
+                        tag,
+                        count: rules.len() as u32,
+                        r: rules,
+                    }
+                    .encode(&mut d);
+                    write_frame(sock, &d);
+                }
+                continue;
+            }
+            "acl_interface_set_acl_list" => {
+                let mut d = Decoder::new(&req);
+                let r = AclInterfaceSetAclList::decode(&mut d).expect("decodes as an ACL binding");
+                let mut st = acls.lock().unwrap();
+                let retval = if st.refuse { -1 } else { 0 };
+                if !st.refuse {
+                    if r.acls.is_empty() {
+                        st.bound.remove(&r.sw_if_index);
+                    } else {
+                        st.bound.insert(r.sw_if_index, (r.n_input, r.acls.clone()));
+                    }
+                }
+                let _ = tx.send(Event::Msg(format!(
+                    "acl_interface_set_acl_list if={} input={} acls={:?}",
+                    r.sw_if_index, r.n_input, r.acls
+                )));
+                out = reply_head("acl_interface_set_acl_list_reply");
+                AclInterfaceSetAclListReply {
+                    context: ctx,
+                    retval,
+                }
+                .encode(&mut out);
+            }
+            "acl_interface_list_dump" => {
+                let mut d = Decoder::new(&req);
+                let want = AclInterfaceListDump::decode(&mut d)
+                    .expect("decodes as an ACL binding dump")
+                    .sw_if_index;
+                let snapshot: Vec<(u32, (u8, Vec<u32>))> = acls
+                    .lock()
+                    .unwrap()
+                    .bound
+                    .iter()
+                    .filter(|(i, _)| want == u32::MAX || **i == want)
+                    .map(|(i, v)| (*i, v.clone()))
+                    .collect();
+                for (sw_if_index, (n_input, list)) in snapshot {
+                    let mut d = reply_head("acl_interface_list_details");
+                    AclInterfaceListDetails {
+                        context: ctx,
+                        sw_if_index,
+                        count: list.len() as u8,
+                        n_input,
+                        acls: list,
+                    }
+                    .encode(&mut d);
                     write_frame(sock, &d);
                 }
                 continue;

@@ -1415,9 +1415,10 @@ Four consequences to decide on before listing a VLAN:
   with anything the fast-path takes), so v6 forward-path firewall policy
   for those VLANs no longer applies to it.
 - **New sessions to the router are refused unless kept.** VPP hands the
-  router's own traffic back to the kernel, where the hand-back guard
-  admits only established and related traffic: replies to what the
-  router opened work, a new inbound SSH/NTP/DHCPv6 session does not.
+  router's own traffic back to the kernel through a guard ACL that
+  admits only replies (see [the guard](#the-hand-back-path)): replies to
+  what the router opened work, a new inbound SSH/NTP/DHCPv6 session does
+  not.
   Every service that must accept new inbound connections on a diverted
   VLAN or port needs a `steer-keep6`, so it never enters VPP at all. That
   is the w23 lesson in IPv6 form, refused on purpose instead of lost.
@@ -1501,27 +1502,49 @@ own traffic:
   never in the route ledger: adoption does not read them back as mirror
   routes, the resync diff does not withdraw them, verify does not sample
   them and the drift tripwire does not see them.
-- **The guard.** `table inet packetframe_handback`: on input,
-  established/related traffic arriving on `pfpunt0` is accepted and
-  everything else arriving there is dropped; on forward, nothing
-  arriving on `pfpunt0` is forwarded. Why it exists: packets arriving on
-  the veth bypass the vendor's WAN_LOCAL rules, which key on the
-  physical WAN ports — without it a new inbound connection to the
-  router over IPv6 through VPP would meet no firewall at all. With it,
-  such connections are refused by default; services that need them use
-  `steer-keep6`.
+- **The guard, in VPP.** A stateless ACL (tag `packetframe-handback`)
+  bound as `host-pfpunt0-vpp`'s **output** ACL, so it judges everything
+  VPP sends the kernel. Per router-owned address `A` — the same set the
+  /128s route, so nothing is handed back for any other destination
+  (defence in depth: Linux has no per-interface IPv6 forwarding switch):
+  1. permit TCP to `A` with **ACK** set, and
+  2. permit TCP to `A` with **RST** set — together the classic stateless
+     `established` test (the `established` keyword of Cisco and Juniper
+     ACLs): every segment of a connection the router opened, SYN+ACK
+     included;
+  3. permit UDP to `A` with a destination port in the kernel's
+     **ephemeral range** (`/proc/sys/net/ipv4/ip_local_port_range`, read
+     at setup and on every check — it covers IPv6 sockets too): client
+     sockets receiving replies (the resolver's upstream queries, an NTP
+     client);
 
-**What it needs from the box.** VPP's `af_packet_plugin.so` (the
-vpp-unifi build loads it by default; the module's API handshake names
-`af_packet_create_v3` if it is missing, whatever `v6` says), `nft` in
-`/usr/sbin`, `/sbin` or `/usr/bin`, and no foreign interface named
+  then deny everything. So a pure SYN — every new inbound TCP
+  connection to the router over diverted IPv6 — is refused, and so are
+  NULL, FIN-only and Xmas-style probes; UDP to a service port outside
+  the ephemeral range is refused too. Why it exists: what arrives on the
+  veth bypasses the vendor's WAN_LOCAL rules, which key on the physical
+  WAN ports. Why in VPP: the vendor controller flushes and rewrites the
+  kernel's iptables on every config apply, so no kernel rule would stay
+  put, while PacketFrame owns VPP outright. Two consequences: a service
+  that must accept new sessions over a diverted port needs a
+  `steer-keep6` (it then never enters VPP); and a UDP service that
+  **listens inside** the ephemeral range — an overlay VPN's listen port,
+  say — IS reachable through the hand-back, since the guard cannot tell
+  it from a client socket.
+
+**What it needs from the box.** VPP's `af_packet_plugin.so` and
+`acl_plugin.so` (the vpp-unifi build loads both by default; the
+module's API handshake names `af_packet_create_v3` or `acl_add_replace`
+if either is missing, whatever `v6` says), a readable
+`/proc/sys/net/ipv4/ip_local_port_range`, and no foreign interface named
 `pfpunt0` or `pfpunt0-vpp` — an existing one that is not PacketFrame's
-veth pair is refused by name and left untouched.
+veth pair is refused by name and left untouched. No kernel firewall rule
+is added.
 
 **The order is enforced.** The v6 half of steering — every v6 diversion
-and keep — is held back until the path is whole: veth up, guard
-loaded, VPP's interface up, and a /128 in VPP for every address the
-host holds. IPv4 steering never waits for it. On a port with IPv4 to
+and keep — is held back until the path is whole: veth up, VPP's
+interface up, the guard ACL exactly as rendered and bound, and a /128 in
+VPP for every address the host holds. IPv4 steering never waits for it. On a port with IPv4 to
 steer, IPv4 installs and the v6 half follows on its own once the path
 is ready; a port that diverts only IPv6 refuses the steer (so the want
 is kept) and the paced retry installs it once the path is ready. If the
@@ -1538,13 +1561,14 @@ hop limit 1.
 **Lifetime.** Built on the first target that diverts IPv6 (at start, or
 by the `packetframe reconfigure` that adds `v6-divert`), and kept until
 the module stops or `packetframe detach --all`, both of which remove the
-/128s, the VPP host interface, the veth and the nft table — `detach
+/128s, the guard ACL, the VPP host interface and the veth — `detach
 --all` even when no state file is left, since the veth can outlive it. A
 `--keep-vpp` restart leaves all of it in place, and the next daemon
 re-verifies it rather than trusting it: it finds the host interface by
 name (never a second socket on the veth), re-asserts its settings,
-re-adds the neighbour only if VPP lacks it, and brings the /128s to the
-host's current addresses. One side effect: the first `--keep-vpp`
+re-adds the neighbour only if VPP lacks it, reuses the guard ACL it
+finds under its tag (rewriting it in place only if it differs), and
+brings the /128s to the host's current addresses. One side effect: the first `--keep-vpp`
 restart after `v6-divert` is first enabled builds the interface on the
 adopted VPP, which can change the FIB summary the preserved ledger is
 checked against — that restart may take the dump path.
@@ -1572,10 +1596,10 @@ jq '.steer_plans[] | .[2].rules_v6' /var/lib/packetframe/state/vpp-offload.json
 
 ```bash
 # The hand-back path, kernel side: a veth whose peer is pfpunt0-vpp,
-# state UP, no global address; the guard table with both chains.
+# state UP, no global address; and the range the guard admits UDP to.
 ip -d link show pfpunt0
 ip -6 addr show dev pfpunt0
-nft list table inet packetframe_handback
+cat /proc/sys/net/ipv4/ip_local_port_range
 
 # VPP side: the host interface up, a /128 for each of the router's
 # global addresses via host-pfpunt0-vpp, the static neighbour, and the
@@ -1583,12 +1607,19 @@ nft list table inet packetframe_handback
 vppctl show interface host-pfpunt0-vpp
 vppctl show ip6 fib 2001:db8:ffff::1/128
 vppctl show ip6 neighbors host-pfpunt0-vpp
+
+# The guard: one ACL tagged packetframe-handback — per address a TCP
+# rule with "tcpflags 16 mask 16" (ACK), one with "tcpflags 4 mask 4"
+# (RST), a UDP rule with the ephemeral dport range, then one deny — bound
+# as host-pfpunt0-vpp's OUTPUT ACL and nothing else.
+vppctl show acl-plugin acl
+vppctl show acl-plugin interface
 ```
 
 `packetframe status` names the diverted ports and VLANs on the steering
 row ("IPv6 on eth4 vlan 100,200"), read from the installed plan, and
-has a `v6-handback` row: `ready — veth up, guard loaded, VPP interface
-host-pfpunt0-vpp up, N router-owned /128(s) handed back`, or Degraded
+has a `v6-handback` row: `ready — veth up, guard ACL in place, VPP
+interface host-pfpunt0-vpp up, N router-owned /128(s) handed back`, or Degraded
 with `IPv6 diversion held back` and what is missing. The metrics add
 `packetframe_vpp_handback_ready`, `packetframe_vpp_handback_routes` and
 `packetframe_vpp_handback_tx_packets` (absent until sampled).
@@ -1606,10 +1637,10 @@ cloud session) — they ride the hand-back path, and `vppctl show
 interface host-pfpunt0-vpp`'s tx counter moves with them. BGP sessions
 on diverted ports must stay Established. Then check the diversion is
 real rather than shadowed: a new TCP session to a router port you did
-**not** keep (say SSH without a keep) must fail — refused by the guard
-after the hand-back. If it succeeds, something above the diversions
-matches all of TCP (safe, but the feature is off) — or the guard is not
-loaded, which the `v6-handback` row would say.
+**not** keep (say SSH without a keep) must fail — its SYN refused by the
+guard ACL. If it succeeds, something
+above the diversions matches all of TCP (safe, but the feature is off)
+— or the guard is not in place, which the `v6-handback` row would say.
 
 ### What watches it, and what does not
 
@@ -1621,9 +1652,11 @@ type — TCP or UDP — MAC, VLAN id and mask, L4 port, the `FLOW_EXT` /
 drift: the audit compares against what may be installed, and the
 `v6-handback` row carries the reason. The hand-back path is re-checked
 every 30 s and repaired when a part has gone or changed: the veth; the
-guard, compared structurally (`nft -j`: both hooked chains with type,
-hook, priority and policy, and exactly its rules in order — any edit to
-the table counts as gone, and the table is reloaded); VPP's interface
+guard ACL, read back with the ACL plugin's dumps and compared rule for
+rule, in order, against what the current addresses and port range
+render, and checked bound alone as the output ACL (any edit, a widened
+range, an unbinding or a second ACL beside it counts as drift, and the
+ACL is rewritten in place); VPP's interface
 (one bound to a veth that no longer exists — wrong MAC, or no link — is
 deleted and recreated, never adopted); and every /128 and the static
 neighbour, read back from VPP. While a piece is being repaired the path
@@ -1647,8 +1680,9 @@ and, with no port left diverting v6, the v6 keeps. `v6-divert` on a
 `steer off` port is accepted and inert on purpose, so the one-token
 rollback never needs a second edit. The hand-back path stays built (and
 harmless: VPP is sent no IPv6 to hand back) until the module stops or
-`packetframe detach --all`; to remove it by hand:
-`nft delete table inet packetframe_handback` and `ip link del pfpunt0`.
+`packetframe detach --all`; to remove it by hand: `ip link del pfpunt0`
+(the guard ACL and the host interface go with the VPP process, or by
+`vppctl` if VPP is kept).
 Turning `v6` itself off comes after (its own rules apply there).
 
 **Before downgrading to a build without v6 steering, roll back first.**

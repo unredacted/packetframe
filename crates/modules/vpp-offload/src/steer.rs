@@ -322,10 +322,10 @@ pub enum RuleAction {
 /// destinations on the eBPF tier. That is intended: correct, and a small
 /// slice. Anything else that opens a NEW session to the router on a
 /// diverted VLAN or port (NTP 123, unicast DHCPv6 547, SSH …) is the
-/// operator's `steer-keep6`: without it VPP hands the packet back to the
-/// kernel, whose hand-back guard admits only established and related
-/// traffic ([`crate::handback`]) — the w23 lesson in IPv6 form, refused
-/// on purpose rather than lost.
+/// operator's `steer-keep6`: without it the packet reaches VPP, whose
+/// hand-back guard admits toward the kernel only replies — TCP with ACK or
+/// RST set, UDP to the kernel's ephemeral ports ([`crate::handback`]) — the
+/// w23 lesson in IPv6 form, refused on purpose rather than lost.
 pub const BUILTIN_KEEPS6: [L4Match; 4] = [
     L4Match::Port {
         proto: L4Proto::Tcp,
