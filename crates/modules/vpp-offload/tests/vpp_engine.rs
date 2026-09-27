@@ -1557,6 +1557,88 @@ fn a_local_route_installs_attached_and_shadows_the_mirror() {
     );
 }
 
+/// `loopback-address6` reaches every interface VPP could receive
+/// diverted IPv6 on — member VF, dot1q subifs (bridged and plain) and the
+/// BVI — through ONE /128 on the loopback, because each of them is
+/// unnumbered to it (VPP's source selection follows the borrow; see
+/// `attach::ensure_loopback_address6`). Asserted as the invariant:
+/// every interface carrying ip6 is unnumbered to the loopback holding the
+/// address, so a new kind of owned interface that skipped the borrow
+/// fails here rather than dropping its errors on hardware.
+#[test]
+fn loopback_address6_sources_every_owned_interface_through_the_borrow() {
+    use fake_vpp::LOOPBACK_INDEX;
+    let lo6: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+    let fake = Fake::start("lo6-owned");
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            mtu: None,
+            vlans: vec![1337, 100],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::Both,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_local_routes(vec![local_route()])
+    .with_topology(Box::new(Kernel {
+        kinds: vec![("br1337", bridge_vlan(1337))],
+        fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(1337, MAC, "eth4")])))),
+        vlans: Default::default(),
+        masters: vec![("eth4", "switch0")],
+        l3: vec![("switch0", 1337, BRIDGE_MAC)],
+    }))
+    .with_loopback6(Some(lo6));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let events = fake.drain_events();
+
+    assert_eq!(
+        fake.addresses6.lock().unwrap().get(&LOOPBACK_INDEX),
+        Some(&vec![(lo6.octets(), 128)]),
+        "one /128, on the loopback — no per-interface address"
+    );
+    assert!(
+        fake.addresses6
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|k| *k == LOOPBACK_INDEX),
+        "no owned interface holds a v6 address of its own"
+    );
+    let borrowers: std::collections::BTreeSet<u32> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Msg(m) => m
+                .strip_prefix("unnumbered if=")
+                .and_then(|rest| rest.strip_suffix(&format!(" to={LOOPBACK_INDEX} add=true")))
+                .and_then(|idx| idx.parse().ok()),
+            _ => None,
+        })
+        .collect();
+    let owned: std::collections::BTreeSet<u32> = e.ip6_interfaces().into_iter().collect();
+    // The premise: the fixture really has all three kinds.
+    for idx in [ASSIGNED_INDEX, SUBIF_BASE, SUBIF_BASE + 1, BVI_BASE] {
+        assert!(owned.contains(&idx), "fixture lacks {idx}: {owned:?}");
+    }
+    assert!(
+        owned.is_subset(&borrowers),
+        "owned interfaces not unnumbered to the loopback: {:?} (events {events:?})",
+        owned.difference(&borrowers).collect::<Vec<_>>()
+    );
+    assert_eq!(e.icmp6_source(), Some(lo6));
+}
+
 /// Kernel neighbours on the backing bridge become static neighbours on
 /// the subif of the port the FDB places them behind — that is what
 /// turns the device name the feed reports into a subif's own index.

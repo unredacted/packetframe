@@ -215,6 +215,37 @@ pub(crate) fn loopback_collision(
         })
 }
 
+/// Refuse a `loopback-address6` the kernel already holds, on any
+/// interface.
+///
+/// Not the ARP war [`loopback_collision`] guards — VPP never sees an NS
+/// for it, since ICMPv6 is never diverted — but a split owner: the
+/// loopback's /128 is a receive entry in VPP's FIB, so diverted TCP/UDP
+/// to a kernel-held address would end in VPP's local stack instead of
+/// the kernel's, and a hand-back route for the router's own addresses
+/// (one /128 per kernel-held global address) would collide with it. The
+/// address only sources errors, so it is one the host does not use.
+///
+/// Split from the `getifaddrs` read so the refusal is testable without
+/// owning the host's interfaces, like its v4 twin.
+pub(crate) fn loopback6_collision(
+    loopback: std::net::Ipv6Addr,
+    owned: &[(String, std::net::Ipv6Addr, u8)],
+) -> Option<String> {
+    owned
+        .iter()
+        .find(|(_, a, _)| *a == loopback)
+        .map(|(ifname, _, len)| {
+            format!(
+                "`loopback-address6 {loopback}` is an address the kernel already holds (on \
+                 {ifname}, /{len}). VPP's loopback would answer for it too: diverted TCP/UDP \
+                 to it would end in VPP instead of the kernel. It only sources VPP's ICMPv6 \
+                 errors, so pick a /128 from your own global space that no host interface \
+                 holds — it need not be announced on its own"
+            )
+        })
+}
+
 /// Every IPv4 address the kernel currently holds, with the interface
 /// that holds it (for the refusal message).
 ///
@@ -291,8 +322,11 @@ fn kernel_v4_ifaddrs() -> Vec<(String, packetframe_common::config::Ipv4Prefix)> 
 /// length — [`kernel_v4_ifaddrs`]'s twin, for the v6 half of the
 /// kernel-delivered classification. Degrades open the same way: an empty
 /// list classifies nothing as the router's own, which leaves such routes
-/// unresolvable and visible rather than hiding anything.
-fn kernel_v6_ifaddrs() -> Vec<(String, std::net::Ipv6Addr, u8)> {
+/// unresolvable and visible rather than hiding anything. Also the read
+/// [`loopback6_collision`] checks against, at attach and in the
+/// feasibility probe alike, where degrading open skips the check the way
+/// [`kernel_v4_addrs`] does for the v4 loopback.
+pub(crate) fn kernel_v6_ifaddrs() -> Vec<(String, std::net::Ipv6Addr, u8)> {
     let mut out = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates the list; freed below on every path
@@ -775,6 +809,12 @@ pub fn bring_up(
     if let Some(err) = loopback_collision(loopback.addr, &kernel_v4_addrs()) {
         return Err(err);
     }
+    if let Some(err) = cfg
+        .loopback_address6
+        .and_then(|a| loopback6_collision(a, &kernel_v6_ifaddrs()))
+    {
+        return Err(err);
+    }
 
     let (state, acquired) = acquire::acquire(
         &paths.sys,
@@ -836,6 +876,7 @@ pub fn bring_up(
         completeness,
         feed_session,
         loopback,
+        cfg.loopback_address6,
         &port_vlans,
         &cfg.trunk_ports,
         local_routes,
@@ -913,6 +954,7 @@ fn finish(
     completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
     feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
     loopback: packetframe_common::config::Ipv4Prefix,
+    loopback6: Option<std::net::Ipv6Addr>,
     port_vlans: &[(String, Vec<u16>)],
     trunk_ports: &[String],
     local_routes: &[crate::LocalRoute],
@@ -1350,6 +1392,7 @@ fn finish(
         .with_recorded_indices(recorded)
         .with_local_routes(local_routes)
         .with_trunk_ports(trunk_ports)
+        .with_loopback6(loopback6)
         .with_self_networks(self_nets.clone())
         .with_self_networks_v6(self_nets6.clone());
         engine.set_steer_exempts(engine_exempts.clone());
@@ -1587,6 +1630,37 @@ mod loopback_collision_tests {
         assert!(loopback_collision(Ipv4Addr::new(192, 0, 2, 254), &owned).is_none());
     }
 
+    /// `loopback-address6` on any host interface is refused, naming the
+    /// interface; an address in the same /64 that nothing holds passes.
+    #[test]
+    fn a_kernel_owned_v6_loopback_is_refused_naming_the_interface() {
+        let a = |s: &str| s.parse::<std::net::Ipv6Addr>().unwrap();
+        let owned = vec![
+            ("lo".to_string(), a("::1"), 128),
+            ("br100".to_string(), a("fe80::2"), 64),
+            ("br100".to_string(), a("2001:db8:100::1"), 64),
+        ];
+        let err = loopback6_collision(a("2001:db8:100::1"), &owned).expect("must refuse");
+        assert!(err.contains("br100") && err.contains("/64"), "{err}");
+        assert!(err.contains("kernel already holds"), "{err}");
+        assert!(loopback6_collision(a("2001:db8:100::ffff"), &owned).is_none());
+        // Inside a host prefix is not a collision — only the address itself.
+        assert!(loopback6_collision(a("2001:db8:100::2"), &owned).is_none());
+    }
+
+    /// Every host has ::1 on its loopback interface, so this smoke-tests
+    /// the v6 `getifaddrs` read the refusal and the probe share.
+    #[test]
+    fn the_kernel_v6_address_read_sees_the_loopback() {
+        let owned = kernel_v6_ifaddrs();
+        assert!(
+            owned
+                .iter()
+                .any(|(_, a, _)| *a == std::net::Ipv6Addr::LOCALHOST),
+            "getifaddrs returned {owned:?}"
+        );
+    }
+
     /// Every host has 127.0.0.1, so this smoke-tests the real
     /// `getifaddrs` read on whatever runs the suite.
     #[test]
@@ -1698,6 +1772,7 @@ mod completeness_gate_tests {
             steer_keeps6: vec![],
             v6: false,
             steer_direction: Default::default(),
+            loopback_address6: None,
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
                 prefix_len: 32,

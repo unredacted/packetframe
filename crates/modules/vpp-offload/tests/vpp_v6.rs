@@ -878,3 +878,250 @@ fn the_loop_reaches_ready_with_every_v6_route_refused() {
     assert_eq!(status.counts.v6.unwrap().rejected, 3);
     assert!(!status.counts.blocks_first_steer(), "v4 may be steered");
 }
+
+// --- `loopback-address6`: the global source for VPP's ICMPv6 errors.
+
+use fake_vpp::LOOPBACK_INDEX;
+
+/// The configured error source, RFC 3849.
+const LO6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 1);
+const LO6_OCTETS: [u8; 16] = LO6.octets();
+
+fn lo6_add(events: &[Event]) -> Vec<String> {
+    msgs(
+        events,
+        &format!("address if={LOOPBACK_INDEX} add=true 2001:db8:ffff::1/128"),
+    )
+}
+
+/// A fresh attach puts the /128 on the loopback, reads it back, and only
+/// then reports it as the error source — before any interface is
+/// unnumbered to the loopback. Without the directive nothing v6 touches
+/// the loopback and there is no source to report.
+#[test]
+fn loopback6_is_added_to_the_loopback_and_read_back_on_a_fresh_attach() {
+    let fake = Fake::start("lo6-fresh");
+    let mut e = engine(&fake, FamilyPolicy::Both).with_loopback6(Some(LO6));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let events = fake.drain_events();
+
+    assert_eq!(lo6_add(&events).len(), 1, "{events:?}");
+    assert_eq!(
+        fake.addresses6.lock().unwrap().get(&LOOPBACK_INDEX),
+        Some(&vec![(LO6_OCTETS, 128)]),
+        "VPP holds exactly the /128, on the loopback"
+    );
+    // Dump, add, dump: the second dump is the readback the source rests on.
+    let pos = |pred: &dyn Fn(&Event) -> bool| events.iter().position(pred);
+    let dumps: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, ev)| matches!(ev, Event::Msg(m) if m == "ip_address_dump"))
+        .map(|(i, _)| i)
+        .collect();
+    let add = pos(&|ev| {
+        matches!(ev, Event::Msg(m) if m.starts_with("address if=") && m.contains("2001:db8:ffff::1"))
+    })
+    .unwrap();
+    assert_eq!(dumps.len(), 2, "{events:?}");
+    assert!(dumps[0] < add && add < dumps[1], "{events:?}");
+    let first_unnumbered =
+        pos(&|ev| matches!(ev, Event::Msg(m) if m.starts_with("unnumbered if="))).unwrap();
+    assert!(add < first_unnumbered, "{events:?}");
+    // The member is unnumbered to the loopback holding it — the borrow
+    // that makes it the source on that interface.
+    assert!(
+        msgs(&events, "unnumbered if=").contains(&format!(
+            "unnumbered if={ASSIGNED_INDEX} to={LOOPBACK_INDEX} add=true"
+        )),
+        "{events:?}"
+    );
+    assert_eq!(e.icmp6_source(), Some(LO6));
+
+    // Unset: no dump, no v6 address, no source.
+    let fake = Fake::start("lo6-unset");
+    let mut e = engine(&fake, FamilyPolicy::Both);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let events = fake.drain_events();
+    assert!(msgs(&events, "ip_address_dump").is_empty(), "{events:?}");
+    assert!(
+        !events.iter().any(
+            |ev| matches!(ev, Event::Msg(m) if m.starts_with("address if=") && m.contains(':'))
+        ),
+        "{events:?}"
+    );
+    assert!(fake.addresses6.lock().unwrap().is_empty());
+    assert_eq!(e.icmp6_source(), None);
+}
+
+/// Adopting a surviving VPP whose loopback already holds the /128 reads
+/// it back and sends nothing else — a re-add would answer
+/// DUPLICATE_IF_ADDRESS, indistinguishable from a real conflict.
+#[test]
+fn an_adopted_loopback_holding_the_address_is_verified_not_rewritten() {
+    static HELD: [([u8; 16], u8); 1] = [(LO6_OCTETS, 128)];
+    let fake = Fake::start_behaving(
+        "lo6-adopt",
+        Behaviour {
+            existing_loopback6: Some(&HELD),
+            ..Default::default()
+        },
+    );
+    let mut e = engine(&fake, FamilyPolicy::Both).with_loopback6(Some(LO6));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh)
+        .expect("adopting an intact loopback");
+    let events = fake.drain_events();
+    // The premise: the loopback was FOUND, not created.
+    assert!(msgs(&events, "create_loopback").is_empty(), "{events:?}");
+    assert_eq!(msgs(&events, "ip_address_dump").len(), 1, "{events:?}");
+    assert!(lo6_add(&events).is_empty(), "{events:?}");
+    assert_eq!(e.icmp6_source(), Some(LO6));
+}
+
+/// A previous daemon that died between creating the loopback and adding
+/// the /128 leaves a loopback without it. Adoption finds that by reading
+/// back, and repairs it rather than trusting the loopback's name.
+#[test]
+fn an_adopted_loopback_missing_the_address_is_repaired() {
+    static NONE: [([u8; 16], u8); 0] = [];
+    let fake = Fake::start_behaving(
+        "lo6-repair",
+        Behaviour {
+            existing_loopback6: Some(&NONE),
+            ..Default::default()
+        },
+    );
+    let mut e = engine(&fake, FamilyPolicy::Both).with_loopback6(Some(LO6));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let events = fake.drain_events();
+    assert!(msgs(&events, "create_loopback").is_empty(), "{events:?}");
+    assert_eq!(lo6_add(&events).len(), 1, "{events:?}");
+    assert_eq!(
+        fake.addresses6.lock().unwrap().get(&LOOPBACK_INDEX),
+        Some(&vec![(LO6_OCTETS, 128)])
+    );
+    assert_eq!(e.icmp6_source(), Some(LO6));
+}
+
+/// Any other IPv6 address on the loopback refuses the attach, naming it:
+/// VPP would source some errors from it (longest match per destination).
+/// Nothing is added beside it, and no source is reported.
+#[test]
+fn a_foreign_v6_address_on_the_loopback_refuses_the_attach() {
+    static FOREIGN: [([u8; 16], u8); 1] = [(
+        Ipv6Addr::new(0x2001, 0xdb8, 0xeeee, 0, 0, 0, 0, 1).octets(),
+        128,
+    )];
+    let fake = Fake::start_behaving(
+        "lo6-foreign",
+        Behaviour {
+            existing_loopback6: Some(&FOREIGN),
+            ..Default::default()
+        },
+    );
+    let mut e = engine(&fake, FamilyPolicy::Both).with_loopback6(Some(LO6));
+    assert!(e.api_ready());
+    let err = e
+        .attach_devices(AttachMode::Fresh)
+        .expect_err("a foreign address must refuse")
+        .to_string();
+    assert!(err.contains("2001:db8:eeee::1/128"), "{err}");
+    assert!(err.contains("detach --all"), "{err}");
+    assert!(lo6_add(&fake.drain_events()).is_empty());
+    assert_eq!(e.icmp6_source(), None);
+}
+
+/// VPP acknowledging the add is not VPP holding the address: a readback
+/// that does not find it refuses the attach, and reports no source.
+#[test]
+fn an_acknowledged_add_the_readback_cannot_find_refuses_the_attach() {
+    let fake = Fake::start_behaving(
+        "lo6-ghost",
+        Behaviour {
+            drop_v6_address_adds: true,
+            ..Default::default()
+        },
+    );
+    let mut e = engine(&fake, FamilyPolicy::Both).with_loopback6(Some(LO6));
+    assert!(e.api_ready());
+    let err = e
+        .attach_devices(AttachMode::Fresh)
+        .expect_err("an unheld address must refuse")
+        .to_string();
+    assert!(err.contains("does not report holding it"), "{err}");
+    assert_eq!(e.icmp6_source(), None);
+}
+
+/// The source is an observation about ONE VPP: it goes with the process,
+/// and the next attach establishes it again by reading back.
+#[test]
+fn the_error_source_goes_with_the_process() {
+    let fake = Fake::start("lo6-gone");
+    let mut e = engine(&fake, FamilyPolicy::Both).with_loopback6(Some(LO6));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    assert_eq!(e.icmp6_source(), Some(LO6));
+    e.on_process_gone();
+    assert_eq!(
+        e.icmp6_source(),
+        None,
+        "the loopback it was read from is gone"
+    );
+}
+
+/// Through the whole loop to `Ready`: the runtime's status carries the
+/// read-back source to the health surface.
+#[test]
+fn the_runtime_status_reports_the_read_back_source() {
+    use packetframe_vpp_offload::driver::Driver;
+    use std::time::{Duration, Instant};
+
+    let fake = Fake::start_behaving(
+        "lo6-loop",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let rt = Runtime::new(
+        engine(&fake, FamilyPolicy::Both).with_loopback6(Some(LO6)),
+        Box::new(DualStack::new(2, 2)),
+        Box::new(SteeringUnavailable),
+        Box::new(NullStore),
+        Box::new(NoResources),
+        "/usr/bin/vpp",
+        "/tmp/startup.conf",
+    );
+    assert_eq!(rt.status().icmp6_source, None, "nothing read back yet");
+    let mut d = Driver::new();
+    let mut now = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(now, SupEvent::Adopted { steered: false }, &mut fx);
+    }
+    let (mut obs, mut fx) = rt.views();
+    for _ in 0..256 {
+        if d.state() == State::Ready {
+            break;
+        }
+        let t = d.tick(now, &mut obs, &mut fx);
+        for ev in rt.take_pending() {
+            d.inject(now, ev, &mut fx);
+        }
+        now += t
+            .sleep
+            .unwrap_or(Duration::from_millis(100))
+            .max(Duration::from_millis(1));
+    }
+    assert_eq!(d.state(), State::Ready);
+    assert_eq!(rt.status().icmp6_source, Some(LO6));
+}

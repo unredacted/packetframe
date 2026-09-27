@@ -1405,6 +1405,7 @@ fn run_loop(
                 unreadable: rs.steer_audit_error.clone(),
                 v6_outbound: rs.steer_v6_outbound.clone(),
                 v6_only: rs.steer_v6_only,
+                icmp6_source: rs.icmp6_source,
             },
             rs.shadowed_routes,
             rs.kernel_delivered_routes,

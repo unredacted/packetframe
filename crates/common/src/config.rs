@@ -261,6 +261,25 @@ pub enum ModuleDirective {
     /// it is also what sources ICMP, so PMTUD's frag-needed is only
     /// correct if an operator chose it deliberately.
     VppLoopbackAddress(Ipv4Prefix),
+    /// `loopback-address6 <ipv6-address>` — a global IPv6 address VPP's
+    /// loopback holds as a /128, beside `loopback-address`, so the
+    /// ICMPv6 errors VPP originates for traffic it forwards (Time
+    /// Exceeded, Packet Too Big, Destination Unreachable) have a source.
+    ///
+    /// Without it an owned interface has only its link-local, and VPP
+    /// v26.06's error node DROPS the error rather than sending it from
+    /// there: `ip6_sas_by_sw_if_index` finds no global address and
+    /// `ip6-icmp-error` sends to error-drop. The members, subifs and
+    /// BVIs are already unnumbered to the loopback, and unnumbered covers
+    /// both families, so one /128 there sources every owned interface.
+    ///
+    /// Must be global unicast (2000::/3): an error sourced from a
+    /// link-local, ULA or other scoped address is dropped off-link or at
+    /// the first bogon filter. Requires `v6 on`. Must not be an address
+    /// the host holds (refused at attach): VPP's loopback would answer for
+    /// it too, so diverted TCP/UDP to it would end in VPP instead of the
+    /// kernel. Restart-only, like `loopback-address`.
+    VppLoopbackAddress6(Ipv6Addr),
     /// `steer-exempt <ip>/<len>` — a destination whose traffic stays on
     /// the kernel path while steering is on, installed as a
     /// higher-priority MCAM rule delivering to the PF. Repeatable.
@@ -1415,6 +1434,40 @@ pub fn is_harvestable_v6(a: Ipv6Addr) -> bool {
     true
 }
 
+/// Why `a` is not global unicast, or `None` if it is — the screen for
+/// `loopback-address6`.
+///
+/// A whitelist (2000::/3, the only range IANA allocates global unicast
+/// from) rather than a list of bad classes, so an address class nobody
+/// listed is refused instead of accepted. The named arms exist only to
+/// make the refusal say what the operator pasted. ULA is refused with
+/// the rest, unlike in [`is_harvestable_v6`]: there it names an internal
+/// segment, here it would source packets to arbitrary hosts, and
+/// `fc00::/7` is filtered as a bogon long before it gets there.
+/// Hand-rolled on the octets for the reason `is_harvestable_v6` gives.
+pub fn non_global_unicast_v6(a: Ipv6Addr) -> Option<&'static str> {
+    let o = a.octets();
+    if a.is_unspecified() {
+        return Some("the unspecified address");
+    }
+    if a.is_loopback() {
+        return Some("the loopback address");
+    }
+    if o[0] == 0xff {
+        return Some("multicast (ff00::/8)");
+    }
+    if o[0] == 0xfe && (o[1] & 0xc0) == 0x80 {
+        return Some("link-local (fe80::/10)");
+    }
+    if o[0] & 0xfe == 0xfc {
+        return Some("unique-local (fc00::/7), which is not globally routable");
+    }
+    if o[0] & 0xe0 != 0x20 {
+        return Some("outside global unicast (2000::/3)");
+    }
+    None
+}
+
 /// The address classes [`is_harvestable_v6`] rejects, as prefixes, so a
 /// `local-prefix6` declaration can be screened for overlap at parse
 /// time. Paired with the operator-facing reason.
@@ -1796,6 +1849,39 @@ impl Config {
             })
             .next_back()
             .unwrap_or(false);
+        // `loopback-address6`: one, and only under `v6 on`. A second line
+        // is refused rather than last-wins because the loopback holds
+        // exactly one error source and the operator meant one of them;
+        // `v6 off` is refused because nothing would program it — no ip6
+        // anywhere in VPP — so the line would sit in the file reading as
+        // configured.
+        let loopbacks6: Vec<&Ipv6Addr> = vpp
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::VppLoopbackAddress6(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        if loopbacks6.len() > 1 {
+            return Err(ConfigError::parse(
+                0,
+                format!(
+                    "module vpp-offload has {} `loopback-address6` lines; the loopback holds \
+                     one IPv6 error source — keep one",
+                    loopbacks6.len()
+                ),
+            ));
+        }
+        if let (Some(a), false) = (loopbacks6.first(), v6_on) {
+            return Err(ConfigError::parse(
+                0,
+                format!(
+                    "`loopback-address6 {a}` needs `v6 on`: without it VPP carries no IPv6 and \
+                     the address would never be programmed. Add `v6 on`, or drop the line"
+                ),
+            ));
+        }
         for d in &vpp.directives {
             let ModuleDirective::VppPort {
                 iface,
@@ -3748,6 +3834,36 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 .parse()
                 .map_err(|e: String| format!("loopback-address: {e}"))?;
             Ok(ModuleDirective::VppLoopbackAddress(p))
+        }),
+        "loopback-address6" => parse_single_arg(line, rest, "loopback-address6", |t| {
+            // One address, programmed as a /128. A trailing `/128` is
+            // accepted because that is how `ip -6 addr` prints a host
+            // address; any other length is refused rather than truncated,
+            // since a wider prefix on the loopback would install a
+            // connected route VPP answers the whole prefix from.
+            let (addr, len) = match t.split_once('/') {
+                Some((a, l)) => (a, Some(l)),
+                None => (t, None),
+            };
+            if let Some(l) = len {
+                if l != "128" {
+                    return Err(format!(
+                        "takes one address (programmed as /128), not a /{l} prefix"
+                    ));
+                }
+            }
+            let a: Ipv6Addr = addr
+                .parse()
+                .map_err(|_| format!("`{t}` is not an IPv6 address"))?;
+            if let Some(why) = non_global_unicast_v6(a) {
+                return Err(format!(
+                    "{a} is {why}; it sources the ICMPv6 errors VPP sends to the hosts \
+                     whose packets it forwards, so it must be global unicast (2000::/3) \
+                     from space you announce — anything else is dropped off-link or by the \
+                     first bogon filter, which is the failure this directive exists to fix"
+                ));
+            }
+            Ok(ModuleDirective::VppLoopbackAddress6(a))
         }),
         "local-route" => {
             // local-route <v4-cidr> port <iface> vlan <vid>
@@ -6749,6 +6865,79 @@ module vpp-offload
             let s = format!("module vpp-offload\n  v6 {bad}\n");
             assert!(Config::parse(&s).is_err(), "`v6 {bad}` must be refused");
         }
+    }
+
+    /// `loopback-address6` takes one global unicast address, bare or as
+    /// `/128`, and refuses every class an ICMPv6 error could not be
+    /// sourced from — each refusal naming the class, so an operator who
+    /// pasted a link-local from `ip -6 addr` learns why.
+    #[test]
+    fn loopback_address6_accepts_global_unicast_only() {
+        let parse = |v: &str| {
+            Config::parse(&format!("module vpp-offload\n  loopback-address6 {v}\n"))
+                .map(|c| c.modules[0].directives[0].clone())
+                .map_err(|e| e.to_string())
+        };
+        let want = ModuleDirective::VppLoopbackAddress6("2001:db8::1".parse().unwrap());
+        assert_eq!(parse("2001:db8::1").unwrap(), want);
+        assert_eq!(parse("2001:db8::1/128").unwrap(), want);
+        // The edges of 2000::/3.
+        assert!(parse("2000::1").is_ok());
+        assert!(parse("3fff:ffff::1").is_ok());
+
+        for (bad, class) in [
+            ("fe80::1", "link-local"),
+            ("ff02::1", "multicast"),
+            ("fd00:db8::1", "unique-local"),
+            ("fc00::1", "unique-local"),
+            ("::", "unspecified"),
+            ("::1", "loopback"),
+            // Outside 2000::/3 and in none of the named classes: the
+            // whitelist refuses what nobody listed.
+            ("::ffff:192.0.2.1", "outside global unicast"),
+            ("4000::1", "outside global unicast"),
+            ("fec0::1", "outside global unicast"),
+        ] {
+            let e = parse(bad).expect_err(bad);
+            assert!(
+                e.contains(class),
+                "`{bad}` should be refused as {class}: {e}"
+            );
+        }
+        for bad in ["2001:db8::1/64", "2001:db8::/48", "192.0.2.1", "nope", ""] {
+            assert!(parse(bad).is_err(), "should reject `{bad}`");
+        }
+        assert!(
+            Config::parse("module vpp-offload\n  loopback-address6 2001:db8::1 2001:db8::2\n")
+                .is_err()
+        );
+    }
+
+    /// Cross-validation: `loopback-address6` needs `v6 on` and may appear
+    /// once.
+    #[test]
+    fn loopback_address6_needs_v6_on_and_appears_once() {
+        let base = "module fast-path\n  forwarding-mode custom-fib\n  attach eth3 generic\n  \
+                    allow-prefix 192.0.2.0/24\n\n\
+                    module vpp-offload\n  loopback-address 198.51.100.254/32\n  \
+                    port eth3 cores 1 steer off\n";
+        let check = |body: &str| {
+            Config::parse(&format!("{base}{body}"))
+                .unwrap()
+                .validate_vpp_offload()
+                .map_err(|e| format!("{e}"))
+        };
+        check("  v6 on\n  loopback-address6 2001:db8::1\n").unwrap();
+
+        let e = check("  loopback-address6 2001:db8::1\n").unwrap_err();
+        assert!(e.contains("needs `v6 on`"), "{e}");
+        let e = check("  v6 off\n  loopback-address6 2001:db8::1\n").unwrap_err();
+        assert!(e.contains("needs `v6 on`"), "{e}");
+
+        let e =
+            check("  v6 on\n  loopback-address6 2001:db8::1\n  loopback-address6 2001:db8::2\n")
+                .unwrap_err();
+        assert!(e.contains("2 `loopback-address6` lines"), "{e}");
     }
 
     #[test]

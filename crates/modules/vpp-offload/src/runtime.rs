@@ -1989,6 +1989,7 @@ impl Runtime {
                 let plan = c.steering.installed_plan();
                 !v6_outbound_summary(&plan).is_empty() && !installs_v4_diversion(&plan)
             },
+            icmp6_source: c.engine.icmp6_source(),
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
@@ -2214,6 +2215,11 @@ pub struct RuntimeStatus {
     /// allowlist beside `v6-outbound`), so the steering row must not
     /// claim allowlisted IPv4 is diverted. See [`installs_v4_diversion`].
     pub steer_v6_only: bool,
+    /// The global address VPP sources ICMPv6 errors from, as read back
+    /// on its loopback ([`ConvergenceEngine::icmp6_source`]). `None`
+    /// while `steer_v6_outbound` is non-empty means diverted IPv6 gets no
+    /// Time Exceeded or Packet Too Big from VPP at all.
+    pub icmp6_source: Option<std::net::Ipv6Addr>,
     /// Changes the source is holding that the engine has not pulled yet.
     ///
     /// Distinct from `pending_ops`, which is what the engine has pulled

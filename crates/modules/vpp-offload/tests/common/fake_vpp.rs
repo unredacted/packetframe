@@ -45,8 +45,9 @@ use packetframe_vpp_offload::vpp_api::generated::{
     ADDRESS_IP4, ADDRESS_IP6, FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
 };
 use packetframe_vpp_offload::vpp_api::generated::{
-    IpRouteDump, SwInterfaceIp6EnableDisable, SwInterfaceIp6EnableDisableReply,
-    SwInterfaceIp6ndRaConfig, SwInterfaceIp6ndRaConfigReply,
+    IpAddressDetails, IpAddressDump, IpRouteDump, SwInterfaceAddDelAddress,
+    SwInterfaceIp6EnableDisable, SwInterfaceIp6EnableDisableReply, SwInterfaceIp6ndRaConfig,
+    SwInterfaceIp6ndRaConfigReply, SwInterfaceSetUnnumbered,
 };
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
@@ -148,6 +149,10 @@ pub struct Fake {
     /// Interfaces VPP has ip6 enabled on — VPP state, so it outlives a
     /// connection like the route and neighbour tables.
     pub ip6_enabled: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>>,
+    /// IPv6 interface addresses per `sw_if_index` — VPP state, so it
+    /// outlives a connection. See the `sw_interface_add_del_address`
+    /// handler for what is and is not modelled.
+    pub addresses6: std::sync::Arc<std::sync::Mutex<Addresses6>>,
     _dir: tempdir::TempDir,
     events: Receiver<Event>,
 }
@@ -278,7 +283,20 @@ pub struct Behaviour {
     /// applying it — a VPP that will not take some v6 route, whatever the
     /// reason, which must never stall IPv4's convergence.
     pub reject_v6_routes: bool,
+    /// A router loopback a surviving VPP already has: `sw_interface_dump`
+    /// lists `loop0` at `LOOPBACK_INDEX`, holding these IPv6 addresses
+    /// `(octets, len)` — the adoption shape for `loopback-address6`.
+    /// `None` keeps the loopback out of the dump, which every older test
+    /// relies on (each attach creates it afresh).
+    pub existing_loopback6: Option<&'static [([u8; 16], u8)]>,
+    /// Acknowledge IPv6 address adds with retval 0 WITHOUT applying them,
+    /// so a readback finds nothing — the acknowledged-but-absent shape.
+    pub drop_v6_address_adds: bool,
 }
+
+/// The fake's IPv6 interface-address table: `sw_if_index` → `(octets,
+/// len)`, in the order added.
+pub type Addresses6 = std::collections::BTreeMap<u32, Vec<([u8; 16], u8)>>;
 
 /// One `Behaviour::existing_via` route:
 /// `(addr, len, nexthop, sw_if_index, weight)`.
@@ -368,6 +386,14 @@ impl Fake {
         let ip6_enabled: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
             Default::default();
         let ip6 = ip6_enabled.clone();
+        let addresses6: std::sync::Arc<std::sync::Mutex<Addresses6>> = Default::default();
+        if let Some(held) = behaviour.existing_loopback6 {
+            addresses6
+                .lock()
+                .unwrap()
+                .insert(LOOPBACK_INDEX, held.to_vec());
+        }
+        let addrs6 = addresses6.clone();
         thread::spawn(move || {
             let mut b = behaviour;
             // VPP's neighbour table, OUTSIDE the accept loop, because it
@@ -407,6 +433,7 @@ impl Fake {
                     &table,
                     &table6,
                     &ip6,
+                    &addrs6,
                     &mut stall,
                 );
                 // One-shot hangup: the point of that test is that a fresh
@@ -421,6 +448,7 @@ impl Fake {
             routes,
             routes6,
             ip6_enabled,
+            addresses6,
             _dir: dir,
             events: rx,
         }
@@ -445,6 +473,7 @@ fn serve(
     table: &std::sync::Mutex<RouteTable>,
     table6: &std::sync::Mutex<RouteTable6>,
     ip6_enabled: &std::sync::Mutex<std::collections::BTreeSet<u32>>,
+    addresses6: &std::sync::Mutex<Addresses6>,
     stall: &mut Option<(&'static str, usize)>,
 ) -> Option<()> {
     // What `sw_interface_set_mac_address` last set, per interface. The
@@ -1063,6 +1092,11 @@ fn serve(
                 }
                 det.encode(&mut d);
                 write_frame(sock, &d);
+                if behaviour.existing_loopback6.is_some() {
+                    let mut d = reply_head("sw_interface_details");
+                    details(LOOPBACK_INDEX, "loop0", 1, ctx).encode(&mut d);
+                    write_frame(sock, &d);
+                }
                 if let Some((vid, idx, mac)) = behaviour.existing_bvi {
                     let mut d = reply_head("sw_interface_details");
                     let mut det = details(idx, &format!("loop{vid}"), 1, ctx);
@@ -1117,16 +1151,88 @@ fn serve(
                 continue;
             }
             "sw_interface_add_del_address" => {
+                let mut d = Decoder::new(&req);
+                let r = SwInterfaceAddDelAddress::decode(&mut d).expect("decodes as an address op");
+                let addr = packetframe_vpp_offload::fib_sync::from_address(&r.prefix.address)
+                    .expect("an address op names a v4 or v6 address");
+                let _ = tx.send(Event::Msg(format!(
+                    "address if={} add={} {addr}/{}",
+                    r.sw_if_index, r.is_add, r.prefix.len
+                )));
+                // IPv6 only, and adds only: VPP v26.06's conflict scan
+                // (`ip6_add_del_interface_address`) answers an identical
+                // re-add DUPLICATE_IF_ADDRESS (-127), as it does an
+                // overlapping prefix on another interface — modelled
+                // here as "the same address anywhere". IPv4 adds are
+                // acknowledged and not tracked, as they always were:
+                // every older test re-creates the loopback on a
+                // reconnect and re-adds its v4 address, which real VPP
+                // would refuse -105 on a surviving process — a gap this
+                // fake keeps (see `adopt_loopback`).
+                let retval = match (addr, r.is_add) {
+                    (IpAddr::V6(a), true) => {
+                        let key = (a.octets(), r.prefix.len);
+                        let mut table = addresses6.lock().unwrap();
+                        if table.values().flatten().any(|(o, _)| *o == key.0) {
+                            -127
+                        } else {
+                            if !behaviour.drop_v6_address_adds {
+                                table.entry(r.sw_if_index).or_default().push(key);
+                            }
+                            0
+                        }
+                    }
+                    _ => 0,
+                };
                 let mut out = reply_head("sw_interface_add_del_address_reply");
                 SwInterfaceAddDelAddressReply {
                     context: ctx,
-                    retval: 0,
+                    retval,
                 }
                 .encode(&mut out);
                 write_frame(sock, &out);
                 continue;
             }
+            "ip_address_dump" => {
+                let mut d = Decoder::new(&req);
+                let r = IpAddressDump::decode(&mut d).expect("decodes as an address dump");
+                // The v6 table only: nothing in this module dumps v4
+                // addresses, and answering empty for them is what a VPP
+                // would say of an interface with none.
+                if r.is_ipv6 {
+                    let held = addresses6
+                        .lock()
+                        .unwrap()
+                        .get(&r.sw_if_index)
+                        .cloned()
+                        .unwrap_or_default();
+                    for (octets, len) in held {
+                        let mut d = reply_head("ip_address_details");
+                        IpAddressDetails {
+                            context: ctx,
+                            sw_if_index: r.sw_if_index,
+                            prefix: Prefix {
+                                address: Address {
+                                    af: ADDRESS_IP6,
+                                    un: AddressUnion(octets),
+                                },
+                                len,
+                            },
+                        }
+                        .encode(&mut d);
+                        write_frame(sock, &d);
+                    }
+                }
+                continue;
+            }
             "sw_interface_set_unnumbered" => {
+                let mut d = Decoder::new(&req);
+                let r =
+                    SwInterfaceSetUnnumbered::decode(&mut d).expect("decodes as an unnumbered op");
+                let _ = tx.send(Event::Msg(format!(
+                    "unnumbered if={} to={} add={}",
+                    r.unnumbered_sw_if_index, r.sw_if_index, r.is_add
+                )));
                 let mut out = reply_head("sw_interface_set_unnumbered_reply");
                 SwInterfaceSetUnnumberedReply {
                     context: ctx,
