@@ -1035,6 +1035,67 @@ fn a_foreign_v6_address_on_the_loopback_refuses_the_attach() {
     assert_eq!(e.icmp6_source(), None);
 }
 
+/// The loopback's link-local, should VPP ever list one in the dump
+/// (source says it will not; hardware has not answered yet), is neither
+/// foreign nor the configured address: beside the /128 it changes
+/// nothing — the attach proceeds and sends no add.
+#[test]
+fn a_link_local_beside_the_address_is_ignored() {
+    static HELD: [([u8; 16], u8); 2] = [
+        (
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x11).octets(),
+            128,
+        ),
+        (LO6_OCTETS, 128),
+    ];
+    let fake = Fake::start_behaving(
+        "lo6-ll-held",
+        Behaviour {
+            existing_loopback6: Some(&HELD),
+            ..Default::default()
+        },
+    );
+    let mut e = engine(&fake, FamilyPolicy::Both).with_loopback6(Some(LO6));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh)
+        .expect("a link-local on the loopback must not refuse the attach");
+    let events = fake.drain_events();
+    assert!(msgs(&events, "create_loopback").is_empty(), "{events:?}");
+    assert!(lo6_add(&events).is_empty(), "{events:?}");
+    assert_eq!(e.icmp6_source(), Some(LO6));
+}
+
+/// A link-local alone is a loopback WITHOUT the configured address: the
+/// /128 is added beside it and read back, and the link-local stays.
+#[test]
+fn a_link_local_alone_is_not_the_address_and_the_address_is_added() {
+    const LL: [u8; 16] = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x11).octets();
+    static HELD: [([u8; 16], u8); 1] = [(LL, 128)];
+    let fake = Fake::start_behaving(
+        "lo6-ll-only",
+        Behaviour {
+            existing_loopback6: Some(&HELD),
+            ..Default::default()
+        },
+    );
+    let mut e = engine(&fake, FamilyPolicy::Both).with_loopback6(Some(LO6));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let events = fake.drain_events();
+    assert!(msgs(&events, "create_loopback").is_empty(), "{events:?}");
+    assert_eq!(lo6_add(&events).len(), 1, "{events:?}");
+    assert_eq!(
+        msgs(&events, "ip_address_dump").len(),
+        2,
+        "dump, add, read back: {events:?}"
+    );
+    assert_eq!(
+        fake.addresses6.lock().unwrap().get(&LOOPBACK_INDEX),
+        Some(&vec![(LL, 128), (LO6_OCTETS, 128)])
+    );
+    assert_eq!(e.icmp6_source(), Some(LO6));
+}
+
 /// VPP acknowledging the add is not VPP holding the address: a readback
 /// that does not find it refuses the attach, and reports no source.
 #[test]

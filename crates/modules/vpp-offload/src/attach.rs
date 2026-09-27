@@ -762,7 +762,8 @@ pub fn create_loopback(t: &mut Transport, addr: Ipv4Prefix) -> Result<u32, Attac
 /// fresh loopback and an adopted one: absent is added, present is left
 /// alone, and anything else is refused.
 ///
-/// **Any other global v6 address on the loopback is refused**, not left
+/// **Any other non-link-local v6 address on the loopback is refused**
+/// (link-locals are ignored outright — [`v6_addresses`] says why), not left
 /// beside ours: `ip6_sas_by_sw_if_index` chooses among them by longest
 /// match per destination, so a foreign one would source some errors and
 /// not others. Nothing in this module adds one — a changed
@@ -844,7 +845,19 @@ pub fn ensure_loopback_address6(
     Ok(())
 }
 
-/// The IPv6 addresses VPP reports on `sw_if_index`, as `(addr, len)`.
+/// The non-link-local IPv6 addresses VPP reports on `sw_if_index`, as
+/// `(addr, len)`.
+///
+/// **Link-locals (fe80::/10) are dropped here, before anything judges the
+/// list.** VPP v26.06 keeps the link-local outside the address pool this
+/// dump walks (`il_ll_addr`, `src/vnet/ip/ip6_link.c`), so none should
+/// appear — but that is a reading of the source, not an observation, and
+/// the cost of being wrong would be every attach refused over a "foreign"
+/// address that is only the loopback's own link-local (adding the /128
+/// enables `ip6_link` on it). A link-local can be neither the configured
+/// address (config accepts only 2000::/3) nor an error source for an
+/// off-link destination (`ip6_sas_by_sw_if_index` answers those from the
+/// pool alone), so ignoring it loses nothing.
 fn v6_addresses(
     t: &mut Transport,
     sw_if_index: u32,
@@ -863,6 +876,7 @@ fn v6_addresses(
                 d.prefix.len,
             )
         })
+        .filter(|(a, _)| !a.is_unicast_link_local())
         .collect())
 }
 
