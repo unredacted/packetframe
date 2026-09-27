@@ -1244,7 +1244,11 @@ Three consequences to decide on before listing a VLAN:
   or it dies in VPP, which has no local delivery. That is the w23 lesson
   in IPv6 form. See the keeps below.
 - **VPP must carry v6** (`v6 on`; validation refuses `v6-outbound`
-  without it), and each VID must be a subinterface VPP has: in the
+  without it). The steer itself checks too, against the policy the
+  running engine was BUILT with rather than the config flag: a target
+  carrying a v6 diversion into a VPP started without v6 is refused whole,
+  before the NIC is touched — v4 included, so the port is never half
+  steered — and the row says why. Each VID must be a subinterface VPP has: in the
   port's `vlans` list (validation), or carried tagged by the kernel
   bridge on a `vlans all` trunk (checked when the rules are planned; an
   unreadable bridge refuses the plan).

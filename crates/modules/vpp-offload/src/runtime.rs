@@ -1970,6 +1970,10 @@ impl Runtime {
             source_backlog: c.source.backlog(),
             steer_configured_ports: c.steering.configured_ports(),
             steer_v6_outbound: v6_outbound_summary(&c.steering.installed_plan()),
+            steer_v6_only: {
+                let plan = c.steering.installed_plan();
+                !v6_outbound_summary(&plan).is_empty() && !installs_v4_diversion(&plan)
+            },
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
@@ -2158,6 +2162,17 @@ pub fn v6_outbound_summary(plans: &[(String, u32, crate::steer::RuleSet)]) -> Ve
         .collect()
 }
 
+/// Whether any installed plan diverts IPv4 — the other half of what the
+/// steering row claims, read from the same installed rules.
+pub fn installs_v4_diversion(plans: &[(String, u32, crate::steer::RuleSet)]) -> bool {
+    plans.iter().any(|(_, _, plan)| {
+        plan.rules.iter().any(|r| {
+            r.action == crate::steer::RuleAction::Divert
+                && matches!(r.shape, crate::steer::RuleMatch::V4 { .. })
+        })
+    })
+}
+
 /// One coherent snapshot of the runtime's observable state, for the
 /// health surface. Everything in it came from an observation.
 #[derive(Debug, Clone)]
@@ -2179,6 +2194,10 @@ pub struct RuntimeStatus {
     /// [`Steering::installed_plan`], so it names what reached the NIC,
     /// not what the config wants. Empty when no v6 is diverted.
     pub steer_v6_outbound: Vec<String>,
+    /// The installed plan diverts IPv6 and no IPv4 at all (a v6-only
+    /// allowlist beside `v6-outbound`), so the steering row must not
+    /// claim allowlisted IPv4 is diverted. See [`installs_v4_diversion`].
+    pub steer_v6_only: bool,
     /// Changes the source is holding that the engine has not pulled yet.
     ///
     /// Distinct from `pending_ops`, which is what the engine has pulled

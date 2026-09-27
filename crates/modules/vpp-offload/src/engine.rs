@@ -1639,6 +1639,11 @@ impl ConvergenceEngine {
         c
     }
 
+    /// Which families VPP carries (`v6 on|off`).
+    pub fn families(&self) -> FamilyPolicy {
+        self.drainer.families()
+    }
+
     /// For fixtures that need a table in a given shape without driving a
     /// resync against a VPP.
     #[cfg(test)]

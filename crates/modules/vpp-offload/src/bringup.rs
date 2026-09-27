@@ -1286,6 +1286,12 @@ fn finish(
         let inherited_rule_count: usize =
             state.steer_rules.iter().map(|(_, locs)| locs.len()).sum();
         let owner = SharedOwner::new(ResourceOwner::new(state, sys));
+        // The steering learns what the ENGINE carries, from the engine —
+        // not from the config flag — so a v6 diversion can never be
+        // installed into a v4-only VPP however the flag is wired
+        // (`NtupleSteering::families`).
+        let mut steering = steering;
+        steering.carry_families_of(engine.families());
         let runtime = Runtime::new(
             engine,
             source,

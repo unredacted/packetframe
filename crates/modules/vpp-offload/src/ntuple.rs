@@ -778,6 +778,10 @@ pub(crate) mod sys {
         /// Locations whose insert must fail, modelling a full or
         /// otherwise refusing MCAM.
         uninsertable: Vec<u32>,
+        /// Locations whose insert LANDS but stores something other than
+        /// what was asked — the readback-mismatch case, where the NIC
+        /// holds a rule the caller never recorded.
+        garbled: Vec<u32>,
         unreadable: Vec<u32>,
         /// Interfaces whose whole TABLE cannot be read — the shape an
         /// administratively DOWN port has (`otx2_get_rxnfc` gates on
@@ -796,6 +800,7 @@ pub(crate) mod sys {
                 rules: HashMap::new(),
                 undeletable: Vec::new(),
                 uninsertable: Vec::new(),
+                garbled: Vec::new(),
                 unreadable: Vec::new(),
                 unreadable_tables: Vec::new(),
                 table_size: super::FALLBACK_TABLE_SIZE,
@@ -820,6 +825,10 @@ pub(crate) mod sys {
 
     pub(crate) fn wedge_insert(locations: &[u32]) {
         NIC.with(|n| n.borrow_mut().uninsertable = locations.to_vec());
+    }
+
+    pub(crate) fn garble_insert(locations: &[u32]) {
+        NIC.with(|n| n.borrow_mut().garbled = locations.to_vec());
     }
 
     /// Make GRXCLSRULE fail at these locations with something that is
@@ -983,7 +992,14 @@ pub(crate) mod sys {
                     }
                     // A real insert at an occupied slot replaces it,
                     // which is what makes re-asserting cheap.
-                    nic.rules.insert(key, req.fs);
+                    let mut stored = req.fs;
+                    if nic.garbled.contains(&req.fs.location) {
+                        // Another queue: a difference `matches` rejects
+                        // for every shape, and one that leaves a keep's
+                        // VF field at 0 — unattributable by cookie.
+                        stored.ring_cookie ^= 7;
+                    }
+                    nic.rules.insert(key, stored);
                     Ok(())
                 }
                 ETHTOOL_GRXCLSRULE if nic.unreadable.contains(&req.fs.location) => {
@@ -1024,16 +1040,29 @@ pub(crate) mod sys {
     }
 }
 
+/// Why [`insert`] failed, and whether the NIC took the write anyway.
+struct InsertError {
+    msg: String,
+    /// The insert ioctl succeeded and only the readback failed, so the
+    /// NIC holds SOMETHING this attempt wrote at that location — the
+    /// rollback must remove it, since no ledger entry would otherwise
+    /// ever name it.
+    landed: bool,
+}
+
 /// Install one rule and confirm the NIC holds what was asked for.
-fn insert(iface: &str, rule: &SteerRule, vf_index: u32) -> Result<(), String> {
+fn insert(iface: &str, rule: &SteerRule, vf_index: u32) -> Result<(), InsertError> {
     let asked = flow_spec(rule, vf_index);
     let mut req = Rxnfc {
         cmd: ETHTOOL_SRXCLSRLINS,
         fs: asked,
         ..Rxnfc::default()
     };
-    sys::ethtool(iface, &mut req)
-        .map_err(|e| format!("inserting ntuple rule at loc {}: {e}", rule.location))?;
+    sys::ethtool(iface, &mut req).map_err(|e| InsertError {
+        msg: format!("inserting ntuple rule at loc {}: {e}", rule.location),
+        landed: false,
+    })?;
+    let landed = |msg: String| InsertError { msg, landed: true };
 
     // Read back, always. See the module docs: a wrong field offset
     // installs cleanly and matches the wrong traffic.
@@ -1045,10 +1074,14 @@ fn insert(iface: &str, rule: &SteerRule, vf_index: u32) -> Result<(), String> {
         },
         ..Rxnfc::default()
     };
-    sys::ethtool(iface, &mut check)
-        .map_err(|e| format!("reading back ntuple rule at loc {}: {e}", rule.location))?;
+    sys::ethtool(iface, &mut check).map_err(|e| {
+        landed(format!(
+            "reading back ntuple rule at loc {}: {e}",
+            rule.location
+        ))
+    })?;
     if !matches(&asked, &check.fs) {
-        return Err(format!(
+        return Err(landed(format!(
             "ntuple rule at loc {} is not what was asked for — the NIC reports flow_type {:#x}, \
              cookie {:#x}; expected {:#x}, {:#x}. Refusing to steer traffic into a rule whose \
              match is unknown",
@@ -1057,7 +1090,7 @@ fn insert(iface: &str, rule: &SteerRule, vf_index: u32) -> Result<(), String> {
             check.fs.ring_cookie,
             asked.flow_type,
             asked.ring_cookie
-        ));
+        )));
     }
     Ok(())
 }
@@ -1209,6 +1242,24 @@ pub struct NtupleSteering {
     /// what they were installed to hold, so ownership falls back to
     /// occupancy — see the non-member arm of `missing_from_nic`.
     installed_as: Option<Vec<(String, u32, RuleSet)>>,
+    /// Which families the ENGINE this steering feeds carries — the
+    /// policy it was built with, handed over by [`Self::carry_families_of`].
+    ///
+    /// A v6 diversion into a VPP with no v6 table is a blackhole: every
+    /// diverted frame misses the FIB and dies. Config validation holds
+    /// `v6-outbound` to `v6 on`, but the config flag and the engine's
+    /// policy are two different facts — a build whose flag is parsed and
+    /// not wired, or a wiring that drifts, would pass validation and
+    /// build a v4-only engine anyway. So `steer` asks the engine's own
+    /// answer, and refuses any target carrying a v6 diversion unless it
+    /// says v6.
+    ///
+    /// A setter rather than a constructor parameter, against this type's
+    /// habit, because the engine does not exist yet when `bring_up`
+    /// builds the steering; it is made inside the supervision factory,
+    /// which is where this is called. The default is `V4Only` so the
+    /// forgotten call fails CLOSED: v6 is refused, never blackholed.
+    families: crate::fib_sync::FamilyPolicy,
 }
 
 impl NtupleSteering {
@@ -1224,7 +1275,32 @@ impl NtupleSteering {
             targets,
             installed: Vec::new(),
             installed_as: None,
+            families: crate::fib_sync::FamilyPolicy::V4Only,
         }
+    }
+
+    /// Adopt the family policy of the engine this steering feeds. See
+    /// [`Self::families`](NtupleSteering) for why it is the engine's.
+    pub fn carry_families_of(&mut self, families: crate::fib_sync::FamilyPolicy) {
+        self.families = families;
+    }
+
+    /// The target's v6 diversions, if the engine cannot carry them — the
+    /// ports that would blackhole.
+    fn v6_without_a_table(&self) -> Vec<&str> {
+        if self.families.dump_families().contains(&true) {
+            return Vec::new();
+        }
+        self.targets
+            .iter()
+            .filter(|(_, _, plan)| {
+                plan.rules.iter().any(|r| {
+                    r.action == crate::steer::RuleAction::Divert
+                        && matches!(r.shape, RuleMatch::V6Frame { .. })
+                })
+            })
+            .map(|(i, _, _)| i.as_str())
+            .collect()
     }
 
     /// The VF this module owns on `iface`, if anything knows.
@@ -1391,9 +1467,36 @@ impl NtupleSteering {
     ///
     /// Returns the failures, formatted for the caller's message.
     fn remove_all(&mut self, victims: Vec<(String, u32)>) -> Vec<String> {
+        self.remove_all_written(victims, &[])
+    }
+
+    /// [`Self::remove_all`], where `written` names locations THIS steer
+    /// attempt just wrote — the rollback's case.
+    ///
+    /// Those skip the ownership read and go straight to the delete. The
+    /// read exists to tell our rule from a stranger's at a slot the
+    /// ledger names from some earlier time; a slot this attempt wrote a
+    /// moment ago holds what we wrote (an insert at an occupied slot
+    /// replaces), so there is nothing to attribute. And the read would
+    /// get it wrong: a cookie-0 keep is claimed only by matching the
+    /// LAST successful install's plan, which a keep new to this attempt
+    /// is not in — so it read as a stranger's, was dropped from the
+    /// ledger and left in the MCAM (review finding). A write whose
+    /// readback failed, whatever the NIC stored, is in the same position.
+    fn remove_all_written(
+        &mut self,
+        victims: Vec<(String, u32)>,
+        written: &[(String, u32)],
+    ) -> Vec<String> {
         let mut failed = Vec::new();
         for (iface, loc) in victims {
-            match self.occupant(&iface, loc) {
+            let ours_now = written.iter().any(|(i, l)| *i == iface && *l == loc);
+            let occupant = if ours_now {
+                Ok(Occupant::IntoOurVf)
+            } else {
+                self.occupant(&iface, loc)
+            };
+            match occupant {
                 Ok(Occupant::IntoOurVf) => {}
                 Ok(Occupant::Absent) => {
                     tracing::info!(
@@ -1668,6 +1771,26 @@ impl crate::runtime::Steering for NtupleSteering {
                     .into(),
             );
         }
+        // A v6 diversion into an engine that carries no v6 is refused, and
+        // the WHOLE steer with it, before anything touches the NIC.
+        //
+        // Whole rather than v6 stripped: installing the v4 half would
+        // report `Steered` for a policy the operator did not write — their
+        // port diverting v4 while the v6 they asked for silently stays
+        // put — which is the half-steered port every refusal in this
+        // module exists to rule out. Before the stale removal, so a
+        // refused reconfigure leaves what is installed exactly as it was;
+        // `steer off` still works, since it takes the port out of the
+        // target and with it the v6 diversion.
+        let blackholes = self.v6_without_a_table();
+        if !blackholes.is_empty() {
+            return Err(format!(
+                "port(s) {blackholes:?} would divert IPv6 (`v6-outbound`) into a VPP whose \
+                 engine carries no IPv6 table: every diverted frame would miss the FIB and be \
+                 dropped. Nothing was installed or changed. VPP carries v6 only with `v6 on`, \
+                 applied at start — restart with it, or drop `v6-outbound`"
+            ));
+        }
         // Clear anything the ledger holds that the current target does
         // not — rules from a previous allowlist, or from a port that has
         // since gone `steer off`. Without this, a reconfigure would
@@ -1702,14 +1825,26 @@ impl crate::runtime::Steering for NtupleSteering {
             ));
         }
 
+        // Every location this attempt has written, for the rollback: see
+        // `remove_all_written` for why those need no ownership read.
+        let mut written: Vec<(String, u32)> = Vec::new();
         for (iface, vf_index, plan) in &self.targets {
             for rule in &plan.rules {
-                if let Err(e) = insert(iface, rule, *vf_index) {
+                if let Err(InsertError { msg: e, landed }) = insert(iface, rule, *vf_index) {
                     // All-or-nothing. A partially steered port divides
                     // traffic between the tiers along a line nobody chose,
-                    // so back out what landed before reporting the failure.
+                    // so back out what landed before reporting the failure
+                    // — including this rule, when its write landed and only
+                    // the readback failed: nothing else would ever name it.
+                    let entry = (iface.clone(), rule.location);
+                    if landed {
+                        written.push(entry.clone());
+                        if !self.installed.contains(&entry) {
+                            self.installed.push(entry);
+                        }
+                    }
                     let victims = std::mem::take(&mut self.installed);
-                    let rollback = self.remove_all(victims);
+                    let rollback = self.remove_all_written(victims, &written);
                     return Err(if rollback.is_empty() {
                         format!("{e}; every rule installed before it was removed")
                     } else {
@@ -1734,6 +1869,7 @@ impl crate::runtime::Steering for NtupleSteering {
                 // clean teardown reported rules it could not remove and
                 // withheld the VF.
                 let entry = (iface.clone(), rule.location);
+                written.push(entry.clone());
                 if !self.installed.contains(&entry) {
                     self.installed.push(entry);
                 }
@@ -3983,6 +4119,14 @@ mod tests {
         NtupleSteering::new(ports.clone(), uniform(ports, plan))
     }
 
+    /// [`steering`] feeding an engine that carries v6 — what a VPP started
+    /// with `v6 on` hands over.
+    fn steering_v6(ports: Vec<(String, u32)>, plan: RuleSet) -> NtupleSteering {
+        let mut s = steering(ports, plan);
+        s.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
+        s
+    }
+
     /// Pair every port with one shared rule set — the pre-per-port
     /// shape, which is what most of these fixtures mean.
     fn uniform(ports: Vec<(String, u32)>, plan: RuleSet) -> Vec<(String, u32, RuleSet)> {
@@ -4167,6 +4311,7 @@ mod tests {
         );
 
         let mut s = steering(vec![("eth0".into(), 0)], plan.clone());
+        s.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
         s.steer().expect("every shape passes its readback");
         assert_eq!(sys::rules().len(), plan.rules.len());
         assert!(
@@ -4181,7 +4326,7 @@ mod tests {
         );
 
         // Another process, from the record as the file holds it.
-        let mut daemon = steering(vec![("eth0".into(), 0)], plan);
+        let mut daemon = steering_v6(vec![("eth0".into(), 0)], plan);
         daemon.steer().expect("steer");
         let rules = daemon.installed();
         let json = serde_json::to_string(&daemon.installed_plan()).expect("serializes");
@@ -4210,12 +4355,120 @@ mod tests {
             .find(|r| matches!(r.shape, RuleMatch::V6L4(L4Match::Proto(58))))
             .expect("the ICMPv6 keep")
             .location;
-        let mut s = steering(vec![("eth0".into(), 0)], plan);
+        let mut s = steering_v6(vec![("eth0".into(), 0)], plan);
         s.steer().expect("steer");
         assert!(audit(&s).is_empty());
         // Narrowed: an address constraint added to the ICMPv6 keep.
         sys::narrow_behind_back("eth0", keep_loc);
         assert_eq!(audit(&s), vec![("eth0".to_string(), keep_loc)]);
+    }
+
+    /// `v6-outbound` over an engine that carries no v6 installs NO v6
+    /// diversion — and no rule at all: the whole steer is refused before
+    /// the NIC is touched, so what was installed stays exactly as it was.
+    /// The default is that engine (`V4Only`), so a steering whose engine
+    /// policy was never handed over fails closed.
+    #[test]
+    fn v6_outbound_into_a_v4_only_engine_installs_no_v6_diversion() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        // Already steering v4.
+        let mut s = steering(vec![("eth0".into(), 0)], plan_for(&[[198, 51, 100, 0]]));
+        s.steer().expect("v4 installs");
+        let before = sys::rules_with_cookies();
+
+        // A reconfigure adds v6-outbound; the engine is v4-only.
+        s.retarget(uniform(vec![("eth0".into(), 0)], plan_both_families()));
+        let e = s
+            .steer()
+            .expect_err("a v4-only engine refuses v6 diversions");
+        assert!(e.contains("no IPv6 table") && e.contains("eth0"), "{e}");
+        assert_eq!(
+            sys::rules_with_cookies(),
+            before,
+            "nothing installed, nothing removed"
+        );
+        assert!(sys::rules_with_cookies()
+            .iter()
+            .all(|(_, _, cookie)| *cookie == ring_cookie(0)));
+
+        // A fresh steering, the policy never handed over: same refusal.
+        sys::reset();
+        let mut fresh = steering(vec![("eth0".into(), 0)], plan_both_families());
+        fresh.steer().expect_err("fails closed");
+        assert!(sys::rules().is_empty());
+
+        // The engine says v6: it installs.
+        fresh.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
+        fresh.steer().expect("v6 carried");
+        assert_eq!(sys::rules().len(), plan_both_families().rules.len());
+    }
+
+    /// A steer that fails partway removes every rule it wrote — the keeps
+    /// NEW to this attempt included — and leaves an accurate ledger.
+    ///
+    /// The keeps were the leak: cookie 0, and not in the last installed
+    /// plan (there is none here), so the ownership read called them a
+    /// stranger's, dropped them from the ledger and left them in the
+    /// MCAM. Covered for v4 keeps and v6 keeps alike, and for the rule
+    /// whose write LANDED but read back wrong, which no ledger entry
+    /// would otherwise name.
+    #[test]
+    fn a_failed_install_rolls_back_every_rule_it_wrote_keeps_included() {
+        use crate::runtime::Steering as _;
+        let plan = plan_both_families();
+        let keeps: Vec<u32> = plan
+            .rules
+            .iter()
+            .filter(|r| r.action == crate::steer::RuleAction::Keep)
+            .map(|r| r.location)
+            .collect();
+        assert!(keeps.len() >= 2 + 4, "v4 and v6 keeps both in play");
+        // Insertion order is plan order; the last rule is a v6 keep, so
+        // failing there leaves every other rule — v4 and v6 keeps and
+        // diversions — already written.
+        let last = plan.rules.last().unwrap().location;
+
+        for (what, wedge) in [
+            ("insert refused", (|l| sys::wedge_insert(&[l])) as fn(u32)),
+            ("write landed, readback wrong", |l| sys::garble_insert(&[l])),
+        ] {
+            sys::reset();
+            wedge(last);
+            let mut s = steering_v6(vec![("eth0".into(), 0)], plan.clone());
+            let e = s.steer().expect_err("the last insert fails");
+            assert!(
+                e.contains("every rule installed before it was removed"),
+                "{what}: {e}"
+            );
+            assert!(
+                sys::rules().is_empty(),
+                "{what}: nothing left in the NIC — left: {:?}",
+                sys::rules_with_cookies()
+            );
+            assert!(
+                s.installed().is_empty(),
+                "{what}: and nothing on the ledger"
+            );
+        }
+
+        // A rollback over a previously installed v4 plan: its rules come
+        // out too, and the ledger ends empty rather than naming ghosts.
+        sys::reset();
+        let mut s = steering_v6(
+            vec![("eth0".into(), 0)],
+            plan_with_keeps(&[[198, 51, 100, 0]]),
+        );
+        s.steer().expect("v4 with keeps");
+        s.retarget(uniform(vec![("eth0".into(), 0)], plan.clone()));
+        sys::wedge_insert(&[last]);
+        s.steer().expect_err("fails at the last rule");
+        assert!(
+            sys::rules().is_empty(),
+            "left: {:?}",
+            sys::rules_with_cookies()
+        );
+        assert!(s.installed().is_empty());
     }
 
     /// Why the plan has to travel, pinned: a ledger without one loses
