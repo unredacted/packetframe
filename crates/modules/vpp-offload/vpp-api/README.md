@@ -32,7 +32,7 @@ route is programmed. Two consequences that are easy to miss:
 
 - **The whitelist is the contract, not the VPP release.** A new VPP
   can change a hundred messages this module never speaks and remain
-  fully compatible; compatibility is defined over the ~36 messages the
+  fully compatible; compatibility is defined over the ~66 messages the
   module actually uses. This is why the vendored bundle stays a small
   whitelist rather than the whole API surface — every vendored file
   widens what counts as a breaking change.
@@ -91,6 +91,30 @@ it:
 3. Commit all of it together. Read the `generated.rs` diff — a moved
    field is a wire-format change and deserves a look, not a rubber
    stamp. CI re-runs the byte-binding and the regenerate-and-diff.
+
+## Vendoring one more file (same release)
+
+Whitelisting a message whose definition lives in a file not vendored
+yet (`ip6_nd.api.json` arrived this way, for
+`sw_interface_ip6nd_ra_config`) is not a version bump: `SOURCE.json`
+does not change. Take the file from the SAME release it names, so CI's
+byte-binding still holds:
+
+```sh
+tag=$(jq -r '"vpp-\(.vpp_ref)-\(.platform)-\(.distro|sub("^debian-";""))-\(.arch)"' \
+  crates/modules/vpp-offload/vpp-api/SOURCE.json)
+dir=$(mktemp -d)
+gh release download "$tag" -R unredacted/vpp-unifi -D "$dir" \
+  -p vpp-api-json.tar.gz -p SHA256SUMS
+(cd "$dir" && grep ' vpp-api-json\.tar\.gz$' SHA256SUMS | sha256sum -c -)
+mkdir "$dir/api" && tar xzf "$dir/vpp-api-json.tar.gz" -C "$dir/api"
+cp "$(find "$dir/api" -name <name>.api.json)" crates/modules/vpp-offload/vpp-api/
+```
+
+then add `<name>` to the codegen's `FILES`, the messages to `MESSAGES`
+(with the why, like every entry there), regenerate, and commit the
+three together. Its `imports` must already be vendored, or the type
+closure fails at codegen.
 
 No cross-version adoption on routers: upgrading a box is
 detach → install → attach (see `docs/runbooks/vpp-offload.md`).

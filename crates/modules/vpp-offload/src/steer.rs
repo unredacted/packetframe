@@ -37,8 +37,10 @@
 //! 710) while the v4 control inserts cleanly — the vendor NPC profile
 //! has no v6 extraction. So no IPv6 packet can be steered into VPP, and
 //! a v6 prefix in the allowlist is skipped here rather than attempted.
-//! [`crate::fib_sync::FamilyPolicy`] encodes the same verdict on the FIB
-//! side; when a kernel bump makes v6 work, both flip together.
+//! [`crate::fib_sync::FamilyPolicy`] used to encode the same verdict on
+//! the FIB side; it is now `v6 on|off`, because phase A of the IPv6
+//! offload steers v6 by ethertype, MAC and VLAN rather than by prefix —
+//! which this prefix planner still cannot, and does not, do.
 //!
 //! ## What is here, and what is not
 //!

@@ -307,6 +307,12 @@ pub struct ResyncPlan {
     /// preserved-ledger adoption this is nearly the whole table — the
     /// point of preserving it; on a fresh resync it is zero.
     pub unchanged: u64,
+    /// Source routes of a family VPP does not carry, left out of the diff
+    /// at its entry ([`ConvergenceEngine::begin_resync`]) — every v6
+    /// route under `V4Only`. Counted rather than folded into `upserts`,
+    /// which used to report ~252k v6 "upserts" on a full-table box only
+    /// for the drainer to discard each one.
+    pub out_of_family: u64,
 }
 
 /// What a verify pass concluded, and whether traffic may be diverted
@@ -547,6 +553,9 @@ pub struct ConvergenceEngine {
     self_addrs: HashSet<IpAddr>,
     /// The router's connected subnets, one per address.
     self_nets: Vec<packetframe_common::config::Ipv4Prefix>,
+    /// The router's connected IPv6 subnets, `(network, length)`, one per
+    /// global address ([`Self::with_self_networks_v6`]).
+    self_nets6: Vec<(std::net::Ipv6Addr, u8)>,
     /// Mirror prefixes left out of VPP as the router's own connected
     /// subnets ([`Self::kernel_delivered_route`]). Kept apart from
     /// `shadowed` (a `local-route` footprint) so each gauge says one
@@ -655,6 +664,16 @@ pub struct ConvergenceEngine {
     /// exactly what is in doubt — a wholesale rebuild would drop what the
     /// v4-only dump cannot see.
     neighbours_unacked: std::collections::HashSet<(u32, IpAddr)>,
+    /// Owned interfaces this VPP has IPv6 enabled on, with router
+    /// advertisements suppressed ([`Self::ensure_ip6`]). Empty and unused
+    /// under `V4Only`.
+    ///
+    /// Written only once VPP has acknowledged both halves, and cleared
+    /// with the process — the ip6 state it records died with it — so the
+    /// next VPP, and an adopted one, is asked afresh; both halves are
+    /// idempotent in VPP, which is what makes asking an adopted VPP
+    /// again free of consequence.
+    ip6_ready: std::collections::BTreeSet<u32>,
     drainer: Drainer,
 
     /// Whether MCAM rules are diverting traffic right now.
@@ -739,6 +758,7 @@ impl ConvergenceEngine {
             shadowed: HashSet::new(),
             self_addrs: HashSet::new(),
             self_nets: Vec::new(),
+            self_nets6: Vec::new(),
             kernel_delivered: HashSet::new(),
             steer_exempts: Vec::new(),
             loopback,
@@ -762,6 +782,7 @@ impl ConvergenceEngine {
             placement_changed: Vec::new(),
             neighbours_installed: std::collections::HashMap::new(),
             neighbours_unacked: std::collections::HashSet::new(),
+            ip6_ready: std::collections::BTreeSet::new(),
             drainer: Drainer::new(DEFAULT_WINDOW).with_families(families),
             steered: false,
             last_api_error: None,
@@ -774,6 +795,19 @@ impl ConvergenceEngine {
             null_drops: None,
             verify_seed: 0,
         }
+    }
+
+    /// The IPv6 pool's high-water mark ([`Capacity::per_family`]); the v4
+    /// mark stays the one [`Self::new`] was given. For bring-up, which
+    /// sizes the pools separately; before any route is classified.
+    pub fn with_v6_capacity(mut self, high_water_v6: u64) -> Self {
+        debug_assert!(
+            self.ledger.is_empty(),
+            "capacity is set before the ledger fills"
+        );
+        let v4 = self.ledger.capacity().high_water();
+        self.ledger = RouteLedger::new(Capacity::per_family(v4, high_water_v6));
+        self
     }
 
     /// Seed the port→index map from the state file so an adopted VPP's
@@ -859,7 +893,10 @@ impl ConvergenceEngine {
         // A new bridged VLAN gets its domain and BVI, a domain gains the
         // trunks and untagged ports now carrying it, and a port that
         // stopped carrying it leaves. Sends nothing when nothing changed.
-        self.ensure_bridges()
+        self.ensure_bridges()?;
+        // And a new subif or BVI gets ip6 before any v6 neighbour or route
+        // is placed on it — also nothing sent when nothing is new.
+        self.ensure_ip6()
     }
 
     /// Take the members' untagged VLANs from the kernel bridge, and hand
@@ -907,6 +944,33 @@ impl ConvergenceEngine {
         self
     }
 
+    /// Declare the router's own IPv6 addresses with their prefix lengths —
+    /// the v6 half of [`Self::with_self_networks`], for the same reason:
+    /// a routing daemon's `redistribute connected` sends the box's own v6
+    /// subnets with itself as next hop, and VPP has no adjacency for its
+    /// own host.
+    ///
+    /// Link-local addresses count as the router's own (a v6 route's next
+    /// hop is as often the peer-facing link-local as a global address)
+    /// but never as a subnet: `fe80::/64` is on every link and is no
+    /// routed prefix, so a mirror route inside it is not "connected".
+    pub fn with_self_networks_v6(
+        mut self,
+        nets: impl IntoIterator<Item = (std::net::Ipv6Addr, u8)>,
+    ) -> Self {
+        for (addr, len) in nets {
+            self.self_addrs.insert(IpAddr::V6(addr));
+            if addr.segments()[0] & 0xffc0 == 0xfe80 {
+                continue;
+            }
+            let len = len.min(128);
+            let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+            self.self_nets6
+                .push((std::net::Ipv6Addr::from(u128::from(addr) & mask), len));
+        }
+        self
+    }
+
     /// The configured `steer-exempt` set. Replaced on every reload, from
     /// the same place steering is retargeted, because the first-steer
     /// gate judges the exemptions the steer about to happen installs.
@@ -932,10 +996,21 @@ impl ConvergenceEngine {
     /// (review finding). A route counts only when its prefix also lies
     /// inside a subnet the router is itself addressed on; anything else
     /// through a self next hop stays unresolvable and keeps blocking.
+    ///
+    /// **IPv6 too** (`v6 on`), by the same two conditions: next hops all
+    /// the router's own (global or link-local), prefix inside one of its
+    /// global v6 subnets. Such a route is left out of VPP and withdrawn if
+    /// installed, exactly as for v4 — left in, it would read unresolvable
+    /// forever. It is NOT a first-steer blocker the way a v4 one is; see
+    /// [`Self::unexempted_local`] for why it need not be.
     fn kernel_delivered_route(&self, prefix: &IpPrefix, nexthops: &[IpAddr]) -> bool {
         !nexthops.is_empty()
             && nexthops.iter().all(|n| self.self_addrs.contains(n))
-            && self.self_nets.iter().any(|net| v4_covers(net, prefix))
+            && (self.self_nets.iter().any(|net| v4_covers(net, prefix))
+                || self
+                    .self_nets6
+                    .iter()
+                    .any(|(net, len)| v6_covers(*net, *len, prefix)))
     }
 
     /// How many mirror prefixes are the router's own connected subnets
@@ -951,8 +1026,33 @@ impl ConvergenceEngine {
     /// is absent follows a less-specific one out of the box. The
     /// exemption tripwire reports such paths, but asynchronously and
     /// without refusing anything, so these block a first steer through
-    /// [`SinkCounts::unexempted_local`] (review finding). Only IPv4
-    /// matters: steering diverts nothing else.
+    /// [`SinkCounts::unexempted_local`] (review finding).
+    ///
+    /// **Only IPv4**, and not merely because `steer-exempt` (an MCAM
+    /// exemption) is v4-only. The v4 gate exists because v4 steering
+    /// diverts by destination PREFIX and a v4 table always has somewhere
+    /// less specific to send a packet — a steered packet for a connected
+    /// subnet VPP lacks follows a covering route, up to the default, OUT
+    /// of the box: a silent misroute. Neither half holds for v6:
+    ///
+    /// - Phase A diverts IPv6 by ethertype, destination MAC and ingress
+    ///   VLAN — outbound customer traffic addressed to the router — never
+    ///   by destination prefix, so there is no prefix set for an
+    ///   exemption to carve a hole in. What that slice owes instead is
+    ///   that VPP never routes to a destination only the kernel can
+    ///   deliver.
+    /// - For a v6 kernel-delivered prefix VPP holds no route, and there
+    ///   is no v6 default to fall through to: this box carries no v6
+    ///   default route, so neither does the mirror nor VPP. A packet for
+    ///   one reaching VPP is dropped — the answer the kernel itself gives
+    ///   any v6 destination absent from its table — never carried out of
+    ///   the box. (A less-specific route the mirror does carry would be
+    ///   followed, as in v4; that is a property of the table, visible in
+    ///   it, and the same on the eBPF tier.)
+    ///
+    /// At rung 0 nothing v6 is steered at all, so none of this is
+    /// reachable yet; it is recorded here because this is where the v4
+    /// gate is, and the v6 one must not be assumed to exist.
     pub fn unexempted_local(&self) -> Vec<IpPrefix> {
         let mut out: Vec<IpPrefix> = self
             .kernel_delivered
@@ -1632,11 +1732,26 @@ impl ConvergenceEngine {
 
     /// The ledger's counts, plus the one first-steer blocker the ledger
     /// cannot see because those routes never enter it
-    /// ([`Self::unexempted_local`]).
+    /// ([`Self::unexempted_local`]), plus IPv6's when VPP carries it —
+    /// the one place the family policy meets the counts, so `None` in
+    /// [`SinkCounts::v6`] always means "not loaded", never "empty".
     pub fn counts(&self) -> SinkCounts {
         let mut c = self.ledger.counts();
         c.unexempted_local = self.unexempted_local().len() as u64;
+        if self.drainer.families().carries_v6() {
+            c.v6 = Some(self.ledger.v6_counts());
+        }
         c
+    }
+
+    /// Which families VPP carries (`v6 on|off`).
+    pub fn families(&self) -> FamilyPolicy {
+        self.drainer.families()
+    }
+
+    /// The IPv6 pool's high-water mark ([`crate::sink::Capacity`]).
+    pub fn route_capacity_v6(&self) -> u64 {
+        self.ledger.capacity().high_water_v6()
     }
 
     /// For fixtures that need a table in a given shape without driving a
@@ -1945,7 +2060,62 @@ impl ConvergenceEngine {
         // before either.
         self.refresh_untagged();
         self.ensure_bridges()?;
+        // Before `program_neighbours` and every drain, which the
+        // supervisor orders after this step: a v6 adjacency or route on an
+        // interface without ip6 has nothing to leave by.
+        self.ensure_ip6()?;
         self.install_attached_routes()
+    }
+
+    /// Enable IPv6, with router advertisements suppressed, on every owned
+    /// interface that does not have it yet — the members' VFs, their
+    /// dot1q subifs and the BVIs ([`crate::attach::enable_ip6`] says what
+    /// that does and does not give an interface). A no-op under
+    /// `V4Only`, where VPP carries no v6 and nothing here is sent.
+    ///
+    /// Every owned interface rather than only those a v6 neighbour sits
+    /// on, because which interface a neighbour lands on moves with the
+    /// FDB and the kernel bridge's VLANs while VPP runs, and an interface
+    /// found missing ip6 at that moment would mean a neighbour sent before
+    /// its interface could carry it. Including L2 bridge members, which
+    /// route nothing while they are members: membership changes at
+    /// runtime too, and ip6 on an L2 port costs one MLD report.
+    fn ensure_ip6(&mut self) -> Result<(), EngineError> {
+        if !self.drainer.families().carries_v6() {
+            return Ok(());
+        }
+        let mut wanted: Vec<u32> = self
+            .port_index
+            .indices()
+            .into_iter()
+            .filter(|i| !self.ip6_ready.contains(i))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        wanted.sort_unstable();
+        for idx in wanted {
+            let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+            if let Err(e) = crate::attach::enable_ip6(t, "egress interface", idx) {
+                if matches!(e, AttachError::Transport(_)) {
+                    self.disconnect();
+                }
+                return Err(e.into());
+            }
+            self.ip6_ready.insert(idx);
+        }
+        tracing::info!(
+            interfaces = self.ip6_ready.len(),
+            "IPv6 enabled on VPP's egress interfaces (link-local only, router \
+             advertisements suppressed)"
+        );
+        Ok(())
+    }
+
+    /// The owned interfaces IPv6 is enabled on, ascending — empty under
+    /// `V4Only`.
+    pub fn ip6_interfaces(&self) -> Vec<u32> {
+        self.ip6_ready.iter().copied().collect()
     }
 
     /// Install one attached route per `local-route`, straight onto the
@@ -2566,7 +2736,13 @@ impl ConvergenceEngine {
         if !self.placement_changed.is_empty() {
             src.requeue_via(&std::mem::take(&mut self.placement_changed));
         }
+        let families = self.drainer.families();
         for (prefix, nhs) in changes.routes {
+            // The delta door's half of the route family filter (see
+            // `begin_resync`): never queued, so never pending.
+            if !families.carries(prefix) {
+                continue;
+            }
             // Shadowed by a local-route: the mirror's view inside a
             // locally delivered prefix never reaches the pending map,
             // on the delta path exactly as at resync. The set tracks
@@ -2745,7 +2921,21 @@ impl ConvergenceEngine {
         // we were not looking leaves the count too.
         self.shadowed.clear();
         self.kernel_delivered.clear();
+        let families = self.drainer.families();
         src.for_each_route(&mut |prefix, nexthops| {
+            // A family VPP does not carry never enters the diff — the
+            // route-side twin of the neighbour filter
+            // ([`Self::carried_neighbours`]). Dropped by the drainer
+            // anyway, but only after being counted as an upsert and held
+            // in the pending map, so the plan's numbers and the map's size
+            // described a table VPP was never going to hold. Not in `seen`
+            // either, which is harmless because the ledger never holds an
+            // uncarried prefix (the drainer, the dump and the seed all
+            // filter it) and so no withdrawal can be derived for one.
+            if !families.carries(prefix) {
+                plan.out_of_family += 1;
+                return;
+            }
             if self.shadows(&prefix) {
                 // Deliberately NOT in `seen`: if the ledger holds a
                 // stale install of a shadowed prefix (a pre-local-route
@@ -2918,6 +3108,7 @@ impl ConvergenceEngine {
             DEFAULT_SAMPLE,
             seed,
             check_paths,
+            self.drainer.families(),
         ) {
             Ok(mut outcome) => {
                 outcome.unexempted_local = self.counts().unexempted_local;
@@ -3057,6 +3248,8 @@ impl ConvergenceEngine {
         // replacement's first delta pay for a dump that can only confirm
         // an empty table.
         self.neighbours_unacked.clear();
+        // The ip6 state belonged to the dead process too.
+        self.ip6_ready.clear();
         self.pending = PendingMap::new();
         self.ledger = RouteLedger::new(self.ledger_capacity());
         self.phase = None;
@@ -3135,16 +3328,17 @@ impl ConvergenceEngine {
         &self,
     ) -> Result<(Vec<Vec<crate::sink::PathKey>>, Vec<(IpPrefix, Option<u32>)>), String> {
         let c = self.ledger.counts();
-        if c.installing > 0 {
+        let v6 = self.ledger.v6_counts();
+        if c.installing + v6.installing > 0 {
             return Err(format!(
                 "{} route(s) are still awaiting VPP's acknowledgement",
-                c.installing
+                c.installing + v6.installing
             ));
         }
         let mut dense: std::collections::HashMap<crate::sink::PathSetId, u32> =
             std::collections::HashMap::new();
         let mut sets: Vec<Vec<crate::sink::PathKey>> = Vec::new();
-        let mut entries = Vec::with_capacity(c.installed as usize);
+        let mut entries = Vec::with_capacity((c.installed + v6.installed) as usize);
         for (prefix, via) in self.ledger.installed_entries() {
             let set = via.map(|id| {
                 *dense.entry(id).or_insert_with(|| {
@@ -3219,6 +3413,19 @@ fn is_neighbour_adj_fib(route: &IpRoute, nh: &[u8; 16]) -> bool {
         _ => route.prefix.len == 128,
     };
     host && route.prefix.address.un.0 == *nh
+}
+
+/// Whether the v6 network `net/len` covers all of `p`. A v4 `p` is never
+/// covered.
+fn v6_covers(net: std::net::Ipv6Addr, len: u8, p: &IpPrefix) -> bool {
+    let IpPrefix::V6 { addr, prefix_len } = p else {
+        return false;
+    };
+    if len > *prefix_len {
+        return false;
+    }
+    let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+    u128::from_be_bytes(*addr) & mask == u128::from(net) & mask
 }
 
 /// Whether `net` covers all of `p`. An IPv6 `p` is never covered.
@@ -3482,6 +3689,7 @@ mod tests {
             withheld: 0,
             unexempted_local: 0,
             dead_interfaces: vec![],
+            v6: None,
         });
         assert!(e.last_verify().is_some());
         e.on_process_gone();

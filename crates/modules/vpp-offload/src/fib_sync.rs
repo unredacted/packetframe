@@ -367,28 +367,29 @@ impl DrainStats {
     }
 }
 
-/// Which address families VPP carries.
+/// Which address families VPP carries — the module's `v6 on|off`.
 ///
-/// Not a tuning knob — a record of what the hardware will do. Gate 0b
-/// round 4 established that `ip6` ntuple rules are rejected by the AF
-/// (error 710: the vendor NPC profile has no v6 extraction), so **no
-/// IPv6 packet can ever be MCAM-steered into VPP** and v6 stays on the
-/// XDP custom-FIB path. Installing v6 routes into a FIB that will
-/// never be consulted costs heap, costs convergence time against the
-/// 60 s budget, and — worst — lets ~250k unreachable v6 routes consume
-/// capacity slots that would otherwise hold v4 routes we actually
-/// forward on.
+/// `V4Only` (the default) is what VPP always carried. Gate 0b round 4
+/// established that `ip6` ntuple rules are rejected by the AF (error
+/// 710: the vendor NPC profile has no v6 extraction), so no IPv6 packet
+/// can be steered into VPP **by prefix**, and a v6 route in a FIB that
+/// is never consulted costs heap and convergence time for nothing.
 ///
-/// It is a policy rather than a hardcoded filter because the v6
-/// roadmap is explicit: retest `ip6` ntuple at every UniFi kernel bump,
-/// since the MKEX profile ships with the AF driver. When it starts
-/// working this becomes [`FamilyPolicy::Both`] and a full resync.
+/// `Both` is phase A of the IPv6 offload, which steers by what the NIC
+/// CAN match — ethertype, destination MAC and VLAN — rather than by v6
+/// prefix. Its rung 0 is this policy alone: the v6 table loaded into VPP
+/// (routes, static neighbours, ip6 on every egress interface with RAs
+/// suppressed) and nothing v6 steered, so the table's cost can be
+/// measured before any traffic depends on it. The v6 routes cannot crowd
+/// out v4 ones: each family has its own capacity pool
+/// (`sink::Capacity`), and the v4 gates read v4 counts only
+/// (`sink::SinkCounts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FamilyPolicy {
-    /// v4 only — the measured reality on this NIC.
+    /// v4 only — `v6 off`, the default.
     #[default]
     V4Only,
-    /// Both families, for a platform whose classifier can steer v6.
+    /// Both families — `v6 on`.
     Both,
 }
 
@@ -428,6 +429,11 @@ impl FamilyPolicy {
             FamilyPolicy::Both => true,
             FamilyPolicy::V4Only => addr.is_ipv4(),
         }
+    }
+
+    /// Whether IPv6 is carried at all (`v6 on`).
+    pub fn carries_v6(self) -> bool {
+        matches!(self, FamilyPolicy::Both)
     }
 }
 
@@ -660,9 +666,15 @@ impl Drainer {
         // mid-drain would re-classify work we just parked in the same
         // pass. Gated on headroom so this cannot become a spin: with
         // no headroom nothing is released, and anything released that
-        // still does not fit is simply parked again.
-        if ledger.has_headroom() && pending.withheld_len() > 0 {
-            stats.released = pending.release_withheld() as u64;
+        // still does not fit is simply parked again. Per family, because
+        // headroom is (see `sink::Capacity`): a v6 pool at its mark must
+        // not be re-released on every drain just because v4 has room.
+        if pending.withheld_len() > 0 {
+            for v6 in [false, true] {
+                if ledger.has_headroom(v6) {
+                    stats.released += pending.release_withheld_family(v6) as u64;
+                }
+            }
         }
         Ok(stats)
     }

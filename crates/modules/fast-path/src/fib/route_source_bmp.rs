@@ -252,8 +252,8 @@ impl BmpStation {
     /// can they be the stale floor credit this guards: a handful of
     /// local /32s is nowhere near capacity/16.
     ///
-    /// Both families count. Only v4 reaches VPP today
-    /// (`FamilyPolicy::V4Only`), so a v6-only remnant carries no floor
+    /// Both families count. Only v4 reaches VPP by default
+    /// (`FamilyPolicy::V4Only`, `v6 off`), so a v6-only remnant carries no floor
     /// credit and this over-defers — but the station has no business
     /// knowing the second tier's family policy, and over-deferring is
     /// the safe direction. An unavailable answer reads as "possible"

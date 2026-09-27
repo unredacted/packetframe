@@ -42,7 +42,7 @@
 
 use packetframe_common::fib::IpPrefix;
 
-use crate::fib_sync::{to_prefix, PortIndex};
+use crate::fib_sync::{to_prefix, FamilyPolicy, PortIndex};
 use crate::sink::RouteLedger;
 use crate::vpp_api::generated::{IpRouteLookup, IpRouteLookupReply};
 use crate::vpp_api::{Transport, TransportError};
@@ -95,6 +95,14 @@ pub struct DeadInterface {
 }
 
 /// Result of one verify pass.
+///
+/// **Every top-level field is IPv4's** — the family steering diverts,
+/// and so the one whose table decides whether it may (the same split as
+/// [`crate::sink::SinkCounts`]). IPv6, when VPP carries it, is probed
+/// with its own sample and reported in [`Self::v6`], where nothing it
+/// finds can fail the pass: at rung 0 no v6 is steered, and a v6
+/// disagreement tearing down a VPP that forwards steered v4 would make
+/// `v6 on` a way to take v4 off it.
 #[derive(Debug, Clone, Default)]
 pub struct VerifyOutcome {
     pub sampled: usize,
@@ -116,6 +124,29 @@ pub struct VerifyOutcome {
     pub unexempted_local: u64,
     /// Owned interfaces that are not both admin-up and link-up.
     pub dead_interfaces: Vec<DeadInterface>,
+    /// IPv6's half of the pass, when VPP carries the family (`v6 on`);
+    /// `None` under `V4Only`.
+    pub v6: Option<FamilyVerify>,
+}
+
+/// One family's probes and degraded counts, for a family that does not
+/// gate steering (see [`VerifyOutcome`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FamilyVerify {
+    /// Probes sent: a sample of its own, the same size as IPv4's, so a
+    /// ~250k-route family is not left to the few probes its share of a
+    /// mixed pool would draw.
+    pub sampled: usize,
+    pub mismatches: Vec<Mismatch>,
+    pub unresolvable: u64,
+    pub withheld: u64,
+}
+
+impl FamilyVerify {
+    /// Whether every probe agreed and nothing is missing.
+    pub fn clean(&self) -> bool {
+        self.mismatches.is_empty() && self.unresolvable == 0 && self.withheld == 0
+    }
 }
 
 impl VerifyOutcome {
@@ -185,6 +216,17 @@ impl VerifyOutcome {
         !self.mismatches.is_empty()
     }
 
+    /// Whether ANY probe, of any family, disagreed with the ledger.
+    ///
+    /// The test a preserved-ledger seed is judged by, which is wider than
+    /// [`Self::restart_worthy`] on purpose: an IPv6 disagreement cannot
+    /// tear down a VPP forwarding steered v4, but it does disprove the
+    /// record it was checked against — and a seed kept with wrong v6
+    /// paths would have its resync skip exactly the routes it has wrong.
+    pub fn any_mismatch(&self) -> bool {
+        !self.mismatches.is_empty() || self.v6.as_ref().is_some_and(|v| !v.mismatches.is_empty())
+    }
+
     /// Pass criteria for *steering*: the FIB is correct AND every dark
     /// member is idle — no installed route can egress an interface
     /// that cannot forward. The halves fail differently — see
@@ -230,6 +272,16 @@ impl VerifyOutcome {
         }
         if self.sampled == 0 {
             s.push_str(" (no installed routes to verify)");
+        }
+        if let Some(v6) = &self.v6 {
+            s.push_str(&format!(
+                "; IPv6 (loaded, not steered — cannot fail the pass): {}/{} probes matched, \
+                 unresolvable={}, withheld={}",
+                v6.sampled.saturating_sub(v6.mismatches.len()),
+                v6.sampled,
+                v6.unresolvable,
+                v6.withheld
+            ));
         }
         for d in &self.dead_interfaces {
             s.push_str(&format!(
@@ -358,7 +410,16 @@ pub fn verify(
     sample_size: usize,
     seed: u64,
 ) -> Result<VerifyOutcome, TransportError> {
-    verify_paths(t, ledger, ports, active_egress, sample_size, seed, false)
+    verify_paths(
+        t,
+        ledger,
+        ports,
+        active_egress,
+        sample_size,
+        seed,
+        false,
+        FamilyPolicy::V4Only,
+    )
 }
 
 /// [`verify`], optionally also comparing each probed route's paths with
@@ -370,6 +431,11 @@ pub fn verify(
 /// probe that finds the prefix present on an owned interface but through
 /// different paths has disproved it, and that is a [`Mismatch`]. A prefix
 /// whose paths the ledger does not know is checked as an ordinary probe.
+///
+/// Under [`FamilyPolicy::Both`] IPv6 gets a sample of its own, drawn from
+/// a seed derived from `seed` so the pass stays replayable, and its
+/// findings go to [`VerifyOutcome::v6`].
+#[allow(clippy::too_many_arguments)]
 pub fn verify_paths(
     t: &mut Transport,
     ledger: &RouteLedger,
@@ -378,18 +444,37 @@ pub fn verify_paths(
     sample_size: usize,
     seed: u64,
     check_paths: bool,
+    families: FamilyPolicy,
 ) -> Result<VerifyOutcome, TransportError> {
     let counts = ledger.counts();
-    let installed = ledger.verifiable_prefixes();
-    let probes = sample(&installed, sample_size, seed);
+    let (v4_pool, v6_pool): (Vec<IpPrefix>, Vec<IpPrefix>) = ledger
+        .verifiable_prefixes()
+        .into_iter()
+        .partition(|p| matches!(p, IpPrefix::V4 { .. }));
+    let mut probes = sample(&v4_pool, sample_size, seed);
+    let v4_probes = probes.len();
     let owned = ports.indices();
 
     let mut out = VerifyOutcome {
-        sampled: probes.len(),
+        sampled: v4_probes,
         unresolvable: counts.unresolvable,
         withheld: counts.withheld,
         ..Default::default()
     };
+    if families.carries_v6() {
+        let v6c = ledger.v6_counts();
+        // A different seed, so the two samples are not the same index
+        // walk over two pools; still a pure function of `seed`.
+        let v6_probes = sample(&v6_pool, sample_size, seed.rotate_left(32) ^ 0x6666);
+        out.v6 = Some(FamilyVerify {
+            sampled: v6_probes.len(),
+            unresolvable: v6c.unresolvable,
+            withheld: v6c.withheld,
+            ..Default::default()
+        });
+        probes.extend(v6_probes);
+    }
+    let mut v6_mismatches = Vec::new();
 
     // Link state, before the probes. A VF that is admin-up with no
     // carrier keeps every route on a valid, owned `sw_if_index`, so the
@@ -400,6 +485,13 @@ pub fn verify_paths(
     out.dead_interfaces = dead_interface_scan(t, &owned, active_egress)?;
 
     for prefix in probes {
+        // Each family's disagreements land in its own list: `out.mismatches`
+        // is IPv4's and gates steering, IPv6's does not (see the type docs).
+        let found = if matches!(prefix, IpPrefix::V6 { .. }) {
+            &mut v6_mismatches
+        } else {
+            &mut out.mismatches
+        };
         let reply = t.request::<IpRouteLookup, IpRouteLookupReply>(IpRouteLookup {
             context: 0,
             table_id: 0,
@@ -410,14 +502,14 @@ pub fn verify_paths(
             prefix: to_prefix(prefix),
         })?;
         if reply.retval != 0 {
-            out.mismatches.push(Mismatch::Absent {
+            found.push(Mismatch::Absent {
                 prefix,
                 retval: reply.retval,
             });
             continue;
         }
         if reply.route.paths.is_empty() {
-            out.mismatches.push(Mismatch::NoPaths { prefix });
+            found.push(Mismatch::NoPaths { prefix });
             continue;
         }
         let foreign = reply
@@ -426,7 +518,7 @@ pub fn verify_paths(
             .iter()
             .find(|p| !owned.contains(&p.sw_if_index));
         if let Some(path) = foreign {
-            out.mismatches.push(Mismatch::ForeignPath {
+            found.push(Mismatch::ForeignPath {
                 prefix,
                 sw_if_index: path.sw_if_index,
             });
@@ -443,12 +535,15 @@ pub fn verify_paths(
         };
         let got = crate::fib_sync::path_set_of(&reply.route.paths);
         if got != expected {
-            out.mismatches.push(Mismatch::WrongPaths {
+            found.push(Mismatch::WrongPaths {
                 prefix,
                 expected: expected.to_vec(),
                 got,
             });
         }
+    }
+    if let Some(v6) = out.v6.as_mut() {
+        v6.mismatches = v6_mismatches;
     }
     Ok(out)
 }

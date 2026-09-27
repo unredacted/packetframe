@@ -63,6 +63,10 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "sw_interface_add_del_address_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_set_unnumbered", crc: "0x154a6439", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "sw_interface_set_unnumbered_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "sw_interface_ip6_enable_disable", crc: "0xae6cfcfb", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "sw_interface_ip6_enable_disable_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "sw_interface_ip6nd_ra_config", crc: "0x3eb00b1c", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "sw_interface_ip6nd_ra_config_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_add_del_mac_address", crc: "0x638bb9f4", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "sw_interface_add_del_mac_address_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "create_vlan_subif", crc: "0xaf34ac8b", context_offset: 6, client_index_prefix: true },
@@ -2362,6 +2366,200 @@ impl Decode for SwInterfaceSetUnnumberedReply {
 
 impl Message for SwInterfaceSetUnnumberedReply {
     const NAME: &'static str = "sw_interface_set_unnumbered_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_ip6_enable_disable` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceIp6EnableDisable {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub enable: bool,
+}
+
+impl Encode for SwInterfaceIp6EnableDisable {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.push(if self.enable { 1u8 } else { 0u8 });
+    }
+}
+
+impl Decode for SwInterfaceIp6EnableDisable {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let enable = d.bool()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            enable,
+        })
+    }
+}
+
+impl Message for SwInterfaceIp6EnableDisable {
+    const NAME: &'static str = "sw_interface_ip6_enable_disable";
+    const CRC: &'static str = "0xae6cfcfb";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_ip6_enable_disable_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceIp6EnableDisableReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for SwInterfaceIp6EnableDisableReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for SwInterfaceIp6EnableDisableReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for SwInterfaceIp6EnableDisableReply {
+    const NAME: &'static str = "sw_interface_ip6_enable_disable_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_ip6nd_ra_config` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceIp6ndRaConfig {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub suppress: u8,
+    pub managed: u8,
+    pub other: u8,
+    pub ll_option: u8,
+    pub send_unicast: u8,
+    pub cease: u8,
+    pub is_no: bool,
+    pub default_router: u8,
+    pub max_interval: u32,
+    pub min_interval: u32,
+    pub lifetime: u32,
+    pub initial_count: u32,
+    pub initial_interval: u32,
+}
+
+impl Encode for SwInterfaceIp6ndRaConfig {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.suppress).to_be_bytes());
+        buf.extend_from_slice(&(self.managed).to_be_bytes());
+        buf.extend_from_slice(&(self.other).to_be_bytes());
+        buf.extend_from_slice(&(self.ll_option).to_be_bytes());
+        buf.extend_from_slice(&(self.send_unicast).to_be_bytes());
+        buf.extend_from_slice(&(self.cease).to_be_bytes());
+        buf.push(if self.is_no { 1u8 } else { 0u8 });
+        buf.extend_from_slice(&(self.default_router).to_be_bytes());
+        buf.extend_from_slice(&(self.max_interval).to_be_bytes());
+        buf.extend_from_slice(&(self.min_interval).to_be_bytes());
+        buf.extend_from_slice(&(self.lifetime).to_be_bytes());
+        buf.extend_from_slice(&(self.initial_count).to_be_bytes());
+        buf.extend_from_slice(&(self.initial_interval).to_be_bytes());
+    }
+}
+
+impl Decode for SwInterfaceIp6ndRaConfig {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let suppress = d.u8()?;
+        let managed = d.u8()?;
+        let other = d.u8()?;
+        let ll_option = d.u8()?;
+        let send_unicast = d.u8()?;
+        let cease = d.u8()?;
+        let is_no = d.bool()?;
+        let default_router = d.u8()?;
+        let max_interval = d.u32()?;
+        let min_interval = d.u32()?;
+        let lifetime = d.u32()?;
+        let initial_count = d.u32()?;
+        let initial_interval = d.u32()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            suppress,
+            managed,
+            other,
+            ll_option,
+            send_unicast,
+            cease,
+            is_no,
+            default_router,
+            max_interval,
+            min_interval,
+            lifetime,
+            initial_count,
+            initial_interval,
+        })
+    }
+}
+
+impl Message for SwInterfaceIp6ndRaConfig {
+    const NAME: &'static str = "sw_interface_ip6nd_ra_config";
+    const CRC: &'static str = "0x3eb00b1c";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `sw_interface_ip6nd_ra_config_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SwInterfaceIp6ndRaConfigReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for SwInterfaceIp6ndRaConfigReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for SwInterfaceIp6ndRaConfigReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for SwInterfaceIp6ndRaConfigReply {
+    const NAME: &'static str = "sw_interface_ip6nd_ra_config_reply";
     const CRC: &'static str = "0xe8d4e804";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;

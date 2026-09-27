@@ -42,7 +42,11 @@ use packetframe_vpp_offload::vpp_api::generated::{
     SwInterfaceSetL2Bridge, SwInterfaceSetL2BridgeReply, SwInterfaceSetMacAddressReply,
     SwInterfaceSetMtu, SwInterfaceSetMtuReply, SwInterfaceSetPromiscReply,
     SwInterfaceSetRxPlacement, SwInterfaceSetRxPlacementReply, SwInterfaceSetUnnumberedReply,
-    ADDRESS_IP4, FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
+    ADDRESS_IP4, ADDRESS_IP6, FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL, MESSAGE_META,
+};
+use packetframe_vpp_offload::vpp_api::generated::{
+    IpRouteDump, SwInterfaceIp6EnableDisable, SwInterfaceIp6EnableDisableReply,
+    SwInterfaceIp6ndRaConfig, SwInterfaceIp6ndRaConfigReply,
 };
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
@@ -107,6 +111,10 @@ pub struct WireRoute {
     pub len: u8,
     /// Interface indices the paths reference.
     pub path_indices: Vec<u32>,
+    /// The prefix's family, and its full sixteen bytes — `addr` alone
+    /// would fold a v6 prefix into four bytes of a bogus v4 one.
+    pub is_ip6: bool,
+    pub addr16: [u8; 16],
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +143,11 @@ pub struct Fake {
     /// the serving thread so a test can play ANOTHER client editing VPP's
     /// FIB between two of this module's requests.
     pub routes: std::sync::Arc<std::sync::Mutex<RouteTable>>,
+    /// The tracked IPv6 route table, alongside `routes` (which is v4's).
+    pub routes6: std::sync::Arc<std::sync::Mutex<RouteTable6>>,
+    /// Interfaces VPP has ip6 enabled on — VPP state, so it outlives a
+    /// connection like the route and neighbour tables.
+    pub ip6_enabled: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>>,
     _dir: tempdir::TempDir,
     events: Receiver<Event>,
 }
@@ -272,6 +285,27 @@ pub type ExistingVia = ([u8; 4], u8, [u8; 4], u32, u8);
 /// lookup echoes what the table holds.
 pub type RouteTable = std::collections::BTreeMap<([u8; 4], u8), Vec<FibPath>>;
 
+/// The IPv6 half of the tracked route table.
+pub type RouteTable6 = std::collections::BTreeMap<([u8; 16], u8), Vec<FibPath>>;
+
+/// `show ip6 fib summary` over the tracked v6 table, in VPP v26.06's
+/// layout: `ip6_fib_table_show` centres its rows (`%=20d%=16lld`).
+pub fn fib6_summary(table: &RouteTable6) -> String {
+    let mut by_len: std::collections::BTreeMap<u8, u64> = std::collections::BTreeMap::new();
+    for (_, len) in table.keys() {
+        *by_len.entry(*len).or_default() += 1;
+    }
+    let mut out = String::from(
+        "ipv6-VRF:0, fib_index:0, flow hash:[src dst sport dport proto flowlabel ] epoch:0 \
+         flags:none locks:[default-route:1, ]\n",
+    );
+    out.push_str(&format!("{:^20}{:^16}\n", "Prefix length", "Count"));
+    for (len, n) in by_len.iter().rev() {
+        out.push_str(&format!("{len:^20}{n:^16}\n"));
+    }
+    out
+}
+
 /// One path as `existing_route` builds it, with a chosen weight.
 pub fn table_path(nh: [u8; 4], sw_if_index: u32, weight: u8) -> FibPath {
     let mut p = existing_route([0; 4], 32, sw_if_index, true, nh).paths[0].clone();
@@ -325,6 +359,11 @@ impl Fake {
 
         let routes: std::sync::Arc<std::sync::Mutex<RouteTable>> = Default::default();
         let table = routes.clone();
+        let routes6: std::sync::Arc<std::sync::Mutex<RouteTable6>> = Default::default();
+        let table6 = routes6.clone();
+        let ip6_enabled: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
+            Default::default();
+        let ip6 = ip6_enabled.clone();
         thread::spawn(move || {
             let mut b = behaviour;
             // VPP's neighbour table, OUTSIDE the accept loop, because it
@@ -333,6 +372,9 @@ impl Fake {
             // the unacknowledged-neighbour tests: the entry is still there
             // when we come back and ask.
             let mut neighbours: Vec<([u8; 4], u32, [u8; 6], u8)> = b.existing_neighbours.to_vec();
+            // The v6 neighbour table, kept apart for the same reason the
+            // route tables are.
+            let mut neighbours6: Vec<([u8; 16], u32, [u8; 6], u8)> = Vec::new();
             // Likewise the route table, for `track_routes`.
             {
                 let mut routes = table.lock().unwrap();
@@ -352,7 +394,17 @@ impl Fake {
             // Accept repeatedly: a disconnect-and-reconnect is part of
             // what these tests exercise.
             while let Ok((mut sock, _)) = listener.accept() {
-                serve(&mut sock, &tx, b, &mut neighbours, &table, &mut stall);
+                serve(
+                    &mut sock,
+                    &tx,
+                    b,
+                    &mut neighbours,
+                    &mut neighbours6,
+                    &table,
+                    &table6,
+                    &ip6,
+                    &mut stall,
+                );
                 // One-shot hangup: the point of that test is that a fresh
                 // connection can finish the job.
                 b.hangup_after = None;
@@ -363,6 +415,8 @@ impl Fake {
         Self {
             path,
             routes,
+            routes6,
+            ip6_enabled,
             _dir: dir,
             events: rx,
         }
@@ -377,12 +431,16 @@ impl Fake {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve(
     sock: &mut UnixStream,
     tx: &Sender<Event>,
     mut behaviour: Behaviour,
     neighbours: &mut Vec<([u8; 4], u32, [u8; 6], u8)>,
+    neighbours6: &mut Vec<([u8; 16], u32, [u8; 6], u8)>,
     table: &std::sync::Mutex<RouteTable>,
+    table6: &std::sync::Mutex<RouteTable6>,
+    ip6_enabled: &std::sync::Mutex<std::collections::BTreeSet<u32>>,
     stall: &mut Option<(&'static str, usize)>,
 ) -> Option<()> {
     // What `sw_interface_set_mac_address` last set, per interface. The
@@ -697,20 +755,32 @@ fn serve(
                 let r = IpRouteAddDel::decode(&mut d).expect("decodes as a route op");
                 let mut addr = [0u8; 4];
                 addr.copy_from_slice(&r.route.prefix.address.un.0[..4]);
+                let is_ip6 = r.route.prefix.address.af == ADDRESS_IP6;
+                let addr16 = r.route.prefix.address.un.0;
                 let _ = tx.send(Event::Route(WireRoute {
                     is_add: r.is_add,
                     addr,
                     len: r.route.prefix.len,
                     path_indices: r.route.paths.iter().map(|p| p.sw_if_index).collect(),
+                    is_ip6,
+                    addr16,
                 }));
                 // A real VPP applies before it answers.
-                let mut routes = table.lock().unwrap();
-                if r.is_add {
-                    routes.insert((addr, r.route.prefix.len), r.route.paths.clone());
+                if is_ip6 {
+                    let mut routes = table6.lock().unwrap();
+                    if r.is_add {
+                        routes.insert((addr16, r.route.prefix.len), r.route.paths.clone());
+                    } else {
+                        routes.remove(&(addr16, r.route.prefix.len));
+                    }
                 } else {
-                    routes.remove(&(addr, r.route.prefix.len));
+                    let mut routes = table.lock().unwrap();
+                    if r.is_add {
+                        routes.insert((addr, r.route.prefix.len), r.route.paths.clone());
+                    } else {
+                        routes.remove(&(addr, r.route.prefix.len));
+                    }
                 }
-                drop(routes);
 
                 routes_seen += 1;
                 if behaviour.hangup_after.is_some_and(|n| routes_seen > n) {
@@ -744,6 +814,27 @@ fn serve(
                 let want = IpNeighborDump::decode(&mut d)
                     .expect("decodes as a neighbour dump")
                     .af;
+                if want == ADDRESS_IP6 {
+                    for &(ip, sw_if_index, mac, flags) in neighbours6.iter() {
+                        let mut d = reply_head("ip_neighbor_details");
+                        IpNeighborDetails {
+                            context: ctx,
+                            age: 1.0,
+                            neighbor: IpNeighbor {
+                                sw_if_index,
+                                flags,
+                                mac_address: mac,
+                                ip_address: Address {
+                                    af: ADDRESS_IP6,
+                                    un: AddressUnion(ip),
+                                },
+                            },
+                        }
+                        .encode(&mut d);
+                        write_frame(sock, &d);
+                    }
+                    continue;
+                }
                 if want != ADDRESS_IP4 {
                     continue;
                 }
@@ -791,6 +882,19 @@ fn serve(
                 // v4 ops move it: the table is v4-keyed (and the dump
                 // answers v4 only), so a v6 address folded into four
                 // bytes would surface as a bogus v4 neighbour.
+                if retval == 0 && n.neighbor.ip_address.af == ADDRESS_IP6 {
+                    let key = n.neighbor.ip_address.un.0;
+                    neighbours6
+                        .retain(|(ip, idx, _, _)| !(*ip == key && *idx == n.neighbor.sw_if_index));
+                    if n.is_add {
+                        neighbours6.push((
+                            key,
+                            n.neighbor.sw_if_index,
+                            n.neighbor.mac_address,
+                            n.neighbor.flags,
+                        ));
+                    }
+                }
                 if retval == 0 && n.neighbor.ip_address.af == ADDRESS_IP4 {
                     let mut key = [0u8; 4];
                     key.copy_from_slice(&n.neighbor.ip_address.un.0[..4]);
@@ -824,8 +928,17 @@ fn serve(
                 let mut addr = [0u8; 4];
                 addr.copy_from_slice(&q.prefix.address.un.0[..4]);
                 out = reply_head("ip_route_lookup_reply");
-                let (retval, paths) = match table.lock().unwrap().get(&(addr, q.prefix.len)) {
-                    Some(p) => (0, p.clone()),
+                let found = if q.prefix.address.af == ADDRESS_IP6 {
+                    table6
+                        .lock()
+                        .unwrap()
+                        .get(&(q.prefix.address.un.0, q.prefix.len))
+                        .cloned()
+                } else {
+                    table.lock().unwrap().get(&(addr, q.prefix.len)).cloned()
+                };
+                let (retval, paths) = match found {
+                    Some(p) => (0, p),
                     // VNET_API_ERROR_NO_SUCH_ENTRY.
                     None => (-6, Vec::new()),
                 };
@@ -870,6 +983,31 @@ fn serve(
                 if let Some(f) = behaviour.dumped {
                     f.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
+                let mut d = Decoder::new(&req);
+                let want6 = IpRouteDump::decode(&mut d)
+                    .expect("decodes as a route dump")
+                    .table
+                    .is_ip6;
+                if want6 {
+                    let snapshot = table6.lock().unwrap().clone();
+                    for (&(addr, len), paths) in snapshot.iter() {
+                        let mut route = existing_route([0; 4], len, 0, true, [192, 0, 2, 1]);
+                        route.prefix.address = Address {
+                            af: ADDRESS_IP6,
+                            un: AddressUnion(addr),
+                        };
+                        route.paths = paths.clone();
+                        route.n_paths = route.paths.len() as u8;
+                        let mut d = reply_head("ip_route_details");
+                        IpRouteDetails {
+                            context: ctx,
+                            route,
+                        }
+                        .encode(&mut d);
+                        write_frame(sock, &d);
+                    }
+                    continue;
+                }
                 let snapshot = table.lock().unwrap().clone();
                 for (&(addr, len), paths) in snapshot.iter() {
                     let mut route = existing_route(addr, len, 0, true, [192, 0, 2, 1]);
@@ -888,6 +1026,16 @@ fn serve(
             "ip_route_dump" => {
                 if let Some(f) = behaviour.dumped {
                     f.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                // `existing_routes` is a v4 table: the v6 dump answers
+                // empty, as a real VPP holding no v6 routes does.
+                let mut d = Decoder::new(&req);
+                if IpRouteDump::decode(&mut d)
+                    .expect("decodes as a route dump")
+                    .table
+                    .is_ip6
+                {
+                    continue;
                 }
                 for &(addr, len, sw_if_index, has_nh) in behaviour.existing_routes {
                     let mut d = reply_head("ip_route_details");
@@ -987,7 +1135,9 @@ fn serve(
                     .expect("decodes as a CLI request")
                     .cmd;
                 let _ = tx.send(Event::Msg(format!("cli {cmd}")));
-                let reply = if cmd.contains("fib summary") && behaviour.track_routes {
+                let reply = if cmd.contains("ip6 fib summary") && behaviour.track_routes {
+                    fib6_summary(&table6.lock().unwrap())
+                } else if cmd.contains("fib summary") && behaviour.track_routes {
                     fib_summary(&table.lock().unwrap())
                 } else if cmd.contains("fib summary") {
                     // Not a table this fake can describe: an answer the
@@ -1005,6 +1155,59 @@ fn serve(
                 .encode(&mut out);
                 write_frame(sock, &out);
                 continue;
+            }
+            "sw_interface_ip6_enable_disable" => {
+                let mut d = Decoder::new(&req);
+                let r = SwInterfaceIp6EnableDisable::decode(&mut d)
+                    .expect("decodes as an ip6 enable op");
+                let _ = tx.send(Event::Msg(format!(
+                    "ip6 enable if={} enable={}",
+                    r.sw_if_index, r.enable
+                )));
+                let mut enabled = ip6_enabled.lock().unwrap();
+                // VPP v26.06 `ip6_link_enable`: a re-enable answers
+                // VALUE_EXIST (-81); a disable of a link that has none
+                // answers IP6_NOT_ENABLED (-62).
+                let retval = match (r.enable, enabled.contains(&r.sw_if_index)) {
+                    (true, true) => -81,
+                    (true, false) => {
+                        enabled.insert(r.sw_if_index);
+                        0
+                    }
+                    (false, true) => {
+                        enabled.remove(&r.sw_if_index);
+                        0
+                    }
+                    (false, false) => -62,
+                };
+                drop(enabled);
+                out = reply_head("sw_interface_ip6_enable_disable_reply");
+                SwInterfaceIp6EnableDisableReply {
+                    context: ctx,
+                    retval,
+                }
+                .encode(&mut out);
+            }
+            "sw_interface_ip6nd_ra_config" => {
+                let mut d = Decoder::new(&req);
+                let r =
+                    SwInterfaceIp6ndRaConfig::decode(&mut d).expect("decodes as an RA config op");
+                let _ = tx.send(Event::Msg(format!(
+                    "ra config if={} suppress={} is_no={}",
+                    r.sw_if_index, r.suppress, r.is_no
+                )));
+                // `ip6_ra_config` refuses an interface with no ip6 link.
+                let retval = if ip6_enabled.lock().unwrap().contains(&r.sw_if_index) {
+                    0
+                } else {
+                    -62
+                };
+                out = reply_head("sw_interface_ip6nd_ra_config_reply");
+                SwInterfaceIp6ndRaConfigReply {
+                    context: ctx,
+                    retval,
+                }
+                .encode(&mut out);
             }
             "control_ping" if behaviour.stall_pings_after == Some(0) => {
                 // Silence, connection held open: the client blocks until
