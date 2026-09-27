@@ -1389,6 +1389,10 @@ VLANs, because the NIC has no untagged-only match — a rule without a
 VLAN term matches every VLAN.
 
 **ICMPv6 is never diverted**, and that is load-bearing, not a nicety.
+Proven on the rig with real frames (2026-09-27): a port-less `tcp6`
+drop scoped to the router MAC blocked TCP while echo, DNS and the
+kernel's own re-resolution of a customer neighbour all passed; the
+`udp6` twin blocked DNS and left TCP and echo alone.
 Neighbour discovery runs both ways over unicast to the router MAC:
 customers' NUD probes of their gateway, and — the one that would hurt
 most — the NA a customer sends back to the **kernel's** own

@@ -329,7 +329,11 @@ pub const BUILTIN_KEEPS6: [L4Match; 2] = [
 /// puts the parsed-L4-type term (`NPC_IPPROTO_TCP`/`_UDP`) on every rule
 /// of those flow types, port or not — unlike `ip6 l4proto`, whose value
 /// it drops. Everything else — ICMPv6, and any other next header —
-/// stays on the kernel path.
+/// stays on the kernel path. Proven with real frames (rig, 2026-09-27):
+/// a port-less `tcp6 dst-mac <router>` drop blocked TCP while echo, DNS
+/// and the kernel's own neighbour resolution (a deleted entry back to
+/// REACHABLE) all passed; the `udp6` twin blocked DNS and left TCP and
+/// echo alone.
 pub const V6_DIVERT_PROTOS: [L4Proto; 2] = [L4Proto::Tcp, L4Proto::Udp];
 
 /// The IPv6 half of one port's steering, from config.
