@@ -2418,6 +2418,63 @@ fn neighbour_resolution_and_loss_reach_the_sink() {
     );
 }
 
+/// A customer host registered by `local-prefix6` reaches the second
+/// tier as a neighbour — never as a route.
+///
+/// The chain a vpp-offload `local-route6` depends on: neigh-snoop writes
+/// a STALE entry for a host VPP's glean solicited, the resolver turns it
+/// into this `/128` Add (host as its own next hop, which is what
+/// registers the host) plus a `Learned` (STALE carries a usable MAC, so
+/// it parses as one), and the programmer announces the neighbour. VPP
+/// takes it as a static neighbour on the BVI, where the attached `/64`
+/// makes it a usable host route; the `/128` itself stays a local-ARP
+/// route and is not announced as installable.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_local_prefix6_host_reaches_the_sink_as_a_neighbour() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let host = IpAddr::V6("2001:db8:1::51".parse().unwrap());
+    let host128 = IpPrefix::V6 {
+        addr: [
+            0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x51,
+        ],
+        prefix_len: 128,
+    };
+    let mac = [0x02, 0, 0, 0, 0xc0, 0x51];
+    let ifindex = 1337;
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: PeerId::local_arp(ifindex),
+                prefix: host128,
+                nexthops: vec![host],
+                path_id: None,
+                local_pref: None,
+            })
+            .await
+            .expect("apply local-arp /128 Add");
+    });
+    h.feed_neigh(NeighEvent::Learned {
+        ip: host,
+        mac,
+        ifindex,
+        src_mac: [0x02, 0, 0, 0, 0xb0, 0x01],
+    });
+
+    let calls = sink.calls();
+    assert!(
+        calls.contains(&SinkCall::NeighResolved(host, mac, ifindex)),
+        "the snooped host must reach the second tier as a neighbour: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, SinkCall::Resolved(p, _) if *p == host128)),
+        "and its /128 never as an installable route: {calls:?}"
+    );
+}
+
 /// Unregistering a nexthop tells the second tier it is gone.
 ///
 /// This is the seam's only exit for an address, and the reason is a

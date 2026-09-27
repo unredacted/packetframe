@@ -174,6 +174,7 @@ impl Host {
             hugepages: None,
             steer_exempts: vec![],
             local_routes: vec![],
+            local_routes6: vec![],
             steer_capacity: None,
             trunk_ports: vec![],
             v6_outbound: vec![],

@@ -135,6 +135,10 @@ pub struct VppOffloadConfig {
     /// via [`VppOffloadModule::set_local_routes`]. Restart-only: the
     /// attached route and the subif it lands on are attach-time work.
     pub local_routes: Vec<(packetframe_common::config::Ipv4Prefix, String, u16)>,
+    /// `(prefix, port, vlan)` per `local-route6` line, in config order —
+    /// `local_routes`' IPv6 twin, resolved into the same [`LocalRoute`]
+    /// list. Restart-only for the same reasons.
+    pub local_routes6: Vec<(packetframe_common::config::Ipv6Prefix, String, u16)>,
     /// `steer-capacity`: the ntuple table size to ask each steerable
     /// member port for at attach. `None` leaves the driver's default
     /// alone. Restart-only — the driver refuses to resize a table
@@ -162,20 +166,76 @@ pub struct VppOffloadConfig {
     pub v6: bool,
 }
 
-/// One `local-route`, resolved for the engine: the config triple plus
-/// the kernel device whose neighbours mirror onto the subif.
+/// One `local-route` or `local-route6`, resolved for the engine: the
+/// config triple plus the kernel device whose neighbours mirror onto the
+/// subif.
 ///
 /// `kernel_dev` is not in the module's own section — it is the `via`
-/// of the fast-path `local-prefix` covering `prefix` (validation
-/// guarantees exactly that cover exists). The loader performs the join
-/// because `Module` methods only see their own section; same reason
-/// the allowlist is a handle.
+/// of the fast-path `local-prefix` (`local-prefix6` for a v6 route)
+/// covering `prefix` (validation guarantees exactly that cover exists).
+/// The loader performs the join because `Module` methods only see their
+/// own section; same reason the allowlist is a handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalRoute {
-    pub prefix: packetframe_common::config::Ipv4Prefix,
+    pub prefix: LocalRoutePrefix,
     pub port: String,
     pub vlan: u16,
     pub kernel_dev: String,
+}
+
+/// A local route's prefix, as declared. One list carries both families
+/// because everything done with one — where the attached route lands,
+/// what it shadows, that it stays out of the ledger — is the same for
+/// both; only the path's next-hop protocol differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRoutePrefix {
+    V4(packetframe_common::config::Ipv4Prefix),
+    V6(packetframe_common::config::Ipv6Prefix),
+}
+
+impl LocalRoutePrefix {
+    /// The prefix VPP is given: the network, host bits cleared
+    /// (declarations need not be aligned).
+    pub fn network(&self) -> packetframe_common::fib::IpPrefix {
+        match self {
+            Self::V4(p) => packetframe_common::fib::IpPrefix::V4 {
+                addr: p.network().octets(),
+                prefix_len: p.prefix_len,
+            },
+            Self::V6(p) => packetframe_common::fib::IpPrefix::V6 {
+                addr: p.network().octets(),
+                prefix_len: p.prefix_len,
+            },
+        }
+    }
+
+    /// Whether `p` lies wholly inside this prefix. Never across families.
+    pub fn covers(&self, p: &packetframe_common::fib::IpPrefix) -> bool {
+        use packetframe_common::fib::IpPrefix;
+        match (self, p) {
+            (Self::V4(lr), IpPrefix::V4 { addr, prefix_len }) => {
+                lr.prefix_len <= *prefix_len && lr.contains_addr(std::net::Ipv4Addr::from(*addr))
+            }
+            (Self::V6(lr), IpPrefix::V6 { addr, prefix_len }) => {
+                lr.prefix_len <= *prefix_len && lr.contains_addr(std::net::Ipv6Addr::from(*addr))
+            }
+            _ => false,
+        }
+    }
+
+    pub fn is_v6(&self) -> bool {
+        matches!(self, Self::V6(_))
+    }
+}
+
+impl std::fmt::Display for LocalRoutePrefix {
+    /// As declared, host bits included — what the operator wrote.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V4(p) => write!(f, "{}/{}", p.addr, p.prefix_len),
+            Self::V6(p) => write!(f, "{}/{}", p.addr, p.prefix_len),
+        }
+    }
 }
 
 /// One parsed `port` line: `(iface, cores, steer, vlans, direction)`.
@@ -237,6 +297,12 @@ impl VppOffloadConfig {
                     vlan,
                     ..
                 } => out.local_routes.push((*prefix, iface.clone(), *vlan)),
+                ModuleDirective::VppLocalRoute6 {
+                    prefix,
+                    iface,
+                    vlan,
+                    ..
+                } => out.local_routes6.push((*prefix, iface.clone(), *vlan)),
                 _ => {}
             }
         }
@@ -377,6 +443,13 @@ impl VppOffloadConfig {
                 self.local_routes, new.local_routes
             ));
         }
+        if self.local_routes6 != new.local_routes6 {
+            return Err(format!(
+                "the `local-route6` lines changed ({:?} → {:?}); the attached route and the \
+                 interface it lands on are installed at attach — restart to apply",
+                self.local_routes6, new.local_routes6
+            ));
+        }
         // Restart-only for a different reason than everything above:
         // VPP has never heard of this directive. What is fixed is the
         // WIRING — the attach sequence installs or withholds the
@@ -438,6 +511,16 @@ impl VppOffloadConfig {
         // written before this directive existed — all `v6 off` by
         // construction — still matches a `v6 off` config and adopts.
         .chain(self.v6.then(|| ("v6", "on".to_string())))
+        // `local-route6`, recorded only when present, for the same
+        // reason: every record written before the directive existed has
+        // none, and must still adopt. Recorded at all because nothing
+        // else removes an attached route — it is outside the ledger —
+        // so a line dropped across a `--keep-vpp` restart must refuse
+        // adoption and restart VPP rather than leave the route behind.
+        .chain(
+            (!self.local_routes6.is_empty())
+                .then(|| ("local-route6", format!("{:?}", self.local_routes6))),
+        )
         .map(|(k, v)| (k.to_string(), v))
         .collect()
     }
@@ -1091,7 +1174,7 @@ impl VppOffloadModule {
         self.allowlist = allowlist;
     }
 
-    /// Hand the module its resolved `local-route` set.
+    /// Hand the module its resolved `local-route` and `local-route6` set.
     ///
     /// A setter for the same reason the allowlist is one: the kernel
     /// bridge device each prefix's neighbours mirror from is the `via`
@@ -1405,14 +1488,14 @@ impl Module for VppOffloadModule {
         // that wiring is missing — refused loudly here rather than
         // attaching a VPP that silently skips the delivery this config
         // exists to provide (the published-is-not-read class).
-        if self.cfg.local_routes.len() != self.local_routes.len() {
+        let declared = self.cfg.local_routes.len() + self.cfg.local_routes6.len();
+        if declared != self.local_routes.len() {
             return Err(ModuleError::other(
                 MODULE_NAME,
                 format!(
-                    "config declares {} local-route line(s) but the loader resolved {} — \
+                    "config declares {declared} local-route line(s) but the loader resolved {} — \
                      set_local_routes was not wired; refusing to attach without the local \
                      delivery the config promises",
-                    self.cfg.local_routes.len(),
                     self.local_routes.len()
                 ),
             ));
@@ -2368,6 +2451,7 @@ mod tests {
             require_table_complete: true,
             steer_exempts: vec![],
             local_routes: vec![],
+            local_routes6: vec![],
             steer_capacity: None,
             trunk_ports: vec![],
             v6_outbound: vec![],
@@ -2958,6 +3042,9 @@ mod tests {
         let mut c = base.clone();
         c.v6 = true;
         changes.push(c);
+        let mut c = base.clone();
+        c.local_routes6.push((doc_v6_64(), "eth4".into(), 1337));
+        changes.push(c);
         for c in &changes {
             assert!(
                 base.restart_only_delta(c).is_err(),
@@ -2993,6 +3080,114 @@ mod tests {
         let parsed = VppOffloadConfig::from_directives(&[ModuleDirective::VppV6(true)]);
         assert!(parsed.v6);
         assert!(!VppOffloadConfig::from_directives(&[]).v6, "default off");
+    }
+
+    fn doc_v6_64() -> packetframe_common::config::Ipv6Prefix {
+        packetframe_common::config::Ipv6Prefix {
+            addr: "2001:db8:1::".parse().unwrap(),
+            prefix_len: 64,
+        }
+    }
+
+    /// `local-route6` is restart-only on both doors — nothing but a VPP
+    /// restart removes an attached route, since it is outside the ledger
+    /// — and a config without it records exactly what a build that
+    /// predates the directive recorded, so an upgrade still adopts.
+    #[test]
+    fn local_route6_is_restart_only_and_absent_records_nothing_new() {
+        let without = cfg(&[("eth4", 1, false)], 1_600_000);
+        let mut with = without.clone();
+        with.local_routes6.push((doc_v6_64(), "eth4".into(), 1337));
+        for (a, b) in [(&without, &with), (&with, &without)] {
+            let e = a
+                .restart_only_delta(b)
+                .expect_err("a local-route6 edit must refuse the reload");
+            assert!(
+                e.contains("`local-route6` lines changed") && e.contains("restart"),
+                "{e}"
+            );
+        }
+        assert!(!without.restart_only().contains_key("local-route6"));
+        assert!(with.restart_only().contains_key("local-route6"));
+
+        let parsed = VppOffloadConfig::from_directives(&[ModuleDirective::VppLocalRoute6 {
+            prefix: doc_v6_64(),
+            iface: "eth4".into(),
+            vlan: 1337,
+            line: 1,
+        }]);
+        assert_eq!(
+            parsed.local_routes6,
+            vec![(doc_v6_64(), "eth4".to_string(), 1337)]
+        );
+        assert!(
+            parsed.local_routes.is_empty(),
+            "never mixed into the v4 list"
+        );
+    }
+
+    /// The resolved prefix: what VPP is given is the network, what an
+    /// operator reads is what they wrote, and coverage never crosses a
+    /// family — a v6 local route shadows nothing v4 and vice versa.
+    #[test]
+    fn local_route_prefix_normalizes_and_covers_within_its_family() {
+        use packetframe_common::fib::IpPrefix;
+        let v6 = LocalRoutePrefix::V6(packetframe_common::config::Ipv6Prefix {
+            addr: "2001:db8:1::5".parse().unwrap(),
+            prefix_len: 64,
+        });
+        assert_eq!(v6.to_string(), "2001:db8:1::5/64");
+        let mut net = [0u8; 16];
+        net[..6].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 1]);
+        assert_eq!(
+            v6.network(),
+            IpPrefix::V6 {
+                addr: net,
+                prefix_len: 64
+            }
+        );
+        let mut host = net;
+        host[15] = 7;
+        assert!(v6.covers(&IpPrefix::V6 {
+            addr: host,
+            prefix_len: 128
+        }));
+        assert!(v6.covers(&IpPrefix::V6 {
+            addr: net,
+            prefix_len: 64
+        }));
+        assert!(!v6.covers(&IpPrefix::V6 {
+            addr: net,
+            prefix_len: 48
+        }));
+        let mut other = net;
+        other[7] = 1; // 2001:db8:1:1::/64
+        assert!(!v6.covers(&IpPrefix::V6 {
+            addr: other,
+            prefix_len: 64
+        }));
+
+        let v4 = LocalRoutePrefix::V4(packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(192, 0, 2, 9),
+            prefix_len: 24,
+        });
+        assert_eq!(v4.to_string(), "192.0.2.9/24");
+        assert_eq!(
+            v4.network(),
+            IpPrefix::V4 {
+                addr: [192, 0, 2, 0],
+                prefix_len: 24
+            }
+        );
+        // Bytes that would match if families were confused.
+        assert!(!v4.covers(&IpPrefix::V6 {
+            addr: [192, 0, 2, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            prefix_len: 128
+        }));
+        assert!(!v6.covers(&IpPrefix::V4 {
+            addr: [0x20, 0x01, 0x0d, 0xb8],
+            prefix_len: 32
+        }));
     }
 
     /// A reordered port list is a change, not a permutation.

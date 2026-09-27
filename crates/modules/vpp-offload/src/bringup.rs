@@ -1327,8 +1327,13 @@ fn finish(
         let _ = (&drift_port_vlans, &drift_trunks);
         let drift_reach = crate::drift::VppReach {
             members: members.clone(),
+            // IPv4 local routes only: the scan judges the kernel's v4
+            // table, and a bridge VPP delivers only v6 into (a
+            // `local-route6` alone) would clear a v4 connected route out
+            // of it that VPP has no attached route for.
             local_devices: local_routes
                 .iter()
+                .filter(|lr| !lr.prefix.is_v6())
                 .map(|lr| lr.kernel_dev.clone())
                 .collect(),
             bridged_devices: Vec::new(),
@@ -1686,6 +1691,7 @@ mod completeness_gate_tests {
             require_table_complete: require,
             steer_exempts: vec![],
             local_routes: vec![],
+            local_routes6: vec![],
             steer_capacity: None,
             trunk_ports: vec![],
             v6_outbound: vec![],

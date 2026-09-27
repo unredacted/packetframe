@@ -53,7 +53,7 @@ use crate::vpp_api::generated::{
     CliInband, CliInbandReply, FibPath, IpNeighbor, IpNeighborAddDel, IpNeighborAddDelReply,
     IpNeighborDetails, IpNeighborDump, IpRoute, IpRouteAddDel, IpRouteAddDelReply, IpRouteDetails,
     IpRouteDump, IpTable, ADDRESS_IP4, ADDRESS_IP6, FIB_API_PATH_FLAG_NONE,
-    FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_TYPE_NORMAL,
+    FIB_API_PATH_NH_PROTO_IP4, FIB_API_PATH_NH_PROTO_IP6, FIB_API_PATH_TYPE_NORMAL,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -543,7 +543,8 @@ pub struct ConvergenceEngine {
     /// the backing bridge mirrored as static neighbours, and the BGP
     /// mirror's view INSIDE each prefix shadowed (skipped at resync
     /// and in deltas). Restart-only config, resolved by the loader
-    /// against fast-path's `local-prefix` for the kernel device.
+    /// against fast-path's `local-prefix` (`local-prefix6` for a
+    /// `local-route6`) for the kernel device. Both families.
     local_routes: Vec<crate::LocalRoute>,
     /// Mirror prefixes currently suppressed by a `local-route` — kept
     /// as a set so health can report a count that means "routes the
@@ -1699,14 +1700,17 @@ impl ConvergenceEngine {
     /// which the kernel path never consults and VPP would faithfully
     /// blackhole with. Local delivery comes from the attached route +
     /// neighbour mirror instead.
+    ///
+    /// A `local-route6` shadows the same way, and has a second reason
+    /// to: a mirror route for the customer prefix itself, if the feed
+    /// carries one through a next hop that is not the router's own,
+    /// would be sent through the same API as the attached route, and a
+    /// route add for an existing prefix REPLACES its paths — the attached
+    /// route would be gone the next resync. Hosts inside it are delivered
+    /// by their static neighbours' adj-fibs, active under the attached
+    /// cover on their interface — exactly the v4 shape.
     fn shadows(&self, p: &IpPrefix) -> bool {
-        let IpPrefix::V4 { addr, prefix_len } = p else {
-            return false;
-        };
-        self.local_routes.iter().any(|lr| {
-            lr.prefix.prefix_len <= *prefix_len
-                && lr.prefix.contains_addr(std::net::Ipv4Addr::from(*addr))
-        })
+        self.local_routes.iter().any(|lr| lr.prefix.covers(p))
     }
 
     /// Whether VPP holds a route for exactly this v6 prefix: installed,
@@ -2177,8 +2181,9 @@ impl ConvergenceEngine {
         self.ip6_ready.iter().copied().collect()
     }
 
-    /// Install one attached route per `local-route`, straight onto the
-    /// subif — deliberately OUTSIDE the pending/ledger path.
+    /// Install one attached route per `local-route` and `local-route6`,
+    /// straight onto the subif — deliberately OUTSIDE the pending/ledger
+    /// path.
     ///
     /// These are module-owned topology, not mirror state: the resync
     /// diff withdraws whatever the ledger holds that the source no
@@ -2195,6 +2200,28 @@ impl ConvergenceEngine {
     /// neighbours (VPP never ARPs; a never-seen host drops here where
     /// the kernel would ARP-queue — documented, service hosts are
     /// static).
+    ///
+    /// **For a `local-route6` that drop is not the end of it.** A packet
+    /// for a host VPP holds no neighbour for takes the attached route's
+    /// glean adjacency, and VPP v26.06's `ip6-glean` solicits the host:
+    /// the NS is sourced from the interface's LINK-LOCAL, unconditionally
+    /// (`ip6_discover_neighbor_inline`), so no global address or
+    /// connected prefix is needed and none is configured — only ip6
+    /// enabled on the interface, which [`Self::ensure_ip6`] did before
+    /// this runs. On a BVI, which carries the kernel bridge's MAC, that
+    /// link-local and the NS's source link-layer option are the bridge's
+    /// own, so the host's reply — a unicast NA, ICMPv6, which is never
+    /// diverted — lands on the kernel bridge. There neigh-snoop learns it
+    /// and installs it `STALE`, fast-path's `local-prefix6` registers it,
+    /// and it comes back here as a static neighbour. The triggering packet
+    /// is dropped either way (glean does not queue): the first-packet cost
+    /// IPv4 pays too.
+    ///
+    /// VPP rate-limits the solicitations itself (`nd_throttle`): at most
+    /// one per (destination, interface) per millisecond per worker, the
+    /// rest counted as `ip6-glean` `throttled`. A stream to a silent
+    /// address therefore solicits up to ~1000 times a second per worker;
+    /// the runbook says what that costs and how to see it.
     fn install_attached_routes(&mut self) -> Result<(), EngineError> {
         if self.local_routes.is_empty() {
             return Ok(());
@@ -2225,13 +2252,9 @@ impl ConvergenceEngine {
                 // operator error, and installing onto index 0 would
                 // route the prefix to local0.
                 return Err(EngineError::AttachedRouteFailed {
-                    prefix: format!("{}/{}", lr.prefix.addr, lr.prefix.prefix_len),
+                    prefix: lr.prefix.to_string(),
                     detail: format!("no subif index for {}.{}", lr.port, lr.vlan),
                 });
-            };
-            let prefix = IpPrefix::V4 {
-                addr: lr.prefix.network().octets(),
-                prefix_len: lr.prefix.prefix_len,
             };
             let mut path = FibPath {
                 sw_if_index,
@@ -2241,7 +2264,11 @@ impl ConvergenceEngine {
                 preference: 0,
                 r#type: FIB_API_PATH_TYPE_NORMAL,
                 flags: FIB_API_PATH_FLAG_NONE,
-                proto: FIB_API_PATH_NH_PROTO_IP4,
+                proto: if lr.prefix.is_v6() {
+                    FIB_API_PATH_NH_PROTO_IP6
+                } else {
+                    FIB_API_PATH_NH_PROTO_IP4
+                },
                 nh: Default::default(),
                 n_labels: 0,
                 label_stack: Default::default(),
@@ -2255,19 +2282,19 @@ impl ConvergenceEngine {
                 route: IpRoute {
                     table_id: 0,
                     stats_index: 0,
-                    prefix: crate::fib_sync::to_prefix(prefix),
+                    prefix: crate::fib_sync::to_prefix(lr.prefix.network()),
                     n_paths: 1,
                     paths: vec![path],
                 },
             })?;
             if reply.retval != 0 {
                 return Err(EngineError::AttachedRouteFailed {
-                    prefix: format!("{}/{}", lr.prefix.addr, lr.prefix.prefix_len),
+                    prefix: lr.prefix.to_string(),
                     detail: format!("retval {}", reply.retval),
                 });
             }
             tracing::info!(
-                prefix = %format!("{}/{}", lr.prefix.addr, lr.prefix.prefix_len),
+                prefix = %lr.prefix,
                 port = %lr.port,
                 vlan = lr.vlan,
                 sw_if_index,

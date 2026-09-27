@@ -140,6 +140,9 @@ mod tests {
             (arp(MAC_A, 2, MAC_A, V4_A, MAC_B, V4_B), PKT_HOST),
             (ns_with_sllao(MAC_A, v6(0x10), v6(0x20)), PKT_MULTICAST),
             (na_with_tllao(MAC_A, ll(0x10), v6(0x10)), PKT_MULTICAST),
+            // A solicited NA unicast to the router: PACKET_HOST, and the
+            // one a customer VLAN's glean depends on.
+            (na_solicited_to_router(MAC_A, ll(0x10), v6(0x10)), PKT_HOST),
             (pad_to(arp_request(MAC_A, V4_A, V4_B), 60), PKT_BROADCAST),
         ];
         for (f, t) in frames {
