@@ -220,10 +220,6 @@ pub enum ModuleDirective {
         v6_outbound: Option<VppV6Outbound>,
         line: usize,
     },
-    /// `v6 on|off` — whether VPP carries the IPv6 table. Parsed here so
-    /// `v6-outbound` can require it; what `on` does to VPP belongs to the
-    /// FIB side, not to steering.
-    VppV6(bool),
     /// `steer-keep6 <tcp|udp> <port> [dst|src|both]` — a customer→router
     /// IPv6 service that stays on the kernel while a port diverts
     /// outbound v6, installed at higher MCAM priority than the diversion.
@@ -236,8 +232,10 @@ pub enum ModuleDirective {
     VppSteerKeep6(VppSteerKeep6),
     /// `vpp-binary <path>` — override the probed VPP binary path.
     VppBinary(String),
-    /// `expected-routes <n>` — sizing input: v4+v6 table + headroom.
+    /// `expected-routes <n>` — sizing input: the IPv4 table + headroom.
     /// The independent variable for VPP heap + hugepage arithmetic.
+    /// `v6 on` sizes the IPv6 table from its own fixed budget on top of
+    /// this, so turning it on never shrinks the room IPv4 has.
     ExpectedRoutes(u64),
     /// `hugepages <n>` — default-size hugepages to reserve at attach.
     /// Must be ≥ the minimum derived from `expected-routes`; the
@@ -283,6 +281,16 @@ pub enum ModuleDirective {
     /// compare against — the shadow has no bird of its own — and it
     /// means the operator owns the completeness judgement instead.
     VppRequireTableComplete(bool),
+    /// `v6 on|off` — whether VPP carries IPv6 routes and neighbours.
+    ///
+    /// Default `off`, which is VPP as it has always been: IPv4 only.
+    /// `on` loads the v6 table into VPP (routes, static neighbours, ip6
+    /// enabled on every egress interface with router advertisements
+    /// suppressed) and sizes the main heap and stats segment for it.
+    /// It steers nothing: whether any IPv6 is diverted into VPP is a
+    /// separate, per-port decision. Restart-only — the segments are
+    /// fixed when VPP starts.
+    VppV6(bool),
     /// `steer-direction src|dst|both` — which side of the packet the
     /// MCAM rules match, per allowlisted prefix.
     ///
@@ -3557,11 +3565,6 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 line,
             })
         }
-        "v6" => parse_single_arg(line, rest, "v6", |t| match t {
-            "on" => Ok(ModuleDirective::VppV6(true)),
-            "off" => Ok(ModuleDirective::VppV6(false)),
-            _ => Err("v6 expects on|off".to_string()),
-        }),
         "steer-keep6" => {
             let usage = "steer-keep6 takes: <tcp|udp> <port 1-65535> [dst|src|both]";
             let proto = match rest.next() {
@@ -3653,6 +3656,11 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 _ => Err("require-table-complete expects on|off".to_string()),
             })
         }
+        "v6" => parse_single_arg(line, rest, "v6", |t| match t {
+            "on" => Ok(ModuleDirective::VppV6(true)),
+            "off" => Ok(ModuleDirective::VppV6(false)),
+            _ => Err("v6 expects on|off".to_string()),
+        }),
         "steer-direction" => parse_single_arg(line, rest, "steer-direction", |t| {
             let d: VppSteerDirection = t.parse()?;
             Ok(ModuleDirective::VppSteerDirection(d))
@@ -6464,6 +6472,24 @@ module vpp-offload
         ));
         assert!(Config::parse("module vpp-offload\n  expected-routes 0\n").is_err());
         assert!(Config::parse("module vpp-offload\n  hugepages 0\n").is_err());
+    }
+
+    #[test]
+    fn v6_parses_on_and_off_and_nothing_else() {
+        let c = Config::parse("module vpp-offload\n  v6 on\n").unwrap();
+        assert!(matches!(
+            c.modules[0].directives[0],
+            ModuleDirective::VppV6(true)
+        ));
+        let c = Config::parse("module vpp-offload\n  v6 off\n").unwrap();
+        assert!(matches!(
+            c.modules[0].directives[0],
+            ModuleDirective::VppV6(false)
+        ));
+        for bad in ["", "yes", "1", "on off"] {
+            let s = format!("module vpp-offload\n  v6 {bad}\n");
+            assert!(Config::parse(&s).is_err(), "`v6 {bad}` must be refused");
+        }
     }
 
     #[test]

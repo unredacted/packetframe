@@ -91,7 +91,10 @@ exemptions, and each `steer-exempt` costs one more. An allowlist that
 does not fit is refused as a whole rather than half-steered.
 `packetframe feasibility` reads the real free count from the NIC and
 reports it as `vpp.steering.budget`. That NIC cannot match IPv6 ntuple
-rules, so IPv6 stays on the XDP path.
+rules, so IPv6 stays on the XDP path. `v6 on` loads the IPv6 table
+into VPP without steering any of it — rung 0 of the IPv6 offload, which
+will steer by ethertype, MAC and VLAN rather than by v6 prefix (runbook,
+"Rung 0 for IPv6").
 
 All of it is documented inline in
 [`conf/example.conf`](../../../conf/example.conf).

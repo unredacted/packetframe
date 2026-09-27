@@ -101,6 +101,38 @@ pub const STATSEG_BYTES_PER_ROUTE_PER_THREAD: u64 = 96;
 /// and its own default is 32 MiB — no reason to go below that.
 pub const STATSEG_FLOOR_BYTES: u64 = 32 << 20;
 
+/// The IPv6 table's route budget under `v6 on` — its own allowance,
+/// sized ON TOP of `expected-routes` rather than carved out of it, so
+/// turning IPv6 on can never shrink the room the v4 table has (see
+/// `sink::Capacity`, which enforces the same split at runtime).
+///
+/// The full-table v6 feed is ~252k routes on the reference fleet (the
+/// v6 half of every resync diff under `v6 off`, 2026-09); the v6 DFZ has
+/// grown on the order of 20–30k routes a year, so 400k is years of
+/// headroom. A table past it is withheld and alarms per family, exactly
+/// like a v4 table past its mark.
+pub const V6_ROUTE_BUDGET: u64 = 400_000;
+
+/// Main-heap bytes per IPv6 route. **UNMEASURED** — a deliberately
+/// conservative placeholder, to be measured at `v6 on` rung 0 (runbook,
+/// "Rung 0 for IPv6") and replaced the way gate 0b replaced the v4 guess.
+///
+/// Why not reuse [`HEAP_BYTES_PER_ROUTE`]: that figure is the v4 table's,
+/// whose lookup is an mtrie with interior nodes amortized over a million
+/// routes. IPv6's forwarding lookup is a bihash plus a per-length
+/// non-forwarding hash, a different structure with different growth
+/// steps, and nothing here has observed it. 2,048 is 2× the padded v4
+/// figure and ~4.4× the measured one — memory is the cheap resource, and
+/// being wrong low aborts VPP mid-resync.
+pub const HEAP_BYTES_PER_V6_ROUTE: u64 = 2_048;
+
+/// Stats-segment bytes per IPv6 route per VPP thread. **UNMEASURED** —
+/// see [`HEAP_BYTES_PER_V6_ROUTE`]. The per-route counters are the same
+/// kind for both families (load-balance and adjacency counters, one copy
+/// per thread), so the v4 measurement is a plausible floor; 192 is 2× the
+/// padded v4 figure until rung 0 says otherwise.
+pub const STATSEG_BYTES_PER_V6_ROUTE_PER_THREAD: u64 = 192;
+
 /// VPP threads for `workers` configured workers: `n_vlib_mains` in
 /// VPP's own terms — the main thread plus one per worker. The main
 /// thread gets a counter slot whether or not workers exist, so a
@@ -132,6 +164,13 @@ pub struct Sizing {
     /// reservation** — a separate budget line, not part of
     /// `total_bytes`.
     pub statseg_bytes: u64,
+    /// The IPv6 route budget these segments were grown for:
+    /// [`V6_ROUTE_BUDGET`] under `v6 on`, `0` otherwise.
+    pub v6_routes: u64,
+    /// The share of `main_heap_bytes` that is IPv6's (`0` under `v6 off`).
+    pub v6_heap_bytes: u64,
+    /// The share of `statseg_bytes` that is IPv6's (`0` under `v6 off`).
+    pub v6_statseg_bytes: u64,
 }
 
 /// Compute the sizing from the route count and the configured worker
@@ -143,7 +182,12 @@ pub struct Sizing {
 /// `cores` promises plus the `cores 0` ports' shared worker
 /// (`VppOffloadConfig::total_workers`) — because VPP's thread count, and therefore its
 /// counter-vector replication, is global rather than per-interface.
-pub fn derive_sizing(expected_routes: u64, workers: u32) -> Result<Sizing, String> {
+///
+/// `v6` (`v6 on`) adds the IPv6 table's own allowance —
+/// [`V6_ROUTE_BUDGET`] routes at the unmeasured per-route constants — on
+/// top of everything `expected-routes` sizes, which stays byte-for-byte
+/// what it is under `v6 off`.
+pub fn derive_sizing(expected_routes: u64, workers: u32, v6: bool) -> Result<Sizing, String> {
     let table = expected_routes
         .checked_mul(HEAP_BYTES_PER_ROUTE)
         .ok_or_else(|| format!("expected-routes {expected_routes} overflows sizing math"))?;
@@ -162,12 +206,27 @@ pub fn derive_sizing(expected_routes: u64, workers: u32) -> Result<Sizing, Strin
             )
         })?
         .max(STATSEG_FLOOR_BYTES);
+    let v6_routes = if v6 { V6_ROUTE_BUDGET } else { 0 };
+    let v6_heap_bytes = v6_routes * HEAP_BYTES_PER_V6_ROUTE;
+    let v6_statseg_bytes = v6_routes
+        .checked_mul(STATSEG_BYTES_PER_V6_ROUTE_PER_THREAD)
+        .and_then(|b| b.checked_mul(thread_count(workers)))
+        .ok_or_else(|| format!("IPv6 stats-segment sizing overflows at {workers} workers"))?;
     Ok(Sizing {
         expected_routes,
         workers,
-        main_heap_bytes,
-        total_bytes,
-        statseg_bytes,
+        main_heap_bytes: main_heap_bytes
+            .checked_add(v6_heap_bytes)
+            .ok_or_else(|| "heap sizing overflow".to_string())?,
+        total_bytes: total_bytes
+            .checked_add(v6_heap_bytes)
+            .ok_or_else(|| "total sizing overflow".to_string())?,
+        statseg_bytes: statseg_bytes
+            .checked_add(v6_statseg_bytes)
+            .ok_or_else(|| "stats-segment sizing overflow".to_string())?,
+        v6_routes,
+        v6_heap_bytes,
+        v6_statseg_bytes,
     })
 }
 
@@ -247,9 +306,14 @@ pub const CAPACITY_UTILISATION_PCT: u64 = 80;
 /// binding constraint at every configuration. Deriving this from the
 /// heap alone would have put the ceiling above the segment that fails
 /// first.
+///
+/// **IPv4's pool only.** Under `v6 on` the segments also hold the IPv6
+/// allowance, which is subtracted first so the v4 ceiling is exactly what
+/// it is under `v6 off`; the v6 pool is [`route_capacity_v6`].
 pub fn route_capacity(sizing: &Sizing) -> u64 {
     let heap_for_routes = sizing
         .main_heap_bytes
+        .saturating_sub(sizing.v6_heap_bytes)
         .saturating_sub(HEAP_FLOOR_BYTES)
         .saturating_mul(CAPACITY_UTILISATION_PCT)
         / 100;
@@ -259,11 +323,25 @@ pub fn route_capacity(sizing: &Sizing) -> u64 {
         STATSEG_BYTES_PER_ROUTE_PER_THREAD_MEASURED * thread_count(sizing.workers);
     let statseg_routes = sizing
         .statseg_bytes
+        .saturating_sub(sizing.v6_statseg_bytes)
         .saturating_mul(CAPACITY_UTILISATION_PCT)
         / 100
         / statseg_per_route;
 
     heap_routes.min(statseg_routes)
+}
+
+/// How many IPv6 routes the ledger admits before withholding: the budget
+/// the segments were grown for, un-derated.
+///
+/// Un-derated where [`route_capacity`] takes 80%, because the derating
+/// there converts a MEASURED per-route cost into a safe ceiling, and
+/// here there is no measurement to derate — the allowance is already
+/// budget × a constant chosen at several times any plausible cost. When
+/// rung 0 measures the real figure, this becomes the same computation as
+/// the v4 one over the v6 share of each segment.
+pub fn route_capacity_v6(sizing: &Sizing) -> u64 {
+    sizing.v6_routes
 }
 
 /// One VPP dataplane port: the VF's PCI address plus the worker count
@@ -412,8 +490,8 @@ mod tests {
 
     #[test]
     fn sizing_scales_with_routes() {
-        let small = derive_sizing(1_000, 1).unwrap();
-        let full = derive_sizing(1_400_000, 1).unwrap();
+        let small = derive_sizing(1_000, 1, false).unwrap();
+        let full = derive_sizing(1_400_000, 1, false).unwrap();
         assert!(full.main_heap_bytes > small.main_heap_bytes);
         assert!(full.statseg_bytes > small.statseg_bytes);
         // Post-measurement band: 1.4M × 1 KiB + 512 MiB floor + 1 GiB
@@ -428,7 +506,7 @@ mod tests {
     /// "tidy up the constants" that quietly drops below reality.
     #[test]
     fn the_constants_cover_the_measured_full_table() {
-        let s = derive_sizing(MEASURED_ROUTES, MEASURED_WORKERS).unwrap();
+        let s = derive_sizing(MEASURED_ROUTES, MEASURED_WORKERS, false).unwrap();
         assert!(
             s.main_heap_bytes > MEASURED_HEAP_USED,
             "derived heap {} must exceed the measured {MEASURED_HEAP_USED}",
@@ -452,7 +530,7 @@ mod tests {
         // time — a default that stopped covering the measured table
         // should fail the build, not a test run.
         const { assert!(crate::DEFAULT_EXPECTED_ROUTES > MEASURED_ROUTES) };
-        let s = derive_sizing(crate::DEFAULT_EXPECTED_ROUTES, MEASURED_WORKERS).unwrap();
+        let s = derive_sizing(crate::DEFAULT_EXPECTED_ROUTES, MEASURED_WORKERS, false).unwrap();
         assert!(s.statseg_bytes > MEASURED_STATSEG_POPULATED);
         assert!(s.main_heap_bytes > MEASURED_HEAP_USED);
     }
@@ -469,7 +547,7 @@ mod tests {
     #[test]
     fn the_stats_segment_covers_every_supported_worker_count() {
         for workers in 0..=16u32 {
-            let s = derive_sizing(crate::DEFAULT_EXPECTED_ROUTES, workers).unwrap();
+            let s = derive_sizing(crate::DEFAULT_EXPECTED_ROUTES, workers, false).unwrap();
             let need = crate::DEFAULT_EXPECTED_ROUTES
                 * MEASURED_STATSEG_PER_ROUTE_PER_THREAD
                 * thread_count(workers);
@@ -486,8 +564,8 @@ mod tests {
     /// route-count-only slope makes this constant, which is the bug.
     #[test]
     fn the_stats_segment_scales_with_workers() {
-        let one = derive_sizing(1_600_000, 1).unwrap();
-        let five = derive_sizing(1_600_000, 5).unwrap();
+        let one = derive_sizing(1_600_000, 1, false).unwrap();
+        let five = derive_sizing(1_600_000, 5, false).unwrap();
         assert!(
             five.statseg_bytes > one.statseg_bytes,
             "5 workers ({}) must need more than 1 ({})",
@@ -511,7 +589,7 @@ mod tests {
         assert_eq!(thread_count(0), 1);
         assert_eq!(thread_count(1), 2);
         assert_eq!(thread_count(5), 6);
-        let s = derive_sizing(1_600_000, 0).unwrap();
+        let s = derive_sizing(1_600_000, 0, false).unwrap();
         assert_eq!(
             s.statseg_bytes,
             1_600_000 * STATSEG_BYTES_PER_ROUTE_PER_THREAD
@@ -524,7 +602,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "stats segment scales with thread count")]
     fn render_refuses_a_worker_count_that_disagrees_with_the_sizing() {
-        let sizing = derive_sizing(1_600_000, 1).unwrap();
+        let sizing = derive_sizing(1_600_000, 1, false).unwrap();
         // Sizing says one worker; the core map says four.
         render(
             &sizing,
@@ -541,7 +619,7 @@ mod tests {
     /// satisfy.
     #[test]
     fn the_stats_segment_is_not_in_the_hugepage_budget() {
-        let s = derive_sizing(1_600_000, 5).unwrap();
+        let s = derive_sizing(1_600_000, 5, false).unwrap();
         assert_eq!(s.total_bytes, s.main_heap_bytes + BUFFER_BYTES);
         assert!(s.statseg_bytes > 0);
         assert!(
@@ -553,10 +631,10 @@ mod tests {
     #[test]
     fn the_stats_segment_respects_its_floor() {
         // A tiny table still needs VPP's own counters.
-        let s = derive_sizing(1_000, 1).unwrap();
+        let s = derive_sizing(1_000, 1, false).unwrap();
         assert_eq!(s.statseg_bytes, STATSEG_FLOOR_BYTES);
         // A large one scales past it.
-        let big = derive_sizing(1_600_000, 1).unwrap();
+        let big = derive_sizing(1_600_000, 1, false).unwrap();
         assert_eq!(
             big.statseg_bytes,
             1_600_000 * STATSEG_BYTES_PER_ROUTE_PER_THREAD * 2
@@ -566,7 +644,7 @@ mod tests {
 
     #[test]
     fn hugepage_budget_enforced() {
-        let sizing = derive_sizing(1_400_000, 1).unwrap();
+        let sizing = derive_sizing(1_400_000, 1, false).unwrap();
         let page = 512u64 << 20; // the EFG's 512 MiB default pages
                                  // 5 pages = 2.5 GiB: below the ~2.8 GiB need → rejected with
                                  // the corrective count in the message.
@@ -580,7 +658,7 @@ mod tests {
 
     #[test]
     fn render_is_deterministic_and_complete() {
-        let sizing = derive_sizing(1_400_000, 2).unwrap();
+        let sizing = derive_sizing(1_400_000, 2, false).unwrap();
         let conf = render(
             &sizing,
             &[14, 15],
@@ -619,7 +697,7 @@ mod tests {
     #[test]
     fn a_stats_segment_stanza_is_always_emitted() {
         for routes in [1_000u64, 1_053_360, 1_600_000] {
-            let s = derive_sizing(routes, 1).unwrap();
+            let s = derive_sizing(routes, 1, false).unwrap();
             let conf = render(&s, &[14], 13, "/run/packetframe/vpp/api.sock", 0);
             assert!(conf.contains("statseg {"), "routes={routes}:\n{conf}");
             let want = s.statseg_bytes.div_ceil(1 << 20);
@@ -639,7 +717,7 @@ mod tests {
     #[test]
     fn the_stats_segment_rounds_up_never_down() {
         // 1,000,001 × 96 × 2 threads = 192,000,192 B = 183.10… MiB
-        let s = derive_sizing(1_000_001, 1).unwrap();
+        let s = derive_sizing(1_000_001, 1, false).unwrap();
         let mib = s.statseg_bytes.div_ceil(1 << 20);
         assert!(
             (mib << 20) >= s.statseg_bytes,
@@ -655,7 +733,7 @@ mod tests {
     /// dataplane that will not come up.
     #[test]
     fn no_dpdk_and_no_device_stanzas() {
-        let sizing = derive_sizing(1_000, 1).unwrap();
+        let sizing = derive_sizing(1_000, 1, false).unwrap();
         let conf = render(&sizing, &[14], 13, "/run/packetframe/vpp/api.sock", 0);
 
         assert!(
@@ -686,7 +764,7 @@ mod tests {
         // Sweep route counts that produce non-MiB-aligned heaps; the
         // rendered value must always cover the derived requirement.
         for routes in [1u64, 7, 1_399_999, 1_400_000, 1_400_001, 2_000_003] {
-            let s = derive_sizing(routes, 1).unwrap();
+            let s = derive_sizing(routes, 1, false).unwrap();
             let mib = s.main_heap_bytes.div_ceil(1 << 20);
             assert!(
                 (mib << 20) >= s.main_heap_bytes,
@@ -706,7 +784,7 @@ mod tests {
     fn capacity_exceeds_the_forecast_at_every_worker_count() {
         for workers in 0..=16u32 {
             for routes in [100_000u64, 1_053_370, 1_600_000, 4_000_000] {
-                let s = derive_sizing(routes, workers).unwrap();
+                let s = derive_sizing(routes, workers, false).unwrap();
                 assert!(
                     route_capacity(&s) > routes,
                     "workers={workers} routes={routes}: capacity {} would withhold at the \
@@ -726,7 +804,7 @@ mod tests {
     fn capacity_stays_under_what_each_segment_really_holds() {
         for workers in 0..=16u32 {
             for routes in [100_000u64, 1_053_370, 1_600_000] {
-                let s = derive_sizing(routes, workers).unwrap();
+                let s = derive_sizing(routes, workers, false).unwrap();
                 let cap = route_capacity(&s);
 
                 let heap_exhausts_at =
@@ -754,7 +832,7 @@ mod tests {
     /// ceiling above the segment that fails first.
     #[test]
     fn the_stats_segment_is_the_constraint_that_binds() {
-        let s = derive_sizing(1_600_000, 4).unwrap();
+        let s = derive_sizing(1_600_000, 4, false).unwrap();
         let heap_routes = (s.main_heap_bytes - HEAP_FLOOR_BYTES) * CAPACITY_UTILISATION_PCT
             / 100
             / HEAP_BYTES_PER_ROUTE_MEASURED;
@@ -771,12 +849,60 @@ mod tests {
     fn capacity_grows_with_the_forecast() {
         let mut last = 0;
         for routes in [50_000u64, 500_000, 1_053_370, 1_600_000, 3_000_000] {
-            let cap = route_capacity(&derive_sizing(routes, 2).unwrap());
+            let cap = route_capacity(&derive_sizing(routes, 2, false).unwrap());
             assert!(
                 cap > last,
                 "capacity fell at routes={routes}: {cap} <= {last}"
             );
             last = cap;
         }
+    }
+
+    /// `v6 on` grows both segments by the IPv6 allowance and nothing
+    /// else: every v4 figure — and so the v4 ceiling — is exactly what
+    /// `v6 off` derives, which is what keeps turning IPv6 on from ever
+    /// withholding a v4 route.
+    #[test]
+    fn v6_sizing_is_additive_and_leaves_the_v4_ceiling_alone() {
+        for workers in [1u32, 5] {
+            let off = derive_sizing(1_600_000, workers, false).unwrap();
+            let on = derive_sizing(1_600_000, workers, true).unwrap();
+            assert_eq!(
+                (off.v6_routes, off.v6_heap_bytes, off.v6_statseg_bytes),
+                (0, 0, 0)
+            );
+            assert_eq!(on.v6_routes, V6_ROUTE_BUDGET);
+            assert_eq!(
+                on.main_heap_bytes,
+                off.main_heap_bytes + V6_ROUTE_BUDGET * HEAP_BYTES_PER_V6_ROUTE
+            );
+            assert_eq!(on.total_bytes, off.total_bytes + on.v6_heap_bytes);
+            assert_eq!(
+                on.statseg_bytes,
+                off.statseg_bytes
+                    + V6_ROUTE_BUDGET
+                        * STATSEG_BYTES_PER_V6_ROUTE_PER_THREAD
+                        * thread_count(workers)
+            );
+            assert_eq!(
+                route_capacity(&on),
+                route_capacity(&off),
+                "workers={workers}: the v4 ceiling moved with v6 on"
+            );
+            assert_eq!(route_capacity_v6(&on), V6_ROUTE_BUDGET);
+            assert_eq!(route_capacity_v6(&off), 0);
+        }
+    }
+
+    /// The unmeasured v6 constants must stay on the conservative side of
+    /// the only measurement there is — the v4 table's.
+    #[test]
+    fn the_unmeasured_v6_constants_err_high() {
+        const {
+            assert!(HEAP_BYTES_PER_V6_ROUTE >= 2 * HEAP_BYTES_PER_ROUTE);
+            assert!(
+                STATSEG_BYTES_PER_V6_ROUTE_PER_THREAD >= 2 * STATSEG_BYTES_PER_ROUTE_PER_THREAD
+            );
+        };
     }
 }

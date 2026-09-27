@@ -78,6 +78,7 @@ running badly.
 - [Rollback](#rollback)
 - [The adopted-reconciliation release gate](#the-adopted-reconciliation-release-gate-what-it-needs-and-when-it-refuses)
 - [What a keep-vpp restart costs now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)
+- [Rung 0 for IPv6: `v6 on`](#rung-0-for-ipv6-v6-on)
 - [Bidirectional offload: local-route and direction dst](#bidirectional-offload-local-route-and-direction-dst)
 - [v6 outbound steering](#v6-outbound-steering)
 - [Triage by symptom](#triage-by-symptom)
@@ -790,6 +791,156 @@ VPP from a dump. A mismatch on THAT pass is an ordinary `VerifyFailed`.
   in place the moment a larger budget is known (an adoption's deadline
   is armed before anything has measured the table). The wedge detector's
   liveness budget — is VPP answering — is unchanged.
+
+## Rung 0 for IPv6: `v6 on`
+
+Phase A of the IPv6 offload steers **outbound** customer IPv6 — frames
+from a customer VLAN addressed to the router's MAC — into VPP, which
+routes them out the transit/IX ports. That needs VPP to carry the v6
+table correctly first. `v6 on` is that and only that: **it steers no
+IPv6**. It exists so the v6 table's cost can be measured, and its
+correctness verified, while every v6 packet still rides the eBPF tier.
+
+### What it does
+
+- VPP carries **IPv6 routes and static neighbours** as well as IPv4
+  (`FamilyPolicy::Both`). The resync, the deltas, the adoption dump,
+  the preserved ledger, the neighbour dump and the L2FIB placement of
+  bridged neighbours all cover both families.
+- **ip6 is enabled on every VPP interface the module owns** — member
+  VFs, dot1q subifs and BVIs — so a v6 route or adjacency has an ip6
+  rewrite to leave by. Each gets only its EUI-64 **link-local**; no
+  global v6 address is added anywhere. The link-local equals the
+  kernel's for the same MAC (a VF carries its PF's MAC, a BVI the
+  bridge's), with no DAD — harmless at rung 0, because nothing is
+  steered to VPP to solicit it and the kernel keeps answering for the
+  address on the wire. Enabling is idempotent (a re-enable answers
+  `VALUE_EXIST`), so an adopted VPP is simply asked again.
+- **Router advertisements are suppressed** on each of those interfaces
+  (`sw_interface_ip6nd_ra_config suppress`). VPP 26.06 sends none by
+  default; the suppression is there so a future default cannot make
+  hosts on an IX or service VLAN adopt VPP as their router. It also
+  makes VPP refuse router solicitations
+  (`ROUTER_SOLICITATION_RADV_NOT_CONFIG` in `show errors`).
+- **MLD: one report per interface as it comes up**, from its own MAC,
+  for groups the kernel already joins on the same port — there is no
+  API to stop it short of disabling ip6, and nothing moves because of
+  it. The solicited-node MAC it adds is a secondary address, which the
+  octeon driver never programs into hardware.
+- **Capacity: one pool per family.** The heap and stats segment grow by
+  a fixed v6 budget of **400,000 routes** on top of what
+  `expected-routes` sizes, at deliberately conservative per-route costs
+  that are **UNMEASURED** (2,048 B heap, 192 B stats segment per VPP
+  thread). The route ledger enforces the same split: a v6 route can only
+  take a v6 slot, so the v6 table can never withhold a v4 route, and the
+  v4 ceiling is exactly what it is under `v6 off`.
+- **Every existing gate and gauge keeps meaning IPv4.** The first-steer
+  refusal, verify's pass criteria, the empty-table alarms and
+  `packetframe_vpp_routes` read v4 counts only — steering diverts v4,
+  so whether v4 may be diverted depends on the v4 table. IPv6 is
+  reported beside it and gates nothing.
+
+### What to set
+
+1. In `module vpp-offload`, add `v6 on`.
+2. Check the sizing before anything restarts:
+   `packetframe feasibility --config /etc/packetframe/packetframe.conf`.
+   If `hugepages` is set, the startup check names the new minimum
+   (`hugepages N ... below the minimum derived from expected-routes`) —
+   the v6 allowance adds 400,000 × 2,048 B ≈ 781 MiB of main heap, and
+   400,000 × 192 B × (workers + 1) of stats segment (≈ 439 MiB at five
+   workers; locked RAM, not hugepages). Raise `hugepages` to the named
+   figure.
+3. `v6` is restart-only, and **a VPP attached under the other setting is
+   not adopted** (its segments and its FIB's families were fixed at
+   start), so this is a full restart, not `--keep-vpp`:
+
+   ```sh
+   systemctl stop packetframe
+   packetframe detach --all
+   systemctl start packetframe
+   ```
+
+   A reload (`packetframe reconfigure`) refuses the change by name, and
+   a `--keep-vpp` start refuses the adoption, naming `v6` (`- → on`).
+
+### What healthy looks like
+
+```sh
+packetframe status
+#   fib-synced   healthy   N routes installed; last verified on 64 probes   <- IPv4, as before
+#   fib-v6       healthy   M IPv6 routes loaded in VPP, not steered
+#   steering     ...       (IPv6 routes are loaded in VPP by `v6 on`, but no IPv6 is steered ...)
+
+grep packetframe_vpp_family_routes /var/lib/node_exporter/textfile/packetframe.prom
+#   ..._family_routes{module="vpp-offload",family="ipv6",state="installed"} M
+#   ..._family_routes{module="vpp-offload",family="ipv6",state="unresolvable"} 0
+#   ..._family_routes{module="vpp-offload",family="ipv6",state="withheld"} 0
+
+journalctl -u packetframe | grep 'verify PASS'
+#   verify PASS: 64/64 probes matched, unresolvable=0, withheld=0; IPv6 (loaded,
+#   not steered — cannot fail the pass): 64/64 probes matched, unresolvable=0, withheld=0
+
+vppctl -s /run/packetframe/vpp/api.sock.cli show ip6 interface          # every member/subif/BVI: link-local only, no global address
+vppctl -s /run/packetframe/vpp/api.sock.cli show ip6 fib summary        # the v6 table, ~the fib-v6 installed count
+vppctl -s /run/packetframe/vpp/api.sock.cli show ip6 neighbors          # the static v6 neighbours
+vppctl -s /run/packetframe/vpp/api.sock.cli show errors | grep -i solicitation   # RADV_NOT_CONFIG counting = RSes refused
+```
+
+Also confirm nothing moved for the kernel, since VPP now shares its
+link-locals:
+
+- the rung-0 leak check ("Verify that last sentence", in the canary
+  ladder: every member's `rx packets` in the low thousands with the
+  lever off) reads as it did under `v6 off`;
+- from a peer on each VLAN, the router's link-local still answers
+  (`ping -6 fe80::<router>%<if>`), and no host has gained a default
+  route via VPP (`ip -6 route show default` / `rdisc6 <if>` on a host
+  shows only the router's own RAs, if any).
+
+Degraded `fib-v6` names every condition that holds, each with its own
+`packetframe_vpp_family_routes{family="ipv6",state=…}` gauge. None of
+them affects IPv4 or its steering, none is restart-worthy, and nothing
+v6 is dropped — none of it is steered:
+
+| Condition (`state=`) | Meaning | What to do |
+|---|---|---|
+| `withheld` | the v6 table outgrew its 400k budget | sizing; raise the budget in `startup_conf.rs` once rung 0 has measured |
+| `unresolvable` | a v6 next hop VPP has no adjacency for (a neighbour on a port VPP does not own, or one the kernel never resolved) | as for v4: `ip -6 neigh`, the port list |
+| `rejected` | VPP refused the route (non-zero `ip_route_add_del`). Parked, not retried every drain — a v6 retry loop would keep the drain from going idle and hold back IPv4's convergence. Retried when the route next changes, and at every resync | the journal's retval; a VPP-side limit or bug |
+| `link_local_refused` | every next hop is link-local. Scoped addresses reach the module without their interface (the feed, and the fast path upstream of it, key neighbours by address alone, and the same `fe80::` can be on two links), so VPP is never given one. A route that also names a global next hop installs through that alone | expected for peers announcing link-local-only next hops; the follow-up is carrying `(address, ifindex)` end to end |
+| `verify_mismatch` | the last verify's v6 probes found VPP disagreeing with the ledger. Retained until the next verify (which does not re-run in steady state) | `vppctl … show ip6 fib <prefix>` against the ledger; a restart re-derives the v6 table |
+| `dark_egress` | a member with no link carries v6 adjacencies. IPv4's link gate counts only interfaces IPv4 routes use, so a dark port with only v6 on it never refuses a v4 steer | the cable / the port, as for any dark member |
+
+### What to measure (the numbers rung 0 exists for)
+
+Take a baseline on the same box under `v6 off` with the full table
+loaded, then again under `v6 on` once `fib-v6` is healthy:
+
+```sh
+vppctl -s /run/packetframe/vpp/api.sock.cli show memory                  # ALL heaps — never main-heap alone (spike runbook, gate 0b)
+#   main heap:      "used" — Δ ÷ fib-v6 installed = heap bytes per v6 route
+#   stats segment:  "populated" (not "used") — Δ ÷ fib-v6 installed ÷ (workers + 1)
+#                   = stats-segment bytes per v6 route per thread
+time vppctl -s /run/packetframe/vpp/api.sock.cli show ip6 fib summary    # this walks the v6 table under VPP's worker barrier;
+time vppctl -s /run/packetframe/vpp/api.sock.cli show ip fib summary     # v4's is O(1) per length — compare the two
+```
+
+Write the per-route figures into "Numbers: measured vs
+published-on-faith", and replace `HEAP_BYTES_PER_V6_ROUTE` /
+`STATSEG_BYTES_PER_V6_ROUTE_PER_THREAD` in `startup_conf.rs` with ~2×
+the measured values, the way gate 0b replaced the v4 guesses. The
+`show ip6 fib summary` time matters because the preserved ledger reads
+it (at a preserving stop, at adoption and again at the deferred
+release, the last two with steered v4 traffic on VPP): if it holds the
+barrier for more than a few milliseconds, that is a per-restart pause
+the phase-A rungs must account for.
+
+### Rolling back
+
+`v6 off`, then the same full restart (`systemctl stop packetframe &&
+packetframe detach --all && systemctl start packetframe`). The new VPP
+starts with no v6 anywhere; `hugepages` can come back down.
 
 ## Bidirectional offload: local-route and direction dst
 

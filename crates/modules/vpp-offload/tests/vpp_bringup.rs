@@ -178,6 +178,7 @@ impl Host {
             trunk_ports: vec![],
             v6_outbound: vec![],
             steer_keeps6: vec![],
+            v6: false,
             // These fixtures have no route authority to compare
             // against, and none of them steers; the gate is exercised
             // where it lives, in `runtime`.

@@ -2777,11 +2777,16 @@ impl Core {
     ///
     /// Cost, since on the steered path it runs with traffic on VPP: one
     /// `cli_inband` (`show ip fib summary`, per family carried). That is a
-    /// non-mp-safe message, so VPP takes its worker barrier for it — but
-    /// for a per-prefix-length hash count, not a table walk: the same
-    /// class of pause as the null-drop sampler's `show errors`, which
+    /// non-mp-safe message, so VPP takes its worker barrier for it. For
+    /// IPv4 it is a per-prefix-length hash count, not a table walk: the
+    /// same class of pause as the null-drop sampler's `show errors`, which
     /// already runs every minute while steered, and nothing like the
-    /// dump's seconds.
+    /// dump's seconds. **IPv6's is a walk** (`v6 on` only): VPP 26.06's
+    /// `ip6_fib_table_show` counts by iterating the table's whole
+    /// non-forwarding hash under that barrier — a counting loop over
+    /// ~250k entries, no per-route formatting or messaging, so orders of
+    /// magnitude below the dump but not free. Unmeasured; rung 0 of the
+    /// v6 runbook measures it.
     fn seed_still_holds(&mut self) -> Result<bool, StepError> {
         let Some(expected) = self.seeded.as_ref().map(|s| s.fingerprint.clone()) else {
             return Ok(true);
@@ -2898,7 +2903,9 @@ impl Observe for ObserveView {
         let routes = c
             .source
             .route_count()
-            .max(c.engine.counts().installed)
+            // Every family VPP holds: a v6 table moves through the same
+            // drains and counts against the same budget.
+            .max(c.engine.counts().installed_all())
             .max(c.seeded.as_ref().map_or(0, |s| s.routes));
         crate::supervisor::convergence_budget(routes, c.last_dump_took)
     }
@@ -3014,6 +3021,7 @@ impl ObserveView {
                             adopted = routes,
                             steered = !unsteered,
                             upserts = plan.upserts,
+                            out_of_family = plan.out_of_family,
                             withdrawals = plan.withdrawals,
                             "route source loaded and quiet again; running the adopted resync \
                              diff against the FIB an earlier dump already read — no second \
@@ -3176,6 +3184,7 @@ impl ObserveView {
                             adopted,
                             dump_secs = took.as_secs_f64(),
                             upserts = plan.upserts,
+                            out_of_family = plan.out_of_family,
                             withdrawals = plan.withdrawals,
                             "route source loaded and quiet and VPP unsteered; dumped its FIB \
                              against no traffic and running the adopted resync diff"
@@ -3218,6 +3227,7 @@ impl ObserveView {
                         have,
                         unchanged = plan.unchanged,
                         upserts = plan.upserts,
+                        out_of_family = plan.out_of_family,
                         withdrawals = plan.withdrawals,
                         "route source loaded and quiet; diffing it against the preserved \
                          ledger while VPP keeps forwarding — no dump and no unsteer, and \
@@ -3287,6 +3297,7 @@ impl ObserveView {
                             adopted,
                             unchanged = plan.unchanged,
                             upserts = plan.upserts,
+                            out_of_family = plan.out_of_family,
                             withdrawals = plan.withdrawals,
                             "route source loaded and quiet; running the adopted resync diff"
                         );
@@ -3898,10 +3909,15 @@ impl Effects for EffectsView {
                 // dump path (`Event::PreservedLedgerRejected`).
                 if seeded {
                     c.seeded = None;
-                    if verdict.outcome.restart_worthy() {
+                    // Any family: a v6 disagreement cannot fail the pass,
+                    // but it disproves the record all the same
+                    // (`VerifyOutcome::any_mismatch`).
+                    if verdict.outcome.any_mismatch() {
                         tracing::warn!(
                             outcome = %verdict.outcome.summary(),
-                            first = ?verdict.outcome.mismatches.first(),
+                            first = ?verdict.outcome.mismatches.first().or_else(|| {
+                                verdict.outcome.v6.as_ref().and_then(|v| v.mismatches.first())
+                            }),
                             "VPP disagrees with the preserved route ledger; discarding it — \
                              steering comes off, and the resync starts over from a read of \
                              VPP's FIB (the dump path). No teardown: it is the record that is \
