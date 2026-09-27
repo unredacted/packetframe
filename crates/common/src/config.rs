@@ -233,7 +233,7 @@ pub enum ModuleDirective {
     /// destinations on the eBPF tier, which is intended. A new session to
     /// the router on a diverted VLAN or port that is not kept is refused by
     /// the guard on VPP's hand-back path (it admits only replies: TCP with
-    /// ACK or RST set, UDP to the kernel's ephemeral ports).
+    /// ACK or RST set, UDP from a DNS or NTP server to an ephemeral port).
     /// Installed only while some port diverts v6.
     VppSteerKeep6(VppSteerKeep6),
     /// `vpp-binary <path>` — override the probed VPP binary path.

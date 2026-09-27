@@ -1731,25 +1731,31 @@ own traffic:
      `established` test (the `established` keyword of Cisco and Juniper
      ACLs): every segment of a connection the router opened, SYN+ACK
      included;
-  3. permit UDP to `A` with a destination port in the kernel's
-     **ephemeral range** (`/proc/sys/net/ipv4/ip_local_port_range`, read
-     at setup and on every check — it covers IPv6 sockets too): client
-     sockets receiving replies (the resolver's upstream queries, an NTP
-     client);
+  3. permit UDP to `A` **from source port 53 (DNS) or 123 (NTP)** to a
+     destination port in the kernel's **ephemeral range**
+     (`/proc/sys/net/ipv4/ip_local_port_range`, read at setup and on every
+     check — it covers IPv6 sockets too): the classic stateless reply
+     rule (`permit udp any eq domain any gt 1023`), one rule per source
+     port — answers to the router's own resolver and time-sync queries;
 
   then deny everything. So a pure SYN — every new inbound TCP
   connection to the router over diverted IPv6 — is refused, and so are
-  NULL, FIN-only and Xmas-style probes; UDP to a service port outside
-  the ephemeral range is refused too. Why it exists: what arrives on the
-  veth bypasses the vendor's WAN_LOCAL rules, which key on the physical
-  WAN ports. Why in VPP: the vendor controller flushes and rewrites the
-  kernel's iptables on every config apply, so no kernel rule would stay
-  put, while PacketFrame owns VPP outright. Two consequences: a service
-  that must accept new sessions over a diverted port needs a
-  `steer-keep6` (it then never enters VPP); and a UDP service that
-  **listens inside** the ephemeral range — an overlay VPN's listen port,
-  say — IS reachable through the hand-back, since the guard cannot tell
-  it from a client socket.
+  NULL, FIN-only and Xmas-style probes, and every other UDP datagram.
+  Why it exists: what arrives on the veth bypasses the vendor's
+  WAN_LOCAL rules, which key on the physical WAN ports. Why in VPP: the
+  vendor controller flushes and rewrites the kernel's iptables on every
+  config apply, so no kernel rule would stay put, while PacketFrame owns
+  VPP outright. Consequences:
+  - a service that must accept new sessions over a diverted port needs a
+    `steer-keep6` (it then never enters VPP, and stays under the vendor's
+    own firewall);
+  - an overlay or VPN that relies on direct **inbound UDP over IPv6**
+    through a diverted port (its listen port usually sits inside the
+    ephemeral range) is refused and falls back — to its relays, or to
+    IPv4 — unless its port is kept with `steer-keep6 udp <port>`;
+  - the residual risk of a stateless rule: a datagram that SPOOFS source
+    port 53 or 123 reaches a UDP listener inside the ephemeral range.
+    The source-port list is a fixed constant, not a knob.
 
 **What it needs from the box.** VPP's `af_packet_plugin.so` and
 `acl_plugin.so` (the vpp-unifi build loads both by default; the
@@ -1767,7 +1773,11 @@ VPP for every address the host holds. IPv4 steering never waits for it. On a por
 steer, IPv4 installs and the v6 half follows on its own once the path
 is ready; a port that diverts only IPv6 refuses the steer (so the want
 is kept) and the paced retry installs it once the path is ready. If the
-path breaks while steered, the v6 half is taken out and IPv4 stays.
+path breaks while steered, the v6 half is taken out and IPv4 stays. A
+`--keep-vpp` restart that inherits v6 rules from a daemon that was
+steering v6 takes them out at the device attach if this daemon's path is
+not ready then (IPv4 untouched); they come back with the adoption's
+steer once the path is.
 
 **Hop limit.** VPP decrements the hop limit of what it hands back.
 Anything router-owned that arrives at hop limit 1 reaches the kernel at
@@ -1787,7 +1797,10 @@ re-verifies it rather than trusting it: it finds the host interface by
 name (never a second socket on the veth), re-asserts its settings,
 re-adds the neighbour only if VPP lacks it, reuses the guard ACL it
 finds under its tag (rewriting it in place only if it differs), and
-brings the /128s to the host's current addresses. One side effect: the first `--keep-vpp`
+brings the /128s to the host's current addresses — counting a surviving
+/128 only in exactly the shape it installs (one path, via
+`host-pfpunt0-vpp`, to the kernel veth's link-local); any other shape is
+replaced, or withdrawn if the host no longer holds the address. One side effect: the first `--keep-vpp`
 restart after `v6-divert` is first enabled builds the interface on the
 adopted VPP, which can change the FIB summary the preserved ledger is
 checked against — that restart may take the dump path.
@@ -1829,8 +1842,9 @@ vppctl show ip6 neighbors host-pfpunt0-vpp
 
 # The guard: one ACL tagged packetframe-handback — per address a TCP
 # rule with "tcpflags 16 mask 16" (ACK), one with "tcpflags 4 mask 4"
-# (RST), a UDP rule with the ephemeral dport range, then one deny — bound
-# as host-pfpunt0-vpp's OUTPUT ACL and nothing else.
+# (RST), two UDP rules (sport 53, sport 123) with the ephemeral dport
+# range, then one deny — bound as host-pfpunt0-vpp's OUTPUT ACL and
+# nothing else.
 vppctl show acl-plugin acl
 vppctl show acl-plugin interface
 ```
@@ -1870,7 +1884,9 @@ type — TCP or UDP — MAC, VLAN id and mask, L4 port, the `FLOW_EXT` /
 `FLOW_MAC_EXT` bits). A v6 half held back for the hand-back path is not
 drift: the audit compares against what may be installed, and the
 `v6-handback` row carries the reason. The hand-back path is re-checked
-every 30 s and repaired when a part has gone or changed: the veth; the
+every 30 s and repaired when a part has gone or changed: the veth (its
+ifindexes, both MACs and the MTU — a change re-asserts VPP's end: MTU,
+neighbour, /128s re-pointed at the new link-local); the
 guard ACL, read back with the ACL plugin's dumps and compared rule for
 rule, in order, against what the current addresses and port range
 render, and checked bound alone as the output ACL (any edit, a widened

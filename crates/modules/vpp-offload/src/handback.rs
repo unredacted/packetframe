@@ -23,7 +23,8 @@
 //! - a guard IN VPP ([`render_guard`]): a stateless ACL bound as the
 //!   hand-back interface's output ACL, admitting only traffic to the
 //!   router's own addresses that is a reply — TCP with ACK or RST set, UDP
-//!   to the kernel's ephemeral ports — because what arrives on the veth
+//!   from a DNS or NTP server to the kernel's ephemeral ports — because
+//!   what arrives on the veth
 //!   bypasses the vendor's WAN_LOCAL rules (they key on the physical WAN
 //!   ports), and the vendor controller rewrites the kernel's netfilter on
 //!   every config apply, so no kernel rule would stay put. It needs VPP's
@@ -210,11 +211,29 @@ fn any_v6() -> crate::vpp_api::generated::Prefix {
     })
 }
 
+/// The UDP source ports whose replies the guard hands back — and only to
+/// a destination port inside the kernel's ephemeral range: the classic
+/// stateless reply rule, `permit udp any eq domain any gt 1023`. Each is a
+/// service the router is a CLIENT of, whose answers can arrive on a
+/// diverted port:
+///
+/// - 53, DNS: answers to the router's own resolver's upstream queries
+///   (the built-in DNS keep covers queries TO the router, not these);
+/// - 123, NTP: answers to the router's time sync.
+///
+/// Deliberately a short constant, not a knob: every other UDP datagram
+/// handed back would reach a kernel socket past the vendor's WAN_LOCAL
+/// rules, and a listener inside the ephemeral range (an overlay VPN's
+/// port) must not become reachable from the internet through it. What
+/// stays open is a datagram SPOOFING source port 53 or 123 aimed at such a
+/// listener — the residual cost of a stateless rule.
+pub const UDP_REPLY_SOURCE_PORTS: [u16; 2] = [53, 123];
+
 fn guard_rule(
     is_permit: u8,
     dst: Option<Ipv6Addr>,
     proto: u8,
-    dports: PortRange,
+    (sports, dports): (PortRange, PortRange),
     tcp_flags: (u8, u8),
 ) -> AclRule {
     AclRule {
@@ -227,8 +246,8 @@ fn guard_rule(
             })
         }),
         proto,
-        srcport_or_icmptype_first: 0,
-        srcport_or_icmptype_last: u16::MAX,
+        srcport_or_icmptype_first: sports.0,
+        srcport_or_icmptype_last: sports.1,
         dstport_or_icmpcode_first: dports.0,
         dstport_or_icmpcode_last: dports.1,
         tcp_flags_mask: tcp_flags.0,
@@ -251,47 +270,47 @@ fn guard_rule(
 ///    (the `established` keyword of Cisco and Juniper ACLs): every segment
 ///    of a connection the router opened, its SYN+ACK included.
 /// 2. TCP to `A` with RST set — the other half of that same test.
-/// 3. UDP to `A` whose destination port is in the kernel's ephemeral range
-///    ([`parse_port_range`]): client sockets receiving replies (the
-///    resolver's upstream queries, an NTP client).
+/// 3. UDP to `A` FROM one of [`UDP_REPLY_SOURCE_PORTS`] (DNS, NTP) TO a
+///    port in the kernel's ephemeral range ([`parse_port_range`]) — one
+///    rule per source port: replies to the router's own client queries.
 ///
 /// then deny everything. So a pure SYN — every NEW inbound TCP connection
 /// to the router over diverted IPv6 — is refused, and so are NULL,
-/// FIN-only and Xmas-style probes; UDP to a service port outside the
-/// ephemeral range is refused too. A service that must accept new
-/// sessions is `steer-keep6`'d and never enters VPP. The one consequence
-/// the port rule cannot help: a UDP service that listens INSIDE the
-/// ephemeral range (an overlay VPN's listen port, say) is reachable
-/// through the hand-back.
+/// FIN-only and Xmas-style probes, and every other UDP datagram. A service
+/// that must accept new sessions is `steer-keep6`'d and never enters VPP;
+/// so must an overlay or VPN that relies on direct inbound UDP over IPv6
+/// through a diverted port, or it falls back (to relays, or IPv4).
 pub fn render_guard(addrs: &BTreeSet<Ipv6Addr>, ports: PortRange) -> Vec<AclRule> {
     let all = (0, u16::MAX);
-    let mut rules = Vec::with_capacity(addrs.len() * 3 + 1);
+    let mut rules = Vec::with_capacity(addrs.len() * (2 + UDP_REPLY_SOURCE_PORTS.len()) + 1);
     for a in addrs {
         rules.push(guard_rule(
             ACL_ACTION_API_PERMIT,
             Some(*a),
             IP_API_PROTO_TCP,
-            all,
+            (all, all),
             (TCP_FLAG_ACK, TCP_FLAG_ACK),
         ));
         rules.push(guard_rule(
             ACL_ACTION_API_PERMIT,
             Some(*a),
             IP_API_PROTO_TCP,
-            all,
+            (all, all),
             (TCP_FLAG_RST, TCP_FLAG_RST),
         ));
-        rules.push(guard_rule(
-            ACL_ACTION_API_PERMIT,
-            Some(*a),
-            IP_API_PROTO_UDP,
-            ports,
-            (0, 0),
-        ));
+        for sport in UDP_REPLY_SOURCE_PORTS {
+            rules.push(guard_rule(
+                ACL_ACTION_API_PERMIT,
+                Some(*a),
+                IP_API_PROTO_UDP,
+                ((sport, sport), ports),
+                (0, 0),
+            ));
+        }
     }
     // VPP's ACLs end in an implicit deny; stated, so the readback shows
     // the whole policy and a rule appended after it would be visible drift.
-    rules.push(guard_rule(ACL_ACTION_API_DENY, None, 0, all, (0, 0)));
+    rules.push(guard_rule(ACL_ACTION_API_DENY, None, 0, (all, all), (0, 0)));
     rules
 }
 
@@ -496,8 +515,8 @@ pub trait HostSide {
     /// Create — or adopt, when it already exists as built — the veth
     /// pair, set its sysctls and MTU and bring both ends up. Idempotent.
     fn ensure(&mut self) -> Result<HostFacts, String>;
-    /// Whether both veth ends are still there, with the ifindexes
-    /// [`Self::ensure`] built them with, and up.
+    /// Whether the veth is still exactly as [`Self::ensure`] built it
+    /// ([`veth_as_built`]): ifindexes, MACs, MTU, both ends up.
     fn check(&mut self, facts: &HostFacts) -> bool;
     /// The kernel's ephemeral port range ([`parse_port_range`]), which the
     /// guard admits UDP replies to.
@@ -514,6 +533,28 @@ pub trait HostSide {
     ) -> Result<Option<BTreeSet<Ipv6Addr>>, AddrReadError>;
     /// Remove the veth pair. Absent is success.
     fn teardown(&mut self) -> Result<(), String>;
+}
+
+/// One veth end as the kernel reports it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkState {
+    pub index: u32,
+    pub mac: Option<[u8; 6]>,
+    pub mtu: Option<u32>,
+    pub up: bool,
+}
+
+/// Whether the veth, as the kernel reports it now, is still the one
+/// `facts` describes: both ends with the ifindexes, MACs and MTU they were
+/// built with, and up. A MAC or MTU changed by hand is as much a changed
+/// path as a missing end: the neighbour VPP resolves through, or the MTU a
+/// router-owned packet must fit, no longer holds.
+pub fn veth_as_built(kernel: &LinkState, vpp: &LinkState, facts: &HostFacts) -> bool {
+    kernel.up
+        && vpp.up
+        && (kernel.index, vpp.index) == (facts.kernel_ifindex, facts.vpp_ifindex)
+        && (kernel.mac, vpp.mac) == (Some(facts.kernel_mac), Some(facts.vpp_mac))
+        && (kernel.mtu, vpp.mtu) == (Some(facts.mtu), Some(facts.mtu))
 }
 
 /// A failed read of the host's addresses.
@@ -577,10 +618,12 @@ fn refused(step: &'static str, retval: i32, detail: impl Into<String>) -> Handba
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VppHalf {
     pub sw_if_index: u32,
-    /// `(kernel ifindex, vpp ifindex)` of the veth this interface's
-    /// socket was opened on. A veth rebuilt under it has new ones, and
-    /// the old socket is bound to an interface that no longer exists.
-    pub bound_to: (u32, u32),
+    /// The veth this half was built or adopted for. Other ifindexes mean
+    /// the veth was rebuilt under it and the socket is bound to one that no
+    /// longer exists (recreate); another MAC or MTU on the same veth means
+    /// the neighbour, next hop or MTU is stale (re-ensure). Either way the
+    /// path is not ready until it matches again ([`Handback::ready`]).
+    pub bound_to: HostFacts,
     /// The kernel veth's link-local, which the static neighbour resolves.
     pub next_hop: Ipv6Addr,
     /// The kernel veth's MAC: the static neighbour's link-layer address.
@@ -595,6 +638,11 @@ pub struct VppHalf {
     /// ([`revalidate`]), since another client or an operator can remove
     /// or replace one behind it.
     pub routes: BTreeSet<Ipv6Addr>,
+    /// /128s a surviving VPP routes through this interface in a shape this
+    /// module never installs (more than one path, another next hop): not
+    /// acknowledged, so the sync replaces the ones the host still holds and
+    /// withdraws the rest.
+    pub malformed: BTreeSet<Ipv6Addr>,
 }
 
 /// Find the host interface a surviving VPP already has, or create it;
@@ -681,14 +729,15 @@ pub fn ensure_vpp(t: &mut Transport, facts: &HostFacts) -> Result<VppHalf, Handb
     ensure_neighbour(t, sw_if_index, next_hop, facts.kernel_mac)?;
     // A just-created interface has no routes through it; only an adopted
     // one is worth a table read.
-    let routes = if adopted.is_some() {
-        routes_via(t, sw_if_index)?
+    let (routes, malformed) = if adopted.is_some() {
+        routes_via(t, sw_if_index, next_hop)?
     } else {
-        BTreeSet::new()
+        Default::default()
     };
     Ok(VppHalf {
         sw_if_index,
-        bound_to: (facts.kernel_ifindex, facts.vpp_ifindex),
+        bound_to: facts.clone(),
+        malformed,
         next_hop,
         next_hop_mac: facts.kernel_mac,
         acl: None,
@@ -820,8 +869,16 @@ fn create_host_if(t: &mut Transport, facts: &HostFacts) -> Result<u32, HandbackE
     Ok(reply.sw_if_index)
 }
 
-/// The /128s VPP's IPv6 table routes through `sw_if_index`.
-fn routes_via(t: &mut Transport, sw_if_index: u32) -> Result<BTreeSet<Ipv6Addr>, TransportError> {
+/// The /128s VPP's IPv6 table routes through `sw_if_index`, split into
+/// `(ours, malformed)`: ours has exactly the shape [`route_op`] installs —
+/// one path, NORMAL, via `sw_if_index` to `next_hop` — and anything else
+/// touching the interface (a second path, another next hop) is malformed,
+/// never counted as acknowledged.
+fn routes_via(
+    t: &mut Transport,
+    sw_if_index: u32,
+    next_hop: Ipv6Addr,
+) -> Result<(BTreeSet<Ipv6Addr>, BTreeSet<Ipv6Addr>), TransportError> {
     let details: Vec<IpRouteDetails> = t.dump(IpRouteDump {
         context: 0,
         table: IpTable {
@@ -830,17 +887,31 @@ fn routes_via(t: &mut Transport, sw_if_index: u32) -> Result<BTreeSet<Ipv6Addr>,
             name: String::new(),
         },
     })?;
-    Ok(details
-        .into_iter()
-        .filter(|d| d.route.paths.iter().any(|p| p.sw_if_index == sw_if_index))
-        .filter_map(|d| match crate::fib_sync::from_prefix(&d.route.prefix) {
-            Some(IpPrefix::V6 {
-                addr,
-                prefix_len: 128,
-            }) => Some(Ipv6Addr::from(addr)),
-            _ => None,
-        })
-        .collect())
+    let want = crate::fib_sync::wire_path(IpAddr::V6(next_hop), sw_if_index);
+    let mut ours = BTreeSet::new();
+    let mut malformed = BTreeSet::new();
+    for d in details {
+        if !d.route.paths.iter().any(|p| p.sw_if_index == sw_if_index) {
+            continue;
+        }
+        let Some(IpPrefix::V6 {
+            addr,
+            prefix_len: 128,
+        }) = crate::fib_sync::from_prefix(&d.route.prefix)
+        else {
+            continue;
+        };
+        let exact = matches!(d.route.paths.as_slice(), [p] if p.sw_if_index == want.sw_if_index
+            && p.r#type == want.r#type
+            && p.proto == want.proto
+            && p.nh.address == want.nh.address);
+        if exact {
+            ours.insert(Ipv6Addr::from(addr));
+        } else {
+            malformed.insert(Ipv6Addr::from(addr));
+        }
+    }
+    Ok((ours, malformed))
 }
 
 fn route_op(
@@ -889,6 +960,15 @@ pub fn sync_routes(
     half: &mut VppHalf,
     desired: &BTreeSet<Ipv6Addr>,
 ) -> Result<(), HandbackError> {
+    // A malformed route for an address the host no longer holds goes; one
+    // it still holds is replaced by the add below (`is_multipath` false
+    // replaces every path).
+    let strays: Vec<Ipv6Addr> = half.malformed.difference(desired).copied().collect();
+    for addr in strays {
+        route_op(t, half, addr, false)?;
+        half.malformed.remove(&addr);
+        tracing::info!(%addr, "a malformed hand-back route was withdrawn");
+    }
     let stale: Vec<Ipv6Addr> = half.routes.difference(desired).copied().collect();
     for addr in stale {
         route_op(t, half, addr, false)?;
@@ -898,6 +978,7 @@ pub fn sync_routes(
     let missing: Vec<Ipv6Addr> = desired.difference(&half.routes).copied().collect();
     for addr in missing {
         route_op(t, half, addr, true)?;
+        half.malformed.remove(&addr);
         half.routes.insert(addr);
         tracing::info!(%addr, "hand-back route installed: VPP hands this address to the kernel");
     }
@@ -1062,8 +1143,14 @@ impl Handback {
             && self.vpp_up
             && !self.routes_in_doubt
             && !self.addrs_unknown
-            && match (&self.vpp, &self.desired) {
-                (Some(v), Some(d)) => v.routes == *d,
+            && match (&self.vpp, &self.desired, &self.facts) {
+                // Built for THIS veth — a half left from a veth since rebuilt,
+                // or whose MAC or MTU moved, is not ready even when a refused
+                // cleanup kept it around to retry — and holding exactly the
+                // host's addresses, nothing malformed beside them.
+                (Some(v), Some(d), Some(f)) => {
+                    v.bound_to == *f && v.routes == *d && v.malformed.is_empty()
+                }
                 _ => false,
             }
     }
@@ -1258,12 +1345,27 @@ impl Handback {
         let Some(t) = t else {
             return Ok(());
         };
+        // The same veth with another MAC or MTU: the neighbour, next hop or
+        // MTU VPP holds is stale, and the idempotent ensure below puts each
+        // right (a VPP end no longer wearing its veth's MAC is recreated by
+        // its stale check; routes via the old next hop read as malformed
+        // and are replaced).
+        if self.vpp.as_ref().is_some_and(|v| {
+            v.bound_to != facts
+                && (v.bound_to.kernel_ifindex, v.bound_to.vpp_ifindex)
+                    == (facts.kernel_ifindex, facts.vpp_ifindex)
+        }) {
+            tracing::warn!("the hand-back veth's MAC or MTU changed; re-asserting VPP's end");
+            self.vpp = None;
+        }
         // A veth rebuilt under a live VPP: its socket is bound to the old
-        // interface, so the VPP half is recreated, not adopted.
-        if let Some(mut v) = self
-            .vpp
-            .take_if(|v| v.bound_to != (facts.kernel_ifindex, facts.vpp_ifindex))
-        {
+        // interface, so the VPP half is recreated, not adopted. A refused
+        // cleanup keeps the old half to retry, and `ready` stays false
+        // while its `bound_to` names the old veth.
+        if let Some(mut v) = self.vpp.take_if(|v| {
+            (v.bound_to.kernel_ifindex, v.bound_to.vpp_ifindex)
+                != (facts.kernel_ifindex, facts.vpp_ifindex)
+        }) {
             tracing::warn!("the hand-back veth was rebuilt; recreating VPP's end on it");
             if let Err(e) = remove_vpp(t, &mut v) {
                 match e {
@@ -1354,11 +1456,11 @@ impl Handback {
         }
         let v = self.vpp.as_mut().expect("ensured just above");
         if self.routes_in_doubt {
-            v.routes = routes_via(t, v.sw_if_index)?;
+            (v.routes, v.malformed) = routes_via(t, v.sw_if_index, v.next_hop)?;
             self.routes_in_doubt = false;
         }
         if let Some(desired) = &self.desired {
-            if v.routes != *desired {
+            if v.routes != *desired || !v.malformed.is_empty() {
                 match sync_routes(t, v, desired) {
                     Ok(()) => {}
                     Err(HandbackError::Transport(e)) => {
@@ -1434,8 +1536,8 @@ mod kernel {
     use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 
     use super::{
-        parse_port_range, router_owned, AddrReadError, HostAddr, HostFacts, HostSide, PortRange,
-        KERNEL_IF, VPP_HOST_IF,
+        parse_port_range, router_owned, veth_as_built, AddrReadError, HostAddr, HostFacts,
+        HostSide, LinkState, PortRange, KERNEL_IF, VPP_HOST_IF,
     };
 
     /// `RTMGRP_IPV6_IFADDR`: the multicast group RTM_NEWADDR/RTM_DELADDR
@@ -1756,10 +1858,14 @@ mod kernel {
         }
 
         fn check(&mut self, facts: &HostFacts) -> bool {
+            let state = |l: &Link| LinkState {
+                index: l.index,
+                mac: l.mac,
+                mtu: l.mtu,
+                up: l.up,
+            };
             match dump_links().map(|l| find_pair(&l)) {
-                Ok(Ok(Some((k, v)))) => {
-                    k.index == facts.kernel_ifindex && v.index == facts.vpp_ifindex && k.up && v.up
-                }
+                Ok(Ok(Some((k, v)))) => veth_as_built(&state(&k), &state(&v), facts),
                 _ => false,
             }
         }
@@ -1959,72 +2065,106 @@ mod tests {
     }
 
     /// Per address: TCP with ACK set, TCP with RST set — the classic
-    /// stateless `established` test — and UDP to the ephemeral range; one
-    /// explicit deny at the end. Every rule is scoped to the address as a
-    /// /128, from any source, with the source port unconstrained, so a
-    /// pure SYN (no ACK, no RST), a NULL or FIN-only probe, and UDP to a
-    /// service port all fall to the deny.
+    /// stateless `established` test — and, per reply source port (DNS 53,
+    /// NTP 123), UDP from that port to the ephemeral range; one explicit
+    /// deny at the end. Every rule is scoped to the address as a /128, from
+    /// any source. So a pure SYN (no ACK, no RST), a NULL or FIN-only probe,
+    /// UDP to a service port, and UDP from anything but 53/123 into the
+    /// ephemeral range (an overlay VPN's inbound datagram) all fall to the
+    /// deny.
     #[test]
     fn the_guard_renders_the_established_policy_per_address() {
         let a: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
         let b: Ipv6Addr = "2001:db8:7::7".parse().unwrap();
         let rules = render_guard(&[a, b].into_iter().collect(), (32768, 60999));
-        assert_eq!(rules.len(), 2 * 3 + 1);
+        let per = 2 + UDP_REPLY_SOURCE_PORTS.len();
+        assert_eq!(UDP_REPLY_SOURCE_PORTS, [53, 123]);
+        assert_eq!(rules.len(), 2 * per + 1);
         let dst = |r: &AclRule| crate::fib_sync::from_prefix(&r.dst_prefix).unwrap();
         let host = |x: Ipv6Addr| IpPrefix::V6 {
             addr: x.octets(),
             prefix_len: 128,
         };
+        let any = Some(IpPrefix::V6 {
+            addr: [0; 16],
+            prefix_len: 0,
+        });
         // BTreeSet order: 2001:db8:7::7 first.
-        for (chunk, addr) in rules.chunks(3).zip([b, a]) {
-            assert!(chunk
-                .iter()
-                .all(|r| r.is_permit == ACL_ACTION_API_PERMIT && dst(r) == host(addr)));
-            assert!(chunk
-                .iter()
-                .all(|r| crate::fib_sync::from_prefix(&r.src_prefix)
-                    == Some(IpPrefix::V6 {
-                        addr: [0; 16],
-                        prefix_len: 0
-                    })
-                    && (r.srcport_or_icmptype_first, r.srcport_or_icmptype_last) == (0, u16::MAX)));
-            assert_eq!(
-                (
-                    chunk[0].proto,
-                    chunk[0].tcp_flags_mask,
-                    chunk[0].tcp_flags_value
-                ),
-                (IP_API_PROTO_TCP, TCP_FLAG_ACK, TCP_FLAG_ACK)
-            );
-            assert_eq!(
-                (
-                    chunk[1].proto,
-                    chunk[1].tcp_flags_mask,
-                    chunk[1].tcp_flags_value
-                ),
-                (IP_API_PROTO_TCP, TCP_FLAG_RST, TCP_FLAG_RST)
-            );
-            assert_eq!(
-                (
-                    chunk[2].proto,
-                    chunk[2].dstport_or_icmpcode_first,
-                    chunk[2].dstport_or_icmpcode_last,
-                    chunk[2].tcp_flags_mask
-                ),
-                (IP_API_PROTO_UDP, 32768, 60999, 0)
-            );
+        for (chunk, addr) in rules.chunks(per).zip([b, a]) {
+            assert!(chunk.iter().all(|r| r.is_permit == ACL_ACTION_API_PERMIT
+                && dst(r) == host(addr)
+                && crate::fib_sync::from_prefix(&r.src_prefix) == any));
+            for (r, flag) in chunk[..2].iter().zip([TCP_FLAG_ACK, TCP_FLAG_RST]) {
+                assert_eq!(
+                    (
+                        r.proto,
+                        r.tcp_flags_mask,
+                        r.tcp_flags_value,
+                        (r.srcport_or_icmptype_first, r.srcport_or_icmptype_last),
+                        (r.dstport_or_icmpcode_first, r.dstport_or_icmpcode_last)
+                    ),
+                    (IP_API_PROTO_TCP, flag, flag, (0, u16::MAX), (0, u16::MAX))
+                );
+            }
+            for (r, sport) in chunk[2..].iter().zip(UDP_REPLY_SOURCE_PORTS) {
+                assert_eq!(
+                    (
+                        r.proto,
+                        (r.srcport_or_icmptype_first, r.srcport_or_icmptype_last),
+                        (r.dstport_or_icmpcode_first, r.dstport_or_icmpcode_last),
+                        r.tcp_flags_mask
+                    ),
+                    (IP_API_PROTO_UDP, (sport, sport), (32768, 60999), 0),
+                    "UDP only FROM {sport}, only INTO the ephemeral range"
+                );
+            }
         }
         let last = rules.last().unwrap();
         assert_eq!((last.is_permit, last.proto), (ACL_ACTION_API_DENY, 0));
-        assert_eq!(
-            crate::fib_sync::from_prefix(&last.dst_prefix),
-            Some(IpPrefix::V6 {
-                addr: [0; 16],
-                prefix_len: 0
-            })
-        );
+        assert_eq!(crate::fib_sync::from_prefix(&last.dst_prefix), any);
         // No address yet: the deny alone.
         assert_eq!(render_guard(&BTreeSet::new(), (32768, 60999)).len(), 1);
+    }
+
+    /// The veth check covers everything the path rests on: ifindexes, both
+    /// MACs, the MTU, both ends up. A change to any one is not the veth
+    /// that was built.
+    #[test]
+    fn the_veth_check_covers_macs_and_mtu() {
+        let facts = HostFacts {
+            kernel_ifindex: 90,
+            kernel_mac: [0x02, 0, 0, 0, 0, 0x90],
+            vpp_ifindex: 91,
+            vpp_mac: [0x02, 0, 0, 0, 0, 0x91],
+            mtu: 9000,
+        };
+        let k = LinkState {
+            index: 90,
+            mac: Some(facts.kernel_mac),
+            mtu: Some(9000),
+            up: true,
+        };
+        let v = LinkState {
+            index: 91,
+            mac: Some(facts.vpp_mac),
+            mtu: Some(9000),
+            up: true,
+        };
+        assert!(veth_as_built(&k, &v, &facts));
+        type Change = fn(&mut LinkState, &mut LinkState);
+        let changes: [(&str, Change); 6] = [
+            ("kernel MTU", |k, _| k.mtu = Some(1500)),
+            ("VPP-end MTU", |_, v| v.mtu = Some(1500)),
+            ("kernel MAC", |k, _| k.mac = Some([0x02, 0, 0, 0, 0, 0xee])),
+            ("VPP-end MAC", |_, v| v.mac = Some([0x02, 0, 0, 0, 0, 0xee])),
+            ("ifindex", |k, _| k.index = 92),
+            ("down", |_, v| v.up = false),
+        ];
+        for (what, change) in changes {
+            let (mut k2, mut v2) = (k, v);
+            change(&mut k2, &mut v2);
+            assert!(!veth_as_built(&k2, &v2, &facts), "{what}");
+        }
     }
 
     /// VPP's `show interface` layout: counters beside the name row and

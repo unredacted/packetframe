@@ -60,6 +60,18 @@ struct HostState {
     periodic_due: bool,
     /// The kernel's ephemeral range, `None` for the stock one.
     ports: Option<PortRange>,
+    /// The veth as the kernel has it now, `None` for [`default_veth`].
+    veth: Option<HostFacts>,
+}
+
+fn default_veth() -> HostFacts {
+    HostFacts {
+        kernel_ifindex: KERNEL_IFINDEX,
+        kernel_mac: KERNEL_MAC,
+        vpp_ifindex: VPP_IFINDEX,
+        vpp_mac: VPP_MAC,
+        mtu: 1500,
+    }
 }
 
 /// The stock Linux ephemeral range.
@@ -89,17 +101,21 @@ impl FakeHost {
 
 impl HostSide for FakeHost {
     fn ensure(&mut self) -> Result<HostFacts, String> {
-        self.0.lock().unwrap().ensures += 1;
-        Ok(HostFacts {
-            kernel_ifindex: KERNEL_IFINDEX,
-            kernel_mac: KERNEL_MAC,
-            vpp_ifindex: VPP_IFINDEX,
-            vpp_mac: VPP_MAC,
-            mtu: 1500,
-        })
+        let mut s = self.0.lock().unwrap();
+        s.ensures += 1;
+        Ok(s.veth.clone().unwrap_or_else(default_veth))
     }
-    fn check(&mut self, _facts: &HostFacts) -> bool {
-        true
+    /// As built exactly when the veth is still what `facts` says —
+    /// ifindexes, MACs and MTU, as the real check compares them.
+    fn check(&mut self, facts: &HostFacts) -> bool {
+        *facts
+            == self
+                .0
+                .lock()
+                .unwrap()
+                .veth
+                .clone()
+                .unwrap_or_else(default_veth)
     }
     fn ephemeral_ports(&mut self) -> Result<PortRange, String> {
         Ok(self.0.lock().unwrap().ports.unwrap_or(EPHEMERAL))
@@ -701,6 +717,187 @@ fn an_intact_surviving_path_is_ready_at_attach_without_touching_the_fib() {
     );
 }
 
+/// A veth whose MTU or kernel-side MAC changed under the path (by hand)
+/// is noticed on the next check: the path is not ready until VPP's end is
+/// re-asserted — its MTU set to the new one; the static neighbour moved to
+/// the new MAC, and every /128 re-pointed at the new link-local (the old
+/// ones read back as malformed and are replaced).
+#[test]
+fn a_veth_mac_or_mtu_change_is_reasserted() {
+    let fake = Fake::start_behaving("hb-veth-change", behaviour());
+    let host = host();
+    let mut e = engine(&fake, &host);
+    converge(&mut e, &Mirror(1));
+    e.service_handback(true).expect("sync");
+    assert!(e.handback_ready());
+    let _ = fake.drain_events();
+
+    let new_mac = [0x02, 0, 0, 0, 0, 0xb0];
+    host.0.lock().unwrap().veth = Some(HostFacts {
+        mtu: 9000,
+        kernel_mac: new_mac,
+        ..default_veth()
+    });
+    let later = std::time::Instant::now() + CHECK_EVERY;
+    e.service_handback_at(false, later).expect("check");
+    assert!(!e.handback_ready(), "not ready until re-pointed");
+    let events = fake.drain_events();
+    assert!(events
+        .iter()
+        .any(|ev| matches!(ev, Event::Msg(m) if m == &format!("mtu if={AF_PACKET_BASE} l3=9000"))));
+    assert!(events.iter().any(|ev| matches!(
+        ev,
+        Event::Neighbour { ip, mac, sw_if_index, is_add: true, .. }
+            if *sw_if_index == AF_PACKET_BASE && *mac == new_mac
+                && *ip == IpAddr::V6(eui64_link_local(new_mac))
+    )));
+    e.service_handback_at(true, later).expect("sync");
+    assert!(e.handback_ready());
+    let nh = eui64_link_local(new_mac).octets();
+    let t = fake.routes6.lock().unwrap();
+    for a in owned() {
+        let paths = &t[&(a.octets(), 128)];
+        assert!(
+            paths.len() == 1 && paths[0].nh.address.0 == nh,
+            "{a} re-pointed at the new link-local"
+        );
+    }
+}
+
+/// A surviving VPP's /128 counts as acknowledged only in exactly the shape
+/// this module installs — one path, via the hand-back interface, to the
+/// kernel veth's link-local. A second path, or another next hop, is
+/// malformed: the path is not ready until it is replaced (for an address
+/// the host holds) or withdrawn (for one it does not).
+#[test]
+fn an_adopted_128_must_have_exactly_the_installed_shape() {
+    let fake = Fake::start_behaving("hb-shape", behaviour());
+    fake.af_packets
+        .lock()
+        .unwrap()
+        .push((VPP_HOST_IF.into(), AF_PACKET_BASE, VPP_MAC));
+    let nh = eui64_link_local(KERNEL_MAC);
+    let path = |via: u32, nh: Ipv6Addr| {
+        let mut p = fake_vpp::table_path([0; 4], via, 1);
+        p.proto = 1;
+        p.nh.address.0 = nh.octets();
+        p
+    };
+    let two_paths = addr("2001:db8:ffff::1");
+    let wrong_nh = addr("2001:db8:ee::5");
+    let good = addr("2001:db8:100::1");
+    let stray = addr("2001:db8:0:dead::1");
+    let other_nh: Ipv6Addr = "fe80::99".parse().unwrap();
+    {
+        let mut t = fake.routes6.lock().unwrap();
+        t.insert(
+            (two_paths.octets(), 128),
+            vec![
+                path(AF_PACKET_BASE, nh),
+                path(fake_vpp::ASSIGNED_INDEX, other_nh),
+            ],
+        );
+        t.insert(
+            (wrong_nh.octets(), 128),
+            vec![path(AF_PACKET_BASE, other_nh)],
+        );
+        t.insert((good.octets(), 128), vec![path(AF_PACKET_BASE, nh)]);
+        t.insert((stray.octets(), 128), vec![path(AF_PACKET_BASE, other_nh)]);
+    }
+    let host = host();
+    let mut e = engine(&fake, &host);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    assert!(!e.handback_ready(), "malformed /128s are not acknowledged");
+    let _ = fake.drain_events();
+
+    e.service_handback(true).expect("sync");
+    let mut ops = handback_ops(&fake.drain_events());
+    ops.sort();
+    let mut want = vec![
+        (stray, false),
+        (two_paths, true),
+        (wrong_nh, true),
+        (addr("2001:db8:7::7"), true),
+    ];
+    want.sort();
+    assert_eq!(ops, want, "the good one untouched");
+    assert_eq!(held(&fake), owned());
+    let t = fake.routes6.lock().unwrap();
+    assert!(owned()
+        .iter()
+        .all(|a| t[&(a.octets(), 128)] == vec![path(AF_PACKET_BASE, nh)]));
+    drop(t);
+    assert!(e.handback_ready());
+}
+
+/// A veth rebuilt under a live VPP whose cleanup of the stale half VPP
+/// refuses: the old half is kept to retry, but the path is NOT ready while
+/// it names the old veth — and once the cleanup goes through, the half is
+/// rebuilt on the new veth and ready again.
+#[test]
+fn a_refused_stale_cleanup_keeps_the_path_not_ready() {
+    let fake = Fake::start_behaving(
+        "hb-stale-refused",
+        Behaviour {
+            track_routes: true,
+            reject_deletes: 1,
+            ..Default::default()
+        },
+    );
+    let host = host();
+    let mut e = engine(&fake, &host);
+    converge(&mut e, &Mirror(1));
+    e.service_handback(true).expect("sync");
+    assert!(e.handback_ready());
+
+    host.0.lock().unwrap().veth = Some(HostFacts {
+        kernel_ifindex: 190,
+        vpp_ifindex: 191,
+        ..default_veth()
+    });
+    let later = std::time::Instant::now() + CHECK_EVERY;
+    e.service_handback_at(true, later)
+        .expect("refusal is not a transport error");
+    assert!(!e.handback_ready(), "a half on the old veth is never ready");
+    assert!(e.handback_status().unwrap().error.is_some());
+
+    e.service_handback_at(true, later + RETRY_EVERY)
+        .expect("retry");
+    assert!(e.handback_ready(), "{:?}", e.handback_status());
+    assert_eq!(held(&fake), owned());
+}
+
+/// A keep-VPP adoption of a NIC already steering IPv6 while this process's
+/// hand-back path is broken: the gate starts closed with the target already
+/// withholding v6, so no transition would ever fire — the inherited v6
+/// rules are dropped at the attach instead, IPv4 left alone.
+#[test]
+fn inherited_v6_rules_are_dropped_when_the_path_is_broken_at_attach() {
+    use packetframe_vpp_offload::driver::Observe as _;
+    use packetframe_vpp_offload::executor::Effects as _;
+    let fake = Fake::start_behaving(
+        "hb-inherited",
+        Behaviour {
+            track_routes: true,
+            reject_af_packet_create: true,
+            ..Default::default()
+        },
+    );
+    let host = host();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let inherited = Arc::new(Mutex::new((2, 0)));
+    let rt = runtime_inheriting(&fake, &host, &seen, &inherited);
+    let (mut obs, mut fx) = rt.views();
+    assert!(obs.api_ready());
+    fx.attach_devices().expect("attach");
+    assert_eq!(
+        *inherited.lock().unwrap(),
+        (0, 2),
+        "both dropped at the attach"
+    );
+}
+
 /// The guard ACL is read back and compared structurally on every check.
 /// Each drift — a rule missing, rules reordered, the UDP range widened,
 /// the ACK rule gone, the ACL unbound, another ACL bound beside it — is
@@ -912,6 +1109,9 @@ type Seen = Arc<Mutex<Vec<(bool, usize, bool)>>>;
 /// had been told the v6 half may go in — and how many hand-back /128s the
 /// fake held, and whether the guard ACL was bound, right then.
 struct GateProbe {
+    /// IPv6 rules "inherited" in the NIC, and how many `drop_held_v6`
+    /// has taken out.
+    inherited_v6: Arc<Mutex<(usize, usize)>>,
     ready: bool,
     rules: Vec<(String, u32)>,
     seen: Seen,
@@ -922,6 +1122,12 @@ struct GateProbe {
 impl packetframe_vpp_offload::runtime::Steering for GateProbe {
     fn set_v6_ready(&mut self, ready: bool) {
         self.ready = ready;
+    }
+    fn drop_held_v6(&mut self) -> Result<usize, String> {
+        let mut s = self.inherited_v6.lock().unwrap();
+        let n = std::mem::take(&mut s.0);
+        s.1 += n;
+        Ok(n)
     }
     fn steer(&mut self) -> Result<SteerOutcome, String> {
         let handed_back = self
@@ -966,10 +1172,20 @@ impl packetframe_vpp_offload::runtime::Steering for GateProbe {
 }
 
 fn runtime(fake: &Fake, host: &FakeHost, seen: &Seen) -> Runtime {
+    runtime_inheriting(fake, host, seen, &Arc::new(Mutex::new((0, 0))))
+}
+
+fn runtime_inheriting(
+    fake: &Fake,
+    host: &FakeHost,
+    seen: &Seen,
+    inherited_v6: &Arc<Mutex<(usize, usize)>>,
+) -> Runtime {
     Runtime::new(
         engine(fake, host),
         Box::new(Mirror(2)),
         Box::new(GateProbe {
+            inherited_v6: inherited_v6.clone(),
             ready: false,
             rules: Vec::new(),
             seen: seen.clone(),

@@ -326,7 +326,7 @@ pub enum RuleAction {
 /// diverted VLAN or port (NTP 123, unicast DHCPv6 547, SSH …) is the
 /// operator's `steer-keep6`: without it the packet reaches VPP, whose
 /// hand-back guard admits toward the kernel only replies — TCP with ACK or
-/// RST set, UDP to the kernel's ephemeral ports ([`crate::handback`]) — the
+/// RST set, UDP from a DNS or NTP server ([`crate::handback`]) — the
 /// w23 lesson in IPv6 form, refused on purpose rather than lost.
 pub const BUILTIN_KEEPS6: [L4Match; 4] = [
     L4Match::Port {

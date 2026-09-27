@@ -1826,6 +1826,60 @@ impl crate::runtime::Steering for NtupleSteering {
         self.targets = Self::effective(&self.configured, ready);
     }
 
+    /// The installed plan says which ledger locations hold IPv6 rules —
+    /// adopted from the state file on a restart — so exactly those come
+    /// out, through the same ownership-checked removal as everything else,
+    /// and the plan forgets them. With no installed plan nothing can be
+    /// attributed, and the adoption's own steer reconciles instead.
+    fn drop_held_v6(&mut self) -> Result<usize, String> {
+        if self.v6_ready {
+            return Ok(0);
+        }
+        let Some(plans) = self.installed_as.as_mut() else {
+            return Ok(0);
+        };
+        let v6_locs: Vec<(String, u32)> = plans
+            .iter()
+            .flat_map(|(iface, _, plan)| {
+                plan.rules
+                    .iter()
+                    .filter(|r| r.is_v6())
+                    .map(move |r| (iface.clone(), r.location))
+            })
+            .collect();
+        let victims: Vec<(String, u32)> = self
+            .installed
+            .iter()
+            .filter(|e| v6_locs.contains(e))
+            .cloned()
+            .collect();
+        if victims.is_empty() {
+            return Ok(0);
+        }
+        self.installed.retain(|e| !victims.contains(e));
+        let n = victims.len();
+        let failed = self.remove_all(victims);
+        // The plan keeps describing what is still in the NIC: the v6 rules
+        // that would not come out stay in it (and in the ledger, which
+        // `remove_all` put them back into).
+        let remaining = self.installed.clone();
+        if let Some(plans) = self.installed_as.as_mut() {
+            for (iface, _, plan) in plans.iter_mut() {
+                plan.rules
+                    .retain(|r| !r.is_v6() || remaining.contains(&(iface.clone(), r.location)));
+            }
+        }
+        if failed.is_empty() {
+            Ok(n)
+        } else {
+            Err(format!(
+                "{} IPv6 steering rule(s) could not be removed ({})",
+                failed.len(),
+                failed.join(", ")
+            ))
+        }
+    }
+
     fn steer(&mut self) -> Result<SteerOutcome, String> {
         // Two ways to have nothing to install, and they are opposite
         // events.
@@ -4674,6 +4728,50 @@ mod tests {
             "the v6 rules came out before the refusal: {:?}",
             sys::rules_with_cookies()
         );
+    }
+
+    /// IPv6 rules the NIC holds while the v6 half is held back come out on
+    /// demand, IPv4 untouched — both in this process and from a record a
+    /// previous one left (the keep-VPP adoption, whose gate starts closed
+    /// with the target already withholding v6, so no transition fires).
+    #[test]
+    fn held_v6_rules_are_dropped_and_v4_stays() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_both_families();
+        let v4_rules = plan.rules.iter().filter(|r| !r.is_v6()).count();
+        let v6_rules = plan.rules.len() - v4_rules;
+
+        // Installed with the path ready, then the path breaks.
+        let mut s = steering_v6(vec![("eth0".into(), 0)], plan.clone());
+        s.steer().expect("both families");
+        s.set_v6_ready(false);
+        assert_eq!(s.drop_held_v6(), Ok(v6_rules));
+        assert_eq!(sys::rules().len(), v4_rules, "v4 stays");
+        assert!(s.installed_plan()[0].2.rules.iter().all(|r| !r.is_v6()));
+        assert_eq!(s.drop_held_v6(), Ok(0), "nothing left to drop");
+
+        // A restart adopting that record with the path not ready.
+        sys::reset();
+        let mut daemon = steering_v6(vec![("eth0".into(), 0)], plan.clone());
+        daemon.steer().expect("both families");
+        let (rules, plans) = (daemon.installed(), daemon.installed_plan());
+        drop(daemon);
+        let mut adopted = steering(vec![("eth0".into(), 0)], plan.clone());
+        adopted.carry_families_of(crate::fib_sync::FamilyPolicy::Both);
+        adopted.adopt_record(rules, plans);
+        assert_eq!(adopted.drop_held_v6(), Ok(v6_rules));
+        assert_eq!(sys::rules().len(), v4_rules);
+        assert!(sys::rules_with_cookies()
+            .iter()
+            .all(|(_, loc, _)| plan.rules.iter().any(|r| r.location == *loc && !r.is_v6())));
+
+        // With the path ready nothing is dropped.
+        sys::reset();
+        let mut ready = steering_v6(vec![("eth0".into(), 0)], plan.clone());
+        ready.steer().unwrap();
+        assert_eq!(ready.drop_held_v6(), Ok(0));
+        assert_eq!(sys::rules().len(), plan.rules.len());
     }
 
     /// A steer that fails partway removes every rule it wrote — the keeps

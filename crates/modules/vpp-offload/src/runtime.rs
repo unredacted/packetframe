@@ -450,6 +450,19 @@ pub trait Steering {
     /// withheld, so a forgotten call fails closed: v6 is held back,
     /// never diverted without a way home.
     fn set_v6_ready(&mut self, _ready: bool) {}
+    /// Take out, now, any IPv6 rule the NIC holds while the v6 half is held
+    /// back — rules inherited from a previous process that was steering v6
+    /// when this one's hand-back path is not ready — leaving every IPv4
+    /// rule exactly where it is. Returns how many came out.
+    ///
+    /// Without it such rules outlive the gate: the target already withholds
+    /// v6, so no gate TRANSITION fires, and they keep diverting the router's
+    /// own IPv6 into a VPP that cannot hand it back until the adoption's
+    /// resync and verify end in a steer. A default no-op for seams that
+    /// plan no IPv6, like [`Self::set_v6_ready`].
+    fn drop_held_v6(&mut self) -> Result<usize, String> {
+        Ok(0)
+    }
     /// How many ports the CONFIG asks to steer, whether or not any rule
     /// is installed.
     ///
@@ -2459,6 +2472,31 @@ impl Core {
     /// [`Self::service_handback`] for `resteer`.
     fn apply_v6_gate(&mut self, resteer: bool) {
         let ready = self.engine.handback_ready();
+        // Held back: whatever v6 rule the NIC still holds comes out now,
+        // whether or not this is a transition — inherited rules meet a gate
+        // that STARTS closed, and nothing else would reach them before the
+        // adoption's steer. IPv4 is untouched.
+        if !ready {
+            match self.steering.drop_held_v6() {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::warn!(
+                        rules = n,
+                        "IPv6 steering rules were in the NIC while the hand-back path is not \
+                         ready; removed them (IPv4 steering untouched)"
+                    );
+                    self.record_steering();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "IPv6 steering rules are in the NIC while the hand-back path is not \
+                         ready, and could not all be removed"
+                    );
+                    self.record_steering();
+                }
+            }
+        }
         if ready != self.v6_gate {
             self.v6_gate = ready;
             self.steering.set_v6_ready(ready);
