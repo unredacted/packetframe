@@ -185,6 +185,7 @@ impl Host {
             // where it lives, in `runtime`.
             require_table_complete: false,
             steer_direction: Default::default(),
+            loopback_address6: None,
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
                 prefix_len: 32,
@@ -460,6 +461,31 @@ fn a_config_that_cannot_work_touches_nothing() {
     .err()
     .expect("must fail");
     assert!(e.contains("is not executable"), "{e}");
+
+    // A `loopback-address6` the host holds. `::1` is on every host's
+    // loopback interface, so the real `getifaddrs` read sees it wherever
+    // this runs; config validation would refuse `::1` for its class, but
+    // `bring_up` is the guard for what the kernel holds and must refuse
+    // it on that ground alone, before anything is acquired.
+    cfg = host.cfg(&[("eth4", 1, false)]);
+    cfg.v6 = true;
+    cfg.loopback_address6 = Some(std::net::Ipv6Addr::LOCALHOST);
+    let e = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        None,
+        &McamBudget::default(),
+        &[],
+    )
+    .err()
+    .expect("must fail");
+    assert!(
+        e.contains("loopback-address6 ::1") && e.contains("kernel already holds"),
+        "{e}"
+    );
 
     // No attempt may have created a VF, a reservation, or a record.
     assert!(host.state().is_none(), "a refused attach left a state file");

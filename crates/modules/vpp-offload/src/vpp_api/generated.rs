@@ -61,6 +61,8 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "create_loopback_reply", crc: "0x5383d31f", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_add_del_address", crc: "0x5463d73b", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "sw_interface_add_del_address_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "ip_address_dump", crc: "0x2d033de4", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "ip_address_details", crc: "0xee29b797", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_set_unnumbered", crc: "0x154a6439", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "sw_interface_set_unnumbered_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "sw_interface_ip6_enable_disable", crc: "0xae6cfcfb", context_offset: 6, client_index_prefix: true },
@@ -2392,6 +2394,83 @@ impl Decode for SwInterfaceAddDelAddressReply {
 impl Message for SwInterfaceAddDelAddressReply {
     const NAME: &'static str = "sw_interface_add_del_address_reply";
     const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `ip_address_dump` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IpAddressDump {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub is_ipv6: bool,
+}
+
+impl Encode for IpAddressDump {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.push(if self.is_ipv6 { 1u8 } else { 0u8 });
+    }
+}
+
+impl Decode for IpAddressDump {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let is_ipv6 = d.bool()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            is_ipv6,
+        })
+    }
+}
+
+impl Message for IpAddressDump {
+    const NAME: &'static str = "ip_address_dump";
+    const CRC: &'static str = "0x2d033de4";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `ip_address_details` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IpAddressDetails {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub prefix: Prefix,
+}
+
+impl Encode for IpAddressDetails {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        self.prefix.encode(buf);
+    }
+}
+
+impl Decode for IpAddressDetails {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let prefix = Prefix::decode(d)?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            prefix,
+        })
+    }
+}
+
+impl Message for IpAddressDetails {
+    const NAME: &'static str = "ip_address_details";
+    const CRC: &'static str = "0xee29b797";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;
     fn set_context(&mut self, context: u32) { self.context = context; }

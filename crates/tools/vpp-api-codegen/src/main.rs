@@ -127,6 +127,16 @@ const MESSAGES: &[&str] = &[
     "create_loopback_reply",
     "sw_interface_add_del_address",
     "sw_interface_add_del_address_reply",
+    //   Reading an interface's addresses back — for `loopback-address6`,
+    //   whose /128 on the loopback is re-verified rather than trusted on
+    //   adoption. Re-adding it cannot serve as the check: VPP v26.06's
+    //   conflict scan answers an identical re-add on the same interface
+    //   with DUPLICATE_IF_ADDRESS (-127), the same code as a genuine
+    //   conflict on another interface (`ip6_add_del_interface_address`,
+    //   `src/vnet/ip/ip6_forward.c`) — the zero-information answer the v4
+    //   loopback's re-assert hit as -105. A DUMP, like `sw_interface_dump`.
+    "ip_address_dump",
+    "ip_address_details",
     "sw_interface_set_unnumbered",
     "sw_interface_set_unnumbered_reply",
     //   IPv6 on an egress interface (`v6 on` only). Unnumbered borrows

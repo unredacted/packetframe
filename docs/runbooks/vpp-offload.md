@@ -1112,6 +1112,11 @@ since the route is kept outside the ledger. A config without any
 `local-route6` records exactly what earlier builds recorded, so an
 upgrade still adopts.
 
+The bridge a `local-route6` names is IPv6 reach for the exemption
+tripwire, so its connected `/64` is not an `exempt-drift-v6` finding
+([IPv6 findings](#ipv6-findings-exempt-drift-v6)). Without the line,
+the same connected route is one while a port carries `v6-divert`.
+
 Verifying on the box (`vppctl` is fine for these; they are not bulk
 reads):
 
@@ -1477,8 +1482,9 @@ exempt-drift-v6: degraded — IPv6 kernel path(s) VPP cannot take, while
 ```
 
 It is the same judgement as v4 — a route is covered when some next hop
-leaves by a member port, or via a gateway on a bridge VLAN a member
-carries — with these differences:
+leaves by a member port, by a bridge VPP delivers this family into, or
+via a gateway on a bridge VLAN a member carries — with these
+differences:
 
 - **Nothing exempts.** The NIC cannot match a v6 address, so there is
   no IPv6 `steer-exempt` and every finding stands until its cause
@@ -1501,9 +1507,13 @@ carries — with these differences:
   device is covered by its device. An ECMP route mixing a link-local
   member hop with a hop out a device VPP does not own is, when VPP
   lacks the prefix, an ordinary finding naming that device.
-- **`local-route` bridges are no v6 reach.** `local-route` delivers an
-  IPv4 subnet; VPP has no route onto that bridge for its v6 subnet, so
-  a connected v6 route there is a finding.
+- **A bridge is v6 reach by `local-route6`, not `local-route`.**
+  `local-route` delivers an IPv4 subnet; VPP has no route onto that
+  bridge for its v6 subnet, so a connected v6 route there is a finding.
+  A [`local-route6`](#local-route6-a-customer-vlan-vpp-can-deliver-ipv6-to)
+  installs the v6 attached route, so its bridge counts exactly as a
+  `local-route` bridge does for v4: by device, any route out it
+  covered. Each line counts for its own family only.
 - **Not paths, never findings:** link-local destinations (routers
   never forward `fe80::/10`), multicast destinations (a `33:33` frame
   no diversion's unicast MAC matches), and the router's own addresses
@@ -1906,7 +1916,97 @@ any port carries `v6-divert`: a kernel v6 route VPP cannot take is an
 (see [IPv6 findings](#ipv6-findings-exempt-drift-v6) for what it
 reports and the remedies — there is no v6 exemption). The keeps are
 what protect the router's own services; the tripwire does not judge
-them.
+them. The source of VPP's own ICMPv6 errors is watched by the
+`icmp6-source` row, below.
+
+### ICMPv6 errors from VPP: `loopback-address6`
+
+Diverted IPv6 is forwarded by VPP, so VPP is the hop that has to send
+the ICMPv6 errors for it: **Time Exceeded** when the hop limit runs out
+(every traceroute's hop at this router), **Packet Too Big** when a
+packet is larger than the egress MTU (PMTUD — IPv6 routers never
+fragment, so without it the sender never learns to shrink), and
+**Destination Unreachable**. An error needs a global source address,
+and with `v6 on` alone VPP's interfaces have only link-locals. VPP
+v26.06 does not send the error from a link-local — it drops it
+(`ip6-icmp-error` finds no source and counts `error message dropped`).
+So without the directive, diverted IPv6 loses all three: the router's
+hop reads `*` in a traceroute, and flows whose path MTU shrinks at VPP
+black-hole their large packets.
+
+```
+module vpp-offload
+  loopback-address 198.51.100.254/32
+  loopback-address6 2001:db8:ffff::1
+  v6 on
+```
+
+It puts one /128 on the same VPP loopback that holds `loopback-address`.
+Every interface VPP owns — member VFs, dot1q subifs, BVIs — is already
+unnumbered to that loopback, and VPP's unnumbered borrow covers both
+families, so all of them source their errors from it. Each keeps its
+own link-local for neighbour discovery and MLD.
+
+**Picking the address.** Any /128 from global space you already announce
+(so the errors pass uRPF and bogon filters on their way to the sender)
+that **no host interface holds**. It does not need announcing on its
+own: it only ever sources errors, nothing replies to it, and VPP never
+answers for it on a wire (ICMPv6 is never diverted to VPP, so no
+neighbour solicitation for it reaches VPP). Refused:
+
+- anything outside global unicast (2000::/3): link-local, ULA
+  (`fc00::/7` — not globally routable, so dropped as a bogon before it
+  reaches the sender), multicast, `::`, `::1`. At config load.
+- an address the kernel holds on any interface. At attach, and as a FAIL
+  of `vpp.loopback6` in `packetframe feasibility`: VPP's loopback would
+  answer for it too, so diverted TCP/UDP to it would end in VPP instead
+  of the kernel.
+- without `v6 on`, or on two lines. At config load.
+
+Restart-only, on reload and on adoption. A `--keep-vpp` restart reads the
+loopback's IPv6 addresses back rather than trusting them: a missing /128
+is added (a previous daemon that died mid-attach), and any other IPv6
+address on the loopback refuses the attach — VPP would source some errors
+from it. Teardown needs nothing: the address lives only in VPP and goes
+with it.
+
+**What it does not do.** VPP routes the error from its own FIB, so the
+sender must be reachable in VPP's IPv6 table. Diverted traffic comes
+from customers on the diverted VLANs, and their subnets are the
+router's connected subnets — which VPP leaves to the kernel
+(kernel-delivered) unless a
+[`local-route6`](#local-route6-a-customer-vlan-vpp-can-deliver-ipv6-to)
+gives VPP an attached route onto that VLAN. Without one, errors to those
+customers are sourced correctly and then dropped for want of a route.
+The counters below tell the two apart.
+
+`packetframe status` shows an `icmp6-source` row, **Degraded**, while any
+port diverts IPv6 and VPP has no source (the directive unset); it is
+absent otherwise. Degraded rather than informational because a lost
+Packet Too Big is traffic silently lost, the class every other
+`nominal` clause refuses. It pages nothing and gates no steering.
+
+Verify on the box:
+
+```bash
+# loop0 holds the /128 (alongside loopback-address). No other interface
+# holds a global v6 address.
+vppctl show interface address
+# The receive entry for it.
+vppctl show ip6 fib 2001:db8:ffff::1/128
+# The error node: "hop limit exceeded response sent" / "packet too big
+# response sent" climb once errors are sourced; "error message dropped"
+# climbing on its own means no source (or the rate limiter). Neither
+# says the error was DELIVERED — a missing route back to the sender is
+# counted further on, where VPP drops it.
+vppctl show errors | grep -iE 'ip6-icmp-error|hop limit|too big|error message'
+```
+
+From a host whose IPv6 VPP forwards and can route back to (a customer on
+a diverted VLAN that has a `local-route6`): `traceroute6 <external v6
+host>` (UDP probes, which are diverted — `-I` ICMP probes are not) or
+`mtr -6 --udp <host>`; the router's hop must show `2001:db8:ffff::1`, not
+`*` and not a link-local.
 
 ### Rollback
 

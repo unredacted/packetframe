@@ -44,6 +44,11 @@ pub(crate) fn run(
     if let Some(addr) = loopback {
         caps.push(probe_loopback(addr));
     }
+    // Read from the section as attach reads it, like the v6 steering
+    // plan below.
+    if let Some(addr) = crate::VppOffloadConfig::from_directives(section).loopback_address6 {
+        caps.push(probe_loopback6(addr));
+    }
     // Probe the binary the module will ACTUALLY exec. Probing the
     // defaults while the config names another path would report a pass
     // for an executable we never run (or a failure for one that
@@ -654,6 +659,22 @@ fn probe_loopback(addr: std::net::Ipv4Addr) -> Capability {
     }
 }
 
+/// `bring_up` refuses a `loopback-address6` the kernel holds on any
+/// interface. The same check over the same `getifaddrs` read, so the
+/// summary cannot say PASS over that refusal — the rule `probe_loopback`
+/// follows for the v4 address.
+fn probe_loopback6(addr: std::net::Ipv6Addr) -> Capability {
+    let name = "vpp.loopback6";
+    match crate::bringup::loopback6_collision(addr, &crate::bringup::kernel_v6_ifaddrs()) {
+        Some(err) => Capability::fail(name, err, true),
+        None => Capability::pass(
+            name,
+            format!("loopback-address6 {addr} is not a live kernel address"),
+            true,
+        ),
+    }
+}
+
 fn probe_vfio() -> Capability {
     let dev = Path::new("/dev/vfio/vfio").exists();
     let drv = Path::new("/sys/bus/pci/drivers/vfio-pci").exists();
@@ -1256,6 +1277,18 @@ mod steering_probe_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The `loopback-address6` probe FAILS on an address the host holds
+    /// — `::1` is on every host's `lo` — exactly where `bring_up`
+    /// refuses, and passes on one nothing holds.
+    #[test]
+    fn a_kernel_held_loopback6_fails_the_probe() {
+        let held = probe_loopback6(std::net::Ipv6Addr::LOCALHOST);
+        assert_eq!(held.status, CapabilityStatus::Fail, "{held:?}");
+        assert!(held.detail.contains("kernel already holds"), "{held:?}");
+        let free = probe_loopback6("2001:db8::ffff".parse().unwrap());
+        assert_eq!(free.status, CapabilityStatus::Pass, "{free:?}");
+    }
+
     /// Every hardware probe is `required` whatever it found.
     ///
     /// Each one probes a condition attach refuses (`bring_up`'s named
@@ -1278,6 +1311,8 @@ mod steering_probe_tests {
             probe_vpp_binary(Some("/bin/sh")),
             probe_sriov("eth-nonexistent"),
             probe_irq_affinity(&[], 1),
+            probe_loopback6(std::net::Ipv6Addr::LOCALHOST),
+            probe_loopback6("2001:db8::ffff".parse().unwrap()),
         ] {
             assert!(
                 cap.required,

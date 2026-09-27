@@ -2019,6 +2019,7 @@ impl Runtime {
                 !v6_divert_summary(&plan).is_empty() && !installs_v4_diversion(&plan)
             },
             handback: c.engine.handback_status(),
+            icmp6_source: c.engine.icmp6_source(),
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
@@ -2247,6 +2248,11 @@ pub struct RuntimeStatus {
     /// The IPv6 hand-back path, while it is wanted or built
     /// ([`crate::handback`]).
     pub handback: Option<crate::handback::HandbackStatus>,
+    /// The global address VPP sources ICMPv6 errors from, as read back
+    /// on its loopback ([`ConvergenceEngine::icmp6_source`]). `None`
+    /// while `steer_v6_divert` is non-empty means diverted IPv6 gets no
+    /// Time Exceeded or Packet Too Big from VPP at all.
+    pub icmp6_source: Option<std::net::Ipv6Addr>,
     /// Changes the source is holding that the engine has not pulled yet.
     ///
     /// Distinct from `pending_ops`, which is what the engine has pulled

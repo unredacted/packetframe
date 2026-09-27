@@ -77,6 +77,10 @@ pub const SUBSYS_FIB_V6: &str = "fib-v6";
 /// The IPv6 hand-back path ([`crate::handback`]), present only while it
 /// is wanted or built.
 pub const SUBSYS_HANDBACK: &str = "v6-handback";
+/// Present only while some port diverts IPv6 and VPP has no global
+/// IPv6 address to source ICMPv6 errors from (`loopback-address6`
+/// unset). See [`StatusSnapshot::v6_errors_unsourced`].
+pub const SUBSYS_ICMP6_SOURCE: &str = "icmp6-source";
 
 /// Liveness of the binary API, as observed from ping/pong timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +337,10 @@ pub struct StatusSnapshot {
     /// The IPv6 hand-back path, while it is wanted or built. See
     /// [`crate::runtime::RuntimeStatus::handback`].
     pub handback: Option<crate::handback::HandbackStatus>,
+    /// Where VPP's ICMPv6 errors come from. See
+    /// [`crate::runtime::RuntimeStatus::icmp6_source`] and
+    /// [`Self::v6_errors_unsourced`].
+    pub icmp6_source: Option<std::net::Ipv6Addr>,
     pub undead: bool,
     pub failures: u32,
     pub counts: SinkCounts,
@@ -498,6 +506,10 @@ pub struct SteerAudit {
     /// See [`crate::runtime::RuntimeStatus::handback`]. Carried here
     /// because it gates the v6 half of the same installed set.
     pub handback: Option<crate::handback::HandbackStatus>,
+    /// See [`crate::runtime::RuntimeStatus::icmp6_source`]. Carried here
+    /// because it only matters for the diverted IPv6 above — the
+    /// `icmp6-source` row judges the two together.
+    pub icmp6_source: Option<std::net::Ipv6Addr>,
 }
 
 impl StatusSnapshot {
@@ -604,6 +616,7 @@ impl StatusSnapshot {
             steer_v6_divert: audit.v6_divert,
             steer_v6_only: audit.v6_only,
             handback: audit.handback,
+            icmp6_source: audit.icmp6_source,
             undead: sup.is_undead(),
             failures: sup.failures(),
             counts,
@@ -800,6 +813,7 @@ impl StatusSnapshot {
             });
         }
         subsystems.extend(self.drift_v6_health());
+        subsystems.extend(self.icmp6_source_health());
         if !self.neighbours_unplaced.is_empty() || self.fdb_unreadable.is_some() {
             let mut parts = Vec::new();
             if !self.neighbours_unplaced.is_empty() {
@@ -955,6 +969,11 @@ impl StatusSnapshot {
             // The IPv6 half, the same way — while it runs at all, which
             // is only while some port diverts IPv6.
             && self.drift_v6.quiet()
+            // Diverted IPv6 that gets no Time Exceeded and no Packet Too
+            // Big from VPP: a PMTUD black hole for any flow whose path
+            // MTU shrinks at VPP, and a `*` hop in every traceroute. The
+            // `icmp6-source` row says so, from the same predicate.
+            && !self.v6_errors_unsourced()
             // A v6 diversion held back for the hand-back path is traffic
             // the operator asked to divert and the module is not — the
             // `v6-handback` row says Degraded, and overall must not
@@ -1028,6 +1047,52 @@ impl StatusSnapshot {
             name: SUBSYS_HANDBACK.into(),
             state,
             message: Some(message),
+            last_success_age_seconds: None,
+        })
+    }
+
+    /// Some port diverts IPv6 into VPP (the INSTALLED rules say so, not
+    /// the config) and VPP holds no global IPv6 address to source ICMPv6
+    /// errors from, so it drops every one it would originate —
+    /// `ip6-icmp-error` sends to error-drop when source selection finds
+    /// nothing (VPP v26.06 `src/vnet/ip/icmp6.c`; see
+    /// [`crate::attach::ensure_loopback_address6`]).
+    ///
+    /// One predicate for the row and for [`Self::nominal`], so the two
+    /// cannot disagree about it.
+    fn v6_errors_unsourced(&self) -> bool {
+        !self.steer_v6_divert.is_empty() && self.icmp6_source.is_none()
+    }
+
+    /// The `icmp6-source` row: present only while
+    /// [`Self::v6_errors_unsourced`], like `exempt-drift-v6` — no
+    /// permanent "fine" line.
+    ///
+    /// Degraded rather than informational, on the precedent of the rows
+    /// beside it: `nominal` refuses every condition under which traffic
+    /// VPP carries is silently lost (an uncovered kernel path, an unplaced
+    /// neighbour), and a lost Packet Too Big is that — the sender never
+    /// learns to shrink, so its large packets vanish at VPP, visible only
+    /// in VPP's own error counters. It pages nothing (only `steered_but_broken` and an
+    /// undead process are Unhealthy) and gates no steering; the remedy is
+    /// one restart-only directive.
+    fn icmp6_source_health(&self) -> Option<SubsystemHealth> {
+        if !self.v6_errors_unsourced() {
+            return None;
+        }
+        Some(SubsystemHealth {
+            name: SUBSYS_ICMP6_SOURCE.into(),
+            state: HealthState::Degraded,
+            message: Some(format!(
+                "IPv6 is diverted into VPP on {} but VPP has no global IPv6 address to source \
+                 ICMPv6 errors from — its interfaces carry only link-locals, so it DROPS the \
+                 Time Exceeded, Packet Too Big and Destination Unreachable it would send for \
+                 that traffic: traceroutes through the router show `*` at its hop, and PMTUD \
+                 breaks for any flow whose path MTU shrinks there. Set `loopback-address6 \
+                 <address>` (a /128 from your own global space that no host interface holds; \
+                 restart-only) — docs/runbooks/vpp-offload.md, v6-divert steering",
+                self.steer_v6_divert.join(", ")
+            )),
             last_success_age_seconds: None,
         })
     }
@@ -3944,6 +4009,70 @@ mod tests {
         assert!(msg.contains("IPv6 on eth4 vlan 100,200"), "{msg}");
         assert!(!msg.contains("allowlisted IPv4"), "{msg}");
         assert!(msg.contains("no IPv4 is diverted"), "{msg}");
+    }
+
+    /// Diverted IPv6 with no `loopback-address6` behind it gets an
+    /// `icmp6-source` row naming the directive, and the module is
+    /// Degraded overall — asserted at the boundary the operator reads
+    /// (`overall` and the metric), not only on the row. A read-back
+    /// source clears both; no v6 diverted means no row at all.
+    #[test]
+    fn diverted_v6_without_an_error_source_is_degraded_and_names_the_directive() {
+        let led = ledger_with(10, 0, 0);
+        let sup = ready_supervisor();
+        let mut snap = StatusSnapshot::observe(
+            &sup,
+            led.counts(),
+            &PendingMap::new(),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            verified(1),
+            ports_up(),
+            true,
+        );
+        snap.steered = true;
+        let row = |s: &StatusSnapshot| {
+            s.report()
+                .subsystems
+                .into_iter()
+                .find(|x| x.name == SUBSYS_ICMP6_SOURCE)
+        };
+        let gauge = |s: &StatusSnapshot| {
+            render_metrics(s, "vpp-offload")
+                .lines()
+                .find(|l| {
+                    l.starts_with("packetframe_vpp_health{") && l.contains("state=\"degraded\"")
+                })
+                .map(str::to_string)
+                .expect("a degraded health gauge line")
+        };
+        // The premise: without the condition this snapshot is nominal, so
+        // whatever changes below is the condition's doing.
+        assert_eq!(
+            snap.report().overall,
+            HealthState::Healthy,
+            "fixture must be nominal"
+        );
+        assert!(row(&snap).is_none(), "no v6 diverted, no row");
+        assert!(gauge(&snap).ends_with(" 0"), "{}", gauge(&snap));
+
+        snap.steer_v6_divert = vec!["eth4 vlan 100".into()];
+        let r = row(&snap).expect("diverted v6 with no source must be reported");
+        assert_eq!(r.state, HealthState::Degraded);
+        let msg = r.message.unwrap();
+        assert!(msg.contains("eth4 vlan 100"), "{msg}");
+        assert!(msg.contains("`loopback-address6"), "{msg}");
+        assert!(
+            msg.contains("Packet Too Big") && msg.contains("`*`"),
+            "{msg}"
+        );
+        assert_eq!(snap.report().overall, HealthState::Degraded);
+        assert!(gauge(&snap).ends_with(" 1"), "{}", gauge(&snap));
+
+        snap.icmp6_source = Some("2001:db8::1".parse().unwrap());
+        assert!(row(&snap).is_none(), "a read-back source clears the row");
+        assert_eq!(snap.report().overall, HealthState::Healthy);
     }
 
     /// Which families the installed rules divert, read from the rules

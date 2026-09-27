@@ -1406,6 +1406,7 @@ fn run_loop(
                 v6_divert: rs.steer_v6_divert.clone(),
                 v6_only: rs.steer_v6_only,
                 handback: rs.handback.clone(),
+                icmp6_source: rs.icmp6_source,
             },
             rs.shadowed_routes,
             rs.kernel_delivered_routes,

@@ -374,7 +374,7 @@ reaches new hosts, alongside `vppctl show errors | grep -i glean`.
 - **vpp-offload**: VPP's adjacencies are mirrored from the kernel
   neighbour table through the resolver, so seeded entries reach VPP
   too. ARP/ND are not prefix-steered, so the tap keeps seeing them
-  under steering, and ICMPv6 is never diverted by `v6-outbound`, so
+  under steering, and ICMPv6 is never diverted by `v6-divert`, so
   the same holds for IPv6 (see the customer-VLAN section above).
 - **HA standby**: the same config runs on the standby; its bridges are
   down, so the module idles with `link absent`. Its persisted cache is

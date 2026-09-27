@@ -62,6 +62,10 @@ module vpp-offload
 - `loopback-address` is mandatory. Without it, member ports are up but
   forward nothing. Use an address that is announced but not assigned
   to anything, including the kernel.
+- `loopback-address6` (with `v6 on`) is the IPv6 twin for ICMPv6 errors:
+  a /128 on the same loopback, from global space you announce, held by
+  no host interface. Without it VPP drops the Time Exceeded and Packet
+  Too Big it would send for diverted IPv6.
 - There must be a `port` line for every fast-path `attach` interface.
   `cores 0` puts egress-only members on one shared worker, and such a
   port cannot be steered. Trunk ports need `vlans` before they can be

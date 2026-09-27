@@ -36,16 +36,16 @@ use crate::vpp_api::generated::{
     Address, AddressUnion, BridgeDomainAddDelV2, BridgeDomainAddDelV2Reply, BridgeDomainDetails,
     BridgeDomainDump, CreateLoopback, CreateLoopbackInstance, CreateLoopbackInstanceReply,
     CreateLoopbackReply, CreateVlanSubif, CreateVlanSubifReply, DevAttach, DevAttachReply,
-    DevCreatePortIf, DevCreatePortIfReply, L2FibTableDetails, L2FibTableDump,
-    L2InterfaceVlanTagRewrite, L2InterfaceVlanTagRewriteReply, L2fibAddDel, L2fibAddDelReply,
-    Prefix, SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply, SwInterfaceAddDelMacAddress,
-    SwInterfaceAddDelMacAddressReply, SwInterfaceDetails, SwInterfaceDump,
-    SwInterfaceIp6EnableDisable, SwInterfaceIp6EnableDisableReply, SwInterfaceIp6ndRaConfig,
-    SwInterfaceIp6ndRaConfigReply, SwInterfaceSetFlags, SwInterfaceSetFlagsReply,
-    SwInterfaceSetL2Bridge, SwInterfaceSetL2BridgeReply, SwInterfaceSetMacAddress,
-    SwInterfaceSetMacAddressReply, SwInterfaceSetMtu, SwInterfaceSetMtuReply,
-    SwInterfaceSetPromisc, SwInterfaceSetPromiscReply, SwInterfaceSetUnnumbered,
-    SwInterfaceSetUnnumberedReply, ADDRESS_IP4,
+    DevCreatePortIf, DevCreatePortIfReply, IpAddressDetails, IpAddressDump, L2FibTableDetails,
+    L2FibTableDump, L2InterfaceVlanTagRewrite, L2InterfaceVlanTagRewriteReply, L2fibAddDel,
+    L2fibAddDelReply, Prefix, SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply,
+    SwInterfaceAddDelMacAddress, SwInterfaceAddDelMacAddressReply, SwInterfaceDetails,
+    SwInterfaceDump, SwInterfaceIp6EnableDisable, SwInterfaceIp6EnableDisableReply,
+    SwInterfaceIp6ndRaConfig, SwInterfaceIp6ndRaConfigReply, SwInterfaceSetFlags,
+    SwInterfaceSetFlagsReply, SwInterfaceSetL2Bridge, SwInterfaceSetL2BridgeReply,
+    SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply, SwInterfaceSetMtu,
+    SwInterfaceSetMtuReply, SwInterfaceSetPromisc, SwInterfaceSetPromiscReply,
+    SwInterfaceSetUnnumbered, SwInterfaceSetUnnumberedReply, ADDRESS_IP4, ADDRESS_IP6,
 };
 use crate::vpp_api::{Transport, TransportError};
 
@@ -643,12 +643,13 @@ pub fn find_loopback(t: &mut Transport) -> Result<Option<u32>, TransportError> {
 /// What this deliberately leaves open: a daemon crash between
 /// `create_loopback`'s create and its address-add leaves a named,
 /// addressless loopback that adoption will trust. That window is two
-/// adjacent API round trips on a unix socket, no whitelisted message
-/// can dump addresses to check (`sw_interface_dump` reports MACs, not
-/// prefixes), and the cure measured worse than the disease. Closing it
-/// properly means adding `ip_address_dump` to the API whitelist and
-/// doing a true readback — tracked as future hardening, not faked with
-/// a probe whose answer cannot be interpreted.
+/// adjacent API round trips on a unix socket, and the cure measured
+/// worse than the disease. Closing it properly means a true readback
+/// with `ip_address_dump` — whitelisted now, for `loopback-address6`
+/// ([`ensure_loopback_address6`] reads the v6 half back on every
+/// attach, adopted or fresh); applying it to the v4 address here is
+/// tracked as future hardening, not faked with a probe whose answer
+/// cannot be interpreted.
 pub fn adopt_loopback(t: &mut Transport, loop_idx: u32) -> Result<(), AttachError> {
     let reply =
         t.request::<SwInterfaceSetFlags, SwInterfaceSetFlagsReply>(SwInterfaceSetFlags {
@@ -722,6 +723,171 @@ pub fn create_loopback(t: &mut Transport, addr: Ipv4Prefix) -> Result<u32, Attac
         });
     }
     Ok(loop_idx)
+}
+
+/// Make the loopback hold `addr`/128 — `loopback-address6`, the global
+/// source for every ICMPv6 error VPP originates — and prove it by
+/// reading the loopback's addresses back.
+///
+/// **Why the loopback is enough.** Evidence from VPP v26.06
+/// (`c3200b88`), the pinned release:
+///
+/// - `ip6-icmp-error` (`src/vnet/ip/icmp6.c`) picks the error's source
+///   with `ip6_sas_by_sw_if_index` on the interface the offending packet
+///   ARRIVED on, and sends the error to error-drop when that finds
+///   nothing.
+/// - `ip6_sas_by_sw_if_index` (`src/vnet/ip/ip_sas.c`) walks the
+///   interface's address pool with `foreach_ip_interface_address(...,
+///   1)`, which for an UNNUMBERED interface reads the pool of the
+///   interface it borrows from (`src/vnet/ip/ip_interface.h`). A
+///   link-local is never in that pool — `ip6_link` keeps it apart
+///   (`il_ll_addr`, `src/vnet/ip/ip6_link.c`) — so today an owned
+///   interface has no candidate and every error is dropped.
+/// - `vnet_sw_interface_update_unnumbered` (`src/vnet/interface.c`) sets
+///   the borrow for BOTH families in one call. Every owned interface —
+///   member VF, dot1q subif, BVI — is already unnumbered to this loopback
+///   for IPv4, so a v6 address here is in scope for all of them with no
+///   per-interface call.
+/// - Each interface keeps its own link-local: `ip6_sas_by_sw_if_index`
+///   answers a link-local or `ff02::` destination from
+///   `ip6_get_link_local_address` of the interface itself, never the
+///   borrow, so ND and MLD are untouched.
+///
+/// **Why read back.** Re-adding cannot serve as the check: an identical
+/// re-add on the same interface answers DUPLICATE_IF_ADDRESS (-127) from
+/// the conflict scan (`ip6_add_del_interface_address`,
+/// `src/vnet/ip/ip6_forward.c`), the same code a genuine conflict gets —
+/// the zero-information answer the v4 loopback's re-assert hit as -105.
+/// `ip_address_dump` is a true readback, so this runs identically on a
+/// fresh loopback and an adopted one: absent is added, present is left
+/// alone, and anything else is refused.
+///
+/// **Any other non-link-local v6 address on the loopback is refused**
+/// (link-locals are ignored outright — [`v6_addresses`] says why), not left
+/// beside ours: `ip6_sas_by_sw_if_index` chooses among them by longest
+/// match per destination, so a foreign one would source some errors and
+/// not others. Nothing in this module adds one — a changed
+/// `loopback-address6` refuses adoption before this runs (the
+/// restart-only record) — so one here was put there by something else,
+/// and a restart onto a fresh VPP is what clears it.
+///
+/// VPP never answers for this address on a wire: ICMPv6 (neighbour
+/// discovery included) is never diverted to VPP, and diverted TCP/UDP
+/// to it would end in VPP's local stack — which nothing legitimate
+/// sends, since the address exists only to source errors.
+pub fn ensure_loopback_address6(
+    t: &mut Transport,
+    loop_idx: u32,
+    addr: std::net::Ipv6Addr,
+) -> Result<(), AttachError> {
+    let label = || "loop0".to_string();
+    let held = v6_addresses(t, loop_idx)?;
+    let foreign: Vec<String> = held
+        .iter()
+        .filter(|(a, len)| !(*a == addr && *len == 128))
+        .map(|(a, len)| format!("{a}/{len}"))
+        .collect();
+    if !foreign.is_empty() {
+        return Err(AttachError::Refused {
+            step: "ip_address_dump(loop0, ipv6)",
+            port: label(),
+            retval: 0,
+            detail: format!(
+                "the loopback holds IPv6 address(es) this config does not ask for ({}) \
+                 beside `loopback-address6 {addr}`; VPP would source ICMPv6 errors from \
+                 whichever matches each destination longest. Nothing in packetframe adds \
+                 them, so this VPP was changed out of band — `packetframe detach --all`, \
+                 then start",
+                foreign.join(", ")
+            ),
+        });
+    }
+    if held.contains(&(addr, 128)) {
+        return Ok(());
+    }
+    let reply = t.request::<SwInterfaceAddDelAddress, SwInterfaceAddDelAddressReply>(
+        SwInterfaceAddDelAddress {
+            context: 0,
+            sw_if_index: loop_idx,
+            is_add: true,
+            del_all: false,
+            prefix: prefix6_of(addr),
+        },
+    )?;
+    if reply.retval != 0 {
+        return Err(AttachError::Refused {
+            step: "sw_interface_add_del_address(loop0, ipv6)",
+            port: label(),
+            retval: reply.retval,
+            detail: format!("{addr}/128"),
+        });
+    }
+    // An acknowledgement is VPP saying it accepted the message, not that
+    // the loopback now answers for the address — the same distinction the
+    // MAC readback draws.
+    if !v6_addresses(t, loop_idx)?.contains(&(addr, 128)) {
+        return Err(AttachError::Refused {
+            step: "ip_address_dump(loop0, ipv6) readback",
+            port: label(),
+            retval: 0,
+            detail: format!(
+                "VPP acknowledged adding {addr}/128 to the loopback but does not report \
+                 holding it"
+            ),
+        });
+    }
+    tracing::info!(
+        address = %addr,
+        sw_if_index = loop_idx,
+        "loopback-address6 on the loopback and read back — VPP's ICMPv6 errors are \
+         sourced from it on every owned interface"
+    );
+    Ok(())
+}
+
+/// The non-link-local IPv6 addresses VPP reports on `sw_if_index`, as
+/// `(addr, len)`.
+///
+/// **Link-locals (fe80::/10) are dropped here, before anything judges the
+/// list.** VPP v26.06 keeps the link-local outside the address pool this
+/// dump walks (`il_ll_addr`, `src/vnet/ip/ip6_link.c`), so none should
+/// appear — but that is a reading of the source, not an observation, and
+/// the cost of being wrong would be every attach refused over a "foreign"
+/// address that is only the loopback's own link-local (adding the /128
+/// enables `ip6_link` on it). A link-local can be neither the configured
+/// address (config accepts only 2000::/3) nor an error source for an
+/// off-link destination (`ip6_sas_by_sw_if_index` answers those from the
+/// pool alone), so ignoring it loses nothing.
+fn v6_addresses(
+    t: &mut Transport,
+    sw_if_index: u32,
+) -> Result<Vec<(std::net::Ipv6Addr, u8)>, TransportError> {
+    let details: Vec<IpAddressDetails> = t.dump(IpAddressDump {
+        context: 0,
+        sw_if_index,
+        is_ipv6: true,
+    })?;
+    Ok(details
+        .into_iter()
+        .filter(|d| d.prefix.address.af == ADDRESS_IP6)
+        .map(|d| {
+            (
+                std::net::Ipv6Addr::from(d.prefix.address.un.0),
+                d.prefix.len,
+            )
+        })
+        .filter(|(a, _)| !a.is_unicast_link_local())
+        .collect())
+}
+
+fn prefix6_of(addr: std::net::Ipv6Addr) -> Prefix {
+    Prefix {
+        address: Address {
+            af: ADDRESS_IP6,
+            un: AddressUnion(addr.octets()),
+        },
+        len: 128,
+    }
 }
 
 /// Enable IPv4 on a member by borrowing the loopback's address.
