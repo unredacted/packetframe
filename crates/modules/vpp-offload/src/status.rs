@@ -1832,10 +1832,10 @@ impl StatusSnapshot {
                  no lever"
             } else {
                 // What it CHANGES is the promise; what it ANSWERS is not.
-                // A reload that edits no steering input may be answered
-                // without the loop (`service::ResendVerdict`) — or, after a
-                // failed request left the loop's target unknown, or while a
-                // pass is in flight, go to it and be refused like any other.
+                // A reload that edits no steering input is answered without
+                // the loop (`service::ResendVerdict`) — or, after a failed
+                // request left the loop's target unknown, goes to it and is
+                // refused like any other.
                 // Naming only the answer that does not vary keeps this line
                 // true of both (review finding).
                 "Until it converges there is nothing to ask: from here `packetframe \

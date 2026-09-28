@@ -480,17 +480,27 @@ pending" cannot look the same.
 request up within 3 s: a tick mid-convergence can take longer than
 that. It applies only to a reload that asks the loop for something. A
 reload that changes no steering input — an edit to fast-path's
-`dry-run`, say, with `allow-prefix` untouched — is answered without the
-loop unless re-sending would do something there: from `Ready` with a
-remembered want (the "ask now" retry), from `Steered` (the repair
-below), or with every port off while something is still steered or
-wanted. A want remembered during a convergence also goes to the loop
-while a loop pass is running, because that pass may be the one that
-ends the convergence and steers. And after any failed request the
-module no longer knows which target the loop holds, so the next reload
-goes to the loop whatever it changes. All of these can still be
-withdrawn; re-run once `packetframe status` shows the convergence
-finished.
+`dry-run`, say, with `allow-prefix` untouched — is applied unchanged,
+without the loop, in every state (converging, adopted resync, backoff
+or converged), unless re-sending would do something there: from `Ready`
+with a remembered want (the "ask now" retry), from `Steered` (the
+repair below), or with every port off while something is still steered
+or wanted and a VPP is running to take it off (the rollback's retry).
+Before 2026-09-27 a reload during an adopted resync after a keep-VPP
+restart also went to the loop — the steered adoption records a want —
+and a fast-path `dry-run` flip came back *"vpp-offload is
+AdoptedResyncing, not converged"*, exit 2, `reconfigure_failed` for a
+module whose configuration had not changed. When a loop pass is running
+as the reload arrives — nearly always, during an adopted resync — the
+module cannot tell whether that pass has just reached `Ready` with a
+want, where the reload is the "ask now" retry. It answers OK anyway and
+also posts the unchanged request without waiting for it: if a retry is
+due it happens at once, and if the loop is still converging it refuses
+the request unseen. After any failed request
+the module no longer knows which target the loop holds, so the next
+reload goes to the loop whatever it changes. The ones that reach the
+loop can still be refused or withdrawn; re-run once `packetframe
+status` shows the convergence finished.
 
 **A module failure does not roll the reload back.** The daemon
 publishes the allowlist and reconfigures every module in config order,
@@ -2322,11 +2332,10 @@ steering  DEGRADED — 1 steering rule(s) ... a convergence re-applies
                      "not converged"
 ```
 
-A reload that edits no steering input changes nothing here either, but
-its answer varies: usually OK without asking the loop, and "not
-converged" when it does ask — after a failed request, when the module no
-longer knows which target the loop holds, or while a loop pass is in
-flight.
+A reload that edits no steering input changes nothing here either, and
+answers OK without asking the loop — except right after a failed
+request, when the module no longer knows which target the loop holds;
+that one goes to the loop and answers "not converged" like any other.
 
 That closing part used to read *"`packetframe reconfigure` asks
 immediately rather than waiting"* — which contradicted the paragraph

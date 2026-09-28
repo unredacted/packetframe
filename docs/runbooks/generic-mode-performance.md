@@ -296,7 +296,7 @@ runners and in qemu. The `hardware-artifacts` workflow closes that gap. It runs 
 every push to `main` and publishes a `hwtest-aarch64-unknown-linux-gnu` artifact
 containing:
 
-- `packetframe_<version>~hwtest<sha>_arm64.deb` — an installable package, same
+- `packetframe_<version>~hwtest.<run>.<sha>_arm64.deb` — an installable package, same
   contents as a release .deb (binary, systemd unit, `/etc/packetframe`)
 - `tests/` — the cross-built test binaries, including `bench`
 - `run-tests.sh`, `example.conf`, and both perf runbooks
@@ -339,11 +339,22 @@ The package declares `Depends: libc6 (>= 2.31)`. If the target's libc6 is older,
 `dpkg -i` refuses; check with `dpkg -s libc6 | grep ^Version`. That's the case the
 musl variant below exists for.
 
-The `~hwtest<sha>` version sorts below every real release and is visible in
+The `~hwtest.<run>.<sha>` version sorts below every real release and is visible in
 `dpkg -l`, so a validation build can't be mistaken for one — and `apt install
-packetframe` later upgrades cleanly over it. The sha is the commit the bundle was
-built from, so `git show <sha>` tells you exactly what is on the box. To go back,
-`dpkg -r packetframe` or install a release .deb over the top.
+packetframe` later upgrades cleanly over it. `<run>` is the workflow's run number,
+so a later-built bundle always installs as an upgrade over an earlier one (and over any
+build from before this layout, versioned `~hwtest<sha>`); a `downgrading` warning
+from `dpkg -i` means the package really was built before the installed one. The sha
+is the commit the bundle was built from, so `git show <sha>` tells you exactly
+what is on the box. To have the install fail outright if the unpacked bundle is
+not the commit you meant, name the 7-character sha, which ends the version:
+
+```sh
+SHA=<7-char commit>
+dpkg -i /root/packetframe-hwtest-aarch64-unknown-linux-gnu/packetframe_*~hwtest.*.${SHA}_*.deb && systemctl daemon-reload
+```
+
+To go back, `dpkg -r packetframe` or install a release .deb over the top.
 
 To take a bundle from a PR instead of `main` — the workflow also runs on PRs that
 change it — pass `-b <branch>` in place of `-b main`. For a different target,

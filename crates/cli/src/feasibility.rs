@@ -1028,6 +1028,41 @@ fn print_row(cap: &Capability, name_w: usize) {
 mod summary_tests {
     use super::*;
 
+    /// What a reload publishes to vpp-offload from fast-path's section is
+    /// the allowlist and nothing else — so a `dry-run`, `fib-cache` or
+    /// `coalesce` edit leaves vpp-offload's steering plan where it was
+    /// (and its `reconfigure` answers without its supervision loop), while
+    /// an `allow-prefix` edit moves it. The hardware case was the first
+    /// half: `dry-run on → off` failed the reload for vpp-offload.
+    #[test]
+    fn only_allow_prefix_edits_reach_vpp_offloads_plan() {
+        let config = |fast_path_extra: &str| {
+            Config::parse(&format!(
+                "module fast-path\n  attach fp0 native\n  allow-prefix 198.51.100.0/24\n  \
+                 allow-prefix6 2001:db8:1::/48\n{fast_path_extra}module vpp-offload\n  \
+                 port vp0 cores 2 steer on\n"
+            ))
+            .expect("parse")
+        };
+        let running = allowlist_from_config(&config("  dry-run on\n"));
+        for unrelated in [
+            "  dry-run off\n",
+            "  dry-run on\n  fib-cache on\n",
+            "  dry-run on\n  coalesce rx-usecs 8\n",
+        ] {
+            assert_eq!(
+                allowlist_from_config(&config(unrelated)),
+                running,
+                "{unrelated:?} is not a vpp-offload change"
+            );
+        }
+        assert_ne!(
+            allowlist_from_config(&config("  dry-run on\n  allow-prefix 203.0.113.0/24\n")),
+            running,
+            "an `allow-prefix` edit is a vpp-offload change"
+        );
+    }
+
     /// The probe's worker count is attach's, `cores 0` shared worker
     /// included — a probe that summed cores alone would derive a core
     /// map one worker short of what attach renders.
