@@ -275,10 +275,12 @@ pub struct Published {
 /// branches on — the lifecycle state and `steer_intended` — so
 /// `Module::reconfigure` can answer a reload that changes no steering
 /// input without a round trip. The round trip is the failure being
-/// avoided: a tick mid-convergence can outlast [`STEERING_BUDGET`], and a
-/// reload that edited only fast-path's section then failed on a request
-/// that asked the loop for nothing (hardware, during a fresh 1.09M-route
-/// convergence).
+/// avoided, twice over on hardware: a reload that edited only fast-path's
+/// section failed on a request that asked the loop for nothing — once
+/// timing out behind a fresh 1.09M-route convergence tick, and once
+/// (keep-VPP restart, fast-path `dry-run on → off`) answered "vpp-offload
+/// is AdoptedResyncing, not converged", recorded as `reconfigure_failed`
+/// for a module whose configuration had not changed.
 ///
 /// "Already holds" is the caller's half, and it rests on one fact: the
 /// loop's target moves only through `apply_steering`, the sole caller of
@@ -288,67 +290,67 @@ pub struct Published {
 /// holds (the refusals after `retarget` keep the new one), so the caller
 /// forgets and the next request goes through.
 ///
-/// A snapshot is the state as of the last completed pass, and a pass in
-/// flight may already have moved on — `Driver::apply` changes the state
-/// and the want BEFORE it runs a steer that can take a while and then
-/// fail (review finding: an adopted convergence publishes `Verifying`,
-/// enters `Ready` and starts its automatic steer inside one pass). So the
-/// two ways a re-send can be inert differ in whether a pass in flight can
-/// undo them:
+/// This is the loop's half: a re-send goes to the loop only where it is
+/// an operator LEVER — where `apply_steering` would admit it and something
+/// is steered or wanted, so it would act:
 ///
-/// - **Nothing is steered or wanted** (`!steer_intended`). A steer takes
-///   the staging path or is refused untouched; a removal has nothing to
-///   remove and no want to retire. No pass can end this on its own: every
-///   arm that sets `steer_wanted` or `steered` needs one of them already
-///   set, an operator request, or attach-time inheritance — the machine
-///   never steers a first attach by itself, and `TableEmptied` fires only
-///   while steered. Operator requests arrive only through this same
-///   serial reconfigure path, so none can be in flight. Trusted from any
-///   snapshot, which is what keeps the reload that edited only fast-path
-///   answerable in the middle of the longest convergence tick.
-/// - **A steer, from a state that refuses steering changes.**
-///   `apply_steering` would refuse it untouched, and what that refusal
-///   promises — the configuration takes effect at the next convergence —
-///   is already true of a target the loop holds. But a pass in flight can
-///   end the convergence and attempt the steer, and if that fails an
-///   identical request is the advertised immediate retry. So this counts
-///   only when the snapshot is SETTLED — published by a pass that has
-///   finished, with no new one begun; see
-///   [`SupervisionService::resend_is_inert`]. A request placed then is
-///   taken at the top of the next pass, before its tick, against exactly
-///   the state this snapshot describes.
+/// - **A steer, from `Ready`/`Steered`, with something steered or
+///   wanted.** From `Ready` with a want recorded it asks immediately
+///   instead of waiting out [`crate::driver::STEER_RETRY_EVERY`]. From
+///   `Steered` it is the runbook's repair for rules a provisioning push
+///   deleted, and the audit that would say whether any are missing can be
+///   up to 30 s old, so no snapshot can vouch that the reconcile would be
+///   a no-op.
+/// - **A removal, from a state with a VPP to take it off (converging or
+///   converged), with something steered or wanted.** It retires the want
+///   and takes the rules out — the rollback's retry, admitted
+///   mid-convergence precisely so a deferral cannot strand traffic on VPP
+///   ([`State::accepts_steering_removal`]).
 ///
-/// Everything else goes to the loop, because there a re-send is not
-/// redundant — it is an advertised lever. From `Ready` with a want
-/// recorded it asks immediately instead of waiting out
-/// [`crate::driver::STEER_RETRY_EVERY`]. From `Steered` it is the
-/// runbook's repair for rules a provisioning push deleted, and the audit
-/// that would say whether any are missing can be up to 30 s old, so no
-/// snapshot can vouch that the reconcile would be a no-op. A removal with
-/// something steered or wanted retires the want and takes the rules out —
-/// or, with no VPP running, is refused with the remedy for rules diverting
-/// into nothing — and either answer is worth hearing on any reload.
+/// Everywhere else an identical request asks the loop for nothing:
+///
+/// - **Nothing steered or wanted.** A steer takes the staging path, a
+///   removal has nothing to remove and no want to retire.
+/// - **A state that would refuse it.** A steer outside `Ready`/`Steered`,
+///   or a removal with no VPP to remove it from, is refused untouched —
+///   and what that refusal promises (the configuration takes effect at
+///   the next convergence) is already true of a target the loop holds.
+///   Refusing a reload that changed nothing, on those grounds, reports a
+///   failure about a change nobody made.
+///
+/// No SETTLED snapshot is needed for either. A pass in flight may already
+/// have moved on — `Driver::apply` changes the state and the want before
+/// it runs a steer — but the verdict is a statement about the reload, not
+/// a promise about the loop: a convergence that ends while the reload is
+/// answered steers (or fails to, and retries) on its own, exactly as it
+/// would have had no reload arrived, and says so on `packetframe status`.
+/// Requiring a settled snapshot is what kept this answer from the adopted
+/// resync, whose passes are long enough that one is nearly always in
+/// flight.
 ///
 /// `Default` answers "not inert": the safe verdict for a snapshot the
 /// loop did not observe.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResendVerdict {
-    at_rest: bool,
-    steer_refused: bool,
+    steer_inert: bool,
+    removal_inert: bool,
 }
 
 impl ResendVerdict {
     pub fn observe(state: State, steer_intended: bool) -> Self {
         Self {
-            at_rest: !steer_intended,
-            steer_refused: !state.accepts_steering_changes(),
+            steer_inert: !(steer_intended && state.accepts_steering_changes()),
+            removal_inert: !(steer_intended && state.accepts_steering_removal()),
         }
     }
 
-    /// For a request whose `want_steer` is this, judged from a snapshot
-    /// that is `settled` or not.
-    pub fn inert(self, want_steer: bool, settled: bool) -> bool {
-        self.at_rest || (want_steer && self.steer_refused && settled)
+    /// For a request whose `want_steer` is this.
+    pub fn inert(self, want_steer: bool) -> bool {
+        if want_steer {
+            self.steer_inert
+        } else {
+            self.removal_inert
+        }
     }
 }
 
@@ -371,10 +373,6 @@ struct Shared {
     steering_result: Mutex<Option<(u64, Result<(), String>)>>,
     /// Hands out request sequence numbers.
     steering_seq: AtomicU64,
-    /// Odd while a loop pass is between its first possible state change
-    /// and its publish — a seqlock over `latest`, read by
-    /// [`SupervisionService::resend_is_inert`].
-    pass_seq: AtomicU64,
 }
 
 /// The one place a shutdown that did not complete is turned into a snapshot.
@@ -555,7 +553,6 @@ impl SupervisionService {
             steering_request: Mutex::new(None),
             steering_result: Mutex::new(None),
             steering_seq: AtomicU64::new(0),
-            pass_seq: AtomicU64::new(0),
         });
         let looped = Arc::clone(&shared);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -848,33 +845,48 @@ impl SupervisionService {
     }
 
     /// Whether re-sending the steering request the loop holds would do
-    /// nothing — the loop's own [`ResendVerdict`], read so it cannot be
-    /// trusted further than it deserves.
+    /// nothing — the loop's own [`ResendVerdict`], from its latest
+    /// snapshot.
     ///
-    /// A dead loop vouches for nothing: its snapshot is frozen. And the
-    /// verdict's state-dependent half needs a snapshot no pass has moved
-    /// past, so `latest` is read between two loads of the pass counter —
-    /// even and unchanged means no pass was running on either side of the
-    /// read.
+    /// A dead loop can act on nothing, so asking it could only time out:
+    /// the request would sit in a slot no thread reads until
+    /// [`STEERING_BUDGET`] ran out. That supervision has stopped is
+    /// `health_check`'s to report, not an unchanged reload's.
     pub fn resend_is_inert(&self, want_steer: bool) -> bool {
         if !self.is_alive() {
-            return false;
+            return true;
         }
-        let before = self.shared.pass_seq.load(Ordering::SeqCst);
-        let Some(p) = self.status() else {
-            return false;
-        };
-        let settled =
-            before.is_multiple_of(2) && self.shared.pass_seq.load(Ordering::SeqCst) == before;
-        p.resend.inert(want_steer, settled)
+        self.status().is_some_and(|p| p.resend.inert(want_steer))
+    }
+
+    /// How many steering requests have been posted to this service —
+    /// whether a reload asked the loop at all, as a count rather than as
+    /// a timing.
+    #[cfg(test)]
+    pub(crate) fn requests_for_test(&self) -> u64 {
+        self.shared.steering_seq.load(Ordering::SeqCst)
     }
 
     /// A service whose loop is alive and never picks up a steering
     /// request — the busy tick, held forever. It publishes `published`
-    /// once and exits on `stop`. `mid_pass` leaves the pass counter odd,
-    /// as a loop blocked inside a tick does.
+    /// once and exits on `stop`.
     #[cfg(test)]
-    pub(crate) fn wedged_for_test(published: Published, mid_pass: bool) -> Self {
+    pub(crate) fn wedged_for_test(published: Published) -> Self {
+        Self::stub_for_test(published, false)
+    }
+
+    /// A service whose loop answers every steering request at once, as
+    /// `apply_steering`'s admission rule would from `published.state`:
+    /// the loop's own refusal where the state refuses the request, `Ok`
+    /// where it admits it.
+    #[cfg(test)]
+    pub(crate) fn answering_for_test(published: Published) -> Self {
+        Self::stub_for_test(published, true)
+    }
+
+    #[cfg(test)]
+    fn stub_for_test(published: Published, answering: bool) -> Self {
+        let state = published.state;
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             preserve: AtomicBool::new(false),
@@ -882,12 +894,26 @@ impl SupervisionService {
             steering_request: Mutex::new(None),
             steering_result: Mutex::new(None),
             steering_seq: AtomicU64::new(0),
-            pass_seq: AtomicU64::new(u64::from(mid_pass)),
         });
         let looped = Arc::clone(&shared);
         let thread = std::thread::spawn(move || {
             while !looped.stop.load(Ordering::SeqCst) && !looped.preserve.load(Ordering::SeqCst) {
-                std::thread::sleep(STOP_POLL_CAP);
+                if answering {
+                    let taken = looped
+                        .steering_request
+                        .lock()
+                        .expect("steering lock")
+                        .take();
+                    if let Some(req) = taken {
+                        let outcome = match refusal(state, req.want_steer) {
+                            Some(why) => Err(why),
+                            None => Ok(()),
+                        };
+                        *looped.steering_result.lock().expect("steering lock") =
+                            Some((req.seq, outcome));
+                    }
+                }
+                std::thread::sleep(STEERING_POLL);
             }
         });
         Self {
@@ -1070,6 +1096,50 @@ fn fmt_failures(outcome: &crate::executor::Outcome) -> Vec<String> {
         .collect()
 }
 
+/// Why `apply_steering` refuses a request from `state` untouched, if it
+/// does — its admission rule, apart so the test stand-in loop answers
+/// with the loop's own words rather than a copy of them.
+fn refusal(state: State, want_steer: bool) -> Option<String> {
+    // Removal is admitted from a converging state; anything that could
+    // divert traffic is not. `want_steer == false` is the whole config
+    // asking for nothing steered — the rollback landing zone — so this
+    // is an all-ports-off lever, never a per-port one. A request that
+    // still steers SOME port is a steering change like any other and
+    // waits for `Ready`.
+    let admitted = if want_steer {
+        state.accepts_steering_changes()
+    } else {
+        state.accepts_steering_removal()
+    };
+    if admitted {
+        return None;
+    }
+    // Deliberately refused rather than queued. A steer request that
+    // outlives a crash and fires against the replacement is not what
+    // the operator asked for, and the replacement re-steers on its
+    // own if steering was wanted. The new config is on disk either
+    // way, so the next attach picks it up.
+    //
+    // A REMOVAL reaching here means there is no process to ask at
+    // all (Stopped/Backoff/Starting), which is a different remedy
+    // from "wait for the convergence" — the rules a record names
+    // are removed by the teardown, not by this path.
+    Some(if want_steer {
+        format!(
+            "vpp-offload is {state:?}, not converged — steering changes apply only \
+             from Ready or Steered. The new configuration is on disk and takes \
+             effect at the next successful convergence"
+        )
+    } else {
+        format!(
+            "vpp-offload is {state:?}: there is no running VPP to remove steering \
+             from. If the NIC still holds rules, `packetframe detach --all` after \
+             stopping the daemon is what clears them — it reads each recorded \
+             location back before deleting it"
+        )
+    })
+}
+
 /// Apply one steering change, from inside the loop.
 ///
 /// Split out so the two halves of a steering change — the target and
@@ -1084,43 +1154,8 @@ fn apply_steering(
     fx: &mut dyn crate::executor::Effects,
     req: &SteeringRequest,
 ) -> Result<(), String> {
-    let state = driver.state();
-    // Removal is admitted from a converging state; anything that could
-    // divert traffic is not. `want_steer == false` is the whole config
-    // asking for nothing steered — the rollback landing zone — so this
-    // is an all-ports-off lever, never a per-port one. A request that
-    // still steers SOME port is a steering change like any other and
-    // waits for `Ready`.
-    let admitted = if req.want_steer {
-        state.accepts_steering_changes()
-    } else {
-        state.accepts_steering_removal()
-    };
-    if !admitted {
-        // Deliberately refused rather than queued. A steer request that
-        // outlives a crash and fires against the replacement is not what
-        // the operator asked for, and the replacement re-steers on its
-        // own if steering was wanted. The new config is on disk either
-        // way, so the next attach picks it up.
-        //
-        // A REMOVAL reaching here means there is no process to ask at
-        // all (Stopped/Backoff/Starting), which is a different remedy
-        // from "wait for the convergence" — the rules a record names
-        // are removed by the teardown, not by this path.
-        return Err(if req.want_steer {
-            format!(
-                "vpp-offload is {state:?}, not converged — steering changes apply only \
-                 from Ready or Steered. The new configuration is on disk and takes \
-                 effect at the next successful convergence"
-            )
-        } else {
-            format!(
-                "vpp-offload is {state:?}: there is no running VPP to remove steering \
-                 from. If the NIC still holds rules, `packetframe detach --all` after \
-                 stopping the daemon is what clears them — it reads each recorded \
-                 location back before deleting it"
-            )
-        });
+    if let Some(why) = refusal(driver.state(), req.want_steer) {
+        return Err(why);
     }
     runtime.retarget(req.targets.clone());
     // Beside the retarget, not the staged scope: the first-steer gate
@@ -1457,10 +1492,6 @@ fn run_loop(
     let _ = ready.send(Ok(()));
 
     while !shared.stop.load(Ordering::SeqCst) && !shared.preserve.load(Ordering::SeqCst) {
-        // Odd from here to the publish below: everything that can move
-        // the state lies between them. The breaks leave it odd, which is
-        // right — nothing after them publishes an ordinary snapshot.
-        shared.pass_seq.fetch_add(1, Ordering::SeqCst);
         // Steering changes first, before the tick. They are the
         // operator's, they are synchronous on the far side, and a tick
         // can take a while — a resync batch, a verify sample — so
@@ -1646,7 +1677,6 @@ fn run_loop(
         if episode_over {
             last_failures.clear();
         }
-        shared.pass_seq.fetch_add(1, Ordering::SeqCst);
 
         match tick.sleep {
             Some(d) if d.is_zero() => {} // more work queued; go again
@@ -1813,14 +1843,16 @@ fn run_loop(
 mod tests {
     use super::*;
 
-    /// An identical steering request is answered without the loop only
-    /// where `apply_steering` would have done nothing with it.
+    /// An identical steering request is answered without the loop exactly
+    /// where it would not act: nothing steered or wanted, or a state whose
+    /// admission rule would refuse it untouched.
     ///
-    /// Derived from `accepts_steering_changes()` rather than a list of
-    /// states, so a state that starts accepting steering changes starts
-    /// going to the loop without this test being edited.
+    /// Derived from the loop's own `refusal` rather than a list of states,
+    /// so a state that starts admitting a request starts going to the loop
+    /// without this test being edited — and the verdict cannot drift from
+    /// the rule it summarises.
     #[test]
-    fn a_resend_is_inert_only_where_apply_steering_would_do_nothing() {
+    fn a_resend_is_inert_exactly_where_the_loop_would_not_act() {
         // Exhaustive by construction: a new variant stops this compiling.
         let all = [
             State::Stopped,
@@ -1843,40 +1875,36 @@ mod tests {
             | State::AdoptedResyncing => (),
         };
         for state in all {
-            for settled in [true, false] {
-                // Nothing steered or wanted: inert both ways, in every
-                // state, even mid-pass — no pass can change it.
-                let rest = ResendVerdict::observe(state, false);
-                assert!(
-                    rest.inert(true, settled) && rest.inert(false, settled),
-                    "{state:?}"
-                );
+            // Nothing steered or wanted: inert both ways, in every state.
+            let rest = ResendVerdict::observe(state, false);
+            assert!(rest.inert(true) && rest.inert(false), "{state:?}");
 
-                let intended = ResendVerdict::observe(state, true);
-                // Where steering changes are accepted, a re-sent steer is
-                // the "ask now" retry and the drift repair: it must reach
-                // the loop. Elsewhere the loop would refuse it untouched —
-                // but only a settled snapshot can say the loop is still
-                // there.
+            // Something steered or wanted: a lever wherever the loop would
+            // admit it — the "ask now" retry and the drift repair for a
+            // steer, the rollback's retry for a removal — and inert where
+            // the loop would refuse it untouched.
+            let intended = ResendVerdict::observe(state, true);
+            for want_steer in [true, false] {
                 assert_eq!(
-                    intended.inert(true, settled),
-                    settled && !state.accepts_steering_changes(),
-                    "{state:?} settled={settled}"
+                    intended.inert(want_steer),
+                    refusal(state, want_steer).is_some(),
+                    "{state:?} want_steer={want_steer}"
                 );
-                // A removal with something steered or wanted always goes.
-                assert!(!intended.inert(false, settled), "{state:?}");
             }
         }
+        // The hardware case by name: a keep-VPP restart adopts a steered
+        // VPP, so the want is recorded and the state is AdoptedResyncing.
+        assert!(ResendVerdict::observe(State::AdoptedResyncing, true).inert(true));
         // And a snapshot nobody observed vouches for nothing.
         let unknown = ResendVerdict::default();
-        assert!(!unknown.inert(true, true) && !unknown.inert(false, true));
+        assert!(!unknown.inert(true) && !unknown.inert(false));
     }
 
-    fn published_with(resend: ResendVerdict) -> Published {
+    fn published_with(state: State, resend: ResendVerdict) -> Published {
         Published {
             report: HealthReport::healthy(),
             metrics: String::new(),
-            state: State::Verifying,
+            state,
             api_error: None,
             terminal: None,
             teardown_failures: Vec::new(),
@@ -1887,31 +1915,33 @@ mod tests {
         }
     }
 
-    /// The review finding's case: the snapshot says `Verifying` with a
-    /// want, but a pass is running — one that may be entering `Ready` and
-    /// attempting the steer right now. The snapshot is stale for exactly
-    /// the question asked, so the re-send goes to the loop. Between passes
-    /// the same snapshot is current, and it is answered here.
+    /// The service reads the verdict from its latest snapshot — and a loop
+    /// that is not running any more can act on nothing, so its frozen
+    /// `Steered` snapshot does not send a no-op reload to wait out the
+    /// budget in a slot nobody reads.
     #[test]
-    fn a_snapshot_a_pass_is_moving_past_does_not_vouch_for_a_refusal() {
-        let wanted = published_with(ResendVerdict::observe(State::Verifying, true));
-        let busy = SupervisionService::wedged_for_test(wanted.clone(), true);
-        assert!(!busy.resend_is_inert(true), "mid-pass: must ask the loop");
-        let idle = SupervisionService::wedged_for_test(wanted, false);
+    fn a_dead_loop_is_asked_for_nothing() {
+        let steered = published_with(State::Steered, ResendVerdict::observe(State::Steered, true));
+        let live = SupervisionService::wedged_for_test(steered.clone());
         assert!(
-            idle.resend_is_inert(true),
-            "settled: the loop would refuse it"
+            !live.resend_is_inert(true),
+            "live and steered: the repair lever"
         );
+        let _ = live.stop();
 
-        // Nothing steered or wanted holds mid-pass too — the fast-path-only
-        // reload during a long convergence tick, which is the whole point.
-        let rest = published_with(ResendVerdict::observe(State::Syncing, false));
-        let busy_at_rest = SupervisionService::wedged_for_test(rest, true);
-        assert!(busy_at_rest.resend_is_inert(true) && busy_at_rest.resend_is_inert(false));
-
-        for svc in [busy, idle, busy_at_rest] {
-            let _ = svc.stop();
-        }
+        let dead = SupervisionService {
+            shared: Arc::new(Shared {
+                stop: AtomicBool::new(false),
+                preserve: AtomicBool::new(false),
+                latest: Mutex::new(Some(steered)),
+                steering_request: Mutex::new(None),
+                steering_result: Mutex::new(None),
+                steering_seq: AtomicU64::new(0),
+            }),
+            thread: None,
+        };
+        assert!(!dead.is_alive());
+        assert!(dead.resend_is_inert(true) && dead.resend_is_inert(false));
     }
 
     /// A factory that FAILS is an attach failure carrying its own
