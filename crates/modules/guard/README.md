@@ -12,9 +12,14 @@ ntuple rules (RX only) and VPP (never carries kernel-originated frames)
 all miss it. The module is therefore needed whether or not traffic is
 offloaded elsewhere.
 
-**Status:** code-complete; the verifier accepts it on CI's 5.15 and 6.6
-kernels, and a netns test checks the rate limiter on a real egress hook.
-It has not yet been through the monitor→enforce ladder on hardware.
+**Status: experimental.** Code-complete, and not enabled in
+production. The verifier accepts it on CI's 5.15 and 6.6 kernels and a
+netns test checks the rate limiter on a real egress hook, but its
+verdict on the reference router's vendor 5.15 kernel is still open, and
+it has not been through the monitor→enforce ladder on hardware. It
+also cannot see frames VPP originates: under vpp-offload, VPP's ARP
+replies, glean ARP requests and neighbour solicitations, and MLD
+reports leave through the VF, not through kernel egress.
 
 ## Frame classes
 

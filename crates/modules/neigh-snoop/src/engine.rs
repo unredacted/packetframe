@@ -1462,7 +1462,7 @@ impl Engine {
         }
         self.publish_gate_input();
         self.publish_snapshot(now);
-        if self.ticks % STATS_EVERY_TICKS == 0 {
+        if self.ticks.is_multiple_of(STATS_EVERY_TICKS) {
             for b in &self.bridges {
                 let confirmed = b.counters.installs[InstallOutcome::Confirmed.index()]
                     + b.counters.seeds[SeedOutcome::Confirmed.index()];

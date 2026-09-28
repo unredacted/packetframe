@@ -517,7 +517,8 @@ mod linux {
             Err(e) => {
                 state.record(GateOutcome::Failed);
                 state.consecutive_failures += 1;
-                if state.consecutive_failures <= 3 || state.consecutive_failures % 20 == 0 {
+                if state.consecutive_failures <= 3 || state.consecutive_failures.is_multiple_of(20)
+                {
                     warn!(error = %e, failures = state.consecutive_failures, "next-hop gate reconcile failed");
                 } else {
                     debug!(error = %e, "next-hop gate reconcile failed");

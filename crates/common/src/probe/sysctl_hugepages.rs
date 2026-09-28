@@ -255,7 +255,7 @@ fn parse_meminfo(contents: &str) -> Result<(u64, u64), String> {
 fn fmt_bytes(bytes: u64) -> String {
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
-    if bytes >= GIB && bytes % GIB == 0 {
+    if bytes >= GIB && bytes.is_multiple_of(GIB) {
         format!("{} GiB", bytes / GIB)
     } else if bytes >= GIB {
         format!("{:.1} GiB", bytes as f64 / GIB as f64)

@@ -13,8 +13,9 @@ env:
   RUST_BACKTRACE: short
   # Pins for tools the Rust project itself publishes — GitHub runners
   # come with rustup pre-installed, so we manage toolchains and targets
-  # via direct `rustup` commands rather than a third-party action.
-  RUST_STABLE: "1.95.0"
+  # via direct `rustup` commands rather than a third-party action. The
+  # stable pin is not here: it lives only in rust-toolchain.toml and each
+  # job reads it via .github/actions/rust-stable-pin.
   RUST_NIGHTLY: "nightly-2026-04-14"
   # bpf-linker pin — bump via reviewed PR. SPEC.md §7.1 calls out pinning
   # the BPF toolchain tight because aya/bpf-linker versions move together.
@@ -32,6 +33,8 @@ jobs:
       PACKETFRAME_BPF_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/rust-stable-pin
 
       - name: Install Rust (stable + nightly for BPF)
         # `bpfel-unknown-none` is a tier-3 target with no prebuilt
@@ -193,6 +196,8 @@ jobs:
           - x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/rust-stable-pin
 
       - name: Install Rust (stable + target)
         run: |

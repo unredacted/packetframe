@@ -838,7 +838,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
 
     // Refuse startup when pins from a prior invocation survive.
     // SPEC.md §8.5 "exit without detach" leaves pins in bpffs after
-    // SIGTERM; v0.1 does not adopt those, operator must run
+    // SIGTERM; they are not adopted, so the operator must run
     // `packetframe detach --all` first. Full adoption (zero-disruption
     // restart) is deferred.
     if pin::has_existing_pins(ctx.bpffs_root) {
@@ -847,7 +847,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
             format!(
                 "existing pins under {} from a prior invocation, \
                  run `packetframe detach --all` before restarting \
-                 (v0.1 does not yet adopt in-place)",
+                 (pins from a prior invocation are not adopted in place)",
                 pin::module_root(ctx.bpffs_root).display()
             ),
         ));
@@ -3053,7 +3053,10 @@ fn populate_vlan_resolve(
                     warn!(
                         bridge = %bridge_name,
                         underlying = %phys_name,
-                        "mss-clamp `via {bridge_name}` will NOT match while the bridge                          egress short-circuit is installed (clamp matching keys on the                          resolved egress ifindex). Scope the clamp `via {phys_name}` or                          set `bridge-resolve off`."
+                        "mss-clamp `via {bridge_name}` will NOT match while the bridge \
+                         egress short-circuit is installed (clamp matching keys on the \
+                         resolved egress ifindex). Scope the clamp `via {phys_name}` or \
+                         set `bridge-resolve off`."
                     );
                 }
             }
