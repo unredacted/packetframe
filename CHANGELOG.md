@@ -7,9 +7,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The release workflow publishes the section for the tagged version as the
 GitHub release notes. It refuses a tag whose version disagrees with
 `VERSION` and the workspace `Cargo.toml`, or whose section is missing.
-A final (non-prerelease) tag's section must also be dated, not
-`UNRELEASED`. To cut a release, replace `UNRELEASED` with the date, then
-tag. Releases up to 0.2.7 predate this file; their
+Every section heading must be exactly `## [X.Y.Z] - YYYY-MM-DD` or
+`## [X.Y.Z] - UNRELEASED`. A final (non-prerelease) tag needs the dated
+form. To cut a release, replace `UNRELEASED` with the date, then push
+the tag. Only a pushed `v*` tag publishes; a manual workflow run is
+always a dry run. Releases up to 0.2.7 predate this file; their
 notes are on the [releases page](https://github.com/unredacted/packetframe/releases).
 
 ## [0.5.0] - UNRELEASED
@@ -69,8 +71,23 @@ deployment, steering IPv4 and IPv6 in both directions. See
   179, both directions) and DNS (TCP/UDP 53) are built-in keeps that
   never enter VPP.
 - `packetframe detach --keep-vpp` restarts the daemon while VPP keeps
-  forwarding. The next daemon adopts VPP from the route ledger preserved
-  at stop, so a restart stays steered with no unsteered window.
+  forwarding. When the stopping daemon preserves its route ledger, the
+  next daemon adopts VPP from that ledger with no FIB dump, and the
+  restart stays steered with no unsteered window.
+  - There is a fallback, the dump path. The next start reads VPP's FIB
+    instead, and traffic moves to the eBPF tier while it does. That
+    happens in three cases: the stopping daemon does not finish writing
+    the ledger within its 5 s budget (a slow or wedged supervision loop
+    at stop), the stopping binary predates the ledger (any upgrade from
+    a build without it), or the ledger no longer matches VPP. On the
+    reference router with a 1.1M-route table, the readback took about 3
+    minutes. Before the ledger existed it took longer.
+  - To see which path ran, run `packetframe events`. The
+    `ledger_preserved` event at stop shows `preserved=true` or `false`.
+    The `adoption_path` event at start shows `path=preserved-ledger`, or
+    `readback` / `readback-deferred` for the dump path. A
+    `preserved_ledger_rejected` event says why a ledger was not used.
+    The journal logs the same.
 - The health surface shows per-port rows in `packetframe status`, gauges
   in the metrics textfile, and remedies that name commands the module
   accepts.
