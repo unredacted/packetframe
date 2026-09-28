@@ -112,7 +112,7 @@ sha256sum -c SHA256SUMS --ignore-missing
 sudo apt-get install ./packetframe_${VERSION#v}_${ARCH}.deb
 ```
 
-Installs `/usr/bin/packetframe`, the systemd unit at `/lib/systemd/system/packetframe.service`, and an example config at `/etc/packetframe/example.conf`. The service is **not** auto-started, and with the shipped metadata (`enable = false`) the package carries no maintainer scripts, so nothing tells systemd about the unit: run `sudo systemctl daemon-reload` after every install or upgrade, or `systemctl start packetframe` can fail with "Unit packetframe.service not found" (or, on an upgrade, keep running the previous unit file). Copy the example to `/etc/packetframe/packetframe.conf`, edit per the [Quickstart](#quickstart), then `sudo systemctl daemon-reload && sudo systemctl enable --now packetframe`. Requires glibc ≥ 2.31 (Debian 11+ / Ubuntu 20.04+).
+Installs `/usr/bin/packetframe`, the systemd unit at `/lib/systemd/system/packetframe.service`, and an example config at `/etc/packetframe/example.conf`, plus the README, `CHANGELOG.md`, a pristine copy of the example config and the runbooks under `/usr/share/doc/packetframe/`. The service is **not** auto-started, and with the shipped metadata (`enable = false`) the package carries no maintainer scripts, so nothing tells systemd about the unit: run `sudo systemctl daemon-reload` after every install or upgrade, or `systemctl start packetframe` can fail with "Unit packetframe.service not found" (or, on an upgrade, keep running the previous unit file). Copy the example to `/etc/packetframe/packetframe.conf`, edit per the [Quickstart](#quickstart), then `sudo systemctl daemon-reload && sudo systemctl enable --now packetframe`. Requires glibc ≥ 2.31 (Debian 11+ / Ubuntu 20.04+).
 
 ### Tarball (any Linux)
 
@@ -130,6 +130,8 @@ tar xzf "packetframe-${VERSION}-${TARGET}.tar.gz"
 sudo install -m 0755 "packetframe-${VERSION}-${TARGET}/packetframe" /usr/local/bin/
 sudo install -m 0644 -D "packetframe-${VERSION}-${TARGET}/conf/example.conf" /etc/packetframe/example.conf
 ```
+
+The tarball also carries `README.md`, `CHANGELOG.md`, `VERSION` and the runbooks under `docs/runbooks/`.
 
 Optional GPG verification: download `SHA256SUMS.asc` and `gpg --verify SHA256SUMS.asc SHA256SUMS` (key ID in release notes).
 
