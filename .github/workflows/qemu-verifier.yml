@@ -116,25 +116,104 @@ jobs:
           sudo apt-get install -y qemu-system-x86 virtme-ng busybox-static
           virtme-ng --version || true
 
+      # The test kernel comes from Canonical's mainline archive
+      # (kernel.ubuntu.com), a single unmirrored host. It returned 503
+      # for ~40 minutes on 2026-09-28 and every qemu job failed before
+      # running a test, blocking merges. So the resolved .debs are
+      # cached per kernel series, and an exact cache hit never touches
+      # the host at all.
+      #
+      # Key = series + ISO week: the first run of each week re-reads
+      # the directory index (so selection still tracks the host), and
+      # restore-keys hand back an earlier week's pair as the fallback
+      # when that refresh fails. Caches saved on main are readable from
+      # every PR; a PR's own saves stay scoped to that PR.
+      - name: Compute kernel cache week
+        id: kernel-week
+        run: echo "week=$(date -u +%G-W%V)" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore cached kernel .debs
+        id: kernel-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/pf-qemu-kernel
+          key: ${{ runner.os }}-qemu-kernel-v1-${{ matrix.kernel_tag }}-${{ steps.kernel-week.outputs.week }}
+          restore-keys: |
+            ${{ runner.os }}-qemu-kernel-v1-${{ matrix.kernel_tag }}-
+
       - name: Fetch + install kernel + modules
+        id: kernel-fetch
+        env:
+          KERNEL_TAG: ${{ matrix.kernel_tag }}
+          CACHE_HIT: ${{ steps.kernel-cache.outputs.cache-hit }}
         run: |
           set -eux
-          BASE="https://kernel.ubuntu.com/mainline/${{ matrix.kernel_tag }}/amd64/"
-          IMG_DEB=$(curl -fsSL "${BASE}" \
-            | grep -oE 'linux-image-unsigned-[0-9][^"]*generic_[^"]*_amd64\.deb' \
-            | sort -u | head -1)
-          MOD_DEB=$(curl -fsSL "${BASE}" \
-            | grep -oE 'linux-modules-[0-9][^"]*generic_[^"]*_amd64\.deb' \
-            | sort -u | head -1)
-          test -n "${IMG_DEB}" && test -n "${MOD_DEB}"
-          curl -fsSL --retry 3 -o /tmp/kernel.deb "${BASE}${IMG_DEB}"
-          curl -fsSL --retry 3 -o /tmp/modules.deb "${BASE}${MOD_DEB}"
+          HOST="kernel.ubuntu.com"
+          BASE="https://${HOST}/mainline/${KERNEL_TAG}/amd64/"
+          # Holds exactly one coherent image+modules pair and is only
+          # ever replaced whole (promotion below), so a half-finished
+          # refresh can never pair a new image with stale modules.
+          CACHE_DIR="${HOME}/.cache/pf-qemu-kernel"
+          NEW_DIR="${RUNNER_TEMP}/pf-qemu-kernel.new"
+          mkdir -p "${CACHE_DIR}"
+          IMG_PAT='linux-image-unsigned-[0-9][^"]*generic_[^"]*_amd64\.deb'
+          MOD_PAT='linux-modules-[0-9][^"]*generic_[^"]*_amd64\.deb'
+          # --retry-all-errors: plain --retry skips some HTTP errors,
+          # and the index fetch used to have no retry at all.
+          CURL=(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20)
+
+          pick() { grep -oE "$1" | sort -u | head -1 || true; }
+          use_cached() {
+            IMG_DEB=$(ls "${CACHE_DIR}" | pick "${IMG_PAT}")
+            MOD_DEB=$(ls "${CACHE_DIR}" | pick "${MOD_PAT}")
+            [ -n "${IMG_DEB}" ] && [ -n "${MOD_DEB}" ]
+          }
+
+          FRESH=false
+          if [ "${CACHE_HIT}" = "true" ] && use_cached; then
+            echo "Exact cache hit for ${KERNEL_TAG} this week; not contacting ${HOST}"
+          else
+            IMG_DEB=""; MOD_DEB=""
+            # Same selection as before caching existed: first sorted
+            # match of each pattern in the directory index.
+            if INDEX=$("${CURL[@]}" --max-time 60 "${BASE}"); then
+              IMG_DEB=$(printf '%s' "${INDEX}" | pick "${IMG_PAT}")
+              MOD_DEB=$(printf '%s' "${INDEX}" | pick "${MOD_PAT}")
+            fi
+            if [ -n "${IMG_DEB}" ] && [ -n "${MOD_DEB}" ]; then
+              rm -rf "${NEW_DIR}"; mkdir -p "${NEW_DIR}"
+              ok=true
+              for deb in "${IMG_DEB}" "${MOD_DEB}"; do
+                if [ -s "${CACHE_DIR}/${deb}" ]; then
+                  # An earlier week's restore already holds this file.
+                  cp "${CACHE_DIR}/${deb}" "${NEW_DIR}/${deb}"
+                elif ! "${CURL[@]}" -o "${NEW_DIR}/${deb}" "${BASE}${deb}" \
+                    || ! dpkg-deb --info "${NEW_DIR}/${deb}" >/dev/null; then
+                  ok=false
+                fi
+              done
+              if [ "${ok}" = true ]; then
+                rm -rf "${CACHE_DIR}"
+                mv "${NEW_DIR}" "${CACHE_DIR}"
+                FRESH=true
+              fi
+            fi
+            if [ "${FRESH}" != true ]; then
+              if use_cached; then
+                echo "::warning::${HOST} unreachable for ${KERNEL_TAG} after retries; using cached ${IMG_DEB} + ${MOD_DEB} from an earlier week"
+              else
+                echo "::error::Could not fetch the ${KERNEL_TAG} test kernel from ${HOST} (${BASE}) after retries, and no cached copy exists to fall back on. Re-run once ${HOST} is reachable."
+                exit 1
+              fi
+            fi
+          fi
+          echo "fresh=${FRESH}" >> "${GITHUB_OUTPUT}"
           # Stage then cp (direct dpkg-deb -x to / clobbered /lib perms
           # on a previous iteration — see commit history).
           sudo rm -rf /tmp/kstage
           sudo mkdir -p /tmp/kstage
-          sudo dpkg-deb -x /tmp/kernel.deb /tmp/kstage
-          sudo dpkg-deb -x /tmp/modules.deb /tmp/kstage
+          sudo dpkg-deb -x "${CACHE_DIR}/${IMG_DEB}" /tmp/kstage
+          sudo dpkg-deb -x "${CACHE_DIR}/${MOD_DEB}" /tmp/kstage
           sudo cp -a /tmp/kstage/boot/. /boot/
           sudo cp -a /tmp/kstage/lib/modules/. /lib/modules/
           KVER=$(ls /tmp/kstage/lib/modules/ | grep -- '-generic$' | tail -1)
@@ -149,6 +228,17 @@ jobs:
           test -e /lib/x86_64-linux-gnu/libm.so.6
           echo "KVER=${KVER}" >> "${GITHUB_ENV}"
           echo "KERNEL_IMG=/boot/vmlinuz-${KVER}" >> "${GITHUB_ENV}"
+
+      # Saved right away rather than in a post-step, so a later test
+      # failure still keeps the fresh pair. Only a fresh fetch is
+      # saved: a stale fallback must not claim this week's key, or the
+      # rest of the week would skip the refresh.
+      - name: Save kernel .debs to cache
+        if: steps.kernel-fetch.outputs.fresh == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/pf-qemu-kernel
+          key: ${{ steps.kernel-cache.outputs.cache-primary-key }}
 
       - name: Build integration tests
         run: |
