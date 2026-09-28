@@ -42,10 +42,12 @@ running badly.
 > FRR over iBGP to the AnyIP listener, attested by
 > `integrity-authority frr`.
 >
-> **What that does not settle.** Whether a UniFi provisioning push can
-> wipe MCAM rules has not been established either way; the 30 s
-> readback audit (below) reports a wiped or altered rule as `steering
-> DEGRADED`, which is the signal to watch after one. And a first attach
+> **What that does not settle.** MCAM rules have been observed
+> surviving one UniFi provisioning push, on a lab box on one firmware;
+> survival across firmware versions is untested. Nothing re-asserts
+> wiped rules automatically: the 30 s readback audit (below) reports a
+> wiped or altered rule as `steering DEGRADED`, and a plain `packetframe
+> reconfigure` while `Steered` re-installs them. And a first attach
 > still never steers: every port moves only when you move its lever,
 > so a fresh box starts at rung 0 like the reference one did.
 >
@@ -784,10 +786,15 @@ iBGP refill is ~2 minutes), then briefly `resyncing the FIB the previous
 process verified and preserved (N routes installed) ...` while the diff
 lands, then healthy. `packetframe_vpp_state` stays at
 `adopted_resyncing` → `verifying` → `ready`/`steered` with steering never
-dropping. **Expected cost of a keep-vpp restart: zero unsteered time and
-no dump.** This is from the design and the host-CI fakes — the hardware
-number is owed: measure it on the rig first, then the shadow, and put it
-in the numbers table.
+dropping. **Measured cost of a keep-vpp restart: zero unsteered time and
+no dump.** First measured on the reference router on 2026-09-27 with a
+~1.09M-route table, and repeated since with IPv4 + IPv6 (~1.34M routes)
+and the hand-back path in place: the new daemon adopted VPP's FIB from
+the preserved ledger without a dump, and an external probe through VPP
+lost 1 of 420 packets across the restart — that one to fast-path's link
+bounce, not to VPP. The fallback below (no preserved ledger: the stopping
+daemon did not write one, or predates it) measured ~3 minutes
+unsteered.
 
 **Every fallback is today's dump path, never a failed attach.** Each is
 logged with its reason (`preserved route ledger not used: ...` /
@@ -2275,7 +2282,7 @@ steering  DEGRADED — 1 steering rule(s) this target asks for are missing
                      from the NIC, no longer match what was asked for, or
                      were never installed — that traffic is on the eBPF
                      tier. Something changed them out of band (a UniFi
-                     provisioning push does this), or the allowlist grew
+                     provisioning push can do this), or the allowlist grew
                      while the inherited rules stayed as they were;
                      `packetframe reconfigure` re-applies steering, and
                      reports its own reason if it refuses — a table too
@@ -2641,9 +2648,10 @@ unsteered — that still needs the lever.) Verified 2026-08-11: 3 rules →
 4, exit 0.
 
 **Run it after every UniFi provisioning push while a port is steered**,
-and check the count afterwards. A push on 2026-08-11 did not disturb the
-VF, hugepages or VPP — but it reconfigured a different interface, so it
-never tested this path.
+and check the count afterwards. The rules have been observed surviving
+one provisioning push on a lab box on one firmware; survival across
+firmware versions is untested, and nothing re-installs wiped rules
+automatically — this reconfigure is the re-assert.
 
 ### A verified FIB is not a complete one
 
@@ -2799,9 +2807,10 @@ classes).
 Check the NIC's ledger against ours. Ours is
 `vpp-offload.json:steer_rules`; the NIC's is `ethtool -n <iface>`. If
 the NIC has no rules but we believe we are steering, the UniFi
-controller has wiped classifier state — a provisioning push does this.
-The supervisor re-asserts on every `Ready`, so a `packetframe
-reconfigure` (or the next verify) restores them.
+controller has wiped classifier state — a provisioning push can do
+this. Nothing re-asserts them automatically in steady state (verify does
+not re-run there); a plain `packetframe reconfigure` while `Steered`
+re-installs them.
 
 If the NIC *has* the rules and traffic still is not arriving, suspect
 `ring_cookie`. It must be `(vf + 1) << 32`; `ethtool`'s own `vf N`
@@ -3151,7 +3160,8 @@ Be precise about this when reasoning about an incident.
 | ntuple `loc` space | **16 per port** (0..=15) at the driver default; up to 256 with `steer-capacity` | measured on the shadow's eth1 2026-08-05, by insert-and-read-back; the default is the driver's `mcam_count`, raised and re-measured on the rig 2026-09-24 (`loc 40` refused at 16, accepted at 256). |
 | NPC MCAM block | 2048 entries, ~1689 free, 31 allocated per PF | from `npc/mcam_info`. **This is not the `loc` space** and must never be used to size one — doing so is what produced `base: 1024`, an out-of-range slot that failed the first steer this module ever attempted. |
 | First steer | **4 rules installed and readback-verified** | 2026-08-06, shadow eth1, locs 15/14/13/12, src+dst × 2 prefixes → VF 0. Installation only: eth1 carries the interconnect, so zero packets match. |
-| Steered-idle soak | **5 h 17 m**, rules intact, no restarts | 2026-08-06 overnight. Proves nothing wiped them; does **not** prove they survive a UniFi provisioning push — the re-assert path is still untested. |
+| Steered-idle soak | **5 h 17 m**, rules intact, no restarts | 2026-08-06 overnight. Proves nothing wiped them. Survival of one UniFi provisioning push was observed later, on a lab box on one firmware; untested across firmware. |
+| keep-vpp restart with a preserved ledger | **zero unsteered time, no dump**; external probe through VPP lost 1/420 (fast-path's link bounce) | reference router, first 2026-09-27 at ~1.09M routes, repeated at IPv4+IPv6 ~1.34M with the hand-back path. The fallback (no preserved ledger) measured ~3 min unsteered. |
 | Drill (a) kill -9 under load | teardown **325 ms**, recovery **40.7 s** | 2026-08-08, 500 pps constant-rate flow. The 50 ms teardown target was missed and is documented as a bound; recovery ≤ 90 s holds with margin. |
 | Drill (b) route change while down | **PASS** | the changed route was present in VPP before steering resumed. |
 | Drill (c) SIGSTOP wedge | detected in **1.81 s** (target ≤ 2 s) | 2026-08-08, ping-interval-bounded as designed. |

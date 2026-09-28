@@ -1894,7 +1894,7 @@ impl StatusSnapshot {
                 "{} steering rule(s) this target asks for are missing from the NIC, no \
                  longer match what was asked for, or were never installed — that traffic \
                  is on the eBPF tier. Something changed them out of band (a UniFi \
-                 provisioning push does this), or the allowlist grew while the inherited \
+                 provisioning push can do this), or the allowlist grew while the inherited \
                  rules stayed as they were; {remedy}",
                 self.steer_missing
             ));
