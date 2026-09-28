@@ -846,10 +846,12 @@ fn parent_of(path: &Path) -> &Path {
 
 /// The log's directory, and every file operation the log does in it.
 ///
-/// On Linux, a descriptor from [`crate::statefile`]'s no-follow walk,
+/// On Linux, a descriptor from [`crate::statefile::open_dir_trusted_links`],
 /// with every open relative to it and `O_NOFOLLOW` on the final
 /// component: the daemon is root and `state-dir` may be writable by
-/// others, so a symlink anywhere in the path is refused, never followed.
+/// others, so a symlink in the path is refused unless only root could
+/// have made it (an appliance's persistent-storage link), and a symlink
+/// at the file itself — or at `.1` / `.tmp` — is never followed.
 /// Elsewhere (the macOS dev loop, where no daemon runs) plain paths.
 struct LogDir {
     #[cfg(target_os = "linux")]
@@ -861,11 +863,7 @@ struct LogDir {
 #[cfg(target_os = "linux")]
 impl LogDir {
     fn open(path: &Path, create: bool) -> std::io::Result<Self> {
-        let fd = if create {
-            crate::statefile::create_and_open_dir_no_follow(path)?
-        } else {
-            crate::statefile::open_dir_no_follow(path)?
-        };
+        let fd = crate::statefile::open_dir_trusted_links(path, create, "event-log")?;
         Ok(Self { fd })
     }
 
@@ -1769,5 +1767,66 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"precious\n");
         assert!(log.status().last_error.is_some());
         log.shutdown();
+    }
+
+    /// `dir/persist -> dir/real`, in a directory group and others cannot
+    /// write: the shape of an appliance's persistent-storage link.
+    #[cfg(target_os = "linux")]
+    fn persist_link(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tmpdir(tag);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real = dir.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let persist = dir.join("persist");
+        std::os::unix::fs::symlink(&real, &persist).unwrap();
+        (dir, real, persist)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_log_under_a_trusted_symlinked_directory_writes_rotates_and_reads() {
+        let (_dir, real, persist) = persist_link("trusted-link");
+        let path = persist.join("packetframe/events.log");
+        let max = 2048;
+        let log = EventLog::start_with(Options {
+            capacity: 1024,
+            ..opts(path.clone(), max)
+        });
+        let n = 100u64;
+        for i in 0..n {
+            log.emit(
+                Event::info("vpp-offload", kind::VERIFY_PASSED)
+                    .field("i", i)
+                    .detail("sampled routes agree with the route source"),
+            );
+        }
+        assert!(log.flush());
+        assert_eq!(log.status().last_error, None);
+        assert_eq!(log.status().written, n);
+        let written = real.join("packetframe/events.log");
+        assert!(written.is_file(), "the file is in the link's target");
+        assert!(rotated_path(&written).is_file(), "and so is `.1`");
+        // The reader follows the same link and sees the newest events.
+        let got = lines(&path);
+        assert_eq!(got.last().unwrap().fields["i"].as_u64(), Some(n - 1));
+        log.shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlink_at_the_file_is_refused_inside_a_followed_directory() {
+        for leaf in ["events.log", "events.log.1"] {
+            let (_dir, real, persist) = persist_link(&format!("leaf-{leaf}"));
+            let victim = real.join("victim");
+            std::fs::write(&victim, b"precious\n").unwrap();
+            std::os::unix::fs::symlink(&victim, real.join(leaf)).unwrap();
+            let log = EventLog::start_with(opts(persist.join("events.log"), DEFAULT_MAX_BYTES));
+            log.emit(Event::info("daemon", kind::PROCESS_START));
+            assert!(log.flush());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"precious\n", "{leaf}");
+            assert!(log.status().last_error.is_some(), "{leaf}");
+            log.shutdown();
+        }
     }
 }
