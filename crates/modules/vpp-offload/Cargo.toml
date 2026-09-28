@@ -1,8 +1,10 @@
 [package]
 name = "packetframe-vpp-offload"
-version = "0.2.7"
-edition = "2021"
-license = "GPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "PacketFrame vpp-offload module: VPP-on-VF forwarding vector orchestrator (phase 4)"
 
 [dependencies]
