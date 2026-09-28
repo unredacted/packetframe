@@ -1375,7 +1375,7 @@ impl NetlinkNeighborResolver {
                 // overflow` warnings. 500/s is comfortably under the
                 // default `gc_thresh3` (1024) replenishment rate and
                 // matches typical NIC ARP-handling capacity.
-                if probed % 50 == 0 {
+                if probed.is_multiple_of(50) {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }

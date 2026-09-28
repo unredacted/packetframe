@@ -902,7 +902,7 @@ pub fn insert_vlan_tag(base: &[u8], vid: u16) -> Vec<u8> {
 impl Ipv4TcpBuilder {
     pub fn build(&self) -> Vec<u8> {
         assert!(
-            self.tcp_options.len() % 4 == 0 && self.tcp_options.len() <= 40,
+            self.tcp_options.len().is_multiple_of(4) && self.tcp_options.len() <= 40,
             "tcp_options must be 4-byte padded and fit the doff field"
         );
         let ip_header_len = (self.ihl as usize) * 4;
@@ -1042,7 +1042,7 @@ impl Ipv6TcpBuilder {
 fn ipv4_checksum(header: &[u8]) -> u16 {
     assert_eq!(header.len() % 2, 0, "header must be even-length");
     let mut sum: u32 = 0;
-    for chunk in header.chunks_exact(2) {
+    for chunk in header.as_chunks::<2>().0 {
         // Skip the checksum field (bytes 10-11 of a standard IPv4 header).
         sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
     }

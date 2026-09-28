@@ -72,7 +72,7 @@ pub fn parse_nexthop_payload(payload: &[u8]) -> Option<NexthopObj> {
             }
             NHA_GROUP => {
                 // struct nexthop_grp { id: u32, weight: u8, resvd1: u8, resvd2: u16 }
-                for chunk in data.chunks_exact(8) {
+                for chunk in data.as_chunks::<8>().0 {
                     obj.group
                         .push(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                 }
