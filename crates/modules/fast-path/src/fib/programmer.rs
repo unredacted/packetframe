@@ -1192,7 +1192,8 @@ impl FibProgrammer {
             self.cache_enabled = prev;
             warn!(
                 requested = on,
-                "fib-cache toggle NOT applied (map write failed); kernel state                  unchanged, will retry on next reconcile"
+                "fib-cache toggle NOT applied (map write failed); kernel state \
+                 unchanged, will retry on next reconcile"
             );
         }
     }

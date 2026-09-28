@@ -580,8 +580,8 @@ pub enum ModuleDirective {
     /// force — an unprovable topology stays on the kernel path);
     /// `Off` disables installation and is the SIGHUP-able rollback.
     BridgeResolve(ToggleAutoOnOff),
-    /// `fdb-pin auto|on|off` — FDB-pinned direct-to-port egress
-    /// (v0.2.9). Extends the bridge egress short-circuit one hop
+    /// `fdb-pin auto|on|off` — FDB-pinned direct-to-port egress.
+    /// Extends the bridge egress short-circuit one hop
     /// further: when a short-circuited chain's underlying device is
     /// itself a multi-member bridge (`br1337` → `switch0.1337` →
     /// `switch0` over `eth0/4/5`), the NeighborResolver consults
@@ -591,9 +591,10 @@ pub enum ModuleDirective {
     /// AF_PACKET tap walk) entirely. Pins invalidate live on AF_BRIDGE
     /// FDB events (MAC move, age-out) and fall back to the bridge
     /// path whenever the FDB has no answer. Requires `bridge-resolve`
-    /// active (the pin extends that proof); no-op otherwise. `Auto`
-    /// (default) = pin wherever provable; `On` = synonym for `Auto`;
-    /// `Off` = never pin. **Restart-only** (attach-time-bound, like
+    /// active (the pin extends that proof); no-op otherwise. **Default
+    /// off**, unlike `bridge-resolve`: `Auto` (the default) means off,
+    /// only `On` arms it, `Off` = never pin (see `fdb_pin_enabled` in
+    /// fast-path's `linux_impl`). **Restart-only** (attach-time-bound, like
     /// `local-prefix`): the chain snapshot and the FDB subscription
     /// live in the resolver, which is constructed at attach. Editing
     /// this directive and reloading leaves the running state
@@ -5455,7 +5456,7 @@ fn parse_circuit_breaker<'a>(
         "rx" => {
             return Err(ConfigError::parse(
                 line,
-                "circuit-breaker: `of rx` is reserved for future modules and not accepted in v0.0.1 (use `of matched`, see SPEC.md §4.9)",
+                "circuit-breaker: `of rx` is reserved for future modules and not accepted (use `of matched`, see SPEC.md §4.9)",
             ));
         }
         other => {

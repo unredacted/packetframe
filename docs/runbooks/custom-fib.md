@@ -38,10 +38,12 @@ how to roll back to the kernel-FIB path if something goes wrong.
              XDP_REDIRECT / XDP_PASS
 ```
 
-- **BgpListener** (the recommended forwarding feed) accepts bird's
-  iBGP session. Bird's `protocol bgp` export filter runs after
-  best-path selection, so we get exactly one UPDATE per prefix
-  with bird's chosen nexthop. Translated to
+- **BgpListener** (the recommended forwarding feed) accepts the
+  routing daemon's iBGP session — FRR on the reference router,
+  through a phantom AnyIP listen address (see "Feeding from FRR
+  instead of bird"), or bird over loopback. The daemon's export
+  policy runs after best-path selection, so we get exactly one
+  UPDATE per prefix with its chosen nexthop. Translated to
   `RouteEvent::Add`/`Del`. **BmpStation** is also available behind
   the `RouteSource` trait but bird's BMP doesn't ship RFC 9069
   Loc-RIB. See the section "When to use `route-source bmp`
@@ -116,9 +118,11 @@ For the recommended iBGP feed:
 
 ```sh
 ss -Htnp state established "( sport = :1179 )" 2>&1
-# Expect one line: bird ↔ packetframe on the BGP listener port.
-birdc show protocols packetframe
+# Expect one line: the routing daemon ↔ packetframe on the BGP listener port.
+birdc show protocols packetframe                    # bird feed
 # State should be "Established" with a non-zero "Routes:" count.
+vtysh -c 'show bgp neighbor 192.0.2.202'            # FRR feed (the AnyIP address)
+# "BGP state = Established", and prefixes sent in the address-family blocks.
 ```
 
 For BMP (FRR or future bird with Loc-RIB):
@@ -194,8 +198,9 @@ integrity-authority frr upstream 192.0.2.1 families v4 upstream 2001:db8::1 fami
 ```
 
 `none` was the only honest answer before this variant existed — a
-`birdc` that is not installed fails blind every 300 s — and it is still
-what the fleet's configs say. It is also refused alongside
+`birdc` that is not installed fails blind every 300 s. The reference
+router now runs `integrity-authority frr`; a config still saying `none`
+on an FRR box should move to it. `none` is also refused alongside
 `require-table-complete on`, because a gate waiting on an attestation
 nothing produces defers a first steer forever.
 
@@ -1082,7 +1087,7 @@ Reload + restart the units after dropping these files:
 sudo systemctl daemon-reload
 sudo systemctl restart bird
 # If packetframe was already running attached, a plain restart will
-# crash-loop on its own surviving pins (v0.1 has no pin adoption):
+# crash-loop on its own surviving pins (pins are never adopted in place):
 sudo systemctl stop packetframe && sudo packetframe detach --all && sudo systemctl start packetframe
 ```
 

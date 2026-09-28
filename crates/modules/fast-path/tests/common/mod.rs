@@ -76,7 +76,8 @@ pub const STATS_COUNT: u32 = 51;
 /// to 46 and watching it fail.
 const _: () = assert!(
     STATS_COUNT as usize == packetframe_fast_path::metrics::COUNTER_COUNT,
-    "STATS_COUNT must equal metrics::COUNTER_COUNT — append to both, or the      harness types a map value size the BPF program did not write"
+    "STATS_COUNT must equal metrics::COUNTER_COUNT — append to both, or the \
+     harness types a map value size the BPF program did not write"
 );
 
 /// `RX_MACS` key: the library's mirror of `RxMacKey` in

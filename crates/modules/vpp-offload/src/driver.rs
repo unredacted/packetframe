@@ -1574,7 +1574,9 @@ mod tests {
         assert_ne!(
             t.sleep,
             Some(Duration::ZERO),
-            "a failed drain must not ask to be called again immediately — the              next attempt fails on a dropped socket without doing any I/O, so              that is a pegged core"
+            "a failed drain must not ask to be called again immediately — the \
+             next attempt fails on a dropped socket without doing any I/O, so \
+             that is a pegged core"
         );
 
         // And the next tick tries to reconnect, which is the only way the
@@ -1582,7 +1584,8 @@ mod tests {
         let _ = d.tick(at(t0, 200), &mut w, &mut fx);
         assert!(
             w.api_readies > readies_before,
-            "nothing attempted to reconnect, so the transport is stranded and              every later drain fails instantly on NotConnected"
+            "nothing attempted to reconnect, so the transport is stranded and \
+             every later drain fails instantly on NotConnected"
         );
     }
 

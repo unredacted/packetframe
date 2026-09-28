@@ -12,11 +12,13 @@ hugepages, VFs and vfio bindings, renders VPP's `startup.conf`, runs
 and supervises VPP, programs VPP's FIB over the binary API, and owns
 the steering rules.
 
-**Status:** has forwarded production traffic on one steered port, at
-the first rung of the canary ladder. It is not deployed in production
-today. Before enabling it anywhere, read the opening section of the
-[runbook](../../../docs/runbooks/vpp-offload.md), which records exactly
-what has and has not been proven on hardware.
+**Status:** production. On the reference router it carries IPv4 and
+IPv6, in both directions, on four steered ports, and `detach
+--keep-vpp` restarts stay steered through them. A first attach never
+steers: each port moves only when an operator moves its lever. Before
+enabling it anywhere, read the opening section of the
+[runbook](../../../docs/runbooks/vpp-offload.md) and walk its canary
+ladder.
 
 ## How it works
 
@@ -82,15 +84,22 @@ module vpp-offload
   steered into VPP and blackholed. The `packetframe_vpp_exempt_drift`
   gauge reports kernel paths that are missing an exemption; it does not
   add them.
-- `local-route`, `steer-direction`, `require-table-complete` and
-  `vpp-binary` cover delivery to local prefixes, which side of a flow
-  is steered, the wait for a converged table, and the binary path.
+- `local-route` / `local-route6`, `steer-direction`,
+  `require-table-complete` and `vpp-binary` cover delivery to local
+  prefixes, which side of a flow is steered, the wait for a converged
+  table, and the binary path.
+- `v6 on` carries the IPv6 table in VPP. `v6-divert <vid>,…|untagged`
+  on a `port` line then steers IPv6 by frame (below), `steer-keep6`
+  keeps IPv6 services on the kernel, and `drift-accept6` acknowledges
+  an IPv6 drift finding that has been examined.
 
-**Reloads.** Only `steer` (and `steer-exempt` / `steer-direction`)
-change under a running VPP: a SIGHUP applies them as an MCAM delta,
-with no VPP restart and no resync. Everything else is fixed when VPP
-starts, and `reconfigure` refuses it by name. All ports as members with
-steering off is the safe staging state and where every rollback ends.
+**Reloads.** The steering inputs — `steer`, `direction` /
+`steer-direction`, `steer-exempt`, `v6-divert`, `steer-keep6` — and
+`drift-accept6` change under a running VPP: a SIGHUP applies them as an
+MCAM delta (or, for `drift-accept6`, at the next scan), with no VPP
+restart and no resync. Everything else is fixed when VPP starts, and
+`reconfigure` refuses it by name. All ports as members with steering
+off is the safe staging state and where every rollback ends.
 
 The rule budget is small. On the Marvell NIC this was built for, the
 ntuple table holds **16 rules per port**. Each steered IPv4 prefix costs
@@ -98,11 +107,25 @@ one rule per direction, two go to built-in broadcast/multicast
 exemptions, and each `steer-exempt` costs one more. An allowlist that
 does not fit is refused as a whole rather than half-steered.
 `packetframe feasibility` reads the real free count from the NIC and
-reports it as `vpp.steering.budget`. That NIC cannot match IPv6 ntuple
-rules, so IPv6 stays on the XDP path. `v6 on` loads the IPv6 table
-into VPP without steering any of it — rung 0 of the IPv6 offload, which
-will steer TCP and UDP by MAC and VLAN rather than by v6 prefix (runbook,
-"Rung 0 for IPv6").
+reports it as `vpp.steering.budget`. `steer-capacity` asks the driver
+for a bigger table (up to 256).
+
+That NIC cannot match an IPv6 address, so IPv6 is steered by frame
+rather than by prefix. `v6 on` loads the IPv6 table into VPP; a
+`v6-divert` port then sends TCP and UDP over IPv6 addressed to the
+router's MAC on the listed VLANs (or untagged) to the VF, two rules per
+VLAN and receive MAC. ICMPv6 is never diverted, so neighbour discovery
+stays with the kernel. Four built-in keeps cost four more rules: TCP
+and UDP to destination port 53 (the router's resolver) and TCP 179 in
+both directions (destination and source, so BGP never enters VPP).
+DNS replies toward the router (source port 53) are diverted and come
+back over the hand-back path. Each `steer-keep6` adds one rule, or two
+with `both` (a `dst` and a `src` rule). The
+router's own IPv6 that arrives on a diverted frame is handed back to
+the kernel over a veth (`pfpunt0`, opened by VPP as an af_packet host
+interface) through a stateless ACL in VPP that admits only replies to
+sessions the router opened; no kernel firewall rule is involved. See
+the runbook's "v6-divert steering".
 
 All of it is documented inline in
 [`conf/example.conf`](../../../conf/example.conf).
@@ -111,7 +134,10 @@ All of it is documented inline in
 
 `packetframe status` shows five health rows: `vpp-process`, `api-ping`,
 `fib-synced`, `steering` and `ports`. `route-feed` and `state-file`
-appear only when they fail. Overall health tracks whether packets are
+appear only when they fail, and the drift rows (`fdb`, `exempt-drift`,
+`exempt-drift-v6`) only with findings. `v6 on` adds `fib-v6`, and IPv6
+diversion adds `v6-handback` (plus `icmp6-source` while no
+`loopback-address6` is set). Overall health tracks whether packets are
 being forwarded correctly. A crash-looping VPP with nothing steered is
 `Degraded`, because the eBPF path is carrying the traffic, while a
 steered VPP that cannot forward is `Unhealthy`.
