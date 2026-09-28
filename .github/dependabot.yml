@@ -2,7 +2,7 @@ version: 2
 
 # SPEC.md §7.1 requires version drifts to surface as reviewable PRs
 # rather than silent ecosystem movement. Dependabot covers the workspace
-# cargo graph, the non-workspace BPF cargo graph, the stable Rust
+# cargo graph, the non-workspace BPF cargo graphs, the stable Rust
 # toolchain pin, and the github-actions used by CI.
 updates:
   - package-ecosystem: "cargo"
@@ -35,11 +35,29 @@ updates:
       - dependency-name: "aya"
         update-types: ["version-update:semver-major"]
 
+  # Each BPF crate is its own non-workspace cargo graph (own Cargo.lock,
+  # own nightly rust-toolchain.toml), so the root entry never sees them.
+  # They are listed explicitly rather than globbed so a new BPF crate is
+  # a deliberate addition here, not a silent one.
   - package-ecosystem: "cargo"
-    directory: "/crates/modules/fast-path/bpf"
+    directories:
+      - "/crates/modules/fast-path/bpf"
+      - "/crates/modules/guard/bpf"
+      - "/crates/modules/probe/bpf"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 3
+    groups:
+      # All three BPF crates build on one nightly + bpf-linker pin, and
+      # aya-ebpf is what that pin has to satisfy. group-by merges each aya
+      # bump into one PR across every directory above, instead of one PR
+      # per crate that could land with the others left behind.
+      # network-types and anything else still go per crate.
+      bpf-aya:
+        group-by: dependency-name
+        update-types: ["patch", "minor", "major"]
+        patterns:
+          - "aya*"
 
   # The stable Rust pin. The cargo ecosystem never reads
   # rust-toolchain.toml, which is why the pin sat on 1.95.0 while stable
