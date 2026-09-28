@@ -30,7 +30,7 @@ pub enum ModuleError {
     #[error("module `{module}`: {message}")]
     Other { module: String, message: String },
 
-    #[error("module `{module}`: not implemented in v0.0.1")]
+    #[error("module `{module}`: not implemented on this platform (Linux only)")]
     NotImplemented { module: String },
 }
 

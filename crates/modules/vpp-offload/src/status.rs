@@ -1613,7 +1613,7 @@ impl StatusSnapshot {
             let cost = match &diverted {
                 None => "No IPv6 is steered, so nothing is dropped".to_string(),
                 Some(on) => format!(
-                    "Outbound IPv6 is diverted into VPP on {on}, so a diverted packet whose \
+                    "IPv6 is diverted into VPP on {on}, so a diverted packet whose \
                      prefix is withheld, unresolvable, refused or left out follows a less \
                      specific VPP route or is dropped (`exempt-drift-v6` names the kernel \
                      paths VPP cannot take)"
@@ -1640,7 +1640,7 @@ impl StatusSnapshot {
                 Some(on) => (
                     HealthState::Degraded,
                     format!(
-                        "no IPv6 routes in VPP yet ({} in flight) while outbound IPv6 is \
+                        "no IPv6 routes in VPP yet ({} in flight) while IPv6 is \
                          diverted into VPP on {on}: every diverted IPv6 packet is dropped \
                          until the table loads. Drop `v6-divert` (or set the port `steer \
                          off`) and `packetframe reconfigure` to put it back on the eBPF \
@@ -1655,8 +1655,7 @@ impl StatusSnapshot {
                 match &diverted {
                     None => format!("{} IPv6 routes loaded in VPP, not steered", v6.installed),
                     Some(on) => format!(
-                        "{} IPv6 routes loaded in VPP; outbound IPv6 is diverted into VPP \
-                         on {on}",
+                        "{} IPv6 routes loaded in VPP; IPv6 is diverted into VPP on {on}",
                         v6.installed
                     ),
                 },

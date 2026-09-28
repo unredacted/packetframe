@@ -213,7 +213,7 @@ pub enum StatIdx {
     /// the global-generation invalidation; sustained Miss means the
     /// working set outsizes the table (or collisions dominate).
     FibCacheStale = 44,
-    // --- v0.2.9: per-hook parse-error attribution. Append-only. -----
+    // --- Per-hook parse-error attribution. Append-only. -------------
     /// `tc_fast_path` parse failure (bumped IN ADDITION to `ErrParse`,
     /// which both datapaths share) — the `RxTotalTc`/`FwdOkTc` pattern
     /// applied to the error path. Exists because the 2026-08-01
@@ -222,7 +222,7 @@ pub enum StatIdx {
     /// excess unattributable without flipping datapaths. During any
     /// mixed rollout, `err_parse - err_parse_tc` is the XDP share.
     ErrParseTc = 45,
-    // --- v0.2.10: which bounds check produced `ErrParseTc`. Append-only.
+    // --- Which bounds check produced `ErrParseTc`. Append-only.
     //
     // All four producers are the same statement — the bytes I need are
     // not in front of me — and under `cls_bpf` that does NOT mean a

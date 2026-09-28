@@ -1479,14 +1479,19 @@ impl Module for VppOffloadModule {
         if self.teardown_pending.is_some() {
             return Err(ModuleError::other(
                 MODULE_NAME,
-                "a previous teardown is still running in the background (it kills VPP and                  releases its VF); attaching now would race it. Wait for it to settle —                  `health_check` reports when it has — and retry.",
+                "a previous teardown is still running in the background (it kills VPP and \
+                 releases its VF); attaching now would race it. Wait for it to settle — \
+                 `health_check` reports when it has — and retry.",
             ));
         }
         if let Some(why) = &self.teardown_failure {
             return Err(ModuleError::other(
                 MODULE_NAME,
                 format!(
-                    "a previous teardown did not complete, so its resources may still be                      held: {why}. Resolve that first (`packetframe detach --all` once VPP                      is confirmed gone); attaching over it would put a second supervisor on                      the same VF."
+                    "a previous teardown did not complete, so its resources may still be \
+                     held: {why}. Resolve that first (`packetframe detach --all` once VPP \
+                     is confirmed gone); attaching over it would put a second supervisor on \
+                     the same VF."
                 ),
             ));
         }
