@@ -944,8 +944,8 @@ impl SupervisionService {
         let Some(p) = self.status() else {
             return ResendAdvice::Send;
         };
-        // `% 2`, not `is_multiple_of` (Rust 1.87): the workspace MSRV is 1.85.
-        let settled = before % 2 == 0 && self.shared.pass_seq.load(Ordering::SeqCst) == before;
+        let settled =
+            before.is_multiple_of(2) && self.shared.pass_seq.load(Ordering::SeqCst) == before;
         if !p.resend.inert(want_steer) {
             ResendAdvice::Send
         } else if p.resend.state_dependent(want_steer) && !settled {
