@@ -40,7 +40,7 @@ These directives can be added, removed, or changed under SIGHUP without re-attac
 | `mss-clamp …` (all four grammars) | `MSS_CLAMP_V4/V6` + `MSS_CLAMP_BY_IFACE` + `CFG.mss_clamp_global` | v0.2.4+; value changes also pick up |
 | (auto) VLAN-subif resolution | `VLAN_RESOLVE` | Re-scanned from `/proc/net/vlan/config` |
 | (auto) Redirect devmap | `REDIRECT_DEVMAP` | Re-scanned from `/sys/class/net` |
-| `log-level` | (none — userspace tracing filter) | v0.2.7+; applied before the module loop, so the reconcile it is on logs at the new level. **No effect while `RUST_LOG` is set** — see below |
+| `log-level` | (none — userspace tracing filter) | v0.5.0+; applied before the module loop, so the reconcile it is on logs at the new level. **No effect while `RUST_LOG` is set** — see below |
 | neigh-snoop `prefix`, `deny-mac`, `peer`, `seed-max-age`, `install-rate`, `table-max`, `coverage-interval`, `frr-gate` interval/remove-after, `rs-coverage-interval` | (none — userspace engine state) | applied on the next engine tick; a `table-max` shrink evicts least-recently-seen entries |
 | vpp-offload `steer`, per-port `direction`, `steer-direction`, `steer-exempt`, `v6-divert`, `steer-keep6` | NIC ntuple (MCAM) rules | applied as a steering reconcile, with no VPP restart and no resync; `packetframe reconfigure` reports whether the change took effect, was refused, or was withdrawn (see [vpp-offload.md](vpp-offload.md), "The canary ladder") |
 | vpp-offload `drift-accept6` | (none — drift-scan state) | applied at the next drift scan |
