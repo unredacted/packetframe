@@ -664,12 +664,12 @@ What to watch after enabling (canary):
 br1337's tx collapsed 318,491 → 4,382 pps (−98.6%; the residual is
 host-originated traffic), switch0 carried the flow directly, and
 `pass_not_in_devmap` stayed pinned at 0. Combined with `fib-cache on` and the
-v0.2.8 hot-path reductions, box-level softirq fell 15,433 → 11,306 ns/packet
+follow-up hot-path reductions, box-level softirq fell 15,433 → 11,306 ns/packet
 (−26.7%) while throughput rose 640k → 766k pps — stated honestly as the
-whole-campaign delta against the pre-v0.2.8 release binary, including diurnal
+whole-campaign delta against the v0.2.7 release binary, including diurnal
 mix shift; per-feature attribution needs a brief `fib-cache off` window.
 
-## FDB-pinned direct-to-port egress (`fdb-pin`, v0.2.9)
+## FDB-pinned direct-to-port egress (`fdb-pin`)
 
 The short-circuit above still leaves one bridge hop: a chain like `br1337 →
 switch0.1337 → switch0 (bridge over eth0/4/5)` redirects to `switch0`, whose
@@ -775,7 +775,7 @@ provisionally, not proven:
   day; `fib_cache_stale` is the number that moves if churn is the problem.
 - *LPM CPU share visibly down:* not demonstrated. The −26.7% softirq/packet
   above is a whole-campaign figure that also contains the bridge short-circuit,
-  the v0.2.8 hot-path reductions, and traffic-mix drift. Isolating the cache
+  the follow-up hot-path reductions, and traffic-mix drift. Isolating the cache
   needs a brief `fib-cache off` window (SIGHUP, no restart) with `perf` before
   and after, comparing the `trie_lookup_elem` + `longest_prefix_match` share.
 

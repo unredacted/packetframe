@@ -30,18 +30,24 @@ running badly.
 > `steer-exempt` machinery all exist because a rung exposed the need.
 > Read that as the ladder working, and as the reason not to skip rungs.
 >
-> **Still unproven anywhere: more than ONE port steered at a time.**
-> Every steer on record diverted a single port — eth1 on the lab
-> gateway, eth4 on all five primary windows — so rung 2 is the first
-> untested rung, not rung 3. Also unproven: `detach`
-> across more than one VF, and whether MCAM rules survive a UniFi
-> provisioning push. A 5 h steered-idle soak proves nothing wiped them;
-> it does not prove a provisioning cycle cannot.
+> **It is in production now.** After the 2026-08-21 hugepage brick and
+> the 2026-08-26 factory reset wiped that first deployment, the ladder
+> was walked again from rung 0. The reference router now runs the
+> offload **steered on four ports, in both directions, for IPv4 and
+> IPv6**: IPv4 by allowlisted prefix, IPv6 by frame (`v6 on` +
+> `v6-divert`, with the built-in DNS/BGP keeps, `steer-keep6`, the
+> hand-back path and `loopback-address6`), customer delivery through
+> `local-route` / `local-route6`, and `detach --keep-vpp` restarts that
+> stay steered through the preserved route ledger. Its route feed is
+> FRR over iBGP to the AnyIP listener, attested by
+> `integrity-authority frr`.
 >
-> **None of the above is currently deployed.** The 2026-08-21 hugepage
-> brick, the firmware upgrade that reset dpkg state, and the 2026-08-26
-> factory reset left the fleet with no VPP installed and no
-> `vpp-offload` block in the config. The ladder restarts from rung 0.
+> **What that does not settle.** Whether a UniFi provisioning push can
+> wipe MCAM rules has not been established either way; the 30 s
+> readback audit (below) reports a wiped or altered rule as `steering
+> DEGRADED`, which is the signal to watch after one. And a first attach
+> still never steers: every port moves only when you move its lever,
+> so a fresh box starts at rung 0 like the reference one did.
 >
 > **The MCAM ioctl path has now met a NIC, and it took several rounds.**
 > First contact on 2026-08-05 found one real defect — the `loc` space
@@ -90,7 +96,7 @@ running badly.
 ## Architecture at a glance
 
 ```text
- bird ──iBGP──→ BgpListener ──RouteEvent──→ FibProgrammer ──→ BPF maps   (failover tier)
+ FRR/bird ─iBGP→ BgpListener ──RouteEvent──→ FibProgrammer ──→ BPF maps   (failover tier)
                 NeighborResolver                  │
                                                   └─ResolvedRouteSink──→ RouteFeed
                                                                            │
@@ -99,6 +105,15 @@ running badly.
  eth4 PF ── MCAM steer (allowlist × {src,dst}) ──→ VF ──→ VPP workers ──→ VF tx (src MAC = MAC-PF)
     └─ everything else ──→ kernel path, eBPF fast-path in front
 ```
+
+The routing daemon is FRR on the reference router (iBGP to the AnyIP
+listener, `integrity-authority frr`); bird over loopback with the
+`birdc` authority is the other supported pairing. Much of this runbook
+was written on bird boxes, so where it says "bird's route count" read
+"the completeness authority's": `birdc show route count` on a bird box,
+`vtysh -c 'show bgp ipv4 unicast statistics'` (and `ipv6`) on an FRR
+one — or just the `fib-integrity` row of `packetframe status`, which
+shows the authority's figure beside the mirror's whichever it is.
 
 Three things about that picture are load-bearing and easy to get
 backwards:
@@ -149,18 +164,20 @@ It does NOT make VPP deaf or mute on ARP:
   address in aggregate), past the `guard` policer. See
   [Glean and ARP counters](#glean-and-arp-counters).
 
-**Only IPv4 neighbours are programmed.** VPP carries v4 routes only (no
-v6 packet can be steered in; see gate 0b below), so the resolver's IPv6
+**IPv6 neighbours are programmed only under `v6 on`.** With `v6 off`
+(the default) VPP carries IPv4 routes only, so the resolver's IPv6
 neighbours are neither programmed as static neighbours nor pinned in a
 bridge domain's L2FIB, and the neighbour gauges
 (`packetframe_vpp_neighbours_unplaced`, `packetframe_vpp_neighbours_flooded`,
 `packetframe_vpp_neighbour_moves`) count v4 only. `show ip6 neighbors`
-listing entries on an adopted VPP means an earlier build programmed
-them; they are inert (no v6 route
+listing entries on such a VPP after adoption means an earlier build (or
+an earlier `v6 on` run) programmed them; they are inert (no v6 route
 references them) and deliberately left until the next VPP restart,
 because deleting each one costs the same worker-barrier walk that
 programming them did. A v6-only MAC an earlier build pinned in the
-L2FIB is withdrawn once, at the next resync, as a stale entry.
+L2FIB is withdrawn once, at the next resync, as a stale entry. Under
+`v6 on` both families are programmed — see
+[Rung 0 for IPv6](#rung-0-for-ipv6-v6-on).
 
 ## Healthy state
 
@@ -185,7 +202,13 @@ module health (pid 12345, 3s old):
 Five rows, always. Two more — `route-feed` and `state-file` — appear
 **only when they have failed**, deliberately, so the list carries no
 permanent "fine" line for an operator to learn to ignore. Seeing either
-of them at all is the signal.
+of them at all is the signal. The same goes for `fdb`, `exempt-drift`
+and `exempt-drift-v6`, which appear only with findings, and
+`icmp6-source`, which appears only while IPv6 is diverted with no
+`loopback-address6`. The IPv6 offload adds two rows that are present
+whenever their feature is: `fib-v6` under `v6 on`, and `v6-handback`
+while the hand-back path is wanted or built — so the reference router,
+steered for both families, shows seven.
 
 Two of the five rows are worth understanding rather than glancing at.
 
@@ -390,13 +413,15 @@ gets a `port` line; every one is `steer off`.
 
 Decide `require-table-complete` first — **it is restart-only**, so
 getting it wrong here costs a daemon restart rather than a reload;
-`reconfigure` refuses a changed value by name. On a box running its own bird,
-leave it `on` (the default); the first steer then waits until the route
-mirror matches bird's route count. On a box without a local bird, attach
-refuses to start with `on`, because the check could never pass. Set it
-`off` there and compare the counts yourself before turning a lever:
-`packetframe status` reports how many routes are installed, and
-`birdc show route count` on the box running bird says how many there
+`reconfigure` refuses a changed value by name. On a box with a
+completeness authority — its own bird (`integrity-authority birdc`, the
+default) or FRR (`integrity-authority frr`, as on the reference router)
+— leave it `on` (the default); the first steer then waits until the
+authority attests the route mirror. With `integrity-authority none`
+attach refuses to start with `on`, because the check could never pass.
+Set it `off` there and compare the counts yourself before turning a
+lever: `packetframe status` reports how many routes are installed, and
+the routing daemon on the box that feeds the mirror says how many there
 should be.
 
 ```bash
@@ -2635,14 +2660,15 @@ That is safe on its own, because a first attach never steers itself:
 lever. The exposure is the operator who moves it early.
 
 **`require-table-complete on` is what closes it**, and it is not
-optional on a box with a bird:
+optional on a box with a completeness authority (bird's `birdc`, or
+`integrity-authority frr`):
 
 ```
 module vpp-offload
   require-table-complete on
 ```
 
-With it, `steer` refuses while the mirror disagrees with bird's count,
+With it, `steer` refuses while the authority does not attest the mirror,
 reports why, and re-attempts itself — at most every 30 s — once the
 mirror converges, so an early lever-move costs a wait rather than a lost
 offload. Without it there is no gate at all — the refusal path is
@@ -2651,8 +2677,8 @@ lever-move and traffic diverted into a 10%-loaded FIB. (The retry
 itself does not depend on the gate — a steer the NIC refused is
 re-attempted either way — but with no verdict to wait on, an early
 lever-move steers into whatever is loaded at that instant.) `off` is
-the documented opt-out for boxes with no bird to compare against (the
-shadow), not a default to leave alone.
+the documented opt-out for boxes with no authority to compare against
+(`integrity-authority none`), not a default to leave alone.
 
 ### Steering came down by itself: VPP's table emptied
 
@@ -2835,7 +2861,9 @@ the reproduction, the w5–w10 forensics index — lives in
 
 ### A steer is refused with "the route mirror holds N of M routes"
 
-The completeness gate. bird's initial dump has not finished, so the
+The completeness gate. The routing daemon's initial dump has not
+finished (or, under `integrity-authority frr`, a declared upstream has
+not sent End-of-RIB on its current session), so the
 mirror is short of the table and steering into it would blackhole
 whatever has not arrived — and a steered miss is dropped, where an
 unsteered one falls through to the kernel path.
@@ -2858,7 +2886,8 @@ manual path below is the only one.
 Watch the two counts converge:
 
 ```bash
-birdc show route count
+birdc show route count                              # bird box
+vtysh -c 'show bgp ipv4 unicast statistics'         # FRR box (and ipv6)
 packetframe status | grep -A6 'module health'
 ```
 
@@ -3549,7 +3578,8 @@ stop the daemon, then `packetframe detach --all`.
   the gate will refuse.
 
   **`fib-synced`'s installed count is not the number to compare** —
-  that is VPP's table, which is v4-only by policy, against an authority
+  it counts VPP's IPv4 table only (under `v6 on` the IPv6 table is
+  reported separately, on the `fib-v6` row), against an authority
   figure that includes v6.
 
   A box that adopts while steered under a vetoing authority has no fast
@@ -3647,11 +3677,12 @@ against the counts printed beside it before acting on the verdict.
 - **`ip6` ntuple naming an address is rejected by the AF** (error 710)
   while the v4 control inserts cleanly — the vendor NPC profile has no
   v6 L3 address extraction. No IPv6 packet can be MCAM-steered by
-  prefix, so allowlisted v6 stays on the XDP custom-FIB path. Retest at
+  prefix, so allowlisted v6 stays on the XDP custom-FIB path except
+  where `v6-divert` takes it by frame. Retest at
   every UniFi kernel bump; the MKEX profile ships with the AF driver.
   What the profile does extract (ethertype, MAC, VLAN id, v6 L4
-  protocol and ports; probed 2026-09-26) carries the address-free
-  address-free diversion — see [v6-divert steering](#v6-divert-steering).
+  protocol and ports; probed 2026-09-26) is what the address-free
+  IPv6 diversion is built on — see [v6-divert steering](#v6-divert-steering).
 - **`rx-mode adaptive` is unsupported** by the native octeon driver.
   The heat goal is dead: **one hot core per VPP worker, 24/7**, as a
   permanent recorded cost. Budget power and thermals for it.
@@ -3815,7 +3846,9 @@ source (no fd.io bullseye+arm64 package exists at any version). Which
 release this build of packetframe was codegen'd against is recorded in
 `crates/modules/vpp-offload/vpp-api/SOURCE.json` (and printed into the
 hwtest bundle's `vpp-pin.txt` as a ready fetch line); the CRC handshake
-refuses any VPP that disagrees at attach.
+refuses any VPP that disagrees at attach. Despite its name, `vpp-pin.txt`
+is not a separate pin: the hardware-artifacts workflow generates it
+from `SOURCE.json` on every build, so the two cannot disagree.
 
 **Installing VPP on a gateway — including the five traps that have
 each cost real time (mask-before-install; `VPP_INSTALL_SKIP_SYSCTL=1`
@@ -4037,10 +4070,15 @@ while VPP runs is not followed until the next restart.
   via `--config`, on every configured port — including the native-XDP
   attach that panics this fleet. Fixed in v0.2.7; on an older build, do
   not run it against a live config.
-- **`reconfigure` accepts only the `steer` flag.** `port`, `cores`,
-  `expected-routes`, `hugepages` and `vpp-binary` are all fixed at VPP's
-  start or at VF acquisition, and each is refused **by name** with what
-  to do about it. A daemon whose running config silently differed from
+- **`reconfigure` accepts only the steering inputs and
+  `drift-accept6`.** `steer`, `direction` / `steer-direction`,
+  `steer-exempt`, `v6-divert` and `steer-keep6` apply as an MCAM
+  reconcile, `drift-accept6` at the next drift scan. Everything else —
+  `port` membership, `cores`, `vlans`, `expected-routes`, `hugepages`,
+  `steer-capacity`, `v6`, `loopback-address` / `loopback-address6`,
+  `local-route` / `local-route6`, `require-table-complete` and
+  `vpp-binary` — is fixed at VPP's start or at VF acquisition, and each
+  is refused **by name** with what to do about it. A daemon whose running config silently differed from
   the file you just edited is how the wrong thing gets debugged for an
   hour.
 - **Restart ordering is stop → detach → start.** This bit production
@@ -4059,7 +4097,9 @@ while VPP runs is not followed until the next restart.
     when VPP was converged, and the start that finds it adopts without
     reading VPP's FIB or unsteering at all — [What a keep-vpp restart
     costs now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger).
-    The form for an upgrade or config restart of a steered box:
+    The form for a same-version config restart of a steered box (a
+    PacketFrame **version upgrade** uses `detach --all` with the old
+    binary instead; see the README's "Upgrading"):
 
     ```bash
     systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe
@@ -4072,8 +4112,8 @@ while VPP runs is not followed until the next restart.
     refusing by name when:
     - the edit changed something VPP fixes at attach: `port` lines
       (including `cores`, `vlans` and `vlans all`), `expected-routes`, `hugepages`,
-      `steer-capacity`, `loopback-address`, `vpp-binary` or
-      `local-route`. Adoption neither applies nor undoes these — a
+      `steer-capacity`, `v6`, `loopback-address`, `loopback-address6`,
+      `vpp-binary`, `local-route` or `local-route6`. Adoption neither applies nor undoes these — a
       dropped VLAN's subif would keep taking steered ingress, unmanaged.
       Steering levers and `steer-direction` are fine; adoption applies
       them;
@@ -4142,9 +4182,11 @@ while VPP runs is not followed until the next restart.
   every location as working. Confirm with `ethtool -n <if>` and look for
   the `Filter: <loc>` block.
 - **The first steer is guarded against an incomplete table — but only
-  where there is a bird.** Verification samples what the *ledger* holds,
-  so a table that is merely missing prefixes verifies clean. That is why
-  the guard is a separate comparison against bird's own route count,
+  where there is a completeness authority** (`integrity-authority birdc`
+  or `frr`). Verification samples what the *ledger* holds, so a table
+  that is merely missing prefixes verifies clean. That is why the guard
+  is a separate comparison against the authority — bird's own route
+  count, or FRR's counts plus End-of-RIB from every declared upstream —
   published by the fast-path integrity checker and consulted by every
   steer, not by the verify. Where no publisher exists,
   `require-table-complete off` hands the judgement back to you, and rung

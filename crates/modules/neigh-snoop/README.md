@@ -12,7 +12,12 @@ addresses. When the router is not allowed to send broadcast ARP or
 multicast NS itself (a switch ACL drops them), it can only reach a peer
 whose MAC it already holds, and after a reboot that can take hours.
 
-**Status:** code-complete and merged; hardware ladder pending.
+**Status:** production. On the reference router it snoops the IX
+bridges in `ix-mode` and a customer bridge, and feeds FRR's next-hop
+gate (`frr-gate`). On a customer bridge behind a vpp-offload
+`local-route6` it is also what turns the neighbour advertisement a host
+sends in answer to VPP's glean into a kernel neighbour, and from there
+into a VPP static neighbour.
 
 ## What it does
 
