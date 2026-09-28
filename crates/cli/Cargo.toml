@@ -67,11 +67,29 @@ assets = [
     ["target/release/packetframe", "/usr/bin/packetframe", "755"],
     ["../../conf/example.conf", "/etc/packetframe/example.conf", "644"],
     ["../../README.md", "/usr/share/doc/packetframe/README.md", "644"],
+    ["../../CHANGELOG.md", "/usr/share/doc/packetframe/CHANGELOG.md", "644"],
+    # A pristine copy next to the docs: /etc/packetframe/example.conf is
+    # a conffile, so once an operator edits it dpkg stops updating it and
+    # the reference for new directives would otherwise be gone.
+    ["../../conf/example.conf", "/usr/share/doc/packetframe/example.conf", "644"],
+    # The runbooks are the operating procedure (restart sequence, VPP
+    # install, cutover and rollback) and the router has no checkout —
+    # the hwtest bundle ships them for the same reason.
+    ["../../docs/runbooks/*.md", "/usr/share/doc/packetframe/runbooks/", "644"],
 ]
 
-# Built-in systemd-units integration: cargo-deb generates the
-# postinst/prerm/postrm maintainer scripts to register the unit with
-# systemctl.
+# systemd-units: cargo-deb installs debian/packetframe.service as the
+# packetframe.service system unit. It does NOT generate
+# maintainer scripts — that needs `maintainer-scripts` set, and it is
+# not — so the package runs nothing at install, upgrade or removal: no
+# `systemctl daemon-reload`, no enable, no stop, no restart. After
+# installing a new .deb, run `systemctl daemon-reload` yourself.
+#
+# Upgrades are operator-driven, deliberately. A package-driven restart
+# would bounce the dataplane, and fast-path refuses to start over the
+# pins a previous daemon left, so the only correct upgrade is the
+# documented stop → `packetframe detach --all` → install → start
+# sequence (see CHANGELOG.md, "Upgrade notes").
 #
 # enable+start stay off, for two reasons that are worth keeping
 # straight. The first is the original one: the daemon needs an
@@ -84,12 +102,15 @@ assets = [
 # enabling it commits to the unit's crash-loop behaviour. The unit now
 # caps that loop (see StartLimit* there), which is what makes enabling
 # defensible at all; the call still belongs to whoever runs the box.
-# `restart-after-upgrade = true` keeps a running daemon alive across
-# `apt upgrade` (the SIGTERM handler preserves pins per SPEC.md §8.5).
+#
+# The two *-upgrade keys are inert today (no scripts are generated).
+# They are pinned false rather than omitted because cargo-deb's default
+# for both is true: if maintainer scripts are ever enabled, an omitted
+# key would silently start restarting the daemon on `apt upgrade`.
 [package.metadata.deb.systemd-units]
 unit-name = "packetframe"
 unit-scripts = "debian"
 enable = false
 start = false
-restart-after-upgrade = true
+restart-after-upgrade = false
 stop-on-upgrade = false
