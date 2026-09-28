@@ -73,6 +73,16 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
+      # release.yml's version gate runs only on a tag push or a manual
+      # dispatch, so its checker is exercised here on every PR (hermetic:
+      # a stub cargo and scratch CHANGELOGs), plus the real tree's check
+      # so a PR that breaks VERSION/Cargo/CHANGELOG agreement fails now
+      # rather than at release time.
+      - name: release gate (script cases + this tree)
+        run: |
+          bash .github/scripts/release-test.sh
+          bash .github/scripts/release.sh check
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 

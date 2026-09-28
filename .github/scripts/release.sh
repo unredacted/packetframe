@@ -37,6 +37,32 @@ heading() {
     awk -v want="## [$1]" 'index($0, want) == 1 { print; exit }' CHANGELOG.md
 }
 
+# The status of a section's heading, validated strictly: the heading
+# must be exactly `## [<version>] - YYYY-MM-DD` (a real calendar date) or
+# `## [<version>] - UNRELEASED`. Prints `dated` or `unreleased`; dies on
+# anything else (no date, `TBD`, a malformed or impossible date,
+# trailing text), so a typo cannot slip past as "not UNRELEASED".
+heading_status() {
+    local v="$1" line rest
+    line="$(heading "$v")"
+    rest="${line#"## [$v] - "}"
+    if [ "$rest" = "$line" ]; then
+        die "CHANGELOG.md heading '${line}' must be '## [${v}] - YYYY-MM-DD' or '## [${v}] - UNRELEASED'"
+    fi
+    if [ "$rest" = "UNRELEASED" ]; then
+        echo unreleased
+        return
+    fi
+    # The shape first (fromisoformat alone also takes other ISO forms on
+    # newer Pythons), then whether the date exists at all.
+    if [[ "$rest" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] &&
+        python3 -c 'import datetime, sys; datetime.date.fromisoformat(sys.argv[1])' "$rest" 2>/dev/null; then
+        echo dated
+        return
+    fi
+    die "CHANGELOG.md heading '${line}': '${rest}' is not a YYYY-MM-DD date or UNRELEASED"
+}
+
 # A prerelease tag (0.5.0-rc1) may have its own section; if it does not,
 # it is described by its base version's section.
 notes_version() {
@@ -81,14 +107,20 @@ for p in m["packages"]:
     nv="$(notes_version "$file_version")"
     [ -n "$nv" ] || die "CHANGELOG.md has no '## [${file_version}]' section"
 
+    # Validated in every mode, so a dispatch dry run catches a malformed
+    # heading before a tag push does. `die` inside the command
+    # substitution only ends the subshell, hence the explicit exit.
+    local status
+    status="$(heading_status "$nv")" || exit 1
+
     if [ -n "$tag" ]; then
         local tag_version="${tag#v}"
         [ "$tag_version" = "$file_version" ] ||
             die "tag ${tag} (${tag_version}) does not match VERSION/Cargo (${file_version})"
         # A published release is dated; UNRELEASED is for main and for
         # prerelease tags (an rc is cut before the final date is known).
-        if [[ "$tag_version" != *-* ]] && heading "$nv" | grep -q 'UNRELEASED'; then
-            die "CHANGELOG.md '## [${nv}]' is still UNRELEASED — date it before tagging"
+        if [[ "$tag_version" != *-* ]] && [ "$status" != dated ]; then
+            die "CHANGELOG.md '## [${nv}]' is still UNRELEASED — date it (YYYY-MM-DD) before tagging"
         fi
     fi
 
