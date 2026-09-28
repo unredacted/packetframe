@@ -162,6 +162,12 @@ jobs:
       # pull_request run GITHUB_SHA alone would be the synthetic merge
       # commit, which exists in nobody's clone.
       PF_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The ordering key stamped ahead of the sha in the package version.
+      # run_number counts every run of this workflow (all events) and
+      # never goes backwards, unlike the sha, which is effectively random.
+      # A re-run of the same run keeps its number — and its commit — so it
+      # rebuilds the same version. See "Build .deb" for the layout.
+      PF_RUN: ${{ github.run_number }}
     steps:
       # Check out the PR head rather than the default merge ref. This
       # workflow's output is an artifact someone installs on a router, so
@@ -414,9 +420,21 @@ jobs:
       #
       # release.yml stays the authority for PUBLISHED packages
       # (reproducible SOURCE_DATE_EPOCH, combined + signed SHA256SUMS).
-      # This one is deliberately versioned `<VERSION>~hwtest<sha>` so it
-      # sorts below any real release, can never be mistaken for one, and is
-      # trivially visible in `dpkg -l`.
+      # This one is deliberately versioned `<VERSION>~hwtest.<run>.<sha>`:
+      #   - `~` sorts it below `<VERSION>` and every later release, so it
+      #     can never be mistaken for one and `apt` upgrades cleanly over it.
+      #   - `<run>` (PF_RUN) makes consecutive builds ascend. dpkg compares
+      #     digit runs numerically (Debian Policy §5.6.12), so 999 < 1000
+      #     with no padding. The old `~hwtest<sha>` compared hashes
+      #     lexically, so a newer build with a lower hash made dpkg report
+      #     a "downgrade" on install.
+      #   - The `.` before `<run>` sorts above any letter or digit, which
+      #     puts every build in this layout above every old `~hwtest<sha>`
+      #     build — the one-time switch-over is an upgrade too, not a
+      #     spurious downgrade.
+      #   - `<sha>` last, just before `_<arch>.deb`, so an operator can pick
+      #     a bundle's package by commit with `*~hwtest.*.<sha>_*.deb` and
+      #     read the exact commit out of `dpkg -l`.
       - name: Build .deb (gnu targets only)
         if: contains(inputs.target || 'aarch64-unknown-linux-gnu', '-gnu')
         run: |
@@ -432,7 +450,7 @@ jobs:
           cargo deb --no-build --no-strip \
             --target "${TARGET}" \
             -p packetframe-cli \
-            --deb-version "$(cat VERSION)~hwtest${PF_SHA:0:7}" \
+            --deb-version "$(cat VERSION)~hwtest.${PF_RUN}.${PF_SHA:0:7}" \
             --output "dist/packetframe-hwtest-${TARGET}/"
           ls -la "dist/packetframe-hwtest-${TARGET}"/*.deb
 
