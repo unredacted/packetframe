@@ -89,7 +89,7 @@ assets = [
 # would bounce the dataplane, and fast-path refuses to start over the
 # pins a previous daemon left, so the only correct upgrade is the
 # documented stop → `packetframe detach --all` → install → start
-# sequence (see CHANGELOG.md, "Upgrade notes").
+# sequence (see README.md, "Upgrading").
 #
 # enable+start stay off, for two reasons that are worth keeping
 # straight. The first is the original one: the daemon needs an
