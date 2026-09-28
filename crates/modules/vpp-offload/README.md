@@ -115,8 +115,12 @@ rather than by prefix. `v6 on` loads the IPv6 table into VPP; a
 `v6-divert` port then sends TCP and UDP over IPv6 addressed to the
 router's MAC on the listed VLANs (or untagged) to the VF, two rules per
 VLAN and receive MAC. ICMPv6 is never diverted, so neighbour discovery
-stays with the kernel. TCP/UDP 53 and TCP 179 in both directions are
-built-in keeps (four more rules), and each `steer-keep6` adds one. The
+stays with the kernel. Four built-in keeps cost four more rules: TCP
+and UDP to destination port 53 (the router's resolver) and TCP 179 in
+both directions (destination and source, so BGP never enters VPP).
+DNS replies toward the router (source port 53) are diverted and come
+back over the hand-back path. Each `steer-keep6` adds one rule, or two
+with `both` (a `dst` and a `src` rule). The
 router's own IPv6 that arrives on a diverted frame is handed back to
 the kernel over a veth (`pfpunt0`, opened by VPP as an af_packet host
 interface) through a stateless ACL in VPP that admits only replies to

@@ -3331,9 +3331,11 @@ vpp-offload: DEGRADED
 for the length of the deferral plus the reconcile, then clears to
 `fib-synced healthy` on its own. Measured 2026-08-09 on the shadow
 (d12): unsteer at +40 s, re-steer at +78 s, worst forwarding gap
-0.109 s. That is the DUMP path; a clean `--keep-vpp` restart that left a
+0.109 s. That is the DUMP path (on the reference router's full table,
+~3 minutes unsteered); a clean `--keep-vpp` restart that left a
 preserved route ledger holds the same Degraded line for the deferral but
-never unsteers — see [What a keep-vpp restart costs
+never unsteers — measured on the reference router at zero unsteered
+time, see [What a keep-vpp restart costs
 now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger).
 
 This is correct and deliberate, and it is DEGRADED rather than
@@ -4110,12 +4112,15 @@ while VPP runs is not followed until the next restart.
     the one every recovery message names.
   - `detach --keep-vpp` tears down every other module's pins and leaves
     VPP, its VFs, hugepages and steering rules running for the next
-    start to adopt — steered traffic keeps flowing across the restart
-    (measured on the rig: one 0.6 s steering dip while the adoption
-    reconciles). The `systemctl stop` leaves a preserved route ledger
-    when VPP was converged, and the start that finds it adopts without
-    reading VPP's FIB or unsteering at all — [What a keep-vpp restart
-    costs now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger).
+    start to adopt — steered traffic keeps flowing across the restart.
+    The `systemctl stop` leaves a preserved route ledger when VPP was
+    converged, and the start that finds it adopts without reading VPP's
+    FIB or unsteering at all: measured on the reference router at zero
+    unsteered time (1 of 420 probe packets lost, to fast-path's link
+    bounce). Without a preserved ledger the adoption falls back to
+    reading VPP's FIB, which measured ~3 minutes unsteered — [What a
+    keep-vpp restart costs
+    now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger).
     The form for a same-version config restart of a steered box (a
     PacketFrame **version upgrade** uses `detach --all` with the old
     binary instead; see the README's "Upgrading"):

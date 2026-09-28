@@ -112,7 +112,7 @@ sha256sum -c SHA256SUMS --ignore-missing
 sudo apt-get install ./packetframe_${VERSION#v}_${ARCH}.deb
 ```
 
-Installs `/usr/bin/packetframe`, the systemd unit at `/lib/systemd/system/packetframe.service`, and an example config at `/etc/packetframe/example.conf`. The service is **not** auto-started, and the package carries no maintainer scripts, so nothing tells systemd about the unit: run `sudo systemctl daemon-reload` after every install or upgrade, or `systemctl start packetframe` can fail with "Unit packetframe.service not found" (or, on an upgrade, keep running the previous unit file). Copy the example to `/etc/packetframe/packetframe.conf`, edit per the [Quickstart](#quickstart), then `sudo systemctl daemon-reload && sudo systemctl enable --now packetframe`. Requires glibc ≥ 2.31 (Debian 11+ / Ubuntu 20.04+).
+Installs `/usr/bin/packetframe`, the systemd unit at `/lib/systemd/system/packetframe.service`, and an example config at `/etc/packetframe/example.conf`. The service is **not** auto-started, and with the shipped metadata (`enable = false`) the package carries no maintainer scripts, so nothing tells systemd about the unit: run `sudo systemctl daemon-reload` after every install or upgrade, or `systemctl start packetframe` can fail with "Unit packetframe.service not found" (or, on an upgrade, keep running the previous unit file). Copy the example to `/etc/packetframe/packetframe.conf`, edit per the [Quickstart](#quickstart), then `sudo systemctl daemon-reload && sudo systemctl enable --now packetframe`. Requires glibc ≥ 2.31 (Debian 11+ / Ubuntu 20.04+).
 
 ### Tarball (any Linux)
 
@@ -285,7 +285,8 @@ listed VLANs (or untagged) into VPP, and never ICMPv6. The router's own
 IPv6 that arrives that way is handed back to the kernel over a veth
 (`pfpunt0`) guarded by a stateless ACL inside VPP, and the services it
 must accept new sessions for stay on the kernel by port (`steer-keep6`;
-DNS and BGP are built in).
+TCP/UDP destination port 53 and TCP 179 in both directions are built
+in).
 
 It is in production on the reference router: IPv4 and IPv6, both
 directions, four steered ports, with `detach --keep-vpp` restarts that
@@ -373,7 +374,7 @@ Quick directive index (every directive the parser accepts; `example.conf` has th
 - `port <iface> cores <n> steer {on|off} [vlans <id>,…|all] [direction {src|dst|both}] [v6-divert <id>,…|untagged]`: one line per fast-path attach interface. `steer` is the per-port lever; `cores 0` puts egress-only members on one shared worker; `vlans` creates the trunk subinterfaces; `direction` overrides `steer-direction` for the port; `v6-divert` steers TCP and UDP over IPv6 addressed to the router's MAC on those VLANs
 - `steer-direction {src|dst|both}`: which side of a flow the IPv4 rules match (default both)
 - `steer-exempt <ipv4-cidr>`: keep a destination on the kernel path while steered
-- `steer-keep6 {tcp|udp} <port> [dst|src|both]`: keep an IPv6 service on the kernel while a port diverts IPv6 (TCP/UDP 53 and TCP 179 both ways are built in)
+- `steer-keep6 {tcp|udp} <port> [dst|src|both]`: keep an IPv6 service on the kernel while a port diverts IPv6 (built in: TCP and UDP destination port 53, and TCP 179 as both destination and source)
 - `steer-capacity <1-256>`: ntuple rules per steerable port to ask the driver for (default table: 16)
 - `v6 {on|off}`: carry the IPv6 table in VPP (required by `v6-divert`)
 - `loopback-address <ipv4>/<len>`: VPP's loopback, which every member is unnumbered to (mandatory)
