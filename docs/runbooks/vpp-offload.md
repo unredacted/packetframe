@@ -3179,7 +3179,7 @@ Be precise about this when reasoning about an incident.
 | PMTUD through a steered path | **PASS** | frag-needed, mtu 1300, sourced from 169.254.254.3, ×5. Gate 0b item 7 closed. |
 | Steered packets reaching VPP | **PASS** | gate 0b item 1 closed 2026-08-07: allowlisted frames counted on octeon0/0, non-allowlisted stayed on the kernel path. |
 | Restart health window | Degraded ~40–80 s | see the note below — the deferral and reconcile are visible by design. |
-| `detach --all` | **2.814 s** | 2026-08-11 shadow, ONE VF with a live VPP holding 1.05M routes. Misses the published <1 s; see below. Breakdown: pins removed in 1 ms, then 2.80 s terminating VPP + rebinding the VF + restoring hugepages. |
+| `detach --all` | **2.814 s** with one VF; **4.91 s** with two | One VF: 2026-08-11 shadow, a live VPP holding 1.05M routes. Breakdown: pins removed in 1 ms, then 2.80 s terminating VPP + rebinding the VF + restoring hugepages. Two VFs: the dev rig's D7 run, two steered VFs, timed as `systemctl stop packetframe && packetframe detach --all`. Both miss the published <1 s. **More than two VFs is not measured**: the reference router runs four, and anything said about its teardown time is an extrapolation from these two points, not a measurement. |
 | Interconnect blip during `detach --all` | **none** | same run, 5 Hz ping from the primary across the teardown: zero gaps >0.5 s, one 30 ms spike. Writing `sriov_numvfs=0` does not disturb the PF link. |
 | `ip_route_dump` at adoption | **7.04 s** for 1,054,548 routes | 2026-08-11, timed directly rather than inferred from a traffic gap. This is the barrier-sync freeze §the deferral exists to keep away from steered traffic. |
 | Adopted restart, UNSTEERED | ~53 s start→verified | 2026-08-11. Dump at +7 s, deferral held 32.8 s waiting for the mirror, diff+verify after. No traffic impact — nothing was steered. |
@@ -3198,11 +3198,11 @@ Be precise about this when reasoning about an incident.
 | The default-route drop counter under steering — decomposed by destination profile | Pre-exemption ~365 pps; **~50+ pps of it was live inter-site traffic** (vti64-bound: ord1's /24 + seven host routes inside the local /24), silently one-way-blackholed in EVERY steered window w23→w26; the remaining **~155 pps is the junk floor** (misdirected VPN/overlay to RFC1918/CGNAT, SSDP, bogons — dies on the kernel path too, upstream and invisibly) | 2026-08-16/17 w26/w26b. Exemptions zeroed the real-traffic share: w26b held 153–170 pps flat for 30 min with 14 rules, tcpdump proofs 5/5 on eth2 (inter-site) and 5/5 on vti64 (tunnel /32s) WHILE steered. The floor is expected; alarm on rate CHANGE. |
 | Idle draw with VPP polling one worker | 33.56 W, 38/49/42 °C, fan 3780 RPM | 2026-08-11 shadow, chassis total — NOT a VPP attribution, no VPP-off baseline was taken. |
 
-**Published but never measured:**
-
-| number | status |
-|---|---|
-| `detach` across **more than one** VF | UNMEASURED — the single-VF case is measured above at 2.814 s. Nothing has torn down N>1 VFs, and the per-VF cost is unknown. |
+**Published but never measured:** `detach --all` across **more than
+two** VFs. The one-VF (2.814 s) and two-VF (4.91 s) teardowns are
+measured above; the reference router's four-VF teardown has not been
+timed, so budget for it by extrapolation and measure it on the next
+full teardown there rather than quoting a figure.
 
 ### A fresh attach on a full-table box holds in `Syncing` for minutes. That is the fix working.
 
