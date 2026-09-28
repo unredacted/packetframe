@@ -70,7 +70,7 @@ pub(crate) fn load(
             MODULE_NAME,
             format!(
                 "existing pins under {} from a prior invocation; run \
-                 `packetframe detach --all` first (v0.1 does not adopt in place)",
+                 `packetframe detach --all` first (pins from a prior invocation are not adopted in place)",
                 pin::module_root(bpffs_root).display()
             ),
         ));

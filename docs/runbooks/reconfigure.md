@@ -42,6 +42,9 @@ These directives can be added, removed, or changed under SIGHUP without re-attac
 | (auto) Redirect devmap | `REDIRECT_DEVMAP` | Re-scanned from `/sys/class/net` |
 | `log-level` | (none — userspace tracing filter) | v0.2.7+; applied before the module loop, so the reconcile it is on logs at the new level. **No effect while `RUST_LOG` is set** — see below |
 | neigh-snoop `prefix`, `deny-mac`, `peer`, `seed-max-age`, `install-rate`, `table-max`, `coverage-interval`, `frr-gate` interval/remove-after, `rs-coverage-interval` | (none — userspace engine state) | applied on the next engine tick; a `table-max` shrink evicts least-recently-seen entries |
+| vpp-offload `steer`, per-port `direction`, `steer-direction`, `steer-exempt`, `v6-divert`, `steer-keep6` | NIC ntuple (MCAM) rules | applied as a steering reconcile, with no VPP restart and no resync; `packetframe reconfigure` reports whether the change took effect, was refused, or was withdrawn (see [vpp-offload.md](vpp-offload.md), "The canary ladder") |
+| vpp-offload `drift-accept6` | (none — drift-scan state) | applied at the next drift scan |
+| guard class rules (`arp-ns-ratelimit`, `bcast-mcast-ratelimit`, `lldp`, `foreign-src`: rates, burst, monitor↔enforce) | `GUARD_CFG` | no reattach; the module is experimental (see [guard.md](guard.md)) |
 
 `log-level` is the one entry here that touches no BPF map: it swaps the
 daemon's tracing filter in place. Raising to `debug` to watch a canary
@@ -67,7 +70,7 @@ Adds-before-removes ordering: a renamed prefix (remove + add of the same value) 
 
 These need a full daemon restart — and note that a plain `systemctl
 restart packetframe` is **not sufficient**: bpffs pins survive SIGTERM
-(SPEC §8.5) and v0.1 never adopts pins from a prior invocation, so the
+(SPEC §8.5) and PacketFrame never adopts pins from a prior invocation, so the
 new process refuses startup and systemd crash-loops with the FIB
 frozen. The working sequence is:
 
@@ -85,6 +88,9 @@ The directives that require it:
 - **`local-prefix` / `local-prefix6` directives (custom-FIB only).** The connected-fast-path resolver is similarly attach-time-bound. Both families are collected once at attach and handed to the resolver; editing either and reloading leaves the running set untouched with no warning.
 - **`coalesce` (NIC interrupt coalescing).** Written to each attached NIC once at attach and reversed at detach from `<state-dir>/coalesce.json`. Unlike the silent entries in this list, a reload whose `coalesce` line differs from the running one is **refused by name** (the CLI exits non-zero with ``daemon rejected: fast-path: `coalesce` changed ...``), and fast-path applies nothing else from that reload.
 - **`bpffs-root`, `state-dir`.** Used at module load only; baked into the running daemon's pin paths and the metrics file location.
+- **vpp-offload: everything but the steering inputs and `drift-accept6`** — `port` membership, `cores`, `vlans`, `expected-routes`, `hugepages`, `steer-capacity`, `v6`, `loopback-address`/`loopback-address6`, `local-route`/`local-route6`, `require-table-complete`, `vpp-binary`. VPP fixes these at start; a reload that changes one is **refused by name**. On a steered box, the same-version restart that keeps VPP forwarding is `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, which itself refuses when the edit is one VPP cannot adopt across; see [vpp-offload.md](vpp-offload.md).
+- **guard `interface` lines, neigh-snoop `bridge` lines (and `ix-mode`), `persist-dir`, and the `frr-gate` list names.** Attach-time bound.
+- **`fdb-pin`.** The pin chains and the FDB subscription live in the resolver, built at attach.
 - **`event-log`, `event-log-max`.** The event log's writer owns its open file for the life of the process. A reload that changes either logs a `WARN` and keeps writing the old file; `packetframe status` names the file actually being written. See [`event-log.md`](event-log.md).
 
 If you change one of these in the config and reload, the daemon keeps using the old value silently (with a `WARN`-level log line for attach-set changes). Restart is the only way through.

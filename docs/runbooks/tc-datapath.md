@@ -228,8 +228,8 @@ Different, deliberately:
 
    Attach-set changes are **restart-only** (not SIGHUP-reloadable),
    and a plain `systemctl restart` is **not sufficient**: bpffs pins
-   survive SIGTERM by design (§8.5) and v0.1 never adopts pins from a
-   prior invocation, so the restarted daemon exits immediately and
+   survive SIGTERM by design (§8.5) and PacketFrame never adopts pins
+   from a prior invocation, so the restarted daemon exits immediately and
    systemd crash-loops — with the old programs still forwarding but
    the FIB frozen. Verified live twice on the reference EFG. The full
    dance:

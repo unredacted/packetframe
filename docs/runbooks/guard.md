@@ -3,10 +3,17 @@
 Operational runbook for the `guard` module: what it polices, the
 monitor→enforce ladder, counter reading, triage, and recovery.
 
+> **Experimental.** The guard is code-complete but **not enabled in
+> production**. Its verifier verdict on the reference router's vendor
+> 5.15 kernel is still open (CI's 5.15 and 6.6 kernels accept it), and
+> the monitor→enforce ladder below has not been walked on hardware.
+> Stage every class in `monitor` first, and keep the switch-side ACL
+> backstop in place.
+
 ## What it is, in one paragraph
 
-A tc-**egress** cls_bpf classifier on configured interfaces (in
-production: the IX-facing bridges) that polices locally-originated L2
+A tc-**egress** cls_bpf classifier on configured interfaces (intended
+for the IX-facing bridges; staged, not deployed) that polices locally-originated L2
 frames the platform's firmware emits uncontrollably. Four fixed
 classes, each per-interface and independently `monitor` or enforce:
 per-target rate-limited ARP requests / IPv6 Neighbor Solicitations,
@@ -27,6 +34,12 @@ architecture, not a stopgap.
   starts; between kernel-up and attach, firmware daemons can spray.
   Keep the switch-side ACL backstop until the fabric operator agrees
   to relax it.
+- **Frames VPP originates.** Under vpp-offload, VPP's ARP replies for
+  its `loopback-address`, its glean ARP requests and neighbour
+  solicitations for `local-route`/`local-route6` hosts, and its MLD
+  reports leave through a VF, never through kernel egress, so no
+  classifier here sees them. The vpp-offload runbook's "Glean and ARP
+  counters" is where those are measured.
 - **Frames the agg switches originate.** PF runs on the router;
   switch-originated LLDP/BPDUs are the switch-config tooling's job.
 - **Ingress traffic.** Dropping inbound attacks is a different module
@@ -147,7 +160,7 @@ possible outcome.) Monitor mode never produces it.
   their device, nothing is leaked. Restart after the interface is
   back.
 - **Startup refuses with "existing pins"**: prior invocation's state;
-  run the standard recovery (below). v0.1 never adopts in place.
+  run the standard recovery (below). Pins are never adopted in place.
 
 ## Recovery / teardown
 
