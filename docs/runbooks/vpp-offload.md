@@ -3188,11 +3188,15 @@ Be precise about this when reasoning about an incident.
 | First steer | **4 rules installed and readback-verified** | 2026-08-06, shadow eth1, locs 15/14/13/12, src+dst × 2 prefixes → VF 0. Installation only: eth1 carries the interconnect, so zero packets match. |
 | Steered-idle soak | **5 h 17 m**, rules intact, no restarts | 2026-08-06 overnight. Proves nothing wiped them. Survival of one UniFi provisioning push was observed later, on a lab box on one firmware; untested across firmware. |
 | keep-vpp restart with a preserved ledger | **zero unsteered time, no dump**; external probe through VPP lost 1/420 (fast-path's link bounce) | reference router, first 2026-09-27 at ~1.09M routes, repeated at IPv4+IPv6 ~1.34M with the hand-back path. The fallback (no preserved ledger) measured ~3 min unsteered. |
-| Softirq, IPv4 steered, IPv6 still on the eBPF tier | si **~15.7%** | reference deployment, 2026-09-27/28, box-wide `si` from `top`. The baseline the four rows below are read against. |
-| Softirq after `v6-divert` on the customer VLAN only | si **~6–8%** | reference deployment, 2026-09-27/28, box-wide `si` from `top`. |
-| Softirq after `v6-divert` on all upstream VLANs plus untagged transit | si **~2.2–2.7%** | reference deployment, 2026-09-27/28, box-wide `si` from `top`. |
-| Softirq, overnight steady state (IPv4 and IPv6 steered) | si **~0.8%** | reference deployment, 2026-09-27/28, box-wide `si` from `top`. |
-| Softirq after the 0.5.0 RC keep-vpp restart | si **~1.0%** | reference deployment, 2026-09-27/28, box-wide `si` from `top`. The CHANGELOG's 0.5.0 "about 16% to about 1%" is the first row against this one. |
+| Softirq with no bypass (before PacketFrame) | si **~74%** | reference deployment, April 2026: every forwarded packet on the kernel's conntrack + iptables path, full tables, 2–3 Gbps forwarded, `si` across all ksoftirqd threads. The same box reached 90–100% total CPU and locked up at ~4 Gbps. |
+| Softirq with the custom FIB empty | si **71%** | reference deployment, 2026-09-11, box-wide `si` from `top` after a reboot: until the FIB converged every flow fell back to the kernel path, so this is the no-bypass figure again. Load 27. Every empty-FIB window costs this. |
+| Softirq, eBPF fast-path only (before VPP) | si **31–62%** | reference deployment, 2026-09-26, box-wide `si` from `top`, off-peak, immediately before the first production steer. |
+| Softirq, IPv4 steered into VPP at launch | si **11–19%** | reference deployment, 2026-09-26, box-wide `si` from `top`, off-peak, same window as the row above: four ports, both directions. |
+| Softirq, IPv4 steered, IPv6 still on the eBPF tier | si **~15.7%** | reference deployment, 2026-09-27/28, box-wide `si` from `top`, off-peak. The baseline the four rows below are read against. |
+| Softirq after `v6-divert` on the customer VLAN only | si **~6–8%** | reference deployment, 2026-09-27/28, box-wide `si` from `top`, off-peak. |
+| Softirq after `v6-divert` on all upstream VLANs plus untagged transit | si **~2.2–2.7%** | reference deployment, 2026-09-27/28, box-wide `si` from `top`, off-peak. |
+| Softirq, overnight steady state (IPv4 and IPv6 steered) | si **~0.8%** | reference deployment, 2026-09-27/28, box-wide `si` from `top`, off-peak. |
+| Softirq after the 0.5.0 RC keep-vpp restart | si **~1.0%** | reference deployment, 2026-09-27/28, box-wide `si` from `top`, off-peak. The CHANGELOG's 0.5.0 highlight is read from this block: no bypass ~74%, eBPF only 31–62%, IPv4 in VPP 11–19%, IPv6 in as well ~1%. **No peak-hour reading exists with IPv4 and IPv6 both in VPP**; every figure after the launch rows is off-peak. |
 | Drill (a) kill -9 under load | teardown **325 ms**, recovery **40.7 s** | 2026-08-08, 500 pps constant-rate flow. The 50 ms teardown target was missed and is documented as a bound; recovery ≤ 90 s holds with margin. |
 | Drill (b) route change while down | **PASS** | the changed route was present in VPP before steering resumed. |
 | Drill (c) SIGSTOP wedge | detected in **1.81 s** (target ≤ 2 s) | 2026-08-08, ping-interval-bounded as designed. |
