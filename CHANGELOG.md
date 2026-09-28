@@ -31,7 +31,7 @@ The first release since 0.2.7 (2026-05-20). It adds three modules (vpp-offload, 
 - **Behaviour change: `bridge-resolve` now defaults to on (`auto`).** While the bridge short-circuit is installed, `mss-clamp … via <bridge>` no longer matches, because clamp matching keys on the resolved egress device. Scope the clamp `via` the underlying device, or set `bridge-resolve off` to keep 0.2.7's behaviour. The daemon logs a warning naming both when it sees this.
 - **Installing the VPP package** (vpp-offload only): follow the [vpp-unifi](https://github.com/unredacted/vpp-unifi) README exactly. It ships a boot-time hugepage sysctl file that its skip flag does not remove. Delete the file and confirm it is gone before you reboot; `packetframe feasibility` flags it as `vpp.sysctl-hugepages`.
 - **Downgrading:** run **0.5.0**'s `packetframe detach --all` before installing 0.2.7. 0.2.7's `detach` does not know guard's tc filters, VPP's MCAM rules, the IPv6 hand-back veth, tc-ingress attachments or the saved coalescing values, and leaves them in place.
-- **Already on a main-branch build running vpp-offload:** install, `systemctl daemon-reload`, then `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`; VPP keeps forwarding throughout.
+- **Already on a main-branch build running vpp-offload:** install, `systemctl daemon-reload`, then `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`; VPP keeps forwarding throughout. Before that, rename `v6-outbound` to `v6-divert` on any `port` line and drop any `steer-keep6 tcp 179 …` or destination-port `steer-keep6 tcp|udp 53` line (now built-in keeps); 0.5.0 refuses a config with either.
 
 ### Highlights
 
@@ -114,13 +114,14 @@ The first release since 0.2.7 (2026-05-20). It adds three modules (vpp-offload, 
 When upgrading, run steps 1 and 2 above first.
 
 ```sh
-curl -LO https://github.com/unredacted/packetframe/releases/download/v0.5.0/packetframe_0.5.0_arm64.deb
+ARCH=$(dpkg --print-architecture)   # amd64 or arm64
+curl -LO "https://github.com/unredacted/packetframe/releases/download/v0.5.0/packetframe_0.5.0_${ARCH}.deb"
 curl -LO https://github.com/unredacted/packetframe/releases/download/v0.5.0/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
-dpkg -i packetframe_0.5.0_arm64.deb && systemctl daemon-reload
+dpkg -i "packetframe_0.5.0_${ARCH}.deb" && systemctl daemon-reload
 ```
 
-`amd64` packages and tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below.
+Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below.
 
 **Full changelog:** https://github.com/unredacted/packetframe/compare/v0.2.7...v0.5.0
 

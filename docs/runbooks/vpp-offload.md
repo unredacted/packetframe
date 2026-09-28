@@ -766,17 +766,21 @@ drop of the supervision service: it cannot tell a process exit from an
 accidental drop, so it keeps supervising VPP and preserves nothing.
 The stopping daemon also waits at most **5 s** for the loop to finish
 writing it: a supervision loop that is slow or wedged at stop is left
-behind when the process exits, with the journal line `the supervision
-loop did not finish preserving the route ledger in time`, and if the
-record was not yet renamed into place the next start takes the dump
-path too.
+behind when the process exits, and if the record was not yet renamed
+into place the next start takes the dump path too. That timeout is
+diagnosed from the **journal** only — the warning `the supervision loop
+did not finish preserving the route ledger in time` — because the loop
+that would have recorded `ledger_preserved` never got that far, so the
+event log may hold no stop-side event for it at all.
 
 Which path a restart took is in the [event log](event-log.md#event-kinds)
-as well as the journal: `ledger_preserved` at the stop (`preserved`
-true or false, with the reason when false), `adoption_path` at the
-start (`path=preserved-ledger`, or `readback` / `readback-deferred` for
-the dump path), and `preserved_ledger_rejected` with the stage and
-reason when a record was found but not used.
+as well as the journal: `ledger_preserved` at the stop when the loop
+reached the preserve step (`preserved` true or false, with the reason
+when false), `adoption_path` at the start (`path=preserved-ledger`, or
+`readback` / `readback-deferred` for the dump path — this one records
+the fallback whatever happened at the stop), and
+`preserved_ledger_rejected` with the stage and reason when a record was
+found but not used.
 
 **The start that finds it** adopts WITHOUT reading VPP's FIB and without
 unsteering, in this order:
