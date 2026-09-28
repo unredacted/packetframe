@@ -1,0 +1,28 @@
+name: Read stable Rust pin
+description: >-
+  Export the root rust-toolchain.toml channel as RUST_STABLE for the
+  steps that follow.
+
+# rust-toolchain.toml is the only copy of the stable pin. Dependabot's
+# rust-toolchain ecosystem bumps it there, and every workflow reads it
+# through this action, so a bump PR moves CI onto the new compiler in
+# the same diff. The BPF nightly and bpf-linker are pinned separately
+# (RUST_NIGHTLY / BPF_LINKER_VERSION) and are not read from here.
+#
+# Parsed with tomllib rather than grepped so quoting or spacing changes
+# a bot might make cannot yield a wrong or empty value. An exact x.y.z
+# release is required: "stable" or "1.98" would let CI float away from
+# what the pin says was tested.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        v=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+        if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error file=rust-toolchain.toml::channel '$v' is not an exact x.y.z stable release"
+          exit 1
+        fi
+        echo "stable Rust pin: $v"
+        echo "RUST_STABLE=$v" >> "$GITHUB_ENV"

@@ -16,7 +16,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_STABLE: "1.95.0"
   RUST_NIGHTLY: "nightly-2026-04-14"
   BPF_LINKER_VERSION: "0.10.3"
 
@@ -33,6 +32,8 @@ jobs:
       PACKETFRAME_BPF_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/rust-stable-pin
 
       - name: Install Rust (stable + nightly for BPF)
         run: |
@@ -145,6 +146,8 @@ jobs:
           else
             echo "PF_REF_LABEL=${GITHUB_REF_NAME//[^a-zA-Z0-9._-]/-}" >> "${GITHUB_ENV}"
           fi
+
+      - uses: ./.github/actions/rust-stable-pin
 
       - name: Install Rust (stable + target)
         run: |

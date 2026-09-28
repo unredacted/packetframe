@@ -41,7 +41,7 @@ Linux-only code (BPF syscalls, `/proc/config.gz`, `/proc/sys/...`, bpffs, netlin
 
 ## Toolchain
 
-Stable Rust is pinned via root `rust-toolchain.toml`. A second `rust-toolchain.toml` under `crates/modules/fast-path/bpf/` pins nightly for the BPF crate (aya-ebpf needs it). `bpf-linker` is pinned in CI via `cargo install --locked bpf-linker@<version>`. Don't unpin any of these; aya has had breaking API changes across minor versions.
+Stable Rust is pinned only in root `rust-toolchain.toml`: CI reads it from there (`.github/actions/rust-stable-pin`) and Dependabot proposes the bumps. A second `rust-toolchain.toml` under `crates/modules/fast-path/bpf/` pins nightly for the BPF crate (aya-ebpf needs it). `bpf-linker` is pinned in CI via `cargo install --locked bpf-linker@<version>`. The nightly and bpf-linker stay hand-pinned. Don't unpin any of these; aya has had breaking API changes across minor versions.
 
 ## Error handling
 

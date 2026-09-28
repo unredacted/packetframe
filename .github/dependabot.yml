@@ -1,9 +1,9 @@
 version: 2
 
 # SPEC.md §7.1 requires version drifts to surface as reviewable PRs
-# rather than silent ecosystem movement. Dependabot covers all three
-# package ecosystems in this repo: the workspace cargo graph, the
-# non-workspace BPF cargo graph, and the github-actions used by CI.
+# rather than silent ecosystem movement. Dependabot covers the workspace
+# cargo graph, the non-workspace BPF cargo graph, the stable Rust
+# toolchain pin, and the github-actions used by CI.
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
@@ -40,6 +40,18 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 3
+
+  # The stable Rust pin. The cargo ecosystem never reads
+  # rust-toolchain.toml, which is why the pin sat on 1.95.0 while stable
+  # moved on. This ecosystem only reads rust-toolchain(.toml) in the
+  # listed directory, not below it, so the hand-pinned BPF nightlies in
+  # crates/modules/*/bpf/ stay out of scope. CI reads the pin from the
+  # same file, so a bump PR is tested on the compiler it proposes.
+  - package-ecosystem: "rust-toolchain"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 1
 
   - package-ecosystem: "github-actions"
     directory: "/"

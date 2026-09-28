@@ -15,7 +15,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
   # Pin versions so adding a matrix dimension doesn't drift toolchains.
-  RUST_STABLE: "1.95.0"
   RUST_NIGHTLY: "nightly-2026-04-14"
   BPF_LINKER_VERSION: "0.10.3"
 
@@ -55,6 +54,8 @@ jobs:
           sudo docker system prune -af 2>/dev/null || true
           sudo apt-get clean
           df -h /
+
+      - uses: ./.github/actions/rust-stable-pin
 
       - name: Install Rust stable + nightly (for BPF)
         run: |
