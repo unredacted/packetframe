@@ -14,7 +14,7 @@ the tag. Only a pushed `v*` tag publishes; a manual workflow run is
 always a dry run. Releases up to 0.2.7 predate this file; their
 notes are on the [releases page](https://github.com/unredacted/packetframe/releases).
 
-## [0.5.0] - UNRELEASED
+## [0.5.0] - 2026-09-28
 
 The first release since 0.2.7 (2026-05-20), about 220 commits. It adds
 three modules — vpp-offload, neigh-snoop and guard — and a persistent
@@ -22,6 +22,26 @@ event log. Code comments cite versions 0.2.8, 0.2.9 and 0.2.10. None of
 those shipped; that work is part of 0.5.0, which is the next version
 after 0.2.7. Read **Upgrade notes** and **Known limitations** before
 installing.
+
+### Highlights
+
+- **VPP offload, in production.** vpp-offload steers IPv4 and IPv6 in
+  both directions into a VPP instance on NIC virtual functions. On the
+  reference deployment (four steered ports, full IPv4 and IPv6 tables),
+  moving IPv6 into VPP alongside IPv4 took softirq from about 16% of CPU
+  to about 1%.
+- **Restarts that stay steered.** `packetframe detach --keep-vpp` leaves
+  VPP forwarding, and the next daemon adopts it from the route ledger the
+  stopping daemon preserved. Measured on the reference deployment: no
+  unsteered window, and VPP's process is never restarted.
+- **neigh-snoop** learns neighbours on IX-facing bridges passively and
+  feeds FRR's next-hop gate.
+- **A persistent event log** (`packetframe events`) records steering,
+  verify, restarts and health transitions, and is readable without the
+  daemon.
+- The release job now refuses a tag whose version, `VERSION`,
+  `Cargo.toml` and this changelog disagree. Release artifacts ship the
+  runbooks and example config.
 
 ### New modules
 
@@ -203,6 +223,11 @@ See `docs/runbooks/guard.md`.
   fast-path refuses to start over the pins a previous daemon left, and
   the package runs no maintainer scripts. It neither stops nor restarts
   the daemon on its own, because that would bounce the dataplane.
+- **From a recent main-branch build that runs vpp-offload:** install the
+  package, `systemctl daemon-reload`, then `systemctl stop packetframe &&
+  packetframe detach --keep-vpp && systemctl start packetframe`. VPP keeps
+  forwarding throughout. This is how the reference deployment moved to
+  0.5.0.
 - **`bridge-resolve` now defaults to on (`auto`).** Add
   `bridge-resolve off` to keep 0.2.7's behaviour. While the
   short-circuit is installed on a bridge, `mss-clamp … via <bridge>`
