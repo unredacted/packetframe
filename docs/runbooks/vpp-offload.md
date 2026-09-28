@@ -3223,12 +3223,108 @@ Be precise about this when reasoning about an incident.
 | Fifth steer (exemptions live — w24) and hours-scale soaks (w25/w26) | w24: `rules-installed=6`, svc-pinger survived the steer for the first time, steered minutes ≈ zero remote loss. w25: 105 min steered, heap flat at 844.6M/2.5G across every snapshot, one daemon pid, SIGHUP auto-rollback exercised live. w26: full 2 h + the B1 delivery gate (`.7/32` via `octeon4/0.1337` before any steer) | 2026-08-14→16. The w25 SSH drop proved the trap rollback unattended; harnesses run detached since. |
 | The default-route drop counter under steering — decomposed by destination profile | Pre-exemption ~365 pps; **~50+ pps of it was live inter-site traffic** (vti64-bound: ord1's /24 + seven host routes inside the local /24), silently one-way-blackholed in EVERY steered window w23→w26; the remaining **~155 pps is the junk floor** (misdirected VPN/overlay to RFC1918/CGNAT, SSDP, bogons — dies on the kernel path too, upstream and invisibly) | 2026-08-16/17 w26/w26b. Exemptions zeroed the real-traffic share: w26b held 153–170 pps flat for 30 min with 14 rules, tcpdump proofs 5/5 on eth2 (inter-site) and 5/5 on vti64 (tunnel /32s) WHILE steered. The floor is expected; alarm on rate CHANGE. |
 | Idle draw with VPP polling one worker | 33.56 W, 38/49/42 °C, fan 3780 RPM | 2026-08-11 shadow, chassis total — NOT a VPP attribution, no VPP-off baseline was taken. |
+| VPP software forwarding cost, one worker | **123 ns/packet** (~8.1 Mpps per core); the same at 64, 750 and 1400 B | 2026-09-28, dev rig (same SoC, 5.15 vendor kernel and VPP 26.06 octeon build as the reference deployment). `packet-generator` into `ip4-input`, 14,643 /24 routes, full 256-packet vectors, active nodes only. **Excludes NIC receive and transmit.** Method: [Per-core forwarding capacity](#per-core-forwarding-capacity-packet-generator-method). |
+| Per-node split of the 123 ns | ip4-input **27**, ip4-lookup **27** (14.6k routes), ip4-rewrite **35**, interface output **12**, generator-interface tx **23** (stands in for the NIC) | Same run. Each node is rounded, so the parts sum to 124. |
 
 **Published but never measured:** `detach --all` across **more than
 two** VFs. The one-VF (2.814 s) and two-VF (4.91 s) teardowns are
 measured above; the reference router's four-VF teardown has not been
 timed, so budget for it by extrapolation and measure it on the next
 full teardown there rather than quoting a figure.
+
+### Per-core forwarding capacity (packet-generator method)
+
+The two per-core rows above were measured on the dev rig with VPP's
+built-in `packet-generator`, so no traffic source and no NIC are
+involved. One stream, pinned to worker 0, injects at `ip4-input` on a
+generator interface bound to a separate FIB table (99). That table
+holds 14,643 /24 routes, all via a static neighbour on a second
+generator interface, and the destination address walks the whole range
+so every route is used. Run it on the dev rig, never on a forwarding
+box: the stream takes worker 0 away from real traffic. Cost is read
+from `show runtime` over a 10 s window after `clear runtime`:
+confirm the vectors are full (Vectors/Call 256), then add up the
+active nodes, leaving out `pg-input` (the generator's own cost).
+Packet size does not move the result, because VPP never touches the
+payload.
+
+```sh
+V="vppctl -s /run/packetframe/vpp/api.sock.cli"
+awk 'BEGIN{for(i=0;i<14643;i++) printf "ip route add 100.%d.%d.0/24 table 99 via 198.18.0.2 pg1\n", 64+int(i/256), i%256}' > /root/pg-routes-add.cli
+sed 's/^ip route add/ip route del/' /root/pg-routes-add.cli > /root/pg-routes-del.cli
+$V create packet-generator interface pg0
+$V create packet-generator interface pg1
+$V ip table add 99
+$V set interface ip table pg0 99
+$V set interface ip table pg1 99
+$V set interface ip address pg0 192.0.2.1/24
+$V set interface ip address pg1 198.18.0.1/24
+$V set interface state pg0 up
+$V set interface state pg1 up
+$V ip neighbor pg1 198.18.0.2 02:00:00:00:00:20 static
+$V exec /root/pg-routes-add.cli
+$V show ip fib table 99 100.64.0.1/32   # forwarding must read "via 198.18.0.2 pg1", not drop
+# one stream per size; the payload is size minus 28 (IPv4 + UDP headers)
+$V packet-generator new "{ name pf750 limit 100000000 size 750-750 worker 0 interface pg0 node ip4-input data { UDP: 198.51.100.1 -> 100.64.0.1 - 100.121.50.1 UDP: 1234 -> 5678 incrementing 722 } }"
+$V packet-generator enable-stream pf750; sleep 3
+$V clear runtime; sleep 10; $V show runtime > /root/pg750.txt
+$V packet-generator disable-stream pf750
+# cleanup
+$V packet-generator delete pf750
+$V exec /root/pg-routes-del.cli
+$V ip neighbor del pg1 198.18.0.2 02:00:00:00:00:20
+$V set interface ip address del pg0 192.0.2.1/24
+$V set interface ip address del pg1 198.18.0.1/24
+$V set interface state pg0 down
+$V set interface state pg1 down
+$V set interface ip table pg0 0
+$V set interface ip table pg1 0
+$V ip table del 99
+```
+
+The two generator interfaces stay, down and unaddressed, until VPP next
+restarts. The destination steps by one address per packet, so each
+256-packet vector falls inside a single /24 and the lookup runs
+cache-warm; together with the small table, that is why the 27 ns lookup
+is a floor, not the full-table figure.
+
+Pitfalls:
+
+- **A route via a link-down interface resolves to drop.** A first
+  attempt used a real port with no cable as the output and measured
+  lookup→drop, not forwarding. Output to a generator interface.
+- **Never point the generator at a port with carrier.** The stream
+  would leave the box onto a real link.
+- **`Clocks` is not CPU cycles on this SoC.** It counts ticks of the
+  100 MHz system timer, 10 ns each (`show cpu` reports ".1000 GHz").
+  Multiply by 10 for nanoseconds.
+- **Polling input nodes' clocks include idle polling time.** Take the
+  per-packet cost from active nodes only.
+
+**Estimated, not measured: what this means on the reference
+deployment.** The rig figure leaves out NIC I/O. At the reference
+deployment's production batches of 1–5 packets, the octeon `-tx`
+node's cost in its live `show runtime` fits a fixed cost per batch plus
+about **70 ns per packet** (7 data points), so NIC transmit at full
+batches is estimated at ~70 ns per packet. NIC receive could not be
+separated from idle polling and is assumed similar. Add the 1.3M-route
+table (the same kind of fit puts ip4-lookup at ~50–70 ns, against 27 on
+the rig), the bridged-VLAN layer-2 nodes, and the IPv6 share
+(ip6-lookup costs about 2.4× ip4-lookup), and the estimate is **about
+300–400 ns per packet, ≈ 2.5–3.3 Mpps per core**: ≈ 15–20 Gbps per core
+at a ~750-byte average packet, ≈ 28–37 Gbps at 1400 bytes. For
+comparison, the tuned generic-XDP path's measured per-packet CPU is in
+[generic-mode-performance.md, IRQ
+coalescing](generic-mode-performance.md#irq-coalescing-the-cheapest-measured-win-on-this-fleet).
+That figure includes NIC receive and the kernel path, so set it against
+this estimate, not against the rig's 123 ns: it is roughly 28–37 times
+more CPU per packet.
+
+**What that means for `cores`.** A port has one worker and one receive
+queue unless `cores N` says otherwise. At a ~750-byte mix a 25G port's
+single worker saturates around 15–20 Gbps by the estimate above, so
+give a port `cores 2` as it approaches ~12 Gbps. That is
+restart-only, like every `cores` change.
 
 ### A fresh attach on a full-table box holds in `Syncing` for minutes. That is the fix working.
 
