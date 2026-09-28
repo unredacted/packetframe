@@ -318,41 +318,85 @@ pub struct Published {
 ///   Refusing a reload that changed nothing, on those grounds, reports a
 ///   failure about a change nobody made.
 ///
-/// No SETTLED snapshot is needed for either. A pass in flight may already
-/// have moved on — `Driver::apply` changes the state and the want before
-/// it runs a steer — but the verdict is a statement about the reload, not
-/// a promise about the loop: a convergence that ends while the reload is
-/// answered steers (or fails to, and retries) on its own, exactly as it
-/// would have had no reload arrived, and says so on `packetframe status`.
-/// Requiring a settled snapshot is what kept this answer from the adopted
-/// resync, whose passes are long enough that one is nearly always in
-/// flight.
+/// A snapshot is the state as of the last completed pass, and a pass in
+/// flight may already have moved on — `Driver::apply` changes the state
+/// and the want BEFORE it runs a steer that can take a while and then fail
+/// (an adopted convergence publishes `Verifying`, enters `Ready` and
+/// starts its automatic steer inside one pass). The two ways a re-send is
+/// inert differ in whether that matters:
+///
+/// - **Nothing steered or wanted** holds from any snapshot. No pass sets a
+///   want or steers on its own from there — every arm that does needs one
+///   already set, an operator request, or attach-time inheritance — and
+///   operator requests arrive only through the serial reconfigure path.
+/// - **A state that would refuse it** is only as current as the snapshot.
+///   From a SETTLED one — published by a pass that has finished, with no
+///   new one begun — a request placed now is taken before the next tick,
+///   against exactly that state, so it would be refused untouched. From
+///   one a pass may be moving past, the loop may already be in `Ready`
+///   with a want, where the identical request is the advertised immediate
+///   retry. The reload still answers `Ok` — failing it was the hardware
+///   bug, and an adopted resync's passes follow one another so closely
+///   that a settled look is rare — but the caller also NUDGES the loop
+///   ([`ResendAdvice::SkipAndNudge`]), so a retry that is due happens now
+///   rather than [`crate::driver::STEER_RETRY_EVERY`] later.
 ///
 /// `Default` answers "not inert": the safe verdict for a snapshot the
 /// loop did not observe.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResendVerdict {
-    steer_inert: bool,
-    removal_inert: bool,
+    at_rest: bool,
+    steer_refused: bool,
+    removal_refused: bool,
 }
 
 impl ResendVerdict {
     pub fn observe(state: State, steer_intended: bool) -> Self {
         Self {
-            steer_inert: !(steer_intended && state.accepts_steering_changes()),
-            removal_inert: !(steer_intended && state.accepts_steering_removal()),
+            at_rest: !steer_intended,
+            steer_refused: !state.accepts_steering_changes(),
+            removal_refused: !state.accepts_steering_removal(),
         }
     }
 
     /// For a request whose `want_steer` is this.
     pub fn inert(self, want_steer: bool) -> bool {
+        self.at_rest || self.refused(want_steer)
+    }
+
+    /// Whether the inert verdict rests on the lifecycle state alone —
+    /// the half a pass in flight can overturn.
+    pub fn state_dependent(self, want_steer: bool) -> bool {
+        !self.at_rest && self.refused(want_steer)
+    }
+
+    fn refused(self, want_steer: bool) -> bool {
         if want_steer {
-            self.steer_inert
+            self.steer_refused
         } else {
-            self.removal_inert
+            self.removal_refused
         }
     }
 }
+
+/// What a reload whose steering inputs equal the loop's should do with
+/// them. See [`ResendVerdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResendAdvice {
+    /// A re-send would act (the repair, the "ask now" retry, the
+    /// rollback's retry): send it and wait for the loop's answer.
+    Send,
+    /// A re-send would ask the loop for nothing: answer without it.
+    Skip,
+    /// Answer without the loop, and post the identical request without
+    /// waiting ([`SupervisionService::nudge_steering`]): the snapshot that
+    /// says the loop would refuse it may be stale.
+    SkipAndNudge,
+}
+
+/// Every request a test stand-in loop took, as `(want_steer, admitted)`.
+#[cfg(test)]
+pub(crate) type TakenLog = Arc<Mutex<Vec<(bool, bool)>>>;
 
 /// Shared between the loop and the module.
 struct Shared {
@@ -373,6 +417,10 @@ struct Shared {
     steering_result: Mutex<Option<(u64, Result<(), String>)>>,
     /// Hands out request sequence numbers.
     steering_seq: AtomicU64,
+    /// Odd while a loop pass is between its first possible state change
+    /// and its publish — a seqlock over `latest`, read by
+    /// [`SupervisionService::resend_advice`].
+    pass_seq: AtomicU64,
 }
 
 /// The one place a shutdown that did not complete is turned into a snapshot.
@@ -553,6 +601,7 @@ impl SupervisionService {
             steering_request: Mutex::new(None),
             steering_result: Mutex::new(None),
             steering_seq: AtomicU64::new(0),
+            pass_seq: AtomicU64::new(0),
         });
         let looped = Arc::clone(&shared);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -717,23 +766,17 @@ impl SupervisionService {
         }
     }
 
-    /// Hand the loop a new steering target and wait for its verdict.
-    ///
-    /// Synchronous on purpose — see [`STEERING_BUDGET`]. Returns `Err`
-    /// when the loop refused the change (not converged, the FIB is
-    /// incomplete, an MCAM insert failed), when a newer request
-    /// superseded this one, or when the loop did not answer in time. In
-    /// every one of those cases the operator's rollout step did NOT
-    /// happen, which is what they need to know.
-    pub fn apply_steering(
+    /// Place a steering request in the loop's slot and return its
+    /// sequence number, without waiting for the answer.
+    fn post_steering(
         &self,
         targets: Vec<(String, u32, crate::steer::RuleSet)>,
         scope: crate::drift::DriftScope,
         want_steer: bool,
         lever_moved: bool,
-    ) -> Result<(), String> {
+    ) -> u64 {
         // Sequence first, so the request that lands in the slot is
-        // always the one whose number we then wait for.
+        // always the one whose number its caller then waits for.
         let seq = self.shared.steering_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let displaced = self
             .shared
@@ -762,9 +805,10 @@ impl SupervisionService {
         // from a request rather than from an observation, in the
         // machinery built to avoid exactly that.
         //
-        // Unreachable from the loader today (SIGHUP handling is serial,
-        // and each `reconfigure` blocks for its answer), so this is
-        // about the seam being honest rather than about a live race.
+        // From the loader this displaces only a nudge — SIGHUP handling
+        // is serial, each `reconfigure` blocks for its answer, and a
+        // nudge's answer has no reader — so it is about the seam being
+        // honest rather than about a live race.
         if let Some(older) = displaced {
             *self.shared.steering_result.lock().expect("steering lock") = Some((
                 older.seq,
@@ -776,7 +820,43 @@ impl SupervisionService {
                 ),
             ));
         }
+        seq
+    }
 
+    /// Post the steering request the loop already holds and return at
+    /// once — [`ResendAdvice::SkipAndNudge`]'s second half.
+    ///
+    /// The loop applies it as it would any request, so where a steer
+    /// retry is due (`Ready` with a want) it happens now, and where the
+    /// state refuses it the refusal is published for a sequence nobody is
+    /// waiting on. Never a lever move: it re-sends the same inputs, so it
+    /// can do nothing a plain `reconfigure` of an unchanged config could
+    /// not.
+    pub fn nudge_steering(
+        &self,
+        targets: Vec<(String, u32, crate::steer::RuleSet)>,
+        scope: crate::drift::DriftScope,
+        want_steer: bool,
+    ) {
+        self.post_steering(targets, scope, want_steer, false);
+    }
+
+    /// Hand the loop a new steering target and wait for its verdict.
+    ///
+    /// Synchronous on purpose — see [`STEERING_BUDGET`]. Returns `Err`
+    /// when the loop refused the change (not converged, the FIB is
+    /// incomplete, an MCAM insert failed), when a newer request
+    /// superseded this one, or when the loop did not answer in time. In
+    /// every one of those cases the operator's rollout step did NOT
+    /// happen, which is what they need to know.
+    pub fn apply_steering(
+        &self,
+        targets: Vec<(String, u32, crate::steer::RuleSet)>,
+        scope: crate::drift::DriftScope,
+        want_steer: bool,
+        lever_moved: bool,
+    ) -> Result<(), String> {
+        let seq = self.post_steering(targets, scope, want_steer, lever_moved);
         let deadline = Instant::now() + STEERING_BUDGET;
         loop {
             if let Some((answered, outcome)) = self
@@ -844,19 +924,35 @@ impl SupervisionService {
         }
     }
 
-    /// Whether re-sending the steering request the loop holds would do
-    /// nothing — the loop's own [`ResendVerdict`], from its latest
-    /// snapshot.
+    /// What to do with a re-send of the steering request the loop holds
+    /// — the loop's own [`ResendVerdict`], read so it is trusted no
+    /// further than it deserves.
     ///
     /// A dead loop can act on nothing, so asking it could only time out:
     /// the request would sit in a slot no thread reads until
     /// [`STEERING_BUDGET`] ran out. That supervision has stopped is
     /// `health_check`'s to report, not an unchanged reload's.
-    pub fn resend_is_inert(&self, want_steer: bool) -> bool {
+    ///
+    /// The state-dependent half needs a snapshot no pass has moved past,
+    /// so `latest` is read between two loads of the pass counter — even
+    /// and unchanged means no pass was running on either side of the read.
+    pub fn resend_advice(&self, want_steer: bool) -> ResendAdvice {
         if !self.is_alive() {
-            return true;
+            return ResendAdvice::Skip;
         }
-        self.status().is_some_and(|p| p.resend.inert(want_steer))
+        let before = self.shared.pass_seq.load(Ordering::SeqCst);
+        let Some(p) = self.status() else {
+            return ResendAdvice::Send;
+        };
+        let settled =
+            before.is_multiple_of(2) && self.shared.pass_seq.load(Ordering::SeqCst) == before;
+        if !p.resend.inert(want_steer) {
+            ResendAdvice::Send
+        } else if p.resend.state_dependent(want_steer) && !settled {
+            ResendAdvice::SkipAndNudge
+        } else {
+            ResendAdvice::Skip
+        }
     }
 
     /// How many steering requests have been posted to this service —
@@ -872,7 +968,7 @@ impl SupervisionService {
     /// once and exits on `stop`.
     #[cfg(test)]
     pub(crate) fn wedged_for_test(published: Published) -> Self {
-        Self::stub_for_test(published, false)
+        Self::stub_for_test(published, false, None).0
     }
 
     /// A service whose loop answers every steering request at once, as
@@ -881,12 +977,22 @@ impl SupervisionService {
     /// where it admits it.
     #[cfg(test)]
     pub(crate) fn answering_for_test(published: Published) -> Self {
-        Self::stub_for_test(published, true)
+        let state = published.state;
+        Self::stub_for_test(published, false, Some(state)).0
     }
 
+    /// The general stand-in. `mid_pass` leaves the pass counter odd, as a
+    /// loop inside a pass does. `answer_as` is the state the loop is
+    /// REALLY in — which may differ from the snapshot's, which is the
+    /// point of a stale one — or `None` for a loop that never picks
+    /// anything up. Every request it takes is recorded as `(want_steer,
+    /// admitted)`.
     #[cfg(test)]
-    fn stub_for_test(published: Published, answering: bool) -> Self {
-        let state = published.state;
+    pub(crate) fn stub_for_test(
+        published: Published,
+        mid_pass: bool,
+        answer_as: Option<State>,
+    ) -> (Self, TakenLog) {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             preserve: AtomicBool::new(false),
@@ -894,21 +1000,28 @@ impl SupervisionService {
             steering_request: Mutex::new(None),
             steering_result: Mutex::new(None),
             steering_seq: AtomicU64::new(0),
+            pass_seq: AtomicU64::new(u64::from(mid_pass)),
         });
+        let taken = Arc::new(Mutex::new(Vec::new()));
         let looped = Arc::clone(&shared);
+        let record = Arc::clone(&taken);
         let thread = std::thread::spawn(move || {
             while !looped.stop.load(Ordering::SeqCst) && !looped.preserve.load(Ordering::SeqCst) {
-                if answering {
-                    let taken = looped
+                if let Some(state) = answer_as {
+                    let req = looped
                         .steering_request
                         .lock()
                         .expect("steering lock")
                         .take();
-                    if let Some(req) = taken {
+                    if let Some(req) = req {
                         let outcome = match refusal(state, req.want_steer) {
                             Some(why) => Err(why),
                             None => Ok(()),
                         };
+                        record
+                            .lock()
+                            .expect("record lock")
+                            .push((req.want_steer, outcome.is_ok()));
                         *looped.steering_result.lock().expect("steering lock") =
                             Some((req.seq, outcome));
                     }
@@ -916,10 +1029,13 @@ impl SupervisionService {
                 std::thread::sleep(STEERING_POLL);
             }
         });
-        Self {
-            shared,
-            thread: Some(thread),
-        }
+        (
+            Self {
+                shared,
+                thread: Some(thread),
+            },
+            taken,
+        )
     }
 
     /// End supervision the PRESERVING way, for a daemon that is exiting
@@ -1492,6 +1608,10 @@ fn run_loop(
     let _ = ready.send(Ok(()));
 
     while !shared.stop.load(Ordering::SeqCst) && !shared.preserve.load(Ordering::SeqCst) {
+        // Odd from here to the publish below: everything that can move
+        // the state lies between them. The breaks leave it odd, which is
+        // right — nothing after them publishes an ordinary snapshot.
+        shared.pass_seq.fetch_add(1, Ordering::SeqCst);
         // Steering changes first, before the tick. They are the
         // operator's, they are synchronous on the far side, and a tick
         // can take a while — a resync batch, a verify sample — so
@@ -1677,6 +1797,7 @@ fn run_loop(
         if episode_over {
             last_failures.clear();
         }
+        shared.pass_seq.fetch_add(1, Ordering::SeqCst);
 
         match tick.sleep {
             Some(d) if d.is_zero() => {} // more work queued; go again
@@ -1890,6 +2011,15 @@ mod tests {
                     refusal(state, want_steer).is_some(),
                     "{state:?} want_steer={want_steer}"
                 );
+                // With a want, that inertness rests on the state alone —
+                // the half a pass in flight can overturn. At rest it
+                // never does.
+                assert_eq!(
+                    intended.state_dependent(want_steer),
+                    intended.inert(want_steer),
+                    "{state:?} want_steer={want_steer}"
+                );
+                assert!(!rest.state_dependent(want_steer), "{state:?}");
             }
         }
         // The hardware case by name: a keep-VPP restart adopts a steered
@@ -1923,8 +2053,9 @@ mod tests {
     fn a_dead_loop_is_asked_for_nothing() {
         let steered = published_with(State::Steered, ResendVerdict::observe(State::Steered, true));
         let live = SupervisionService::wedged_for_test(steered.clone());
-        assert!(
-            !live.resend_is_inert(true),
+        assert_eq!(
+            live.resend_advice(true),
+            ResendAdvice::Send,
             "live and steered: the repair lever"
         );
         let _ = live.stop();
@@ -1937,11 +2068,41 @@ mod tests {
                 steering_request: Mutex::new(None),
                 steering_result: Mutex::new(None),
                 steering_seq: AtomicU64::new(0),
+                pass_seq: AtomicU64::new(1),
             }),
             thread: None,
         };
         assert!(!dead.is_alive());
-        assert!(dead.resend_is_inert(true) && dead.resend_is_inert(false));
+        assert_eq!(dead.resend_advice(true), ResendAdvice::Skip);
+        assert_eq!(dead.resend_advice(false), ResendAdvice::Skip);
+    }
+
+    /// A state-dependent verdict is trusted outright only from a settled
+    /// snapshot. From one a pass may be moving past, the reload skips the
+    /// wait but nudges; at rest, no pass can overturn it, so neither
+    /// matters.
+    #[test]
+    fn only_a_stale_state_dependent_verdict_asks_for_a_nudge() {
+        let adopted = || {
+            published_with(
+                State::AdoptedResyncing,
+                ResendVerdict::observe(State::AdoptedResyncing, true),
+            )
+        };
+        let (mid, _) = SupervisionService::stub_for_test(adopted(), true, None);
+        assert_eq!(mid.resend_advice(true), ResendAdvice::SkipAndNudge);
+        let (settled, _) = SupervisionService::stub_for_test(adopted(), false, None);
+        assert_eq!(settled.resend_advice(true), ResendAdvice::Skip);
+        let at_rest = published_with(
+            State::Syncing,
+            ResendVerdict::observe(State::Syncing, false),
+        );
+        let (rest, _) = SupervisionService::stub_for_test(at_rest, true, None);
+        assert_eq!(rest.resend_advice(true), ResendAdvice::Skip);
+        assert_eq!(rest.resend_advice(false), ResendAdvice::Skip);
+        for svc in [mid, settled, rest] {
+            let _ = svc.stop();
+        }
     }
 
     /// A factory that FAILS is an attach failure carrying its own

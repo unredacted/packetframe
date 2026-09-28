@@ -1720,26 +1720,43 @@ impl Module for VppOffloadModule {
         //   hot directive, `drift-accept6`, was published above;
         // - an identical request would not ACT: nothing is steered or
         //   wanted, or the state would refuse it untouched — in every
-        //   convergence state, degraded or not, from any snapshot. What
-        //   still goes to the loop is the plain `reconfigure` the runbook
-        //   uses as a lever — the steering repair from `Steered`, "ask
-        //   now" for a remembered want from `Ready`, and the rollback's
-        //   retry for a removal — which is the only place a re-send does
-        //   something. See `service::ResendVerdict`.
+        //   convergence state, degraded or not. What still goes to the
+        //   loop is the plain `reconfigure` the runbook uses as a lever —
+        //   the steering repair from `Steered`, "ask now" for a remembered
+        //   want from `Ready`, and the rollback's retry for a removal —
+        //   which is the only place a re-send does something. See
+        //   `service::ResendVerdict`.
+        //
+        // "The state would refuse it" is only as fresh as the loop's last
+        // snapshot, and a pass in flight may already have reached `Ready`
+        // with a want, where this reload is the immediate retry. So from
+        // a snapshot a pass may be moving past, the reload still answers
+        // `Ok` but also posts the identical request without waiting for
+        // it: if the retry is due it happens now, and if the loop is
+        // still converging its refusal goes unread.
         //
         // The drift scope is safe too: nothing is staged, and nothing
         // needs to be, because what would have been staged is what the
-        // watcher already has or is waiting to commit.
-        if !lever_moved
-            && attached.held_steering.as_ref() == Some(&planned)
-            && attached.service.resend_is_inert(planned.want_steer)
-        {
-            tracing::info!(
-                "vpp-offload: reload changes none of this module's steering inputs; applied \
-                 unchanged without asking the supervision loop"
-            );
-            self.cfg = new;
-            return Ok(());
+        // watcher already has or is waiting to commit — and a nudge
+        // stages the very scope the loop holds.
+        if !lever_moved && attached.held_steering.as_ref() == Some(&planned) {
+            let advice = attached.service.resend_advice(planned.want_steer);
+            if advice != service::ResendAdvice::Send {
+                if advice == service::ResendAdvice::SkipAndNudge {
+                    attached.service.nudge_steering(
+                        planned.targets.clone(),
+                        planned.scope.clone(),
+                        planned.want_steer,
+                    );
+                }
+                tracing::info!(
+                    nudged = advice == service::ResendAdvice::SkipAndNudge,
+                    "vpp-offload: reload changes none of this module's steering inputs; \
+                     applied unchanged without waiting on the supervision loop"
+                );
+                self.cfg = new;
+                return Ok(());
+            }
         }
         let outcome = attached.service.apply_steering(
             planned.targets.clone(),
@@ -2928,6 +2945,115 @@ mod tests {
                 );
                 m.detach().expect("the stand-in loop stops");
             }
+        }
+    }
+
+    /// Behind a stand-in loop whose snapshot says `published.state` while
+    /// it is really in `actually`, with a pass in flight or not — plus the
+    /// record of every request it takes, as `(want_steer, admitted)`.
+    fn behind_a_loop_really_in(
+        section: &packetframe_common::config::ModuleSection,
+        published: service::Published,
+        mid_pass: bool,
+        actually: State,
+    ) -> (VppOffloadModule, service::TakenLog) {
+        let (svc, taken) =
+            service::SupervisionService::stub_for_test(published, mid_pass, Some(actually));
+        (attached_behind(section, svc), taken)
+    }
+
+    /// Wait for the stand-in loop to have taken `n` requests.
+    fn taken_after(taken: &std::sync::Mutex<Vec<(bool, bool)>>, n: usize) -> Vec<(bool, bool)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let seen = taken.lock().unwrap().clone();
+            if seen.len() >= n || std::time::Instant::now() >= deadline {
+                return seen;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// (a) The review finding: the snapshot says `AdoptedResyncing`, but a
+    /// pass in flight has already reached `Ready` with the want recorded —
+    /// where this unchanged reload is the operator's immediate retry. The
+    /// reload answers `Ok` without waiting, and the loop receives exactly
+    /// one nudge, which it ADMITS: the steer attempt happens now rather
+    /// than at the next retry interval.
+    #[test]
+    fn a_stale_snapshot_answers_ok_and_nudges_the_retry_that_is_due() {
+        let section = steered_section(vec![]);
+        let (mut m, taken) = behind_a_loop_really_in(
+            &section,
+            published_in(State::AdoptedResyncing, true),
+            true,
+            State::Ready,
+        );
+        let started = std::time::Instant::now();
+        reload(&mut m, &section).expect("nothing changed, so nothing can fail");
+        assert!(
+            started.elapsed() < service::STEERING_BUDGET / 2,
+            "the reload does not wait on the nudge: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            taken_after(&taken, 1),
+            [(true, true)],
+            "one nudge, admitted by the loop that is really in Ready"
+        );
+        assert_eq!(requests(&m), 1, "exactly one nudge");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(taken.lock().unwrap().len(), 1, "and nothing after it");
+        m.detach().expect("the stand-in loop stops");
+    }
+
+    /// (b) The same stale snapshot over a loop that IS still resyncing:
+    /// the nudge is refused, nobody reads the refusal, and the reload —
+    /// and the next one — are still `Ok`, with the loop's target still
+    /// known, since a nudge re-sends exactly what it holds.
+    #[test]
+    fn a_nudge_into_a_genuine_resync_is_refused_harmlessly() {
+        let section = steered_section(vec![]);
+        let (mut m, taken) = behind_a_loop_really_in(
+            &section,
+            published_in(State::AdoptedResyncing, true),
+            true,
+            State::AdoptedResyncing,
+        );
+        reload(&mut m, &section).expect("the refused nudge is not the reload's answer");
+        assert_eq!(taken_after(&taken, 1), [(true, false)], "refused, unread");
+        assert!(
+            m.attached
+                .as_ref()
+                .expect("attached")
+                .held_steering
+                .is_some(),
+            "a nudge re-sends what the loop holds, so the target stays known"
+        );
+        reload(&mut m, &section).expect("and again");
+        assert_eq!(taken_after(&taken, 2), [(true, false), (true, false)]);
+        m.detach().expect("the stand-in loop stops");
+    }
+
+    /// (c) From a SETTLED snapshot the refusal it predicts is current — a
+    /// request placed now is taken before the next tick against exactly
+    /// that state — so there is nothing to nudge.
+    #[test]
+    fn a_settled_non_converged_snapshot_sends_no_nudge() {
+        let section = steered_section(vec![]);
+        for state in [
+            State::AdoptedResyncing,
+            State::Syncing,
+            State::Verifying,
+            State::Backoff,
+        ] {
+            let (mut m, taken) =
+                behind_a_loop_really_in(&section, published_in(state, true), false, state);
+            reload(&mut m, &section).expect("nothing changed");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(requests(&m), 0, "{state:?}: no nudge");
+            assert!(taken.lock().unwrap().is_empty(), "{state:?}");
+            m.detach().expect("the stand-in loop stops");
         }
     }
 

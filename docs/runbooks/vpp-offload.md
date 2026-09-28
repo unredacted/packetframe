@@ -463,7 +463,13 @@ Before 2026-09-27 a reload during an adopted resync after a keep-VPP
 restart also went to the loop — the steered adoption records a want —
 and a fast-path `dry-run` flip came back *"vpp-offload is
 AdoptedResyncing, not converged"*, exit 2, `reconfigure_failed` for a
-module whose configuration had not changed. After any failed request
+module whose configuration had not changed. When a loop pass is running
+as the reload arrives — nearly always, during an adopted resync — the
+module cannot tell whether that pass has just reached `Ready` with a
+want, where the reload is the "ask now" retry. It answers OK anyway and
+also posts the unchanged request without waiting for it: if a retry is
+due it happens at once, and if the loop is still converging it refuses
+the request unseen. After any failed request
 the module no longer knows which target the loop holds, so the next
 reload goes to the loop whatever it changes. The ones that reach the
 loop can still be refused or withdrawn; re-run once `packetframe
