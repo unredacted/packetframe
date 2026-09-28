@@ -3241,27 +3241,43 @@ payload.
 
 ```sh
 V="vppctl -s /run/packetframe/vpp/api.sock.cli"
-awk 'BEGIN{for(i=0;i<14643;i++) printf "ip route add 100.%d.%d.0/24 table 99 via 198.51.100.2 pg1\n", 64+int(i/256), i%256}' > /root/pg-routes.cli
+awk 'BEGIN{for(i=0;i<14643;i++) printf "ip route add 100.%d.%d.0/24 table 99 via 198.18.0.2 pg1\n", 64+int(i/256), i%256}' > /root/pg-routes-add.cli
+sed 's/^ip route add/ip route del/' /root/pg-routes-add.cli > /root/pg-routes-del.cli
 $V create packet-generator interface pg0
 $V create packet-generator interface pg1
 $V ip table add 99
 $V set interface ip table pg0 99
 $V set interface ip table pg1 99
 $V set interface ip address pg0 192.0.2.1/24
-$V set interface ip address pg1 198.51.100.1/24
+$V set interface ip address pg1 198.18.0.1/24
 $V set interface state pg0 up
 $V set interface state pg1 up
-$V set ip neighbor pg1 198.51.100.2 02:00:00:00:00:02 static
-$V exec /root/pg-routes.cli
-$V packet-generator new "{ name cap worker 0 size 64-64 node ip4-input interface pg0 data { UDP: 192.0.2.10 -> 100.64.0.1 - 100.121.50.254 UDP: 1234 -> 5678 } }"
-$V packet-generator enable-stream cap
-$V clear runtime; sleep 10; $V show runtime
-# cleanup: the stream goes now; table 99 and pg0/pg1 go at the next VPP restart
-$V packet-generator disable-stream cap
-$V packet-generator delete cap
+$V ip neighbor pg1 198.18.0.2 02:00:00:00:00:20 static
+$V exec /root/pg-routes-add.cli
+$V show ip fib table 99 100.64.0.1/32   # forwarding must read "via 198.18.0.2 pg1", not drop
+# one stream per size; the payload is size minus 28 (IPv4 + UDP headers)
+$V packet-generator new "{ name pf750 limit 100000000 size 750-750 worker 0 interface pg0 node ip4-input data { UDP: 198.51.100.1 -> 100.64.0.1 - 100.121.50.1 UDP: 1234 -> 5678 incrementing 722 } }"
+$V packet-generator enable-stream pf750; sleep 3
+$V clear runtime; sleep 10; $V show runtime > /root/pg750.txt
+$V packet-generator disable-stream pf750
+# cleanup
+$V packet-generator delete pf750
+$V exec /root/pg-routes-del.cli
+$V ip neighbor del pg1 198.18.0.2 02:00:00:00:00:20
+$V set interface ip address del pg0 192.0.2.1/24
+$V set interface ip address del pg1 198.18.0.1/24
 $V set interface state pg0 down
 $V set interface state pg1 down
+$V set interface ip table pg0 0
+$V set interface ip table pg1 0
+$V ip table del 99
 ```
+
+The two generator interfaces stay, down and unaddressed, until VPP next
+restarts. The destination steps by one address per packet, so each
+256-packet vector falls inside a single /24 and the lookup runs
+cache-warm; together with the small table, that is why the 27 ns lookup
+is a floor, not the full-table figure.
 
 Pitfalls:
 
