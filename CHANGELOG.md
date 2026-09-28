@@ -67,9 +67,11 @@ deployment, steering IPv4 and IPv6 in both directions. See
   host interface, plus a /128 in VPP for each of the host's global
   addresses. It is guarded inside VPP by a stateless ACL, not by
   nftables. The ACL admits only replies: TCP with ACK or RST set, and
-  UDP from DNS or NTP servers to the kernel's ephemeral ports. BGP (TCP
-  179, both directions) and DNS (TCP/UDP 53) are built-in keeps that
-  never enter VPP.
+  UDP from DNS or NTP servers to the kernel's ephemeral ports. Two
+  built-in keeps never enter VPP: BGP (TCP port 179, both directions)
+  and DNS to the router (TCP/UDP destination port 53). Replies to the
+  router's own DNS queries are diverted and return over the hand-back
+  path.
 - `packetframe detach --keep-vpp` restarts the daemon while VPP keeps
   forwarding. When the stopping daemon preserves its route ledger, the
   next daemon adopts VPP from that ledger with no FIB dump, and the
@@ -182,6 +184,10 @@ See `docs/runbooks/guard.md`.
 - Release artifacts now include `CHANGELOG.md`, `conf/example.conf` and
   the runbooks: in the tarball under `docs/runbooks/`, and in the .deb
   under `/usr/share/doc/packetframe/`.
+- Built with Rust 1.98.1. The stable toolchain is pinned only in
+  `rust-toolchain.toml`: CI reads it from there, and Dependabot proposes
+  bumps. The workspace minimum (`rust-version`) is now 1.98. The eBPF
+  crates stay on their pinned nightly and `bpf-linker`.
 
 ### Upgrade notes
 
