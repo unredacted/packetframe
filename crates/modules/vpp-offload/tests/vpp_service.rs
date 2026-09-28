@@ -22,7 +22,7 @@ use packetframe_vpp_offload::fib_sync::FamilyPolicy;
 use packetframe_vpp_offload::runtime::{
     IdentityStore, NoResources, NullStore, ProcessIdentity, Runtime, SteeringUnavailable,
 };
-use packetframe_vpp_offload::service::SupervisionService;
+use packetframe_vpp_offload::service::{ResendAdvice, SupervisionService};
 use packetframe_vpp_offload::supervisor::{Event, State};
 
 struct Mirror(Vec<IpPrefix>);
@@ -1397,6 +1397,101 @@ fn a_reconfigure_retries_a_steer_that_was_refused() {
     assert_eq!(seen.last().map(String::as_str), Some("steer"), "{seen:?}");
 }
 
+/// The nudge an unchanged reload sends from a stale snapshot does what
+/// the waited-for re-send would have: over a refused steer in `Ready`
+/// with the want remembered, it re-attempts the steer NOW — well inside
+/// the module's own retry interval, which is the delay a skipped reload
+/// would otherwise have cost the operator.
+#[test]
+fn a_nudge_retries_a_refused_steer_without_waiting_out_the_interval() {
+    let fake = Fake::start("svc-nudge-retry");
+    let sock = fake.path.clone();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spy = std::sync::Arc::clone(&log);
+    let allow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = std::sync::Arc::clone(&allow);
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                    pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                    accept_macs: vec![],
+                    mtu: None,
+                    vlans: vec![],
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+                packetframe_common::config::Ipv4Prefix {
+                    addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                    prefix_len: 32,
+                },
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(GatedSteer {
+                    log: std::sync::Arc::clone(&spy),
+                    allow: std::sync::Arc::clone(&gate),
+                }),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while svc.status().expect("published").state != State::Ready {
+        assert!(Instant::now() < deadline, "did not reach Ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    svc.apply_steering(uniform1(plan_for(2)), Default::default(), true, true)
+        .expect_err("the steer is refused, and the want remembered");
+
+    allow.store(true, std::sync::atomic::Ordering::SeqCst);
+    let started = Instant::now();
+    svc.nudge_steering(uniform1(plan_for(2)), Default::default(), true);
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "a nudge does not wait: {:?}",
+        started.elapsed()
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while svc.status().expect("published").state != State::Steered {
+        assert!(
+            Instant::now() < deadline,
+            "the nudge must retry the steer now, not at the next interval: {:?}",
+            log.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        log.lock().unwrap().last().map(String::as_str),
+        Some("steer")
+    );
+    let _ = svc.stop();
+}
+
 /// One eth4 target carrying `plan` — the uniform shape these fixtures
 /// meant before targets became per-port.
 fn uniform1(
@@ -1590,6 +1685,119 @@ fn a_steering_change_before_convergence_is_refused() {
     );
 
     svc.stop();
+}
+
+/// The keep-VPP restart, against a real loop: an adopted, STEERED VPP
+/// resyncing a table large enough that its passes follow one another,
+/// so one is nearly always in flight when a reload looks.
+///
+/// That is where an unchanged reload failed on hardware — fast-path's
+/// `dry-run` flipped, and vpp-offload answered "AdoptedResyncing, not
+/// converged". The verdict used to count only from a settled snapshot,
+/// which this loop almost never offers; every look must now answer the
+/// reload without waiting on the loop (skipping, or skipping and
+/// nudging), because the loop itself would refuse the request untouched
+/// — which the last step shows, in the loop's own words.
+#[test]
+fn an_adopted_resync_says_an_identical_steer_is_inert_from_every_look() {
+    let fake = Fake::start("svc-adopted-inert");
+    let sock = fake.path.clone();
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                    pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                    accept_macs: vec![],
+                    mtu: None,
+                    vlans: vec![],
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+                packetframe_common::config::Ipv4Prefix {
+                    addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                    prefix_len: 32,
+                },
+            );
+            let runtime = Runtime::new(
+                engine,
+                // Large enough that the resync spans many passes.
+                Box::new(Mirror(
+                    (0..=255u8)
+                        .flat_map(|a| (0..=255u8).map(move |b| fake_vpp::v4(a, b)))
+                        .collect(),
+                )),
+                Box::new(SteeringUnavailable),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: true }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let mut looks = 0;
+    while looks < 200 {
+        let before = svc.status().expect("started").state;
+        let advice = svc.resend_advice(true);
+        let after = svc.status().expect("started").state;
+        if before != State::AdoptedResyncing || after != State::AdoptedResyncing {
+            break;
+        }
+        assert_ne!(
+            advice,
+            ResendAdvice::Send,
+            "look {looks}: an adopted resync with a steered VPP must not wait on the \
+             loop for an unchanged steer"
+        );
+        looks += 1;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        looks >= 20,
+        "the resync must last long enough to be looked at: {looks} look(s)"
+    );
+
+    // A nudge into the genuine resync returns at once and is refused by
+    // the loop with nobody listening; the loop carries on.
+    let started = Instant::now();
+    svc.nudge_steering(uniform1(plan_for(2)), Default::default(), true);
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "a nudge does not wait: {:?}",
+        started.elapsed()
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(svc.is_alive(), "the refused nudge is harmless");
+
+    // What asking would have got: the loop's refusal, untouched.
+    let e = svc
+        .apply_steering(uniform1(plan_for(2)), Default::default(), true, false)
+        .expect_err("the adopted resync refuses a steer");
+    assert!(
+        e.contains("AdoptedResyncing, not converged"),
+        "must be the refusal, not the wait timing out: {e}"
+    );
+
+    let _ = svc.stop();
 }
 
 /// An all-off reconfigure that performs no steering action still
