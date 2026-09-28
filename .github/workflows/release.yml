@@ -4,15 +4,14 @@ on:
   push:
     tags:
       - 'v*.*.*'
-  # Manual trigger for pre-release validation — runs the BPF + cross
-  # build matrix but skips publishing. Use to confirm release tarballs
-  # would ship a real BPF ELF before cutting a tag.
+  # Manual trigger for pre-release validation: the version gate, the
+  # BPF + cross build matrix and the .deb, never a publish. Use it to
+  # confirm the release tarballs would ship a real BPF ELF and that
+  # CHANGELOG.md has a well-formed section for VERSION before cutting a
+  # tag. Every dispatch run is a dry run, even one started on a tag ref:
+  # a release is published ONLY by pushing a `v*` tag (the `publish`
+  # job's `if:`), so there is no input that could publish from a branch.
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Skip the publish step (no GitHub release created)'
-        type: boolean
-        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +19,40 @@ env:
   BPF_LINKER_VERSION: "0.10.3"
 
 jobs:
+  # Refuse to build a release whose version sources disagree. The .deb
+  # takes its version from the tag, the tarball ships VERSION, and the
+  # binary reports the workspace Cargo version — a tag cut without the
+  # bump would publish a 0.x.y package whose binary says the previous
+  # version. Also fails fast (before ~20 min of builds) when CHANGELOG.md
+  # has no section for the version, which publish needs for the notes.
+  # A workflow_dispatch run (always a dry run, see `on:`) takes its
+  # version from VERSION instead of the ref: it skips the tag leg, still
+  # checks VERSION against Cargo and the changelog section's shape, and
+  # extracts the notes exactly as publish would.
+  version-gate:
+    name: version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable, for cargo metadata)
+        run: |
+          rustup toolchain install ${{ env.RUST_STABLE }} --profile minimal
+          rustup default ${{ env.RUST_STABLE }}
+
+      - name: Tag, VERSION, Cargo and CHANGELOG agree
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION_UNDER_TEST="${GITHUB_REF_NAME#v}"
+            bash .github/scripts/release.sh check "${GITHUB_REF_NAME}"
+          else
+            VERSION_UNDER_TEST="$(tr -d '[:space:]' < VERSION)"
+            bash .github/scripts/release.sh check
+          fi
+          # The same extraction publish runs, so a dry run proves it too.
+          bash .github/scripts/release.sh notes "${VERSION_UNDER_TEST}"
+
   # Build the BPF ELF once on the host runner (rustup + nightly + bpf-linker
   # all available here). Every cross-build job downloads this artifact and
   # embeds it via PACKETFRAME_BPF_OBJ_PATH — cross's Docker images have no
@@ -27,6 +60,7 @@ jobs:
   # shipped a stub ELF and every attach silently failed).
   bpf:
     name: build BPF ELF
+    needs: version-gate
     runs-on: ubuntu-latest
     env:
       PACKETFRAME_BPF_REQUIRED: "1"
@@ -209,10 +243,16 @@ jobs:
           # a dispatch validation run (a `/` here would break tar's paths).
           STEM="packetframe-${PF_REF_LABEL}-${{ matrix.target }}"
           STAGE="dist/${STEM}"
-          mkdir -p "${STAGE}/conf"
+          mkdir -p "${STAGE}/conf" "${STAGE}/docs/runbooks"
           cp "target/${{ matrix.target }}/release/packetframe" "${STAGE}/"
           cp conf/example.conf "${STAGE}/conf/"
-          cp LICENSE README.md VERSION "${STAGE}/"
+          cp LICENSE README.md CHANGELOG.md VERSION "${STAGE}/"
+          # The runbooks are the operating procedure (restart sequence,
+          # VPP install, cutover and rollback) and a router has no
+          # checkout — the same reason the hwtest bundle ships them
+          # (hardware-artifacts.yml). The .deb installs the same set
+          # under /usr/share/doc/packetframe/runbooks/.
+          cp docs/runbooks/*.md "${STAGE}/docs/runbooks/"
           ( cd dist && tar czf "${STEM}.tar.gz" "${STEM}" )
           ( cd dist && sha256sum "${STEM}.tar.gz" > "${STEM}.tar.gz.sha256" )
 
@@ -276,14 +316,27 @@ jobs:
   publish:
     name: publish release
     needs: build
-    # Skip publish on workflow_dispatch dry_run so maintainers can validate
-    # the bpf + cross-build flow without creating a GitHub release.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run == false }}
+    # Publish ONLY from a pushed `v*` tag. A workflow_dispatch run is
+    # always a dry run — even on a tag ref — so maintainers can validate
+    # the gate, bpf and cross-build flow without creating a release, and
+    # the notes below (keyed on the tag) never see a branch name.
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
+
+      # The release notes are CHANGELOG.md's section for this version,
+      # not GitHub's generated PR list: the changelog carries the
+      # upgrade notes and known limitations an operator must read before
+      # installing. version-gate already proved the section exists; this
+      # re-extracts it from the tagged tree.
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          bash .github/scripts/release.sh notes "${GITHUB_REF_NAME#v}" > release-notes.md
+          cat release-notes.md
 
       - uses: actions/download-artifact@v8
         with:
@@ -341,6 +394,6 @@ jobs:
           fi
           gh release create "${GITHUB_REF_NAME}" \
             ${PRERELEASE_FLAG} \
-            --generate-notes \
+            --notes-file release-notes.md \
             --title "${GITHUB_REF_NAME}" \
             "${FILES[@]}"
