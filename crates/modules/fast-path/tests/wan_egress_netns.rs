@@ -14,7 +14,8 @@
 //! 3. A converged reconcile emits no `RTNLGRP_IPV4_RULE` notification.
 //! 4. Removal takes out every owned rule, anchor included, and no
 //!    foreign rule, including the one parked at `main - 1`.
-//! 5. With no unconditional `lookup main` nothing is written.
+//! 5. With no unconditional `lookup main`, or with two of them, nothing
+//!    is written.
 //! 6. The reconcile thread repairs a removed rule on its own, prompted
 //!    by the rule event rather than the 30 s tick.
 //!
@@ -36,8 +37,8 @@ use futures::TryStreamExt;
 use netlink_packet_route::rule::RuleAttribute;
 use packetframe_common::config::Config;
 use packetframe_fast_path::wan_egress::{
-    reconcile_once, remove_all_owned, spec_from_directives, Condition, Layout, WanEgress,
-    WanEgressSpec,
+    reconcile_once, remove_all_owned, spec_from_directives, Condition, Layout, PlanError,
+    WanEgress, WanEgressSpec,
 };
 use packetframe_fast_path::PACKETFRAME_RT_PROTOCOL;
 
@@ -406,6 +407,32 @@ fn wan_egress_without_main_writes_nothing() {
     let _ns = enter_netns(&n.netns);
     let rt = runtime();
 
+    // Two unconditional `lookup main` rules: skipping the first would
+    // land on the second, so nothing is written.
+    ns_run(
+        &n.netns,
+        &["ip", "rule", "add", "pref", "32100", "lookup", "main"],
+    );
+    let before = rules_text(&n);
+    let report = rt.block_on(reconcile_once(&spec())).expect("reconcile");
+    assert!(
+        matches!(
+            report.layout,
+            Err(PlanError::SecondMain {
+                first: 32000,
+                second: 32100
+            })
+        ),
+        "{report:?}"
+    );
+    assert!(!report.wrote(), "{report:?}");
+    assert_eq!(rules_text(&n), before);
+
+    // No `lookup main` at all.
+    ns_run(
+        &n.netns,
+        &["ip", "rule", "del", "pref", "32100", "lookup", "main"],
+    );
     ns_run(
         &n.netns,
         &["ip", "rule", "del", "pref", "32000", "lookup", "main"],
@@ -444,8 +471,12 @@ fn wan_egress_thread_repairs_on_the_rule_event() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    let removed = w.shutdown_and_remove().expect("shutdown");
-    assert_eq!(removed, 8);
+    // The directive leaves the config (the reload path): retire removes
+    // every rule and says so before the reconciler is dropped.
+    assert_eq!(w.retire().expect("retire"), 8);
+    assert_eq!(w.status().condition, Condition::Retired);
+    assert_eq!(w.spec(), None);
+    w.stop();
     assert_eq!(rt.block_on(owned_count()), 0);
     assert_eq!(egress(&n, VIA_IX, SRC), n.ix);
 }

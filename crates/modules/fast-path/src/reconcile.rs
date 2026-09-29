@@ -258,7 +258,7 @@ fn reconcile_wan_egress(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> Modu
         |e: std::io::Error| ModuleError::other(MODULE_NAME, format!("wan-egress reconcile: {e}"));
     match (state.wan_egress.as_ref(), wanted) {
         (Some(running), Some(spec)) => {
-            if running.spec() != spec {
+            if running.spec().as_ref() != Some(&spec) {
                 info!(
                     sources = spec.sources.len(),
                     keep = spec.keep.len(),
@@ -275,18 +275,25 @@ fn reconcile_wan_egress(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> Modu
             );
             state.wan_egress = Some(crate::wan_egress::WanEgress::start(spec).map_err(io_err)?);
         }
-        (Some(_), None) => {
+        // Retire before dropping: if the removal does not finish, the
+        // reconciler stays, keeps the status row saying so, and retries
+        // every pass and on the next reload. Dropping it first (the
+        // original shape) lost all three on a single transient failure,
+        // and every later reload read `(None, None)` and said nothing
+        // (review finding).
+        (Some(running), None) => {
+            let n = running.retire().map_err(|e| {
+                ModuleError::other(
+                    MODULE_NAME,
+                    format!(
+                        "wan-egress removed from the config, but its rules could not all be \
+                         removed: {e}; retrying every pass (see the `wan-egress` status row)"
+                    ),
+                )
+            })?;
+            info!(removed = n, "wan-egress disabled by reload; rules removed");
             if let Some(running) = state.wan_egress.take() {
-                let n = running.shutdown_and_remove().map_err(|e| {
-                    ModuleError::other(
-                        MODULE_NAME,
-                        format!(
-                            "wan-egress removed from the config, but its rules could not all \
-                             be removed: {e}; `packetframe detach` removes them"
-                        ),
-                    )
-                })?;
-                info!(removed = n, "wan-egress disabled by reload; rules removed");
+                running.stop();
             }
         }
         (None, None) => {}

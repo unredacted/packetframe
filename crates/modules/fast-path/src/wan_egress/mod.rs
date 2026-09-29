@@ -308,6 +308,11 @@ pub enum PlanError {
     /// `main` sits at the highest priority there is, so no rule can
     /// follow it.
     NoRoomAfterMain { main: u32 },
+    /// A second unconditional `lookup main` follows the first. The
+    /// goto resumes evaluation after the first, so the second would
+    /// hand the sources straight back to the full table: installing
+    /// would report healthy while changing nothing.
+    SecondMain { first: u32, second: u32 },
 }
 
 impl fmt::Display for PlanError {
@@ -328,12 +333,19 @@ impl fmt::Display for PlanError {
                 f,
                 "main sits at priority {main}, the highest there is; no rule can follow it"
             ),
+            Self::SecondMain { first, second } => write!(
+                f,
+                "a second unconditional `lookup main` at {second} follows the one at {first}; \
+                 skipping the first would only reach the second, so nothing is installed or \
+                 changed until one of them goes"
+            ),
         }
     }
 }
 
 /// Priority of the unconditional `lookup main`, the lowest one if
-/// there are several (that is where `main` is consulted first).
+/// there are several (that is where `main` is consulted first;
+/// [`plan_layout`] refuses a layout with more than one).
 pub fn find_main(observed: &[ObservedRule]) -> Option<u32> {
     observed
         .iter()
@@ -352,6 +364,17 @@ pub fn find_main(observed: &[ObservedRule]) -> Option<u32> {
 /// which the platform's next provisioning pass would change.
 pub fn plan_layout(observed: &[ObservedRule]) -> Result<Layout, PlanError> {
     let main = find_main(observed).ok_or(PlanError::MainNotFound)?;
+    if let Some(second) = observed
+        .iter()
+        .filter(|r| r.is_unconditional_main() && r.priority > main)
+        .map(|r| r.priority)
+        .min()
+    {
+        return Err(PlanError::SecondMain {
+            first: main,
+            second,
+        });
+    }
     let target = main
         .checked_add(1)
         .ok_or(PlanError::NoRoomAfterMain { main })?;
@@ -419,6 +442,13 @@ impl Diff {
     }
 }
 
+/// Where an owned rule falls in removal order, which runs from the
+/// highest stage down: unrecognised owned rules (3) first, then goto,
+/// keep, anchor.
+fn removal_stage(r: &ObservedRule) -> u8 {
+    r.as_owned().map_or(3, |o| o.stage())
+}
+
 /// Desired against owned, as multisets: a duplicate of a desired rule
 /// (the kernel accepts identical rules) is removed like any other
 /// stale one. Foreign rules never appear in the result.
@@ -444,8 +474,7 @@ pub fn diff(desired: &[OwnedRule], observed: &[ObservedRule]) -> Diff {
         }
     }
     add.sort_by_key(OwnedRule::stage);
-    // Unrecognised owned rules first, then goto, keep, anchor.
-    unmatched.sort_by_key(|&i| std::cmp::Reverse(observed[i].as_owned().map_or(3, |r| r.stage())));
+    unmatched.sort_by_key(|&i| std::cmp::Reverse(removal_stage(&observed[i])));
     Diff {
         add,
         remove: unmatched,
@@ -464,6 +493,14 @@ pub enum Condition {
     Refused(PlanError),
     /// The dump or at least one write failed.
     Failing(String),
+    /// The directive left the config and every owned rule is gone. A
+    /// reload drops the reconciler as soon as it gets here, so this is
+    /// seen only when a background pass finished a removal a reload
+    /// could not.
+    Retired,
+    /// The directive left the config, but its rules could not all be
+    /// removed yet; every pass retries.
+    Removing(String),
 }
 
 /// What `status` and the metrics report.
@@ -520,6 +557,17 @@ impl Status {
                     self.present, self.desired
                 ),
             ),
+            Condition::Retired => (
+                HealthState::Healthy,
+                "removed from the config; no rules remain".to_string(),
+            ),
+            Condition::Removing(error) => (
+                HealthState::Degraded,
+                format!(
+                    "removed from the config, but its rules could not all be removed \
+                     (retrying): {error}"
+                ),
+            ),
         };
         SubsystemHealth {
             name: SUBSYSTEM_NAME.to_string(),
@@ -534,7 +582,10 @@ impl Status {
     /// Textfile gauges: desired rules, the ones in place, and whether
     /// the last pass converged.
     pub fn render_metrics(&self, out: &mut String) {
-        let healthy = u8::from(self.condition == Condition::Converged);
+        let healthy = u8::from(matches!(
+            self.condition,
+            Condition::Converged | Condition::Retired
+        ));
         let _ = writeln!(
             out,
             "# HELP packetframe_wan_egress_rules wan-egress policy rules, desired and in place"
@@ -809,6 +860,27 @@ mod tests {
     }
 
     #[test]
+    fn a_second_unconditional_main_is_refused() {
+        // Provisioning mid-way: the moved main is in, the stock one is
+        // not gone yet. Skipping 32000 would land on 32766.
+        let mut rules = platform(32000);
+        rules.push(foreign(32766, RuleAction::ToTable(MAIN_TABLE)));
+        assert_eq!(
+            plan_layout(&rules),
+            Err(PlanError::SecondMain {
+                first: 32000,
+                second: 32766
+            })
+        );
+        // A selected main after it (a VPN daemon's fwmark rule) is not.
+        let mut rules = platform(32000);
+        let mut fwmark = foreign(32500, RuleAction::ToTable(MAIN_TABLE));
+        fwmark.other_selectors = true;
+        rules.push(fwmark);
+        assert!(plan_layout(&rules).is_ok());
+    }
+
+    #[test]
     fn only_an_unconditional_foreign_rule_counts_as_main() {
         let mut fwmark = foreign(5210, RuleAction::ToTable(MAIN_TABLE));
         fwmark.other_selectors = true;
@@ -1004,6 +1076,14 @@ mod tests {
             HealthState::Degraded,
             "silence must not read as healthy"
         );
+
+        let removing = Status {
+            condition: Condition::Removing("EBUSY".into()),
+            ..Status::default()
+        };
+        let h = removing.subsystem_health(now);
+        assert_eq!(h.state, HealthState::Degraded);
+        assert!(h.message.unwrap().contains("could not all be removed"));
     }
 
     #[test]

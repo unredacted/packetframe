@@ -874,7 +874,9 @@ anchor is needed.)
 - **Where `main` is.** Each pass dumps the IPv4 rules and takes the
   lowest-priority `lookup main` with no selectors and no PacketFrame
   tag. Rules with an fwmark, interface, `suppress_prefixlength` or
-  other selector do not count. If there is none, nothing is written.
+  other selector do not count. If there is none, or a second one
+  follows the first (the goto would only land on it), nothing is
+  written.
 - **Keep and goto.** The goto sits at the nearest priority below
   `main` that no foreign rule uses; the keep rules at the nearest free
   one below that, all within 100 of `main`. A priority shared with a
@@ -913,7 +915,9 @@ in force:
 | healthy, `N rules in place; keep at K, goto G -> T past main at M` | Every rule is in place | Nothing |
 | degraded, `no unconditional lookup main rule found` | Nothing to skip past; nothing was written, existing rules left as they were | `ip rule show`; the platform may be mid-provisioning. It retries every pass |
 | degraded, `priorities ... below main are taken` | Fewer than two free priorities within 100 of `main`; nothing written or changed | `ip rule show` to see what fills the band |
-| degraded, `repair failing: X of Y rules in place; ...` | A dump or write failed | The error names the rule and the netlink error; it retries every pass |
+| degraded, `a second unconditional lookup main at S follows the one at F` | Skipping the first `main` would only reach the second; nothing written or changed | Usually a provisioning pass caught half-way; if it persists, find which one the platform meant to keep |
+| degraded, `repair failing: X of Y rules in place; ...` | A dump or write failed. Writes stop at the first failed stage (anchor, then keep, then goto), and nothing old is removed until every new rule is in, so a partial pass never leaves a goto without its keep rules | The error names the rule and the netlink error; it retries every pass |
+| degraded, `removed from the config, but its rules could not all be removed` | A reload dropped the directive and the removal did not finish | It retries every pass and on the next reload; `packetframe detach` also removes them |
 
 The textfile metrics carry `packetframe_wan_egress_rules{state="desired"}`,
 `packetframe_wan_egress_rules{state="present"}` and

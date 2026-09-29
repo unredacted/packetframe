@@ -19,8 +19,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::{
-    desired_rules, diff, plan_layout, Condition, Layout, ObservedRule, OwnedRule, PlanError,
-    RepairLimiter, RuleAction, Status, WanEgressSpec, MAIN_TABLE, RECONCILE_INTERVAL,
+    desired_rules, diff, plan_layout, removal_stage, Condition, Layout, ObservedRule, OwnedRule,
+    PlanError, RepairLimiter, RuleAction, Status, WanEgressSpec, MAIN_TABLE, RECONCILE_INTERVAL,
 };
 use crate::{MODULE_NAME, PACKETFRAME_RT_PROTOCOL};
 
@@ -35,6 +35,8 @@ pub enum WanEgressError {
     Connection(#[from] io::Error),
     #[error("netlink request failed: {0}")]
     Request(#[from] rtnetlink::Error),
+    #[error("removed {removed} rules, then stopped: {first}")]
+    Incomplete { removed: usize, first: String },
 }
 
 type StrictConnection =
@@ -255,51 +257,94 @@ pub async fn reconcile_once(spec: &WanEgressSpec) -> Result<PassReport, WanEgres
         removed: Vec::new(),
         errors: Vec::new(),
     };
+    // Writes are gated by stage, because a partial write can be worse
+    // than none. Adds run anchor → keep → goto and stop at the first
+    // stage with a failure: a goto without every keep rule of its
+    // source would send kept destinations to the WAN. Removals run only
+    // once every add has landed (the rules they remove may be the
+    // working layout the adds were replacing) and stop the same way:
+    // removing keep rules behind a goto whose removal failed would
+    // leave that goto live without them. Whatever is left undone is
+    // retried by the next pass.
+    let mut failed_stage = None;
     for rule in &d.add {
+        if failed_stage.is_some_and(|s| s != rule.stage()) {
+            break;
+        }
         match add(&handle, rule).await {
             Ok(()) => {
                 report.present += 1;
                 report.added.push(*rule);
             }
-            Err(e) => report.errors.push(format!("add `{rule}`: {e}")),
+            Err(e) => {
+                failed_stage = Some(rule.stage());
+                report.errors.push(format!("add `{rule}`: {e}"));
+            }
         }
     }
-    for &i in &d.remove {
-        let what = describe(&observed[i]);
-        match delete(&handle, &raw[i]).await {
-            Ok(()) => report.removed.push(what),
-            Err(e) => report.errors.push(format!("remove `{what}`: {e}")),
-        }
+    if report.errors.is_empty() {
+        let (removed, errors) = remove_staged(&handle, &raw, &observed, &d.remove).await;
+        report.removed = removed;
+        report.errors = errors;
     }
     Ok(report)
 }
 
+/// Delete the owned rules at `order` (removal order, see [`diff`]),
+/// stopping after the first stage in which a delete failed. Returns
+/// what was removed and one message per failure.
+async fn remove_staged(
+    handle: &Handle,
+    raw: &[RuleMessage],
+    observed: &[ObservedRule],
+    order: &[usize],
+) -> (Vec<String>, Vec<String>) {
+    let mut removed = Vec::new();
+    let mut errors = Vec::new();
+    let mut failed_stage = None;
+    for &i in order {
+        let stage = removal_stage(&observed[i]);
+        if failed_stage.is_some_and(|s| s != stage) {
+            break;
+        }
+        let what = describe(&observed[i]);
+        match delete(handle, &raw[i]).await {
+            Ok(()) => removed.push(what),
+            Err(e) => {
+                failed_stage = Some(stage);
+                errors.push(format!("remove `{what}`: {e}"));
+            }
+        }
+    }
+    (removed, errors)
+}
+
 /// Remove every rule wearing PacketFrame's protocol, anchor included:
 /// gotos first, then keep rules, then the anchor, so no goto is ever
-/// left pointing at nothing. Foreign rules are structurally out of
-/// reach (the delete echoes an owned rule, protocol and all). Every
-/// rule is attempted; the first failure is returned after the rest.
+/// left pointing at nothing or live without its keep rules (a stage
+/// with a failure ends the removal; see [`remove_staged`]). Foreign
+/// rules are structurally out of reach: the delete echoes an owned
+/// rule, protocol and all.
 pub async fn remove_all_owned() -> Result<usize, WanEgressError> {
     let (conn, handle) = strict_connection()?;
     tokio::spawn(conn);
     let (raw, observed) = dump(&handle).await?;
-    let mut removed = 0;
-    let mut first_err = None;
-    for i in diff(&[], &observed).remove {
-        match delete(&handle, &raw[i]).await {
-            Ok(()) => {
-                removed += 1;
-                info!(rule = %describe(&observed[i]), "wan-egress: rule removed");
-            }
-            Err(e) => {
-                warn!(rule = %describe(&observed[i]), error = %e, "wan-egress: rule removal failed");
-                first_err.get_or_insert(e);
-            }
-        }
+    let (removed, errors) =
+        remove_staged(&handle, &raw, &observed, &diff(&[], &observed).remove).await;
+    for r in &removed {
+        info!(rule = %r, "wan-egress: rule removed");
     }
-    match first_err {
-        Some(e) => Err(e.into()),
-        None => Ok(removed),
+    match errors.first() {
+        Some(e) => {
+            for e in &errors {
+                warn!(error = %e, "wan-egress: rule removal failed");
+            }
+            Err(WanEgressError::Incomplete {
+                removed: removed.len(),
+                first: e.clone(),
+            })
+        }
+        None => Ok(removed.len()),
     }
 }
 
@@ -325,13 +370,40 @@ struct PassMemory {
 }
 
 struct Shared {
-    spec: Mutex<WanEgressSpec>,
+    /// `None` once the directive has left the config: passes then
+    /// remove every owned rule until none remain (see
+    /// [`WanEgress::retire`]).
+    spec: Mutex<Option<WanEgressSpec>>,
     status: Mutex<Status>,
     /// Serializes passes between the thread and the synchronous
     /// callers (attach, SIGHUP). A tokio mutex because the thread
     /// holds it across the pass's awaits; it works across the two
     /// runtimes involved.
     pass: tokio::sync::Mutex<PassMemory>,
+}
+
+/// A pass for a retired spec: remove every owned rule. The caller
+/// holds the pass lock.
+async fn retire_pass(shared: &Shared, memory: &mut PassMemory) -> Result<usize, WanEgressError> {
+    // Re-enabling the same spec later is a fresh install, not a repair.
+    memory.converged_on = None;
+    let result = remove_all_owned().await;
+    let mut status = shared.status.lock().unwrap_or_else(PoisonError::into_inner);
+    let condition = match &result {
+        Ok(_) => Condition::Retired,
+        Err(e) => Condition::Removing(e.to_string()),
+    };
+    if condition != status.condition {
+        if let Condition::Removing(e) = &condition {
+            warn!(error = %e, "wan-egress: rule removal incomplete; retrying every pass");
+        }
+    }
+    *status = Status {
+        condition,
+        last_converged: status.last_converged,
+        ..Status::default()
+    };
+    result
 }
 
 async fn run_pass(shared: &Shared) {
@@ -341,6 +413,10 @@ async fn run_pass(shared: &Shared) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
+    let Some(spec) = spec else {
+        let _ = retire_pass(shared, &mut memory).await;
+        return;
+    };
     let prev = shared
         .status
         .lock()
@@ -409,7 +485,7 @@ async fn run_pass(shared: &Shared) {
             ),
             Condition::Refused(why) => warn!("wan-egress: {why}"),
             Condition::Failing(e) => warn!(error = %e, "wan-egress: repair failing"),
-            Condition::Pending => {}
+            Condition::Pending | Condition::Retired | Condition::Removing(_) => {}
         }
     }
     *shared.status.lock().unwrap_or_else(PoisonError::into_inner) = next;
@@ -492,7 +568,7 @@ impl WanEgress {
     /// created; netlink trouble is a degraded status, retried.
     pub fn start(spec: WanEgressSpec) -> io::Result<Self> {
         let shared = Arc::new(Shared {
-            spec: Mutex::new(spec),
+            spec: Mutex::new(Some(spec)),
             status: Mutex::new(Status::default()),
             pass: tokio::sync::Mutex::new(PassMemory::default()),
         });
@@ -528,16 +604,46 @@ impl WanEgress {
             .shared
             .spec
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = spec;
+            .unwrap_or_else(PoisonError::into_inner) = Some(spec);
         run_pass_blocking(&self.shared)
     }
 
-    pub fn spec(&self) -> WanEgressSpec {
+    /// The spec in force; `None` after [`Self::retire`].
+    pub fn spec(&self) -> Option<WanEgressSpec> {
         self.shared
             .spec
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The directive has left the config: remove every owned rule now
+    /// and report whether that finished. The reconciler keeps running
+    /// either way, so a removal that did not finish stays on the
+    /// status row and is retried by every pass (and by the next
+    /// reload) instead of being forgotten; the caller drops the
+    /// reconciler with [`Self::stop`] once this succeeds.
+    pub fn retire(&self) -> Result<usize, WanEgressError> {
+        *self
+            .shared
+            .spec
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let mut memory = self.shared.pass.lock().await;
+                retire_pass(&self.shared, &mut memory).await
+            })
+    }
+
+    /// Stop the thread, leaving the rules as they are.
+    pub fn stop(mut self) {
+        self.shutdown.cancel();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 
     pub fn status(&self) -> Status {
@@ -549,11 +655,8 @@ impl WanEgress {
     }
 
     /// Stop the thread, then remove every owned rule.
-    pub fn shutdown_and_remove(mut self) -> Result<usize, WanEgressError> {
-        self.shutdown.cancel();
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+    pub fn shutdown_and_remove(self) -> Result<usize, WanEgressError> {
+        self.stop();
         remove_all_owned_blocking()
     }
 }
