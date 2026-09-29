@@ -117,7 +117,7 @@ fn write_once(
                 &stats,
                 uptime_seconds,
             ));
-            // Custom-FIB occupancy gauges (Option F, Phase 3.8).
+            // PacketFrame FIB occupancy gauges (Option F, Phase 3.8).
             // Best-effort: `fib_status_from_pin` returns a default
             // snapshot when the pins aren't readable (e.g., kernel-fib
             // mode), and the renderer handles that by emitting zeros +

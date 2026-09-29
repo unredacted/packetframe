@@ -8,7 +8,7 @@
 //! depends on both lists matching: the zipping loop in
 //! `render_textfile` assumes `NAMES` and `stats` line up.
 //!
-//! Phase 3.8 adds a sibling `render_fib_gauges` for custom-FIB
+//! Phase 3.8 adds a sibling `render_fib_gauges` for PacketFrame FIB
 //! occupancy. Those are gauges (not counters), rendered in a separate
 //! body so the primary counters surface stays independent of whether
 //! the FIB pins are readable.
@@ -52,10 +52,10 @@ pub const COUNTER_NAMES: [&str; 51] = [
     "pass_not_in_devmap",
     "pass_complex_header",
     "err_head_shift",
-    // --- Custom FIB (Option F, Phase 1) ---
-    "custom_fib_hit",
-    "custom_fib_miss",
-    "custom_fib_no_neigh",
+    // --- PacketFrame FIB (Option F, Phase 1) ---
+    "fib_hit",
+    "fib_miss",
+    "fib_no_neigh",
     "compare_agree",
     "compare_disagree",
     "ecmp_hash_v4",
@@ -172,13 +172,13 @@ pub fn render_softnet(t: &crate::softnet::SoftnetTotals) -> String {
     out
 }
 
-/// Render custom-FIB occupancy metrics as Prometheus gauges
+/// Render PacketFrame FIB occupancy metrics as Prometheus gauges
 /// (Option F, Phase 3.8).
 ///
 /// Output mirrors what `packetframe status` prints in its FIB block,
 /// but as a textfile-collector-scrapeable format. `forwarding_mode`
 /// is encoded as a one-hot label so PromQL can still aggregate /
-/// alert on mode transitions (`packetframe_fib_forwarding_mode{mode="custom-fib"} 1`).
+/// alert on mode transitions (`packetframe_fib_forwarding_mode{mode="packetframe-fib"} 1`).
 ///
 /// When the pins aren't readable, `snap` carries its default values
 /// (zeroes + `forwarding_mode = None`); rendering proceeds and the
@@ -193,7 +193,7 @@ pub fn render_fib_gauges(snap: &FibStatusSnapshot) -> String {
         "# HELP packetframe_fib_forwarding_mode 1 for the active forwarding mode, 0 otherwise"
     );
     let _ = writeln!(out, "# TYPE packetframe_fib_forwarding_mode gauge");
-    for mode in ["kernel-fib", "custom-fib", "compare"] {
+    for mode in ["kernel-fib", "packetframe-fib", "compare"] {
         let active = snap.forwarding_mode == Some(mode);
         let _ = writeln!(
             out,
@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn fib_gauges_emit_forwarding_mode_onehot() {
         let snap = FibStatusSnapshot {
-            forwarding_mode: Some("custom-fib"),
+            forwarding_mode: Some("packetframe-fib"),
             default_hash_mode: Some(5),
             nh_resolved: 12,
             nh_incomplete: 2,
@@ -388,7 +388,7 @@ mod tests {
         };
         let body = render_fib_gauges(&snap);
         assert!(body.contains(
-            "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"custom-fib\"} 1"
+            "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"packetframe-fib\"} 1"
         ));
         assert!(body.contains(
             "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"kernel-fib\"} 0"
@@ -431,7 +431,7 @@ mod tests {
         // With `forwarding_mode: None`, no mode is "active", every
         // one-hot emits 0.
         assert!(body.contains(
-            "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"custom-fib\"} 0"
+            "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"packetframe-fib\"} 0"
         ));
         assert!(body.contains(
             "packetframe_fib_forwarding_mode{module=\"fast-path\",mode=\"kernel-fib\"} 0"

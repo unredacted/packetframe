@@ -3715,7 +3715,7 @@ against the counts printed beside it before acting on the verdict.
 - **`ip6` ntuple naming an address is rejected by the AF** (error 710)
   while the v4 control inserts cleanly — the vendor NPC profile has no
   v6 L3 address extraction. No IPv6 packet can be MCAM-steered by
-  prefix, so allowlisted v6 stays on the XDP custom-FIB path except
+  prefix, so allowlisted v6 stays on the XDP PacketFrame FIB path except
   where `v6-divert` takes it by frame. Retest at
   every UniFi kernel bump; the MKEX profile ships with the AF driver.
   What the profile does extract (ethertype, MAC, VLAN id, v6 L4

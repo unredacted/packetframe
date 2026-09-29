@@ -104,11 +104,7 @@ pub fn probe(ctx: XdpContext) -> u32 {
     // `data`). Clamp at `MAX_OFFSET` so a malformed userspace value
     // can't turn this into an unbounded memory peek, and mask to u16
     // so the verifier's bounds tracker stays tight.
-    let offset = CFG
-        .get(0)
-        .map(|c| c.offset)
-        .unwrap_or(0)
-        .min(MAX_OFFSET) as usize;
+    let offset = CFG.get(0).map(|c| c.offset).unwrap_or(0).min(MAX_OFFSET) as usize;
 
     // Reserve a slot before reading packet bytes, keeps the hot path
     // cheap when the ringbuf is full (no reads, no work). Rust's

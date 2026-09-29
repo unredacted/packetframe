@@ -15,7 +15,7 @@ dmesg before touching anything).
 
 Before any VPP work, answer "what does the full-table commitment
 actually buy" from the live table. **Not from the kernel**: on a
-custom-fib box bird's kernel export was dropped at cutover, so
+packetframe-fib box bird's kernel export was dropped at cutover, so
 `ip route show table main` is deliberately near-empty (verified live:
 2 routes). The authoritative source is bird's RIB:
 
@@ -377,7 +377,7 @@ the operations runbook's "v6-divert steering" section.
 
 Consequences:
 - **v6 cannot be MCAM-steered into VPP.** The per-family split from
-  the plan activates: v6 stays on the XDP custom-FIB path (already
+  the plan activates: v6 stays on the XDP PacketFrame FIB path (already
   correct, ~2% of matched traffic), unless the XDP→AF_XDP side door
   is ever deemed worth its complexity for that 2%.
 - **The full-table verdict's condition fired** (§0's conditional
@@ -396,7 +396,7 @@ Consequences:
 
   **DECIDED (2026-08-02, user): FULL v4 TABLE.** The failure-behavior
   and verifiability arguments won again on v4-only numbers. v6 stays
-  on the XDP custom-FIB path — fully correct forwarding, and the v4
+  on the XDP PacketFrame FIB path — fully correct forwarding, and the v4
   offload effectively dedicates the entire 18-core kernel path to
   v6's remainder, so v6 can grow ~10x before the split even itches.
   v6 roadmap, recorded not built: (1) retest ip6 ntuple at every
@@ -405,7 +405,7 @@ Consequences:
   tier with no VPP involvement; (3) the XDP->AF_XDP->VPP side door
   stays documented and deliberately unbuilt until native XDP makes
   AF_XDP zero-copy — while rx is generic-XDP copy mode it buys
-  nothing over the custom-FIB path v6 already has.
+  nothing over the PacketFrame FIB path v6 already has.
 
 **Item 9 — rx-mode: FAILS; the heat goal is dead on this driver.**
 `set interface rx-mode` (adaptive and interrupt) both answer
@@ -769,7 +769,7 @@ shadow any time VPP is up.
 
 Two plain files, produced on the **primary** (bird has the table) and
 copied to the shadow. Note the source is bird, not the kernel — bird's
-kernel export was dropped at custom-fib cutover, so `ip route show` is
+kernel export was dropped at packetframe-fib cutover, so `ip route show` is
 deliberately near-empty.
 
 ```sh

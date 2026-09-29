@@ -35,10 +35,10 @@ A circuit breaker watches unreachable and FIB-error drops as a share of matched 
 `forwarding-mode` decides where the egress lookup comes from:
 
 - **`kernel-fib`** (default) calls `bpf_fib_lookup()` against the kernel's routing table. It makes the same decisions as plain Linux, and it is always the rollback path.
-- **`custom-fib`** looks up PacketFrame's own FIB: LPM tries for IPv4 and IPv6, a nexthop array and ECMP groups, all in BPF maps. PacketFrame fills them from a BGP feed it receives itself. The per-packet lookup never touches the kernel routing table, so it doesn't depend on how or when the routing daemon writes that table. The control plane still uses the kernel for next-hop resolution: it asks the main table (`RTM_GETROUTE`) which interface a BGP next hop is on, then resolves the MAC over netlink. The connected routes that cover your next hops must stay in the kernel. An optional destination cache (`fib-cache`) sits in front of the LPM lookup.
+- **`packetframe-fib`** looks up PacketFrame's own FIB: LPM tries for IPv4 and IPv6, a nexthop array and ECMP groups, all in BPF maps. PacketFrame fills them from a BGP feed it receives itself. The per-packet lookup never touches the kernel routing table, so it doesn't depend on how or when the routing daemon writes that table. The control plane still uses the kernel for next-hop resolution: it asks the main table (`RTM_GETROUTE`) which interface a BGP next hop is on, then resolves the MAC over netlink. The connected routes that cover your next hops must stay in the kernel. An optional destination cache (`fib-cache`) sits in front of the LPM lookup.
 - **`compare`** performs both lookups, forwards using the kernel result, and counts disagreements. Use it to validate before cutover.
 
-In `custom-fib`, routes come from one of two sources:
+In `packetframe-fib`, routes come from one of two sources:
 
 - **A passive iBGP listener** (`route-source bgp`). The routing daemon connects to PacketFrame and exports its best paths to it. PacketFrame negotiates MP-BGP for IPv4 and IPv6 unicast, four-octet ASNs and ADD-PATH receive (for ECMP). It never originates routes. FRR and BIRD are both supported; FRR is the production pairing.
 - **A BMP station** (`route-source bmp`, RFC 7854 and RFC 9069). It needs an emitter that sends a Loc-RIB view (FRR can; BIRD 2.x and 3.x cannot).
@@ -69,7 +69,7 @@ Attaches a diagnostic XDP program and dumps the first bytes of sampled frames. U
 
 ## Results
 
-Measured on a production edge router after switching from `kernel-fib` to `custom-fib`. Your results will depend on traffic mix, NIC, kernel and topology.
+Measured on a production edge router after switching from `kernel-fib` to `packetframe-fib`. Your results will depend on traffic mix, NIC, kernel and topology.
 
 | Metric | Change |
 |---|---|
@@ -93,7 +93,7 @@ Later, the same router moved IPv6 into VPP alongside IPv4 (four steered ports, f
 | Feature | Status |
 |---|---|
 | Fast path, `kernel-fib` | Production |
-| Fast path, `custom-fib` with the iBGP listener | Production (fed by FRR) |
+| Fast path, `packetframe-fib` with the iBGP listener | Production (fed by FRR) |
 | Integrity authority (`birdc`, `frr`) | Production (`frr`) |
 | Connected-host fast path (`local-prefix`, `local-prefix6`) | Production |
 | Synthetic default route (`fallback-default`) | Production |
@@ -115,7 +115,7 @@ Later, the same router moved IPv6 into VPP alongside IPv4 (four steered ports, f
 - Linux 5.15 or newer, on x86_64 or aarch64.
 - Root access.
 - The `.deb` needs glibc 2.31 or newer (Debian 11, Ubuntu 20.04 or later). The musl tarballs run on any Linux.
-- For `custom-fib`: FRR or BIRD, configured to export to PacketFrame over iBGP.
+- For `packetframe-fib`: FRR or BIRD, configured to export to PacketFrame over iBGP.
 - For vpp-offload: a NIC with SR-IOV and ntuple flow steering to a VF, plus hugepages and spare cores for VPP workers. It has been built and tested only on UniFi gateways with Marvell OCTEON TX2 (`rvu-nicpf`) NICs. Read [the runbook](docs/runbooks/vpp-offload.md) before trying other hardware.
 
 ## Install
@@ -210,7 +210,7 @@ Check that the `matched_*` counters are rising and that they account for the tra
 sudo packetframe reconfigure
 ```
 
-`systemctl reload packetframe` does the same thing (both send SIGHUP). Allowlists, `dry-run`, `block-prefix`, `mss-clamp`, `forwarding-mode` between `compare` and `custom-fib`, and vpp-offload's steering levers all reload live. Changing the attach set, `route-source` or `local-prefix` needs a restart. [`docs/runbooks/reconfigure.md`](docs/runbooks/reconfigure.md) lists which settings are which.
+`systemctl reload packetframe` does the same thing (both send SIGHUP). Allowlists, `dry-run`, `block-prefix`, `mss-clamp`, `forwarding-mode` between `compare` and `packetframe-fib`, and vpp-offload's steering levers all reload live. Changing the attach set, `route-source` or `local-prefix` needs a restart. [`docs/runbooks/reconfigure.md`](docs/runbooks/reconfigure.md) lists which settings are which.
 
 **To remove PacketFrame from the interfaces:**
 
@@ -219,14 +219,14 @@ sudo systemctl stop packetframe
 sudo packetframe detach --all
 ```
 
-## Setting up custom-fib
+## Setting up packetframe-fib
 
 Add these lines to the `fast-path` module.
 
 **With FRR:**
 
 ```
-forwarding-mode custom-fib
+forwarding-mode packetframe-fib
 route-source bgp 192.0.2.202:1179 local-as 65551 peer-as 65551 allow-remote peer-from 192.0.2.201/32 anyip
 integrity-authority frr upstream 192.0.2.1 families v4,v6
 ```
@@ -237,7 +237,7 @@ integrity-authority frr upstream 192.0.2.1 families v4,v6
 **With BIRD:**
 
 ```
-forwarding-mode custom-fib
+forwarding-mode packetframe-fib
 route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551
 ```
 
@@ -245,7 +245,7 @@ The listener is passive: the routing daemon connects out and exports its best pa
 
 Run `forwarding-mode compare` first and watch the disagreement counter. To roll back, set `forwarding-mode kernel-fib` and restart.
 
-[`docs/runbooks/custom-fib.md`](docs/runbooks/custom-fib.md) covers switching over, rolling back, checking the table and troubleshooting. It also covers BMP feeds (`route-source bmp … require-loc-rib`).
+[`docs/runbooks/packetframe-fib.md`](docs/runbooks/packetframe-fib.md) covers switching over, rolling back, checking the table and troubleshooting. It also covers BMP feeds (`route-source bmp … require-loc-rib`).
 
 ## Upgrading and restarting
 
@@ -279,13 +279,13 @@ Coming from 0.2.7? Read the upgrade notes in [CHANGELOG.md](CHANGELOG.md) first.
 sudo packetframe status                # live counters and per-module health
 sudo packetframe events --since 12h    # steering, verify, restarts, reloads, health transitions
 sudo packetframe fib lookup 192.0.2.10 # what the XDP lookup returns for this destination
-sudo packetframe fib stats             # custom-FIB occupancy and ECMP hash mode
+sudo packetframe fib stats             # PacketFrame FIB occupancy and ECMP hash mode
 sudo packetframe fib dump-v4           # walk the IPv4 LPM trie
 ```
 
 `fib` reads the pinned maps directly, and `events` reads the log file, so both work while the daemon is stopped. The event log is newline-delimited JSON at `<state-dir>/events.log`, rotated at `event-log-max`. It exists because a journal capped for the whole box can lose these events within hours. On appliances whose root filesystem is reset by firmware upgrades, point `event-log` at persistent storage.
 
-With `metrics-textfile` set, the daemon rewrites a Prometheus textfile every 15 seconds. It contains per-counter gauges, custom-FIB occupancy by nexthop state, the active forwarding mode, and each module's own gauges.
+With `metrics-textfile` set, the daemon rewrites a Prometheus textfile every 15 seconds. It contains per-counter gauges, PacketFrame FIB occupancy by nexthop state, the active forwarding mode, and each module's own gauges.
 
 ## XDP modes and drivers
 
@@ -294,7 +294,7 @@ With `metrics-textfile` set, the daemon rewrites a Prometheus textfile every 15 
 | `native` | In the driver's receive path, before skb allocation | The driver supports native XDP and hands it Ethernet-shaped frames |
 | `generic` | After skb allocation | The driver lacks native XDP or has native-mode bugs |
 | `auto` | Tries native, falls back to generic | Most cases. Downgrades on drivers with known bugs |
-| `tc` | tc ingress (custom-fib only) | Not recommended ([why](docs/runbooks/tc-datapath.md)) |
+| `tc` | tc ingress (packetframe-fib only) | Not recommended ([why](docs/runbooks/tc-datapath.md)) |
 
 PacketFrame refuses settings it knows to be unsafe:
 
@@ -319,7 +319,7 @@ Runbooks, for running PacketFrame in production:
 
 | Runbook | Covers |
 |---|---|
-| [custom-fib](docs/runbooks/custom-fib.md) | Switching to PacketFrame's own routing table, rolling back, troubleshooting |
+| [packetframe-fib](docs/runbooks/packetframe-fib.md) | Switching to PacketFrame's own routing table, rolling back, troubleshooting |
 | [vpp-offload](docs/runbooks/vpp-offload.md) | Rolling out VPP offload one port at a time, rolling back, what it costs |
 | [neigh-snoop](docs/runbooks/neigh-snoop.md) | Rolling out neighbour snooping, the FRR next-hop feed |
 | [guard](docs/runbooks/guard.md) | Moving guard from monitoring to enforcing |

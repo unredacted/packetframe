@@ -1,7 +1,7 @@
 //! One `vtysh` invoker, for every module that asks FRR a question.
 //!
 //! Two do: neigh-snoop's next-hop gate writes prefix lists, and the
-//! custom-FIB's FRR completeness authority reads counts, session state
+//! PacketFrame FIB's FRR completeness authority reads counts, session state
 //! and the running config. They had the same 50 lines of subprocess
 //! handling, and the parts that matter are exactly the parts a second
 //! copy gets wrong — `kill_on_drop`, so a timeout kills a wedged vtysh

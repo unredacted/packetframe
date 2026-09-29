@@ -6,7 +6,7 @@
 //! pin registry and the live stats map respectively. SIGHUP triggers a
 //! delta-only reconcile (allowlists, VLAN-resolve, devmap) without
 //! detaching. `fib` (Option F, Phase 3.8, see SPEC.md §4.11) opens
-//! the pinned custom-FIB maps directly for inspection.
+//! the pinned PacketFrame FIB maps directly for inspection.
 
 mod atomic;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
@@ -159,7 +159,7 @@ enum Command {
         args: Vec<String>,
     },
 
-    /// Inspect the custom-FIB maps. Opens the pinned LPM tries and
+    /// Inspect the PacketFrame FIB maps. Opens the pinned LPM tries and
     /// nexthop arrays directly; works without the daemon running.
     #[cfg(all(target_os = "linux", feature = "fast-path"))]
     Fib {

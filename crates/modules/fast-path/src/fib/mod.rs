@@ -1,4 +1,4 @@
-//! Custom-FIB userspace subsystem (Option F).
+//! PacketFrame FIB userspace subsystem (Option F).
 //!
 //! Phase 1 Slice 1A: type mirrors only (`types`). The XDP dispatch path
 //! lands in Slice 1B; the BMP station, neighbor resolver, and fib

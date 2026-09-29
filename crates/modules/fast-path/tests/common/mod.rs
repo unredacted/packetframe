@@ -91,7 +91,7 @@ pub const FP_CFG_FLAG_IPV4: u8 = 0b0000_0001;
 pub const FP_CFG_FLAG_IPV6: u8 = 0b0000_0010;
 #[allow(dead_code)]
 pub const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
-pub const FP_CFG_FLAG_CUSTOM_FIB: u8 = 0b0000_1000;
+pub const FP_CFG_FLAG_PACKETFRAME_FIB: u8 = 0b0000_1000;
 pub const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
 pub const FP_CFG_FLAG_BLOCK_PRESENT: u8 = 0b0010_0000;
 pub const FP_CFG_FLAG_VLAN_PRESENT: u8 = 0b0100_0000;
@@ -122,10 +122,10 @@ pub enum StatIdx {
     PassNotInDevmap = 17,
     PassComplexHeader = 18,
     ErrHeadShift = 19,
-    // --- Custom FIB (Option F, Phase 1) ---
-    CustomFibHit = 20,
-    CustomFibMiss = 21,
-    CustomFibNoNeigh = 22,
+    // --- PacketFrame FIB (Option F, Phase 1) ---
+    FibHit = 20,
+    FibMiss = 21,
+    FibNoNeigh = 22,
     CompareAgree = 23,
     CompareDisagree = 24,
     EcmpHashV4 = 25,
@@ -479,15 +479,15 @@ impl Harness {
         trie.insert(&key, 1u8, 0).expect("ALLOW_V6 insert");
     }
 
-    // --- Custom-FIB helpers (Option F, Phase 1) -----------------------
+    // --- PacketFrame FIB helpers (Option F, Phase 1) -----------------------
 
-    /// Flip the CFG flag to select the custom-FIB XDP lookup path.
+    /// Flip the CFG flag to select the PacketFrame FIB XDP lookup path.
     /// `compare` additionally enables compare mode (runs both lookups,
     /// forwards via kernel result, bumps CompareAgree/CompareDisagree).
-    pub fn set_custom_fib(&mut self, on: bool, compare: bool) {
+    pub fn set_packetframe_fib(&mut self, on: bool, compare: bool) {
         let mut flags = FP_CFG_FLAG_IPV4 | FP_CFG_FLAG_IPV6;
         if on {
-            flags |= FP_CFG_FLAG_CUSTOM_FIB;
+            flags |= FP_CFG_FLAG_PACKETFRAME_FIB;
             if compare {
                 flags |= FP_CFG_FLAG_COMPARE_MODE;
             }

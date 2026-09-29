@@ -1,4 +1,4 @@
-//! Read-side inspection helpers for the custom-FIB maps.
+//! Read-side inspection helpers for the PacketFrame FIB maps.
 //! Powers `packetframe fib dump / lookup / stats`.
 //!
 //! All functions open the bpffs pins directly so they work

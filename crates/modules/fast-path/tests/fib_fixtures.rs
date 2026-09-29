@@ -1,11 +1,11 @@
-//! Packet-level fixtures for the Option F custom-FIB XDP path, via
+//! Packet-level fixtures for the Option F PacketFrame FIB XDP path, via
 //! `bpf_prog_test_run`. Covers the Phase 1 deliverable cases listed
 //! in the plan:
 //!
-//! - Custom-FIB miss → `CustomFibMiss` + `XDP_PASS`
-//! - Custom-FIB single-nexthop hit with resolved nexthop → `CustomFibHit`
+//! - PacketFrame FIB miss → `FibMiss` + `XDP_PASS`
+//! - PacketFrame FIB single-nexthop hit with resolved nexthop → `FibHit`
 //!   + `XDP_REDIRECT` + `FwdOk` to the expected egress ifindex
-//! - Custom-FIB hit with `Incomplete` nexthop → `CustomFibNoNeigh` +
+//! - PacketFrame FIB hit with `Incomplete` nexthop → `FibNoNeigh` +
 //!   `XDP_PASS`
 //! - ECMP across 2+ nexthops: distribution ~equal across many 5-tuples
 //! - ECMP with dead leg: all packets land on the live leg +
@@ -31,7 +31,7 @@ mod common;
 use aya::maps::Array;
 use common::{
     insert_vlan_tag, xdp_action, Harness, Ipv4TcpBuilder, Ipv6TcpBuilder, StatIdx, BUILDER_DST_MAC,
-    FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_IPV4, FP_CFG_FLAG_IPV6,
+    FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_IPV4, FP_CFG_FLAG_IPV6, FP_CFG_FLAG_PACKETFRAME_FIB,
     TEST_RUN_INGRESS_IFINDEX,
 };
 use packetframe_fast_path::fib::types::{NexthopEntry, NH_STATE_INCOMPLETE};
@@ -43,53 +43,53 @@ const LO_IFINDEX: u32 = 1;
 const EGRESS_MAC: [u8; 6] = [0xde, 0xad, 0xbe, 0xef, 0, 0x01];
 const NEXTHOP_MAC: [u8; 6] = [0xde, 0xad, 0xbe, 0xef, 0, 0x02];
 
-fn prep_custom_fib_harness() -> Harness {
+fn prep_packetframe_fib_harness() -> Harness {
     let mut h = Harness::new();
-    h.set_custom_fib(true, /*compare=*/ false);
+    h.set_packetframe_fib(true, /*compare=*/ false);
     h.set_fib_hash_mode(5);
     h.add_devmap_ifindex(LO_IFINDEX);
     h
 }
 
-// ========== Custom-FIB miss ===============================================
+// ========== PacketFrame FIB miss ===============================================
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn custom_fib_v4_miss_returns_pass() {
-    let mut h = prep_custom_fib_harness();
+fn packetframe_fib_v4_miss_returns_pass() {
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v4("10.0.0.0/8"); // match the allowlist so we exercise FIB path
                                   // No FIB_V4 entries → every destination misses.
 
     let pkt = Ipv4TcpBuilder::default().build();
 
-    let before_miss = h.stat(StatIdx::CustomFibMiss);
+    let before_miss = h.stat(StatIdx::FibMiss);
     let before_fwd = h.stat(StatIdx::FwdOk);
     let (verdict, _) = h.run(&pkt);
     assert_eq!(verdict, xdp_action::XDP_PASS);
-    assert_eq!(h.stat(StatIdx::CustomFibMiss), before_miss + 1);
+    assert_eq!(h.stat(StatIdx::FibMiss), before_miss + 1);
     assert_eq!(h.stat(StatIdx::FwdOk), before_fwd, "no forward on miss");
 }
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn custom_fib_v6_miss_returns_pass() {
-    let mut h = prep_custom_fib_harness();
+fn packetframe_fib_v6_miss_returns_pass() {
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v6("2001:db8::/32");
 
     let pkt = Ipv6TcpBuilder::default().build();
 
-    let before = h.stat(StatIdx::CustomFibMiss);
+    let before = h.stat(StatIdx::FibMiss);
     let (verdict, _) = h.run(&pkt);
     assert_eq!(verdict, xdp_action::XDP_PASS);
-    assert_eq!(h.stat(StatIdx::CustomFibMiss), before + 1);
+    assert_eq!(h.stat(StatIdx::FibMiss), before + 1);
 }
 
-// ========== Custom-FIB single-nexthop hit =================================
+// ========== PacketFrame FIB single-nexthop hit =================================
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn custom_fib_v4_single_nexthop_hit_redirects() {
-    let mut h = prep_custom_fib_harness();
+fn packetframe_fib_v4_single_nexthop_hit_redirects() {
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
     h.add_fib_v4_single("10.0.0.0/24", 1);
@@ -101,11 +101,11 @@ fn custom_fib_v4_single_nexthop_hit_redirects() {
     }
     .build();
 
-    let before_hit = h.stat(StatIdx::CustomFibHit);
+    let before_hit = h.stat(StatIdx::FibHit);
     let before_fwd = h.stat(StatIdx::FwdOk);
     let (verdict, out) = h.run(&pkt);
     assert_eq!(verdict, xdp_action::XDP_REDIRECT, "expected XDP_REDIRECT");
-    assert_eq!(h.stat(StatIdx::CustomFibHit), before_hit + 1);
+    assert_eq!(h.stat(StatIdx::FibHit), before_hit + 1);
     assert_eq!(h.stat(StatIdx::FwdOk), before_fwd + 1);
     // L2 should have been rewritten with the nexthop's MAC pair.
     assert_eq!(&out[0..6], &NEXTHOP_MAC, "dst MAC not rewritten");
@@ -114,18 +114,18 @@ fn custom_fib_v4_single_nexthop_hit_redirects() {
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn custom_fib_v6_single_nexthop_hit_redirects() {
-    let mut h = prep_custom_fib_harness();
+fn packetframe_fib_v6_single_nexthop_hit_redirects() {
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v6("2001:db8::/32");
     h.add_nexthop_v6(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
     h.add_fib_v6_single("2001:db8::/32", 1);
 
     let pkt = Ipv6TcpBuilder::default().build();
 
-    let before_hit = h.stat(StatIdx::CustomFibHit);
+    let before_hit = h.stat(StatIdx::FibHit);
     let (verdict, _) = h.run(&pkt);
     assert_eq!(verdict, xdp_action::XDP_REDIRECT);
-    assert_eq!(h.stat(StatIdx::CustomFibHit), before_hit + 1);
+    assert_eq!(h.stat(StatIdx::FibHit), before_hit + 1);
 }
 
 // ========== /128 vs covering route (local-prefix6 premise) ================
@@ -148,8 +148,8 @@ fn v6_dst(pkt_dst: &str) -> [u8; 16] {
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn custom_fib_v6_slash128_beats_covering_routes() {
-    let mut h = prep_custom_fib_harness();
+fn packetframe_fib_v6_slash128_beats_covering_routes() {
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v6("2001:db8::/32");
     h.add_nexthop_v6(1, LO_IFINDEX, EGRESS_MAC, COVERING_MAC);
     h.add_nexthop_v6(2, LO_IFINDEX, EGRESS_MAC, HOST_MAC);
@@ -202,10 +202,10 @@ fn custom_fib_v6_slash128_beats_covering_routes() {
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn custom_fib_v6_slash128_wins_regardless_of_insertion_order() {
+fn packetframe_fib_v6_slash128_wins_regardless_of_insertion_order() {
     // Same assertion as above with the inserts reversed, ruling out an
     // ordering artifact in the LPM trie.
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v6("2001:db8::/32");
     h.add_nexthop_v6(2, LO_IFINDEX, EGRESS_MAC, HOST_MAC);
     h.add_fib_v6_single("2001:db8::2/128", 2);
@@ -252,7 +252,7 @@ fn icmpv6_pkt(icmp_type: u8, dst: &str) -> Vec<u8> {
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn ndp_is_passed_untouched_even_when_fib_would_redirect() {
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v6("2001:db8::/32");
     // A /128 for the destination: without the guard this would redirect.
     h.add_nexthop_v6(2, LO_IFINDEX, EGRESS_MAC, HOST_MAC);
@@ -263,7 +263,7 @@ fn ndp_is_passed_untouched_even_when_fib_would_redirect() {
     for icmp_type in [133u8, 134, 135, 136, 137] {
         let pkt = icmpv6_pkt(icmp_type, "2001:db8::2");
         let before_ndp = h.stat(StatIdx::PassNdp);
-        let before_hit = h.stat(StatIdx::CustomFibHit);
+        let before_hit = h.stat(StatIdx::FibHit);
         let before_matched = h.stat(StatIdx::MatchedV6);
 
         let (verdict, out) = h.run(&pkt);
@@ -279,7 +279,7 @@ fn ndp_is_passed_untouched_even_when_fib_would_redirect() {
             "type {icmp_type} must bump pass_ndp"
         );
         assert_eq!(
-            h.stat(StatIdx::CustomFibHit),
+            h.stat(StatIdx::FibHit),
             before_hit,
             "type {icmp_type} must not reach the FIB"
         );
@@ -299,7 +299,7 @@ fn ndp_is_passed_untouched_even_when_fib_would_redirect() {
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn ndp_guard_does_not_deoptimize_other_icmpv6_or_tcp() {
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v6("2001:db8::/32");
     h.add_nexthop_v6(2, LO_IFINDEX, EGRESS_MAC, HOST_MAC);
     h.add_fib_v6_single("2001:db8::2/128", 2);
@@ -333,12 +333,12 @@ fn ndp_guard_does_not_deoptimize_other_icmpv6_or_tcp() {
     assert_eq!(&out[0..6], &HOST_MAC);
 }
 
-// ========== Custom-FIB hit with incomplete neighbor =======================
+// ========== PacketFrame FIB hit with incomplete neighbor =======================
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn custom_fib_v4_incomplete_nexthop_returns_noneigh() {
-    let mut h = prep_custom_fib_harness();
+fn packetframe_fib_v4_incomplete_nexthop_returns_noneigh() {
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v4("10.0.0.0/8");
     // Write the nexthop resolved first, then flip to incomplete, this
     // exercises the code path where the seqlock discipline is
@@ -354,18 +354,18 @@ fn custom_fib_v4_incomplete_nexthop_returns_noneigh() {
     }
     .build();
 
-    let before_no_neigh = h.stat(StatIdx::CustomFibNoNeigh);
+    let before_no_neigh = h.stat(StatIdx::FibNoNeigh);
     let before_fwd = h.stat(StatIdx::FwdOk);
     let before_retry = h.stat(StatIdx::NexthopSeqRetry);
     let before_cache_miss = h.stat(StatIdx::NeighCacheMiss);
     let (verdict, _) = h.run(&pkt);
     assert_eq!(verdict, xdp_action::XDP_PASS, "incomplete → PASS");
-    assert_eq!(h.stat(StatIdx::CustomFibNoNeigh), before_no_neigh + 1);
+    assert_eq!(h.stat(StatIdx::FibNoNeigh), before_no_neigh + 1);
     assert_eq!(h.stat(StatIdx::FwdOk), before_fwd, "no forward on NoNeigh");
     // A stably-unresolved entry is NOT a torn read: the seqlock split
     // must short-circuit without burning the retry budget. Earlier
     // versions bumped NexthopSeqRetry 4× here, inflating the counter
-    // to ~4× the custom_fib_no_neigh rate in production and masking
+    // to ~4× the fib_no_neigh rate in production and masking
     // genuine churn.
     assert_eq!(
         h.stat(StatIdx::NexthopSeqRetry),
@@ -379,8 +379,8 @@ fn custom_fib_v4_incomplete_nexthop_returns_noneigh() {
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn custom_fib_v4_ecmp_splits_across_legs() {
-    let mut h = prep_custom_fib_harness();
+fn packetframe_fib_v4_ecmp_splits_across_legs() {
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v4("10.0.0.0/8");
     // Two resolved nexthops with distinct MACs; forward verdict reveals
     // which one the program picked via the rewritten dst MAC.
@@ -428,8 +428,8 @@ fn custom_fib_v4_ecmp_splits_across_legs() {
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn custom_fib_v4_ecmp_dead_leg_falls_over() {
-    let mut h = prep_custom_fib_harness();
+fn packetframe_fib_v4_ecmp_dead_leg_falls_over() {
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v4("10.0.0.0/8");
     let dmac_live: [u8; 6] = [0xaa, 0, 0, 0, 0, 0x01];
     let dmac_dead: [u8; 6] = [0xbb, 0, 0, 0, 0, 0x02];
@@ -475,11 +475,11 @@ fn custom_fib_v4_ecmp_dead_leg_falls_over() {
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn custom_fib_seqlock_permanent_odd_drains_retries() {
+fn packetframe_fib_seqlock_permanent_odd_drains_retries() {
     // If NEXTHOPS[idx].seq is permanently odd, the 4-retry budget
     // exhausts and the XDP program returns NoNeigh. Useful as a
     // regression guard for the verifier-bounded retry unroll.
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
     // Force seq to an odd value and leave it there, no even follow-up.
@@ -547,7 +547,7 @@ fn cache_pkt(dst_last: u8) -> Vec<u8> {
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn fib_cache_off_is_byte_identical_and_counts_nothing() {
     // Default state: FIB_CACHE_CFG untouched (kernel-zeroed = off).
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
     h.add_fib_v4_single("10.0.0.0/24", 1);
@@ -561,13 +561,13 @@ fn fib_cache_off_is_byte_identical_and_counts_nothing() {
     assert_eq!(h.stat(StatIdx::FibCacheHit), 0);
     assert_eq!(h.stat(StatIdx::FibCacheMiss), 0);
     assert_eq!(h.stat(StatIdx::FibCacheStale), 0);
-    assert_eq!(h.stat(StatIdx::CustomFibHit), 2);
+    assert_eq!(h.stat(StatIdx::FibHit), 2);
 }
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn fib_cache_v4_hit_skips_lpm_with_identical_output() {
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.set_fib_cache(1, 1);
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
@@ -586,13 +586,13 @@ fn fib_cache_v4_hit_skips_lpm_with_identical_output() {
     assert_eq!(out1, out2, "cached FibValue must resolve identically");
     // A cache hit is still a FIB hit — route-decision counters keep
     // their semantics.
-    assert_eq!(h.stat(StatIdx::CustomFibHit), 2);
+    assert_eq!(h.stat(StatIdx::FibHit), 2);
 }
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn fib_cache_stale_generation_refills_with_new_route() {
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.set_fib_cache(1, 1);
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
@@ -625,7 +625,7 @@ fn fib_cache_stale_generation_refills_with_new_route() {
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn fib_cache_ecmp_flow_placement_preserved() {
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.set_fib_cache(1, 1);
     h.add_allow_v4("10.0.0.0/8");
     let dmac_a: [u8; 6] = [0xaa, 0, 0, 0, 0, 0x01];
@@ -670,7 +670,7 @@ fn fib_cache_ecmp_flow_placement_preserved() {
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn fib_cache_nexthop_churn_needs_no_invalidation() {
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.set_fib_cache(1, 1);
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
@@ -696,7 +696,7 @@ fn fib_cache_nexthop_churn_needs_no_invalidation() {
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn fib_cache_v6_hit_and_stale() {
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.set_fib_cache(1, 1);
     h.add_allow_v6("2001:db8::/32");
     h.add_nexthop_v6(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
@@ -725,7 +725,7 @@ fn fib_cache_zeroed_slot_never_false_hits() {
     // Enable with an arbitrary live generation but never warm the
     // slot: a kernel-zeroed entry is {dst:0, gen:0} and gen 0 is
     // reserved, so the first packet must be a MISS, never a hit.
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.set_fib_cache(1, 7);
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
@@ -743,7 +743,7 @@ fn fib_cache_zeroed_slot_never_false_hits() {
 fn fib_cache_hit_on_tc_datapath() {
     // fib.rs is shared by both datapaths; prove the cache works under
     // the tc classifiers too.
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.set_fib_cache(1, 1);
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
@@ -771,11 +771,11 @@ fn fib_cache_hit_on_tc_datapath() {
 /// the kernel is only bridging.
 const FOREIGN_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x99];
 
-/// Custom-FIB harness with a resolved nexthop covering every
+/// PacketFrame FIB harness with a resolved nexthop covering every
 /// destination (a `fallback-default`-shaped 0/0 and ::/0), so any
 /// allowlisted frame that reaches the FIB is redirected.
 fn dst_mac_harness() -> Harness {
-    let mut h = prep_custom_fib_harness();
+    let mut h = prep_packetframe_fib_harness();
     h.add_allow_v4("192.0.2.0/24");
     h.add_allow_v6("2001:db8::/32");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
@@ -810,7 +810,7 @@ fn v6_to(dst_mac: [u8; 6], dst: &str) -> Vec<u8> {
 fn assert_passed_not_for_us(h: &Harness, pkt: &[u8], matched: StatIdx, what: &str) {
     let before = h.stat(StatIdx::PassNotForUs);
     let before_matched = h.stat(matched);
-    let before_hit = h.stat(StatIdx::CustomFibHit);
+    let before_hit = h.stat(StatIdx::FibHit);
     let before_fwd = h.stat(StatIdx::FwdOk);
     let (verdict, out) = h.run(pkt);
     assert_eq!(
@@ -829,7 +829,7 @@ fn assert_passed_not_for_us(h: &Harness, pkt: &[u8], matched: StatIdx, what: &st
         "{what}: still counts as matched"
     );
     assert_eq!(
-        h.stat(StatIdx::CustomFibHit),
+        h.stat(StatIdx::FibHit),
         before_hit,
         "{what}: must not reach the FIB"
     );
@@ -918,7 +918,7 @@ fn a_receive_mac_is_scoped_to_its_ingress_port() {
 }
 
 /// Broadcast and multicast frames from an allowlisted host must never be
-/// routed; with a default route in the custom FIB (`fallback-default`)
+/// routed; with a default route in the PacketFrame FIB (`fallback-default`)
 /// they were, since the program had no MAC check at all.
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
@@ -983,7 +983,10 @@ fn a_foreign_frame_is_neither_bogon_dropped_nor_dry_run_counted() {
     let mut h = dst_mac_harness();
     h.add_block_v4("192.0.2.0/24");
     h.set_cfg_flags(
-        FP_CFG_FLAG_IPV4 | FP_CFG_FLAG_IPV6 | FP_CFG_FLAG_CUSTOM_FIB | FP_CFG_FLAG_BLOCK_PRESENT,
+        FP_CFG_FLAG_IPV4
+            | FP_CFG_FLAG_IPV6
+            | FP_CFG_FLAG_PACKETFRAME_FIB
+            | FP_CFG_FLAG_BLOCK_PRESENT,
     );
     let (verdict, _) = h.run(&v4_to(BUILDER_DST_MAC, [192, 0, 2, 2]));
     assert_eq!(

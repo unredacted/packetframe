@@ -191,7 +191,7 @@ pub struct SubsystemHealth {
 /// freshness independently. Modules without subsystems return
 /// `HealthReport::default()` (an empty, healthy report).
 ///
-/// Added during the Option F custom-FIB rollout because the prior
+/// Added during the Option F PacketFrame FIB rollout because the prior
 /// `ModuleResult<()>` surface couldn't express partial-degraded
 /// states across multiple control-plane subsystems.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

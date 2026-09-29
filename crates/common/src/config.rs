@@ -440,7 +440,7 @@ pub enum ModuleDirective {
     /// fast-path inbound traffic for. Bird's iBGP feed gives us the
     /// /24 with an unresolvable next-hop (a self-IP for direct-origin
     /// routes), so without per-host /32 entries the LPM lookup hits
-    /// the /24 with `state=Incomplete` and bumps `custom_fib_no_neigh`
+    /// the /24 with `state=Incomplete` and bumps `fib_no_neigh`
     /// XDP_PASS to kernel for every packet. With a `local-prefix`
     /// directive, [`NetlinkNeighborResolver`] walks the kernel's
     /// neighbour table for IPs within `cidr` reachable via `iface`
@@ -476,7 +476,7 @@ pub enum ModuleDirective {
     /// sweep *could* find (hand-numbered `::1..::ff` servers) are
     /// statically configured and actively talking, which means they are
     /// already in the neighbour table that reactive seeding reads. See
-    /// `docs/runbooks/custom-fib.md`.
+    /// `docs/runbooks/packetframe-fib.md`.
     ///
     /// Requires a matching `allow-prefix6`: the allowlist is consulted
     /// before the FIB lookup, so a /128 in `FIB_V6` does nothing if the
@@ -487,7 +487,7 @@ pub enum ModuleDirective {
         iface: String,
         line: usize,
     },
-    /// Synthetic IPv4 default route for the custom FIB (v0.2.1). With
+    /// Synthetic IPv4 default route for the PacketFrame FIB (v0.2.1). With
     /// `fallback-default via <iface> nexthop <ipv4>`, the resolver
     /// injects a `RouteEvent::Add { prefix: 0.0.0.0/0, nexthops: [nh] }`
     /// at startup. Every more-specific bird-fed route still wins in
@@ -542,12 +542,12 @@ pub enum ModuleDirective {
         line: usize,
     },
     DryRun(bool),
-    /// `fib-cache on|off` — destination cache in front of the custom
-    /// FIB LPM lookups (default off; an experiment with an explicit
+    /// `fib-cache on|off` — destination cache in front of the
+    /// PacketFrame FIB LPM lookups (default off; an experiment with an explicit
     /// kill criterion, see docs). Caches the FibValue keyed on the
     /// full destination address; invalidated globally on every route
     /// change via a generation counter owned by the FibProgrammer.
-    /// Only meaningful under `forwarding-mode custom-fib`; parsed and
+    /// Only meaningful under `forwarding-mode packetframe-fib`; parsed and
     /// inert otherwise (warned at apply time). SIGHUP-reconcilable.
     FibCache(bool),
     /// `coalesce [rx-usecs <n>] [rx-frames <n>] [tx-usecs <n>]
@@ -605,17 +605,17 @@ pub enum ModuleDirective {
     /// the only defined knob is `rvu-nicpf-head-shift` (SPEC
     /// §11.1(c)), see [`DriverWorkaround`] for the axes.
     DriverWorkaround(DriverWorkaround),
-    // --- Custom FIB (Option F, Phase 1) ---
+    // --- PacketFrame FIB (Option F, Phase 1) ---
     /// Selects the forwarding lookup path. `kernel-fib` (default)
-    /// uses the existing `bpf_fib_lookup()`; `custom-fib` consults
+    /// uses the existing `bpf_fib_lookup()`; `packetframe-fib` consults
     /// the module's own LPM-trie FIB + NEXTHOPS array; `compare`
     /// runs both and bumps CompareAgree/CompareDisagree (pre-cutover
     /// validation, temporary).
     ForwardingMode(ForwardingMode),
-    /// RouteSource configuration, where the custom FIB gets its
+    /// RouteSource configuration, where the PacketFrame FIB gets its
     /// routes. Two kinds: `bmp <addr>:<port>` and `bgp <addr>:<port>
     /// local-as <asn> peer-as <asn>`. Spawned by the RouteController
-    /// when this is set and `forwarding-mode` is `custom-fib` or
+    /// when this is set and `forwarding-mode` is `packetframe-fib` or
     /// `compare`. See [`RouteSourceSpec`] for the per-kind shape.
     RouteSource(RouteSourceSpec),
     /// Which authority the integrity checker cross-checks the mirror
@@ -625,7 +625,7 @@ pub enum ModuleDirective {
     /// the default path, which is the fleet's shape and preserves
     /// every existing config.
     IntegrityAuthority(IntegrityAuthoritySpec),
-    /// Max entries for the custom-FIB LPM tries and side arrays.
+    /// Max entries for the PacketFrame FIB LPM tries and side arrays.
     /// Accepted but **not yet runtime-applied**, aya / kernel
     /// allocate maps at compile-time sizes set in
     /// `crates/modules/fast-path/bpf/src/maps.rs`. The directive is
@@ -714,7 +714,7 @@ pub enum ModuleDirective {
     /// bridge is not a startup error — the module waits for it.
     /// `ix-mode` additionally tells fast-path's neighbour resolver to
     /// stop issuing its own broadcast probes for nexthops routed via
-    /// this bridge (custom-fib only; inert under kernel-fib).
+    /// this bridge (packetframe-fib only; inert under kernel-fib).
     SnoopBridge {
         iface: String,
         ix_mode: bool,
@@ -818,7 +818,7 @@ pub enum MssClampPrefix {
 }
 
 /// Forwarding-path selector. `KernelFib` keeps today's behavior
-/// bpf_fib_lookup() and the legacy success path. `CustomFib` routes
+/// bpf_fib_lookup() and the legacy success path. `PacketframeFib` routes
 /// through the Option-F LPM trie + nexthop cache. `Compare` runs
 /// both and bumps disagreement counters; the kernel result is
 /// authoritative.
@@ -827,19 +827,26 @@ pub enum MssClampPrefix {
 pub enum ForwardingMode {
     #[default]
     KernelFib,
-    CustomFib,
+    PacketframeFib,
     Compare,
 }
+
+/// Former name of [`ForwardingMode::PacketframeFib`], still accepted.
+const DEPRECATED_PACKETFRAME_FIB: &str = "custom-fib";
 
 impl FromStr for ForwardingMode {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "kernel-fib" => Ok(Self::KernelFib),
-            "custom-fib" => Ok(Self::CustomFib),
+            "packetframe-fib" => Ok(Self::PacketframeFib),
+            // The name through 0.5.0. Deployed configs carry it, and a
+            // daemon that refused its own config would leave every
+            // flow on the conntrack path; the directive parser warns.
+            DEPRECATED_PACKETFRAME_FIB => Ok(Self::PacketframeFib),
             "compare" => Ok(Self::Compare),
             other => Err(format!(
-                "expected `kernel-fib`, `custom-fib`, or `compare`, got `{other}`"
+                "expected `kernel-fib`, `packetframe-fib`, or `compare`, got `{other}`"
             )),
         }
     }
@@ -849,7 +856,7 @@ impl FromStr for ForwardingMode {
 /// is the recommended forwarding feed because bird's BMP
 /// implementation lacks RFC 9069 Loc-RIB, see
 /// `route_source_bgp.rs` module docs and
-/// `docs/runbooks/custom-fib.md` for the rationale.
+/// `docs/runbooks/packetframe-fib.md` for the rationale.
 ///
 /// **Authorization.** The listeners are unauthenticated at the
 /// protocol level (no TCP-MD5 wiring). The default posture is
@@ -1322,7 +1329,7 @@ pub enum AttachMode {
     /// clsact qdisc instead of XDP. For hosts forced into xdp-generic
     /// (e.g. rvu-nicpf pre-6.8), this avoids generic XDP's per-packet
     /// headroom realloc + GRO linearization. Requires
-    /// `forwarding-mode custom-fib` (enforced at attach time); `auto`
+    /// `forwarding-mode packetframe-fib` (enforced at attach time); `auto`
     /// never selects tc — it is an explicit per-iface opt-in so
     /// canary rollouts stay operator-controlled.
     Tc,
@@ -2207,8 +2214,8 @@ impl Config {
     ///   every fast-path `attach` interface needs a `port` line (a
     ///   steered packet's best path may egress any port; a missing
     ///   member would blackhole those destinations in VPP);
-    /// - steering requires `forwarding-mode custom-fib` (the full
-    ///   table VPP mirrors comes from the custom-FIB route pipeline);
+    /// - steering requires `forwarding-mode packetframe-fib` (the full
+    ///   table VPP mirrors comes from the PacketFrame FIB route pipeline);
     /// - duplicate `port` lines for one interface are rejected;
     /// - the IPv6 steering rules ([`Self::validate_vpp_v6_steering`]);
     /// - `drift-accept6` ([`Self::validate_vpp_drift_accepts6`]);
@@ -2459,11 +2466,11 @@ impl Config {
                 _ => None,
             })
             .unwrap_or_default();
-        if fwd != ForwardingMode::CustomFib {
+        if fwd != ForwardingMode::PacketframeFib {
             return Err(ConfigError::parse(
                 0,
-                "vpp-offload steering requires `forwarding-mode custom-fib` in module \
-                 fast-path (VPP mirrors the custom-FIB route pipeline)",
+                "vpp-offload steering requires `forwarding-mode packetframe-fib` in module \
+                 fast-path (VPP mirrors the PacketFrame FIB route pipeline)",
             ));
         }
 
@@ -4113,6 +4120,12 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
         "driver-workaround" => parse_driver_workaround(line, rest),
         "forwarding-mode" => parse_single_arg(line, rest, "forwarding-mode", |t| {
             let mode: ForwardingMode = t.parse().map_err(|e: String| e)?;
+            if t == DEPRECATED_PACKETFRAME_FIB {
+                tracing::warn!(
+                    "config line {line}: `forwarding-mode {DEPRECATED_PACKETFRAME_FIB}` is \
+                     deprecated; write `forwarding-mode packetframe-fib`"
+                );
+            }
             Ok(ModuleDirective::ForwardingMode(mode))
         }),
         "route-source" => parse_route_source(line, rest),
@@ -6175,7 +6188,7 @@ module fast-path
 module fast-path
   attach eth2 generic
   allow-prefix 203.0.113.0/24
-  forwarding-mode custom-fib
+  forwarding-mode packetframe-fib
   integrity-authority frr upstream 192.0.2.1 families v4,v6
 
 module vpp-offload
@@ -6282,7 +6295,7 @@ module vpp-offload
     /// row for a weaker guarantee than the operator asked for.
     #[test]
     fn the_frr_authority_is_refused_over_a_bmp_feed() {
-        let bmp = "module fast-path\n  forwarding-mode custom-fib\n  \
+        let bmp = "module fast-path\n  forwarding-mode packetframe-fib\n  \
                    route-source bmp 127.0.0.1:1790 require-loc-rib\n  \
                    integrity-authority frr upstream 192.0.2.1 families v4,v6\n\
                    module vpp-offload\n  loopback-address 192.0.2.9/32\n  \
@@ -6344,7 +6357,7 @@ module vpp-offload
     /// rollout window.
     #[test]
     fn the_frr_authority_rejects_packetframes_own_session_as_an_upstream() {
-        let cfg = "module fast-path\n  forwarding-mode custom-fib\n  \
+        let cfg = "module fast-path\n  forwarding-mode packetframe-fib\n  \
                    route-source bgp 127.0.0.1:1179 local-as 64512 peer-as 64512\n  \
                    integrity-authority frr upstream 127.0.0.1 families v4\n";
         let err = Config::parse(cfg)
@@ -6372,7 +6385,7 @@ module vpp-offload
     /// load rather than discovered as a canary that defers forever.
     #[test]
     fn require_table_complete_needs_an_authority() {
-        let base = "module fast-path\n  forwarding-mode custom-fib\n  \
+        let base = "module fast-path\n  forwarding-mode packetframe-fib\n  \
                     route-source bgp 127.0.0.1:1179 local-as 1 peer-as 1\n  \
                     integrity-authority none\n\
                     module vpp-offload\n  loopback-address 192.0.2.1/32\n  \
@@ -6461,7 +6474,7 @@ module vpp-offload
     /// while unsteered alongside a steered port that has its own core.
     #[test]
     fn vpp_port_cores_zero_parses_and_validates_unsteered() {
-        let s = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  \
+        let s = "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth4 generic\n  \
                  attach eth5 generic\n\nmodule vpp-offload\n  \
                  loopback-address 198.51.100.1/32\n  port eth4 cores 0 steer off\n  \
                  port eth5 cores 1 steer on\n";
@@ -6488,7 +6501,7 @@ module vpp-offload
     /// same validator, so this is also the SIGHUP refusal.
     #[test]
     fn vpp_port_cores_zero_with_steer_on_is_refused() {
-        let s = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  \
+        let s = "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth4 generic\n  \
                  attach eth5 generic\n\nmodule vpp-offload\n  \
                  loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer off\n  \
                  port eth5 cores 0 steer on\n";
@@ -6693,7 +6706,7 @@ module vpp-offload
     /// of them, so the rollback stays a one-token edit.
     #[test]
     fn v6_steering_cross_validation() {
-        let base = "module fast-path\n  forwarding-mode custom-fib\n  attach eth3 generic\n  \
+        let base = "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth3 generic\n  \
                     attach eth4 generic\n  allow-prefix 192.0.2.0/24\n\n\
                     module vpp-offload\n  loopback-address 198.51.100.254/32\n";
         let check = |body: &str| {
@@ -6969,7 +6982,7 @@ module vpp-offload
     /// is a load-time refusal. Pure transit needs no local-routes.
     #[test]
     fn dst_direction_requires_local_route_coverage() {
-        let fp = "module fast-path\n  forwarding-mode custom-fib\n  attach eth3 generic\n  \
+        let fp = "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth3 generic\n  \
                   attach eth4 generic\n  allow-prefix 192.0.2.0/24\n  \
                   local-prefix 192.0.2.0/24 via br1337\n\n";
         let vpp_base = "module vpp-offload\n  loopback-address 198.51.100.254/32\n  \
@@ -7023,7 +7036,8 @@ module vpp-offload
         // dst steering with no local prefix in the allowlist's path
         // (pure transit): nothing to cover, valid. The global default
         // direction (`both`) triggers coverage exactly like `dst`.
-        let transit = "module fast-path\n  forwarding-mode custom-fib\n  attach eth3 generic\n  \
+        let transit =
+            "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth3 generic\n  \
                        allow-prefix 198.18.0.0/15\n\n\
                        module vpp-offload\n  loopback-address 198.51.100.254/32\n  \
                        port eth3 cores 1 steer on\n";
@@ -7117,7 +7131,7 @@ module vpp-offload
     /// once.
     #[test]
     fn loopback_address6_needs_v6_on_and_appears_once() {
-        let base = "module fast-path\n  forwarding-mode custom-fib\n  attach eth3 generic\n  \
+        let base = "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth3 generic\n  \
                     allow-prefix 192.0.2.0/24\n\n\
                     module vpp-offload\n  loopback-address 198.51.100.254/32\n  \
                     port eth3 cores 1 steer off\n";
@@ -7185,7 +7199,7 @@ module vpp-offload
     /// are allowed.
     #[test]
     fn drift_accept6_needs_v6_on_and_refuses_duplicates() {
-        let base = "module fast-path\n  forwarding-mode custom-fib\n  attach eth3 generic\n  \
+        let base = "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth3 generic\n  \
                     allow-prefix 192.0.2.0/24\n\n\
                     module vpp-offload\n  loopback-address 198.51.100.254/32\n  \
                     port eth3 cores 1 steer off\n";
@@ -7242,7 +7256,7 @@ module vpp-offload
             .validate_vpp_offload()
             .is_err());
 
-        // Steering without custom-fib: rejected.
+        // Steering without packetframe-fib: rejected.
         let no_cfib = "module fast-path\n  attach eth4 generic\n\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer on\n";
         assert!(Config::parse(no_cfib)
             .unwrap()
@@ -7250,14 +7264,14 @@ module vpp-offload
             .is_err());
 
         // Steering with a fast-path attach port missing membership: rejected.
-        let missing_member = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  attach eth5 generic\n\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth5 cores 1 steer on\n";
+        let missing_member = "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth4 generic\n  attach eth5 generic\n\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth5 cores 1 steer on\n";
         assert!(Config::parse(missing_member)
             .unwrap()
             .validate_vpp_offload()
             .is_err());
 
-        // Full membership + steering + custom-fib: valid.
-        let good = "module fast-path\n  forwarding-mode custom-fib\n  attach eth4 generic\n  attach eth5 generic\n\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer off\n  port eth5 cores 1 steer on\n";
+        // Full membership + steering + packetframe-fib: valid.
+        let good = "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth4 generic\n  attach eth5 generic\n\nmodule vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer off\n  port eth5 cores 1 steer on\n";
         Config::parse(good).unwrap().validate_vpp_offload().unwrap();
 
         // Duplicate port line: rejected.
@@ -7515,11 +7529,12 @@ module fast-path
     }
 
     #[test]
-    fn forwarding_mode_accepts_all_three_values() {
+    fn forwarding_mode_accepts_every_spelling() {
         for (tok, expected) in [
             ("kernel-fib", ForwardingMode::KernelFib),
-            ("custom-fib", ForwardingMode::CustomFib),
+            ("packetframe-fib", ForwardingMode::PacketframeFib),
             ("compare", ForwardingMode::Compare),
+            ("custom-fib", ForwardingMode::PacketframeFib),
         ] {
             let m = parse_module_body(&format!("  forwarding-mode {tok}\n")).unwrap();
             assert_eq!(
@@ -8956,7 +8971,7 @@ module fast-path
         // The staging state the ladder starts from: two attached ports,
         // both members, neither steering.
         let staged = "module fast-path\n  attach eth4 generic\n  attach eth5 generic\n  \
-                      forwarding-mode custom-fib\n\n\
+                      forwarding-mode packetframe-fib\n\n\
                       module vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth4 cores 1 steer off\n  \
                       port eth5 cores 1 steer off\n  expected-routes 100\n";
         Config::parse(staged)
@@ -8967,7 +8982,7 @@ module fast-path
         // The rollout's first rung, with one member quietly missing.
         // Startup would refuse this; so must a reload.
         let rung_one = "module fast-path\n  attach eth4 generic\n  attach eth5 generic\n  \
-                        forwarding-mode custom-fib\n\n\
+                        forwarding-mode packetframe-fib\n\n\
                         module vpp-offload\n  loopback-address 198.51.100.1/32\n  port eth5 cores 1 steer on\n  \
                         expected-routes 100\n";
         let e = Config::parse(rung_one)

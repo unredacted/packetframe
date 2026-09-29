@@ -1,9 +1,9 @@
-//! Custom-FIB lookup path (Option F, Phase 1 Slice 1B).
+//! PacketFrame FIB lookup path (Option F, Phase 1 Slice 1B).
 //!
 //! Replaces `bpf_fib_lookup()` with an LPM-trie lookup in `FIB_V4` /
 //! `FIB_V6`, followed by a seqlock-aware read of `NEXTHOPS` (and for
 //! ECMP, a bounded walk of `ECMP_GROUPS[i].nh_idx`). Gated on
-//! `FP_CFG_FLAG_CUSTOM_FIB` by the caller in `main.rs`; this module
+//! `FP_CFG_FLAG_PACKETFRAME_FIB` by the caller in `main.rs`; this module
 //! never runs when the operator is on `forwarding-mode kernel-fib`.
 //!
 //! **Verifier friendliness.** The ECMP walk is manually unrolled over
@@ -60,14 +60,14 @@ pub const FIB_ACTION_FORWARD: u8 = 1;
 pub const FIB_ACTION_NO_NEIGH: u8 = 2;
 pub const FIB_ACTION_DROP: u8 = 3;
 
-/// Result of a custom-FIB lookup. `action` is one of `FIB_ACTION_*`.
+/// Result of a PacketFrame FIB lookup. `action` is one of `FIB_ACTION_*`.
 /// When `action == FIB_ACTION_FORWARD`, `egress_ifindex` / `smac` /
 /// `dmac` carry the forwarding decision and `pin_vid` carries the
 /// FDB-pinned egress VID (0 = not pinned; the caller runs its normal
 /// `VLAN_RESOLVE` resolution). Otherwise those fields are undefined
 /// and the caller must not consult them.
 #[derive(Copy, Clone)]
-pub struct CustomFibResult {
+pub struct PacketframeFibResult {
     pub action: u8,
     pub egress_ifindex: u32,
     pub smac: [u8; 6],
@@ -75,7 +75,7 @@ pub struct CustomFibResult {
     pub pin_vid: u16,
 }
 
-impl CustomFibResult {
+impl PacketframeFibResult {
     #[inline(always)]
     pub fn miss() -> Self {
         Self {
@@ -112,14 +112,14 @@ impl CustomFibResult {
 
 // --- Top-level lookup -------------------------------------------------
 
-/// IPv4 custom-FIB lookup. Caller passes the parsed src/dst/proto plus
+/// IPv4 PacketFrame FIB lookup. Caller passes the parsed src/dst/proto plus
 /// the packet bounds and L4 header offset; **port extraction is
 /// deferred** into the ECMP arm (`resolve_fib_value_v4`), because ports
 /// feed only the ECMP flow hash — on the single-nexthop path (the
 /// common case on deployments with no ECMP groups) no port bytes are
 /// read at all. `(start, end)` scalars rather than a ctx type keep the
 /// whole module hook-agnostic (shared with the tc datapath, Phase T).
-/// Returns a [`CustomFibResult`] the caller feeds into its own
+/// Returns a [`PacketframeFibResult`] the caller feeds into its own
 /// dispatch verdict mapping.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -131,7 +131,7 @@ pub fn lookup_v4(
     src: [u8; 4],
     dst: [u8; 4],
     proto: u8,
-) -> CustomFibResult {
+) -> PacketframeFibResult {
     // Destination-cache probe (gated; generation 0 = disabled). On a
     // hit the LPM walk is skipped entirely; the FibValue still resolves
     // through NEXTHOPS/ECMP_GROUPS below, so the seqlock read and the
@@ -185,8 +185,8 @@ pub fn lookup_v4(
                 // No negative caching: a stale "no route" entry is a
                 // blackhole-shaped bug, and true misses are rare under
                 // a full table.
-                bump(stats, StatIdx::CustomFibMiss);
-                return CustomFibResult::miss();
+                bump(stats, StatIdx::FibMiss);
+                return PacketframeFibResult::miss();
             }
         };
         if cache_gen != 0 {
@@ -211,24 +211,24 @@ pub fn lookup_v4(
         None => {
             // ECMP walked every leg and none resolved, or the single
             // nexthop index was out of range.
-            bump(stats, StatIdx::CustomFibNoNeigh);
-            return CustomFibResult::no_neigh();
+            bump(stats, StatIdx::FibNoNeigh);
+            return PacketframeFibResult::no_neigh();
         }
     };
 
     match read_nexthop_ptr(stats, nh_ptr) {
         Some((ifindex, smac, dmac, pin_vid)) => {
-            bump(stats, StatIdx::CustomFibHit);
-            CustomFibResult::forward(ifindex, smac, dmac, pin_vid)
+            bump(stats, StatIdx::FibHit);
+            PacketframeFibResult::forward(ifindex, smac, dmac, pin_vid)
         }
         None => {
-            bump(stats, StatIdx::CustomFibNoNeigh);
-            CustomFibResult::no_neigh()
+            bump(stats, StatIdx::FibNoNeigh);
+            PacketframeFibResult::no_neigh()
         }
     }
 }
 
-/// IPv6 custom-FIB lookup. See [`lookup_v4`]; same deferred-port and
+/// IPv6 PacketFrame FIB lookup. See [`lookup_v4`]; same deferred-port and
 /// scalar-bounds contracts.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -240,7 +240,7 @@ pub fn lookup_v6(
     src: [u8; 16],
     dst: [u8; 16],
     proto: u8,
-) -> CustomFibResult {
+) -> PacketframeFibResult {
     // Destination-cache probe; see the v4 twin for the full contract
     // and the register-pressure note (nothing but `cache_gen`, `fib`,
     // `cached` may live across the LPM call — the dst words and slot
@@ -283,8 +283,8 @@ pub fn lookup_v6(
         fib = match FIB_V6.get(&key) {
             Some(v) => *v,
             None => {
-                bump(stats, StatIdx::CustomFibMiss);
-                return CustomFibResult::miss();
+                bump(stats, StatIdx::FibMiss);
+                return PacketframeFibResult::miss();
             }
         };
         if cache_gen != 0 {
@@ -312,19 +312,19 @@ pub fn lookup_v6(
     let nh_ptr = match resolve_fib_value_v6(stats, start, end, l4_off, &fib, src, dst, proto) {
         Some(p) => p,
         None => {
-            bump(stats, StatIdx::CustomFibNoNeigh);
-            return CustomFibResult::no_neigh();
+            bump(stats, StatIdx::FibNoNeigh);
+            return PacketframeFibResult::no_neigh();
         }
     };
 
     match read_nexthop_ptr(stats, nh_ptr) {
         Some((ifindex, smac, dmac, pin_vid)) => {
-            bump(stats, StatIdx::CustomFibHit);
-            CustomFibResult::forward(ifindex, smac, dmac, pin_vid)
+            bump(stats, StatIdx::FibHit);
+            PacketframeFibResult::forward(ifindex, smac, dmac, pin_vid)
         }
         None => {
-            bump(stats, StatIdx::CustomFibNoNeigh);
-            CustomFibResult::no_neigh()
+            bump(stats, StatIdx::FibNoNeigh);
+            PacketframeFibResult::no_neigh()
         }
     }
 }
@@ -485,7 +485,7 @@ const SEQ_NOT_RESOLVED: u8 = 2;
 /// versions retried (and bumped `NexthopSeqRetry`) on that stable
 /// condition too, which burned up to 3 extra attempts per packet on
 /// unresolved nexthops and inflated the retry counter to ~4× the
-/// `custom_fib_no_neigh` rate — masking the genuine-churn signal the
+/// `fib_no_neigh` rate — masking the genuine-churn signal the
 /// counter is documented to carry. `NexthopSeqRetry` now counts only
 /// real torn reads; `NeighCacheMiss` still counts every failed read.
 #[inline(always)]

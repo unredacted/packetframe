@@ -277,7 +277,7 @@ impl Module for FastPathModule {
         Ok(())
     }
 
-    /// Subsystem health for the custom-FIB control plane.
+    /// Subsystem health for the PacketFrame FIB control plane.
     ///
     /// One row so far: the integrity check's verdict, which was
     /// computed every 300 s and discarded — `packetframe status` had

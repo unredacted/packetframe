@@ -2,7 +2,7 @@
 //! sched_cls programs, attached via clsact with direct-action.
 //!
 //! Same forwarding semantics as the XDP pair in `main.rs`/`finalize.rs`
-//! — same maps, same counters, same classification and custom-FIB
+//! — same maps, same counters, same classification and PacketFrame FIB
 //! logic (shared via `datapath.rs` and `fib.rs`) — but running on the
 //! skb path, which on generic-XDP-only hardware (rvu-nicpf pre-6.8)
 //! avoids generic XDP's three per-packet taxes: the 256-byte-headroom
@@ -27,7 +27,7 @@
 //!   oversize non-GSO packet would reach the driver silently.
 //!   `bpf_check_mtu(BPF_MTU_CHK_SEGS)` runs in stage 1, before TTL/L2
 //!   rewrite, and exceeds return TC_ACT_OK pristine so the kernel
-//!   emits FRAG_NEEDED — which also gives custom-fib mode the
+//!   emits FRAG_NEEDED — which also gives packetframe-fib mode the
 //!   FRAG_NEEDED parity it lacks under XDP.
 //! - **Egress VLAN uses the skb helpers.** Manual byte-shifting at TC
 //!   would desync `skb->mac_len`/`skb->protocol`, which
@@ -59,7 +59,7 @@ use crate::datapath::{
 };
 use crate::maps::{
     bump, stats_base, StatIdx, StatsPtr, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG,
-    FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_MSS_CLAMP_PRESENT,
+    FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_MSS_CLAMP_PRESENT, FP_CFG_FLAG_PACKETFRAME_FIB,
     FP_CFG_FLAG_VLAN_PRESENT, MUTATION_CTX, TC_MUTATION_PROGS, TC_REDIRECT_TARGETS, VLAN_RESOLVE,
 };
 use crate::{
@@ -237,19 +237,19 @@ fn tc_handle_ipv4(
         return Ok(TC_ACT_OK as i32);
     }
 
-    // tc datapath is custom-fib only (Phase T scope): kernel-fib
+    // tc datapath is packetframe-fib only (Phase T scope): kernel-fib
     // deployments have no reason to leave XDP, and skipping the
     // bpf_fib_lookup arm keeps this program's verifier footprint
     // small. Userspace enforces the pairing (attach `tc` requires
-    // `forwarding-mode custom-fib`); if the flag is somehow clear,
+    // `forwarding-mode packetframe-fib`); if the flag is somehow clear,
     // fail open to the kernel path rather than guess.
-    if cfg_flags & FP_CFG_FLAG_CUSTOM_FIB == 0 {
+    if cfg_flags & FP_CFG_FLAG_PACKETFRAME_FIB == 0 {
         return Ok(TC_ACT_OK as i32);
     }
     let l4_off = ip_offset + Ipv4Hdr::LEN;
-    let custom = fib::lookup_v4(stats, start, end, l4_off, src_bytes, dst_bytes, proto);
-    tc_dispatch_custom_fib(
-        custom,
+    let packetframe_fib = fib::lookup_v4(stats, start, end, l4_off, src_bytes, dst_bytes, proto);
+    tc_dispatch_packetframe_fib(
+        packetframe_fib,
         ctx,
         stats,
         cfg_flags,
@@ -326,14 +326,14 @@ fn tc_handle_ipv6(
         return Ok(TC_ACT_OK as i32);
     }
 
-    // Custom-fib only; see tc_handle_ipv4.
-    if cfg_flags & FP_CFG_FLAG_CUSTOM_FIB == 0 {
+    // `packetframe-fib` only; see tc_handle_ipv4.
+    if cfg_flags & FP_CFG_FLAG_PACKETFRAME_FIB == 0 {
         return Ok(TC_ACT_OK as i32);
     }
     let l4_off = ip_offset + Ipv6Hdr::LEN;
-    let custom = fib::lookup_v6(stats, start, end, l4_off, src_bytes, dst_bytes, next);
-    tc_dispatch_custom_fib(
-        custom,
+    let packetframe_fib = fib::lookup_v6(stats, start, end, l4_off, src_bytes, dst_bytes, next);
+    tc_dispatch_packetframe_fib(
+        packetframe_fib,
         ctx,
         stats,
         cfg_flags,
@@ -345,13 +345,13 @@ fn tc_handle_ipv6(
     )
 }
 
-/// TC verdict mapping for a [`fib::CustomFibResult`]: same shape as
-/// main.rs::dispatch_custom_fib with XDP verdicts swapped for TC
+/// TC verdict mapping for a [`fib::PacketframeFibResult`]: same shape as
+/// main.rs::dispatch_packetframe_fib with XDP verdicts swapped for TC
 /// actions (PASS→OK, DROP→SHOT).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn tc_dispatch_custom_fib(
-    result: fib::CustomFibResult,
+fn tc_dispatch_packetframe_fib(
+    result: fib::PacketframeFibResult,
     ctx: &TcContext,
     stats: StatsPtr,
     cfg_flags: u8,
@@ -430,7 +430,7 @@ fn tc_forward_success(
 
     // MTU pre-check, segment-aware: a GSO super-skb passes if its
     // segments fit. Exceeds return the packet PRISTINE so the kernel
-    // slow path emits FRAG_NEEDED (custom-fib gets FRAG_NEEDED parity
+    // slow path emits FRAG_NEEDED (packetframe-fib gets FRAG_NEEDED parity
     // XDP never had). `skb_do_redirect → dev_queue_xmit` performs no
     // MTU check of its own.
     let mut mtu_len: u32 = 0;

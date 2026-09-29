@@ -178,7 +178,7 @@ which is why the diagnosis ships and the datapath change waits.
 
 ## Prerequisites
 
-- `forwarding-mode custom-fib` with a live `route-source`. The tc
+- `forwarding-mode packetframe-fib` with a live `route-source`. The tc
   classifiers have no kernel-fib arm; the loader refuses the pairing
   otherwise.
 - Kernel: `CONFIG_NET_SCH_INGRESS` + `CONFIG_NET_CLS_BPF` (verified
@@ -191,7 +191,7 @@ which is why the diagnosis ships and the datapath change waits.
 
 ## Semantics vs the XDP datapath
 
-Identical: allowlist match, custom-FIB lookup (shared code), counters
+Identical: allowlist match, PacketFrame FIB lookup (shared code), counters
 (same indices), block-prefix (drop is `TC_ACT_SHOT`), dry-run, NDP
 gate, mss-clamp, VLAN-subif egress resolution, the
 mutate-only-if-forwardable invariant (via `TC_REDIRECT_TARGETS`, the
@@ -201,7 +201,7 @@ Different, deliberately:
 
 | Aspect | XDP datapath | tc datapath |
 |---|---|---|
-| Oversize packets | pass, kernel decides | `bpf_check_mtu` pre-check → pristine pass, kernel emits FRAG_NEEDED (parity custom-fib never had under XDP) |
+| Oversize packets | pass, kernel decides | `bpf_check_mtu` pre-check → pristine pass, kernel emits FRAG_NEEDED (parity packetframe-fib never had under XDP) |
 | Egress path | `generic_xdp_tx` direct xmit | `dev_queue_xmit` — traverses the egress qdisc, so `fq` pacing/shaping still applies |
 | tcpdump on ingress | blind (XDP runs before taps) | sees ingress traffic again |
 | VLAN ingress | inline tag parse | skb metadata first, inline fallback |

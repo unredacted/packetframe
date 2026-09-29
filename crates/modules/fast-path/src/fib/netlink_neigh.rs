@@ -98,7 +98,7 @@ pub struct LocalPrefixSpec {
 
 /// Operator-declared synthetic IPv4 default route (v0.2.1, issue #31).
 /// The resolver injects a single `RouteEvent::Add { 0.0.0.0/0,
-/// nexthops: [nexthop] }` at startup so the custom-FIB has a
+/// nexthops: [nexthop] }` at startup so the PacketFrame FIB has a
 /// catch-all for destinations bird's iBGP feed doesn't cover (RFC 1918,
 /// CGNAT, test-net, anything not in DFZ). Otherwise those packets
 /// miss LPM, fall to slow-path through netfilter / conntrack, and
@@ -1428,7 +1428,7 @@ impl NetlinkNeighborResolver {
     }
 
     /// v0.2.1 issue #31. Inject a synthetic IPv4 default route into
-    /// the custom-FIB if the operator declared `fallback-default`.
+    /// the PacketFrame FIB if the operator declared `fallback-default`.
     /// One-shot at startup; no ongoing maintenance because the
     /// /0 doesn't change (operator restarts to remove it). Uses a
     /// dedicated PeerId derived from the iface ifindex so it scopes

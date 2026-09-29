@@ -97,7 +97,7 @@ assets = [
 # auto-starting on a fresh install just produces a noisy first-launch
 # failure. The second is why it is still off even on a configured box —
 # enabling at boot is a per-deployment decision, because a reboot with
-# no packetframe leaves a custom-FIB box with a near-empty route table
+# no packetframe leaves a PacketFrame FIB box with a near-empty route table
 # until someone runs the teardown-and-start sequence by hand, while
 # enabling it commits to the unit's crash-loop behaviour. The unit now
 # caps that loop (see StartLimit* there), which is what makes enabling

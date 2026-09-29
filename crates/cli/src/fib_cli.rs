@@ -1,6 +1,6 @@
 //! `packetframe fib` subcommand implementations (Option F, Phase 3.8).
 //!
-//! Three operations over the pinned custom-FIB maps:
+//! Three operations over the pinned PacketFrame FIB maps:
 //! - `dump-v4` / `dump-v6`: walk the LPM trie, print every entry.
 //! - `lookup <ip>`: resolve a single address end-to-end.
 //! - `stats`: print the same FIB occupancy block as `status`.

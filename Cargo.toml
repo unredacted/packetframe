@@ -22,9 +22,9 @@ exclude = [
 ]
 
 [workspace.package]
-# Version history: 0.0.1 → 0.2.0 with the Option F custom-FIB rollout
+# Version history: 0.0.1 → 0.2.0 with the Option F PacketFrame FIB rollout
 # (rc1 → rc5 cutover series on the reference EFG; SPEC.md §11.14,
-# `docs/runbooks/custom-fib.md`), 0.2.x point releases through 0.2.7,
+# `docs/runbooks/packetframe-fib.md`), 0.2.x point releases through 0.2.7,
 # then 0.5.0 (vpp-offload, neigh-snoop, guard, tc datapath, event log).
 # Code comments that cite 0.2.8/0.2.9/0.2.10 name versions that never
 # shipped; that work is part of 0.5.0 (see CHANGELOG.md).
