@@ -71,8 +71,15 @@ fn prefix(addr: std::net::Ipv4Addr, len: u8) -> Option<Ipv4Prefix> {
 /// Every attribute outside the handful we write counts as a selector,
 /// so neither `lookup main` detection nor ownership matching can be
 /// fooled by a rule that only looks like one of those (an fwmark
-/// `lookup main`, say, which a VPN daemon installs).
+/// `lookup main`, say, which a VPN daemon installs). The exceptions are
+/// attributes the kernel sends for every rule whether set or not:
+/// `FRA_SUPPRESS_PREFIXLEN` is emitted unconditionally, as -1 when
+/// unset, and counting it made every rule, `lookup main` included, look
+/// selected (the first qemu run of the netns test). `FRA_SUPPRESS_IFGROUP`
+/// and `FRA_L3MDEV` get the same treatment at their unset values.
 fn observe(m: &RuleMessage) -> Option<ObservedRule> {
+    /// The kernel's -1, "not set", as the u32 the attribute carries.
+    const UNSET: u32 = u32::MAX;
     if m.header.family != AddressFamily::Inet {
         return None;
     }
@@ -91,7 +98,9 @@ fn observe(m: &RuleMessage) -> Option<ObservedRule> {
             RuleAttribute::Protocol(p) => owned = u8::from(*p) == PACKETFRAME_RT_PROTOCOL,
             RuleAttribute::Source(IpAddr::V4(a)) => src = prefix(*a, m.header.src_len),
             RuleAttribute::Destination(IpAddr::V4(a)) => dst = prefix(*a, m.header.dst_len),
-            RuleAttribute::L3MDev(false) => {}
+            RuleAttribute::SuppressPrefixLen(UNSET)
+            | RuleAttribute::SuppressIfGroup(UNSET)
+            | RuleAttribute::L3MDev(false) => {}
             _ => other_selectors = true,
         }
     }
@@ -583,7 +592,12 @@ mod tests {
                 target: 32001,
             },
         ] {
-            let seen = observe(&message_for(&rule)).expect("an IPv4 rule");
+            let mut dumped = message_for(&rule);
+            // The kernel adds this to every rule it dumps.
+            dumped
+                .attributes
+                .push(RuleAttribute::SuppressPrefixLen(u32::MAX));
+            let seen = observe(&dumped).expect("an IPv4 rule");
             assert!(seen.owned, "{rule}: protocol tag lost");
             assert_eq!(seen.as_owned(), Some(rule));
         }
@@ -595,14 +609,22 @@ mod tests {
         main.header.family = AddressFamily::Inet;
         main.header.action = NlAction::ToTable;
         main.header.table = 254;
+        // What the kernel dumps for `ip rule add pref 32000 lookup main`,
+        // including the always-present suppress_prefixlength of -1.
         main.attributes = vec![
-            RuleAttribute::Priority(32000),
             RuleAttribute::Table(254),
+            RuleAttribute::SuppressPrefixLen(u32::MAX),
             RuleAttribute::Protocol(RouteProtocol::Boot),
+            RuleAttribute::Priority(32000),
         ];
         let o = observe(&main).unwrap();
-        assert!(!o.owned);
+        assert!(!o.owned && !o.other_selectors, "{o:?}");
         assert_eq!(crate::wan_egress::find_main(&[o]), Some(32000));
+
+        // A real suppress_prefixlength (the wg-quick shape) is a selector.
+        let mut suppress = main.clone();
+        suppress.attributes[1] = RuleAttribute::SuppressPrefixLen(0);
+        assert!(observe(&suppress).unwrap().other_selectors);
 
         let mut fwmark = main.clone();
         fwmark.attributes.push(RuleAttribute::FwMark(0x80000));
