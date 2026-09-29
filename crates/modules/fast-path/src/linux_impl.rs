@@ -20,8 +20,8 @@ use aya::{
 };
 use packetframe_common::{
     config::{
-        uncovered_local_prefix_warnings, AttachMode, DriverWorkaround, Ipv4Prefix, Ipv6Prefix,
-        ModuleDirective, ToggleAutoOnOff,
+        uncovered_local_prefix_warnings, wan_egress_allow_overlap_warnings, AttachMode,
+        DriverWorkaround, Ipv4Prefix, Ipv6Prefix, ModuleDirective, ToggleAutoOnOff,
     },
     module::{Attachment, HookType, LoaderCtx, ModuleConfig, ModuleError, ModuleResult},
 };
@@ -760,6 +760,11 @@ pub struct ActiveState {
     /// once, so a reload that edits it must be refused by name rather
     /// than accepted with the NICs still on the old values.
     pub coalesce: Option<packetframe_common::ethtool::CoalesceSpec>,
+    /// The `wan-egress` reconciler, started at the end of `attach` when
+    /// the directive is present and started, re-specced or stopped by
+    /// the SIGHUP reconcile. `detach` removes its rules; a drop (the
+    /// preserve-attach exit) leaves them for the next start to adopt.
+    pub wan_egress: Option<crate::wan_egress::WanEgress>,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
@@ -882,6 +887,7 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         integrity_authority: integrity_authority_from_cfg(cfg),
         route_source_spec: route_source_spec_from_cfg(cfg),
         coalesce: coalesce_spec_from_cfg(cfg),
+        wan_egress: None,
     })
 }
 
@@ -2132,6 +2138,10 @@ pub fn attach(
         );
     }
 
+    // `wan-egress` policy rules, after every step that can fail the
+    // attach, so a refused start installs no rules.
+    start_wan_egress(state, cfg)?;
+
     // NIC interrupt coalescing, LAST: every step above that can fail
     // the attach has already succeeded, so a refused start never leaves
     // a NIC retuned. Scoped to `state.links` — what this attach actually
@@ -2175,6 +2185,41 @@ pub fn attach(
             },
         })
         .collect())
+}
+
+/// Start the `wan-egress` reconciler when the directive is present;
+/// otherwise remove any rules a previous daemon left, so the config
+/// stays the only source of truth for the kernel's policy rules (a
+/// directive dropped across a restart must not leave its rules behind).
+fn start_wan_egress(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+    match crate::wan_egress::spec_from_directives(&cfg.section.directives) {
+        Some(spec) => {
+            for w in wan_egress_allow_overlap_warnings(&cfg.section.directives) {
+                warn!("{w}");
+            }
+            info!(
+                sources = spec.sources.len(),
+                keep = spec.keep.len(),
+                "wan-egress enabled"
+            );
+            let w = crate::wan_egress::WanEgress::start(spec).map_err(|e| {
+                ModuleError::other(MODULE_NAME, format!("wan-egress start failed: {e}"))
+            })?;
+            state.wan_egress = Some(w);
+        }
+        None => match crate::wan_egress::remove_all_owned_blocking() {
+            Ok(0) => {}
+            Ok(n) => info!(
+                removed = n,
+                "wan-egress not configured; removed the rules a previous daemon left"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                "wan-egress not configured; could not check for rules a previous daemon left"
+            ),
+        },
+    }
+    Ok(())
 }
 
 /// Pin the fast-path program and every §4.5 map under the module's
@@ -3131,6 +3176,19 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
     if let Some(w) = state.redirect_watch.take() {
         w.shutdown();
     }
+    // wan-egress rules are kernel routing policy, not BPF state, so
+    // their removal depends on nothing below. A failure is logged, not
+    // fatal: `packetframe detach` removes owned rules again from a
+    // fresh dump, with no in-process state needed.
+    if let Some(w) = state.wan_egress.take() {
+        match w.shutdown_and_remove() {
+            Ok(n) => info!(removed = n, "wan-egress rules removed"),
+            Err(e) => warn!(
+                error = %e,
+                "wan-egress rule removal failed; `packetframe detach` retries it"
+            ),
+        }
+    }
 
     // Drop every PinnedLink next: this closes our userspace FDs but
     // the kernel keeps the attach alive via the bpffs inodes. tc
@@ -4011,6 +4069,7 @@ mod tests {
             },
             route_source_spec: None,
             coalesce: None,
+            wan_egress: None,
         };
 
         let bridge_idx = if_nametoindex(BRIDGE).unwrap();

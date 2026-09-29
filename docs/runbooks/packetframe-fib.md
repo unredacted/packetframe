@@ -10,6 +10,7 @@ how to roll back to the kernel-FIB path if something goes wrong.
 - [Healthy operation](#healthy-operation)
 - [Everyday inspection commands](#everyday-inspection-commands)
 - [Connected fast-path (v0.2.1)](#connected-fast-path-v021)
+- [WAN egress](#wan-egress)
 - [Cutover and rollback](#cutover-and-rollback)
 - [Triage by symptom](#triage-by-symptom)
 - [Resolved items](#resolved-items)
@@ -810,6 +811,133 @@ be in a bogon range.
 Refuses to start if a `block-prefix` overlaps any `allow-prefix` or
 `local-prefix` (operator config bug; would silently drop traffic to
 declared customer prefixes).
+
+## WAN egress
+
+`wan-egress` is a fast-path directive, but it acts on the kernel's
+routing policy rather than on the BPF datapath, and it works in every
+forwarding mode (`kernel-fib` included).
+
+### When and why
+
+It is for gateways where all three of these hold:
+
+- the full BGP table is installed into the kernel's `main` table;
+- the platform consults `main` (the rule `lookup main`) *before* its own
+  WAN policy rules (fwmark rules into per-WAN tables, a catch-all into
+  the primary WAN's table);
+- the platform's NAT is masquerade on the WAN egress interfaces only.
+
+Then a private (RFC 1918) source whose destination's best BGP path is a
+peering interface follows `main` out of that interface with no NAT, and
+the flow dies. The platform's own tools do not help: its policy routes
+are fwmark rules evaluated after `main`, a source-NAT rule on the
+peering interface may be accepted by the UI and never provisioned, and
+hand-added `ip rule` or iptables state is wiped by the next provisioning
+pass, reboot or firmware upgrade.
+
+```
+wan-egress from <cidr> [from <cidr> ...] [keep <cidr> ...]
+```
+
+Traffic from each `from` prefix skips `main` and continues with the
+rules after it, so the platform picks the WAN and NATs as it would for
+any destination it has no BGP route for. Destinations in the keep set
+still use `main`. The keep set is always:
+
+- 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC 1918);
+- 100.64.0.0/10 (RFC 6598 shared address space);
+- 169.254.0.0/16 (link-local);
+- every IPv4 `allow-prefix` and `local-prefix` in the section.
+
+Each `keep` adds to it. Both lists are normalized: host bits cleared,
+duplicates and prefixes covered by another entry dropped. IPv4 only
+(there is no NAT66 to hand IPv6 to). One `wan-egress` line per section;
+a `/0` is refused on either side.
+
+### How it works
+
+Three kinds of policy rule, all tagged `proto 199`, PacketFrame's
+protocol number (the same tag the `anyip` route wears):
+
+```
+31998:  from <src> to <keep> lookup main     # one per (source, keep) pair
+31999:  from <src> goto 32001                # one per source
+32000:  from all lookup main                 # the platform's own rule
+32001:  from all nop                         # the anchor, only when 32001 is free
+```
+
+(Priorities for a `lookup main` at 32000; on stock Linux, where `main`
+is at 32766 and `default` at 32767, the goto targets 32767 and no
+anchor is needed.)
+
+- **Where `main` is.** Each pass dumps the IPv4 rules and takes the
+  lowest-priority `lookup main` with no selectors and no PacketFrame
+  tag. Rules with an fwmark, interface, `suppress_prefixlength` or
+  other selector do not count. If there is none, nothing is written.
+- **Keep and goto.** The goto sits at the nearest priority below
+  `main` that no foreign rule uses; the keep rules at the nearest free
+  one below that, all within 100 of `main`. A priority shared with a
+  foreign rule is never used: the kernel orders same-priority rules by
+  insertion time, which the platform's next provisioning pass would
+  change. A foreign rule that ends up between the goto and `main` is
+  skipped for wan-egress sources, as `main` is.
+- **Anchor.** The kernel resolves a goto only to a rule that exists at
+  its target priority. An unresolved goto is skipped, which would
+  quietly put the sources back in `main`. The gotos therefore always
+  target `main + 1`, and when nothing foreign sits there PacketFrame
+  installs a `nop` there. Evaluation continues from it into the
+  platform's own rules, whatever they are.
+- **Ownership.** A rule wearing `proto 199` is PacketFrame's: adopted
+  when a new daemon finds it, repaired or removed as the config says.
+  A rule without the tag is never modified or deleted.
+- **Reconcile.** At start, on every `packetframe reconfigure` (the
+  directive is hot-reloadable; editing `allow-prefix` or `local-prefix`
+  changes the keep set too), on every IPv4 rule change (1 s debounce),
+  and every 30 s. A pass writes only the difference; when everything is
+  in place it writes nothing, so it wakes no other daemon that watches
+  rule events.
+- **Lifetime.** Like the pinned programs, the rules outlive a `systemctl
+  stop` (the next start adopts them) and go away with `packetframe
+  detach`, which finds them by their tag, and with module teardown
+  (including a circuit-breaker trip). A start whose config has no
+  `wan-egress` removes any tagged rules left behind.
+
+### Status and troubleshooting
+
+`packetframe status` shows a `wan-egress` row whenever the directive is
+in force:
+
+| Row | Meaning | What to do |
+|---|---|---|
+| healthy, `N rules in place; keep at K, goto G -> T past main at M` | Every rule is in place | Nothing |
+| degraded, `no unconditional lookup main rule found` | Nothing to skip past; nothing was written, existing rules left as they were | `ip rule show`; the platform may be mid-provisioning. It retries every pass |
+| degraded, `priorities ... below main are taken` | Fewer than two free priorities within 100 of `main`; nothing written or changed | `ip rule show` to see what fills the band |
+| degraded, `repair failing: X of Y rules in place; ...` | A dump or write failed | The error names the rule and the netlink error; it retries every pass |
+
+The textfile metrics carry `packetframe_wan_egress_rules{state="desired"}`,
+`packetframe_wan_egress_rules{state="present"}` and
+`packetframe_wan_egress_converged`. A repair (rules put back after they
+disappeared under an unchanged config) is logged and recorded in the
+event log as `wan_egress_repaired`, at most once every five minutes.
+
+To check the path a flow takes:
+
+```sh
+ip -4 rule show
+ip -4 route get <dst> from <private-src> iif <lan-iface>
+```
+
+Before the fix the second command names the peering interface; after
+it, the WAN interface (and a kept destination still names whatever
+`main` says).
+
+**The allow-prefix caveat.** The fast path matches the allowlist on
+source as well as destination, so a flow from an allowlisted source is
+forwarded by XDP (and by VPP when steered) and never reaches kernel
+routing, these rules, or the platform's NAT. A `from` prefix that
+overlaps an `allow-prefix` is warned about at start and on reload, and
+wan-egress cannot affect those flows.
 
 ## Cutover and rollback
 

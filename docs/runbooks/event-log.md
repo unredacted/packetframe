@@ -101,6 +101,12 @@ Kinds are stable: scripts and alerts may key on them.
 | `vpp_teardown` | The supervisor ordered VPP torn down | `cause`, `from_state`, `to_state` |
 | `handback_ready` / `handback_held_back` | The IPv6 hand-back path changed readiness; the v6 half of steering follows it | `detail` |
 
+**fast-path**
+
+| Kind | When | Fields |
+|---|---|---|
+| `wan_egress_repaired` | `wan-egress` put back policy rules that had disappeared from the kernel while the config was unchanged. At most one every five minutes; repairs in between are counted in the next one | `added`, `removed`, `suppressed`, `main_priority` |
+
 **The log itself (`module: event-log`)**
 
 | Kind | When | Fields |

@@ -2286,6 +2286,27 @@ fn detach_fast_path(
             );
         }
     }
+    // `wan-egress` policy rules, found by their protocol tag in a fresh
+    // dump: no state file is needed, and nothing without the tag can be
+    // touched. Whatever the pin teardown's outcome, like the coalescing
+    // restore, and a failure here joins the result rather than
+    // replacing it.
+    #[cfg(target_os = "linux")]
+    let result = match packetframe_fast_path::wan_egress::remove_all_owned_blocking() {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!(count = n, "wan-egress policy rules removed");
+            }
+            result
+        }
+        Err(e) => {
+            let e = format!("wan-egress rule removal: {e}");
+            Err(match result {
+                Ok(()) => e,
+                Err(prev) => format!("{prev}; AND {e}"),
+            })
+        }
+    };
     result
 }
 

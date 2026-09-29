@@ -25,6 +25,7 @@ shipped; that work is part of 0.5.0.
 
 ### Changes
 
+- **New fast-path directive `wan-egress from <cidr> [from <cidr> ...] [keep <cidr> ...]`** (IPv4). On gateways that install the full BGP table into `main` and consult `main` before their own WAN policy rules, with NAT only on the WAN interfaces, private sources whose destination's best path was a peering interface left un-NATed and died. Traffic from the listed sources now skips `main` and continues with the platform's own WAN rules and NAT, except for kept destinations (RFC 1918, RFC 6598, link-local, every `allow-prefix` and `local-prefix`, plus any `keep`), which still use `main`. PacketFrame installs `ip rule` entries tagged `proto 199` just below `lookup main` (a goto past it, with a `nop` anchor when needed), reconciles them at start, on reload, on rule changes and every 30 s, writes nothing when they are already in place, never touches a rule it did not create, and removes them on `packetframe detach`. New `wan-egress` status row, `packetframe_wan_egress_*` textfile gauges and a `wan_egress_repaired` event. See [WAN egress](docs/runbooks/packetframe-fib.md#wan-egress).
 - The custom-FIB runbook moved to [`docs/runbooks/packetframe-fib.md`](docs/runbooks/packetframe-fib.md).
 
 ## [0.5.0] - 2026-09-28

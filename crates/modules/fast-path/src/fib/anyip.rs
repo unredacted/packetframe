@@ -84,10 +84,11 @@ const LOCAL_TABLE: u32 = 255;
 ///   matches routes carrying that protocol, so shutdown removal is
 ///   structurally unable to delete a route we don't own.
 ///
-/// 199 is unassigned in iproute2's `rt_protos` (186 bgp, 187 isis,
-/// 188 ospf, 189 rip, 192 eigrp are the neighbors); `ip route show
-/// table local` renders it as `proto 199`.
-const ANYIP_ROUTE_PROTOCOL: RouteProtocol = RouteProtocol::Other(199);
+/// The value is [`crate::PACKETFRAME_RT_PROTOCOL`] (199), shared with
+/// the `wan-egress` policy rules, which use it as `FRA_PROTOCOL` for
+/// the same three reasons; `ip route show table local` renders it as
+/// `proto 199`.
+const ANYIP_ROUTE_PROTOCOL: RouteProtocol = RouteProtocol::Other(crate::PACKETFRAME_RT_PROTOCOL);
 
 #[derive(Debug, thiserror::Error)]
 pub enum AnyipError {

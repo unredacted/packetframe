@@ -27,6 +27,19 @@ pub mod registry;
 pub mod rx_macs;
 pub mod softnet;
 pub mod tc_links;
+pub mod wan_egress;
+
+/// The protocol number that tags kernel routing objects as
+/// PacketFrame's own: `RTPROT` on the `anyip` local route and
+/// `FRA_PROTOCOL` on the `wan-egress` policy rules.
+///
+/// The tag is what lets one daemon adopt what a previous one left, lets
+/// every write refuse to touch an object someone else owns, and scopes
+/// every delete (the kernel matches a nonzero protocol on delete, so a
+/// tagged delete cannot remove a foreign object). 199 is unassigned in
+/// iproute2's `rt_protos` (186 bgp, 187 isis, 188 ospf, 189 rip, 192
+/// eigrp are the neighbours); iproute2 renders it as `proto 199`.
+pub const PACKETFRAME_RT_PROTOCOL: u8 = 199;
 
 #[cfg(target_os = "linux")]
 pub mod linux_impl;
@@ -270,10 +283,20 @@ impl Module for FastPathModule {
         Ok(())
     }
 
+    /// Only the `wan-egress` gauges come through here: they live in
+    /// the daemon's memory, not in a pinned map. Everything else the
+    /// cli's MetricsExporter (`crates/cli/src/metrics.rs`) reads from
+    /// the pins directly on its 15 s cadence.
+    #[cfg(target_os = "linux")]
+    fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
+        if let Some(w) = self.state.as_ref().and_then(|s| s.wan_egress.as_ref()) {
+            w.status().render_metrics(out.out);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn sample_metrics(&self, _out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
-        // Module-side hook is a no-op; the cli's MetricsExporter
-        // (`crates/cli/src/metrics.rs`) reads STATS + the FIB
-        // snapshot from pinned maps directly on its 15 s cadence.
         Ok(())
     }
 
@@ -292,15 +315,22 @@ impl Module for FastPathModule {
     /// checker exists the row appears, including before its first
     /// check completes — the whole point being that silence must not
     /// be readable as agreement.
+    ///
+    /// A second row, `wan-egress`, whenever that directive is in force
+    /// (in any forwarding mode): the policy rules in place, or why
+    /// they are not.
     #[cfg(target_os = "linux")]
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
-        let subsystems: Vec<_> = self
+        let mut subsystems: Vec<_> = self
             .state
             .as_ref()
             .and_then(linux_impl::integrity_posture)
             .map(|p| p.subsystem_health())
             .into_iter()
             .collect();
+        if let Some(w) = self.state.as_ref().and_then(|s| s.wan_egress.as_ref()) {
+            subsystems.push(w.status().subsystem_health(std::time::Instant::now()));
+        }
         // `worse_of` rather than a hand-rolled escalation: a module that
         // reports Healthy over a Degraded subsystem disagrees with its
         // own report, which is the defect vpp-offload's `nominal()`
