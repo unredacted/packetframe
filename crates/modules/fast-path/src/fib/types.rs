@@ -1,4 +1,4 @@
-//! Userspace-side mirrors of the custom-FIB map value types declared in
+//! Userspace-side mirrors of the PacketFrame FIB map value types declared in
 //! [`bpf/src/maps.rs`](../../bpf/src/maps.rs). Every struct here is
 //! `#[repr(C)]` with primitive-only fields and exact trailing padding,
 //! so the byte layout matches what the BPF program sees. Compile-time

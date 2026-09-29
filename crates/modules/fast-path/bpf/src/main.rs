@@ -42,8 +42,8 @@ use datapath::{
 use maps::{
     bump, stats_base, RxMacKey, StatIdx, StatsPtr, ALLOW_V4, ALLOW_V6, BLOCK_V4, BLOCK_V6, CFG,
     FIB_LOOKUP_SCRATCH, FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_COMPARE_MODE,
-    FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_VLAN_PRESENT, MUTATION_CTX,
-    MUTATION_PROGS, REDIRECT_DEVMAP, RX_MACS, VLAN_RESOLVE,
+    FP_CFG_FLAG_HEAD_SHIFT_128, FP_CFG_FLAG_PACKETFRAME_FIB, FP_CFG_FLAG_VLAN_PRESENT,
+    MUTATION_CTX, MUTATION_PROGS, REDIRECT_DEVMAP, RX_MACS, VLAN_RESOLVE,
 };
 
 const AF_INET: u8 = 2;
@@ -99,7 +99,7 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
     bump(stats, StatIdx::RxTotal);
 
     // Single CFG read for the whole stage. Prior versions re-read
-    // CFG.get(0) once per flag test (head-shift, dry-run, custom-fib,
+    // CFG.get(0) once per flag test (head-shift, dry-run, packetframe-fib,
     // compare — four opaque bpf_map_lookup_elem calls per packet that
     // LLVM cannot CSE); the three scalars now travel in registers.
     // `mss_clamp_global` rides along so `forward_success` can stash it
@@ -299,21 +299,21 @@ fn handle_ipv4(
         return Ok(xdp_action::XDP_PASS);
     }
 
-    // Option F: select between custom-FIB (LPM trie + NEXTHOPS) and
+    // Option F: select between PacketFrame FIB (LPM trie + NEXTHOPS) and
     // kernel-FIB (bpf_fib_lookup) based on runtime flags. Compare mode
     // runs both and forwards via the kernel result.
     //
     // L4 port extraction is deferred to the consumers: the kernel-FIB
     // scratch fill below (BE `__be16` contract) and the ECMP hash arm
     // inside fib::lookup_* (native order, swapped there). The
-    // custom-fib single-nexthop path — the common case — never reads
+    // packetframe-fib single-nexthop path — the common case — never reads
     // a port byte.
-    let use_custom = cfg_flags & FP_CFG_FLAG_CUSTOM_FIB != 0;
+    let use_custom = cfg_flags & FP_CFG_FLAG_PACKETFRAME_FIB != 0;
     let compare = cfg_flags & FP_CFG_FLAG_COMPARE_MODE != 0;
     let l4_off = ip_offset + Ipv4Hdr::LEN;
 
     if use_custom && !compare {
-        let custom = fib::lookup_v4(
+        let packetframe_fib = fib::lookup_v4(
             stats,
             ctx.data(),
             ctx.data_end(),
@@ -322,8 +322,8 @@ fn handle_ipv4(
             dst_bytes,
             proto,
         );
-        return dispatch_custom_fib(
-            custom,
+        return dispatch_packetframe_fib(
+            packetframe_fib,
             ctx,
             stats,
             cfg_flags,
@@ -394,11 +394,11 @@ fn handle_ipv4(
         // Compare mode: we also ran above iff `use_custom`; but since
         // `compare` implies `use_custom` (userspace rejects otherwise),
         // both flags set ⇒ we take this else-branch with kernel FIB
-        // and additionally run the custom lookup for comparison. If
-        // the operator managed to set COMPARE without CUSTOM_FIB (bug
+        // and additionally run the PacketFrame FIB lookup for comparison. If
+        // the operator managed to set COMPARE without PACKETFRAME_FIB (bug
         // or manual map poke), the branch above is unreachable and
         // we still do only the kernel lookup here.
-        let custom = fib::lookup_v4(
+        let packetframe_fib = fib::lookup_v4(
             stats,
             ctx.data(),
             ctx.data_end(),
@@ -407,7 +407,7 @@ fn handle_ipv4(
             dst_bytes,
             proto,
         );
-        compare_and_bump(stats, ret as u32, fib_ref, &custom);
+        compare_and_bump(stats, ret as u32, fib_ref, &packetframe_fib);
     }
 
     dispatch_fib(
@@ -515,12 +515,12 @@ fn handle_ipv6(
 
     // Option F dispatch, see handle_ipv4 for commentary, including the
     // deferred-port rationale.
-    let use_custom = cfg_flags & FP_CFG_FLAG_CUSTOM_FIB != 0;
+    let use_custom = cfg_flags & FP_CFG_FLAG_PACKETFRAME_FIB != 0;
     let compare = cfg_flags & FP_CFG_FLAG_COMPARE_MODE != 0;
     let l4_off = ip_offset + Ipv6Hdr::LEN;
 
     if use_custom && !compare {
-        let custom = fib::lookup_v6(
+        let packetframe_fib = fib::lookup_v6(
             stats,
             ctx.data(),
             ctx.data_end(),
@@ -529,8 +529,8 @@ fn handle_ipv6(
             dst_bytes,
             next,
         );
-        return dispatch_custom_fib(
-            custom,
+        return dispatch_packetframe_fib(
+            packetframe_fib,
             ctx,
             stats,
             cfg_flags,
@@ -579,7 +579,7 @@ fn handle_ipv6(
     let fib_ref = unsafe { &*fib_ptr };
 
     if compare {
-        let custom = fib::lookup_v6(
+        let packetframe_fib = fib::lookup_v6(
             stats,
             ctx.data(),
             ctx.data_end(),
@@ -588,7 +588,7 @@ fn handle_ipv6(
             dst_bytes,
             next,
         );
-        compare_and_bump(stats, ret as u32, fib_ref, &custom);
+        compare_and_bump(stats, ret as u32, fib_ref, &packetframe_fib);
     }
 
     dispatch_fib(
@@ -674,7 +674,7 @@ fn dispatch_fib(
 }
 
 /// Success path shared between the kernel-FIB (`dispatch_fib`) and
-/// custom-FIB (`dispatch_custom_fib`) code paths. Takes a decided
+/// PacketFrame FIB (`dispatch_packetframe_fib`) code paths. Takes a decided
 /// `(egress_ifindex, smac, dmac)` and performs VLAN resolution,
 /// devmap pre-check, TTL decrement, L2 rewrite, then writes the
 /// per-CPU `MUTATION_CTX` and tail-calls into the `finalize` program
@@ -790,15 +790,15 @@ fn forward_success(
     Ok(xdp_action::XDP_PASS)
 }
 
-/// Dispatch on a [`fib::CustomFibResult`] returned by the custom-FIB
+/// Dispatch on a [`fib::PacketframeFibResult`] returned by the PacketFrame FIB
 /// path. Maps the four action codes into the same XDP verdicts
 /// `dispatch_fib` returns for the equivalent kernel-FIB outcomes
 /// so the allowlist / dry-run / VLAN-resolve plumbing upstream and
-/// downstream is unchanged whether we took the kernel or custom path.
+/// downstream is unchanged whether we took the kernel or PacketFrame FIB path.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn dispatch_custom_fib(
-    result: fib::CustomFibResult,
+fn dispatch_packetframe_fib(
+    result: fib::PacketframeFibResult,
     ctx: &XdpContext,
     stats: StatsPtr,
     cfg_flags: u8,
@@ -837,7 +837,7 @@ fn dispatch_custom_fib(
 }
 
 /// Compare-mode: kernel-FIB is authoritative (its decision drives
-/// forwarding), but we've also computed a custom-FIB decision and
+/// forwarding), but we've also computed a PacketFrame FIB decision and
 /// want to know whether they agree. Agreement is defined as
 /// `(egress_ifindex, dst_mac)` match when both forward, or both
 /// don't-forward. Transient disagreement during BGP convergence is
@@ -847,17 +847,18 @@ fn compare_and_bump(
     stats: StatsPtr,
     kernel_ret: u32,
     kernel_fib: &bpf_fib_lookup,
-    custom: &fib::CustomFibResult,
+    packetframe_fib: &fib::PacketframeFibResult,
 ) {
     let kernel_forwards = kernel_ret == BPF_FIB_LKUP_RET_SUCCESS;
-    let custom_forwards = custom.action == fib::FIB_ACTION_FORWARD;
-    let agree = if kernel_forwards && custom_forwards {
+    let packetframe_forwards = packetframe_fib.action == fib::FIB_ACTION_FORWARD;
+    let agree = if kernel_forwards && packetframe_forwards {
         // Both forward, compare the decision tuple.
-        kernel_fib.ifindex == custom.egress_ifindex && kernel_fib.dmac == custom.dmac
+        kernel_fib.ifindex == packetframe_fib.egress_ifindex
+            && kernel_fib.dmac == packetframe_fib.dmac
     } else {
         // Both non-forward is "agree" (both defer upstream). Any
         // mix, one forwards while the other doesn't, is disagree.
-        !kernel_forwards && !custom_forwards
+        !kernel_forwards && !packetframe_forwards
     };
     if agree {
         bump(stats, StatIdx::CompareAgree);

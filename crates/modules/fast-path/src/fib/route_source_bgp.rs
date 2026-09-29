@@ -16,7 +16,7 @@
 //! bird kept (typically equal-cost multipath), each tagged with a
 //! distinct `path_id` per RFC 7911 §3, and the FibProgrammer
 //! aggregates them into an ECMP group on the prefix. See
-//! `docs/runbooks/custom-fib.md` "Phase 4 bird config" for the
+//! `docs/runbooks/packetframe-fib.md` "Phase 4 bird config" for the
 //! `protocol bgp packetframe { ... }` snippet and the
 //! "Multi-NH ECMP from BGP" section for the ADD-PATH enablement
 //! steps.
@@ -1021,7 +1021,7 @@ fn asn_to_u32(asn: Asn) -> u32 {
 /// bird was correctly exporting never landed in `FIB_V4` at all
 /// the prefix wasn't present for XDP to LPM-match. Operator-visible
 /// symptom: `matched_dst_only` inbound to customer /24s all bumped
-/// `custom_fib_miss` instead of `custom_fib_no_neigh`, and the FIB
+/// `fib_miss` instead of `fib_no_neigh`, and the FIB
 /// integrity check perpetually reported drift between bird's
 /// exported-route count and packetframe's mirror count.
 ///
@@ -1030,7 +1030,7 @@ fn asn_to_u32(asn: Asn) -> u32 {
 /// can't get a useful MAC for loopback, so the route lands with
 /// `state=Incomplete`, operationally the same XDP_PASS-to-kernel as
 /// the silent-drop, but now the prefix exists in `FIB_V4`, the
-/// nexthop counter (`custom_fib_no_neigh`) reflects reality, and
+/// nexthop counter (`fib_no_neigh`) reflects reality, and
 /// integrity drift goes away. Phase B (`local-prefix` ARP-walk)
 /// turns those /24s into per-/32 fast-paths.
 fn elem_to_route_event(
@@ -1486,7 +1486,7 @@ mod tests {
     /// `next_hop = None`, which is exactly what bird's iBGP emits for
     /// `protocol direct` announces without `next hop self`. Result:
     /// connected /24s never reached `FIB_V4`, every inbound
-    /// matched_dst_only packet bumped `custom_fib_miss`, and the FIB
+    /// matched_dst_only packet bumped `fib_miss`, and the FIB
     /// integrity check chronically reported drift. The fix makes
     /// `elem_to_route_event` fall back to a caller-supplied address
     /// (the BGP session's listen IP) so the route lands in the FIB

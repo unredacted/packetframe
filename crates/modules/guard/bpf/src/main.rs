@@ -48,8 +48,7 @@ use network_types::eth::{EthHdr, EtherType};
 use crate::maps::{
     bucket_slot, bump, gcra_conforms, stats_base, GuardStatIdx, StatsPtr, ACTION_DISABLED,
     ACTION_ENFORCE, ARP_SALT, GUARD_CFG, GUARD_CFG_VERSION, GUARD_MCAST_BUCKETS,
-    GUARD_MCAST_BUCKETS_ENTRIES, GUARD_NDP_BUCKETS, GUARD_NDP_BUCKETS_ENTRIES, MCAST_SALT,
-    NS_SALT,
+    GUARD_MCAST_BUCKETS_ENTRIES, GUARD_NDP_BUCKETS, GUARD_NDP_BUCKETS_ENTRIES, MCAST_SALT, NS_SALT,
 };
 
 /// LLDP ethertype in wire byte order. network-types has no LLDP
@@ -128,8 +127,7 @@ fn classify(ctx: &TcContext, stats: StatsPtr) -> Result<i32, ()> {
             bump(stats, GuardStatIdx::ErrParseVlan);
             return Err(());
         }
-        let inner =
-            unsafe { core::ptr::read_unaligned((start + EthHdr::LEN + 2) as *const u16) };
+        let inner = unsafe { core::ptr::read_unaligned((start + EthHdr::LEN + 2) as *const u16) };
         (inner, EthHdr::LEN + VLAN_HDR_LEN)
     } else {
         (outer_ether, EthHdr::LEN)
@@ -206,14 +204,10 @@ fn classify(ctx: &TcContext, stats: StatsPtr) -> Result<i32, ()> {
                     bump(stats, GuardStatIdx::ErrParseNs);
                     return Err(());
                 }
-                let w0 =
-                    unsafe { core::ptr::read_unaligned((start + icmp + 8) as *const u32) };
-                let w1 =
-                    unsafe { core::ptr::read_unaligned((start + icmp + 12) as *const u32) };
-                let w2 =
-                    unsafe { core::ptr::read_unaligned((start + icmp + 16) as *const u32) };
-                let w3 =
-                    unsafe { core::ptr::read_unaligned((start + icmp + 20) as *const u32) };
+                let w0 = unsafe { core::ptr::read_unaligned((start + icmp + 8) as *const u32) };
+                let w1 = unsafe { core::ptr::read_unaligned((start + icmp + 12) as *const u32) };
+                let w2 = unsafe { core::ptr::read_unaligned((start + icmp + 16) as *const u32) };
+                let w3 = unsafe { core::ptr::read_unaligned((start + icmp + 20) as *const u32) };
                 let word = ifindex ^ NS_SALT ^ w0 ^ w1 ^ w2 ^ w3;
                 return Ok(ndp_bucket_verdict(stats, cfg.act_ns, cfg, word, false));
             }

@@ -36,7 +36,7 @@ These directives can be added, removed, or changed under SIGHUP without re-attac
 | `allow-prefix`, `allow-prefix6` | `ALLOW_V4`, `ALLOW_V6` | Delta diff vs in-kernel state |
 | `block-prefix` | `BLOCK_V4` | v0.2.4+; wired up alongside reconfigure |
 | `dry-run on/off` | `CFG.dry_run` | Single-byte write |
-| `forwarding-mode {kernel-fib\|custom-fib\|compare}` | `CFG.flags` bits 3-4 | Atomic |
+| `forwarding-mode {kernel-fib\|packetframe-fib\|compare}` | `CFG.flags` bits 3-4 | Atomic |
 | `mss-clamp …` (all four grammars) | `MSS_CLAMP_V4/V6` + `MSS_CLAMP_BY_IFACE` + `CFG.mss_clamp_global` | v0.2.4+; value changes also pick up |
 | (auto) VLAN-subif resolution | `VLAN_RESOLVE` | Re-scanned from `/proc/net/vlan/config` |
 | (auto) Redirect devmap | `REDIRECT_DEVMAP` | Re-scanned from `/sys/class/net` |
@@ -83,9 +83,9 @@ routing table carries traffic if your routing daemon exports to it.)
 The directives that require it:
 
 - **`attach` directives (interface added or removed).** XDP attach mutates kernel-side state and risks brief link bounce on some drivers (SPEC §11.8). The reconcile path explicitly logs a warning and skips attach-set changes; your delta does not silently apply.
-- **`route-source` config (custom-FIB only).** The RouteController's runtime is started at attach. Editing the BGP/BMP listener address or peer-AS requires bringing the runtime down and back up.
+- **`route-source` config (PacketFrame FIB only).** The RouteController's runtime is started at attach. Editing the BGP/BMP listener address or peer-AS requires bringing the runtime down and back up.
 - **`circuit-breaker` thresholds.** The breaker sampler thread reads its config at thread start; it doesn't currently observe SIGHUP.
-- **`local-prefix` / `local-prefix6` directives (custom-FIB only).** The connected-fast-path resolver is similarly attach-time-bound. Both families are collected once at attach and handed to the resolver; editing either and reloading leaves the running set untouched with no warning.
+- **`local-prefix` / `local-prefix6` directives (PacketFrame FIB only).** The connected-fast-path resolver is similarly attach-time-bound. Both families are collected once at attach and handed to the resolver; editing either and reloading leaves the running set untouched with no warning.
 - **`coalesce` (NIC interrupt coalescing).** Written to each attached NIC once at attach and reversed at detach from `<state-dir>/coalesce.json`. Unlike the silent entries in this list, a reload whose `coalesce` line differs from the running one is **refused by name** (the CLI exits non-zero with ``daemon rejected: fast-path: `coalesce` changed ...``), and fast-path applies nothing else from that reload.
 - **`bpffs-root`, `state-dir`.** Used at module load only; baked into the running daemon's pin paths and the metrics file location.
 - **vpp-offload: everything but the steering inputs and `drift-accept6`** — `port` membership, `cores`, `vlans`, `expected-routes`, `hugepages`, `steer-capacity`, `v6`, `loopback-address`/`loopback-address6`, `local-route`/`local-route6`, `require-table-complete`, `vpp-binary`. VPP fixes these at start; a reload that changes one is **refused by name**. On a steered box, the same-version restart that keeps VPP forwarding is `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, which itself refuses when the edit is one VPP cannot adopt across; see [vpp-offload.md](vpp-offload.md).

@@ -1,6 +1,6 @@
-# Custom-FIB operations runbook
+# PacketFrame FIB operations runbook
 
-This runbook covers the Option F custom-FIB forwarding path: what the
+This runbook covers the Option F PacketFrame FIB forwarding path: what the
 pieces are, how to tell it's healthy, what to do when it's not, and
 how to roll back to the kernel-FIB path if something goes wrong.
 
@@ -56,15 +56,15 @@ how to roll back to the kernel-FIB path if something goes wrong.
 - **fast-path XDP program** (in kernel) consults `FIB_V4`/`FIB_V6` LPM
   tries, follows the `FibValue → NEXTHOPS[idx]` chain (or `ECMP_GROUPS`
   for multipath), and redirects with `bpf_redirect_map`. Gated on the
-  `FP_CFG_FLAG_CUSTOM_FIB` bit in the CFG map; kernel-FIB mode bypasses
+  `FP_CFG_FLAG_PACKETFRAME_FIB` bit in the CFG map; kernel-FIB mode bypasses
   all of the above and calls `bpf_fib_lookup()` as before.
 
 ## Healthy operation
 
-Indicators that the custom-FIB path is working:
+Indicators that the PacketFrame FIB path is working:
 
-- `packetframe status` reports `forwarding-mode: custom-fib`.
-- `custom_fib_hit` counter climbs; `custom_fib_miss` is low relative
+- `packetframe status` reports `forwarding-mode: packetframe-fib`.
+- `fib_hit` counter climbs; `fib_miss` is low relative
   to it (misses indicate prefixes that arrived in XDP before bird
   announced them, or prefixes in the allowlist that bird doesn't cover).
 - `fwd_ok` climbs (the shared success counter; custom and kernel FIB
@@ -90,7 +90,7 @@ Indicators that the custom-FIB path is working:
   entry below.
 - `bmp_peer_down` stays at zero unless a BGP session you expect to
   flap has flapped.
-- `nexthop_seq_retry` stays below ~0.01% of `custom_fib_hit` (the
+- `nexthop_seq_retry` stays below ~0.01% of `fib_hit` (the
   seqlock retry is ~free on a normal read; sustained retries mean
   the BGP session is churning nexthop MACs nonstop).
 - udapi log parse errors: zero (the point of Option F).
@@ -100,7 +100,7 @@ out of the pin; no daemon IPC required.
 
 ## Everyday inspection commands
 
-### Is custom-fib forwarding what you think it's forwarding?
+### Is packetframe-fib forwarding what you think it's forwarding?
 
 ```sh
 sudo packetframe status --config /etc/packetframe/packetframe.conf
@@ -108,9 +108,9 @@ sudo packetframe status --config /etc/packetframe/packetframe.conf
 
 Look at:
 
-- `custom-FIB status:` block: `forwarding-mode`, nexthop resolution
+- `PacketFrame FIB status:` block: `forwarding-mode`, nexthop resolution
   counts, ECMP group count.
-- counter block, especially the `custom_fib_*` family.
+- counter block, especially the `packetframe_fib_*` family.
 
 ### Is the route-source session live?
 
@@ -346,7 +346,7 @@ vtysh -c 'show bgp neighbor 192.0.2.202'
 ss -Htnp state established "( sport = :1179 )"
 ```
 
-### Is a specific prefix forwarding through custom-fib?
+### Is a specific prefix forwarding through packetframe-fib?
 
 ```sh
 # What bird says:
@@ -398,11 +398,11 @@ sudo packetframe fib dump-v4
 sudo packetframe fib stats
 ```
 
-### Prometheus metrics for custom-FIB
+### Prometheus metrics for PacketFrame FIB
 
 Alongside the existing counter family, the textfile exporter emits:
 
-- `packetframe_fib_forwarding_mode{mode="kernel-fib|custom-fib|compare"}`:
+- `packetframe_fib_forwarding_mode{mode="kernel-fib|packetframe-fib|compare"}`:
   one-hot gauge; alert on unexpected transitions.
 - `packetframe_nexthops{state="resolved|incomplete|failed|stale|freed|unwritten"}`:
   NEXTHOPS slot counts. `incomplete` + `failed` are live nexthops whose
@@ -426,7 +426,7 @@ sum(packetframe_nexthops{state=~"resolved|incomplete|failed|stale"})
 sum(packetframe_nexthops{state=~"incomplete|failed"}) > 0
 
 # Unexpected forwarding-mode transition.
-changes(packetframe_fib_forwarding_mode{mode="custom-fib"}[5m]) > 0
+changes(packetframe_fib_forwarding_mode{mode="packetframe-fib"}[5m]) > 0
 ```
 
 ### Integrity check + BmpStalled alert
@@ -495,7 +495,7 @@ on `br1337`) with a self-referential BGP NEXT_HOP (the device's local
 IP). The neighbour resolver can't map that to a useful destination
 MAC: it's our own IP. Without the connected fast-path, the LPM
 lookup hits the /24 with `state=Incomplete` and returns
-`custom_fib_no_neigh` (or, pre-v0.2.1, `custom_fib_miss` because the
+`fib_no_neigh` (or, pre-v0.2.1, `fib_miss` because the
 listener silently dropped the announce). Either way, the packet
 falls through XDP_PASS to kernel slow-path: through netfilter,
 conntrack, the FIB walk, and finally out the bridge. That's exactly
@@ -516,7 +516,7 @@ to the router take the /32.
 
 ### When to enable it
 
-When you're running custom-fib (not kernel-fib) and the box has
+When you're running packetframe-fib (not kernel-fib) and the box has
 connected /24s carrying meaningful inbound traffic. Typical case
 on the reference EFG: customer LANs (`198.51.100.0/24`), internal
 storage networks (Ceph: `203.0.113.64/26`), and other LAN bridges.
@@ -527,7 +527,7 @@ to climb from ~30% to >95% once kernel ARP populates.
 
 ```
 module fast-path
-  forwarding-mode custom-fib
+  forwarding-mode packetframe-fib
   route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551
 
   # One line per local prefix you want fast-pathed inbound:
@@ -568,11 +568,11 @@ sudo packetframe fib lookup 198.51.100.10
 # (typical aging churn).
 journalctl -u packetframe -f | grep 'neighbour resolver stats'
 
-# 4. Bypass rate. Compare custom_fib_hit / matched_v4 before vs.
+# 4. Bypass rate. Compare fib_hit / matched_v4 before vs.
 # after enabling. Typical recovery: matched_dst_only flips from
 # ~100% miss to ~100% hit. (rate may climb gradually as kernel
 # ARP populates the cache for under-trafficked hosts.)
-sudo packetframe status | grep -E 'matched_v4|custom_fib_hit|custom_fib_miss|custom_fib_no_neigh'
+sudo packetframe status | grep -E 'matched_v4|fib_hit|fib_miss|fib_no_neigh'
 ```
 
 For `local-prefix6`, the same four checks with the v6 tools. Note
@@ -594,7 +594,7 @@ journalctl -u packetframe -f | grep 'neighbour resolver stats'
 
 # 4. pass_ndp should be non-zero and climbing: neighbor discovery is
 # deliberately handed to the kernel (see the NDP note below).
-sudo packetframe status | grep -E 'matched_v6|pass_ndp|custom_fib_hit|custom_fib_miss'
+sudo packetframe status | grep -E 'matched_v6|pass_ndp|fib_hit|fib_miss'
 ```
 
 Cross-check the /128 set against the kernel. These two should agree,
@@ -655,7 +655,7 @@ connected /128.
   natively via `bpf_fib_lookup()` + ARP cache, no extra config
   needed. The directive is a no-op in this mode (parsed and
   validated, but the resolver only emits events when both
-  custom-fib AND a route-source are configured).
+  packetframe-fib AND a route-source are configured).
 - **Operator hasn't declared the customer prefix in `allow-prefix`.**
   XDP filters on allowlist BEFORE the FIB lookup, so a /32 in the
   FIB does nothing if the parent prefix isn't matched. Add the
@@ -765,7 +765,7 @@ ip -6 neigh show dev br1337        # then confirm it landed
 
 ### `fallback-default` synthetic /0 (v0.2.1, issue #31)
 
-Custom-FIB only has prefixes bird's iBGP feed advertised. Destinations
+PacketFrame FIB only has prefixes bird's iBGP feed advertised. Destinations
 bird doesn't have specific routes for (RFC 1918, CGNAT, test-net,
 anything outside DFZ) miss LPM, fall to kernel slow path through
 netfilter / conntrack, and get dropped upstream anyway, wasting
@@ -813,16 +813,16 @@ declared customer prefixes).
 
 ## Cutover and rollback
 
-### Cutover to custom-fib
+### Cutover to packetframe-fib
 
 **Pre-flight:**
 
-1. Run the staging soak: custom-fib + the iBGP feed live to a bird
+1. Run the staging soak: packetframe-fib + the iBGP feed live to a bird
    mirror for 24h. Zero `compare_disagree` sustained above 0.01%
    of matched packets, zero `StaleFib`, NEXTHOPS occupancy stable.
 2. Pathvector `global-config` injects the `protocol bgp packetframe
    { ... }` block (see "Phase 4 bird + pathvector config" below).
-3. Add `forwarding-mode custom-fib` + `route-source bgp
+3. Add `forwarding-mode packetframe-fib` + `route-source bgp
    127.0.0.1:1179 local-as <ASN> peer-as <ASN>` under `module
    fast-path` in `/etc/packetframe/packetframe.conf`.
 4. Confirm bird's `kernel.export: false` (or equivalent) so no BGP
@@ -846,7 +846,7 @@ sudo systemctl start packetframe
 # 5. Verify route-source session up:
 #      birdc show protocols packetframe   # or `bmp1`, depending on feed
 #      ss -Htnp state established "( sport = :1179 )"   # or 6543 for BMP
-# 6. Verify custom_fib_hit climbing.
+# 6. Verify fib_hit climbing.
 # 7. Verify udapi log parse errors are zero (journalctl -u ubios-udapi-server).
 ```
 
@@ -862,7 +862,7 @@ sudo kill -TERM $(pgrep -f 'packetframe run')
 # 2. Detach.
 sudo packetframe detach --all --config /etc/packetframe/packetframe.conf
 
-# 3. Edit config: remove `forwarding-mode custom-fib` and
+# 3. Edit config: remove `forwarding-mode packetframe-fib` and
 #    `route-source bmp` lines (or change forwarding-mode to kernel-fib).
 sudo sed -i '/^  forwarding-mode /d; /^  route-source bmp /d' \
     /etc/packetframe/packetframe.conf
@@ -881,7 +881,7 @@ same-day diagnosis and a forward-fix plan.
 
 ### Phase 4 bird + pathvector config
 
-For a cutover to `forwarding-mode custom-fib`, packetframe needs
+For a cutover to `forwarding-mode packetframe-fib`, packetframe needs
 a feed of bird's selected best paths, and bird's kernel-protocol
 export needs to stay off so udapi never sees BGP routes.
 
@@ -1031,7 +1031,7 @@ NLRI decodes without `path_id`.
 
 ```
 module fast-path
-  forwarding-mode custom-fib              # or `compare` for the soak window
+  forwarding-mode packetframe-fib              # or `compare` for the soak window
   route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551 router-id 198.51.100.7
 ```
 
@@ -1043,7 +1043,7 @@ the local AS (v6 listen).
 ```sh
 birdc show protocols packetframe          # state=Established (after a few seconds)
 birdc show route count                    # bird's total
-sudo packetframe fib stats                # forwarding-mode=custom-fib
+sudo packetframe fib stats                # forwarding-mode=packetframe-fib
 sudo packetframe fib lookup 8.8.8.8       # MATCH with sane nexthop
 journalctl -u packetframe | grep -i bgp   # "BGP listener started", no errors
 ```
@@ -1115,7 +1115,7 @@ Read the `detach` output rather than assuming it: it refuses outright
 if it cannot confirm the daemon is gone, which is the case where
 unlinking pins would leave the program attached through a live
 process's open FDs while reporting success. Then confirm forwarding
-actually came back (`packetframe status`, and the `custom_fib_hit`
+actually came back (`packetframe status`, and the `fib_hit`
 counter moving) — the start limit resetting proves only that systemd
 will try again.
 
@@ -1174,7 +1174,7 @@ Note that other ICMPv6 (echo, errors) is deliberately *not* gated: the
 guard keys on message type, not on hop limit, so ordinary ICMPv6 still
 fast-paths.
 
-### Symptom: `custom_fib_miss` climbs without `custom_fib_hit` keeping pace
+### Symptom: `fib_miss` climbs without `fib_hit` keeping pace
 
 What it means: XDP is finding no route in `FIB_V4`/`FIB_V6` for most
 matched packets. Either the FIB isn't populated (programmer not
@@ -1348,7 +1348,7 @@ routes. Usually benign; BGP in stable state just doesn't send much.
 
 Check:
 
-- `custom_fib_hit` still climbing (existing routes are still
+- `fib_hit` still climbing (existing routes are still
   forwarding). If yes, this is fine.
 - If forwarding has stopped entirely, that's a different problem.
   Look at `fwd_ok`, `pass_not_in_devmap`, `drop_unreachable`.
@@ -1385,7 +1385,7 @@ retained as a changelog of what shipped and when.
 - **`packetframe fib` subcommands** (Phase 3.8). `dump-v4 / dump-v6
   / lookup <ip> / stats` ship in the main binary. Opens the pinned
   maps directly; works without the daemon running.
-- **Custom-FIB Prometheus metrics** (Phase 3.8). The textfile
+- **PacketFrame FIB Prometheus metrics** (Phase 3.8). The textfile
   exporter now emits `packetframe_fib_forwarding_mode{mode="..."}`,
   `packetframe_nexthops{state="..."}`, `packetframe_nexthops_max`,
   `packetframe_ecmp_groups_active`, `packetframe_ecmp_groups_max`,
@@ -1416,14 +1416,14 @@ retained as a changelog of what shipped and when.
   whose decoded NEXT_HOP was None: exactly what bird emits for
   `protocol direct` (and static-origin) routes when the BGP block has
   no `next hop self`. Connected /24s never landed in FIB_V4, so every
-  inbound packet to a customer host bumped `custom_fib_miss` and fell
+  inbound packet to a customer host bumped `fib_miss` and fell
   through to slow path. v0.2.1 makes the listener fall back to its
   own listen address; the route lands with `state=Incomplete` so
   counters reflect reality. The `local-prefix <cidr> via <iface>`
   directive turns those /24s into per-/32 fast-paths. See the
   [Connected fast-path](#connected-fast-path-v021) section above.
 - **`fallback-default` synthetic /0** (v0.2.1, issue #31). Inject
-  a catch-all default into the custom-FIB so bogon-bound traffic
+  a catch-all default into the PacketFrame FIB so bogon-bound traffic
   XDP-redirects to upstream instead of slow-pathing.
 - **`arp-scavenge` for quiet LANs** (v0.2.1, issue #32). One-shot
   ARP sweep of declared local-prefix CIDRs at startup so storage

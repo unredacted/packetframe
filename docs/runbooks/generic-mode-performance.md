@@ -403,8 +403,8 @@ reduction and the tc datapath in place:
 | Bench | ns/packet |
 |---|---|
 | `bench_allowlist_miss` | 85 |
-| `bench_custom_fib_forward_syn` | 278 |
-| `bench_custom_fib_forward_established` | 282 |
+| `bench_packetframe_fib_forward_syn` | 278 |
+| `bench_packetframe_fib_forward_established` | 282 |
 
 Two things to read off these:
 
@@ -474,11 +474,11 @@ over the live pins.
 - `pass_not_for_us`: matched frames not addressed to the router at their
   ingress port (bridged host-to-host, broadcast, multicast), correctly left
   to the kernel. Steady on a bridge member; a jump with `fwd_ok` falling by
-  the same amount means a port's MAC is missing from `RX_MACS` (custom-fib
+  the same amount means a port's MAC is missing from `RX_MACS` (packetframe-fib
   runbook, triage).
-- `custom_fib_miss`: destinations the BGP feed doesn't cover (consider
+- `fib_miss`: destinations the BGP feed doesn't cover (consider
   `fallback-default`).
-- `nexthop_seq_retry`, `custom_fib_no_neigh`: sustained growth means nexthop churn
+- `nexthop_seq_retry`, `fib_no_neigh`: sustained growth means nexthop churn
   or unresolved neighbors, each such packet takes the slow path.
 
 ## Silent TX drops under generic XDP (kernel < 5.18)
@@ -738,7 +738,7 @@ eth4` — fq `Sent` counters stop growing at the forwarded rate;
 
 ## FIB destination cache (`fib-cache`, experiment)
 
-Live profiling showed the custom-FIB LPM walks are the dominant *BPF-side* cost
+Live profiling showed the PacketFrame FIB LPM walks are the dominant *BPF-side* cost
 (~1.2 µs/packet of `trie_lookup_elem` + `longest_prefix_match` on a full table —
 the walks miss cache on a 2M-entry trie). `fib-cache on` puts a direct-mapped
 per-CPU cache in front of `FIB_V4`/`FIB_V6`: repeat destinations become one array

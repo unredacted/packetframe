@@ -103,7 +103,7 @@ module neigh-snoop
    1/N of it, so size the rate for the sum of the bridges' tables.
 4. Run the acceptance tests below (T1–T3, T6).
 5. Add `ix-mode` (restart). fast-path's stats line gains
-   `ix_probe_suppressed`; `custom_fib_no_neigh` should fall.
+   `ix_probe_suppressed`; `fib_no_neigh` should fall.
 6. Enable `frr-gate` (restart) once the static FRR half is uploaded.
    Confirm the lists match what a hand-built list would hold, then
    retire any manual seeding of them.
@@ -368,7 +368,7 @@ reaches new hosts, alongside `vppctl show errors | grep -i glean`.
 - **guard** polices the kernel's *own* ARP/NS emission on the same
   bridges; the snooper makes those emissions rarely necessary and never
   adds to them. Both can run on one bridge.
-- **fast-path custom-fib**: `ix-mode` bridges get no proactive kick
+- **fast-path packetframe-fib**: `ix-mode` bridges get no proactive kick
   from the resolver; the resolver already treats STALE entries as
   resolved, so seeded neighbours flow into the nexthop table.
 - **vpp-offload**: VPP's adjacencies are mirrored from the kernel

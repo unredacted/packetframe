@@ -129,7 +129,7 @@ impl Drop for PinDirs {
     }
 }
 
-/// Load the fast-path ELF, pin the four custom-FIB maps under the
+/// Load the fast-path ELF, pin the four PacketFrame FIB maps under the
 /// test's bpffs subdir, and return the pinned `Ebpf` so the maps
 /// stay alive after `take_map` hands them to the programmer.
 fn load_and_pin(pins: &PinDirs) -> Ebpf {

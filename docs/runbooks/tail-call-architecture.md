@@ -26,7 +26,7 @@ This is **not** the multi-module dispatcher (SPEC §3.4 / §5.0). The dispatcher
    ┌──────────────────────────────────────────────────┐
    │ fast_path  (XDP, attached to eth0..ethN)         │  Frame A
    │   classification (allow-prefix, block-prefix)     │  fits 512B
-   │   FIB lookup  (kernel-fib | custom-fib | compare)│
+   │   FIB lookup  (kernel-fib | packetframe-fib | compare)│
    │   devmap pre-check                                │
    │   TTL decrement                                   │
    │   L2 rewrite (smac/dmac in place)                 │

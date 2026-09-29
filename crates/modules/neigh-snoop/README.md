@@ -40,7 +40,7 @@ into a VPP static neighbour.
    tracked **by name**, because platform daemons destroy and recreate
    them.
 5. **`ix-mode`** tells fast-path's neighbour resolver to stop issuing
-   its own broadcast probes for next-hops via that bridge (custom-fib
+   its own broadcast probes for next-hops via that bridge (packetframe-fib
    only).
 6. **`frr-gate`** (optional) keeps FRR's runtime next-hop prefix-lists
    in step with the kernel's resolved neighbours through `vtysh`, so

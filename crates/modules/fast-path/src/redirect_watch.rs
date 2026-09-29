@@ -29,7 +29,7 @@
 //! subscription is live so nothing slips between the attach-time fill
 //! and the first event. Everything is opened from the bpffs pins like
 //! the rest of the control plane, and it runs in every forwarding mode:
-//! the pre-check is the same under kernel-fib and custom-fib.
+//! the pre-check is the same under kernel-fib and packetframe-fib.
 //!
 //! The same refresh keeps `RX_MACS` — the destination MACs each
 //! attached port receives on — in step with the link table: a bridge

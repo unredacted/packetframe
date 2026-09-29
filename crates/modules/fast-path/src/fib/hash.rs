@@ -1,4 +1,4 @@
-//! Userspace reference implementation of the custom-FIB flow hash.
+//! Userspace reference implementation of the PacketFrame FIB flow hash.
 //!
 //! **Byte-for-byte mirror of `bpf/src/fib.rs` hash functions.** Every
 //! operation here must appear there. The Phase 1 cross-check in

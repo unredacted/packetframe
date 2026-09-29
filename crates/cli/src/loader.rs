@@ -3001,7 +3001,7 @@ fn print_stats(bpffs_root: &Path) {
     }
 }
 
-/// Print the Option F custom-FIB status, map occupancies, nexthop
+/// Print the Option F PacketFrame FIB status, map occupancies, nexthop
 /// state distribution, default hash mode. Best-effort: prints
 /// whatever readable slice of the FIB pins returns. Runs regardless
 /// of forwarding-mode so operators can verify pins exist and the
@@ -3010,7 +3010,7 @@ fn print_stats(bpffs_root: &Path) {
 fn print_fib_status(bpffs_root: &Path) {
     let snap = packetframe_fast_path::fib_status_from_pin(bpffs_root);
     println!();
-    println!("custom-FIB status (from {}):", bpffs_root.display());
+    println!("PacketFrame FIB status (from {}):", bpffs_root.display());
     match snap.forwarding_mode {
         Some(mode) => println!("  forwarding-mode:            {mode}"),
         None => println!("  forwarding-mode:            <CFG pin not readable>"),
@@ -3056,7 +3056,7 @@ fn print_fib_status(bpffs_root: &Path) {
     }
     println!(
         "  FIB_V4 / FIB_V6 occupancy:  not shown (LpmTrie walk is O(N); \
-         infer from custom_fib_hit / custom_fib_miss counters below)"
+         infer from fib_hit / fib_miss counters below)"
     );
 }
 

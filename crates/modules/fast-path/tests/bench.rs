@@ -64,7 +64,7 @@ const LO_IFINDEX: u32 = 1;
 
 /// Hard skip knob for CI under emulation. Two rounds of quick-mode
 /// capping (per-syscall repeat in #82, then the ~400-execution total
-/// budget below) still left `bench_custom_fib_*` tripping the 22 s
+/// budget below) still left `bench_packetframe_fib_*` tripping the 22 s
 /// soft-lockup watchdog on slow TCG runners (PR #206 on 2026-08-25,
 /// PR #207 on 2026-08-26): `bpf_test_run` is uninterruptible, and
 /// TCG's per-execution cost varies enough across hosted runners that
@@ -152,14 +152,14 @@ fn median_ns(h: &Harness, pkt: &[u8], repeat: u32, calls: usize, expect_verdict:
     samples[samples.len() / 2]
 }
 
-/// Production-profile harness: custom-fib, one allowlisted /8, one
+/// Production-profile harness: packetframe-fib, one allowlisted /8, one
 /// resolved single nexthop, egress in the devmap. Mirrors the
-/// reference deployment (single-NH custom-fib, no ECMP / clamp /
+/// reference deployment (single-NH packetframe-fib, no ECMP / clamp /
 /// block / VLAN).
-fn custom_fib_harness() -> Harness {
+fn packetframe_fib_harness() -> Harness {
     let mut h = Harness::new();
     h.add_allow_v4("10.0.0.0/8");
-    h.set_custom_fib(true, false);
+    h.set_packetframe_fib(true, false);
     h.add_nexthop_v4(
         0,
         LO_IFINDEX,
@@ -184,11 +184,11 @@ fn fwd_packet(tcp_flags: u8) -> Vec<u8> {
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test --test bench -- --ignored --nocapture`"]
-fn bench_custom_fib_forward_established() {
+fn bench_packetframe_fib_forward_established() {
     if bench_skip() {
         return;
     }
-    let h = custom_fib_harness();
+    let h = packetframe_fib_harness();
     let pkt = fwd_packet(TCP_FLAG_ACK);
 
     let fwd_before = h.stat(StatIdx::FwdOk);
@@ -203,7 +203,9 @@ fn bench_custom_fib_forward_established() {
     assert_eq!(h.stat(StatIdx::FwdOk) - fwd_before, executed);
     assert_eq!(h.stat(StatIdx::PassLowTtl), low_ttl_before);
 
-    eprintln!("bench_custom_fib_forward_established: {ns} ns/pkt (median of {calls} x {repeat})");
+    eprintln!(
+        "bench_packetframe_fib_forward_established: {ns} ns/pkt (median of {calls} x {repeat})"
+    );
 
     if let Ok(baseline) = std::env::var("PACKETFRAME_BENCH_BASELINE_NS") {
         let baseline: u32 = baseline
@@ -218,11 +220,11 @@ fn bench_custom_fib_forward_established() {
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test --test bench -- --ignored --nocapture`"]
-fn bench_custom_fib_forward_syn() {
+fn bench_packetframe_fib_forward_syn() {
     if bench_skip() {
         return;
     }
-    let h = custom_fib_harness();
+    let h = packetframe_fib_harness();
     let pkt = fwd_packet(TCP_FLAG_SYN);
 
     let fwd_before = h.stat(StatIdx::FwdOk);
@@ -231,7 +233,7 @@ fn bench_custom_fib_forward_syn() {
     let executed = (repeat as u64) * (calls as u64);
     assert_eq!(h.stat(StatIdx::FwdOk) - fwd_before, executed);
 
-    eprintln!("bench_custom_fib_forward_syn: {ns} ns/pkt (median of {calls} x {repeat})");
+    eprintln!("bench_packetframe_fib_forward_syn: {ns} ns/pkt (median of {calls} x {repeat})");
 }
 
 #[test]

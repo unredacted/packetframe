@@ -55,7 +55,7 @@ use crate::MODULE_NAME;
 ///
 /// Only when a controller exists. In `kernel-fib` mode nothing consumes
 /// the directive, so there is no divergence to refuse — and reaching
-/// custom-fib from there is itself a restart.
+/// packetframe-fib from there is itself a restart.
 fn refuse_integrity_authority_change(
     state: &ActiveState,
     cfg: &ModuleConfig<'_>,
@@ -100,12 +100,12 @@ fn refuse_route_source_change(state: &ActiveState, cfg: &ModuleConfig<'_>) -> Mo
 /// Restart-only guard for forwarding-mode changes that cross the
 /// controller boundary. The RouteController (and with it the BGP/BMP
 /// listener and any anyip route) is created only at attach, only for
-/// custom-fib/compare. A reload crossing that boundary in either
+/// packetframe-fib/compare. A reload crossing that boundary in either
 /// direction produces runtime state a fresh start with the same
-/// config would not: custom→kernel leaves a live controller
+/// config would not: packetframe-fib→kernel leaves a live controller
 /// recreating an anyip route the config no longer implies; kernel→
-/// custom flips the data-plane flag with no controller to feed it
-/// (review finding, PR #196). Within the boundary — compare↔custom,
+/// packetframe-fib flips the data-plane flag with no controller to feed it
+/// (review finding, PR #196). Within the boundary — compare↔packetframe-fib,
 /// the documented cutover flip — reload remains allowed.
 fn refuse_controller_boundary_change(
     state: &ActiveState,
@@ -114,7 +114,7 @@ fn refuse_controller_boundary_change(
     let controller_running = state.route_controller.is_some();
     let wants_controller = matches!(
         crate::linux_impl::forwarding_mode_from_cfg(cfg),
-        packetframe_common::config::ForwardingMode::CustomFib
+        packetframe_common::config::ForwardingMode::PacketframeFib
             | packetframe_common::config::ForwardingMode::Compare
     );
     if controller_running != wants_controller {
@@ -156,7 +156,7 @@ fn route_source_refusal() -> String {
 fn controller_boundary_refusal() -> String {
     format!(
         "`forwarding-mode` change crosses the route-controller boundary (kernel-fib \
-         on one side, custom-fib/compare on the other); the controller and any anyip \
+         on one side, packetframe-fib/compare on the other); the controller and any anyip \
          route it owns are built once at attach — restart required: \
          {RESTART_SEQUENCE}"
     )

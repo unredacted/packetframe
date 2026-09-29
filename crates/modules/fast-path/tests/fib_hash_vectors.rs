@@ -34,13 +34,13 @@ fn distinct_macs(n: usize) -> Vec<[u8; 6]> {
     (0..n).map(|i| [0xaa, 0, 0, 0, 0, i as u8 + 1]).collect()
 }
 
-/// Build a harness primed for ECMP hash cross-checks: custom-FIB on,
+/// Build a harness primed for ECMP hash cross-checks: PacketFrame FIB on,
 /// hash mode 5, `count` resolved nexthops in one ECMP group (id 0),
 /// devmap populated.
 fn harness_with_ecmp_group(count: usize, hash_mode: u8) -> (Harness, Vec<[u8; 6]>) {
     let macs = distinct_macs(count);
     let mut h = Harness::new();
-    h.set_custom_fib(true, /*compare=*/ false);
+    h.set_packetframe_fib(true, /*compare=*/ false);
     h.set_fib_hash_mode(hash_mode);
     h.add_devmap_ifindex(LO_IFINDEX);
     let nh_ids: Vec<u32> = (1..=count as u32).collect();

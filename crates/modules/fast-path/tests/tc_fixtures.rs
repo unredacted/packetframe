@@ -4,7 +4,7 @@
 //! counters, the TC_REDIRECT_TARGETS pristine-packet pre-check, and
 //! the inline-VLAN-tag fallback parse.
 //!
-//! The tc datapath is custom-fib only; kernel-fib/compare stay on XDP.
+//! The tc datapath is packetframe-fib only; kernel-fib/compare stay on XDP.
 //! Real clsact attach, metadata-VLAN round-trip, and MTU/GSO behavior
 //! need a netns + veth (T3's integration test) — TEST_RUN neither
 //! untags inline 802.1Q into skb metadata nor executes the redirect.
@@ -18,7 +18,7 @@ mod common;
 
 use common::{
     tc_action, xdp_action, FpCfg, Harness, Ipv4TcpBuilder, StatIdx, FP_CFG_FLAG_BLOCK_PRESENT,
-    FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_IPV4, FP_CFG_FLAG_IPV6, FP_CFG_FLAG_MSS_CLAMP_PRESENT,
+    FP_CFG_FLAG_IPV4, FP_CFG_FLAG_IPV6, FP_CFG_FLAG_MSS_CLAMP_PRESENT, FP_CFG_FLAG_PACKETFRAME_FIB,
     FP_CFG_VERSION_V2,
 };
 
@@ -27,11 +27,11 @@ use common::{
 const LO_IFINDEX: u32 = 1;
 const EGRESS_MAC: [u8; 6] = [0xde, 0xad, 0xbe, 0xef, 0, 0x01];
 const NEXTHOP_MAC: [u8; 6] = [0xde, 0xad, 0xbe, 0xef, 0, 0x02];
-const BASE_FLAGS: u8 = FP_CFG_FLAG_IPV4 | FP_CFG_FLAG_IPV6 | FP_CFG_FLAG_CUSTOM_FIB;
+const BASE_FLAGS: u8 = FP_CFG_FLAG_IPV4 | FP_CFG_FLAG_IPV6 | FP_CFG_FLAG_PACKETFRAME_FIB;
 
 fn tc_forwarding_harness() -> Harness {
     let mut h = Harness::new();
-    h.set_custom_fib(true, /*compare=*/ false);
+    h.set_packetframe_fib(true, /*compare=*/ false);
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
     h.add_fib_v4_single("10.0.0.0/24", 1);
@@ -52,7 +52,7 @@ fn matched_pkt() -> Vec<u8> {
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn tc_allowlist_miss_returns_ok_and_attributes_rx() {
     let mut h = Harness::new();
-    h.set_custom_fib(true, false);
+    h.set_packetframe_fib(true, false);
     // No allowlist entries: everything misses.
     let pkt = Ipv4TcpBuilder::default().build();
 
@@ -68,16 +68,16 @@ fn tc_allowlist_miss_returns_ok_and_attributes_rx() {
 
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn tc_custom_fib_hit_redirects_with_rewrites() {
+fn tc_packetframe_fib_hit_redirects_with_rewrites() {
     let h = tc_forwarding_harness();
     let pkt = matched_pkt();
 
     let fwd_before = h.stat(StatIdx::FwdOk);
     let fwd_tc_before = h.stat(StatIdx::FwdOkTc);
-    let hit_before = h.stat(StatIdx::CustomFibHit);
+    let hit_before = h.stat(StatIdx::FibHit);
     let (verdict, out) = h.run_tc(&pkt);
     assert_eq!(verdict, tc_action::TC_ACT_REDIRECT);
-    assert_eq!(h.stat(StatIdx::CustomFibHit), hit_before + 1);
+    assert_eq!(h.stat(StatIdx::FibHit), hit_before + 1);
     assert_eq!(h.stat(StatIdx::FwdOk), fwd_before + 1);
     assert_eq!(h.stat(StatIdx::FwdOkTc), fwd_tc_before + 1);
     // Same mutations as the XDP path: L2 rewrite + TTL decrement.
@@ -94,7 +94,7 @@ fn tc_targets_miss_passes_pristine() {
     // unchecked ifindex would DROP the skb after return, and a
     // mutated pass-through would be the §11.13 hazard).
     let mut h = Harness::new();
-    h.set_custom_fib(true, false);
+    h.set_packetframe_fib(true, false);
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4(1, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC);
     h.add_fib_v4_single("10.0.0.0/24", 1);
@@ -177,7 +177,7 @@ fn tc_mss_clamp_parity_with_xdp() {
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn tc_parse_error_bumps_both_shared_and_tc_counter() {
     let mut h = Harness::new();
-    h.set_custom_fib(true, false);
+    h.set_packetframe_fib(true, false);
     // A frame the KERNEL accepts but the PARSER rejects. Sub-14-byte
     // buffers can't be used here: `bpf_prog_test_run` fails the whole
     // syscall with EINVAL when `size < ETH_HLEN`, so the program never
@@ -270,7 +270,7 @@ fn tc_fdb_pinned_nexthop_forwards() {
     // not serialize into data_out — verdict + counters are the
     // observable surface here.
     let mut h = Harness::new();
-    h.set_custom_fib(true, false);
+    h.set_packetframe_fib(true, false);
     h.add_allow_v4("10.0.0.0/8");
     h.add_nexthop_v4_pinned(0, LO_IFINDEX, EGRESS_MAC, NEXTHOP_MAC, 1337);
     h.add_fib_v4_single("10.0.0.0/8", 0);

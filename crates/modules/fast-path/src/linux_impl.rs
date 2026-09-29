@@ -60,19 +60,19 @@ pub(crate) const FP_CFG_VERSION_V2: u32 = 1;
 /// §11.1(c)). Keep in lockstep with the BPF side.
 pub(crate) const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
 
-/// Mirror of `bpf/src/maps.rs::FP_CFG_FLAG_CUSTOM_FIB` (Option F).
-/// Set when `forwarding-mode` is `custom-fib` or `compare`; routes
+/// Mirror of `bpf/src/maps.rs::FP_CFG_FLAG_PACKETFRAME_FIB` (Option F).
+/// Set when `forwarding-mode` is `packetframe-fib` or `compare`; routes
 /// the XDP program to consult `FIB_V4`/`FIB_V6` instead of
 /// `bpf_fib_lookup()`. Not yet read from the XDP program, Phase 1
 /// Slice 1B lands the dispatch gate. Kept in lockstep with the BPF
 /// side so userspace writes the right bit.
 #[allow(dead_code)]
-pub(crate) const FP_CFG_FLAG_CUSTOM_FIB: u8 = 0b0000_1000;
+pub(crate) const FP_CFG_FLAG_PACKETFRAME_FIB: u8 = 0b0000_1000;
 
 /// Mirror of `bpf/src/maps.rs::FP_CFG_FLAG_COMPARE_MODE` (Option F).
 /// Enables compare mode (both lookups run, forward via kernel
 /// result, bump disagreement counter). Requires
-/// `FP_CFG_FLAG_CUSTOM_FIB`; userspace rejects compare without it.
+/// `FP_CFG_FLAG_PACKETFRAME_FIB`; userspace rejects compare without it.
 #[allow(dead_code)]
 pub(crate) const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
 
@@ -719,7 +719,7 @@ pub struct ActiveState {
     pub state_dir: PathBuf,
     pub bpffs_root: PathBuf,
     /// Option F control plane, started in `attach` when
-    /// `forwarding-mode` is `custom-fib` or `compare`. `None` in
+    /// `forwarding-mode` is `packetframe-fib` or `compare`. `None` in
     /// `kernel-fib` mode (which is the default and today's behavior).
     /// `detach` shuts it down cooperatively before tearing down pins.
     pub route_controller: Option<crate::fib::controller::RouteController>,
@@ -1034,8 +1034,8 @@ pub(crate) fn fib_flags_from_forwarding_mode(
     use packetframe_common::config::ForwardingMode;
     match mode {
         ForwardingMode::KernelFib => 0,
-        ForwardingMode::CustomFib => FP_CFG_FLAG_CUSTOM_FIB,
-        ForwardingMode::Compare => FP_CFG_FLAG_CUSTOM_FIB | FP_CFG_FLAG_COMPARE_MODE,
+        ForwardingMode::PacketframeFib => FP_CFG_FLAG_PACKETFRAME_FIB,
+        ForwardingMode::Compare => FP_CFG_FLAG_PACKETFRAME_FIB | FP_CFG_FLAG_COMPARE_MODE,
     }
 }
 
@@ -1072,7 +1072,7 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
     let fp_cfg = FpCfg {
         dry_run: u8::from(dry_run),
         // bits 0-1: IPv4/IPv6 enabled (historical, load-bearing for
-        // dashboards). bits 3-4: custom-FIB / compare (Option F).
+        // dashboards). bits 3-4: PacketFrame FIB / compare (Option F).
         // bits 5-7: feature-presence gates (block / vlan / mss-clamp).
         // bit 2 (HEAD_SHIFT_128) is OR'd on later in
         // apply_driver_quirks_cfg for rvu-nicpf attaches.
@@ -1112,7 +1112,7 @@ fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
 /// Populate the `FIB_CONFIG` map with the parsed `ecmp-default-hash-mode`
 /// directive (default: 5-tuple). Always runs regardless of forwarding
 /// mode so the XDP program reads consistent config even if an
-/// operator flips to `custom-fib` via `packetframe reconfigure`
+/// operator flips to `packetframe-fib` via `packetframe reconfigure`
 /// later. Fail-soft: if the map is missing from the ELF (older build
 /// during development), log and continue, the BPF program reads the
 /// map defensively and falls back to built-in defaults.
@@ -1331,7 +1331,7 @@ fn gc_thresh3_capacity_warning(v4: Option<u64>, v6: Option<u64>, cap: u32) -> Op
          NEXTHOPS pool ({cap}). Each neighbour inside a local-prefix consumes one \
          slot, so dense segments can exhaust the pool and starve BGP nexthops; \
          affected routes fall to the kernel slow path. See \
-         docs/runbooks/custom-fib.md (capacity considerations)",
+         docs/runbooks/packetframe-fib.md (capacity considerations)",
         v4.unwrap_or(0),
         v6.unwrap_or(0),
     ))
@@ -1527,7 +1527,7 @@ pub fn attach(
     let mut anyip_guard = AnyipUnwindGuard::new(None);
     if matches!(
         forwarding_mode_from_cfg(cfg),
-        packetframe_common::config::ForwardingMode::CustomFib
+        packetframe_common::config::ForwardingMode::PacketframeFib
             | packetframe_common::config::ForwardingMode::Compare
     ) {
         if let Some(addr) = anyip_addr_from_cfg(cfg) {
@@ -1646,18 +1646,18 @@ pub fn attach(
         .into_iter()
         .partition(|(_, mode, _)| matches!(mode, AttachMode::Tc));
 
-    // The tc datapath is custom-fib only (the classifiers have no
+    // The tc datapath is packetframe-fib only (the classifiers have no
     // kernel-FIB arm; see bpf/src/tc.rs). Reject the pairing up front
     // rather than silently passing all matched traffic to the kernel.
     if !tc_dirs.is_empty()
         && !matches!(
             forwarding_mode_from_cfg(cfg),
-            packetframe_common::config::ForwardingMode::CustomFib
+            packetframe_common::config::ForwardingMode::PacketframeFib
         )
     {
         return Err(ModuleError::other(
             MODULE_NAME,
-            "`attach <iface> tc` requires `forwarding-mode custom-fib` \
+            "`attach <iface> tc` requires `forwarding-mode packetframe-fib` \
              (the tc datapath has no kernel-fib/compare arm)",
         ));
     }
@@ -1890,13 +1890,13 @@ pub fn attach(
     }
 
     // Start Option F's RouteController if the operator asked for the
-    // custom FIB path. Uses `MapData::from_pin` internally, so it
+    // PacketFrame FIB path. Uses `MapData::from_pin` internally, so it
     // must run after `pin_program_and_maps`. Kernel-fib mode skips
     // this entirely and pays nothing for the feature.
     let forwarding = forwarding_mode_from_cfg(cfg);
     if matches!(
         forwarding,
-        packetframe_common::config::ForwardingMode::CustomFib
+        packetframe_common::config::ForwardingMode::PacketframeFib
             | packetframe_common::config::ForwardingMode::Compare
     ) {
         // Translate the operator's `route-source ...` directive into
@@ -2040,7 +2040,7 @@ pub fn attach(
         // qualifying topology, or bridge-resolve off) = never pins.
         //
         // Never in compare mode. Compare bumps CompareDisagree when
-        // the custom-FIB egress ifindex differs from the kernel FIB's
+        // the PacketFrame FIB egress ifindex differs from the kernel FIB's
         // (bpf/src/main.rs `compare_and_bump`), and the kernel always
         // reports the logical bridge. A pinned nexthop reports the
         // member port, so every pinned flow would register as a
@@ -2102,28 +2102,28 @@ pub fn attach(
         );
     } else {
         if fib_cache_enabled(&cfg.section.directives) {
-            warn!("fib-cache on has no effect in kernel-fib mode (no custom FIB to cache)");
+            warn!("fib-cache on has no effect in kernel-fib mode (no PacketFrame FIB to cache)");
         }
         // Same class of silent no-op: pin discovery and the resolver
-        // that publishes pins both live in the custom-FIB branch, so
+        // that publishes pins both live in the PacketFrame FIB branch, so
         // `fdb-pin on` under kernel-fib can never dump an FDB or write
         // a pin. Say so rather than letting an operator believe the
         // optimization is live.
         if fdb_pin_enabled(&cfg.section.directives) {
             warn!(
                 "fdb-pin on has no effect in kernel-fib mode (pins are published by the \
-                 custom-FIB neighbour resolver, which is not running)"
+                 PacketFrame FIB neighbour resolver, which is not running)"
             );
         }
         // Same class again: the probe the ix-mode flag suppresses is the
-        // custom-FIB resolver's, so under kernel-fib the flag changes
+        // PacketFrame FIB resolver's, so under kernel-fib the flag changes
         // nothing here. The snooper itself still runs; only fast-path's
         // half of the arrangement is idle.
         if !ix_mode_ifaces.is_empty() {
             info!(
                 ifaces = ?ix_mode_ifaces,
                 "ix-mode configured but forwarding-mode is kernel-fib; fast-path's \
-                 proactive-probe suppression is inert until custom-fib"
+                 proactive-probe suppression is inert until packetframe-fib"
             );
         }
         info!(
@@ -3412,7 +3412,7 @@ pub fn snapshot_links(state: &ActiveState) -> Vec<(String, u32, AttachMode)> {
         .collect()
 }
 
-/// The custom-FIB control plane's last integrity check, for the
+/// The PacketFrame FIB control plane's last integrity check, for the
 /// module's health surface.
 ///
 /// `None` in kernel-fib mode, where no control plane runs at all, and
@@ -3437,7 +3437,7 @@ pub fn snapshot_stats(state: &ActiveState) -> ModuleResult<Vec<u64>> {
     read_stats(&stats)
 }
 
-/// Snapshot of the custom-FIB control-plane state that's readable
+/// Snapshot of the PacketFrame FIB control-plane state that's readable
 /// from a separate process via the bpffs pins, i.e., no live
 /// `FibProgrammer` handle required. Used by `packetframe status` to
 /// surface an operator-facing summary during and after cutover.
@@ -3479,10 +3479,10 @@ pub struct FibStatusSnapshot {
     pub ecmp_max_entries: u32,
 }
 
-/// Read the custom-FIB snapshot from the bpffs pins. Best-effort:
+/// Read the PacketFrame FIB snapshot from the bpffs pins. Best-effort:
 /// missing or malformed pins produce warnings and default values
 /// rather than hard errors, `packetframe status` should still
-/// show whatever it can even if a subset of the custom-FIB maps
+/// show whatever it can even if a subset of the PacketFrame FIB maps
 /// aren't pinned yet (e.g., kernel-fib mode).
 pub fn fib_status_from_pin(bpffs_root: &Path) -> FibStatusSnapshot {
     let mut snapshot = FibStatusSnapshot {
@@ -3502,11 +3502,11 @@ pub fn fib_status_from_pin(bpffs_root: &Path) -> FibStatusSnapshot {
     // --- CFG flags: forwarding mode ---
     if let Ok(fp_cfg) = read_cfg_map(bpffs_root) {
         let flags = fp_cfg.flags;
-        let custom = flags & FP_CFG_FLAG_CUSTOM_FIB != 0;
+        let packetframe_fib = flags & FP_CFG_FLAG_PACKETFRAME_FIB != 0;
         let compare = flags & FP_CFG_FLAG_COMPARE_MODE != 0;
-        snapshot.forwarding_mode = Some(match (custom, compare) {
+        snapshot.forwarding_mode = Some(match (packetframe_fib, compare) {
             (false, _) => "kernel-fib",
-            (true, false) => "custom-fib",
+            (true, false) => "packetframe-fib",
             (true, true) => "compare",
         });
     }
@@ -3888,7 +3888,7 @@ mod tests {
     /// Bits 5-7 must never collide with the established bits 0-4.
     #[test]
     fn presence_bits_are_disjoint_from_legacy_bits() {
-        let legacy = 0b0001_1111u8; // ipv4|ipv6|head-shift|custom-fib|compare
+        let legacy = 0b0001_1111u8; // ipv4|ipv6|head-shift|packetframe-fib|compare
         for bit in [
             FP_CFG_FLAG_BLOCK_PRESENT,
             FP_CFG_FLAG_VLAN_PRESENT,

@@ -34,10 +34,10 @@ the redirect) so that each gets its own 512-byte BPF stack. See
 | Mode | Egress comes from | Use |
 |---|---|---|
 | `kernel-fib` (default) | `bpf_fib_lookup()` against the kernel routing table | Same decisions as plain Linux; the permanent rollback path |
-| `custom-fib` | PacketFrame's own FIB, fed by a `route-source` | Full-table boxes where the kernel FIB is the bottleneck |
+| `packetframe-fib` | PacketFrame's own FIB, fed by a `route-source` | Full-table boxes where the kernel FIB is the bottleneck |
 | `compare` | Both; forwards on the kernel result and counts disagreements | Validation before a cutover only |
 
-In `custom-fib` mode a tokio-driven control plane under
+In `packetframe-fib` mode a tokio-driven control plane under
 [`src/fib/`](src/fib/) owns the FIB:
 
 - **Route source.** `BgpListener` is a passive iBGP speaker that the
@@ -65,10 +65,10 @@ module fast-path
   circuit-breaker drop-ratio 0.01 of matched window 5s threshold 5
 ```
 
-Cutting over to the custom FIB adds:
+Cutting over to the PacketFrame FIB adds:
 
 ```
-  forwarding-mode custom-fib
+  forwarding-mode packetframe-fib
   route-source bgp 127.0.0.1:1179 local-as 64500 peer-as 64500
 ```
 
@@ -81,13 +81,13 @@ documented inline in [`conf/example.conf`](../../../conf/example.conf).
 
 Attach modes are `native`, `generic`, `auto` (native with a fallback,
 downgraded on drivers with known bugs) and `tc`, a tc-ingress variant
-that works only with `custom-fib`. `tc` measured slower on the reference
+that works only with `packetframe-fib`. `tc` measured slower on the reference
 hardware and is kept for reference only
 ([tc-datapath.md](../../../docs/runbooks/tc-datapath.md)).
 
 **Reloads.** `packetframe reconfigure` (SIGHUP) applies allowlist,
 `block-prefix`, `dry-run`, `mss-clamp` and VLAN changes as deltas.
-`forwarding-mode` is hot only between `compare` and `custom-fib`: the
+`forwarding-mode` is hot only between `compare` and `packetframe-fib`: the
 route controller exists only if the daemon started in one of those, so
 a change to or from `kernel-fib` is refused and needs a restart.
 Changing the attach set, `route-source`, `circuit-breaker` or
@@ -98,7 +98,7 @@ Changing the attach set, `route-source`, `circuit-breaker` or
 
 ```sh
 sudo packetframe status             # counters, module health
-sudo packetframe fib stats          # custom-FIB occupancy
+sudo packetframe fib stats          # PacketFrame FIB occupancy
 sudo packetframe fib lookup 192.0.2.1
 sudo packetframe detach --all       # remove pins, detach
 ```
@@ -116,13 +116,13 @@ Counters are exported to the Prometheus textfile as `packetframe_*`.
 
 | Path | Contents |
 |---|---|
-| `bpf/` | The BPF crate (nightly toolchain): `main.rs` XDP entry, `finalize.rs` tail-call stage, `fib.rs` custom-FIB lookup, `tc.rs` tc variant, `maps.rs` map definitions |
+| `bpf/` | The BPF crate (nightly toolchain): `main.rs` XDP entry, `finalize.rs` tail-call stage, `fib.rs` PacketFrame FIB lookup, `tc.rs` tc variant, `maps.rs` map definitions |
 | `build.rs` | Builds `bpf/` and embeds the ELF |
 | `src/linux_impl.rs` | Load, attach, detach; the `Module` implementation |
 | `src/reconcile.rs` | SIGHUP delta application |
 | `src/breaker.rs` | Circuit breaker |
 | `src/redirect_watch.rs` | Keeps redirect targets and VLAN resolution in step with the link table |
-| `src/fib/` | Custom-FIB control plane: route sources, programmer, resolver, integrity, inspection |
+| `src/fib/` | PacketFrame FIB control plane: route sources, programmer, resolver, integrity, inspection |
 | `src/pin.rs`, `src/registry.rs`, `src/tc_links.rs` | Pin paths and persisted attach records for `detach` |
 
 ## Tests
@@ -141,6 +141,6 @@ sudo -E $(which cargo) test -p packetframe-fast-path --tests -- --ignored
 
 ## Further reading
 
-- [custom-fib.md](../../../docs/runbooks/custom-fib.md): cutover, rollback, triage by symptom
+- [packetframe-fib.md](../../../docs/runbooks/packetframe-fib.md): cutover, rollback, triage by symptom
 - [mss-clamp.md](../../../docs/runbooks/mss-clamp.md): MSS clamping for traffic iptables no longer sees
 - [generic-mode-performance.md](../../../docs/runbooks/generic-mode-performance.md): generic vs native XDP cost

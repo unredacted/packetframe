@@ -30,7 +30,7 @@ pub const MAP_NAMES: [&str; 25] = [
     "REDIRECT_DEVMAP",
     "VLAN_RESOLVE",
     "LOG",
-    // --- Custom-FIB maps (Option F, Phase 1) ---
+    // --- PacketFrame FIB maps (Option F, Phase 1) ---
     // Pinned even when `forwarding-mode` is `kernel-fib`; they're
     // present in the ELF regardless and pinning them keeps detach
     // teardown uniform across modes.

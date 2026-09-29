@@ -1455,7 +1455,7 @@ impl Module for VppOffloadModule {
                 "module vpp-offload declares no `port` lines; nothing to orchestrate",
             ));
         }
-        // Cross-section membership/steering/custom-fib validation runs
+        // Cross-section membership/steering/packetframe-fib validation runs
         // at the Config level (`Config::validate_vpp_offload`) where
         // the fast-path section is visible; by load time it has passed.
         // Here: validate the sizing arithmetic so a too-small

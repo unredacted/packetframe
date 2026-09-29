@@ -1,4 +1,4 @@
-//! Custom-FIB trait shapes shared across userspace modules (Option F).
+//! PacketFrame FIB trait shapes shared across userspace modules (Option F).
 //!
 //! Phase 1 defines only the trait surfaces so Phase 2-3 can land
 //! concrete implementations (BMP station, netlink neighbor listener,

@@ -16,6 +16,17 @@ notes are on the [releases page](https://github.com/unredacted/packetframe/relea
 Versions 0.2.8, 0.2.9 and 0.2.10, which some code comments cite, never
 shipped; that work is part of 0.5.0.
 
+## [0.6.0] - UNRELEASED
+
+### Upgrading from 0.5.0
+
+- **`forwarding-mode custom-fib` is now `forwarding-mode packetframe-fib`.** The old name still parses and logs a deprecation warning naming the line; it will be removed in a later release. Update your config at your next edit.
+- **Renamed metrics.** The counters `custom_fib_hit`, `custom_fib_miss` and `custom_fib_no_neigh` are now `fib_hit`, `fib_miss` and `fib_no_neigh`, so the textfile exports `packetframe_fib_hit_total` and so on. The mode label reads `packetframe_fib_forwarding_mode{mode="packetframe-fib"}`. Counter indices are unchanged. Update any alert or dashboard that matches the old names.
+
+### Changes
+
+- The custom-FIB runbook moved to [`docs/runbooks/packetframe-fib.md`](docs/runbooks/packetframe-fib.md).
+
 ## [0.5.0] - 2026-09-28
 
 The first release since 0.2.7 (2026-05-20). It adds three modules (vpp-offload, neigh-snoop, and guard, which is experimental) and a persistent event log. No directive was removed and a 0.2.7 config parses unchanged, but read **Upgrading from 0.2.7** before installing: the upgrade order matters, and one default changed.

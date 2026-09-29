@@ -375,7 +375,7 @@ impl GateState {
 pub use linux::{gate_task, GateInput};
 /// Re-exported so this module's callers keep one name for it while the
 /// implementation lives in `packetframe-common`. It is shared with the
-/// custom-FIB's FRR completeness authority, which asks FRR different
+/// PacketFrame FIB's FRR completeness authority, which asks FRR different
 /// questions through the same bounded child process — and, more to the
 /// point, honours the same `PACKETFRAME_VTYSH` override, which is how
 /// `snoop_netns`'s fake gets in front of both.

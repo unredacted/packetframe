@@ -92,25 +92,25 @@ pub enum StatIdx {
     /// returns `XDP_PASS` unmodified; the counter tells operators how
     /// many frames the fast path couldn't touch because of this.
     ErrHeadShift = 19,
-    // --- Custom FIB additions (Option F, Phase 1). Append-only. ---
-    /// Custom-FIB lookup returned a forward decision for the packet
+    // --- PacketFrame FIB additions (Option F, Phase 1). Append-only. ---
+    /// PacketFrame FIB lookup returned a forward decision for the packet
     /// (LPM hit → resolved nexthop → redirect).
-    CustomFibHit = 20,
-    /// Custom-FIB lookup missed the LPM trie. No route for this
+    FibHit = 20,
+    /// PacketFrame FIB lookup missed the LPM trie. No route for this
     /// destination in our map.
-    CustomFibMiss = 21,
-    /// Custom-FIB lookup hit a route but the resolved nexthop's
+    FibMiss = 21,
+    /// PacketFrame FIB lookup hit a route but the resolved nexthop's
     /// state is not `Resolved` (incomplete/stale/failed). Packet
     /// falls to `XDP_PASS` so the kernel can attempt ARP/ND.
-    CustomFibNoNeigh = 22,
-    /// Compare mode: custom-FIB and kernel-FIB decisions agreed on
+    FibNoNeigh = 22,
+    /// Compare mode: PacketFrame FIB and kernel-FIB decisions agreed on
     /// `(egress_ifindex, dst_mac)`. Forward path is kernel result.
     CompareAgree = 23,
-    /// Compare mode: custom-FIB and kernel-FIB decisions differed.
+    /// Compare mode: PacketFrame FIB and kernel-FIB decisions differed.
     /// Forward path is kernel result; disagreement is diagnostic.
     CompareDisagree = 24,
     /// ECMP group dispatch bumped for every IPv4 packet that hit an
-    /// ECMP group in custom-FIB (distribution visibility).
+    /// ECMP group in PacketFrame FIB (distribution visibility).
     EcmpHashV4 = 25,
     EcmpHashV6 = 26,
     /// ECMP hash selected a dead-leg nexthop; we walked to a live one.
@@ -198,7 +198,7 @@ pub enum StatIdx {
     // The three probe outcomes are mutually exclusive per packet, so
     // hit rate = hit / (hit + miss + stale). They are a layer ON TOP
     // of the route-decision counters: a cache-hit packet still bumps
-    // `CustomFibHit` (it IS a FIB hit) and `EcmpHashV4/V6` where
+    // `FibHit` (it IS a FIB hit) and `EcmpHashV4/V6` where
     // applicable — cache counters describe the probe, not the verdict.
     /// Cache probe matched (dst equal, generation current); the LPM
     /// walk was skipped.
@@ -260,7 +260,7 @@ pub enum StatIdx {
     /// multicast frame; the kernel bridges or delivers them. A subset
     /// of `matched_v4 + matched_v6`. A jump to a large share of it, with
     /// `fwd_ok` falling by as much, means a port's receive MACs are
-    /// missing: see docs/runbooks/custom-fib.md.
+    /// missing: see docs/runbooks/packetframe-fib.md.
     PassNotForUs = 50,
 }
 
@@ -281,21 +281,21 @@ pub type StatsPtr = *mut [u64; STATS_COUNT_USIZE];
 /// Flag bits for `FpCfg.flags`. Bits 0-1 are the IPv4/IPv6 enable
 /// mask (historical, load-bearing for dashboards). Bit 2 is the
 /// rvu-nicpf head-shift workaround (SPEC §11.1(c)). Bits 3-4 gate
-/// the custom-FIB lookup path (Option F); see `crates/modules/fast-path/src/fib/`.
+/// the PacketFrame FIB lookup path (Option F); see `crates/modules/fast-path/src/fib/`.
 /// Higher bits reserved for future per-iface or per-driver quirks.
 pub const FP_CFG_FLAG_IPV4: u8 = 0b0000_0001;
 pub const FP_CFG_FLAG_IPV6: u8 = 0b0000_0010;
 pub const FP_CFG_FLAG_HEAD_SHIFT_128: u8 = 0b0000_0100;
-/// Enable the custom-FIB lookup path in place of `bpf_fib_lookup()`.
+/// Enable the PacketFrame FIB lookup path in place of `bpf_fib_lookup()`.
 /// The XDP program consults `FIB_V4` / `FIB_V6` LPM tries and the
 /// `NEXTHOPS` array instead of calling into the kernel FIB. Set by
-/// userspace when `forwarding-mode custom-fib` or `compare` is
+/// userspace when `forwarding-mode packetframe-fib` or `compare` is
 /// configured.
-pub const FP_CFG_FLAG_CUSTOM_FIB: u8 = 0b0000_1000;
-/// Compare-mode: run both the custom-FIB and kernel-FIB lookups,
+pub const FP_CFG_FLAG_PACKETFRAME_FIB: u8 = 0b0000_1000;
+/// Compare-mode: run both the PacketFrame FIB and kernel-FIB lookups,
 /// forward via the kernel result, bump `CompareAgree`/`CompareDisagree`
 /// based on whether `(egress_ifindex, dst_mac)` matches. Implies
-/// `FP_CFG_FLAG_CUSTOM_FIB`; userspace rejects compare-mode without
+/// `FP_CFG_FLAG_PACKETFRAME_FIB`; userspace rejects compare-mode without
 /// it. Temporary validation mode; removed in Phase 5.
 pub const FP_CFG_FLAG_COMPARE_MODE: u8 = 0b0001_0000;
 /// At least one `block-prefix` directive is configured, i.e. BLOCK_V4
@@ -352,25 +352,25 @@ const RX_MACS_MAX_ENTRIES: u32 = 1024;
 /// rule. 64 is comfortable for any non-container deployment.
 const MSS_CLAMP_IFACE_MAX_ENTRIES: u32 = 64;
 
-// --- Custom-FIB map sizes (Option F) -----------------------------------
+// --- PacketFrame FIB map sizes (Option F) -----------------------------------
 //
 // Sized to accommodate the full IPv4 + IPv6 BGP tables plus headroom.
 // Kernel allocates at load time regardless of whether `forwarding-mode
-// custom-fib` is selected, the maps live in the same ELF. Approximate
+// packetframe-fib` is selected, the maps live in the same ELF. Approximate
 // memory cost at defaults: ~50-80 MB v4 + ~40-50 MB v6 + small NH + ECMP.
 // Changing `max_entries` requires an ELF rebuild (aya/kernel limitation);
 // config-level `fib-v4-max-entries` directives are accepted but documented
 // as "rebuild required" in Phase 1.
 //
 // Phase 1 keeps these empty, the BPF program never reads them while
-// `FP_CFG_FLAG_CUSTOM_FIB` is clear, so the allocation is all the load
+// `FP_CFG_FLAG_PACKETFRAME_FIB` is clear, so the allocation is all the load
 // cost. Phase 3's FibProgrammer populates them.
 
-/// Max IPv4 prefixes in the custom FIB. 2²¹ = 2 097 152; covers the
+/// Max IPv4 prefixes in the PacketFrame FIB. 2²¹ = 2 097 152; covers the
 /// full DFZ v4 table (~1.2M as of 2026) with substantial headroom.
 const FIB_V4_MAX_ENTRIES: u32 = 2_097_152;
 
-/// Max IPv6 prefixes in the custom FIB. 2²⁰ = 1 048 576; covers the
+/// Max IPv6 prefixes in the PacketFrame FIB. 2²⁰ = 1 048 576; covers the
 /// full DFZ v6 table (~230K) with substantial headroom.
 const FIB_V6_MAX_ENTRIES: u32 = 1_048_576;
 
@@ -491,7 +491,7 @@ pub struct MutationCtx {
 // instead of the UniFi 5.15 verifier failing the load.
 const _: () = assert!(core::mem::size_of::<MutationCtx>() == 20);
 
-// --- Custom FIB value layouts (Option F) -------------------------------
+// --- PacketFrame FIB value layouts (Option F) -------------------------------
 
 /// Max nexthops in a single ECMP group. The XDP program walks `nh_idx`
 /// starting at `hash % nh_count` to find a resolved leg; unrolling
@@ -787,19 +787,19 @@ pub static TC_MUTATION_PROGS: ProgramArray = ProgramArray::with_max_entries(8, 0
 pub static TC_REDIRECT_TARGETS: HashMap<u32, u32> =
     HashMap::with_max_entries(REDIRECT_DEVMAP_MAX_ENTRIES, 0);
 
-// --- Custom-FIB maps (Option F, Phase 1) -------------------------------
+// --- PacketFrame FIB maps (Option F, Phase 1) -------------------------------
 //
 // These maps are declared and sized in Phase 1 but neither read nor
-// written by the XDP program until Phase 1 Slice 1B gates the custom
-// lookup path on `FP_CFG_FLAG_CUSTOM_FIB`. Phase 3 wires up the
+// written by the XDP program until Phase 1 Slice 1B gates the PacketFrame FIB
+// lookup path on `FP_CFG_FLAG_PACKETFRAME_FIB`. Phase 3 wires up the
 // FibProgrammer that populates them from BMP.
 
-/// IPv4 custom FIB. Keyed by `{prefixlen, addr[4]}`; value is a
+/// IPv4 PacketFrame FIB. Keyed by `{prefixlen, addr[4]}`; value is a
 /// `FibValue` pointing at `NEXTHOPS` (Single) or `ECMP_GROUPS` (Ecmp).
 #[map]
 pub static FIB_V4: LpmTrie<[u8; 4], FibValue> = LpmTrie::with_max_entries(FIB_V4_MAX_ENTRIES, 0);
 
-/// IPv6 custom FIB. Same semantics, 128-bit address key.
+/// IPv6 PacketFrame FIB. Same semantics, 128-bit address key.
 #[map]
 pub static FIB_V6: LpmTrie<[u8; 16], FibValue> = LpmTrie::with_max_entries(FIB_V6_MAX_ENTRIES, 0);
 

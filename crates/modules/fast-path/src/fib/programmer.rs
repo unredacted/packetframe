@@ -243,7 +243,7 @@ impl FibProgrammerHandle {
 
     /// Decrement the refcount on `ip`. Frees the ID when refcount
     /// hits zero (marked `Failed` in the BPF map so any stale
-    /// lookups bail out with `CustomFibNoNeigh`).
+    /// lookups bail out with `FibNoNeigh`).
     pub async fn unregister_nexthop(&self, ip: IpAddr) -> Result<(), ProgrammerError> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -1346,7 +1346,7 @@ impl FibProgrammer {
                 losses_total = self.reprobe_losses,
                 recoveries_total = self.reprobe_recoveries,
                 "nexthops awaiting resolution; their traffic is taking the kernel path \
-                 (custom_fib_no_neigh). `packetframe fib dump-v4 --unresolved` lists the routes"
+                 (fib_no_neigh). `packetframe fib dump-v4 --unresolved` lists the routes"
             );
         }
     }
@@ -1396,7 +1396,7 @@ impl FibProgrammer {
         }
 
         // Leave the NEXTHOPS slot marked Failed so any stale FIB
-        // pointer still producing lookups gets CustomFibNoNeigh
+        // pointer still producing lookups gets FibNoNeigh
         // rather than forwarding to a recycled MAC. `family: 0` is
         // what tells every reader (`NexthopSlotClass`) this is a
         // tombstone and not a live nexthop the kernel gave up on; keep

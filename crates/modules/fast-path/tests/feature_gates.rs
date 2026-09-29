@@ -16,17 +16,17 @@
 mod common;
 
 use common::{
-    xdp_action, Harness, Ipv4TcpBuilder, StatIdx, FP_CFG_FLAG_BLOCK_PRESENT,
-    FP_CFG_FLAG_CUSTOM_FIB, FP_CFG_FLAG_IPV4, FP_CFG_FLAG_IPV6, FP_CFG_FLAG_VLAN_PRESENT,
+    xdp_action, Harness, Ipv4TcpBuilder, StatIdx, FP_CFG_FLAG_BLOCK_PRESENT, FP_CFG_FLAG_IPV4,
+    FP_CFG_FLAG_IPV6, FP_CFG_FLAG_PACKETFRAME_FIB, FP_CFG_FLAG_VLAN_PRESENT,
 };
 
 const LO_IFINDEX: u32 = 1;
 /// A fake VLAN-subif ifindex; deliberately NOT in the devmap so a
 /// bypassed VLAN_RESOLVE lookup is observable as PassNotInDevmap.
 const SUBIF_IFINDEX: u32 = 4242;
-const BASE_FLAGS: u8 = FP_CFG_FLAG_IPV4 | FP_CFG_FLAG_IPV6 | FP_CFG_FLAG_CUSTOM_FIB;
+const BASE_FLAGS: u8 = FP_CFG_FLAG_IPV4 | FP_CFG_FLAG_IPV6 | FP_CFG_FLAG_PACKETFRAME_FIB;
 
-/// Custom-fib forwarding scaffold: allowlisted /8, one resolved
+/// `packetframe-fib` forwarding scaffold: allowlisted /8, one resolved
 /// nexthop pointing at `nh_ifindex`, loopback in the devmap.
 fn forwarding_harness(nh_ifindex: u32) -> Harness {
     let mut h = Harness::new();
