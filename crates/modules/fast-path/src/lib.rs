@@ -112,6 +112,9 @@ pub struct FastPathModule {
     /// egressing them. Names, not ifindexes. Present on every platform
     /// so the loader's wiring stays cfg-clean.
     ix_mode_ifaces: Vec<String>,
+    /// Set by [`Module::breaker_tripping`]; decides whether the
+    /// following `detach` is a [`wan_egress::Teardown::BreakerTrip`].
+    breaker_tripped: bool,
 }
 
 impl FastPathModule {
@@ -130,6 +133,16 @@ impl FastPathModule {
     /// snooper would leave those nexthops unresolvable.
     pub fn set_ix_mode_ifaces(&mut self, ifaces: Vec<String>) {
         self.ix_mode_ifaces = ifaces;
+    }
+
+    /// What kind of teardown the next `detach` is: a breaker trip when
+    /// the loader said so, otherwise a full one.
+    pub fn teardown(&self) -> wan_egress::Teardown {
+        if self.breaker_tripped {
+            wan_egress::Teardown::BreakerTrip
+        } else {
+            wan_egress::Teardown::Full
+        }
     }
 
     /// Announce the resolved FIB to a second tier.
@@ -265,10 +278,14 @@ impl Module for FastPathModule {
         Err(ModuleError::not_implemented(MODULE_NAME))
     }
 
+    fn breaker_tripping(&mut self) {
+        self.breaker_tripped = true;
+    }
+
     #[cfg(target_os = "linux")]
     fn detach(&mut self) -> ModuleResult<()> {
         if let Some(mut state) = self.state.take() {
-            linux_impl::detach(&mut state)?;
+            linux_impl::detach(&mut state, self.teardown())?;
             // Dropping `state` drops the `Ebpf`, which unloads the
             // program and maps. PR #6 adds pin cleanup when pinning
             // exists.
@@ -361,6 +378,19 @@ mod tests {
     fn module_name_matches_spec() {
         let m = FastPathModule::new();
         assert_eq!(m.name(), "fast-path");
+    }
+
+    /// The loader's breaker path calls `breaker_tripping` before
+    /// `detach`; that, and only that, turns the detach into one that
+    /// leaves the wan-egress rules in place.
+    #[test]
+    fn only_the_breaker_signal_makes_detach_a_breaker_teardown() {
+        let mut m = FastPathModule::new();
+        assert_eq!(m.teardown(), wan_egress::Teardown::Full);
+        assert!(m.teardown().removes_wan_egress_rules());
+        m.breaker_tripping();
+        assert_eq!(m.teardown(), wan_egress::Teardown::BreakerTrip);
+        assert!(!m.teardown().removes_wan_egress_rules());
     }
 
     #[test]

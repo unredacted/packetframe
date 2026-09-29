@@ -18,6 +18,9 @@
 //!    is written.
 //! 6. The reconcile thread repairs a removed rule on its own, prompted
 //!    by the rule event rather than the 30 s tick.
+//! 7. Stopping the reconciler without removal (the breaker-trip and
+//!    `detach --keep-vpp` paths) leaves working rules, and a new
+//!    reconciler adopts them without writing anything.
 //!
 //! The topology mirrors the platform shape the feature exists for:
 //! `main` moved from 32766 to 32000 and holding a specific route via
@@ -470,6 +473,38 @@ fn wan_egress_thread_repairs_on_the_rule_event() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+
+    // A breaker trip or `detach --keep-vpp`: the reconciler stops and
+    // the rules stay, still steering the sources to the WAN.
+    w.stop();
+    assert_eq!(rt.block_on(owned_count()), 8);
+    assert_eq!(egress(&n, VIA_IX, SRC), n.wan, "kept rules keep working");
+
+    // The next daemon adopts them: its first pass finds everything in
+    // place and writes nothing, so no rule event is emitted.
+    let w = rt.block_on(async {
+        let (conn, _handle, mut msgs) =
+            rtnetlink::new_multicast_connection(&[rtnetlink::MulticastGroup::Ipv4Rule])
+                .expect("subscribe RTNLGRP_IPV4_RULE");
+        tokio::spawn(conn);
+        // `start` builds its own runtime, so it must run off this one.
+        let w = tokio::task::spawn_blocking(|| WanEgress::start(spec()))
+            .await
+            .expect("join")
+            .expect("adopting start");
+        let quiet = tokio::time::timeout(
+            Duration::from_millis(500),
+            futures::StreamExt::next(&mut msgs),
+        )
+        .await;
+        if let Ok(Some((msg, _))) = quiet {
+            panic!("adoption emitted a rule notification: {msg:?}");
+        }
+        w
+    });
+    let status = w.status();
+    assert_eq!(status.condition, Condition::Converged, "{status:?}");
+    assert_eq!(status.present, 8);
 
     // The directive leaves the config (the reload path): retire removes
     // every rule and says so before the reconciler is dropped.

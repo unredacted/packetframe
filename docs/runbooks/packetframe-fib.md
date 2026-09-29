@@ -899,11 +899,21 @@ anchor is needed.)
   and every 30 s. A pass writes only the difference; when everything is
   in place it writes nothing, so it wakes no other daemon that watches
   rule events.
-- **Lifetime.** Like the pinned programs, the rules outlive a `systemctl
-  stop` (the next start adopts them) and go away with `packetframe
-  detach`, which finds them by their tag, and with module teardown
-  (including a circuit-breaker trip). A start whose config has no
-  `wan-egress` removes any tagged rules left behind.
+- **Lifetime.** The rules serve kernel forwarding, which runs whether
+  or not the XDP datapath does, so only "PacketFrame is leaving this
+  box" removes them:
+
+  | Event | Rules |
+  |---|---|
+  | `systemctl stop` (preserve-attach exit) | Stay; the next start adopts them |
+  | `packetframe detach --keep-vpp` (the routine restart) | Stay; the next start adopts them |
+  | Circuit-breaker trip | Stay. The breaker stops XDP because XDP was dropping traffic; removing the rules too would send private sources back out the peering interface until an operator restarts |
+  | `packetframe detach`, `packetframe detach --all` | Removed (found by their tag in a fresh dump, no state file needed) |
+  | Reload whose config drops `wan-egress` | Removed before the reload returns; retried every pass if that fails |
+  | Start whose config has no `wan-egress` | Any tagged rules left behind are removed |
+
+  Adoption is a pass like any other: rules already in place are left
+  untouched, and nothing is written.
 
 ### Status and troubleshooting
 

@@ -3162,7 +3162,7 @@ pub(crate) fn read_vlan_config() -> std::io::Result<Vec<(String, u16, String)>> 
     Ok(out)
 }
 
-pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
+pub fn detach(state: &mut ActiveState, teardown: crate::wan_egress::Teardown) -> ModuleResult<()> {
     // Stop the Option F control plane first. Its tasks hold map
     // handles opened via `MapData::from_pin`; draining them before we
     // remove the pins keeps shutdown ordered and avoids "map removed
@@ -3177,16 +3177,26 @@ pub fn detach(state: &mut ActiveState) -> ModuleResult<()> {
         w.shutdown();
     }
     // wan-egress rules are kernel routing policy, not BPF state, so
-    // their removal depends on nothing below. A failure is logged, not
-    // fatal: `packetframe detach` removes owned rules again from a
-    // fresh dump, with no in-process state needed.
+    // what happens to them depends on nothing below. A breaker trip
+    // leaves them (see `Teardown`); a full teardown removes them, and a
+    // failure is logged, not fatal: `packetframe detach` removes owned
+    // rules again from a fresh dump, with no in-process state needed.
     if let Some(w) = state.wan_egress.take() {
-        match w.shutdown_and_remove() {
-            Ok(n) => info!(removed = n, "wan-egress rules removed"),
-            Err(e) => warn!(
-                error = %e,
-                "wan-egress rule removal failed; `packetframe detach` retries it"
-            ),
+        if teardown.removes_wan_egress_rules() {
+            match w.shutdown_and_remove() {
+                Ok(n) => info!(removed = n, "wan-egress rules removed"),
+                Err(e) => warn!(
+                    error = %e,
+                    "wan-egress rule removal failed; `packetframe detach` retries it"
+                ),
+            }
+        } else {
+            w.stop();
+            info!(
+                ?teardown,
+                "wan-egress rules left in place: they serve kernel forwarding, and the next \
+                 daemon adopts them (`packetframe detach` removes them)"
+            );
         }
     }
 

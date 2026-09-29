@@ -92,6 +92,37 @@ pub const DEFAULT_KEEP: [Ipv4Prefix; 5] = [
     v4(169, 254, 0, 0, 16),
 ];
 
+/// Why the fast-path is being torn down, as far as the wan-egress rules
+/// care.
+///
+/// The rules serve kernel forwarding, which runs whether or not the XDP
+/// datapath does. So only a teardown that means "PacketFrame is leaving
+/// this box" removes them. A teardown on the way to a daemon that will
+/// adopt them, or a stop of the XDP datapath for a reason unrelated to
+/// routing policy, leaves them in place: removing them would reopen the
+/// blackhole the rules exist to close, for as long as the box runs
+/// without them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Teardown {
+    /// `packetframe detach` / `detach --all`, or the module detached
+    /// for any reason other than the circuit breaker.
+    Full,
+    /// `packetframe detach --keep-vpp`: the routine restart. The next
+    /// daemon adopts the rules by their protocol tag.
+    KeepVppRestart,
+    /// The circuit breaker tripped. It stops XDP forwarding because
+    /// XDP was dropping traffic; removing wan-egress too would send
+    /// private sources back out the peering interface until an
+    /// operator intervenes, the opposite of failing safe.
+    BreakerTrip,
+}
+
+impl Teardown {
+    pub fn removes_wan_egress_rules(self) -> bool {
+        self == Self::Full
+    }
+}
+
 /// The resolved directive: sources, and the full keep set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WanEgressSpec {
@@ -713,6 +744,21 @@ mod tests {
             sources: sources.iter().map(|s| p(s)).collect(),
             keep: keep.iter().map(|s| p(s)).collect(),
         }
+    }
+
+    // --- teardown ---
+
+    #[test]
+    fn only_a_full_teardown_removes_the_rules() {
+        assert!(Teardown::Full.removes_wan_egress_rules());
+        assert!(
+            !Teardown::KeepVppRestart.removes_wan_egress_rules(),
+            "the routine restart: the next daemon adopts them"
+        );
+        assert!(
+            !Teardown::BreakerTrip.removes_wan_egress_rules(),
+            "the breaker stops XDP, not kernel routing policy"
+        );
     }
 
     // --- spec ---
