@@ -35,7 +35,7 @@ A circuit breaker watches unreachable and FIB-error drops as a share of matched 
 `forwarding-mode` decides where the egress lookup comes from:
 
 - **`kernel-fib`** (default) calls `bpf_fib_lookup()` against the kernel's routing table. It makes the same decisions as plain Linux, and it is always the rollback path.
-- **`custom-fib`** looks up PacketFrame's own FIB: LPM tries for IPv4 and IPv6, a nexthop array and ECMP groups, all in BPF maps. PacketFrame fills them from a BGP feed it receives itself. It resolves next-hop MACs over netlink. The kernel routing table is never read, so the lookup doesn't depend on how or when the routing daemon writes the kernel table. An optional destination cache (`fib-cache`) sits in front of the LPM lookup.
+- **`custom-fib`** looks up PacketFrame's own FIB: LPM tries for IPv4 and IPv6, a nexthop array and ECMP groups, all in BPF maps. PacketFrame fills them from a BGP feed it receives itself. The per-packet lookup never touches the kernel routing table, so it doesn't depend on how or when the routing daemon writes that table. The control plane still uses the kernel for next-hop resolution: it asks the main table (`RTM_GETROUTE`) which interface a BGP next hop is on, then resolves the MAC over netlink. The connected routes that cover your next hops must stay in the kernel. An optional destination cache (`fib-cache`) sits in front of the LPM lookup.
 - **`compare`** performs both lookups, forwards using the kernel result, and counts disagreements. Use it to validate before cutover.
 
 In `custom-fib`, routes come from one of two sources:
@@ -43,7 +43,7 @@ In `custom-fib`, routes come from one of two sources:
 - **A passive iBGP listener** (`route-source bgp`). The routing daemon connects to PacketFrame and exports its best paths to it. PacketFrame negotiates MP-BGP for IPv4 and IPv6 unicast, four-octet ASNs and ADD-PATH receive (for ECMP). It never originates routes. FRR and BIRD are both supported; FRR is the production pairing.
 - **A BMP station** (`route-source bmp`, RFC 7854 and RFC 9069). It needs an emitter that sends a Loc-RIB view (FRR can; BIRD 2.x and 3.x cannot).
 
-An **integrity authority** (`integrity-authority birdc` or `frr`) compares PacketFrame's copy of the table against the routing daemon's own table, so an incomplete feed is detected rather than forwarded on.
+An **integrity authority** (`integrity-authority birdc` or `frr`) compares PacketFrame's copy of the table against the routing daemon's own table and reports drift. It does not withdraw a partial table from the fast path. vpp-offload uses the result to hold its first steer until the table is complete (`require-table-complete`).
 
 ### VPP offload (`vpp-offload`)
 
@@ -343,7 +343,7 @@ make lint         # formatting and clippy checks
 make release-all  # all four release targets (needs `cargo install --locked cross`)
 ```
 
-The BPF crates under `crates/modules/*/bpf/` each pin their own nightly toolchain and build with `bpf-linker`. Linux-only code is behind `cfg(target_os = "linux")`, so the workspace builds and tests on macOS against `ENOSYS` stubs. CI runs the BPF integration tests in QEMU on 5.15 and 6.6 kernels.
+The BPF crates under `crates/modules/*/bpf/` each pin their own nightly toolchain, which rustup installs, and they also need `bpf-linker`, which it doesn't: `cargo install --locked bpf-linker@0.10.3` (the version CI pins in `.github/workflows/ci.yml`). Without it the build still succeeds, but each BPF program is embedded as an empty stub, and the binary fails when it tries to attach. Linux-only code is behind `cfg(target_os = "linux")`, so the workspace builds and tests on macOS against `ENOSYS` stubs. CI runs the BPF integration tests in QEMU on 5.15 and 6.6 kernels.
 
 ## License
 
