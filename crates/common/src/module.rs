@@ -273,6 +273,16 @@ pub trait Module: Send + Sync {
     /// bpffs pins already preserve their attachment. vpp-offload uses it
     /// to leave its route ledger for the next daemon's adoption.
     fn exit_preserving(&mut self) {}
+    /// The circuit breaker tripped and [`Self::detach`] follows
+    /// immediately. Called by the loader on that path only, so a module
+    /// can tell a breaker teardown from every other detach, which a
+    /// `detach` call alone cannot say.
+    ///
+    /// Additive, with a default that does nothing, like
+    /// [`Self::exit_preserving`]. fast-path uses it to leave its
+    /// `wan-egress` policy rules in place: they serve kernel forwarding,
+    /// which the breaker hands traffic back to.
+    fn breaker_tripping(&mut self) {}
 
     fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()>;
 

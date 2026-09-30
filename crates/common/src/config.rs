@@ -507,6 +507,24 @@ pub enum ModuleDirective {
         nexthop: Ipv4Addr,
         line: usize,
     },
+    /// `wan-egress from <cidr> [from <cidr> ...] [keep <cidr> ...]`:
+    /// traffic from `sources` skips the `main` routing table (where a
+    /// full BGP table lives) and continues with the policy rules that
+    /// follow it, i.e. the platform's own WAN selection and NAT. Only
+    /// destinations in the keep set still use `main`.
+    ///
+    /// `keep` holds the operator's explicit entries only; the default
+    /// keep set (RFC 1918, RFC 6598, link-local, and every IPv4
+    /// `allow-prefix` / `local-prefix`) is added by the fast-path
+    /// module, which is also where the policy rules are installed and
+    /// reconciled. IPv4 only: there is no NAT66 for the IPv6 half to
+    /// fall back to. At most one per section (the parser refuses a
+    /// second line). SIGHUP-reconcilable.
+    WanEgress {
+        sources: Vec<Ipv4Prefix>,
+        keep: Vec<Ipv4Prefix>,
+        line: usize,
+    },
     /// XDP-time prefix block (v0.2.1). When dst (or src for symmetry)
     /// falls in `block-prefix <cidr>` AND the packet is otherwise
     /// allowlist-matched, the program returns `XDP_DROP` rather than
@@ -3105,6 +3123,47 @@ pub fn uncovered_local_prefix_warnings(directives: &[ModuleDirective]) -> Vec<St
     out
 }
 
+/// One warning per `wan-egress from` prefix that overlaps an
+/// `allow-prefix`.
+///
+/// The allowlist matches on source as well as destination, so a flow
+/// from an allowlisted source is forwarded by the XDP fast path (and by
+/// VPP when steered) and never reaches kernel routing, the policy rules
+/// wan-egress installs, or the platform's NAT. The directive cannot
+/// affect those flows. Advisory, like
+/// [`uncovered_local_prefix_warnings`]: the overlap may be deliberate
+/// (only part of the source range is allowlisted). Callers log each
+/// returned string at WARN.
+pub fn wan_egress_allow_overlap_warnings(directives: &[ModuleDirective]) -> Vec<String> {
+    let allow: Vec<Ipv4Prefix> = directives
+        .iter()
+        .filter_map(|d| match d {
+            ModuleDirective::AllowPrefix4(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for d in directives {
+        let ModuleDirective::WanEgress { sources, line, .. } = d else {
+            continue;
+        };
+        for s in sources {
+            for a in &allow {
+                if a.contains_prefix(s) || s.contains_prefix(a) {
+                    out.push(format!(
+                        "wan-egress from {}/{} (line {line}) overlaps allow-prefix {}/{}; \
+                         flows from allowlisted sources are forwarded by the fast path (and \
+                         VPP when steered) and never reach kernel routing or NAT, so \
+                         wan-egress cannot affect them",
+                        s.addr, s.prefix_len, a.addr, a.prefix_len
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
 enum Cursor {
     None,
     Global,
@@ -3214,6 +3273,24 @@ fn parse(input: &str) -> Result<Config, ConfigError> {
                                 format!(
                                     "duplicate `coalesce` (first on line {prev}); put every \
                                      parameter on one line"
+                                ),
+                            ));
+                        }
+                    }
+                    // One rule set per section: a second line would
+                    // raise the question of whether its keep list
+                    // applies to the first line's sources, and the
+                    // answer should not live in a code comment.
+                    if matches!(d, ModuleDirective::WanEgress { .. }) {
+                        if let Some(prev) = modules[i].directives.iter().find_map(|e| match e {
+                            ModuleDirective::WanEgress { line, .. } => Some(*line),
+                            _ => None,
+                        }) {
+                            return Err(ConfigError::parse(
+                                line,
+                                format!(
+                                    "duplicate `wan-egress` (first on line {prev}); put every \
+                                     `from` and `keep` on one line"
                                 ),
                             ));
                         }
@@ -3441,6 +3518,77 @@ fn parse_global_directive(line: usize, s: &str, g: &mut GlobalConfig) -> Result<
         }
     }
     Ok(())
+}
+
+/// `wan-egress from <cidr> [from <cidr> ...] [keep <cidr> ...]`.
+///
+/// Keyword/value pairs, so a line reads the way an operator would say
+/// it. Both lists are IPv4-only: the rules are `ip rule` entries whose
+/// whole purpose is to reach the platform's IPv4 NAT, and there is no
+/// NAT66 for an IPv6 source to reach. A `/0` is refused on either side:
+/// `from 0.0.0.0/0` would pull every source, the router's own BGP
+/// sessions included, off the full table; `keep 0.0.0.0/0` would keep
+/// every destination in `main`, a directive that does nothing.
+fn parse_wan_egress<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    const FORM: &str = "form: `wan-egress from <cidr> [from <cidr> ...] [keep <cidr> ...]`";
+    let mut sources = Vec::new();
+    let mut keep = Vec::new();
+    while let Some(kw) = rest.next() {
+        let list = match kw {
+            "from" => &mut sources,
+            "keep" => &mut keep,
+            other => {
+                return Err(ConfigError::parse(
+                    line,
+                    format!("wan-egress: expected `from` or `keep`, got `{other}` ({FORM})"),
+                ));
+            }
+        };
+        let tok = rest.next().ok_or_else(|| {
+            ConfigError::parse(line, format!("wan-egress: `{kw}` requires an IPv4 CIDR"))
+        })?;
+        let p: Ipv4Prefix = tok.parse().map_err(|e: String| {
+            if tok.parse::<Ipv6Prefix>().is_ok() {
+                ConfigError::parse(
+                    line,
+                    format!(
+                        "wan-egress: `{kw} {tok}` is IPv6; wan-egress is IPv4 only (it hands \
+                         traffic to the platform's IPv4 NAT, and there is no NAT66 to hand \
+                         IPv6 to)"
+                    ),
+                )
+            } else {
+                ConfigError::parse(line, format!("wan-egress: `{kw} {tok}`: {e}"))
+            }
+        })?;
+        if p.prefix_len == 0 {
+            let why = if kw == "from" {
+                "would take every source, the router's own sessions included, off the \
+                 main table"
+            } else {
+                "would keep every destination in main, which makes the directive a no-op"
+            };
+            return Err(ConfigError::parse(
+                line,
+                format!("wan-egress: `{kw} {tok}` {why}"),
+            ));
+        }
+        list.push(p);
+    }
+    if sources.is_empty() {
+        return Err(ConfigError::parse(
+            line,
+            format!("wan-egress requires at least one `from <cidr>` ({FORM})"),
+        ));
+    }
+    Ok(ModuleDirective::WanEgress {
+        sources,
+        keep,
+        line,
+    })
 }
 
 fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, ConfigError> {
@@ -3675,6 +3823,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 line,
             })
         }
+        "wan-egress" => parse_wan_egress(line, rest),
         "block-prefix" => {
             // Grammar: block-prefix <cidr>
             let cidr = rest
@@ -8678,6 +8827,103 @@ module fast-path
              local-prefix 192.0.2.0/24 via br1337\n",
         );
         assert!(w.is_empty(), "narrower allow overlaps, no warn: {w:?}");
+    }
+
+    // --- wan-egress ---
+
+    fn wan_egress_of(body: &str) -> (Vec<Ipv4Prefix>, Vec<Ipv4Prefix>) {
+        let m = parse_module_body(body).expect("parse");
+        m.directives
+            .iter()
+            .find_map(|d| match d {
+                ModuleDirective::WanEgress { sources, keep, .. } => {
+                    Some((sources.clone(), keep.clone()))
+                }
+                _ => None,
+            })
+            .expect("a wan-egress directive")
+    }
+
+    fn wan_egress_err(body: &str) -> String {
+        match parse_module_body(body).unwrap_err() {
+            ConfigError::Parse { message, .. } => message,
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    fn p4(s: &str) -> Ipv4Prefix {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn wan_egress_parses_sources_and_keep() {
+        let (sources, keep) =
+            wan_egress_of("  wan-egress from 198.18.0.0/24 from 198.18.1.0/24 keep 192.0.2.0/24\n");
+        assert_eq!(sources, vec![p4("198.18.0.0/24"), p4("198.18.1.0/24")]);
+        assert_eq!(keep, vec![p4("192.0.2.0/24")]);
+    }
+
+    #[test]
+    fn wan_egress_keep_is_optional() {
+        let (sources, keep) = wan_egress_of("  wan-egress from 198.18.0.0/15\n");
+        assert_eq!(sources, vec![p4("198.18.0.0/15")]);
+        assert!(
+            keep.is_empty(),
+            "explicit keep only; defaults are fast-path's"
+        );
+    }
+
+    #[test]
+    fn wan_egress_refusals() {
+        for (body, needle) in [
+            ("  wan-egress\n", "at least one `from"),
+            ("  wan-egress keep 192.0.2.0/24\n", "at least one `from"),
+            ("  wan-egress from\n", "requires an IPv4 CIDR"),
+            (
+                "  wan-egress from 198.18.0.0/24 keep\n",
+                "requires an IPv4 CIDR",
+            ),
+            (
+                "  wan-egress to 198.18.0.0/24\n",
+                "expected `from` or `keep`",
+            ),
+            ("  wan-egress from 2001:db8::/32\n", "IPv4 only"),
+            (
+                "  wan-egress from 198.18.0.0/24 keep 2001:db8::/32\n",
+                "IPv4 only",
+            ),
+            ("  wan-egress from 198.18.0.0\n", "expected CIDR"),
+            ("  wan-egress from 0.0.0.0/0\n", "every source"),
+            ("  wan-egress from 198.18.0.0/24 keep 0.0.0.0/0\n", "no-op"),
+        ] {
+            let msg = wan_egress_err(body);
+            assert!(msg.contains(needle), "{body:?}: got {msg}");
+        }
+    }
+
+    #[test]
+    fn wan_egress_second_line_is_refused() {
+        let msg =
+            wan_egress_err("  wan-egress from 198.18.0.0/24\n  wan-egress from 198.18.1.0/24\n");
+        assert!(msg.contains("duplicate `wan-egress`"), "{msg}");
+    }
+
+    #[test]
+    fn wan_egress_warns_on_allow_prefix_overlap_only() {
+        let m = parse_module_body(
+            "  allow-prefix 198.18.0.0/16\n  allow-prefix 203.0.113.0/24\n  \
+             wan-egress from 198.18.5.0/24 from 192.0.2.0/24\n",
+        )
+        .unwrap();
+        let w = wan_egress_allow_overlap_warnings(&m.directives);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("198.18.5.0/24") && w[0].contains("198.18.0.0/16"));
+        assert!(w[0].contains("never reach kernel routing"));
+
+        let clean =
+            parse_module_body("  allow-prefix 203.0.113.0/24\n  wan-egress from 198.18.0.0/24\n")
+                .unwrap();
+        assert!(wan_egress_allow_overlap_warnings(&clean.directives).is_empty());
     }
 
     // --- v0.2.1 fallback-default + block-prefix ---

@@ -866,6 +866,10 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 .emit();
             let mut failed: Vec<String> = Vec::new();
             for (name, module) in modules.iter_mut() {
+                // Tell each module why before it detaches: fast-path keeps
+                // its wan-egress rules on a trip (they serve the kernel
+                // path the breaker is handing traffic back to).
+                module.breaker_tripping();
                 if let Err(e) = module.detach() {
                     tracing::error!(module = %name, error = %e, "detach failed");
                     failed.push(format!("{name}: {e}"));
@@ -1943,7 +1947,12 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     // down — the historical recovery semantics.
     #[cfg(feature = "fast-path")]
     if all || config_has_fast_path {
-        if let Err(e) = detach_fast_path(&bpffs_root, &state_dir, settle_time) {
+        if let Err(e) = detach_fast_path(
+            &bpffs_root,
+            &state_dir,
+            settle_time,
+            fast_path_teardown(keep_vpp),
+        ) {
             errors.push(e);
         }
     } else {
@@ -2256,6 +2265,28 @@ fn detach_guard(_bpffs_root: &Path, _state_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// How a `packetframe detach` tears the fast-path down, as far as the
+/// wan-egress rules care: `--keep-vpp` is the routine restart and
+/// leaves them for the next daemon; every other detach is a full
+/// teardown and removes them.
+#[cfg(feature = "fast-path")]
+fn fast_path_teardown(keep_vpp: bool) -> packetframe_fast_path::wan_egress::Teardown {
+    if keep_vpp {
+        packetframe_fast_path::wan_egress::Teardown::KeepVppRestart
+    } else {
+        packetframe_fast_path::wan_egress::Teardown::Full
+    }
+}
+
+#[cfg(all(test, feature = "fast-path"))]
+mod fast_path_teardown_tests {
+    #[test]
+    fn only_keep_vpp_leaves_the_wan_egress_rules() {
+        assert!(super::fast_path_teardown(false).removes_wan_egress_rules());
+        assert!(!super::fast_path_teardown(true).removes_wan_egress_rules());
+    }
+}
+
 /// The fast-path half of `detach`, unchanged except for being callable.
 ///
 /// Split out so its `?`s abort only its own teardown: as one inline block its
@@ -2266,6 +2297,7 @@ fn detach_fast_path(
     bpffs_root: &Path,
     state_dir: &Path,
     settle_time: std::time::Duration,
+    teardown: packetframe_fast_path::wan_egress::Teardown,
 ) -> Result<(), String> {
     let result = detach_fast_path_attachments(bpffs_root, state_dir, settle_time);
     // `coalesce` directive: NIC settings the daemon changed, written
@@ -2286,6 +2318,38 @@ fn detach_fast_path(
             );
         }
     }
+    // `wan-egress` policy rules, found by their protocol tag in a fresh
+    // dump: no state file is needed, and nothing without the tag can be
+    // touched. Whatever the pin teardown's outcome, like the coalescing
+    // restore, and a failure here joins the result rather than
+    // replacing it. Only a full detach removes them: `--keep-vpp` is
+    // the routine restart, and the next daemon adopts them.
+    #[cfg(target_os = "linux")]
+    if !teardown.removes_wan_egress_rules() {
+        tracing::info!(
+            ?teardown,
+            "wan-egress policy rules left in place for the next start to adopt"
+        );
+        return result;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = teardown;
+    #[cfg(target_os = "linux")]
+    let result = match packetframe_fast_path::wan_egress::remove_all_owned_blocking() {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!(count = n, "wan-egress policy rules removed");
+            }
+            result
+        }
+        Err(e) => {
+            let e = format!("wan-egress rule removal: {e}");
+            Err(match result {
+                Ok(()) => e,
+                Err(prev) => format!("{prev}; AND {e}"),
+            })
+        }
+    };
     result
 }
 

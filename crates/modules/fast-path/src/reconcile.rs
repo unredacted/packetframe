@@ -203,6 +203,10 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     if let Some(w) = &state.redirect_watch {
         w.set_directives(cfg.section.directives.to_vec());
     }
+    // Last: the one step here that writes kernel policy rather than
+    // maps, so a failure in it cannot keep the map updates above (or
+    // the watcher's hand-over) from landing.
+    reconcile_wan_egress(state, cfg)?;
 
     info!(
         v4_added = v4.added,
@@ -227,6 +231,73 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
         rx_macs_removed = rx_macs.removed,
         "SIGHUP reconcile applied"
     );
+    Ok(())
+}
+
+/// Hot-apply `wan-egress`: start, re-spec or stop the reconciler.
+///
+/// The spec includes the keep set, which follows `allow-prefix` and
+/// `local-prefix`, so a reload that edits only those still reaches the
+/// rules. A changed spec is reconciled before this returns; its outcome
+/// (including a refusal such as no `lookup main`) is on the
+/// `wan-egress` status row, and the periodic pass keeps retrying, so a
+/// netlink failure is a degraded row rather than a failed reload. The
+/// one failure reported here is a removal that did not complete after
+/// the directive was dropped: the reload would otherwise read as done
+/// with rules the config no longer declares still steering traffic.
+fn reconcile_wan_egress(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
+    let wanted = crate::wan_egress::spec_from_directives(&cfg.section.directives);
+    if wanted.is_some() {
+        for w in
+            packetframe_common::config::wan_egress_allow_overlap_warnings(&cfg.section.directives)
+        {
+            warn!("{w}");
+        }
+    }
+    let io_err =
+        |e: std::io::Error| ModuleError::other(MODULE_NAME, format!("wan-egress reconcile: {e}"));
+    match (state.wan_egress.as_ref(), wanted) {
+        (Some(running), Some(spec)) => {
+            if running.spec().as_ref() != Some(&spec) {
+                info!(
+                    sources = spec.sources.len(),
+                    keep = spec.keep.len(),
+                    "wan-egress spec changed; reconciling"
+                );
+                running.set_spec(spec).map_err(io_err)?;
+            }
+        }
+        (None, Some(spec)) => {
+            info!(
+                sources = spec.sources.len(),
+                keep = spec.keep.len(),
+                "wan-egress enabled by reload"
+            );
+            state.wan_egress = Some(crate::wan_egress::WanEgress::start(spec).map_err(io_err)?);
+        }
+        // Retire before dropping: if the removal does not finish, the
+        // reconciler stays, keeps the status row saying so, and retries
+        // every pass and on the next reload. Dropping it first (the
+        // original shape) lost all three on a single transient failure,
+        // and every later reload read `(None, None)` and said nothing
+        // (review finding).
+        (Some(running), None) => {
+            let n = running.retire().map_err(|e| {
+                ModuleError::other(
+                    MODULE_NAME,
+                    format!(
+                        "wan-egress removed from the config, but its rules could not all be \
+                         removed: {e}; retrying every pass (see the `wan-egress` status row)"
+                    ),
+                )
+            })?;
+            info!(removed = n, "wan-egress disabled by reload; rules removed");
+            if let Some(running) = state.wan_egress.take() {
+                running.stop();
+            }
+        }
+        (None, None) => {}
+    }
     Ok(())
 }
 

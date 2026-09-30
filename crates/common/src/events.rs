@@ -132,6 +132,11 @@ pub mod kind {
     pub const HANDBACK_READY: &str = "handback_ready";
     pub const HANDBACK_HELD_BACK: &str = "handback_held_back";
 
+    // --- fast-path ---
+    /// `wan-egress` put back policy rules that had disappeared from the
+    /// kernel under an unchanged config. Rate-limited at the source.
+    pub const WAN_EGRESS_REPAIRED: &str = "wan_egress_repaired";
+
     // --- the event log itself (module `event-log`) ---
     pub const EVENTS_DROPPED: &str = "events_dropped";
     pub const EVENT_LOG_RECOVERED: &str = "event_log_recovered";

@@ -38,6 +38,7 @@ These directives can be added, removed, or changed under SIGHUP without re-attac
 | `dry-run on/off` | `CFG.dry_run` | Single-byte write |
 | `forwarding-mode {kernel-fib\|packetframe-fib\|compare}` | `CFG.flags` bits 3-4 | Atomic |
 | `mss-clamp …` (all four grammars) | `MSS_CLAMP_V4/V6` + `MSS_CLAMP_BY_IFACE` + `CFG.mss_clamp_global` | v0.2.4+; value changes also pick up |
+| `wan-egress …` | (none — kernel policy rules, `proto 199`) | Added, changed or removed; the keep set also follows `allow-prefix` and `local-prefix` edits. Reconciled before the reload returns; the outcome is on the `wan-egress` status row (see [packetframe-fib.md](packetframe-fib.md#wan-egress)) |
 | (auto) VLAN-subif resolution | `VLAN_RESOLVE` | Re-scanned from `/proc/net/vlan/config` |
 | (auto) Redirect devmap | `REDIRECT_DEVMAP` | Re-scanned from `/sys/class/net` |
 | `log-level` | (none — userspace tracing filter) | v0.5.0+; applied before the module loop, so the reconcile it is on logs at the new level. **No effect while `RUST_LOG` is set** — see below |
