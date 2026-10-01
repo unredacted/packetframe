@@ -58,6 +58,7 @@ use tracing::{debug, info, warn};
 
 use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, RouteEvent};
 
+use crate::fib::local_nexthops::{awaiting_summary, kernel_local_addrs, LocalNexthops};
 use crate::fib::netlink_neigh::NeighborResolveHandle;
 use crate::fib::types::{
     EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, ECMP_NH_UNUSED, FIB_KIND_ECMP, MAX_ECMP_PATHS,
@@ -133,6 +134,8 @@ const REPROBE_BATCH: usize = 256;
 /// How often the pending re-probe set is summarised at info while it
 /// is non-empty. One line a minute at most, so a chronic loss is
 /// visible in the journal without a flapping neighbour flooding it.
+/// Also how often the router's own addresses are re-read for the
+/// `local` classification ([`super::local_nexthops`]).
 const REPROBE_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// `NexthopId` is an index into the `NEXTHOPS` BPF array. Stable
@@ -741,6 +744,10 @@ pub struct FibProgrammer {
     reprobe_losses: u64,
     reprobe_recoveries: u64,
     reprobe_last_stats: Instant,
+    /// Registered nexthops that are the router's own addresses, which
+    /// the kernel never resolves and nothing re-probes
+    /// ([`super::local_nexthops`]). Re-read with every re-probe summary.
+    local: LocalNexthops,
 }
 
 /// One pending re-probe. `attempts` drives the backoff.
@@ -889,6 +896,7 @@ impl FibProgrammer {
                 reprobe_losses: 0,
                 reprobe_recoveries: 0,
                 reprobe_last_stats: Instant::now(),
+                local: LocalNexthops::new(kernel_local_addrs()),
             },
             FibProgrammerHandle { tx: cmd_tx },
         )
@@ -1252,6 +1260,22 @@ impl FibProgrammer {
         self.by_id.insert(id, ip);
         debug!(?ip, id, "NexthopId allocated");
 
+        // The router's own address: the kernel delivers what routes
+        // through it and will never resolve a neighbour for it, so there
+        // is nothing to ask the resolver and nothing to re-probe. The
+        // slot stays seeded Incomplete — XDP PASSes the traffic to the
+        // kernel either way — and only the reporting changes.
+        if self.local.register(ip) {
+            info!(
+                ?ip,
+                nh_id = id,
+                "nexthop is the router's own address (local): routes through it are \
+                 delivered by the kernel (fib_no_neigh) by design, and it is not awaiting \
+                 resolution"
+            );
+            return Ok(id);
+        }
+
         // Phase 3.9 fix: kick the NeighborResolver so this nexthop
         // gets resolved promptly. The resolver consults its kernel-
         // ARP cache (seeded at startup); on hit it synthesizes a
@@ -1281,6 +1305,11 @@ impl FibProgrammer {
     /// each transition, or a dead one would be probed as fast as the
     /// kernel can report failures.
     fn arm_reprobe(&mut self, ip: IpAddr) {
+        // Never for the router's own address: nothing will answer, and
+        // the summary would count it as chronic forever.
+        if self.local.is_local(&ip) {
+            return;
+        }
         self.reprobe.entry(ip).or_insert(Reprobe {
             due: Instant::now() + REPROBE_INITIAL,
             attempts: 0,
@@ -1335,20 +1364,73 @@ impl FibProgrammer {
                 );
             }
         }
-        if !self.reprobe.is_empty()
-            && now.duration_since(self.reprobe_last_stats) >= REPROBE_STATS_INTERVAL
-        {
+        // Once a minute: re-read which nexthops are the router's own, then
+        // summarise the ones genuinely awaiting resolution. Local ones are
+        // not among them — the line used to fire every minute forever on
+        // a healthy box, counting the router's own addresses as chronic.
+        if now.duration_since(self.reprobe_last_stats) >= REPROBE_STATS_INTERVAL {
             self.reprobe_last_stats = now;
-            let chronic = self.reprobe.values().filter(|r| r.attempts >= 6).count();
-            info!(
-                pending = self.reprobe.len(),
-                chronic_over_1min = chronic,
-                losses_total = self.reprobe_losses,
-                recoveries_total = self.reprobe_recoveries,
-                "nexthops awaiting resolution; their traffic is taking the kernel path \
-                 (fib_no_neigh). `packetframe fib dump-v4 --unresolved` lists the routes"
+            self.refresh_local();
+            let (pending, chronic) = awaiting_summary(
+                self.reprobe.iter().map(|(ip, r)| (ip, r.attempts)),
+                &self.local,
+                6,
             );
+            if pending > 0 {
+                info!(
+                    pending,
+                    chronic_over_1min = chronic,
+                    local = self.local.len(),
+                    losses_total = self.reprobe_losses,
+                    recoveries_total = self.reprobe_recoveries,
+                    "nexthops awaiting resolution; their traffic is taking the kernel path \
+                     (fib_no_neigh). `packetframe fib dump-v4 --unresolved` lists the routes"
+                );
+            }
         }
+    }
+
+    /// Re-read the router's addresses and move nexthops in or out of
+    /// `local` ([`LocalNexthops::set_addrs`]): an address added after its
+    /// nexthop registered stops being re-probed, and one taken off the box
+    /// is handed to the resolver like any other nexthop. Named in the
+    /// journal when the set changes, never otherwise.
+    fn refresh_local(&mut self) {
+        // A box always holds at least its loopback address, so an empty
+        // read is a failed one, and acting on it would hand every local
+        // nexthop back to the resolver for a minute. Keep the last read.
+        let addrs = kernel_local_addrs();
+        if addrs.is_empty() {
+            return;
+        }
+        let change = self.local.set_addrs(addrs, self.by_ip.keys().copied());
+        if change.is_empty() {
+            return;
+        }
+        for ip in &change.became_local {
+            self.reprobe.remove(ip);
+        }
+        for ip in &change.stopped_local {
+            if let Some(h) = &self.neigh_handle {
+                h.request_resolve(*ip);
+            }
+            self.arm_reprobe(*ip);
+        }
+        let named: Vec<String> = self
+            .local
+            .local()
+            .map(|ip| match self.by_ip.get(ip) {
+                Some(rec) => format!("{ip} (nh_id={})", rec.id),
+                None => ip.to_string(),
+            })
+            .collect();
+        info!(
+            local = ?named,
+            became_local = ?change.became_local,
+            stopped_local = ?change.stopped_local,
+            "nexthops that are the router's own addresses changed; local ones are delivered \
+             by the kernel and are not awaiting resolution"
+        );
     }
 
     fn unregister(&mut self, ip: IpAddr) -> Result<(), ProgrammerError> {
@@ -1367,6 +1449,7 @@ impl FibProgrammer {
         self.free_ids.push(id);
         // Nothing routes through it any more, so nothing to recover.
         self.reprobe.remove(&ip);
+        self.local.unregister(&ip);
 
         // The second tier's LAST chance to hear about this address.
         //

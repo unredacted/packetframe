@@ -24,6 +24,11 @@ pub mod integrity_status;
 /// inside the module.
 pub mod frr;
 
+/// Ungated for the same reason: which nexthops are the router's own
+/// addresses is pure classification, and only the address read inside
+/// it is Linux's.
+pub mod local_nexthops;
+
 #[cfg(target_os = "linux")]
 pub mod anyip;
 #[cfg(target_os = "linux")]

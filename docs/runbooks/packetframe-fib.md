@@ -1376,6 +1376,40 @@ Check:
   interface (probes are deliberately suppressed there; the snooper
   seeds them), and whether the peer answers ARP/ND at all.
 
+#### `local` nexthops: the router's own addresses
+
+A routing daemon sends what it originates (`redistribute connected`,
+`redistribute static`) with its own session address as the next hop,
+and the BGP listener falls back to its listen address when bird sends
+none. The kernel never resolves a neighbour for its own address, so such
+a slot stays `incomplete` for as long as a route uses it, and XDP passes
+its traffic to the kernel (`fib_no_neigh`). That is correct: the kernel
+delivers those prefixes, or routes them on.
+
+The programmer labels these nexthops **`local`**. They are never
+re-probed and never counted in the `awaiting resolution` summary, so a
+healthy box no longer logs `pending=2 chronic_over_1min=2` every minute
+for its own addresses. Each is named once in the journal when it is
+registered (`nexthop is the router's own address (local)`, with its
+`nh_id`), and the set is named again whenever a re-read of the router's
+addresses (once a minute) moves a nexthop in or out of it. The summary
+line carries `local=N` for context.
+
+Nothing in the datapath changes: the slot stays seeded `incomplete`, the
+map layout and the stats counters are untouched, and traffic is passed
+to the kernel exactly as before. The pinned maps carry no addresses, so
+`packetframe status` still counts these slots under
+`nexthops (incomplete)`, and `fib dump-v4 --unresolved` still lists
+their routes as `state=incomplete ifindex=0`. To tell them apart, match
+the dump's `nh_id` against the journal's `local` lines:
+
+```sh
+journalctl -u packetframe | grep "router's own address (local)"
+```
+
+vpp-offload counts the same routes as kernel-delivered, not unresolvable
+(see the vpp-offload runbook, "Kernel-delivered routes").
+
 ### Symptom: `pass_not_in_devmap` climbs
 
 What it means: the FIB resolved an egress interface that is not in
