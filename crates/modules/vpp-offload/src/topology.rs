@@ -281,6 +281,35 @@ pub trait Topology {
     fn mtu(&self, _dev: &str) -> Option<u32> {
         None
     }
+    /// The kernel FIB's entry for exactly `prefix` — one `RTM_GETROUTE`
+    /// with `RTM_F_FIB_MATCH` — for the engine's kernel-delivered
+    /// classification of routes the router originates with itself as
+    /// next hop. `Err` when there is no kernel to ask or it did not
+    /// answer, which the engine reads as "not proven" and leaves the
+    /// route unresolvable: this may only ever reclassify on evidence.
+    fn fib_match(&self, _prefix: packetframe_common::fib::IpPrefix) -> Result<FibMatch, String> {
+        Err("no kernel FIB to consult".into())
+    }
+}
+
+/// What the kernel's FIB holds for one prefix, reduced to what the
+/// kernel-delivered classification needs ([`Topology::fib_match`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FibMatch {
+    /// The longest match for the prefix's network address is a
+    /// different prefix (or nothing): the kernel has no route of its own
+    /// for exactly this one, so its word proves nothing about it.
+    NotExact,
+    /// `RTN_LOCAL`, `RTN_BROADCAST` or `RTN_ANYCAST`: the kernel delivers
+    /// it itself.
+    Local,
+    /// A forwarding entry, with each hop's output device (several for
+    /// ECMP). Empty when the kernel named none.
+    Unicast { oifs: Vec<String> },
+    /// Anything else — blackhole, unreachable, prohibit, throw. Not the
+    /// kernel delivering or carrying the traffic, so not evidence for
+    /// the classification either way.
+    Other,
 }
 
 /// No kernel to ask: every device is [`DevKind::Plain`] and the FDB is
@@ -471,6 +500,121 @@ impl Topology for KernelTopology {
 
     fn mtu(&self, dev: &str) -> Option<u32> {
         crate::attach::kernel_mtu(std::path::Path::new("/sys/class/net"), dev)
+    }
+
+    fn fib_match(&self, prefix: packetframe_common::fib::IpPrefix) -> Result<FibMatch, String> {
+        kernel_fib_match(prefix)
+    }
+}
+
+/// One `RTM_GETROUTE` for `prefix`'s network address with
+/// `RTM_F_FIB_MATCH` (Linux 4.13+), which answers with the FIB entry the
+/// lookup matched — its type, its prefix length and its output devices —
+/// rather than a synthesised host route. An output lookup, as for a
+/// packet the box itself sends, so policy rules apply as they do there.
+///
+/// Asked from the supervision loop, and only for routes whose every next
+/// hop is the router itself (the engine budgets how many per walk), so a
+/// single request/reply on a socket whose receive is bounded
+/// ([`crate::fdb::bound_recv`]) — never a dump.
+#[cfg(target_os = "linux")]
+pub fn kernel_fib_match(prefix: packetframe_common::fib::IpPrefix) -> Result<FibMatch, String> {
+    use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_REQUEST};
+    use netlink_packet_route::route::{
+        RouteAddress, RouteAttribute, RouteFlags, RouteMessage, RouteType,
+    };
+    use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+    use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
+    use packetframe_common::fib::IpPrefix;
+
+    let (family, dst, host_len, want) = match prefix {
+        IpPrefix::V4 { addr, prefix_len } => (
+            AddressFamily::Inet,
+            RouteAddress::Inet(std::net::Ipv4Addr::from(addr)),
+            32,
+            prefix_len,
+        ),
+        IpPrefix::V6 { addr, prefix_len } => (
+            AddressFamily::Inet6,
+            RouteAddress::Inet6(std::net::Ipv6Addr::from(addr)),
+            128,
+            prefix_len,
+        ),
+    };
+    let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
+    crate::fdb::bound_recv(&socket)?;
+    socket
+        .bind_auto()
+        .map_err(|e| format!("netlink bind: {e}"))?;
+    socket
+        .connect(&SocketAddr::new(0, 0))
+        .map_err(|e| format!("netlink connect: {e}"))?;
+
+    let mut route = RouteMessage::default();
+    route.header.address_family = family;
+    route.header.destination_prefix_length = host_len;
+    route.header.flags = RouteFlags::FibMatch;
+    route
+        .attributes
+        .push(RouteAttribute::Destination(dst.clone()));
+    let mut msg = NetlinkMessage::from(RouteNetlinkMessage::GetRoute(route));
+    msg.header.flags = NLM_F_REQUEST;
+    msg.header.sequence_number = 1;
+    msg.finalize();
+    let mut send_buf = vec![0u8; msg.header.length as usize];
+    msg.serialize(&mut send_buf);
+    socket
+        .send(&send_buf, 0)
+        .map_err(|e| format!("netlink send: {e}"))?;
+
+    let mut recv_buf = vec![0u8; 16 * 1024];
+    let n = socket
+        .recv(&mut &mut recv_buf[..], 0)
+        .map_err(|e| format!("netlink recv: {e}"))?;
+    let pkt = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&recv_buf[..n])
+        .map_err(|e| format!("netlink parse: {e}"))?;
+    match pkt.payload {
+        NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(m)) => {
+            let mut matched_dst: Option<&RouteAddress> = None;
+            let mut oifs: Vec<u32> = Vec::new();
+            for attr in &m.attributes {
+                match attr {
+                    RouteAttribute::Destination(a) => matched_dst = Some(a),
+                    RouteAttribute::Oif(i) => oifs.push(*i),
+                    RouteAttribute::MultiPath(hops) => {
+                        oifs.extend(hops.iter().map(|h| h.interface_index))
+                    }
+                    _ => {}
+                }
+            }
+            // No RTA_DST is the default route; only `/0` can match that.
+            let exact = m.header.destination_prefix_length == want
+                && match matched_dst {
+                    Some(a) => *a == dst,
+                    None => want == 0,
+                };
+            if !exact {
+                return Ok(FibMatch::NotExact);
+            }
+            Ok(match m.header.kind {
+                RouteType::Local | RouteType::Broadcast | RouteType::Anycast => FibMatch::Local,
+                RouteType::Unicast => FibMatch::Unicast {
+                    oifs: oifs.into_iter().map(crate::fdb::ifname).collect(),
+                },
+                _ => FibMatch::Other,
+            })
+        }
+        // No route at all: nothing of the kernel's own for this prefix.
+        NetlinkPayload::Error(e)
+            if matches!(
+                e.code.map(|c| -c.get()),
+                Some(libc::ENETUNREACH) | Some(libc::EHOSTUNREACH) | Some(libc::ESRCH)
+            ) =>
+        {
+            Ok(FibMatch::NotExact)
+        }
+        NetlinkPayload::Error(e) => Err(format!("netlink error: {e}")),
+        _ => Err("unexpected netlink reply to a route lookup".into()),
     }
 }
 

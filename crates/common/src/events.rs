@@ -131,6 +131,9 @@ pub mod kind {
     pub const VPP_TEARDOWN: &str = "vpp_teardown";
     pub const HANDBACK_READY: &str = "handback_ready";
     pub const HANDBACK_HELD_BACK: &str = "handback_held_back";
+    /// The set of named unresolvable routes changed (rate-limited at the
+    /// source); `detail` "none" once it empties.
+    pub const UNRESOLVABLE_ROUTES: &str = "unresolvable_routes";
 
     // --- fast-path ---
     /// `wan-egress` put back policy rules that had disappeared from the

@@ -761,6 +761,8 @@ impl Drainer {
                                 // was-installed case was handled above,
                                 // before classification.
                                 stats.unresolvable += 1;
+                                // So health can name it, not only count it.
+                                ledger.note_unresolvable(prefix, nexthops);
                             }
                         }
                         return Ok(Begun::Done);
@@ -846,6 +848,9 @@ impl Drainer {
             // incomplete.
             (PendingOp::Withdraw, 0) => {
                 ledger.classify_resolved(f.prefix, 0);
+                if let PendingOp::Upsert { nexthops } = &f.original {
+                    ledger.note_unresolvable(f.prefix, nexthops);
+                }
                 stats.withdrawn += 1;
                 stats.unresolvable += 1;
             }

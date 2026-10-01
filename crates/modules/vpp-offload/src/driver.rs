@@ -221,6 +221,16 @@ pub trait Observe {
     fn convergence_budget(&mut self) -> Duration {
         crate::supervisor::CONVERGENCE_BUDGET
     }
+
+    /// Re-run a verdict the table has outgrown, if it is due
+    /// ([`crate::verify::ReverifySchedule`]). Called only from a converged
+    /// state (`Ready`/`Steered`), on a tick whose drain proved the engine
+    /// idle, with VPP answering — the same proofs a steer retry needs, and
+    /// the reason no delta can land between a probe's sample and its
+    /// answer. Produces no event: the verdict it refreshes decides nothing.
+    /// The default does nothing, which is every harness that does not
+    /// exercise it.
+    fn poll_reverify(&mut self, _now: Instant) {}
 }
 
 /// A convergence step that lost the API, waiting to be resumed.
@@ -630,6 +640,7 @@ impl Driver {
             }
             events.extend(self.poll_emptied(now, obs));
             events.extend(self.poll_steer_retry(now, drain_proved_idle, obs));
+            self.poll_reverify(now, drain_proved_idle, obs);
         }
 
         let mut tick = self.apply(now, events, fx);
@@ -967,6 +978,28 @@ impl Driver {
         vec![Event::SteerUnblocked]
     }
 
+    /// Offer the runtime its chance to re-run a stale verdict
+    /// ([`Observe::poll_reverify`]) — only where nothing is converging and
+    /// this tick proved there is nothing to send and a VPP to ask.
+    ///
+    /// `Ready` and `Steered` only: every earlier state has its own verify
+    /// still to come, and a probe during `Verifying` would be a second
+    /// verify racing the first. The detector's last probe, not
+    /// `is_wedged`, for the reason `poll_steer_retry` gives.
+    fn poll_reverify(&mut self, now: Instant, drained_idle: bool, obs: &mut dyn Observe) {
+        if !drained_idle || !matches!(self.sup.state(), State::Ready | State::Steered) {
+            return;
+        }
+        if !self
+            .detector
+            .as_ref()
+            .is_some_and(|d| d.answered_last_probe())
+        {
+            return;
+        }
+        obs.poll_reverify(now);
+    }
+
     /// Apply events through the supervisor, execute what they ask for,
     /// and feed the results back until the system settles.
     fn apply(&mut self, now: Instant, events: Vec<Event>, fx: &mut dyn Effects) -> Tick {
@@ -1122,9 +1155,14 @@ mod tests {
         /// The table-scaled convergence budget to report. `None` = the
         /// trait default, the flat budget.
         budget: Option<Duration>,
+        /// Times the driver offered a verify re-run.
+        reverify_polls: usize,
     }
 
     impl Observe for World {
+        fn poll_reverify(&mut self, _now: Instant) {
+            self.reverify_polls += 1;
+        }
         fn last_drain_took(&self) -> Duration {
             self.drain_took
         }
@@ -2563,6 +2601,50 @@ mod tests {
             "the canary is the operator's lever: {:?}",
             fx.calls
         );
+    }
+
+    // ---- A stale verdict, re-run ----
+
+    /// The re-run is offered only where nothing converges — `Ready` or
+    /// `Steered` — on a tick whose drain proved the engine idle, with the
+    /// last ping answered. Never while syncing or verifying: every state
+    /// before `Ready` has its own verify still to come. And never as an
+    /// event: the supervisor's state is the same after as before.
+    #[test]
+    fn a_verify_re_run_is_offered_only_when_converged_idle_and_answering() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 3,
+            ..Default::default()
+        };
+        d.inject(t0, Event::StartRequested, &mut fx);
+        settle(&mut d, t0, &mut w, &mut fx);
+        assert_eq!(d.state(), State::Verifying);
+        d.tick(at(t0, 30), &mut w, &mut fx);
+        assert_eq!(w.reverify_polls, 0, "not while a verify is still to come");
+
+        d.inject(at(t0, 40), Event::VerifyIncomplete, &mut fx);
+        assert_eq!(d.state(), State::Ready);
+        let t = d.tick(at(t0, 50), &mut w, &mut fx);
+        assert_eq!(w.reverify_polls, 1, "converged, idle, answering");
+        assert!(t.events.is_empty(), "a re-run is no event: {:?}", t.events);
+        assert_eq!(d.state(), State::Ready);
+
+        // A drain with work left proves nothing.
+        w.batches = 3;
+        d.tick(at(t0, 60), &mut w, &mut fx);
+        assert_eq!(w.reverify_polls, 1);
+        w.batches = 0;
+
+        // A ping that went unanswered withholds it too.
+        w.ping_fails = true;
+        d.tick(at(t0, 5_000), &mut w, &mut fx);
+        let polled = w.reverify_polls;
+        d.tick(at(t0, 5_010), &mut w, &mut fx);
+        assert_eq!(w.reverify_polls, polled, "no answer, no probe");
     }
 
     // ---- The refused steer, retried ----

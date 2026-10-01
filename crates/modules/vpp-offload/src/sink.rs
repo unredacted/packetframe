@@ -655,6 +655,58 @@ impl NexthopMap {
     pub fn resolve_all(&self, nexthops: &[IpAddr]) -> Vec<NexthopTarget> {
         nexthops.iter().filter_map(|nh| self.resolve(nh)).collect()
     }
+
+    /// The egress device the neighbour source reported for `nexthop`,
+    /// if any.
+    pub fn device_of(&self, nexthop: &IpAddr) -> Option<&str> {
+        self.device_of.get(nexthop).map(String::as_str)
+    }
+
+    /// Why `nexthop` does not resolve, in the operator's terms — the
+    /// reason half of an unresolvable route's name, printed after the
+    /// nexthop and its [`Self::device_of`]. Walks the same policy as
+    /// [`Self::target`], arm for arm, so the words cannot describe a
+    /// different decision from the one that was made. A nexthop that DOES
+    /// resolve now (its neighbour arrived after the route was classified)
+    /// says so: naming it by a reason that no longer holds would send an
+    /// operator after a fault that has cleared.
+    pub fn why_unresolved(&self, nexthop: &IpAddr) -> String {
+        const NOW: &str = "reachable now; the route is re-programmed with its neighbour";
+        let Some(dev) = self.device_of.get(nexthop) else {
+            return "no neighbour: the kernel has not resolved it".into();
+        };
+        match self.kind_of(dev) {
+            None => "a bridge shape VPP cannot reach through".into(),
+            Some(DevKind::Plain) if self.is_member(dev) => NOW.into(),
+            Some(DevKind::Plain) => "not a VPP port".into(),
+            Some(DevKind::PortVlan { port, vid }) => {
+                if !self.is_member(port) {
+                    format!("VLAN {vid} on {port}, which is not a VPP port")
+                } else if !self.port_vlans.get(port).is_some_and(|v| v.contains(vid)) {
+                    format!("VLAN {vid} is not declared on port {port} (`port … vlans`)")
+                } else {
+                    NOW.into()
+                }
+            }
+            Some(DevKind::BridgeVlan { bridge, vid }) => {
+                if self.bvis.get(vid) == Some(bridge) {
+                    return NOW.into();
+                }
+                match self.placement(nexthop) {
+                    None => "bridge neighbour not placed behind a VPP port yet \
+                             (`bridge fdb show`)"
+                        .into(),
+                    Some(port) if !self.is_member(port) => {
+                        format!("bridge neighbour behind {port}, which is not a VPP port")
+                    }
+                    Some(port) if !self.is_untagged(port, *vid) => format!(
+                        "bridge neighbour behind {port} on tagged VLAN {vid}, which has no BVI"
+                    ),
+                    Some(_) => NOW.into(),
+                }
+            }
+        }
+    }
 }
 
 /// The pending map: what the sink still owes VPP.
@@ -988,7 +1040,28 @@ pub struct RouteLedger {
     /// the IPv4 link gate can ask which next hops IPv4 routes actually
     /// use ([`Self::v4_nexthops`]) without walking a million routes.
     v4_via_refs: std::collections::HashMap<PathSetId, u64>,
+    /// The next hops each `Unresolvable` prefix was classified through,
+    /// per family (`[v4, v6]`), so health can NAME what the count
+    /// counts ([`Self::unresolvable_detail`]). The slot itself keeps
+    /// only a path-set id, and an unresolvable route has no paths, so
+    /// without this the count had no way back to a prefix: an operator
+    /// saw `unresolvable=1` and went spelunking through `vppctl` and
+    /// the fast-path dump to guess which.
+    ///
+    /// Bounded at [`UNRESOLVABLE_DETAIL_CAP`] per family, because the
+    /// single-member bisection configs hold the whole table
+    /// unresolvable by design and a second copy of a million routes'
+    /// next hops would buy nothing a handful of names does not. Past
+    /// the cap the count stays exact and the names are a subset.
+    /// Entries leave the moment their prefix leaves `Unresolvable`
+    /// ([`Self::set_slot`], [`Self::clear_state`]), so a name is never
+    /// older than the state it explains.
+    unresolvable_nh: [BTreeMap<PrefixKey, Vec<IpAddr>>; 2],
 }
+
+/// How many unresolvable prefixes per family the ledger remembers the
+/// next hops of. See [`RouteLedger::unresolvable_nh`].
+pub const UNRESOLVABLE_DETAIL_CAP: usize = 4096;
 
 impl RouteLedger {
     pub fn new(capacity: Capacity) -> Self {
@@ -999,6 +1072,48 @@ impl RouteLedger {
             capacity,
             paths: PathSets::default(),
             v4_via_refs: std::collections::HashMap::new(),
+            unresolvable_nh: [BTreeMap::new(), BTreeMap::new()],
+        }
+    }
+
+    /// Remember the next hops an `Unresolvable` prefix was classified
+    /// through, for [`Self::unresolvable_detail`]. A no-op unless the
+    /// prefix IS unresolvable right now — the caller names what it just
+    /// classified, and a stale call cannot resurrect a name. Updates an
+    /// entry already held; adds one only under the per-family cap.
+    pub fn note_unresolvable(&mut self, prefix: IpPrefix, nexthops: &[IpAddr]) {
+        let key = PrefixKey::from(prefix);
+        if self.state.get(&key).map(|s| s.state)
+            != Some(RouteState::NotInstalled(NotInstalled::Unresolvable))
+        {
+            return;
+        }
+        let held = &mut self.unresolvable_nh[usize::from(key.family == 6)];
+        if let Some(nhs) = held.get_mut(&key) {
+            *nhs = nexthops.to_vec();
+        } else if held.len() < UNRESOLVABLE_DETAIL_CAP {
+            held.insert(key, nexthops.to_vec());
+        }
+    }
+
+    /// Up to `n` unresolvable prefixes of one family (`v6`, or v4), in
+    /// key order, each with the next hops it was classified through.
+    /// Fewer than the family's count when the cap overflowed or a
+    /// prefix was classified without its next hops being noted; the
+    /// caller reports the difference as "+K more" from the exact count.
+    pub fn unresolvable_detail(&self, v6: bool, n: usize) -> Vec<(IpPrefix, Vec<IpAddr>)> {
+        self.unresolvable_nh[usize::from(v6)]
+            .iter()
+            .take(n)
+            .map(|(k, nhs)| ((*k).into(), nhs.clone()))
+            .collect()
+    }
+
+    /// Drop a prefix's unresolvable detail unless `st` keeps it
+    /// unresolvable. Every state change passes through here.
+    fn settle_detail(&mut self, key: &PrefixKey, st: Option<RouteState>) {
+        if st != Some(RouteState::NotInstalled(NotInstalled::Unresolvable)) {
+            self.unresolvable_nh[usize::from(key.family == 6)].remove(key);
         }
     }
 
@@ -1115,6 +1230,7 @@ impl RouteLedger {
         }
         Self::tally(&mut self.counts, &mut self.v6, &key, st, true);
         self.via_ref(&key, via, true);
+        self.settle_detail(&key, Some(st));
     }
 
     fn set_state(&mut self, key: PrefixKey, st: RouteState) {
@@ -1132,6 +1248,7 @@ impl RouteLedger {
         let old = self.state.remove(&key)?;
         Self::tally(&mut self.counts, &mut self.v6, &key, old.state, false);
         self.via_ref(&key, old.via, false);
+        self.settle_detail(&key, None);
         Some(old.state)
     }
 
@@ -2058,5 +2175,113 @@ mod tests {
         m.discard(p);
         assert!(m.is_empty());
         assert_eq!(m.withheld_len(), 0);
+    }
+    /// The ledger remembers the next hops of an unresolvable prefix only
+    /// while it IS unresolvable — a name never outlives its state — and
+    /// only up to the cap per family, past which the count stays exact
+    /// and the names are a subset.
+    #[test]
+    fn unresolvable_detail_follows_the_state_and_is_capped() {
+        let map = member_map();
+        let mut led = RouteLedger::new(Capacity::new(1_000_000));
+        let p = v4(10, 0, 0, 0, 16);
+        let bad = nh(192, 0, 2, 9);
+        // Not unresolvable: nothing noted.
+        led.note_unresolvable(p, &[bad]);
+        assert!(led.unresolvable_detail(false, 5).is_empty());
+        let (st, _) = led.classify_upsert(p, &[bad], &map);
+        assert_eq!(st, RouteState::NotInstalled(NotInstalled::Unresolvable));
+        led.note_unresolvable(p, &[bad]);
+        assert_eq!(led.unresolvable_detail(false, 5), vec![(p, vec![bad])]);
+        assert!(led.unresolvable_detail(true, 5).is_empty(), "per family");
+        // Resolvable now: the name goes with the state.
+        led.classify_upsert(p, &[nh(192, 0, 2, 1)], &map);
+        assert!(led.unresolvable_detail(false, 5).is_empty());
+        // And with a withdrawal.
+        led.classify_upsert(p, &[bad], &map);
+        led.note_unresolvable(p, &[bad]);
+        led.forget(p);
+        assert!(led.unresolvable_detail(false, 5).is_empty());
+
+        for i in 0..(UNRESOLVABLE_DETAIL_CAP + 10) {
+            let q = v4(10, (i >> 8) as u8, i as u8, 0, 24);
+            led.classify_upsert(q, &[bad], &map);
+            led.note_unresolvable(q, &[bad]);
+        }
+        assert_eq!(
+            led.counts().unresolvable as usize,
+            UNRESOLVABLE_DETAIL_CAP + 10,
+            "the count is exact"
+        );
+        assert_eq!(
+            led.unresolvable_detail(false, usize::MAX).len(),
+            UNRESOLVABLE_DETAIL_CAP,
+            "the names are bounded"
+        );
+    }
+
+    /// Each reason names the decision `target` made, arm for arm.
+    #[test]
+    fn why_unresolved_names_the_mapping_decision() {
+        let mut m = NexthopMap::new(vec!["eth4".into()])
+            .with_port_vlans([("eth4".to_string(), vec![100u16])]);
+        let (none, mgmt, vlan_off, vlan_undeclared, bridged, member) = (
+            nh(192, 0, 2, 10),
+            nh(192, 0, 2, 11),
+            nh(192, 0, 2, 12),
+            nh(192, 0, 2, 13),
+            nh(192, 0, 2, 14),
+            nh(192, 0, 2, 15),
+        );
+        m.set_device(mgmt, "eth0");
+        m.set_device(vlan_off, "eth9.100");
+        m.set_kind(
+            "eth9.100",
+            Some(DevKind::PortVlan {
+                port: "eth9".into(),
+                vid: 100,
+            }),
+        );
+        m.set_device(vlan_undeclared, "eth4.200");
+        m.set_kind(
+            "eth4.200",
+            Some(DevKind::PortVlan {
+                port: "eth4".into(),
+                vid: 200,
+            }),
+        );
+        m.set_device(bridged, "br3998");
+        m.set_kind(
+            "br3998",
+            Some(DevKind::BridgeVlan {
+                bridge: "switch0".into(),
+                vid: 3998,
+            }),
+        );
+        m.set_device(member, "eth4");
+        assert_eq!(
+            m.why_unresolved(&none),
+            "no neighbour: the kernel has not resolved it"
+        );
+        assert_eq!(m.why_unresolved(&mgmt), "not a VPP port");
+        assert_eq!(m.device_of(&mgmt), Some("eth0"));
+        assert_eq!(
+            m.why_unresolved(&vlan_off),
+            "VLAN 100 on eth9, which is not a VPP port"
+        );
+        assert_eq!(
+            m.why_unresolved(&vlan_undeclared),
+            "VLAN 200 is not declared on port eth4 (`port … vlans`)"
+        );
+        assert!(
+            m.why_unresolved(&bridged)
+                .starts_with("bridge neighbour not placed"),
+            "{}",
+            m.why_unresolved(&bridged)
+        );
+        assert!(
+            m.why_unresolved(&member).starts_with("reachable now"),
+            "a reason that no longer holds is not reported as one"
+        );
     }
 }
