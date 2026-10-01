@@ -1186,3 +1186,99 @@ fn the_runtime_status_reports_the_read_back_source() {
     assert_eq!(d.state(), State::Ready);
     assert_eq!(rt.status().icmp6_source, Some(LO6));
 }
+
+/// A kernel whose FIB claims every prefix leaves through a tunnel, and
+/// counts the asking — for the IPv6 refusal of the kernel-owned shape.
+struct TunnelKernel(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl packetframe_vpp_offload::topology::Topology for TunnelKernel {
+    fn classify(
+        &self,
+        _: &str,
+    ) -> Result<Option<packetframe_vpp_offload::topology::DevKind>, String> {
+        Ok(Some(packetframe_vpp_offload::topology::DevKind::Plain))
+    }
+    fn fdb(&self) -> Result<packetframe_vpp_offload::topology::FdbSnapshot, String> {
+        Ok(Default::default())
+    }
+    fn port_vlans(&self) -> Result<packetframe_vpp_offload::topology::PortVlans, String> {
+        Ok(Default::default())
+    }
+    fn master_of(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn bridge_l3(&self, _: &str, _: u16) -> Option<packetframe_vpp_offload::topology::BridgeL3> {
+        None
+    }
+    fn fib_match(
+        &self,
+        _: IpPrefix,
+    ) -> Result<packetframe_vpp_offload::topology::FibMatch, String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(packetframe_vpp_offload::topology::FibMatch::Unicast {
+            oifs: vec!["tun0".into()],
+        })
+    }
+}
+
+/// IPv6 never takes the kernel-owned reclassification. A v6 diversion
+/// takes TCP/UDP to the router's MAC whatever the destination, there is no
+/// v6 `steer-exempt`, and the hand-back path returns only the router's own
+/// /128s — so a v6 prefix the kernel carries out a tunnel, left out of
+/// VPP, would be diverted traffic dropped there while `fib-v6` read clean.
+/// It stays unresolvable, and its name says why. The router's own /128
+/// (which the hand-back path does return) is still kernel-delivered.
+#[test]
+fn a_v6_route_the_kernel_carries_elsewhere_stays_unresolvable() {
+    const SELF6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0xaa, 0, 0, 0, 1);
+    struct ViaSelf;
+    impl RouteSource for ViaSelf {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            visit(v4(0), &[NH4]);
+            // A static via a tunnel, outside the router's own subnets.
+            visit(v6(9), &[IpAddr::V6(SELF6)]);
+            // The router's own address, as a host route.
+            visit(
+                IpPrefix::V6 {
+                    addr: SELF6.octets(),
+                    prefix_len: 128,
+                },
+                &[IpAddr::V6(SELF6)],
+            );
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(NH4, "eth4", MAC);
+        }
+        fn requeue(&self, _: SourceChanges) {}
+        fn route_count(&self) -> u64 {
+            3
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+    let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fake = Fake::start("v6-kernel-owned");
+    // The /128 alone: no connected subnet covers the static.
+    let mut e = engine(&fake, FamilyPolicy::Both)
+        .with_self_networks_v6([(SELF6, 128)])
+        .with_topology(Box::new(TunnelKernel(lookups.clone())));
+    converge(&mut e, &ViaSelf, AttachMode::Fresh);
+    assert_eq!(e.kernel_delivered_routes(), 1, "only the router's own /128");
+    assert_eq!(e.counts().v6.unwrap().unresolvable, 1);
+    assert_eq!(
+        lookups.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the kernel is not even asked for v6"
+    );
+    let named = e.unresolvable_named(true);
+    assert_eq!(named.len(), 1, "{named:?}");
+    assert!(
+        named[0].starts_with("2001:db8:9::/48 via 2001:db8:0:aa::1"),
+        "{named:?}"
+    );
+    assert!(
+        named[0].contains("IPv6 has no steer-exempt, so diverted traffic for it would be dropped"),
+        "{named:?}"
+    );
+}

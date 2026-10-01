@@ -54,6 +54,44 @@ impl LocalChange {
     pub fn is_empty(&self) -> bool {
         self.became_local.is_empty() && self.stopped_local.is_empty()
     }
+
+    /// What the programmer owes the slots this change moved, in order.
+    ///
+    /// A nexthop that became the router's own may be RESOLVED right now —
+    /// an address takeover moves a neighbour's address onto the box — and
+    /// its slot then still rewrites and redirects to the former neighbour.
+    /// `local` promises the kernel path, so the slot and the cached live
+    /// state go back to `Incomplete` (the datapath PASSes), and the second
+    /// tier hears the neighbour is gone (review finding). The reverse is
+    /// an ordinary unresolved nexthop: ask the resolver, arm the re-probe.
+    pub fn actions(&self) -> Vec<SlotAction> {
+        self.became_local
+            .iter()
+            .map(|ip| SlotAction::ForgetResolution(*ip))
+            .chain(self.stopped_local.iter().map(|ip| SlotAction::Resolve(*ip)))
+            .collect()
+    }
+}
+
+/// One slot's due after a reclassification ([`LocalChange::actions`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotAction {
+    /// Write the slot `Incomplete`, drop the cached live resolution and
+    /// any re-probe, and tell the second tier the neighbour is lost.
+    ForgetResolution(IpAddr),
+    /// Hand the nexthop to the resolver and arm its re-probe.
+    Resolve(IpAddr),
+}
+
+/// What to do with a neighbour event ([`LocalNexthops::neigh_event`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeighVerdict {
+    Apply,
+    /// The nexthop is the router's own: whatever the kernel says about a
+    /// neighbour at that address is stale or about another entry, and
+    /// applying a `Learned` would put a redirect back into a slot the
+    /// `local` classification reset to the kernel path.
+    IgnoreLocal,
 }
 
 impl LocalNexthops {
@@ -83,6 +121,17 @@ impl LocalNexthops {
 
     pub fn is_local(&self, ip: &IpAddr) -> bool {
         self.local.contains(ip)
+    }
+
+    /// Whether a neighbour event for `ip` may touch its slot. A `Learned`
+    /// already in flight when the address moved onto the box lands after
+    /// the reset; it is dropped here for as long as the nexthop is local.
+    pub fn neigh_event(&self, ip: &IpAddr) -> NeighVerdict {
+        if self.is_local(ip) {
+            NeighVerdict::IgnoreLocal
+        } else {
+            NeighVerdict::Apply
+        }
     }
 
     /// The registered nexthops that are the router's own, in order.
@@ -247,5 +296,30 @@ mod tests {
         );
         assert!(l.is_local(&ip(2)) && !l.is_local(&ip(1)));
         assert!(l.set_addrs(addrs(&[2]), [ip(1), ip(2)]).is_empty());
+    }
+    /// An address takeover: a RESOLVED nexthop's address moves onto the
+    /// box. Its slot must go back to the kernel path, and a `Learned`
+    /// still in flight for it must not put the redirect back. When the
+    /// address leaves again it resolves like any other nexthop, and
+    /// neighbour events apply once more.
+    #[test]
+    fn a_takeover_forgets_the_resolution_and_drops_stale_learned_events() {
+        let mut l = LocalNexthops::new(addrs(&[1]));
+        assert!(!l.register(ip(7)), "a peer, resolvable");
+        assert_eq!(l.neigh_event(&ip(7)), NeighVerdict::Apply);
+
+        // The peer's address is added to the router.
+        let change = l.set_addrs(addrs(&[1, 7]), [ip(7)]);
+        assert_eq!(change.actions(), vec![SlotAction::ForgetResolution(ip(7))]);
+        assert_eq!(
+            l.neigh_event(&ip(7)),
+            NeighVerdict::IgnoreLocal,
+            "the in-flight Learned must not re-resolve a local slot"
+        );
+
+        // And removed again: resolvable through the normal path.
+        let change = l.set_addrs(addrs(&[1]), [ip(7)]);
+        assert_eq!(change.actions(), vec![SlotAction::Resolve(ip(7))]);
+        assert_eq!(l.neigh_event(&ip(7)), NeighVerdict::Apply);
     }
 }

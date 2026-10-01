@@ -55,10 +55,24 @@ pub(crate) fn ifname(index: u32) -> String {
 /// able to wedge anything, including itself (review finding).
 #[cfg(target_os = "linux")]
 pub(crate) fn bound_recv(socket: &netlink_sys::Socket) -> Result<(), String> {
+    bound_recv_for(socket, std::time::Duration::from_secs(5))
+}
+
+/// [`bound_recv`] with a caller's bound, for a single request/reply on the
+/// supervision loop where 5 s is far past what the loop can afford
+/// ([`crate::topology::kernel_fib_match`]).
+#[cfg(target_os = "linux")]
+pub(crate) fn bound_recv_for(
+    socket: &netlink_sys::Socket,
+    bound: std::time::Duration,
+) -> Result<(), String> {
     use std::os::fd::AsRawFd as _;
+    // `as _`: the field types are `time_t`/`suseconds_t`, which libc
+    // deprecates by name on musl (their width is changing there), and the
+    // inferred cast is the same conversion on every target.
     let tv = libc::timeval {
-        tv_sec: 5,
-        tv_usec: 0,
+        tv_sec: bound.as_secs() as _,
+        tv_usec: bound.subsec_micros() as _,
     };
     // SAFETY: `socket` owns the fd for the call, and `tv` is a
     // `timeval` of exactly the length passed.

@@ -507,6 +507,11 @@ impl Topology for KernelTopology {
     }
 }
 
+/// How long one kernel FIB lookup may wait for its reply. A reply is
+/// tens of microseconds; this is the bound for a kernel that sends none.
+#[cfg(target_os = "linux")]
+const FIB_MATCH_RECV_BOUND: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// One `RTM_GETROUTE` for `prefix`'s network address with
 /// `RTM_F_FIB_MATCH` (Linux 4.13+), which answers with the FIB entry the
 /// lookup matched — its type, its prefix length and its output devices —
@@ -542,7 +547,10 @@ pub fn kernel_fib_match(prefix: packetframe_common::fib::IpPrefix) -> Result<Fib
         ),
     };
     let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
-    crate::fdb::bound_recv(&socket)?;
+    // Bounded well inside the walk's shared lookup time
+    // (`engine::FIB_MATCH_WALL_BUDGET`): a kernel that does not answer
+    // costs one short wait, and the engine stops asking.
+    crate::fdb::bound_recv_for(&socket, FIB_MATCH_RECV_BOUND)?;
     socket
         .bind_auto()
         .map_err(|e| format!("netlink bind: {e}"))?;

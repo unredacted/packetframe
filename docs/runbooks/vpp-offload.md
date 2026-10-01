@@ -1102,14 +1102,24 @@ router's own state:
    loopback), and no next hop reaches VPP. The kernel's local table
    delivers these ahead of anything in `main`. A host route VPP *can*
    carry through a member port is never touched.
-3. **A route via the router that the kernel carries elsewhere.** Every
-   next hop is one of the router's addresses, and the kernel's own FIB
-   entry for exactly that prefix (`ip route get` with `fibmatch`
+3. **An IPv4 route via the router that the kernel carries elsewhere.**
+   Every next hop is one of the router's addresses, and the kernel's own
+   FIB entry for exactly that prefix (`ip route get` with `fibmatch`
    semantics) either delivers it locally or leaves only through devices
    VPP cannot reach: not a member port, not a VLAN of one, not a bridge
    a member port is enslaved to, not a `local-route` device. A static
-   `/32` via a tunnel is the usual case. At most 1,024 such lookups run
-   per resync and 64 per delta batch.
+   `/32` via a tunnel is the usual case. Each walk asks the kernel at
+   most 1,024 times per resync and 64 per delta batch. It spends at most
+   150 ms on the asking in total, and stops at the first lookup the
+   kernel fails to answer; the routes it then never asked about stay
+   unresolvable, named with why.
+
+IPv6 takes shapes 1 and 2 only. A `v6-divert` rule takes TCP and UDP to
+the router's MAC whatever the destination, there is no v6 `steer-exempt`,
+and the hand-back path returns only the router's own `/128`s (every global
+address, which is why shape 2 is safe for v6). A v6 prefix the kernel
+carries out a tunnel would be diverted traffic dropped in VPP, so it stays
+unresolvable on `fib-v6`, with a name that says so.
 
 The next hop alone is never enough. Under `next-hop-self` every transit
 route carries the router's address; the kernel sends those out member
@@ -3001,6 +3011,7 @@ reason is the mapping's own decision:
 | `not a VPP port` | the neighbour is on a device that is not a member port | add the `port`, or the route is not VPP's to carry |
 | `VLAN N on P, which is not a VPP port` / `VLAN N is not declared on port P` | a VLAN device over a non-member, or a vid missing from `port … vlans` | the `port` line |
 | `bridge neighbour …` | the FDB has not placed it behind a member, or it is behind a non-member or a tagged VLAN with no BVI | see [bridge neighbours](#bridge-neighbours-placed-per-neighbour-from-the-fdb) |
+| `… and IPv6 has no steer-exempt, so diverted traffic for it would be dropped in VPP …` | a v6 route via the router outside its subnets and addresses; never left to the kernel (shape 3 is v4 only) | the feed, a `steer-keep6`, or dropping `v6-divert` |
 | `the router's own address, which VPP has no adjacency for; …` | every next hop is the router, and none of the kernel-delivered shapes held. The rest of the reason says how the kernel answered for exactly that prefix: `sends this prefix out <dev>, which VPP can reach` (a transit route under `next-hop-self`: the feed is wrong), `drops it (blackhole, unreachable or prohibit)` (an aggregate the router originates; VPP would send its traffic down a less-specific route, so it is not left to the kernel), `has no route of its own for exactly this prefix`, `could not be read`, or `was not asked` (the per-walk lookup budget was spent) | `ip route get <prefix-address> fibmatch` shows the same entry the module read |
 | `reachable now; …` | the neighbour arrived after the route was classified | nothing: it is re-programmed with the neighbour |
 

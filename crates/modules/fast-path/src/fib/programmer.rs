@@ -58,7 +58,9 @@ use tracing::{debug, info, warn};
 
 use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, RouteEvent};
 
-use crate::fib::local_nexthops::{awaiting_summary, kernel_local_addrs, LocalNexthops};
+use crate::fib::local_nexthops::{
+    awaiting_summary, kernel_local_addrs, LocalNexthops, NeighVerdict, SlotAction,
+};
 use crate::fib::netlink_neigh::NeighborResolveHandle;
 use crate::fib::types::{
     EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, ECMP_NH_UNUSED, FIB_KIND_ECMP, MAX_ECMP_PATHS,
@@ -1407,14 +1409,16 @@ impl FibProgrammer {
         if change.is_empty() {
             return;
         }
-        for ip in &change.became_local {
-            self.reprobe.remove(ip);
-        }
-        for ip in &change.stopped_local {
-            if let Some(h) = &self.neigh_handle {
-                h.request_resolve(*ip);
+        for action in change.actions() {
+            match action {
+                SlotAction::ForgetResolution(ip) => self.forget_resolution(ip),
+                SlotAction::Resolve(ip) => {
+                    if let Some(h) = &self.neigh_handle {
+                        h.request_resolve(ip);
+                    }
+                    self.arm_reprobe(ip);
+                }
             }
-            self.arm_reprobe(*ip);
         }
         let named: Vec<String> = self
             .local
@@ -1431,6 +1435,48 @@ impl FibProgrammer {
             "nexthops that are the router's own addresses changed; local ones are delivered \
              by the kernel and are not awaiting resolution"
         );
+    }
+
+    /// Put a nexthop that just became the router's own back on the kernel
+    /// path ([`SlotAction::ForgetResolution`]): its slot may still hold a
+    /// resolved neighbour from before the address moved onto the box, and
+    /// XDP would go on redirecting to it. Written `Incomplete` with the
+    /// cached live state cleared, so a pin rewrite cannot resurrect it, and
+    /// the second tier hears it lost, as on `Gone`.
+    fn forget_resolution(&mut self, ip: IpAddr) {
+        self.reprobe.remove(&ip);
+        let Some(rec) = self.by_ip.get_mut(&ip) else {
+            return;
+        };
+        rec.live = None;
+        let id = rec.id;
+        let family = match ip {
+            IpAddr::V4(_) => NH_FAMILY_V4,
+            IpAddr::V6(_) => NH_FAMILY_V6,
+        };
+        let entry = NexthopEntry {
+            seq: 0,
+            ifindex: 0,
+            dst_mac: [0; 6],
+            pin_vid: 0,
+            src_mac: [0; 6],
+            _pad1: [0; 2],
+            state: NH_STATE_INCOMPLETE,
+            family,
+            bmp_peer_hint: [0; 2],
+        };
+        if let Err(e) = self.write_seqlock(id, entry) {
+            warn!(
+                ?ip,
+                id,
+                error = %e,
+                "NEXTHOPS reset of a nexthop that became the router's own failed; it may \
+                 still redirect to the former neighbour until the next write"
+            );
+        }
+        if let Some(sink) = self.route_sink.as_deref() {
+            sink.neighbour_lost(ip);
+        }
     }
 
     fn unregister(&mut self, ip: IpAddr) -> Result<(), ProgrammerError> {
@@ -1524,6 +1570,18 @@ impl FibProgrammer {
             ),
             None => return,
         };
+
+        // The router's own address: nothing the kernel says about a
+        // neighbour there may touch the slot. A `Learned` already in flight
+        // when the address moved onto the box would otherwise put the
+        // redirect back into the slot `forget_resolution` just reset.
+        if self.local.neigh_event(&ip) == NeighVerdict::IgnoreLocal {
+            debug!(
+                ?ip,
+                "neighbour event for the router's own address ignored (local)"
+            );
+            return;
+        }
 
         // The kernel keys neighbours `(device, address)`; we key
         // nexthops by address. A `Failed`/`Gone` for this address on a

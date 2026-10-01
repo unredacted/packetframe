@@ -127,6 +127,14 @@ pub const FIB_MATCH_BUDGET_RESYNC: usize = 1_024;
 /// The same, per delta batch.
 pub const FIB_MATCH_BUDGET_DELTA: usize = 64;
 
+/// Wall-clock time one walk may spend in kernel FIB lookups, shared by
+/// every lookup in it — a tenth of the steady socket deadline
+/// ([`crate::liveness`]'s 1.5 s), so a slow kernel costs the supervision
+/// loop a bounded slice however many candidates the walk holds. A lookup
+/// is tens of microseconds normally; past this the rest stay unresolvable
+/// and are named so.
+pub const FIB_MATCH_WALL_BUDGET: Duration = Duration::from_millis(150);
+
 /// How many kernel refusals the engine keeps the reason of
 /// ([`ConvergenceEngine`]'s `kernel_refused`). Past it a route still
 /// classifies the same; only its name is less specific.
@@ -707,6 +715,16 @@ pub struct ConvergenceEngine {
     /// `next-hop-self` misconfiguration — costs a bounded number of
     /// netlink round trips on the supervision loop, not a million.
     fib_match_budget: usize,
+    /// Time the current walk has spent in kernel FIB lookups, against
+    /// [`FIB_MATCH_WALL_BUDGET`].
+    fib_match_spent: Duration,
+    /// Why the current walk stopped asking the kernel, once it has: the
+    /// FIB could not be read, or the walk's lookup time is spent. Every
+    /// later candidate in the walk is refused with this reason instead of
+    /// waiting out the same failure again — on an unanswering
+    /// `NETLINK_ROUTE` that was a receive timeout per candidate, up to the
+    /// whole count budget, on the supervision loop (review finding).
+    fib_match_halted: Option<String>,
     /// Why the kernel did not prove a route via the router its own
     /// ([`Self::kernel_owns`]), per prefix, for the name an unresolvable
     /// route gets ([`Self::unresolvable_named`]): the likeliest lone
@@ -936,6 +954,8 @@ impl ConvergenceEngine {
             self_nets6: Vec::new(),
             kernel_delivered: HashSet::new(),
             fib_match_budget: 0,
+            fib_match_spent: Duration::ZERO,
+            fib_match_halted: None,
             kernel_refused: std::collections::HashMap::new(),
             link_local_refused: HashSet::new(),
             steer_exempts: Vec::new(),
@@ -1279,8 +1299,8 @@ impl ConvergenceEngine {
     ///    VPP: a route VPP could install is never withdrawn by this, so
     ///    the reclassification only ever relabels a route that was going
     ///    to be missing from VPP anyway.
-    /// 3. **A route via the router itself that the kernel carries through
-    ///    devices VPP cannot reach** (a static /32 via a tunnel, a
+    /// 3. **An IPv4 route via the router itself that the kernel carries
+    ///    through devices VPP cannot reach** (a static /32 via a tunnel, a
     ///    connected route on a device that is neither a member port nor
     ///    bridged into one) **or delivers itself**. Every next hop the
     ///    router's, AND the kernel's own FIB entry for exactly this prefix
@@ -1304,13 +1324,17 @@ impl ConvergenceEngine {
     /// routes out devices VPP does not take — so neither needs a second
     /// report of its own.
     ///
-    /// **IPv6 too** (`v6 on`), by the same rules: next hops all the
+    /// **IPv6** (`v6 on`) takes shapes 1 and 2 only: next hops all the
     /// router's own (global or link-local) and the prefix inside one of
-    /// its global v6 subnets, or one of its addresses, or owned by the
-    /// kernel. Such a route is left out of VPP and withdrawn if installed,
-    /// exactly as for v4 — left in, it would read unresolvable forever. It
-    /// is NOT a first-steer blocker the way a v4 one is; see
-    /// [`Self::unexempted_local`] for why it need not be.
+    /// its global v6 subnets, or one of its addresses — whose /128 the
+    /// hand-back path returns to the kernel when IPv6 is diverted
+    /// ([`crate::handback::router_owned`]: every global address). Such a
+    /// route is left out of VPP and withdrawn if installed, exactly as for
+    /// v4 — left in, it would read unresolvable forever. It is NOT a
+    /// first-steer blocker the way a v4 one is; see
+    /// [`Self::unexempted_local`] for why it need not be. Shape 3 is
+    /// refused for v6: nothing would keep diverted traffic for such a
+    /// prefix off VPP.
     fn kernel_delivered_route(&mut self, prefix: &IpPrefix, nexthops: &[IpAddr]) -> bool {
         if nexthops.is_empty() {
             return false;
@@ -1328,7 +1352,14 @@ impl ConvergenceEngine {
         if self.own_address(prefix) && self.nexthops.resolve_all(nexthops).is_empty() {
             return true;
         }
-        all_self && self.kernel_owns(prefix)
+        // IPv4 only (review finding). A v6 diversion takes TCP/UDP to the
+        // router's MAC whatever the destination, there is no v6
+        // `steer-exempt` to keep a prefix's traffic on the kernel, and the
+        // hand-back path returns only the router's own /128s — so a v6
+        // route the kernel carries elsewhere, left out of VPP, is diverted
+        // traffic dropped in VPP. It stays unresolvable, impaired on
+        // `fib-v6`, and its name says why ([`Self::why_unresolved`]).
+        all_self && matches!(prefix, IpPrefix::V4 { .. }) && self.kernel_owns(prefix)
     }
 
     /// Whether `prefix` is a host prefix naming one of the router's own
@@ -1359,13 +1390,25 @@ impl ConvergenceEngine {
     /// all answer `false`, which leaves the route unresolvable.
     fn kernel_owns(&mut self, prefix: &IpPrefix) -> bool {
         use crate::topology::FibMatch;
-        let refused: String = if self.fib_match_budget == 0 {
+        let refused: String = if let Some(why) = &self.fib_match_halted {
+            why.clone()
+        } else if self.fib_match_budget == 0 {
             "the kernel was not asked about this prefix (this walk's lookup budget was spent, \
              as on a feed whose every route names the router)"
                 .into()
         } else {
             self.fib_match_budget -= 1;
-            match self.topology.fib_match(*prefix) {
+            let asked = std::time::Instant::now();
+            let answer = self.topology.fib_match(*prefix);
+            self.fib_match_spent += asked.elapsed();
+            if self.fib_match_spent >= FIB_MATCH_WALL_BUDGET && self.fib_match_halted.is_none() {
+                self.fib_match_halted = Some(format!(
+                    "the kernel was not asked about this prefix (this walk's {} ms for kernel \
+                     lookups was spent)",
+                    FIB_MATCH_WALL_BUDGET.as_millis()
+                ));
+            }
+            match answer {
                 Ok(FibMatch::Local) => {
                     self.kernel_refused.remove(prefix);
                     return true;
@@ -1391,12 +1434,20 @@ impl ConvergenceEngine {
                 Ok(FibMatch::NotExact) => {
                     "the kernel has no route of its own for exactly this prefix".into()
                 }
+                // The first failure ends the walk's lookups: a facility
+                // that did not answer once is not asked again for every
+                // remaining candidate.
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         prefix = ?prefix,
                         error = %e,
-                        "kernel FIB lookup failed; the route stays unresolvable"
+                        "kernel FIB lookup failed; routes via the router stay unresolvable for \
+                         the rest of this walk"
                     );
+                    self.fib_match_halted = Some(format!(
+                        "the kernel's FIB could not be read ({e}), so it was not asked again \
+                         this walk"
+                    ));
                     format!("the kernel's route for this prefix could not be read ({e})")
                 }
             }
@@ -1504,6 +1555,12 @@ impl ConvergenceEngine {
     /// address never admitted as a neighbour
     /// ([`Self::carries_neighbour`]) — then the mapping's.
     fn why_unresolved(&self, prefix: &IpPrefix, nh: &IpAddr) -> String {
+        if self.self_addrs.contains(nh) && matches!(prefix, IpPrefix::V6 { .. }) {
+            return "the router's own address, which VPP has no adjacency for; the prefix is in no \
+                    subnet or address of the router, and IPv6 has no steer-exempt, so diverted \
+                    traffic for it would be dropped in VPP rather than left to the kernel"
+                .into();
+        }
         if self.self_addrs.contains(nh) {
             // Which way the kernel answered, when it was asked: a route via
             // the router is kernel-delivered only on the kernel's word
@@ -2434,11 +2491,12 @@ impl ConvergenceEngine {
             .collect()
     }
 
-    /// The freshest dark-interface observation available, and the scan
-    /// wins when there is one: it is what the steer gate acted on, so a
-    /// port restored between the last verify and the last steer reads as
-    /// restored here too. Falling back to the verify's recording covers
-    /// the window before any gate has run.
+    /// The freshest dark-interface observation available. Both the steer
+    /// gate's scan and every completed verify (a re-run included) write the
+    /// cache, so it is whichever looked last: a port restored between the
+    /// last verify and the last steer reads as restored, and a member gone
+    /// dark at a re-run reads as dark. Falling back to the verify's
+    /// recording covers a cache cleared with the process.
     fn latest_dead(&self) -> &[crate::verify::DeadInterface] {
         self.last_dead_scan
             .as_deref()
@@ -3509,6 +3567,8 @@ impl ConvergenceEngine {
         }
         let families = self.drainer.families();
         self.fib_match_budget = FIB_MATCH_BUDGET_DELTA;
+        self.fib_match_spent = Duration::ZERO;
+        self.fib_match_halted = None;
         for (prefix, nhs) in changes.routes {
             // The delta door's half of the route family filter (see
             // `begin_resync`): never queued, so never pending.
@@ -3709,6 +3769,8 @@ impl ConvergenceEngine {
         self.link_local_refused.clear();
         self.kernel_refused.clear();
         self.fib_match_budget = FIB_MATCH_BUDGET_RESYNC;
+        self.fib_match_spent = Duration::ZERO;
+        self.fib_match_halted = None;
         let families = self.drainer.families();
         src.for_each_route(&mut |prefix, nexthops| {
             // A family VPP does not carry never enters the diff — the
@@ -3946,6 +4008,12 @@ impl ConvergenceEngine {
                     v6.unresolvable_named = self.unresolvable_named(true);
                 }
                 self.last_verify = Some(outcome.clone());
+                // The pass dumped the interfaces too, and that is now the
+                // newest link observation: `latest_dead` prefers the cache,
+                // so leaving an older steer-gate scan there kept the ports
+                // row and `steered_but_broken` on it while this verdict
+                // named a member gone dark (review finding).
+                self.last_dead_scan = Some(outcome.dead_interfaces.clone());
                 self.phase = None;
                 // The gate the ledger has always been able to answer and
                 // nothing asked.

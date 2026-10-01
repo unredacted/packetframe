@@ -4643,3 +4643,188 @@ fn a_verify_re_run_refreshes_the_verdict_and_leaves_no_phase() {
     assert!(e.phase().is_none(), "a re-run is not a convergence");
     assert!(e.last_verify().is_some_and(|v| v.passed()));
 }
+
+/// A kernel that answers every lookup after `delay` with a tunnel route,
+/// or fails every one, counting the asking.
+struct FlakyKernel {
+    lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail: bool,
+    delay: std::time::Duration,
+}
+
+impl Topology for FlakyKernel {
+    fn classify(&self, _: &str) -> Result<Option<DevKind>, String> {
+        Ok(Some(DevKind::Plain))
+    }
+    fn fdb(&self) -> Result<FdbSnapshot, String> {
+        Ok(FdbSnapshot::default())
+    }
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        Ok(PortVlans::default())
+    }
+    fn master_of(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn bridge_l3(&self, _: &str, _: u16) -> Option<BridgeL3> {
+        None
+    }
+    fn fib_match(
+        &self,
+        _: IpPrefix,
+    ) -> Result<packetframe_vpp_offload::topology::FibMatch, String> {
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        if self.fail {
+            return Err("netlink recv: Resource temporarily unavailable".into());
+        }
+        Ok(packetframe_vpp_offload::topology::FibMatch::Unicast {
+            oifs: vec!["tun0".into()],
+        })
+    }
+}
+
+/// Six routes via the router, each outside its subnets: six kernel-lookup
+/// candidates in one walk.
+fn six_via_the_router() -> Routed {
+    let own = IpAddr::V4(Ipv4Addr::from(OWN));
+    let mut routes = vec![(v4(0, 0), vec![nh()])];
+    for i in 0..6u8 {
+        routes.push((host4([192, 0, 2, 200 + i]), vec![own]));
+    }
+    Routed {
+        routes,
+        neighbours: vec![(nh(), "eth4")],
+    }
+}
+
+/// An unanswering `NETLINK_ROUTE` must not cost the supervision loop a
+/// receive timeout per candidate: the first failure ends the walk's
+/// lookups, and every remaining candidate stays unresolvable, named with
+/// why. And a kernel that answers, but slowly, is asked only until the
+/// walk's shared lookup time is spent (review finding: 1024 × 5 s on a
+/// resync before this).
+#[test]
+fn kernel_lookups_stop_at_the_first_failure_and_at_the_walk_time_budget() {
+    let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fake = Fake::start("fib-match-fails");
+    let mut e = engine_for(&fake)
+        .with_self_networks([pfx(OWN, 30)])
+        .with_topology(Box::new(FlakyKernel {
+            lookups: lookups.clone(),
+            fail: true,
+            delay: std::time::Duration::ZERO,
+        }));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = six_via_the_router();
+    let plan = e.begin_resync(&src);
+    assert_eq!(plan.kernel_delivered, 0);
+    assert_eq!(
+        lookups.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one failure, and the kernel is not asked again this walk"
+    );
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().unresolvable, 6);
+    let named = e.unresolvable_named(false);
+    assert!(
+        named[0].contains("the kernel's route for this prefix could not be read (netlink recv"),
+        "{named:?}"
+    );
+    assert!(
+        named[1..5]
+            .iter()
+            .all(|n| n.contains("the kernel's FIB could not be read")
+                && n.contains("not asked again this walk")),
+        "{named:?}"
+    );
+
+    // A slow kernel: asked until the walk's lookup time is spent.
+    let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let delay = std::time::Duration::from_millis(60);
+    let fake = Fake::start("fib-match-slow");
+    let mut e = engine_for(&fake)
+        .with_self_networks([pfx(OWN, 30)])
+        .with_topology(Box::new(FlakyKernel {
+            lookups: lookups.clone(),
+            fail: false,
+            delay,
+        }));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = six_via_the_router();
+    let started = std::time::Instant::now();
+    let plan = e.begin_resync(&src);
+    let took = started.elapsed();
+    let asked = lookups.load(std::sync::atomic::Ordering::SeqCst);
+    let budget = packetframe_vpp_offload::engine::FIB_MATCH_WALL_BUDGET;
+    assert!(
+        asked < 6,
+        "the time budget stops the lookups: asked {asked}"
+    );
+    assert_eq!(asked as u32, budget.as_millis() as u32 / 60 + 1);
+    assert!(
+        took < budget + delay * 2,
+        "bounded by the budget plus one lookup: {took:?}"
+    );
+    assert_eq!(
+        plan.kernel_delivered, asked as u64,
+        "every answer asked was used"
+    );
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().unresolvable, 6 - asked as u64);
+    assert!(
+        e.unresolvable_named(false)
+            .iter()
+            .take(6 - asked)
+            .all(|n| n.contains("ms for kernel lookups was spent")),
+        "{:?}",
+        e.unresolvable_named(false)
+    );
+}
+
+/// The member a re-run finds dark is what the ports row reports: the
+/// re-run's interface dump is the newest link observation, so an older
+/// clean steer-gate scan must not keep standing in for it — that is the
+/// difference between a steered blackhole reading Unhealthy and Degraded.
+#[test]
+fn a_verify_re_run_publishes_its_link_scan() {
+    static DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let fake = Fake::start_behaving(
+        "reverify-links",
+        Behaviour {
+            first_port_dark: Some(&DARK),
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = NexthopSource {
+        routes: vec![(v4(0, 0), vec![nh()])],
+        queue: Default::default(),
+    };
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    // The steer gate's scan, while the cable is in: clean.
+    assert!(e.dead_members().expect("scan").is_empty());
+    assert!(e.port_links().iter().all(|p| p.link_up));
+
+    // The cable comes out; a re-run sees it.
+    DARK.store(true, std::sync::atomic::Ordering::SeqCst);
+    let again = e.refresh_verify().expect("re-run");
+    assert!(
+        again.dead_interfaces.iter().any(|d| d.in_use && !d.link_up),
+        "{}",
+        again.summary()
+    );
+    let links = e.port_links();
+    assert!(
+        links.iter().any(|p| p.in_use && !p.link_up),
+        "the ports row reads the re-run's observation: {links:?}"
+    );
+}

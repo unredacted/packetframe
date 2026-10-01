@@ -1395,9 +1395,14 @@ registered (`nexthop is the router's own address (local)`, with its
 addresses (once a minute) moves a nexthop in or out of it. The summary
 line carries `local=N` for context.
 
-Nothing in the datapath changes: the slot stays seeded `incomplete`, the
-map layout and the stats counters are untouched, and traffic is passed
-to the kernel exactly as before. The pinned maps carry no addresses, so
+Nothing in the datapath changes for these: the slot stays seeded
+`incomplete`, the map layout and the stats counters are untouched, and
+traffic is passed to the kernel exactly as before. One transition does
+write the slot. If a nexthop's address moves onto the router while it is
+resolved (an address takeover), the slot is reset to `incomplete` so XDP
+stops redirecting to the former neighbour, and neighbour events for that
+address are ignored for as long as it is local. When the address leaves
+the router, the nexthop resolves like any other. The pinned maps carry no addresses, so
 `packetframe status` still counts these slots under
 `nexthops (incomplete)`, and `fib dump-v4 --unresolved` still lists
 their routes as `state=incomplete ifindex=0`. To tell them apart, match
