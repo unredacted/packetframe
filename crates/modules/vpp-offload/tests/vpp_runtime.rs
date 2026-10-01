@@ -4052,3 +4052,140 @@ mod preserved {
         assert!(captured.lock().unwrap().is_none(), "nothing left behind");
     }
 }
+
+/// A source whose routes carry their own next hops and whose delta
+/// batches the test queues by hand.
+struct Deltas {
+    routes: Vec<(IpPrefix, Vec<IpAddr>)>,
+    queue: std::sync::Mutex<Vec<packetframe_vpp_offload::engine::SourceChanges>>,
+}
+
+impl RouteSource for Deltas {
+    fn requeue(&self, changes: packetframe_vpp_offload::engine::SourceChanges) {
+        self.queue.lock().unwrap().insert(0, changes);
+    }
+    fn drain_changes(&self, _max: usize) -> packetframe_vpp_offload::engine::SourceChanges {
+        self.queue.lock().unwrap().pop().unwrap_or_default()
+    }
+    fn backlog(&self) -> u64 {
+        self.queue.lock().unwrap().len() as u64
+    }
+    fn route_count(&self) -> u64 {
+        self.routes.len() as u64
+    }
+    fn change_seq(&self) -> u64 {
+        0
+    }
+    fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+        for (p, nhs) in &self.routes {
+            visit(*p, nhs);
+        }
+    }
+    fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+        visit(fake_vpp::nh(), "eth4", MAC);
+    }
+}
+
+/// The whole loop, end to end: a verify that found one unresolvable route
+/// is re-run once that route is gone and the table has stayed clean for
+/// the debounce — once, not on every tick after — and the re-run reaches
+/// the loop as a refreshed verdict, never as a supervisor event. The
+/// module stays in the staging state it was in: a first attach is not
+/// steered by a verdict, re-run or not.
+#[test]
+fn an_incomplete_verdict_is_re_run_once_its_unresolvable_route_is_gone() {
+    let missing = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 99));
+    let src = std::sync::Arc::new(Deltas {
+        routes: vec![
+            (fake_vpp::v4(0, 0), vec![fake_vpp::nh()]),
+            (fake_vpp::v4(0, 1), vec![missing]),
+        ],
+        queue: Default::default(),
+    });
+    struct Shared(std::sync::Arc<Deltas>);
+    impl RouteSource for Shared {
+        fn requeue(&self, c: packetframe_vpp_offload::engine::SourceChanges) {
+            self.0.requeue(c)
+        }
+        fn drain_changes(&self, max: usize) -> packetframe_vpp_offload::engine::SourceChanges {
+            self.0.drain_changes(max)
+        }
+        fn backlog(&self) -> u64 {
+            self.0.backlog()
+        }
+        fn route_count(&self) -> u64 {
+            self.0.route_count()
+        }
+        fn change_seq(&self) -> u64 {
+            self.0.change_seq()
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            self.0.for_each_route(visit)
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            self.0.for_each_neighbour(visit)
+        }
+    }
+    let fake = Fake::start("reverify-loop");
+    let rt = runtime_with_source(&fake, Box::new(Shared(std::sync::Arc::clone(&src))));
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+    let (mut now, events) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+    assert!(events.contains(&Event::VerifyIncomplete), "{events:?}");
+    let stale = rt.status().last_verify.expect("a verdict");
+    assert_eq!(stale.unresolvable, 1);
+    assert_eq!(
+        stale.unresolvable_named,
+        vec!["10.0.1.0/24 via 192.0.2.99 (no neighbour: the kernel has not resolved it)"]
+    );
+    assert!(rt.take_refreshed_verify().is_none(), "nothing re-run yet");
+
+    // The route goes. The re-run waits for the debounce, then fires once.
+    src.queue
+        .lock()
+        .unwrap()
+        .push(packetframe_vpp_offload::engine::SourceChanges {
+            neighbours: Vec::new(),
+            routes: vec![(fake_vpp::v4(0, 1), None)],
+        });
+    let (mut obs, mut fx) = rt.views();
+    let mut refreshed = Vec::new();
+    let end = now + Duration::from_secs(120);
+    while now < end {
+        let t = d.tick(now, &mut obs, &mut fx);
+        assert!(
+            !t.events.iter().any(|e| matches!(
+                e,
+                Event::VerifyPassed | Event::VerifyIncomplete | Event::VerifyFailed
+            )),
+            "a re-run is no supervisor event: {:?}",
+            t.events
+        );
+        for e in rt.take_pending() {
+            d.inject(now, e, &mut fx);
+        }
+        if let Some(v) = rt.take_refreshed_verify() {
+            refreshed.push((now, v));
+        }
+        now += Duration::from_millis(500);
+    }
+    assert_eq!(refreshed.len(), 1, "once per clearing, not per tick");
+    let (when, v) = &refreshed[0];
+    assert!(v.passed(), "{}", v.summary());
+    assert!(
+        *when >= t0 + packetframe_vpp_offload::verify::REVERIFY_DEBOUNCE,
+        "debounced"
+    );
+    assert_eq!(d.state(), State::Ready, "staged, not steered");
+    assert!(!d.supervisor().is_steered());
+    assert!(rt.status().last_verify.is_some_and(|v| v.passed()));
+}

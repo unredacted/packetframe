@@ -4272,3 +4272,559 @@ fn a_v4_route_via_a_v6_next_hop_is_unresolvable_under_v4_only() {
     assert_eq!((e.counts().installed, e.counts().unresolvable), (1, 1));
     assert!(e.counts().blocks_first_steer(), "and it is loud");
 }
+
+/// A source with explicit neighbours, for the kernel-delivered and
+/// unresolvable-naming tests: each route carries its next hops, each
+/// neighbour its device.
+struct Routed {
+    routes: Vec<(IpPrefix, Vec<IpAddr>)>,
+    neighbours: Vec<(IpAddr, &'static str)>,
+}
+
+impl RouteSource for Routed {
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("this source hands nothing over, so nothing can come back")
+    }
+    fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+        for (p, nhs) in &self.routes {
+            visit(*p, nhs);
+        }
+    }
+    fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+        for (ip, dev) in &self.neighbours {
+            visit(*ip, dev, MAC);
+        }
+    }
+    fn route_count(&self) -> u64 {
+        self.routes.len() as u64
+    }
+    fn change_seq(&self) -> u64 {
+        0
+    }
+}
+
+fn host4(a: [u8; 4]) -> IpPrefix {
+    IpPrefix::V4 {
+        addr: a,
+        prefix_len: 32,
+    }
+}
+
+/// A kernel view whose FIB answers `fib_match` from a fixed table, for
+/// shape 3 of the kernel-delivered rule. Devices are plain unless listed.
+struct RoutingKernel {
+    fib: Vec<(IpPrefix, packetframe_vpp_offload::topology::FibMatch)>,
+    kinds: Vec<(&'static str, Option<DevKind>)>,
+    masters: Vec<(&'static str, &'static str)>,
+    lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Topology for RoutingKernel {
+    fn classify(&self, dev: &str) -> Result<Option<DevKind>, String> {
+        Ok(self
+            .kinds
+            .iter()
+            .find(|(d, _)| *d == dev)
+            .map_or(Some(DevKind::Plain), |(_, k)| k.clone()))
+    }
+    fn fdb(&self) -> Result<FdbSnapshot, String> {
+        Ok(FdbSnapshot::default())
+    }
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        Ok(PortVlans::default())
+    }
+    fn master_of(&self, port: &str) -> Option<String> {
+        self.masters
+            .iter()
+            .find(|(p, _)| *p == port)
+            .map(|(_, b)| b.to_string())
+    }
+    fn bridge_l3(&self, _: &str, _: u16) -> Option<BridgeL3> {
+        None
+    }
+    fn fib_match(
+        &self,
+        prefix: IpPrefix,
+    ) -> Result<packetframe_vpp_offload::topology::FibMatch, String> {
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.fib.iter().find(|(p, _)| *p == prefix).map_or(
+            packetframe_vpp_offload::topology::FibMatch::NotExact,
+            |(_, m)| m.clone(),
+        ))
+    }
+}
+
+/// The router's own session address, the next hop a routing daemon puts
+/// on what it originates.
+const OWN: [u8; 4] = [198, 51, 100, 1];
+
+/// A /32 the router holds on a device with no connected subnet around it
+/// — the shape a honeypot or dummy device produces — is the router's own
+/// business, not an unresolvable route, whichever way the feed carries
+/// it: via the router itself (what `redistribute connected` sends), or
+/// via a next hop that reaches nothing in VPP. Either way it never enters
+/// VPP and never counts as unresolvable; and since it is kernel-delivered,
+/// it needs a `steer-exempt` before a first steer like any other.
+///
+/// What the reclassification must NEVER do is pull a route VPP can carry:
+/// the same /32 learned through a neighbour on a member port stays
+/// installed.
+#[test]
+fn a_local_host_address_on_a_device_vpp_does_not_know_is_kernel_delivered() {
+    let own = IpAddr::V4(Ipv4Addr::from(OWN));
+    let honeypot = [203, 0, 113, 5];
+    let peer_nowhere = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+    let fake = Fake::start("local-host");
+    let mut e = engine_for(&fake)
+        // The session address in its /30, and the honeypot's bare /32.
+        .with_self_networks([pfx(OWN, 30), pfx(honeypot, 32)]);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = Routed {
+        routes: vec![
+            (v4(0, 0), vec![nh()]),
+            // As FRR's `redistribute connected` sends it.
+            (host4(honeypot), vec![own]),
+            // Another of the router's addresses (its session address as
+            // a host route), through a next hop nothing has resolved.
+            (host4(OWN), vec![peer_nowhere]),
+        ],
+        neighbours: vec![(nh(), "eth4")],
+    };
+    let plan = e.begin_resync(&src);
+    assert_eq!((plan.upserts, plan.kernel_delivered), (1, 2), "{plan:?}");
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().installed, 1);
+    assert_eq!(
+        e.counts().unresolvable,
+        0,
+        "{:?}",
+        e.unresolvable_named(false)
+    );
+    assert_eq!(e.kernel_delivered_routes(), 2);
+    assert!(e.unresolvable_named(false).is_empty());
+    assert_eq!(e.counts().unexempted_local, 2, "both need a steer-exempt");
+    let v = e.run_verify().expect("verify");
+    assert_eq!(v.outcome.unresolvable, 0, "{}", v.outcome.summary());
+
+    // The same host route through a neighbour VPP reaches: installed,
+    // because a route VPP can carry is never reclassified.
+    let fake = Fake::start("local-host-reachable");
+    let mut e = engine_for(&fake).with_self_networks([pfx(OWN, 30), pfx(honeypot, 32)]);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = Routed {
+        routes: vec![(host4(OWN), vec![nh()])],
+        neighbours: vec![(nh(), "eth4")],
+    };
+    let plan = e.begin_resync(&src);
+    assert_eq!((plan.upserts, plan.kernel_delivered), (1, 0), "{plan:?}");
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().installed, 1);
+}
+
+/// A route via the router itself whose prefix lies in no subnet the router
+/// is addressed on — a static /32 via a tunnel — is kernel-delivered when
+/// the kernel's own FIB entry for exactly that prefix leaves through a
+/// device VPP cannot reach. The same next hop on a TRANSIT route
+/// (`next-hop-self`), whose kernel entry leaves through a member port,
+/// stays unresolvable: the next hop alone proves nothing (#265's review
+/// finding), and neither does a kernel answer for a different prefix, a
+/// drop route, or a hop into a bridge a member port is enslaved to.
+#[test]
+fn a_route_via_the_router_the_kernel_carries_elsewhere_is_kernel_delivered() {
+    use packetframe_vpp_offload::topology::FibMatch;
+    let own = IpAddr::V4(Ipv4Addr::from(OWN));
+    let tunnel_peer = host4([192, 0, 2, 200]);
+    let transit = v4(77, 0);
+    let blackholed = v4(88, 0);
+    let elsewhere = v4(99, 0);
+    let bridged = v4(66, 0);
+    let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fake = Fake::start("kernel-owned");
+    let mut e = engine_for(&fake)
+        .with_self_networks([pfx(OWN, 30)])
+        .with_topology(Box::new(RoutingKernel {
+            fib: vec![
+                (
+                    tunnel_peer,
+                    FibMatch::Unicast {
+                        oifs: vec!["tun0".into()],
+                    },
+                ),
+                (
+                    transit,
+                    FibMatch::Unicast {
+                        oifs: vec!["eth4".into()],
+                    },
+                ),
+                (blackholed, FibMatch::Other),
+                (
+                    bridged,
+                    FibMatch::Unicast {
+                        oifs: vec!["br0".into()],
+                    },
+                ),
+            ],
+            // `br0`: a multi-member bridge (a shape placement cannot
+            // use) with the member eth4 enslaved to it.
+            kinds: vec![("br0", None)],
+            masters: vec![("eth4", "br0")],
+            lookups: lookups.clone(),
+        }));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = Routed {
+        routes: vec![
+            (v4(0, 0), vec![nh()]),
+            (tunnel_peer, vec![own]),
+            (transit, vec![own]),
+            (blackholed, vec![own]),
+            (elsewhere, vec![own]),
+            (bridged, vec![own]),
+        ],
+        neighbours: vec![(nh(), "eth4")],
+    };
+    let plan = e.begin_resync(&src);
+    assert_eq!(plan.kernel_delivered, 1, "only the tunnel route: {plan:?}");
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.kernel_delivered_routes(), 1);
+    assert_eq!(
+        e.counts().unresolvable,
+        4,
+        "transit, bridged, blackholed and the kernel-unknown prefix stay unresolvable"
+    );
+    // Each named with the way the kernel answered, so the operator
+    // reading `unresolvable=4` knows which of these each one is.
+    let named = e.unresolvable_named(false);
+    let own = "via 198.51.100.1 (the router's own address, which VPP has no adjacency for; ";
+    assert_eq!(
+        named,
+        vec![
+            format!(
+                "10.66.0.0/24 {own}the kernel sends this prefix out br0, which VPP can reach (a \
+                 transit route under `next-hop-self`?))"
+            ),
+            format!(
+                "10.77.0.0/24 {own}the kernel sends this prefix out eth4, which VPP can reach (a \
+                 transit route under `next-hop-self`?))"
+            ),
+            format!(
+                "10.88.0.0/24 {own}the kernel's route for exactly this prefix drops it \
+                 (blackhole, unreachable or prohibit))"
+            ),
+            format!(
+                "10.99.0.0/24 {own}the kernel has no route of its own for exactly this prefix)"
+            ),
+        ]
+    );
+    assert_eq!(
+        lookups.load(std::sync::atomic::Ordering::SeqCst),
+        5,
+        "one lookup per route via the router outside its subnets, none for the rest"
+    );
+}
+
+/// A genuinely unreachable next hop on a VPP port stays unresolvable, and
+/// health names it: the prefix, the next hop, the device the neighbour
+/// source reported, and why it does not reach VPP. The count alone sent
+/// an operator through `vppctl` and the fast-path dump for rounds.
+///
+/// Bounded: five names, then "+K more" from the exact count.
+#[test]
+fn unresolvable_routes_are_named_with_their_next_hop_device_and_reason_and_capped() {
+    let missing = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
+    let off_port = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50));
+    let fake = Fake::start("named");
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let mut routes = vec![(v4(0, 0), vec![nh()]), (v4(1, 0), vec![off_port])];
+    for i in 0..6u8 {
+        routes.push((v4(2, i), vec![missing]));
+    }
+    let src = Routed {
+        routes,
+        // `missing` has no neighbour at all; `off_port` has one, on a
+        // device that is not a member.
+        neighbours: vec![(nh(), "eth4"), (off_port, "eth9")],
+    };
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().unresolvable, 7);
+    let named = e.unresolvable_named(false);
+    assert_eq!(named.len(), 6, "five names and the remainder: {named:?}");
+    assert_eq!(
+        named[0], "10.1.0.0/24 via 192.0.2.50 dev eth9 (not a VPP port)",
+        "{named:?}"
+    );
+    assert_eq!(
+        named[1],
+        "10.2.0.0/24 via 192.0.2.99 (no neighbour: the kernel has not resolved it)"
+    );
+    assert_eq!(named[5], "+2 more");
+    assert!(e.unresolvable_named(true).is_empty(), "nothing v6 here");
+
+    // The verdict carries the names too, and its summary prints them.
+    let v = e.run_verify().expect("verify");
+    assert_eq!(v.outcome.unresolvable_named, named);
+    let summary = v.outcome.summary();
+    assert!(
+        summary.contains("unresolvable=7 (10.1.0.0/24 via 192.0.2.50 dev eth9"),
+        "{summary}"
+    );
+    assert!(summary.contains("; +2 more), withheld=0"), "{summary}");
+
+    // A name leaves with its route.
+    let fake = Fake::start("named-leaves");
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = NexthopSource {
+        routes: vec![(v4(2, 0), vec![missing])],
+        queue: Default::default(),
+    };
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.unresolvable_named(false).len(), 1);
+    src.queue
+        .lock()
+        .unwrap()
+        .push(packetframe_vpp_offload::engine::SourceChanges {
+            neighbours: Vec::new(),
+            routes: vec![(v4(2, 0), Some(vec![nh()]))],
+        });
+    e.apply_changes(&src, 64).expect("delta");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().unresolvable, 0);
+    assert!(e.unresolvable_named(false).is_empty());
+}
+
+/// A re-run refreshes the verdict once the table is clean and leaves no
+/// convergence behind: no phase (which would hold `may_restart` false and
+/// key the socket deadline to converging), the new outcome recorded.
+#[test]
+fn a_verify_re_run_refreshes_the_verdict_and_leaves_no_phase() {
+    let missing = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
+    let fake = Fake::start("reverify");
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = NexthopSource {
+        routes: vec![(v4(0, 0), vec![nh()]), (v4(2, 0), vec![missing])],
+        queue: Default::default(),
+    };
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    let first = e.run_verify().expect("verify").outcome;
+    assert!(first.awaits_clean_table(), "{}", first.summary());
+
+    // The unresolvable route is withdrawn: the table is clean.
+    src.queue
+        .lock()
+        .unwrap()
+        .push(packetframe_vpp_offload::engine::SourceChanges {
+            neighbours: Vec::new(),
+            routes: vec![(v4(2, 0), None)],
+        });
+    e.apply_changes(&src, 64).expect("delta");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().unresolvable, 0);
+    let again = e.refresh_verify().expect("re-run");
+    assert!(again.passed(), "{}", again.summary());
+    assert!(!again.awaits_clean_table());
+    assert!(e.phase().is_none(), "a re-run is not a convergence");
+    assert!(e.last_verify().is_some_and(|v| v.passed()));
+}
+
+/// A kernel that answers every lookup after `delay` with a tunnel route,
+/// or fails every one, counting the asking.
+struct FlakyKernel {
+    lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail: bool,
+    delay: std::time::Duration,
+}
+
+impl Topology for FlakyKernel {
+    fn classify(&self, _: &str) -> Result<Option<DevKind>, String> {
+        Ok(Some(DevKind::Plain))
+    }
+    fn fdb(&self) -> Result<FdbSnapshot, String> {
+        Ok(FdbSnapshot::default())
+    }
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        Ok(PortVlans::default())
+    }
+    fn master_of(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn bridge_l3(&self, _: &str, _: u16) -> Option<BridgeL3> {
+        None
+    }
+    fn fib_match(
+        &self,
+        _: IpPrefix,
+    ) -> Result<packetframe_vpp_offload::topology::FibMatch, String> {
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        if self.fail {
+            return Err("netlink recv: Resource temporarily unavailable".into());
+        }
+        Ok(packetframe_vpp_offload::topology::FibMatch::Unicast {
+            oifs: vec!["tun0".into()],
+        })
+    }
+}
+
+/// Six routes via the router, each outside its subnets: six kernel-lookup
+/// candidates in one walk.
+fn six_via_the_router() -> Routed {
+    let own = IpAddr::V4(Ipv4Addr::from(OWN));
+    let mut routes = vec![(v4(0, 0), vec![nh()])];
+    for i in 0..6u8 {
+        routes.push((host4([192, 0, 2, 200 + i]), vec![own]));
+    }
+    Routed {
+        routes,
+        neighbours: vec![(nh(), "eth4")],
+    }
+}
+
+/// An unanswering `NETLINK_ROUTE` must not cost the supervision loop a
+/// receive timeout per candidate: the first failure ends the walk's
+/// lookups, and every remaining candidate stays unresolvable, named with
+/// why. And a kernel that answers, but slowly, is asked only until the
+/// walk's shared lookup time is spent (review finding: 1024 × 5 s on a
+/// resync before this).
+#[test]
+fn kernel_lookups_stop_at_the_first_failure_and_at_the_walk_time_budget() {
+    let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fake = Fake::start("fib-match-fails");
+    let mut e = engine_for(&fake)
+        .with_self_networks([pfx(OWN, 30)])
+        .with_topology(Box::new(FlakyKernel {
+            lookups: lookups.clone(),
+            fail: true,
+            delay: std::time::Duration::ZERO,
+        }));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = six_via_the_router();
+    let plan = e.begin_resync(&src);
+    assert_eq!(plan.kernel_delivered, 0);
+    assert_eq!(
+        lookups.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one failure, and the kernel is not asked again this walk"
+    );
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().unresolvable, 6);
+    let named = e.unresolvable_named(false);
+    assert!(
+        named[0].contains("the kernel's route for this prefix could not be read (netlink recv"),
+        "{named:?}"
+    );
+    assert!(
+        named[1..5]
+            .iter()
+            .all(|n| n.contains("the kernel's FIB could not be read")
+                && n.contains("not asked again this walk")),
+        "{named:?}"
+    );
+
+    // A slow kernel: asked until the walk's lookup time is spent.
+    let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let delay = std::time::Duration::from_millis(60);
+    let fake = Fake::start("fib-match-slow");
+    let mut e = engine_for(&fake)
+        .with_self_networks([pfx(OWN, 30)])
+        .with_topology(Box::new(FlakyKernel {
+            lookups: lookups.clone(),
+            fail: false,
+            delay,
+        }));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = six_via_the_router();
+    let started = std::time::Instant::now();
+    let plan = e.begin_resync(&src);
+    let took = started.elapsed();
+    let asked = lookups.load(std::sync::atomic::Ordering::SeqCst);
+    let budget = packetframe_vpp_offload::engine::FIB_MATCH_WALL_BUDGET;
+    assert!(
+        asked < 6,
+        "the time budget stops the lookups: asked {asked}"
+    );
+    assert_eq!(asked as u32, budget.as_millis() as u32 / 60 + 1);
+    assert!(
+        took < budget + delay * 2,
+        "bounded by the budget plus one lookup: {took:?}"
+    );
+    assert_eq!(
+        plan.kernel_delivered, asked as u64,
+        "every answer asked was used"
+    );
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!(e.counts().unresolvable, 6 - asked as u64);
+    assert!(
+        e.unresolvable_named(false)
+            .iter()
+            .take(6 - asked)
+            .all(|n| n.contains("ms for kernel lookups was spent")),
+        "{:?}",
+        e.unresolvable_named(false)
+    );
+}
+
+/// The member a re-run finds dark is what the ports row reports: the
+/// re-run's interface dump is the newest link observation, so an older
+/// clean steer-gate scan must not keep standing in for it — that is the
+/// difference between a steered blackhole reading Unhealthy and Degraded.
+#[test]
+fn a_verify_re_run_publishes_its_link_scan() {
+    static DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let fake = Fake::start_behaving(
+        "reverify-links",
+        Behaviour {
+            first_port_dark: Some(&DARK),
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = NexthopSource {
+        routes: vec![(v4(0, 0), vec![nh()])],
+        queue: Default::default(),
+    };
+    e.begin_resync(&src);
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    // The steer gate's scan, while the cable is in: clean.
+    assert!(e.dead_members().expect("scan").is_empty());
+    assert!(e.port_links().iter().all(|p| p.link_up));
+
+    // The cable comes out; a re-run sees it.
+    DARK.store(true, std::sync::atomic::Ordering::SeqCst);
+    let again = e.refresh_verify().expect("re-run");
+    assert!(
+        again.dead_interfaces.iter().any(|d| d.in_use && !d.link_up),
+        "{}",
+        again.summary()
+    );
+    let links = e.port_links();
+    assert!(
+        links.iter().any(|p| p.in_use && !p.link_up),
+        "the ports row reads the re-run's observation: {links:?}"
+    );
+}

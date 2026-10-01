@@ -117,6 +117,34 @@ fn op_timeout(steered: bool, converging: bool) -> Duration {
 /// full table so a tick cannot monopolise the loop and starve the ping.
 pub const DRAIN_BATCH: usize = 4_096;
 
+/// Kernel FIB lookups one resync walk may make for routes whose every
+/// next hop is the router ([`ConvergenceEngine::kernel_owns`]). A
+/// production feed has tens of those (what the routing daemon originates
+/// itself); a `next-hop-self` feed has the whole table, and past this
+/// many the rest stay unresolvable — which is what that feed is.
+pub const FIB_MATCH_BUDGET_RESYNC: usize = 1_024;
+
+/// The same, per delta batch.
+pub const FIB_MATCH_BUDGET_DELTA: usize = 64;
+
+/// Wall-clock time one walk may spend in kernel FIB lookups, shared by
+/// every lookup in it — a tenth of the steady socket deadline
+/// ([`crate::liveness`]'s 1.5 s), so a slow kernel costs the supervision
+/// loop a bounded slice however many candidates the walk holds. A lookup
+/// is tens of microseconds normally; past this the rest stay unresolvable
+/// and are named so.
+pub const FIB_MATCH_WALL_BUDGET: Duration = Duration::from_millis(150);
+
+/// How many kernel refusals the engine keeps the reason of
+/// ([`ConvergenceEngine`]'s `kernel_refused`). Past it a route still
+/// classifies the same; only its name is less specific.
+pub const KERNEL_REFUSALS_CAP: usize = 4_096;
+
+/// How many unresolvable prefixes per family health names, with each
+/// one's next hops and why they do not reach VPP
+/// ([`ConvergenceEngine::unresolvable_named`]). The rest are "+K more".
+pub const NAMED_UNRESOLVABLE: usize = 5;
+
 /// Where routes and nexthop devices come from.
 ///
 /// A trait because the real source is the fast-path crate's
@@ -680,6 +708,31 @@ pub struct ConvergenceEngine {
     /// `kernel_delivered` prefix before a first steer
     /// ([`Self::unexempted_local`]).
     steer_exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+    /// Kernel FIB lookups the current walk may still make
+    /// ([`Self::kernel_owns`]). Reset to [`FIB_MATCH_BUDGET_RESYNC`] by
+    /// each resync and to [`FIB_MATCH_BUDGET_DELTA`] by each delta
+    /// batch, so a feed whose every route names the router — the
+    /// `next-hop-self` misconfiguration — costs a bounded number of
+    /// netlink round trips on the supervision loop, not a million.
+    fib_match_budget: usize,
+    /// Time the current walk has spent in kernel FIB lookups, against
+    /// [`FIB_MATCH_WALL_BUDGET`].
+    fib_match_spent: Duration,
+    /// Why the current walk stopped asking the kernel, once it has: the
+    /// FIB could not be read, or the walk's lookup time is spent. Every
+    /// later candidate in the walk is refused with this reason instead of
+    /// waiting out the same failure again — on an unanswering
+    /// `NETLINK_ROUTE` that was a receive timeout per candidate, up to the
+    /// whole count budget, on the supervision loop (review finding).
+    fib_match_halted: Option<String>,
+    /// Why the kernel did not prove a route via the router its own
+    /// ([`Self::kernel_owns`]), per prefix, for the name an unresolvable
+    /// route gets ([`Self::unresolvable_named`]): the likeliest lone
+    /// unresolvable route on a production feed is one of these, and
+    /// "the router's own address" alone does not say which way the kernel
+    /// answered. Cleared by each resync, an entry dropped when its route
+    /// is withdrawn, and bounded at [`KERNEL_REFUSALS_CAP`].
+    kernel_refused: std::collections::HashMap<IpPrefix, String>,
     /// The address the loopback holds; every member is unnumbered to it.
     loopback: packetframe_common::config::Ipv4Prefix,
     /// The loopback's index once created. `None` until the first attach
@@ -900,6 +953,10 @@ impl ConvergenceEngine {
             self_nets: Vec::new(),
             self_nets6: Vec::new(),
             kernel_delivered: HashSet::new(),
+            fib_match_budget: 0,
+            fib_match_spent: Duration::ZERO,
+            fib_match_halted: None,
+            kernel_refused: std::collections::HashMap::new(),
             link_local_refused: HashSet::new(),
             steer_exempts: Vec::new(),
             loopback,
@@ -1218,45 +1275,312 @@ impl ConvergenceEngine {
         self.steer_exempts = exempts;
     }
 
-    /// Whether a route is one of the router's own connected subnets,
-    /// which the kernel delivers and VPP has no path for.
+    /// Whether a route is the router's own business — delivered, or
+    /// carried, by the kernel through nothing VPP has — and so left out
+    /// of VPP and counted as kernel-delivered rather than unresolvable.
     ///
-    /// A routing daemon feeding packetframe over iBGP sends what it
-    /// originates — `redistribute connected` above all — with NEXT_HOP
-    /// set to its own session address. VPP has no adjacency for its own
-    /// host and never will: left in, each such route reads as
-    /// unresolvable, which blocks the first steer by design, and on a
-    /// production feed with a dozen connected subnets steering could
-    /// never start.
+    /// Three shapes, every one PROVEN from the router's own state, never
+    /// inferred from the next hop alone:
     ///
-    /// BOTH conditions, because a self next hop alone does not say where
-    /// a route came from: `next-hop-self` on the packetframe session puts
-    /// the router's address on every TRANSIT route too, and treating
-    /// those as kernel-delivered would withdraw the whole table from VPP
-    /// (review finding). A route counts only when its prefix also lies
-    /// inside a subnet the router is itself addressed on; anything else
-    /// through a self next hop stays unresolvable and keeps blocking.
+    /// 1. **A connected subnet via the router itself** (#265). A routing
+    ///    daemon feeding packetframe over iBGP sends what it originates —
+    ///    `redistribute connected` above all — with NEXT_HOP set to its
+    ///    own session address. VPP has no adjacency for its own host and
+    ///    never will: left in, each such route reads as unresolvable,
+    ///    which blocks the first steer by design, and on a production
+    ///    feed with a dozen connected subnets steering could never start.
+    ///    Every next hop the router's, AND the prefix inside a subnet the
+    ///    router is itself addressed on.
+    /// 2. **One of the router's own addresses**: a /32 or /128 the kernel
+    ///    holds on any device, which its local table delivers ahead of
+    ///    anything in main. The shape the subnet test cannot see when the
+    ///    address sits on a device with no connected subnet around it (a
+    ///    /32 on a dummy or honeypot device). Only when NO next hop reaches
+    ///    VPP: a route VPP could install is never withdrawn by this, so
+    ///    the reclassification only ever relabels a route that was going
+    ///    to be missing from VPP anyway.
+    /// 3. **An IPv4 route via the router itself that the kernel carries
+    ///    through devices VPP cannot reach** (a static /32 via a tunnel, a
+    ///    connected route on a device that is neither a member port nor
+    ///    bridged into one) **or delivers itself**. Every next hop the
+    ///    router's, AND the kernel's own FIB entry for exactly this prefix
+    ///    says so ([`Self::kernel_owns`]).
     ///
-    /// **IPv6 too** (`v6 on`), by the same two conditions: next hops all
-    /// the router's own (global or link-local), prefix inside one of its
-    /// global v6 subnets. Such a route is left out of VPP and withdrawn if
-    /// installed, exactly as for v4 — left in, it would read unresolvable
-    /// forever. It is NOT a first-steer blocker the way a v4 one is; see
-    /// [`Self::unexempted_local`] for why it need not be.
-    fn kernel_delivered_route(&self, prefix: &IpPrefix, nexthops: &[IpAddr]) -> bool {
-        !nexthops.is_empty()
-            && nexthops.iter().all(|n| self.self_addrs.contains(n))
+    /// Never the next hop alone (the review finding on #265):
+    /// `next-hop-self` on the packetframe session puts the router's
+    /// address on every TRANSIT route too. Those leave through member
+    /// ports in the kernel, so shape 3 refuses them and they stay
+    /// unresolvable — loud, blocking the first steer — rather than
+    /// reading as the designed state. Anything not proven here stays
+    /// unresolvable, and a genuinely unreachable next hop on a VPP port
+    /// is none of the three.
+    ///
+    /// Leaving a prefix out of VPP is only safe while steered traffic for
+    /// it never arrives there, so every v4 prefix counted here must be
+    /// covered by a `steer-exempt` before a first steer
+    /// ([`Self::unexempted_local`]): one gate for all three shapes. The
+    /// exemption tripwire (`exempt-drift`) independently names the kernel
+    /// paths behind shapes 2 and 3 — the router's own addresses, and
+    /// routes out devices VPP does not take — so neither needs a second
+    /// report of its own.
+    ///
+    /// **IPv6** (`v6 on`) takes shapes 1 and 2 only: next hops all the
+    /// router's own (global or link-local) and the prefix inside one of
+    /// its global v6 subnets, or one of its addresses — whose /128 the
+    /// hand-back path returns to the kernel when IPv6 is diverted
+    /// ([`crate::handback::router_owned`]: every global address). Such a
+    /// route is left out of VPP and withdrawn if installed, exactly as for
+    /// v4 — left in, it would read unresolvable forever. It is NOT a
+    /// first-steer blocker the way a v4 one is; see
+    /// [`Self::unexempted_local`] for why it need not be. Shape 3 is
+    /// refused for v6: nothing would keep diverted traffic for such a
+    /// prefix off VPP.
+    fn kernel_delivered_route(&mut self, prefix: &IpPrefix, nexthops: &[IpAddr]) -> bool {
+        if nexthops.is_empty() {
+            return false;
+        }
+        let all_self = nexthops.iter().all(|n| self.self_addrs.contains(n));
+        if all_self
             && (self.self_nets.iter().any(|net| v4_covers(net, prefix))
                 || self
                     .self_nets6
                     .iter()
                     .any(|(net, len)| v6_covers(*net, *len, prefix)))
+        {
+            return true;
+        }
+        if self.own_address(prefix) && self.nexthops.resolve_all(nexthops).is_empty() {
+            return true;
+        }
+        // IPv4 only (review finding). A v6 diversion takes TCP/UDP to the
+        // router's MAC whatever the destination, there is no v6
+        // `steer-exempt` to keep a prefix's traffic on the kernel, and the
+        // hand-back path returns only the router's own /128s — so a v6
+        // route the kernel carries elsewhere, left out of VPP, is diverted
+        // traffic dropped in VPP. It stays unresolvable, impaired on
+        // `fib-v6`, and its name says why ([`Self::why_unresolved`]).
+        all_self && matches!(prefix, IpPrefix::V4 { .. }) && self.kernel_owns(prefix)
     }
 
-    /// How many mirror prefixes are the router's own connected subnets
-    /// and so are left out of VPP.
+    /// Whether `prefix` is a host prefix naming one of the router's own
+    /// addresses.
+    fn own_address(&self, prefix: &IpPrefix) -> bool {
+        match *prefix {
+            IpPrefix::V4 {
+                addr,
+                prefix_len: 32,
+            } => self
+                .self_addrs
+                .contains(&IpAddr::V4(std::net::Ipv4Addr::from(addr))),
+            IpPrefix::V6 {
+                addr,
+                prefix_len: 128,
+            } => self
+                .self_addrs
+                .contains(&IpAddr::V6(std::net::Ipv6Addr::from(addr))),
+            _ => false,
+        }
+    }
+
+    /// Whether the kernel's own FIB entry for exactly `prefix` delivers it
+    /// locally, or carries it only through devices VPP cannot reach —
+    /// shape 3 of [`Self::kernel_delivered_route`]. One lookup, charged to
+    /// the walk's budget. A spent budget, an unreadable kernel, an entry
+    /// for a different prefix, a drop route, or any hop VPP might take
+    /// all answer `false`, which leaves the route unresolvable.
+    fn kernel_owns(&mut self, prefix: &IpPrefix) -> bool {
+        use crate::topology::FibMatch;
+        let refused: String = if let Some(why) = &self.fib_match_halted {
+            why.clone()
+        } else if self.fib_match_budget == 0 {
+            "the kernel was not asked about this prefix (this walk's lookup budget was spent, \
+             as on a feed whose every route names the router)"
+                .into()
+        } else {
+            self.fib_match_budget -= 1;
+            let asked = std::time::Instant::now();
+            let answer = self.topology.fib_match(*prefix);
+            self.fib_match_spent += asked.elapsed();
+            if self.fib_match_spent >= FIB_MATCH_WALL_BUDGET && self.fib_match_halted.is_none() {
+                self.fib_match_halted = Some(format!(
+                    "the kernel was not asked about this prefix (this walk's {} ms for kernel \
+                     lookups was spent)",
+                    FIB_MATCH_WALL_BUDGET.as_millis()
+                ));
+            }
+            match answer {
+                Ok(FibMatch::Local) => {
+                    self.kernel_refused.remove(prefix);
+                    return true;
+                }
+                Ok(FibMatch::Unicast { oifs }) if oifs.is_empty() => {
+                    "the kernel's route for exactly this prefix names no device".into()
+                }
+                Ok(FibMatch::Unicast { oifs }) => {
+                    match oifs.iter().find(|d| !self.vpp_cannot_reach(d)) {
+                        None => {
+                            self.kernel_refused.remove(prefix);
+                            return true;
+                        }
+                        Some(dev) => format!(
+                        "the kernel sends this prefix out {dev}, which VPP can reach (a transit \
+                         route under `next-hop-self`?)"
+                    ),
+                    }
+                }
+                Ok(FibMatch::Other) => "the kernel's route for exactly this prefix drops it \
+                                        (blackhole, unreachable or prohibit)"
+                    .into(),
+                Ok(FibMatch::NotExact) => {
+                    "the kernel has no route of its own for exactly this prefix".into()
+                }
+                // The first failure ends the walk's lookups: a facility
+                // that did not answer once is not asked again for every
+                // remaining candidate.
+                Err(e) => {
+                    tracing::warn!(
+                        prefix = ?prefix,
+                        error = %e,
+                        "kernel FIB lookup failed; routes via the router stay unresolvable for \
+                         the rest of this walk"
+                    );
+                    self.fib_match_halted = Some(format!(
+                        "the kernel's FIB could not be read ({e}), so it was not asked again \
+                         this walk"
+                    ));
+                    format!("the kernel's route for this prefix could not be read ({e})")
+                }
+            }
+        };
+        if self.kernel_refused.len() < KERNEL_REFUSALS_CAP
+            || self.kernel_refused.contains_key(prefix)
+        {
+            self.kernel_refused.insert(*prefix, refused);
+        }
+        false
+    }
+
+    /// Whether VPP provably has no way out through kernel device `dev`:
+    /// not a member port, not a VLAN of one, not a bridge a member port
+    /// is enslaved to nor a VLAN of such a bridge, not a `local-route`
+    /// device. An unreadable classification is not proof.
+    fn vpp_cannot_reach(&self, dev: &str) -> bool {
+        let member = |d: &str| self.ports.iter().any(|p| p.port == d);
+        let member_under = |bridge: &str| {
+            self.ports
+                .iter()
+                .any(|p| self.topology.master_of(&p.port).as_deref() == Some(bridge))
+        };
+        if member(dev) || self.local_routes.iter().any(|l| l.kernel_dev == dev) {
+            return false;
+        }
+        match self.topology.classify(dev) {
+            Ok(Some(crate::topology::DevKind::Plain)) => true,
+            Ok(Some(crate::topology::DevKind::PortVlan { port, .. })) => !member(&port),
+            Ok(Some(crate::topology::DevKind::BridgeVlan { bridge, .. })) => !member_under(&bridge),
+            // A bridge shape placement cannot use: reachable if any
+            // member port is enslaved to it.
+            Ok(None) => !member_under(dev),
+            Err(_) => false,
+        }
+    }
+
+    /// How many mirror prefixes are the router's own business
+    /// ([`Self::kernel_delivered_route`]) and so are left out of VPP.
     pub fn kernel_delivered_routes(&self) -> u64 {
         self.kernel_delivered.len() as u64
+    }
+
+    /// Up to [`NAMED_UNRESOLVABLE`] of one family's unresolvable routes
+    /// (`v6`, or v4), each as `"<prefix> via <nexthop> [dev <device>]
+    /// (<why>)"` — the device the neighbour source reported, when it
+    /// reported one — then `"+K more"` when the count is larger. Empty
+    /// when nothing is unresolvable.
+    ///
+    /// The names the count never had: `unresolvable=1` on its own sent an
+    /// operator through `vppctl show ip fib` and the fast-path dump for
+    /// rounds, and the fast-path dump cannot even show it — a route whose
+    /// next hop the kernel HAS resolved, on a device VPP does not own, is
+    /// resolved there and unresolvable here. Same pattern as the unplaced
+    /// neighbours ([`Self::unplaced_neighbours`]): bounded, and read off
+    /// state already held — the ledger's per-prefix detail and the
+    /// mapping's own reasons ([`NexthopMap::why_unresolved`]), so a name
+    /// cannot describe a different decision from the one that was made.
+    pub fn unresolvable_named(&self, v6: bool) -> Vec<String> {
+        let total = if v6 {
+            self.ledger.v6_counts().unresolvable
+        } else {
+            self.ledger.counts().unresolvable
+        };
+        if total == 0 {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = self
+            .ledger
+            .unresolvable_detail(v6, NAMED_UNRESOLVABLE)
+            .into_iter()
+            .map(|(prefix, nhs)| {
+                if nhs.is_empty() {
+                    return format!("{} (no next hop)", cidr(&prefix));
+                }
+                // An ECMP set is named by its first few paths: the reason
+                // is usually shared, and a line per path would bury the
+                // other prefixes.
+                const PATHS_NAMED: usize = 3;
+                let mut paths: Vec<String> = nhs
+                    .iter()
+                    .take(PATHS_NAMED)
+                    .map(|nh| match self.nexthops.device_of(nh) {
+                        Some(dev) => {
+                            format!("{nh} dev {dev} ({})", self.why_unresolved(&prefix, nh))
+                        }
+                        None => format!("{nh} ({})", self.why_unresolved(&prefix, nh)),
+                    })
+                    .collect();
+                if nhs.len() > PATHS_NAMED {
+                    paths.push(format!("+{} more path(s)", nhs.len() - PATHS_NAMED));
+                }
+                format!("{} via {}", cidr(&prefix), paths.join(", "))
+            })
+            .collect();
+        let named = out.len() as u64;
+        if total > named {
+            out.push(format!("+{} more", total - named));
+        }
+        out
+    }
+
+    /// Why one next hop does not reach VPP. The engine's own refusals
+    /// come first — the router's own address, a link-local or uncarried
+    /// address never admitted as a neighbour
+    /// ([`Self::carries_neighbour`]) — then the mapping's.
+    fn why_unresolved(&self, prefix: &IpPrefix, nh: &IpAddr) -> String {
+        if self.self_addrs.contains(nh) && matches!(prefix, IpPrefix::V6 { .. }) {
+            return "the router's own address, which VPP has no adjacency for; the prefix is in no \
+                    subnet or address of the router, and IPv6 has no steer-exempt, so diverted \
+                    traffic for it would be dropped in VPP rather than left to the kernel"
+                .into();
+        }
+        if self.self_addrs.contains(nh) {
+            // Which way the kernel answered, when it was asked: a route via
+            // the router is kernel-delivered only on the kernel's word
+            // ([`Self::kernel_delivered_route`]), so its absence is the
+            // reason.
+            return format!(
+                "the router's own address, which VPP has no adjacency for; {}",
+                self.kernel_refused.get(prefix).map_or(
+                    "the prefix is in no subnet or address of the router",
+                    String::as_str
+                )
+            );
+        }
+        if is_link_local(nh) {
+            return "link-local, whose interface the route feed does not carry".into();
+        }
+        if !self.drainer.families().carries_address(*nh) {
+            return "an IPv6 next hop, and VPP carries no IPv6 (`v6 off`)".into();
+        }
+        self.nexthops.why_unresolved(nh)
     }
 
     /// The kernel-delivered prefixes no `steer-exempt` covers, sorted.
@@ -2167,11 +2491,12 @@ impl ConvergenceEngine {
             .collect()
     }
 
-    /// The freshest dark-interface observation available, and the scan
-    /// wins when there is one: it is what the steer gate acted on, so a
-    /// port restored between the last verify and the last steer reads as
-    /// restored here too. Falling back to the verify's recording covers
-    /// the window before any gate has run.
+    /// The freshest dark-interface observation available. Both the steer
+    /// gate's scan and every completed verify (a re-run included) write the
+    /// cache, so it is whichever looked last: a port restored between the
+    /// last verify and the last steer reads as restored, and a member gone
+    /// dark at a re-run reads as dark. Falling back to the verify's
+    /// recording covers a cache cleared with the process.
     fn latest_dead(&self) -> &[crate::verify::DeadInterface] {
         self.last_dead_scan
             .as_deref()
@@ -3241,6 +3566,9 @@ impl ConvergenceEngine {
             src.requeue_via(&std::mem::take(&mut self.placement_changed));
         }
         let families = self.drainer.families();
+        self.fib_match_budget = FIB_MATCH_BUDGET_DELTA;
+        self.fib_match_spent = Duration::ZERO;
+        self.fib_match_halted = None;
         for (prefix, nhs) in changes.routes {
             // The delta door's half of the route family filter (see
             // `begin_resync`): never queued, so never pending.
@@ -3284,6 +3612,7 @@ impl ConvergenceEngine {
                 None => {
                     self.kernel_delivered.remove(&prefix);
                     self.link_local_refused.remove(&prefix);
+                    self.kernel_refused.remove(&prefix);
                     self.pending.withdraw(prefix);
                 }
             }
@@ -3438,6 +3767,10 @@ impl ConvergenceEngine {
         self.shadowed.clear();
         self.kernel_delivered.clear();
         self.link_local_refused.clear();
+        self.kernel_refused.clear();
+        self.fib_match_budget = FIB_MATCH_BUDGET_RESYNC;
+        self.fib_match_spent = Duration::ZERO;
+        self.fib_match_halted = None;
         let families = self.drainer.families();
         src.for_each_route(&mut |prefix, nexthops| {
             // A family VPP does not carry never enters the diff — the
@@ -3619,12 +3952,45 @@ impl ConvergenceEngine {
             return Err(EngineError::NotConnected);
         }
         self.phase = Some(Phase::Verify);
+        // On a transport failure the phase is KEPT. The supervisor is
+        // still converging — a lost connection resumes the verify, a
+        // protocol fault aborts it (`abort_convergence` clears this) — and
+        // the socket deadline keys on the phase. Cleared here, the
+        // reconnect and the post-loss probe of an unsteered verify ran
+        // under the steady 1.5 s while the detector allowed 10 s: the
+        // mismatch `Phase::Attach` removes, recreated one step later
+        // (review finding, PR #272).
+        self.verify_pass(check_paths)
+    }
+
+    /// Re-run verify outside a convergence, to refresh a verdict the
+    /// table has outgrown ([`crate::verify::ReverifySchedule`]). The same
+    /// pass as [`Self::run_verify`] and the same recorded outcome; what
+    /// differs is that this is not a convergence step. No phase is set, so
+    /// the socket deadline is the steady one the wedge detector judges this
+    /// state by — a converging deadline here would let one slow reply hold
+    /// the loop past the budget the detector publishes — and a failure
+    /// leaves nothing behind for an abort to clear. The caller hands the
+    /// verdict to no supervisor. Paths are never compared: a seeded ledger
+    /// is judged once, by the convergence that seeded it.
+    pub fn refresh_verify(&mut self) -> Result<VerifyOutcome, EngineError> {
+        if self.transport.is_none() {
+            return Err(EngineError::NotConnected);
+        }
+        self.verify_pass(false).map(|v| v.outcome)
+    }
+
+    /// One verify pass over a connected transport, under whatever phase
+    /// the caller set.
+    fn verify_pass(&mut self, check_paths: bool) -> Result<Verdict, EngineError> {
         self.arm_timeout();
         self.verify_seed = next_seed(self.verify_seed);
         let seed = self.verify_seed;
 
         let active = self.active_egress_indices();
-        let t = self.transport.as_mut().expect("checked just above");
+        let Some(t) = self.transport.as_mut() else {
+            return Err(EngineError::NotConnected);
+        };
         match verify_paths(
             t,
             &self.ledger,
@@ -3637,7 +4003,17 @@ impl ConvergenceEngine {
         ) {
             Ok(mut outcome) => {
                 outcome.unexempted_local = self.counts().unexempted_local;
+                outcome.unresolvable_named = self.unresolvable_named(false);
+                if let Some(v6) = outcome.v6.as_mut() {
+                    v6.unresolvable_named = self.unresolvable_named(true);
+                }
                 self.last_verify = Some(outcome.clone());
+                // The pass dumped the interfaces too, and that is now the
+                // newest link observation: `latest_dead` prefers the cache,
+                // so leaving an older steer-gate scan there kept the ports
+                // row and `steered_but_broken` on it while this verdict
+                // named a member gone dark (review finding).
+                self.last_dead_scan = Some(outcome.dead_interfaces.clone());
                 self.phase = None;
                 // The gate the ledger has always been able to answer and
                 // nothing asked.
@@ -3650,15 +4026,6 @@ impl ConvergenceEngine {
                 // transport failure is not a verdict on the FIB, and
                 // storing it as a failed verify would report "FIB is
                 // wrong" for what is actually "we could not ask".
-                //
-                // The phase is KEPT. The supervisor is still converging —
-                // a lost connection resumes the verify, a protocol fault
-                // aborts it (`abort_convergence` clears this) — and the
-                // socket deadline keys on the phase. Cleared here, the
-                // reconnect and the post-loss probe of an unsteered
-                // verify ran under the steady 1.5 s while the detector
-                // allowed 10 s: the mismatch `Phase::Attach` removes,
-                // recreated one step later (review finding, PR #272).
                 Err(EngineError::Transport(e))
             }
         }
@@ -3979,6 +4346,18 @@ fn is_neighbour_adj_fib(route: &IpRoute, nh: &[u8; 16]) -> bool {
         _ => route.prefix.len == 128,
     };
     host && route.prefix.address.un.0 == *nh
+}
+
+/// `addr/len`, as `ip route` prints it.
+fn cidr(p: &IpPrefix) -> String {
+    match *p {
+        IpPrefix::V4 { addr, prefix_len } => {
+            format!("{}/{prefix_len}", std::net::Ipv4Addr::from(addr))
+        }
+        IpPrefix::V6 { addr, prefix_len } => {
+            format!("{}/{prefix_len}", std::net::Ipv6Addr::from(addr))
+        }
+    }
 }
 
 /// `fe80::/10`: scoped to one link, so meaningless without an interface.
@@ -4314,6 +4693,7 @@ mod tests {
             sampled: 4,
             mismatches: vec![],
             unresolvable: 0,
+            unresolvable_named: vec![],
             withheld: 0,
             unexempted_local: 0,
             dead_interfaces: vec![],

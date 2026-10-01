@@ -1081,24 +1081,69 @@ One line does three things at attach:
    exactly its poisoned host route, and a JUMP in it is a mirror
    change worth reading about.
 
-Separately from `local-route`, the router's own connected subnets are
-left out of VPP. A routing daemon feeding packetframe over iBGP sends
-what it originates, `redistribute connected` above all, with its own
-session address as NEXT_HOP. The kernel delivers those subnets, and VPP
-could only ever count them unresolvable, which blocks the first steer.
-A route is treated this way only when every next hop is one of the
-router's addresses AND its prefix lies inside a subnet the router is
-addressed on. Under `next-hop-self` a transit route carries the router's
-address too, and it stays unresolvable. The router's addresses are read
-at attach. `packetframe_vpp_kernel_delivered_routes` counts them; a
-steady value equal to the number of connected subnets the daemon
-redistributes is normal.
+#### Kernel-delivered routes: the router's own, never unresolvable
 
-Each one needs a covering `steer-exempt`, and a first steer is refused
+Separately from `local-route`, routes that are the router's own business
+are left out of VPP and counted as **kernel-delivered**, not as
+unresolvable. A routing daemon feeding packetframe over iBGP sends what
+it originates (`redistribute connected` and `redistribute static` above
+all) with its own session address as NEXT_HOP. VPP has no adjacency for
+the router itself, so it could only ever count those routes unresolvable,
+which blocks the first steer and keeps `fib-synced` Degraded for good.
+
+A route is kernel-delivered in exactly three shapes, each proven from the
+router's own state:
+
+1. **A connected subnet via the router itself.** Every next hop is one
+   of the router's addresses, and the prefix lies inside a subnet the
+   router is addressed on.
+2. **One of the router's own addresses.** The prefix is a `/32` or
+   `/128` the kernel holds on any device (a dummy or honeypot device, a
+   loopback), and no next hop reaches VPP. The kernel's local table
+   delivers these ahead of anything in `main`. A host route VPP *can*
+   carry through a member port is never touched.
+3. **An IPv4 route via the router that the kernel carries elsewhere.**
+   Every next hop is one of the router's addresses, and the kernel's own
+   FIB entry for exactly that prefix (`ip route get` with `fibmatch`
+   semantics) either delivers it locally or leaves only through devices
+   VPP cannot reach: not a member port, not a VLAN of one, not a bridge
+   a member port is enslaved to, not a `local-route` device. A static
+   `/32` via a tunnel is the usual case. Each walk asks the kernel at
+   most 1,024 times per resync and 64 per delta batch. It spends at most
+   150 ms on the asking in total, and stops at the first lookup the
+   kernel fails to answer; the routes it then never asked about stay
+   unresolvable, named with why.
+
+IPv6 takes shapes 1 and 2 only. A `v6-divert` rule takes TCP and UDP to
+the router's MAC whatever the destination, there is no v6 `steer-exempt`,
+and the hand-back path returns only the router's own `/128`s (every global
+address, which is why shape 2 is safe for v6). A v6 prefix the kernel
+carries out a tunnel would be diverted traffic dropped in VPP, so it stays
+unresolvable on `fib-v6`, with a name that says so.
+
+The next hop alone is never enough. Under `next-hop-self` every transit
+route carries the router's address; the kernel sends those out member
+ports, so shape 3 refuses them and they stay unresolvable (loud, and
+blocking the first steer). A kernel entry for a different prefix, a
+blackhole or unreachable route, or an unreadable kernel also leaves a
+route unresolvable. The router's addresses are read at attach; the kernel
+lookup runs when the route is classified.
+
+`packetframe_vpp_kernel_delivered_routes` counts them, and the
+`fib-synced` row prints the count beside the unresolvable one. A steady
+value equal to what the daemon originates (connected subnets, its own
+addresses, statics via tunnels) is normal.
+
+Each v4 one needs a covering `steer-exempt`, and a first steer is refused
 until every one has it. VPP has no route for them, so a steered packet
 would follow a less-specific route out of the box. The refusal names the
-subnets; add the exemptions and `reconfigure`. A gateway `/32` does not
-cover its subnet.
+prefixes; add the exemptions and `reconfigure`. A gateway `/32` does not
+cover its subnet. The exemption tripwire (`exempt-drift`) names the same
+kernel paths independently: the router's own addresses and routes out
+devices VPP does not take are exactly what it watches. A kernel-delivered
+prefix without an exemption fails verify on its own count
+(`N kernel-delivered prefix(es) without a steer-exempt`), never as
+unresolvable.
 
 Validation refuses: a port the section does not declare, a vlan
 missing from the port's `vlans` list, a prefix outside every
@@ -2946,6 +2991,38 @@ nexthops, no tunnels — so any non-zero value means either a new egress
 device appeared in the table or a member port is missing. Check the
 `port` lines against every `dev` appearing as a FIB nexthop in bird.
 
+**Read the names first.** Every surface that reports the count also
+names up to five of the routes, then `+K more`: the `fib-synced` and
+`fib-v6` rows (live), the verify summary (as of that verify), a refused
+first steer, and an `unresolvable_routes` event in `packetframe events`
+whenever the set changes (at most once a minute; `detail: none` once it
+empties). Each name reads
+
+```
+<prefix> via <nexthop> [dev <device>] (<why>)
+```
+
+where the device is the one the neighbour source reported, and the
+reason is the mapping's own decision:
+
+| Reason | Meaning | What to do |
+|---|---|---|
+| `no neighbour: the kernel has not resolved it` | nothing has reported a neighbour for the next hop | `ip neigh show <nexthop>`; on an IX, the snooper |
+| `not a VPP port` | the neighbour is on a device that is not a member port | add the `port`, or the route is not VPP's to carry |
+| `VLAN N on P, which is not a VPP port` / `VLAN N is not declared on port P` | a VLAN device over a non-member, or a vid missing from `port … vlans` | the `port` line |
+| `bridge neighbour …` | the FDB has not placed it behind a member, or it is behind a non-member or a tagged VLAN with no BVI | see [bridge neighbours](#bridge-neighbours-placed-per-neighbour-from-the-fdb) |
+| `… and IPv6 has no steer-exempt, so diverted traffic for it would be dropped in VPP …` | a v6 route via the router outside its subnets and addresses; never left to the kernel (shape 3 is v4 only) | the feed, a `steer-keep6`, or dropping `v6-divert` |
+| `the router's own address, which VPP has no adjacency for; …` | every next hop is the router, and none of the kernel-delivered shapes held. The rest of the reason says how the kernel answered for exactly that prefix: `sends this prefix out <dev>, which VPP can reach` (a transit route under `next-hop-self`: the feed is wrong), `drops it (blackhole, unreachable or prohibit)` (an aggregate the router originates; VPP would send its traffic down a less-specific route, so it is not left to the kernel), `has no route of its own for exactly this prefix`, `could not be read`, or `was not asked` (the per-walk lookup budget was spent) | `ip route get <prefix-address> fibmatch` shows the same entry the module read |
+| `reachable now; …` | the neighbour arrived after the route was classified | nothing: it is re-programmed with the neighbour |
+
+`packetframe fib dump-v4 --unresolved` is **not** the place to look for
+these. That lists routes whose next hop the fast path has not resolved;
+a route whose next hop the kernel *has* resolved, on a device VPP does
+not own, is resolved there and unresolvable here. And the router's own
+connected and static routes show up there as `state=incomplete` (the
+fast path labels those next hops `local`) while VPP counts them as
+kernel-delivered.
+
 This also **blocks the first steer** on an unsteered port, by design:
 if the table cannot be installed, traffic must not be diverted into it.
 A lever move refused on those grounds is remembered, and the steer goes
@@ -3360,9 +3437,17 @@ reason, and prints the verdict's age and the live table beside it:
 ```
 fib-synced   DEGRADED — verify INCOMPLETE — steering refused, no
   restart: 0/0 probes matched, unresolvable=0, withheld=0 (verify ran
-  1847s ago and does not re-run in steady state; the table now holds
+  1847s ago and re-runs on its own once the table holds no unresolvable
+  route and no unexempted kernel-delivered prefix; the table now holds
   69155 installed, 0 withheld, 0 unresolvable)
 ```
+
+A verdict that failed only on unresolvable routes, unexempted
+kernel-delivered prefixes or an empty sample is **re-run once the table
+is clean** (see [the re-run](#the-one-re-run-a-stale-incomplete-verdict)),
+so this line no longer outlives its cause by more than a few seconds. One
+that failed for any other reason (a dark member carrying routes) says
+`does not re-run in steady state` instead.
 
 Read the parenthesis first. Verification is a convergence-time gate, and
 **the live steering gates never consult this verdict** — they re-read
@@ -3814,6 +3899,30 @@ The same applies to a NON-green one, and it bites harder, because the
 condition usually clears while the verdict does not. Every `fib-synced`
 line that is not `healthy` therefore carries its own age; compare that
 against the counts printed beside it before acting on the verdict.
+
+#### The one re-run: a stale incomplete verdict
+
+One verdict is re-run. A verify that failed **only** because the table
+held unresolvable routes, kernel-delivered prefixes without a
+`steer-exempt`, or nothing at all is re-run once, after the table has
+held none of those for 10 s, and at most once every 5 minutes. A verdict
+with a probe mismatch or an in-use dark member is never re-run, since a
+clean table does not clear either.
+
+The re-run happens only in `Ready` or `Steered`, on a tick whose drain
+proved nothing is pending, with VPP answering its last ping. It also
+needs no source backlog, nothing in flight, the last drain to have
+landed, and no deferral, fresh hold or unverified preserved ledger. No
+delta can land between a probe's sample and its answer, which is the
+race that keeps verification out of steady state otherwise.
+
+**It refreshes the verdict and decides nothing.** No supervisor event
+comes of it: steering stays with the live gates, which never read the
+verdict, and a first attach is still never steered on its own. Only what
+`fib-synced` reports changes. The re-run is logged as an ordinary
+`verify_passed` / `verify_incomplete` / `verify_failed` event with
+`rerun: true`. A `verify_failed` re-run tears nothing down. It reports
+VPP disagreeing with the ledger, and a daemon restart rebuilds the FIB.
 
 **Failed, and shaping the design:**
 

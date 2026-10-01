@@ -111,6 +111,11 @@ pub struct VerifyOutcome {
     /// Steady state on the reference fleet is exactly 0, which is what
     /// makes it a usable gate rather than noise.
     pub unresolvable: u64,
+    /// Up to a handful of those routes by name, each with its next hops
+    /// and why they do not reach VPP, then "+K more" — filled by the
+    /// engine ([`crate::engine::ConvergenceEngine::unresolvable_named`]),
+    /// which alone holds the mapping. Empty when `unresolvable` is 0.
+    pub unresolvable_named: Vec<String>,
     /// Routes held back by capacity. Degraded but *known*, and
     /// deliberately NOT a verify failure: withholding is the designed
     /// response to a table that outgrew its heap, and failing verify
@@ -139,6 +144,8 @@ pub struct FamilyVerify {
     pub sampled: usize,
     pub mismatches: Vec<Mismatch>,
     pub unresolvable: u64,
+    /// See [`VerifyOutcome::unresolvable_named`].
+    pub unresolvable_named: Vec<String>,
     pub withheld: u64,
 }
 
@@ -237,6 +244,24 @@ impl VerifyOutcome {
         self.fib_correct() && !self.dead_interfaces.iter().any(|d| d.in_use)
     }
 
+    /// Whether this verdict failed ONLY for reasons the live table can
+    /// be seen to outgrow: unresolvable routes, kernel-delivered prefixes
+    /// without a `steer-exempt`, or nothing installed to probe — and
+    /// nothing that says VPP is wrong (a mismatch) or that a cable is out
+    /// (an in-use dark member), which a clean table does not clear.
+    ///
+    /// The verdict the re-run exists for ([`ReverifySchedule`]).
+    /// Verification is a convergence-time gate, so a verify that found
+    /// one unresolvable route stood as the last word — `fib-synced`
+    /// Degraded — long after the route had resolved or been withdrawn,
+    /// with nothing that would ever look again short of a restart.
+    pub fn awaits_clean_table(&self) -> bool {
+        !self.passed()
+            && self.mismatches.is_empty()
+            && !self.dead_interfaces.iter().any(|d| d.in_use)
+            && (self.unresolvable > 0 || self.unexempted_local > 0 || self.sampled == 0)
+    }
+
     /// One-line operator summary. Separates the two degraded counts,
     /// because "mapping is misconfigured" and "table outgrew the box"
     /// are different pages at 03:00 — and distinct labels for dark
@@ -249,7 +274,7 @@ impl VerifyOutcome {
     /// `Verdict::event`).
     pub fn summary(&self) -> String {
         let mut s = format!(
-            "verify {}: {}/{} probes matched, unresolvable={}, withheld={}",
+            "verify {}: {}/{} probes matched, unresolvable={}{}, withheld={}",
             if self.passed() {
                 "PASS"
             } else if self.fib_correct() {
@@ -262,11 +287,12 @@ impl VerifyOutcome {
             self.sampled.saturating_sub(self.mismatches.len()),
             self.sampled,
             self.unresolvable,
+            named_in_parens(&self.unresolvable_named),
             self.withheld
         );
         if self.unexempted_local > 0 {
             s.push_str(&format!(
-                ", {} connected subnet(s) without a steer-exempt",
+                ", {} kernel-delivered prefix(es) without a steer-exempt",
                 self.unexempted_local
             ));
         }
@@ -276,10 +302,11 @@ impl VerifyOutcome {
         if let Some(v6) = &self.v6 {
             s.push_str(&format!(
                 "; IPv6 (loaded, not steered — cannot fail the pass): {}/{} probes matched, \
-                 unresolvable={}, withheld={}",
+                 unresolvable={}{}, withheld={}",
                 v6.sampled.saturating_sub(v6.mismatches.len()),
                 v6.sampled,
                 v6.unresolvable,
+                named_in_parens(&v6.unresolvable_named),
                 v6.withheld
             ));
         }
@@ -548,6 +575,82 @@ pub fn verify_paths(
     Ok(out)
 }
 
+/// `" (a; b; +K more)"` for named unresolvable routes, nothing for none.
+fn named_in_parens(names: &[String]) -> String {
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", names.join("; "))
+    }
+}
+
+/// How long the table must stay clean before a stale verdict is re-run
+/// ([`ReverifySchedule`]). Long enough that a route flapping between
+/// unresolvable and resolved does not buy a verify per flap; short
+/// against how long an operator watches a Degraded row.
+pub const REVERIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The least time between two re-runs. A verify probes VPP with
+/// [`DEFAULT_SAMPLE`] requests on the supervision loop; this keeps a
+/// table that keeps getting dirty and clean again from turning a
+/// convergence-time gate into a heartbeat.
+pub const REVERIFY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// When a verdict that failed only because the table was not yet clean
+/// ([`VerifyOutcome::awaits_clean_table`]) is re-run, once the table is.
+///
+/// Verification stays a convergence-time gate — `status::FibSync` gives
+/// the reasons a periodic verify is a design change — and this does not
+/// make it a heartbeat. It re-runs the ONE verdict known to be stale in
+/// a way the live counts can show: the table held unresolvable routes,
+/// kernel-delivered prefixes without an exemption, or nothing at all,
+/// and now holds none of those. One re-run per clearing, debounced by
+/// [`REVERIFY_DEBOUNCE`] and at most once per [`REVERIFY_MIN_INTERVAL`].
+///
+/// **It refreshes the verdict and nothing else.** No supervisor event
+/// comes of it: steering is decided by the live gates
+/// (`Runtime::fib_fit_to_steer`, the completeness verdict, the backlog),
+/// which never consulted the verdict, and a first attach still never
+/// steers on its own. What changes is what `fib-synced` reports.
+///
+/// Pure bookkeeping over the caller's clock, so the policy is testable
+/// without a VPP; the runtime owns the conditions and the verify.
+#[derive(Debug, Default)]
+pub struct ReverifySchedule {
+    /// Since when the stale verdict and the clean table have held
+    /// together, uninterrupted.
+    clean_since: Option<std::time::Instant>,
+    /// When the last re-run was granted.
+    last_run: Option<std::time::Instant>,
+}
+
+impl ReverifySchedule {
+    /// Whether to re-run verify now. `stale` is "the standing verdict
+    /// [`VerifyOutcome::awaits_clean_table`]", `clean` is the caller's
+    /// reading that the live table no longer holds what failed it and
+    /// the moment is quiet enough to probe. A `true` is spent: the caller
+    /// runs verify, and the schedule starts over.
+    pub fn poll(&mut self, now: std::time::Instant, stale: bool, clean: bool) -> bool {
+        if !(stale && clean) {
+            self.clean_since = None;
+            return false;
+        }
+        let since = *self.clean_since.get_or_insert(now);
+        if now.duration_since(since) < REVERIFY_DEBOUNCE {
+            return false;
+        }
+        if self
+            .last_run
+            .is_some_and(|t| now.duration_since(t) < REVERIFY_MIN_INTERVAL)
+        {
+            return false;
+        }
+        self.last_run = Some(now);
+        self.clean_since = None;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,5 +759,79 @@ mod tests {
         let s = o.summary();
         assert!(s.contains("unresolvable=3"), "{s}");
         assert!(s.contains("withheld=7"), "{s}");
+    }
+    /// The verdict a re-run exists for: failed only on unresolvable
+    /// routes, unexempted kernel-delivered prefixes or an empty sample.
+    /// Never one that says VPP is wrong, or that a member carrying routes
+    /// is dark — a clean table does not clear either.
+    #[test]
+    fn only_a_verdict_the_table_can_outgrow_awaits_a_clean_table() {
+        let base = VerifyOutcome {
+            sampled: 64,
+            ..Default::default()
+        };
+        assert!(!base.awaits_clean_table(), "a pass awaits nothing");
+        for o in [
+            VerifyOutcome {
+                unresolvable: 1,
+                ..base.clone()
+            },
+            VerifyOutcome {
+                unexempted_local: 2,
+                ..base.clone()
+            },
+            VerifyOutcome {
+                sampled: 0,
+                ..base.clone()
+            },
+        ] {
+            assert!(o.awaits_clean_table(), "{}", o.summary());
+        }
+        let wrong = VerifyOutcome {
+            unresolvable: 1,
+            mismatches: vec![Mismatch::NoPaths { prefix: v4(0, 0) }],
+            ..base.clone()
+        };
+        assert!(!wrong.awaits_clean_table(), "a mismatch is not outgrown");
+        let dark = VerifyOutcome {
+            unresolvable: 1,
+            dead_interfaces: vec![DeadInterface {
+                name: "eth5".into(),
+                sw_if_index: 3,
+                admin_up: true,
+                link_up: false,
+                in_use: true,
+            }],
+            ..base.clone()
+        };
+        assert!(!dark.awaits_clean_table(), "nor is a cable");
+    }
+
+    /// One re-run per clearing: only once the table has stayed clean for
+    /// the debounce, never twice inside the minimum interval, and the
+    /// debounce starts over whenever the table gets dirty again.
+    #[test]
+    fn a_re_run_fires_once_when_the_table_clears_and_is_rate_limited() {
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        let mut r = ReverifySchedule::default();
+        // A stale verdict over a dirty table: nothing.
+        assert!(!r.poll(at(0), true, false));
+        // Clean from t=1: not before the debounce has run.
+        assert!(!r.poll(at(1), true, true));
+        assert!(!r.poll(at(5), true, true));
+        // Dirty again at t=8 resets it.
+        assert!(!r.poll(at(8), true, false));
+        assert!(!r.poll(at(9), true, true));
+        assert!(!r.poll(at(18), true, true));
+        assert!(r.poll(at(19), true, true), "clean for the debounce: fire");
+        // Spent: a verdict that is still stale (the re-run did not clear
+        // it) waits out the interval, however clean the table reads.
+        assert!(!r.poll(at(30), true, true));
+        assert!(!r.poll(at(19 + 299), true, true));
+        assert!(r.poll(at(19 + 300), true, true), "the interval has run");
+        // A verdict that is no longer stale asks for nothing.
+        assert!(!r.poll(at(10_000), false, true));
+        assert!(!r.poll(at(10_100), false, true));
     }
 }

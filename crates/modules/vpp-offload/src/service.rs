@@ -1378,25 +1378,32 @@ fn apply_steering(
                 }
                 if counts.unexempted_local > 0 {
                     return Err(format!(
-                        "refusing the first steer: {} of the router's own connected \
-                         subnet(s) have no steer-exempt: {}. The kernel delivers them and \
-                         VPP has no route for them, so a steered packet for one would \
-                         follow a less-specific route out of the box. Add a steer-exempt \
-                         covering each (hot, via reconfigure). The request is remembered: \
-                         the module steers on its own once they are covered, at most {}s \
-                         later",
+                        "refusing the first steer: {} kernel-delivered prefix(es) — the \
+                         router's own subnets and addresses, and routes via itself the \
+                         kernel carries out devices VPP cannot reach — have no \
+                         steer-exempt: {}. The kernel delivers them and VPP has no route \
+                         for them, so a steered packet for one would follow a less-specific \
+                         route out of the box. Add a steer-exempt covering each (hot, via \
+                         reconfigure). The request is remembered: the module steers on its \
+                         own once they are covered, at most {}s later",
                         counts.unexempted_local,
                         runtime.unexempted_local().join(", "),
                         crate::driver::STEER_RETRY_EVERY.as_secs()
                     ));
                 }
+                let named = runtime.unresolvable_named();
                 return Err(format!(
-                    "refusing the first steer: the FIB is incomplete ({} unresolvable, {} \
+                    "refusing the first steer: the FIB is incomplete ({} unresolvable{}, {} \
                      withheld, {} still installing). Diverting traffic into it would \
                      blackhole exactly the prefixes that are missing. `packetframe status` \
                      reports all three; they must be zero. The request is remembered: the \
                      module steers on its own once they are, at most {}s later",
                     counts.unresolvable,
+                    if named.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", named.join("; "))
+                    },
                     counts.withheld,
                     counts.installing,
                     crate::driver::STEER_RETRY_EVERY.as_secs()
@@ -1574,6 +1581,8 @@ fn run_loop(
             rs.drift_v6,
         );
         snap.neighbour_counters = rs.neighbour_counters;
+        snap.unresolvable_named = rs.unresolvable_named;
+        snap.unresolvable_named_v6 = rs.unresolvable_named_v6;
         let report = snap.report();
         let episode_over = snap.failure_episode_over();
         let published = Published {
@@ -1696,6 +1705,13 @@ fn run_loop(
             // outcome, because neither is produced by one.
             let injected = driver.inject(Instant::now(), e, &mut fx);
             failures.extend(fmt_failures(&injected.outcome));
+        }
+        // A re-run verdict is a completed verify like any other, and gets
+        // the timestamp the same way; it goes through no injection
+        // because it decides nothing (`verify::ReverifySchedule`).
+        if let Some(outcome) = runtime.take_refreshed_verify() {
+            last_verify = Some(outcome);
+            last_verify_at = Some(Instant::now());
         }
         runtime.set_steered(driver.supervisor().is_steered());
         // Retained BEFORE the terminal check below, which `break`s.

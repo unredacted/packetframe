@@ -215,8 +215,15 @@ pub enum FibSync {
     /// this snapshot (`Verdict::event` spells out why), so a box
     /// recovers and steers while this verdict still describes the
     /// window before its feed landed. Anything rendering it must say
-    /// how old it is.
-    Unfit { age: Duration, summary: String },
+    /// how old it is — and whether it will be looked at again: `reruns`
+    /// is [`VerifyOutcome::awaits_clean_table`], the verdicts
+    /// [`crate::verify::ReverifySchedule`] re-runs once the table is
+    /// clean.
+    Unfit {
+        age: Duration,
+        summary: String,
+        reruns: bool,
+    },
     /// VPP answered a probe and disagreed with the ledger. The one
     /// verify outcome a restart remedies.
     Failed { age: Duration, summary: String },
@@ -242,6 +249,7 @@ impl FibSync {
             Self::Unfit {
                 age,
                 summary: outcome.summary(),
+                reruns: outcome.awaits_clean_table(),
             }
         }
     }
@@ -412,11 +420,24 @@ pub struct StatusSnapshot {
     /// route). Surfaced so a mirror change inside a local prefix is
     /// visible rather than silently absorbed.
     pub shadowed_routes: u64,
-    /// Mirror prefixes routed via the router itself — the routing
-    /// daemon's own connected subnets — which VPP leaves to the kernel.
-    /// Informational: a steady non-zero count is the designed state on a
-    /// feed with `redistribute connected`.
+    /// Mirror prefixes that are the router's own business — its
+    /// connected subnets and addresses, and routes via itself the kernel
+    /// carries out devices VPP cannot reach
+    /// ([`crate::engine::ConvergenceEngine`]'s kernel-delivered rule) —
+    /// which VPP leaves to the kernel. Informational: a steady non-zero
+    /// count is the designed state on a feed with `redistribute
+    /// connected`. Never counted as unresolvable, and never a verify
+    /// failure by itself; a v4 one without a `steer-exempt` is, through
+    /// `SinkCounts::unexempted_local`.
     pub kernel_delivered_routes: u64,
+    /// The IPv4 unresolvable routes by name, as
+    /// [`crate::engine::ConvergenceEngine::unresolvable_named`] renders
+    /// them (a handful, then "+K more"). Empty when none. Not an
+    /// `observe_parts` argument; the service sets it on the snapshot, as
+    /// it does `neighbour_counters`, before anything renders from it.
+    pub unresolvable_named: Vec<String>,
+    /// The same for IPv6, under `v6 on`.
+    pub unresolvable_named_v6: Vec<String>,
     /// Cumulative null-node drops from VPP's own error counters,
     /// sampled over `cli_inband`. `None` until a sample succeeds —
     /// absent rather than 0, so a broken read path cannot impersonate
@@ -639,6 +660,8 @@ impl StatusSnapshot {
             source_backlog,
             shadowed_routes,
             kernel_delivered_routes,
+            unresolvable_named: Vec::new(),
+            unresolvable_named_v6: Vec::new(),
             null_drops,
             neighbour_counters: None,
             neighbours_unplaced,
@@ -985,6 +1008,20 @@ impl StatusSnapshot {
             // `v6-handback` row says Degraded, and overall must not
             // outrank it.
             && !self.handback_withholding()
+    }
+
+    /// `"; N kernel-delivered (…)"` for the `fib-synced` row when any
+    /// mirror prefix is left to the kernel, so a count that moved out of
+    /// `unresolvable` is seen to have gone somewhere.
+    fn kernel_delivered_note(&self) -> String {
+        if self.kernel_delivered_routes == 0 {
+            return String::new();
+        }
+        format!(
+            "; {} kernel-delivered (the router's own subnets, addresses and routes out devices \
+             VPP cannot reach — by design, never unresolvable)",
+            self.kernel_delivered_routes
+        )
     }
 
     /// The target diverts IPv6 and the hand-back path is not ready, so the
@@ -1477,18 +1514,29 @@ impl StatusSnapshot {
                         .into(),
                 ),
             ),
-            FibSync::Unfit { summary, age } => {
+            FibSync::Unfit {
+                summary,
+                age,
+                reruns,
+            } => {
                 let c = self.counts;
+                let when = if *reruns {
+                    "re-runs on its own once the table holds no unresolvable route and no \
+                     unexempted kernel-delivered prefix"
+                } else {
+                    "does not re-run in steady state"
+                };
                 (
                     HealthState::Degraded,
                     Some(format!(
-                        "{summary} (verify ran {}s ago and does not re-run in steady \
-                         state; the table now holds {} installed, {} withheld, {} \
-                         unresolvable)",
+                        "{summary} (verify ran {}s ago and {when}; the table now holds {} \
+                         installed, {} withheld, {} unresolvable{}{})",
                         age.as_secs(),
                         c.installed,
                         c.withheld,
-                        c.unresolvable
+                        c.unresolvable,
+                        named(&self.unresolvable_named),
+                        self.kernel_delivered_note(),
                     )),
                 )
             }
@@ -1533,8 +1581,11 @@ impl StatusSnapshot {
                         HealthState::Degraded,
                         Some(format!(
                             "verified on {sampled} probes; {} withheld (at capacity), \
-                             {} unresolvable (mapping)",
-                            c.withheld, c.unresolvable
+                             {} unresolvable (mapping){}{}",
+                            c.withheld,
+                            c.unresolvable,
+                            named(&self.unresolvable_named),
+                            self.kernel_delivered_note(),
                         )),
                     )
                 } else {
@@ -1583,9 +1634,13 @@ impl StatusSnapshot {
             // different remedy; the counts that are zero stay out of the
             // line so the one that matters is readable.
             let mut parts = vec![format!("{} installed", v6.installed)];
+            let v6_unresolvable = format!(
+                "unresolvable (next hop not on a VPP port){}",
+                named(&self.unresolvable_named_v6)
+            );
             for (n, what) in [
                 (v6.withheld, "withheld (v6 pool at capacity)"),
-                (v6.unresolvable, "unresolvable (next hop not on a VPP port)"),
+                (v6.unresolvable, v6_unresolvable.as_str()),
                 (
                     v6.rejected,
                     "refused by VPP (parked; retried when the route next changes or \
@@ -2218,6 +2273,16 @@ fn drift_v6_acceptance_note(v6: &crate::drift::V6DriftState) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(". "))
 }
 
+/// `": a; b; +K more"` for a non-empty list of named unresolvable
+/// routes, nothing for an empty one.
+fn named(names: &[String]) -> String {
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", names.join("; "))
+    }
+}
+
 /// Render `packetframe_vpp_*` gauges for the Prometheus textfile
 /// collector.
 ///
@@ -2546,7 +2611,7 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
     gauge(
         &mut out,
         "packetframe_vpp_kernel_delivered_routes",
-        "mirror prefixes routed via the router itself (its own connected subnets), left to the kernel",
+        "mirror prefixes that are the router's own (connected subnets, addresses, routes via itself out devices VPP cannot reach), left to the kernel",
     );
     let _ = writeln!(
         out,
@@ -3596,6 +3661,7 @@ mod tests {
         let stale = FibSync::Unfit {
             age: Duration::from_secs(1847),
             summary: VerifyOutcome::default().summary(),
+            reruns: true,
         };
         let r = snap_of(
             &steered_supervisor(),
@@ -3629,6 +3695,7 @@ mod tests {
         let stale = FibSync::Unfit {
             age: Duration::from_secs(1847),
             summary: VerifyOutcome::default().summary(),
+            reruns: true,
         };
         let s = snap_of(
             &steered_supervisor(),
@@ -3713,6 +3780,7 @@ mod tests {
         let stale = FibSync::Unfit {
             age: Duration::from_secs(1847),
             summary: VerifyOutcome::default().summary(),
+            reruns: true,
         };
         let s = snap_of(
             &steered_supervisor(),
@@ -3749,6 +3817,7 @@ mod tests {
                 FibSync::Unfit {
                     age: Duration::from_secs(30),
                     summary: VerifyOutcome::default().summary(),
+                    reruns: true,
                 },
                 ports_up(),
             );
@@ -3776,6 +3845,7 @@ mod tests {
             FibSync::Unfit {
                 age: Duration::from_secs(30),
                 summary: VerifyOutcome::default().summary(),
+                reruns: true,
             },
             ports_up(),
         );
@@ -6189,6 +6259,101 @@ mod tests {
         assert!(
             snap.steered_but_broken(),
             "an empty preserved table is still steered into nothing"
+        );
+    }
+
+    /// The rows that report an unresolvable count name the routes it
+    /// counts — the live list, from the snapshot — and say where the
+    /// kernel-delivered ones went; a stale verdict says whether it will be
+    /// looked at again.
+    #[test]
+    fn the_fib_rows_name_unresolvable_routes_and_say_when_verify_re_runs() {
+        let named = vec![
+            "198.51.100.0/24 via 192.0.2.9 dev eth0 (not a VPP port)".to_string(),
+            "+2 more".to_string(),
+        ];
+        let row = |s: &StatusSnapshot, name: &str| {
+            s.report()
+                .subsystems
+                .into_iter()
+                .find(|x| x.name == name)
+                .and_then(|x| x.message)
+                .unwrap_or_default()
+        };
+        for reruns in [true, false] {
+            let mut s = snap_of(
+                &ready_supervisor(),
+                &ledger_with(5_000, 0, 3),
+                ApiHealth::Answering {
+                    silent_for: Duration::ZERO,
+                },
+                FibSync::Unfit {
+                    age: Duration::from_secs(30),
+                    summary: "verify INCOMPLETE".into(),
+                    reruns,
+                },
+                ports_up(),
+            );
+            s.unresolvable_named = named.clone();
+            s.kernel_delivered_routes = 4;
+            let msg = row(&s, SUBSYS_FIB);
+            assert!(
+                msg.contains(
+                    "3 unresolvable: 198.51.100.0/24 via 192.0.2.9 dev eth0 (not a VPP port); \
+                     +2 more"
+                ),
+                "{msg}"
+            );
+            assert!(msg.contains("4 kernel-delivered"), "{msg}");
+            assert_eq!(
+                msg.contains("re-runs on its own once the table holds no unresolvable route"),
+                reruns,
+                "{msg}"
+            );
+            assert_eq!(
+                msg.contains("does not re-run in steady state"),
+                !reruns,
+                "{msg}"
+            );
+        }
+
+        // Verified, then a route went unresolvable: named there too.
+        let mut s = snap_of(
+            &ready_supervisor(),
+            &ledger_with(5_000, 0, 3),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            FibSync::Verified {
+                age: Duration::from_secs(30),
+                sampled: 64,
+            },
+            ports_up(),
+        );
+        s.unresolvable_named = named.clone();
+        let msg = row(&s, SUBSYS_FIB);
+        assert!(
+            msg.contains("3 unresolvable (mapping): 198.51.100.0/24"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("kernel-delivered"),
+            "none, so not mentioned: {msg}"
+        );
+
+        // And the v6 row, from its own list.
+        s.counts.v6 = Some(crate::sink::FamilyCounts {
+            installed: 10,
+            unresolvable: 1,
+            ..Default::default()
+        });
+        s.unresolvable_named_v6 = vec!["2001:db8:1::/48 via 2001:db8::1 (the router's own \
+                                        address: …)"
+            .to_string()];
+        let msg = row(&s, SUBSYS_FIB_V6);
+        assert!(
+            msg.contains("1 unresolvable (next hop not on a VPP port): 2001:db8:1::/48 via"),
+            "{msg}"
         );
     }
 }

@@ -732,6 +732,53 @@ struct Core {
     /// ([`Steering::set_v6_ready`]) — the gate on the v6 half of steering.
     /// A change is what re-steers ([`Core::service_handback`]).
     v6_gate: bool,
+    /// When a verdict the table has outgrown is re-run
+    /// ([`crate::verify::ReverifySchedule`], [`Observe::poll_reverify`]).
+    reverify: crate::verify::ReverifySchedule,
+    /// A re-run verdict the loop has not picked up yet
+    /// ([`Runtime::take_refreshed_verify`]). Handed over rather than read
+    /// off the engine because the loop stamps its own clock on every
+    /// completed verdict, and a verdict it never hears about would be
+    /// reported with the previous one's age.
+    refreshed_verify: Option<crate::verify::VerifyOutcome>,
+    /// The named unresolvable routes as last written to the event log
+    /// ([`UnresolvableLog`]).
+    unresolvable_log: UnresolvableLog,
+}
+
+/// How often, at most, a changed set of named unresolvable routes is
+/// written to the event log ([`UnresolvableLog`]).
+pub const UNRESOLVABLE_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// When the named unresolvable routes go to the event log: once per
+/// change of the set, never per tick, and at most once per
+/// [`UNRESOLVABLE_LOG_EVERY`] — a route flapping between unresolvable
+/// and resolved must not own the log. A change inside the window is not
+/// lost: it is what the next write says, once the window has passed.
+/// The status rows carry the live list regardless.
+#[derive(Debug, Default)]
+pub struct UnresolvableLog {
+    written: (Vec<String>, Vec<String>),
+    at: Option<std::time::Instant>,
+}
+
+impl UnresolvableLog {
+    /// Whether `(v4, v6)` should be written now. A `true` records it as
+    /// written.
+    pub fn due(&mut self, now: std::time::Instant, v4: &[String], v6: &[String]) -> bool {
+        if self.written.0 == v4 && self.written.1 == v6 {
+            return false;
+        }
+        if self
+            .at
+            .is_some_and(|t| now.duration_since(t) < UNRESOLVABLE_LOG_EVERY)
+        {
+            return false;
+        }
+        self.written = (v4.to_vec(), v6.to_vec());
+        self.at = Some(now);
+        true
+    }
 }
 
 /// The loaded-and-quiet release gate, shared by both deferral stages.
@@ -1571,6 +1618,9 @@ impl Runtime {
                 last_drain_took: Duration::ZERO,
                 last_dump_took: None,
                 v6_gate: false,
+                reverify: crate::verify::ReverifySchedule::default(),
+                refreshed_verify: None,
+                unresolvable_log: UnresolvableLog::default(),
             })),
         }
     }
@@ -1742,8 +1792,14 @@ impl Runtime {
         self.core.borrow_mut().engine.set_steer_exempts(exempts);
     }
 
-    /// The kernel-delivered connected subnets no `steer-exempt` covers,
-    /// for the refusal that names them.
+    /// The IPv4 unresolvable routes by name, for the refusal that names
+    /// them ([`crate::engine::ConvergenceEngine::unresolvable_named`]).
+    pub fn unresolvable_named(&self) -> Vec<String> {
+        self.core.borrow().engine.unresolvable_named(false)
+    }
+
+    /// The kernel-delivered prefixes no `steer-exempt` covers, for the
+    /// refusal that names them.
     pub fn unexempted_local(&self) -> Vec<String> {
         self.core
             .borrow()
@@ -1796,6 +1852,14 @@ impl Runtime {
     /// the loop to feed through `Driver::inject`.
     pub fn take_pending(&self) -> Vec<Event> {
         std::mem::take(&mut self.core.borrow_mut().pending)
+    }
+
+    /// A verdict re-run since the last call ([`Observe::poll_reverify`]),
+    /// for the loop to record as the latest completed verify. Never an
+    /// event: a re-run refreshes what `fib-synced` reports and decides
+    /// nothing ([`crate::verify::ReverifySchedule`]).
+    pub fn take_refreshed_verify(&self) -> Option<crate::verify::VerifyOutcome> {
+        self.core.borrow_mut().refreshed_verify.take()
     }
 
     /// Keep the engine's socket deadline keyed to the budget in force.
@@ -2057,6 +2121,12 @@ impl Runtime {
             steer_audit_error: c.steer_audit_error.clone(),
             shadowed_routes: c.engine.shadowed_routes(),
             kernel_delivered_routes: c.engine.kernel_delivered_routes(),
+            unresolvable_named: c.engine.unresolvable_named(false),
+            unresolvable_named_v6: if c.engine.counts().v6.is_some() {
+                c.engine.unresolvable_named(true)
+            } else {
+                Vec::new()
+            },
             null_drops: c.engine.null_drops(),
             neighbour_counters: c.engine.neighbour_counters(),
             neighbours_unplaced: c
@@ -2313,6 +2383,10 @@ pub struct RuntimeStatus {
     pub shadowed_routes: u64,
     /// [`crate::engine::ConvergenceEngine::kernel_delivered_routes`].
     pub kernel_delivered_routes: u64,
+    /// [`crate::engine::ConvergenceEngine::unresolvable_named`], IPv4.
+    pub unresolvable_named: Vec<String>,
+    /// The same for IPv6; empty under `v6 off`.
+    pub unresolvable_named_v6: Vec<String>,
     /// Cumulative null-node drops as last sampled, absent until read.
     pub null_drops: Option<u64>,
     /// VPP's glean and ARP-reply transmit counters as last sampled,
@@ -2706,6 +2780,36 @@ impl Core {
         !self.steer_diverts_traffic() || self.source.backlog() == 0
     }
 
+    /// Write the named unresolvable routes to the event log when the set
+    /// has changed ([`UnresolvableLog`]), and to the journal alongside.
+    fn log_unresolvable(&mut self, now: std::time::Instant) {
+        let v4 = self.engine.unresolvable_named(false);
+        let v6 = if self.engine.counts().v6.is_some() {
+            self.engine.unresolvable_named(true)
+        } else {
+            Vec::new()
+        };
+        if !self.unresolvable_log.due(now, &v4, &v6) {
+            return;
+        }
+        if v4.is_empty() && v6.is_empty() {
+            tracing::info!("no route is unresolvable any more");
+            event_log::Event::info(crate::MODULE_NAME, event_kind::UNRESOLVABLE_ROUTES)
+                .detail("none")
+                .emit();
+            return;
+        }
+        tracing::warn!(
+            ipv4 = ?v4,
+            ipv6 = ?v6,
+            "unresolvable routes: VPP holds no path for these, so they are missing from its FIB"
+        );
+        event_log::Event::warn(crate::MODULE_NAME, event_kind::UNRESOLVABLE_ROUTES)
+            .field("ipv4", v4.join("; "))
+            .field("ipv6", v6.join("; "))
+            .emit();
+    }
+
     /// Whether the FIB itself is fit to take traffic.
     ///
     /// The second gate, and the one that is easy to forget: `steer` does
@@ -3086,8 +3190,78 @@ impl Observe for ObserveView {
         // the call that blocks longest (an adopted dump) is inside it.
         let started = std::time::Instant::now();
         let r = self.drain_once(now);
-        self.core.borrow_mut().last_drain_took = started.elapsed();
+        let mut c = self.core.borrow_mut();
+        c.last_drain_took = started.elapsed();
+        c.log_unresolvable(now);
         r
+    }
+
+    fn poll_reverify(&mut self, now: std::time::Instant) {
+        let mut c = self.core.borrow_mut();
+        let stale = c
+            .engine
+            .last_verify()
+            .is_some_and(|v| v.awaits_clean_table());
+        let counts = c.engine.counts();
+        // Clean: nothing the verdict failed on is left, and nothing about
+        // the moment would make a probe race the table — the same
+        // conditions the convergence verify runs under. Nothing pending,
+        // nothing in flight, nothing the source is still holding, the
+        // last drain landed, no deferral or hold between the mirror and
+        // VPP, and no seed still waiting for its own judgement.
+        let clean = counts.unresolvable == 0
+            && counts.unexempted_local == 0
+            && counts.installing == 0
+            && counts.installed > 0
+            && c.engine.pending().is_empty()
+            && c.source.backlog() == 0
+            && c.last_drain_error.is_none()
+            && c.deferred_resync.is_none()
+            && c.fresh_hold.is_none()
+            && c.seeded.is_none();
+        if !c.reverify.poll(now, stale, clean) {
+            return;
+        }
+        match c.engine.refresh_verify() {
+            Ok(outcome) => {
+                let summary = outcome.summary();
+                let kind = if outcome.passed() {
+                    tracing::info!(outcome = %summary, "verify re-run once the table was clean: passed");
+                    event_log::Event::info(crate::MODULE_NAME, event_kind::VERIFY_PASSED)
+                } else if outcome.restart_worthy() {
+                    tracing::warn!(
+                        outcome = %summary,
+                        "verify re-run found FIB mismatches; a re-run decides nothing, so VPP \
+                         stays up and steering is unchanged — a daemon restart rebuilds the FIB"
+                    );
+                    event_log::Event::warn(crate::MODULE_NAME, event_kind::VERIFY_FAILED)
+                        .detail("re-run; nothing is torn down by a re-run")
+                } else {
+                    tracing::info!(outcome = %summary, "verify re-run: still incomplete");
+                    event_log::Event::info(crate::MODULE_NAME, event_kind::VERIFY_INCOMPLETE)
+                };
+                kind.field("outcome", summary.to_string())
+                    .field("rerun", true)
+                    .emit();
+                c.refreshed_verify = Some(outcome);
+            }
+            // The API is the loop's business: a lost socket is reconnected
+            // by the next tick's `api_ready`, exactly as after a failed
+            // steady-state drain. The verdict stands as it was.
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "verify re-run could not reach VPP; the previous verdict stands"
+                );
+                // A pass that lost the socket dropped it. Reconnect now, as
+                // the driver would after a failed drain: left for the next
+                // tick, the pings in between would fail on a socket that is
+                // gone and count toward a wedge VPP is not in.
+                if e.api_lost() {
+                    let _ = c.engine.api_ready();
+                }
+            }
+        }
     }
 
     fn last_drain_took(&self) -> Duration {
@@ -4253,6 +4427,31 @@ mod tests {
     // Only the Linux-gated process tests need these.
     #[cfg(target_os = "linux")]
     use std::sync::{Arc, Mutex};
+
+    /// The named unresolvable routes reach the event log once per change,
+    /// never per tick, and no more than once a minute; a change inside the
+    /// window is written when it has passed, and the set emptying is
+    /// written too.
+    #[test]
+    fn the_named_unresolvable_routes_are_logged_once_per_change_and_paced() {
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let a = vec!["198.51.100.0/24 via 192.0.2.9 (no neighbour)".to_string()];
+        let b = vec!["203.0.113.0/24 via 192.0.2.9 (no neighbour)".to_string()];
+        let mut log = UnresolvableLog::default();
+        assert!(
+            !log.due(at(0), &[], &[]),
+            "nothing, and nothing written yet"
+        );
+        assert!(log.due(at(1), &a, &[]), "a new set");
+        assert!(!log.due(at(2), &a, &[]), "unchanged: not per tick");
+        assert!(!log.due(at(30), &b, &[]), "changed, inside the window");
+        assert!(log.due(at(61), &b, &[]), "written once the window passed");
+        assert!(!log.due(at(200), &b, &[]));
+        assert!(log.due(at(300), &[], &[]), "emptying is a change");
+        assert!(!log.due(at(400), &[], &[]));
+        assert!(log.due(at(500), &[], &a), "v6 counts as the set too");
+    }
 
     /// A veto is only a veto where the gate actually asks.
     ///

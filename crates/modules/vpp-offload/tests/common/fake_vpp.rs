@@ -355,6 +355,9 @@ pub struct Behaviour {
     /// Acknowledge IPv6 address adds with retval 0 WITHOUT applying them,
     /// so a readback finds nothing — the acknowledged-but-absent shape.
     pub drop_v6_address_adds: bool,
+    /// While set, the first member port reports admin-up but LINK-DOWN —
+    /// a cable pulled mid-run, toggled by the test between scans.
+    pub first_port_dark: Option<&'static std::sync::atomic::AtomicBool>,
 }
 
 /// The fake's IPv6 interface-address table: `sw_if_index` → `(octets,
@@ -1161,7 +1164,10 @@ fn serve(
             }
             "sw_interface_dump" => {
                 let mut d = reply_head("sw_interface_details");
-                let mut det = details(ASSIGNED_INDEX, "octeon0/0", 3, ctx);
+                let dark = behaviour
+                    .first_port_dark
+                    .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst));
+                let mut det = details(ASSIGNED_INDEX, "octeon0/0", if dark { 1 } else { 3 }, ctx);
                 if let Some(m) = macs.get(&ASSIGNED_INDEX) {
                     det.l2_address = *m;
                 }
