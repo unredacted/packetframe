@@ -5,7 +5,7 @@
 //! template sets (id 3) and data sets (id = template id >= 256). Times are
 //! absolute (Unix epoch milliseconds), unlike NetFlow v9.
 
-use crate::{pad4, put_u16_at, v4, v6, Field, FlowRecord};
+use crate::{fill, pad4, put_u16_at, v4, v6, EncodeError, Field, FlowRecord};
 
 /// IANA IPFIX information element ids used here.
 mod ie {
@@ -25,6 +25,7 @@ mod ie {
     pub const SAMPLING_INTERVAL: u16 = 34;
     pub const FLOW_START_MILLISECONDS: u16 = 152;
     pub const FLOW_END_MILLISECONDS: u16 = 153;
+    pub const SELECTION_SEQUENCE_ID: u16 = 301;
     pub const SELECTOR_ID: u16 = 302;
     pub const SELECTOR_ALGORITHM: u16 = 304;
     pub const SAMPLING_PACKET_INTERVAL: u16 = 305;
@@ -32,6 +33,7 @@ mod ie {
     pub const DATA_LINK_FRAME_SIZE: u16 = 312;
     pub const DATA_LINK_FRAME_SECTION: u16 = 315;
     pub const OBSERVATION_TIME_MILLISECONDS: u16 = 323;
+    pub const DATA_LINK_FRAME_TYPE: u16 = 408;
 }
 
 /// Template length marking a variable-length field (RFC 7011 §7).
@@ -42,6 +44,10 @@ const VARIABLE_LENGTH: u16 = 0xffff;
 /// `samplingPacketSpace` (packets skipped) — the encoding collectors read
 /// a plain 1-in-N rate from. 1-in-N is interval 1, space N-1.
 const SELECTOR_SYSTEMATIC_COUNT: u16 = 1;
+
+/// `dataLinkFrameType` (RFC 7133 §3.2.1) of an IEEE 802.3 frame: the type
+/// a `dataLinkFrameSection` is decoded as.
+const DATA_LINK_ETHERNET: u16 = 0x0001;
 
 const SET_TEMPLATE: u16 = 2;
 const SET_OPTIONS_TEMPLATE: u16 = 3;
@@ -83,8 +89,9 @@ pub struct Template<'a> {
     pub fields: &'a [Field],
 }
 
-/// A selector (sampler) to announce in an options record: scoped by its
-/// selector id, describing a 1-in-`interval` selection.
+/// A selector (sampler) to announce in an options record (RFC 5476
+/// §6.5.2, Selector Report Interpretation): scoped by its selector id,
+/// describing a 1-in-`interval` selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selector {
     pub template_id: u16,
@@ -92,15 +99,39 @@ pub struct Selector {
     pub interval: u32,
 }
 
+/// A selection sequence (RFC 5476 §6.5.1): the observation point a packet
+/// was selected at and the selector that selected it. Every packet report
+/// names one by id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionSequence {
+    pub id: u64,
+    /// The observation point: the interface packets were sampled on.
+    pub ingress_if: u32,
+    pub selector_id: u64,
+}
+
+/// What announcing packet reports takes: their template, and the selection
+/// sequences their reports name (an options template and one record each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketReporting<'a> {
+    pub template_id: u16,
+    pub sequence_template_id: u16,
+    pub sequences: &'a [SelectionSequence],
+}
+
 /// One PSAMP packet report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketReport<'a> {
+    /// The selection sequence that selected the packet (RFC 5476 §6.4.1).
+    pub selection_sequence_id: u64,
+    /// The sequence's selector, repeated in the report: collectors that look
+    /// the sampling rate up by a report's own selector id (Akvorado) need it.
     pub selector_id: u64,
     pub observation_ms: u64,
     pub input_if: u32,
     /// 0 when unknown.
     pub output_if: u32,
-    /// Length of the frame on the wire.
+    /// Length of the Ethernet frame, FCS excluded, before truncation.
     pub frame_size: u16,
     /// Leading bytes of the frame, from the Ethernet header.
     pub frame_section: &'a [u8],
@@ -111,12 +142,13 @@ pub struct PacketReport<'a> {
 pub struct Announce<'a> {
     pub templates: &'a [Template<'a>],
     pub selector: Option<Selector>,
-    /// Template id for packet reports, announced with their template.
-    pub packet_report_template: Option<u16>,
+    pub packet_reports: Option<PacketReporting<'a>>,
 }
 
 impl Exporter {
-    /// Encodes a message of flow records with template `data`.
+    /// Encodes into `out` (cleared first) a message of the announcements
+    /// and the longest prefix of `records` (template `data`) that fits in
+    /// `max_len` bytes; returns how many records it holds.
     pub fn encode_flows(
         &mut self,
         out: &mut Vec<u8>,
@@ -124,22 +156,27 @@ impl Exporter {
         announce: &Announce<'_>,
         data: &Template<'_>,
         records: &[FlowRecord],
-    ) {
-        let options = self.begin(out, export_time_s, announce);
-        if !records.is_empty() {
-            let set = begin_set(out, data.id);
-            for r in records {
+        max_len: usize,
+    ) -> Result<usize, EncodeError> {
+        self.encode(
+            out,
+            export_time_s,
+            announce,
+            data.id,
+            records,
+            max_len,
+            |out, r| {
                 for &f in data.fields {
                     write_field(out, f, r);
                 }
-            }
-            end_set(out, set);
-        }
-        self.finish(out, records.len() as u32 + options);
+            },
+        )
     }
 
-    /// Encodes a message of PSAMP packet reports with template `template_id`
-    /// (announced with [`Announce::packet_report_template`]).
+    /// Encodes into `out` (cleared first) a message of the announcements
+    /// and the longest prefix of `reports` that fits in `max_len` bytes;
+    /// returns how many reports it holds. `template_id` is the one
+    /// announced in [`PacketReporting`].
     pub fn encode_packet_reports(
         &mut self,
         out: &mut Vec<u8>,
@@ -147,21 +184,62 @@ impl Exporter {
         announce: &Announce<'_>,
         template_id: u16,
         reports: &[PacketReport<'_>],
-    ) {
-        let options = self.begin(out, export_time_s, announce);
-        if !reports.is_empty() {
-            let set = begin_set(out, template_id);
-            for p in reports {
+        max_len: usize,
+    ) -> Result<usize, EncodeError> {
+        self.encode(
+            out,
+            export_time_s,
+            announce,
+            template_id,
+            reports,
+            max_len,
+            |out, p| {
+                out.extend_from_slice(&p.selection_sequence_id.to_be_bytes());
                 out.extend_from_slice(&p.selector_id.to_be_bytes());
                 out.extend_from_slice(&p.observation_ms.to_be_bytes());
                 out.extend_from_slice(&p.input_if.to_be_bytes());
                 out.extend_from_slice(&p.output_if.to_be_bytes());
+                out.extend_from_slice(&DATA_LINK_ETHERNET.to_be_bytes());
                 out.extend_from_slice(&p.frame_size.to_be_bytes());
                 put_varlen(out, p.frame_section);
+            },
+        )
+    }
+
+    /// Header, announcements, then one data set of as many records as fit.
+    /// The limit is capped at the 16-bit message length (RFC 7011 §3.1),
+    /// which bounds every set length inside it too.
+    #[allow(clippy::too_many_arguments)]
+    fn encode<T>(
+        &mut self,
+        out: &mut Vec<u8>,
+        export_time_s: u32,
+        announce: &Announce<'_>,
+        set_id: u16,
+        records: &[T],
+        max_len: usize,
+        write: impl FnMut(&mut Vec<u8>, &T),
+    ) -> Result<usize, EncodeError> {
+        let limit = max_len.min(usize::from(u16::MAX));
+        let options = self.begin(out, export_time_s, announce);
+        if out.len() > limit {
+            out.clear();
+            return Err(EncodeError::TooLarge);
+        }
+        let mut n = 0;
+        if !records.is_empty() {
+            let set = begin_set(out, set_id);
+            n = fill(out, limit, records, write);
+            if n == 0 {
+                out.clear();
+                return Err(EncodeError::TooLarge);
             }
             end_set(out, set);
         }
-        self.finish(out, reports.len() as u32 + options);
+        let len = out.len() as u16;
+        put_u16_at(out, 2, len);
+        self.sequence = self.sequence.wrapping_add(n as u32 + options);
+        Ok(n)
     }
 
     /// Writes the header and the announced templates and options; returns
@@ -175,7 +253,7 @@ impl Exporter {
         out.extend_from_slice(&self.sequence.to_be_bytes());
         out.extend_from_slice(&self.observation_domain_id.to_be_bytes());
 
-        if !a.templates.is_empty() || a.packet_report_template.is_some() {
+        if !a.templates.is_empty() || a.packet_reports.is_some() {
             let set = begin_set(out, SET_TEMPLATE);
             for t in a.templates {
                 out.extend_from_slice(&t.id.to_be_bytes());
@@ -185,34 +263,49 @@ impl Exporter {
                     put_spec(out, id, len);
                 }
             }
-            if let Some(id) = a.packet_report_template {
-                out.extend_from_slice(&id.to_be_bytes());
-                out.extend_from_slice(&6u16.to_be_bytes());
+            if let Some(p) = a.packet_reports {
+                out.extend_from_slice(&p.template_id.to_be_bytes());
+                out.extend_from_slice(&8u16.to_be_bytes());
+                put_spec(out, ie::SELECTION_SEQUENCE_ID, 8);
                 put_spec(out, ie::SELECTOR_ID, 8);
                 put_spec(out, ie::OBSERVATION_TIME_MILLISECONDS, 8);
                 put_spec(out, ie::INGRESS_INTERFACE, 4);
                 put_spec(out, ie::EGRESS_INTERFACE, 4);
+                put_spec(out, ie::DATA_LINK_FRAME_TYPE, 2);
                 put_spec(out, ie::DATA_LINK_FRAME_SIZE, 2);
                 put_spec(out, ie::DATA_LINK_FRAME_SECTION, VARIABLE_LENGTH);
             }
             end_set(out, set);
         }
 
-        if let Some(s) = a.selector {
-            // Options template: scope selectorId, then the algorithm and its
-            // parameters (RFC 5476 §6.5.1, Selection Sequence Report
-            // Interpretation simplified to one selector).
+        if a.selector.is_some() || a.packet_reports.is_some() {
             let set = begin_set(out, SET_OPTIONS_TEMPLATE);
-            out.extend_from_slice(&s.template_id.to_be_bytes());
-            out.extend_from_slice(&5u16.to_be_bytes()); // field count
-            out.extend_from_slice(&1u16.to_be_bytes()); // scope field count
-            put_spec(out, ie::SELECTOR_ID, 8);
-            put_spec(out, ie::SELECTOR_ALGORITHM, 2);
-            put_spec(out, ie::SAMPLING_PACKET_INTERVAL, 4);
-            put_spec(out, ie::SAMPLING_PACKET_SPACE, 4);
-            put_spec(out, ie::SAMPLING_INTERVAL, 4);
+            if let Some(s) = a.selector {
+                // Scope selectorId, then the algorithm and its parameters.
+                out.extend_from_slice(&s.template_id.to_be_bytes());
+                out.extend_from_slice(&5u16.to_be_bytes()); // field count
+                out.extend_from_slice(&1u16.to_be_bytes()); // scope field count
+                put_spec(out, ie::SELECTOR_ID, 8);
+                put_spec(out, ie::SELECTOR_ALGORITHM, 2);
+                put_spec(out, ie::SAMPLING_PACKET_INTERVAL, 4);
+                put_spec(out, ie::SAMPLING_PACKET_SPACE, 4);
+                put_spec(out, ie::SAMPLING_INTERVAL, 4);
+            }
+            if let Some(p) = a.packet_reports {
+                // Scope selectionSequenceId, then the observation point and
+                // the one selector applied there.
+                out.extend_from_slice(&p.sequence_template_id.to_be_bytes());
+                out.extend_from_slice(&3u16.to_be_bytes()); // field count
+                out.extend_from_slice(&1u16.to_be_bytes()); // scope field count
+                put_spec(out, ie::SELECTION_SEQUENCE_ID, 8);
+                put_spec(out, ie::INGRESS_INTERFACE, 4);
+                put_spec(out, ie::SELECTOR_ID, 8);
+            }
             end_set(out, set);
+        }
 
+        let mut records = 0;
+        if let Some(s) = a.selector {
             let set = begin_set(out, s.template_id);
             out.extend_from_slice(&s.selector_id.to_be_bytes());
             out.extend_from_slice(&SELECTOR_SYSTEMATIC_COUNT.to_be_bytes());
@@ -220,17 +313,19 @@ impl Exporter {
             out.extend_from_slice(&s.interval.saturating_sub(1).to_be_bytes());
             out.extend_from_slice(&s.interval.to_be_bytes());
             end_set(out, set);
-            return 1;
+            records += 1;
         }
-        0
-    }
-
-    /// Backfills the message length and advances the sequence past the
-    /// message's data records.
-    fn finish(&mut self, out: &mut [u8], data_records: u32) {
-        let len = out.len() as u16;
-        put_u16_at(out, 2, len);
-        self.sequence = self.sequence.wrapping_add(data_records);
+        if let Some(p) = a.packet_reports.filter(|p| !p.sequences.is_empty()) {
+            let set = begin_set(out, p.sequence_template_id);
+            for q in p.sequences {
+                out.extend_from_slice(&q.id.to_be_bytes());
+                out.extend_from_slice(&q.ingress_if.to_be_bytes());
+                out.extend_from_slice(&q.selector_id.to_be_bytes());
+            }
+            end_set(out, set);
+            records += p.sequences.len() as u32;
+        }
+        records
     }
 }
 
@@ -336,6 +431,18 @@ mod tests {
         }
     }
 
+    fn report(section: &[u8], observation_ms: u64) -> PacketReport<'_> {
+        PacketReport {
+            selection_sequence_id: 7,
+            selector_id: 1,
+            observation_ms,
+            input_if: 2,
+            output_if: 0,
+            frame_size: 1500,
+            frame_section: section,
+        }
+    }
+
     #[test]
     fn flows_with_templates_and_selector() {
         let fields = flow_fields(Family::V6, Profile::Full, SamplingSignal::Options);
@@ -350,14 +457,15 @@ mod tests {
                 selector_id: 1,
                 interval: 512,
             }),
-            packet_report_template: None,
+            packet_reports: None,
         };
         let mut e = Exporter {
             observation_domain_id: 9,
             sequence: 100,
         };
         let mut b = Vec::new();
-        e.encode_flows(&mut b, 1_790_000_002, &a, &t, &[record(), record()]);
+        let n = e.encode_flows(&mut b, 1_790_000_002, &a, &t, &[record(), record()], 1500);
+        assert_eq!(n, Ok(2));
 
         assert_eq!(u16_at(&b, 0), 10);
         assert_eq!(u32_at(&b, 4), 1_790_000_002);
@@ -392,11 +500,24 @@ mod tests {
     }
 
     #[test]
-    fn packet_reports_with_short_and_long_sections() {
+    fn packet_reports_with_selection_sequence() {
+        let sequences = [SelectionSequence {
+            id: 7,
+            ingress_if: 2,
+            selector_id: 1,
+        }];
         let a = Announce {
             templates: &[],
-            selector: None,
-            packet_report_template: Some(300),
+            selector: Some(Selector {
+                template_id: 257,
+                selector_id: 1,
+                interval: 1000,
+            }),
+            packet_reports: Some(PacketReporting {
+                template_id: 300,
+                sequence_template_id: 259,
+                sequences: &sequences,
+            }),
         };
         let mut e = Exporter {
             observation_domain_id: 1,
@@ -404,46 +525,122 @@ mod tests {
         };
         let short = [0x11u8; 64];
         let long = [0x22u8; 300];
-        let reports = [
-            PacketReport {
-                selector_id: 1,
-                observation_ms: 5,
-                input_if: 2,
-                output_if: 0,
-                frame_size: 1500,
-                frame_section: &short,
-            },
-            PacketReport {
-                selector_id: 1,
-                observation_ms: 6,
-                input_if: 2,
-                output_if: 0,
-                frame_size: 1500,
-                frame_section: &long,
-            },
-        ];
+        let reports = [report(&short, 5), report(&long, 6)];
         let mut b = Vec::new();
-        e.encode_packet_reports(&mut b, 1, &a, 300, &reports);
-        assert_eq!(e.sequence, 2);
+        assert_eq!(
+            e.encode_packet_reports(&mut b, 1, &a, 300, &reports, 1500),
+            Ok(2)
+        );
+        assert_eq!(e.sequence, 2 + 1 + 1, "reports, selector and sequence");
 
         let s = sets(&b);
-        assert_eq!(s.iter().map(|x| x.0).collect::<Vec<_>>(), vec![2, 300]);
+        assert_eq!(
+            s.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec![2, 3, 257, 259, 300]
+        );
+
+        // Report template: the sequence first, the frame typed as Ethernet.
         let (_, at, _) = s[0];
         assert_eq!(u16_at(&b, at + 4), 300);
-        assert_eq!(u16_at(&b, at + 6), 6);
-        let last_spec = at + 8 + 5 * 4;
-        assert_eq!(u16_at(&b, last_spec), ie::DATA_LINK_FRAME_SECTION);
-        assert_eq!(u16_at(&b, last_spec + 2), VARIABLE_LENGTH);
+        assert_eq!(u16_at(&b, at + 6), 8);
+        let spec = |i: usize| (u16_at(&b, at + 8 + 4 * i), u16_at(&b, at + 10 + 4 * i));
+        assert_eq!(spec(0), (ie::SELECTION_SEQUENCE_ID, 8));
+        assert_eq!(spec(1), (ie::SELECTOR_ID, 8));
+        assert_eq!(spec(5), (ie::DATA_LINK_FRAME_TYPE, 2));
+        assert_eq!(spec(7), (ie::DATA_LINK_FRAME_SECTION, VARIABLE_LENGTH));
 
-        // Fixed part is 8 + 8 + 4 + 4 + 2 = 26 bytes, then the section.
+        // Options templates: the selector's, then the sequence's (scope 301).
         let (_, at, _) = s[1];
+        let seq_tmpl = at + 4 + 6 + 5 * 4;
+        assert_eq!(u16_at(&b, seq_tmpl), 259);
+        assert_eq!(u16_at(&b, seq_tmpl + 2), 3);
+        assert_eq!(u16_at(&b, seq_tmpl + 4), 1);
+        assert_eq!(u16_at(&b, seq_tmpl + 6), ie::SELECTION_SEQUENCE_ID);
+        assert_eq!(u16_at(&b, seq_tmpl + 10), ie::INGRESS_INTERFACE);
+        assert_eq!(u16_at(&b, seq_tmpl + 14), ie::SELECTOR_ID);
+
+        // Sequence record: id 7 observed on ifIndex 2 by selector 1.
+        let (_, at, _) = s[3];
+        assert_eq!(u64_at(&b, at + 4), 7);
+        assert_eq!(u32_at(&b, at + 12), 2);
+        assert_eq!(u64_at(&b, at + 16), 1);
+
+        // Fixed part is 8 + 8 + 8 + 4 + 4 + 2 + 2 = 36 bytes, then the section.
+        let (_, at, _) = s[4];
         let r0 = at + 4;
-        assert_eq!(u64_at(&b, r0 + 8), 5);
-        assert_eq!(b[r0 + 26], 64, "one-byte length");
-        let r1 = r0 + 26 + 1 + 64;
-        assert_eq!(u64_at(&b, r1 + 8), 6);
-        assert_eq!(b[r1 + 26], 255, "three-byte length marker");
-        assert_eq!(u16_at(&b, r1 + 27), 300);
-        assert_eq!(b[r1 + 29], 0x22);
+        assert_eq!(u64_at(&b, r0), 7);
+        assert_eq!(u64_at(&b, r0 + 8), 1);
+        assert_eq!(u64_at(&b, r0 + 16), 5);
+        assert_eq!(u16_at(&b, r0 + 32), DATA_LINK_ETHERNET);
+        assert_eq!(u16_at(&b, r0 + 34), 1500);
+        assert_eq!(b[r0 + 36], 64, "one-byte length");
+        let r1 = r0 + 36 + 1 + 64;
+        assert_eq!(u64_at(&b, r1 + 16), 6);
+        assert_eq!(b[r1 + 36], 255, "three-byte length marker");
+        assert_eq!(u16_at(&b, r1 + 37), 300);
+        assert_eq!(b[r1 + 39], 0x22);
+    }
+
+    #[test]
+    fn length_limit_takes_a_prefix_and_keeps_the_sequence() {
+        let section = [0u8; 128];
+        let reports = [report(&section, 1); 20];
+        let mut e = Exporter {
+            observation_domain_id: 1,
+            sequence: 0,
+        };
+        let mut b = Vec::new();
+        // Header 16, set header 4, each report 36 + 1 + 128 = 165.
+        let none = Announce::default();
+        assert_eq!(
+            e.encode_packet_reports(&mut b, 1, &none, 300, &reports, 1472),
+            Ok(8)
+        );
+        assert_eq!(b.len(), (16 + 4 + 8 * 165usize).next_multiple_of(4));
+        assert_eq!(e.sequence, 8);
+
+        // Too small for one report: nothing encoded, sequence untouched.
+        assert_eq!(
+            e.encode_packet_reports(&mut b, 1, &none, 300, &reports, 16 + 4 + 164),
+            Err(EncodeError::TooLarge)
+        );
+        assert!(b.is_empty());
+        assert_eq!(e.sequence, 8);
+
+        // A limit beyond the 16-bit message length is capped to it.
+        let huge = [0u8; 70_000];
+        let big = [report(&huge, 1)];
+        assert_eq!(
+            e.encode_packet_reports(&mut b, 1, &none, 300, &big, usize::MAX),
+            Err(EncodeError::TooLarge)
+        );
+        let fields = flow_fields(Family::V6, Profile::Full, SamplingSignal::InRecord);
+        let t = Template {
+            id: 256,
+            fields: &fields,
+        };
+        let many = vec![record(); 1000];
+        let n = e
+            .encode_flows(&mut b, 1, &none, &t, &many, usize::MAX)
+            .unwrap();
+        assert!(n < many.len());
+        assert!(b.len() <= usize::from(u16::MAX));
+        assert_eq!(usize::from(u16_at(&b, 2)), b.len());
+        sets(&b);
+
+        // Announcements alone over the limit.
+        let a = Announce {
+            templates: std::slice::from_ref(&t),
+            ..Announce::default()
+        };
+        assert_eq!(
+            e.encode_flows(&mut b, 1, &a, &t, &[], 40),
+            Err(EncodeError::TooLarge)
+        );
+        assert_eq!(
+            e.encode_flows(&mut b, 1, &a, &t, &[], 1500)
+                .map(|_| sets(&b).len()),
+            Ok(1)
+        );
     }
 }

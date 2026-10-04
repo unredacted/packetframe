@@ -10,6 +10,12 @@
 //! numbers, timestamps and template refresh, because those are export-process
 //! state that the formats define per exporter, not per message.
 //!
+//! Every encoder takes a length limit and encodes the longest prefix of its
+//! records that fits, returning how many it took; the caller sends the
+//! message and passes the rest to the next one. The limit is the caller's
+//! (a datagram that fits the path MTU), further capped by the format's own
+//! 16-bit length fields, so an encoded message is never malformed by size.
+//!
 //! NetFlow v9 and IPFIX share one field model ([`Field`], [`FlowRecord`]):
 //! a template is a list of fields, and a record is written field by field in
 //! template order, so a privacy profile is just a shorter field list.
@@ -20,7 +26,31 @@ pub mod ipfix;
 pub mod netflow9;
 pub mod sflow;
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// Why nothing was encoded. The output buffer is left empty and no
+/// sequence number advanced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodeError {
+    /// The header and announcements, or the first record after them, do
+    /// not fit the length limit.
+    TooLarge,
+    /// An sFlow compact sample cannot carry an ifIndex of 2^24 or more; the
+    /// agent must use [`sflow::Encoding::Expanded`] for all its samples.
+    IfIndexRange(u32),
+}
+
+impl fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge => f.write_str("message exceeds the length limit"),
+            Self::IfIndexRange(i) => write!(f, "ifIndex {i} needs the expanded sFlow encoding"),
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {}
 
 /// One flow, as aggregated from sampled packets.
 ///
@@ -153,6 +183,28 @@ fn pad4(out: &mut Vec<u8>) {
     while !out.len().is_multiple_of(4) {
         out.push(0);
     }
+}
+
+/// Appends records with `write` while the message, padded to four bytes,
+/// stays within `limit`; returns how many were appended. A record that
+/// would cross the limit is removed again and ends the fill.
+fn fill<T>(
+    out: &mut Vec<u8>,
+    limit: usize,
+    records: &[T],
+    mut write: impl FnMut(&mut Vec<u8>, &T),
+) -> usize {
+    let mut n = 0;
+    for r in records {
+        let mark = out.len();
+        write(out, r);
+        if out.len().next_multiple_of(4) > limit {
+            out.truncate(mark);
+            break;
+        }
+        n += 1;
+    }
+    n
 }
 
 /// Backfills a big-endian u16 at `at`.

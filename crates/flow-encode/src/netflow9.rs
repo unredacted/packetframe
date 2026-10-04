@@ -6,7 +6,7 @@
 //! exporter's uptime (`sysUptime`), so [`Exporter`] converts the epoch
 //! times a [`FlowRecord`] carries.
 
-use crate::{pad4, put_u16_at, v4, v6, Field, FlowRecord};
+use crate::{fill, pad4, put_u16_at, v4, v6, EncodeError, Field, FlowRecord};
 
 /// NetFlow v9 field types used here (RFC 3954 §8).
 mod ty {
@@ -85,12 +85,16 @@ impl Exporter {
         epoch_ms.saturating_sub(self.boot_epoch_ms) as u32
     }
 
-    /// Encodes one export packet into `out` (cleared first) and advances
-    /// [`Self::sequence`].
+    /// Encodes into `out` (cleared first) an export packet of the
+    /// announcements and the longest prefix of `records` (template `data`)
+    /// that fits in `max_len` bytes, and advances [`Self::sequence`];
+    /// returns how many records it holds. The limit is capped at the
+    /// 16-bit FlowSet length.
     ///
     /// `templates` and `sampler` are (re)announced in this packet when
     /// given; v9 has no reliable transport, so exporters resend them
-    /// periodically. `records` are encoded with `data` as their template.
+    /// periodically.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode(
         &mut self,
         out: &mut Vec<u8>,
@@ -99,7 +103,9 @@ impl Exporter {
         sampler: Option<SamplerOptions>,
         data: &Template<'_>,
         records: &[FlowRecord],
-    ) {
+        max_len: usize,
+    ) -> Result<usize, EncodeError> {
+        let limit = max_len.min(usize::from(u16::MAX));
         out.clear();
         out.extend_from_slice(&9u16.to_be_bytes());
         let count_at = out.len();
@@ -108,7 +114,7 @@ impl Exporter {
         out.extend_from_slice(&((now_epoch_ms / 1000) as u32).to_be_bytes());
         out.extend_from_slice(&self.sequence.to_be_bytes());
         out.extend_from_slice(&self.source_id.to_be_bytes());
-        let mut count: u16 = 0;
+        let mut count = 0;
 
         if !templates.is_empty() {
             let set = begin_set(out, 0);
@@ -150,20 +156,29 @@ impl Exporter {
             end_set(out, set);
             count += 1;
         }
+        if out.len() > limit {
+            out.clear();
+            return Err(EncodeError::TooLarge);
+        }
 
+        let mut n = 0;
         if !records.is_empty() {
             let set = begin_set(out, data.id);
-            for r in records {
+            n = fill(out, limit, records, |out, r| {
                 for &f in data.fields {
                     self.write_field(out, f, r);
                 }
-                count += 1;
+            });
+            if n == 0 {
+                out.clear();
+                return Err(EncodeError::TooLarge);
             }
             end_set(out, set);
         }
 
-        put_u16_at(out, count_at, count);
+        put_u16_at(out, count_at, (count + n) as u16);
         self.sequence = self.sequence.wrapping_add(1);
+        Ok(n)
     }
 
     fn write_field(&self, out: &mut Vec<u8>, f: Field, r: &FlowRecord) {
@@ -264,14 +279,16 @@ mod tests {
             template_id: 257,
             interval: 1000,
         };
-        e.encode(
+        let n = e.encode(
             &mut b,
             1_002_000,
             std::slice::from_ref(&t),
             Some(opts),
             &t,
             &[record(), record()],
+            1500,
         );
+        assert_eq!(n, Ok(2));
 
         assert_eq!(u16_at(&b, 0), 9);
         assert_eq!(
@@ -334,11 +351,53 @@ mod tests {
             boot_epoch_ms: 0,
         };
         let mut b = Vec::new();
-        e.encode(&mut b, 5000, &[], None, &t, &[record()]);
+        assert_eq!(
+            e.encode(&mut b, 5000, &[], None, &t, &[record()], 1500),
+            Ok(1)
+        );
         assert_eq!(u16_at(&b, 2), 1);
         assert_eq!(e.sequence, 0, "wraps");
         let s = sets(&b);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].0, 300);
+    }
+
+    #[test]
+    fn length_limit_takes_a_prefix() {
+        let fields = flow_fields(Family::V4, Profile::Full, SamplingSignal::InRecord);
+        let t = Template {
+            id: 256,
+            fields: &fields,
+        };
+        let width: usize = fields.iter().map(|&f| type_and_len(f).1 as usize).sum();
+        let mut e = Exporter {
+            source_id: 1,
+            sequence: 0,
+            boot_epoch_ms: 0,
+        };
+        let mut b = Vec::new();
+        let many = vec![record(); 100];
+        let fit = (1472 - 20 - 4) / width;
+        assert_eq!(e.encode(&mut b, 0, &[], None, &t, &many, 1472), Ok(fit));
+        assert_eq!(u16_at(&b, 2) as usize, fit);
+        assert!(b.len() <= 1472);
+        sets(&b);
+        assert_eq!(e.sequence, 1);
+
+        // Too small for one record: nothing encoded, sequence untouched.
+        assert_eq!(
+            e.encode(&mut b, 0, &[], None, &t, &many, 20 + 4 + width - 1),
+            Err(EncodeError::TooLarge)
+        );
+        assert!(b.is_empty());
+        assert_eq!(e.sequence, 1);
+
+        // The FlowSet length caps a limit beyond it.
+        let lots = vec![record(); 2000];
+        let n = e
+            .encode(&mut b, 0, &[], None, &t, &lots, usize::MAX)
+            .unwrap();
+        assert_eq!(n, (usize::from(u16::MAX) - 20 - 4) / width);
+        sets(&b);
     }
 }
