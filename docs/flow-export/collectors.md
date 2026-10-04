@@ -45,8 +45,9 @@ under 0.2.
 
 ## Method
 
-Each case models **100,000 packets/s** of 1,000-byte frames (986-byte IP
-packets) towards one documentation address, sampled **1-in-1000**, for 20–30 s.
+Each case models **100,000 packets/s** of 1,000-byte frames (FCS excluded;
+986-byte IP packets) towards one documentation address, sampled
+**1-in-1000**, for 20–30 s.
 That is about 100 samples or records per second, deliberately low-rate.
 Sources are drawn from `203.0.113.0/24` and AS numbers come from the
 documentation range.
@@ -74,7 +75,7 @@ packetframe flow-synth --to <collector>:<port> --format <sflow|nfv9|ipfix|psamp>
 | NetFlow v9, rate in an options record | ✅ 2,000,000 ¹ | ✅ 97,760 pps |
 | IPFIX, rate in each record only (IE 34) | ✅ 2,000,000 ¹ | ❌ **95 pps: never scaled** |
 | IPFIX, rate in a selector options record (IE 302/304/305/306/34) | ✅ 2,000,000 ¹ | ✅ 97,760 pps |
-| IPFIX PSAMP packet reports (IE 315 frame section) | ✅ 2,000,000 ¹ | ✅ 98,166 pps |
+| IPFIX PSAMP packet reports (IE 315 frame section) ³ | ✅ 2,000,000 ¹ | ✅ 98,166 pps |
 | Profile `no-source` (no source address), v9 and IPFIX | ✅ stored, source unknown | ✅ detected (keys on destination) |
 | Profile `as-only` (no addresses), IPFIX | ✅ stored with AS pair | ❌ no host to attribute to: never detected |
 | AS numbers from the records | ✅ used (`asn-providers` default starts with `flow`) | not displayed |
@@ -95,11 +96,40 @@ have a remote country in Akvorado. A truncated address (/24, /48) would still
 geolocate, but this lab used documentation prefixes, which have no GeoIP
 entries, so that case was **not exercised**.
 
-**Bytes:** for sFlow and PSAMP, both collectors take bytes from the IP header's
-total length, i.e. the IP layer. For flow records, `octetDeltaCount` / `IN_BYTES`
-must likewise be IP-layer octets (RFC 5102). The first `flow-synth` draft sent
-frame bytes, and the 14-byte-per-packet discrepancy showed up in the comparison.
-Fixed; all formats now read 986 B/packet.
+³ Each report carries `selectionSequenceId` (IE 301), announced by a
+Selection Sequence Report Interpretation (RFC 5476 §6.5.1), and also its
+`selectorId` (IE 302). Akvorado's decoder looks the sampling rate up by the
+selectorId in the report itself, so with only IE 301 it would fall back to an
+unscaled rate (read from its source, not measured). Both collectors ignore
+the sequence's options record, which carries no rate. The template types the
+frame section as Ethernet (`dataLinkFrameType`, RFC 7133).
+
+**Re-measured after review (2026-10-04).** The encoding changed in four
+ways:
+- sFlow `frame_length` now includes the FCS, with `stripped` = 4;
+- PSAMP gained the selection sequence and `dataLinkFrameType` (³);
+- every datagram is now sized to fit a 1500-byte path MTU;
+- TCP and UDP checksums are now valid.
+
+sFlow, PSAMP, IPFIX with an options record, and NetFlow v9 were each rerun
+for 20 s, plus a 60-byte TCP SYN case over sFlow. Every run scaled exactly
+once:
+- Akvorado stored 2,000,000 / 2,000,000 each time, and the TCP case once its
+  held batch was flushed;
+- FastNetMon banned the host each time, at about 92–94k pps in its 5-second
+  average.
+
+**Bytes.** Collectors differ in which length they count for packet samples.
+- **Akvorado**, for sFlow and PSAMP, and **FastNetMon**, for PSAMP, take the IP
+  header's total length, i.e. the IP layer.
+- **FastNetMon counts sFlow's `frame_length`** by default: on the wire, FCS
+  included. A 1,000-byte frame read 741 Mbit/s at 92,307 pps, about
+  1,004 B/packet, and a 60-byte frame about 64 B/packet.
+  `sflow_read_packet_length_from_ip_header = on` switches it to the IP layer.
+- **Flow records** must carry IP-layer octets in `octetDeltaCount` /
+  `IN_BYTES` (RFC 5102). The first `flow-synth` draft sent frame bytes, and the
+  comparison showed the 14-byte-per-packet discrepancy. Fixed: all flow formats
+  read 986 B/packet on both collectors.
 
 ## Telemetry loss
 
@@ -126,15 +156,19 @@ traffic arrives. We measured about 10% of a 20 s stream held back until then.
    with `samplingPacketInterval`/`samplingPacketSpace` and IE 34. Do not rely on
    the in-record interval, which FastNetMon ignores. In-record may be added as
    well; Akvorado reads either.
-2. **Report IP-layer octets** in flow records.
+2. **Report IP-layer octets** in flow records. For sFlow, report the on-wire
+   `frame_length` with the FCS, `stripped` ≥ 4, which is what FastNetMon
+   counts by default.
 3. **Send templates early and periodically.** Tell Akvorado operators to run
    `load-balance: by-exporter` for v9/IPFIX/PSAMP. sFlow needs neither.
 4. **Do not offer `as-only` to a DDoS-detection collector.** It suits statistics
    (Akvorado stores it), not attribution. `no-source` works for both.
-5. **Country is not exportable** in these formats. A country-only privacy profile
+5. **PSAMP packet reports carry both IE 301 and IE 302:** the selection
+   sequence the RFC requires, and the selectorId Akvorado scales by.
+6. **Country is not exportable** in these formats. A country-only privacy profile
    is blocked for both collectors. Truncation preserves geolocation, untested
    here.
-6. **Telemetry health must gate automatic withdrawals** (above), because neither
+7. **Telemetry health must gate automatic withdrawals** (above), because neither
    collector can tell silence from calm.
 
 ## Reproducing
