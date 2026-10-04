@@ -1,0 +1,10 @@
+[package]
+name = "packetframe-flow-encode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Flow-telemetry wire encoders: sFlow v5, NetFlow v9, IPFIX and IPFIX packet reports"
+
+[dependencies]

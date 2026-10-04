@@ -10,6 +10,7 @@ PacketFrame is a modular eBPF data plane written in pure Rust (aya + aya-ebpf). 
 
 - `crates/common/`: config parser (SPEC.md §6), `Module` trait (§3.2), §2.1 capability probes, PacketFrame FIB trait shapes (`fib/mod.rs`)
 - `crates/cli/`: the `packetframe` binary (clap subcommands: `feasibility`, `run`, `detach`, `status`, `fib`, `probe`)
+- `crates/flow-encode/`: pure wire encoders for flow export (sFlow v5, NetFlow v9, IPFIX flows and PSAMP packet reports); no sockets or clocks. Driven today by the dev-only `packetframe flow-synth` (`dev-tools` feature, off by default); collector evidence and the requirements it puts on the exporter in `docs/flow-export/collectors.md`
 - `crates/modules/fast-path/`: fast-path module including the PacketFrame FIB control plane under `src/fib/`
 - `crates/modules/guard/`: tc-egress frame policer (ARP/NS per-target rate limit, LLDP drop, foreign-src-MAC drop, bcast/mcast catch-all) for the IX-facing bridges; runbook at `docs/runbooks/guard.md`
 - `crates/modules/neigh-snoop/`: passive ARP/ND neighbour snooper for the IX-facing bridges (receive-only AF_PACKET + cBPF, learns third-party pairs, installs NUD_STALE, persists per bridge, tracks bridges by name, `ix-mode` into fast-path's resolver, FRR next-hop gate feed); runbook at `docs/runbooks/neigh-snoop.md`. No site-specific addresses in code, tests or docs: RFC 5737/3849 prefixes and `02:…` MACs only

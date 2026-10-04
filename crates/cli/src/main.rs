@@ -16,6 +16,8 @@ mod events_cli;
 mod feasibility;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod fib_cli;
+#[cfg(feature = "dev-tools")]
+mod flow_synth;
 #[cfg(feature = "fast-path")]
 mod health;
 mod loader;
@@ -167,6 +169,13 @@ enum Command {
         op: fib_cli::FibOp,
     },
 
+    /// Development: send synthetic flow telemetry (sFlow v5, NetFlow v9,
+    /// IPFIX flows or IPFIX packet reports) for a modelled packet stream to
+    /// a collector, to check how it reads PacketFrame's export formats.
+    /// Low-rate by design; built only with the `dev-tools` feature.
+    #[cfg(feature = "dev-tools")]
+    FlowSynth(flow_synth::FlowSynthArgs),
+
     /// Attach a diagnostic XDP program, dump the first 16 bytes of a
     /// sample of incoming packets, detach. Built to answer "what does
     /// this driver hand to XDP?" when an interface's counters suggest
@@ -200,7 +209,7 @@ enum Command {
     },
 }
 
-#[cfg(feature = "probe")]
+#[cfg(any(feature = "probe", feature = "dev-tools"))]
 fn parse_duration(s: &str) -> Result<Duration, String> {
     // Unit suffixes: `ms`, `s`, `m`, parsed in longest-match order so
     // `ms` wins over `s`. Bare integers are treated as seconds, which
@@ -376,6 +385,8 @@ fn main() -> ExitCode {
         Command::Map { .. } => not_implemented("map"),
         #[cfg(all(target_os = "linux", feature = "fast-path"))]
         Command::Fib { op } => fib_cli::run(op),
+        #[cfg(feature = "dev-tools")]
+        Command::FlowSynth(args) => flow_synth::run(args),
         #[cfg(feature = "probe")]
         Command::Probe {
             iface,
