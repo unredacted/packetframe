@@ -8,6 +8,6 @@
   "octeon_pmd": "dev_octeon,net_cn10k,net_cn20k,net_cn9k",
   "patches": "none (upstream verbatim)",
   "packaging": "etc/sysctl.d/80-vpp.conf removed from the vpp .deb — applied at every boot, its vm.nr_hugepages=1024 is a 512 GiB hugepage request on 64K-page kernels (bricked a 64 GB EFG 2026-08-21); hugepage sizing belongs to the consumer at attach",
-  "built_by": "unredacted/vpp-unifi@8fe485d606a55cefdf225a58b43c292157450fa5",
-  "workflow_run": "https://github.com/unredacted/vpp-unifi/actions/runs/32511309002"
+  "built_by": "unredacted/vpp-unifi@ca06310b9e35a95bc856db2c6b369880b6c91fab",
+  "workflow_run": "https://github.com/unredacted/vpp-unifi/actions/runs/37196016516"
 }
