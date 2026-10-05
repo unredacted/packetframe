@@ -1,0 +1,14 @@
+[package]
+name = "packetframe-sampler-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The PacketFrame VPP sampler plugin's logic, free of VPP so it is tested on any host"
+
+[dependencies]
+packetframe-sampler-shm.workspace = true
+
+[dev-dependencies]
+libc.workspace = true

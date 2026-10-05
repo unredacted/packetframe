@@ -10,6 +10,7 @@ members = [
     "crates/modules/vpp-offload",
     "crates/sampler-shm",
     "crates/tools/vpp-api-codegen",
+    "crates/vpp-plugins/pf-sampler-core",
 ]
 # BPF crates live at `crates/modules/*/bpf/` and are deliberately
 # excluded from the workspace. They target `bpfel-unknown-none` and
@@ -20,6 +21,11 @@ exclude = [
     "crates/modules/fast-path/bpf",
     "crates/modules/guard/bpf",
     "crates/modules/probe/bpf",
+    # The VPP sampler plugin is a cdylib built only against one VPP's
+    # headers (bindgen at build time), in CI's arm64 VPP job; in the
+    # workspace it would break every host and cross build. Its logic is
+    # the workspace member `pf-sampler-core`.
+    "crates/vpp-plugins/pf-sampler",
 ]
 
 [workspace.package]
