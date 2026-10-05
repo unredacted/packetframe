@@ -218,7 +218,10 @@ pub enum EpochError {
 /// A random epoch identifier.
 pub fn random_epoch() -> u64 {
     let mut b = [0u8; 8];
-    let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
+    // The system call, not glibc's wrapper: that arrived in glibc 2.25,
+    // and PacketFrame's packages link against cross's 2.23.
+    // SAFETY: an 8-byte buffer of exactly that length.
+    let n = unsafe { libc::syscall(libc::SYS_getrandom, b.as_mut_ptr(), b.len(), 0) };
     if n != 8 {
         // getrandom cannot fail for 8 bytes once the pool is seeded; fall
         // back to the clock rather than a constant if it ever does.
@@ -472,6 +475,21 @@ pub fn open_epoch(dir: &Path, consume: bool) -> Result<Opened, OpenError> {
     })
 }
 
+/// Bytes in use on `dir`'s filesystem, and its size: for the sampler
+/// tmpfs, the memory epoch files hold against the budget.
+pub fn usage(dir: &Path) -> io::Result<(u64, u64)> {
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Field widths differ between glibc and musl.
+    #[allow(clippy::unnecessary_cast)]
+    let (frsize, blocks, free) = (st.f_frsize as u64, st.f_blocks as u64, st.f_bfree as u64);
+    Ok(((blocks - free) * frsize, blocks * frsize))
+}
+
 /// Creates `dir` with mode 0700 if it does not exist (for tests and lab
 /// tools; in production PacketFrame mounts the tmpfs there).
 pub fn ensure_dir(dir: &Path) -> io::Result<()> {
@@ -633,6 +651,12 @@ mod tests {
         assert!(d.join("desired.conf").exists());
         assert!(d.join("epoch-notanepoch.shm").exists());
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn usage_reports_the_filesystem() {
+        let (used, total) = usage(&std::env::temp_dir()).unwrap();
+        assert!(total > 0 && used <= total);
     }
 
     #[test]

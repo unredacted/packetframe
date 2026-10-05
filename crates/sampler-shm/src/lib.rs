@@ -19,12 +19,18 @@
 //! peer can corrupt values but never cause a data race in the other
 //! process. Readers validate everything they decode.
 //!
-//! The file operations ([`fs`]) are Linux-only; the formats and the
+//! Consumers judge [`coverage`] from what they observe, and follow the
+//! sampler across VPP restarts with [`follow`].
+//!
+//! The file operations ([`fs`], [`follow`]) are Linux-only; the formats and the
 //! lock-free protocols build everywhere, and under `--cfg loom` run against
 //! loom's model checker instead of std's atomics (`tests/loom.rs`).
 
+pub mod coverage;
 pub mod current;
 pub mod desired;
+#[cfg(all(target_os = "linux", not(loom)))]
+pub mod follow;
 #[cfg(all(target_os = "linux", not(loom)))]
 pub mod fs;
 pub mod layout;
