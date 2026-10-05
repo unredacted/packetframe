@@ -175,6 +175,52 @@ jobs:
           sudo -E $(which cargo) test -p packetframe-guard --tests -- --ignored --nocapture
           sudo -E $(which cargo) test -p packetframe-neigh-snoop --tests -- --ignored --nocapture
           sudo -E $(which cargo) test -p packetframe-probe --tests -- --ignored --nocapture
+          sudo -E $(which cargo) test -p packetframe-sampler-shm --tests -- --ignored --nocapture
+
+  sampler-shm-arm64:
+    name: sampler-shm (arm64)
+    # The sampler rings and status seqlock are lock-free code shared by two
+    # processes, VPP and PacketFrame. A missing ordering shows on aarch64's
+    # weaker memory model (the EFG's) long before x86's, so the
+    # two-process stress run and the loom model checks run on arm64
+    # hardware. The `check` job runs the same tests, smaller, on x86_64.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/rust-stable-pin
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install ${{ env.RUST_STABLE }} --profile minimal
+          rustup default ${{ env.RUST_STABLE }}
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-arm64-sampler-shm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-arm64-sampler-shm-
+
+      - name: cargo test (two processes, 20M samples through a 64-slot ring)
+        env:
+          PF_SHM_STRESS_N: "20000000"
+        run: cargo test -p packetframe-sampler-shm --release
+
+      - name: cargo test (tmpfs budget, sudo)
+        run: sudo -E $(which cargo) test -p packetframe-sampler-shm --release --tests -- --ignored --nocapture
+
+      - name: loom model checks
+        # Its own target dir: `--cfg loom` rebuilds every crate.
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: "3"
+          CARGO_TARGET_DIR: target/loom
+        run: cargo test -p packetframe-sampler-shm --release --test loom
 
   cross-build:
     name: cross-build ${{ matrix.target }}

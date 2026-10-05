@@ -8,6 +8,7 @@ members = [
     "crates/modules/neigh-snoop",
     "crates/modules/probe",
     "crates/modules/vpp-offload",
+    "crates/sampler-shm",
     "crates/tools/vpp-api-codegen",
 ]
 # BPF crates live at `crates/modules/*/bpf/` and are deliberately
@@ -48,6 +49,7 @@ packetframe-guard = { path = "crates/modules/guard" }
 packetframe-neigh-snoop = { path = "crates/modules/neigh-snoop" }
 packetframe-probe = { path = "crates/modules/probe" }
 packetframe-vpp-offload = { path = "crates/modules/vpp-offload" }
+packetframe-sampler-shm = { path = "crates/sampler-shm" }
 
 anyhow = "1.0"
 thiserror = "2.0"

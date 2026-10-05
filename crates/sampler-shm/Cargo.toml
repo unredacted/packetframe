@@ -1,0 +1,21 @@
+[package]
+name = "packetframe-sampler-shm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared-memory protocol between PacketFrame and its VPP sampler plugin"
+
+[dependencies]
+thiserror.workspace = true
+libc.workspace = true
+
+# Model-checking build only: `RUSTFLAGS="--cfg loom" cargo test -p
+# packetframe-sampler-shm --test loom`. Every other build uses std's
+# atomics and never compiles loom.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
