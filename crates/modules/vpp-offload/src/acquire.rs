@@ -509,14 +509,14 @@ pub fn release(paths: &SysPaths, state: ResourceState) -> Result<(), String> {
         }
     }
 
-    // The sampler's tmpfs, if it is ours. VPP is gone by now (every
-    // caller releases after the kill, or before any spawn), and a reader
-    // still mapping an epoch keeps only that memory, not the mount.
-    if state.sampler_mount {
-        match crate::sampler::release_mount(&paths.sampler_dir) {
-            Ok(()) => remaining.sampler_mount = false,
-            Err(e) => errors.push(e),
-        }
+    // The sampler's tmpfs, if it is PacketFrame's. VPP is gone by now
+    // (every caller releases after the kill, or before any spawn), and a
+    // reader still mapping an epoch keeps only that memory, not the
+    // mount. Not one of `errors`: its record is its own file, which stays
+    // when this fails, so a later release retries it whatever happens to
+    // this one.
+    if let Err(e) = crate::sampler::release_recorded(&paths.sampler_dir, &paths.state_dir) {
+        tracing::warn!(error = %e, "the VPP sampler's tmpfs was not released; `packetframe detach --all` retries it");
     }
 
     if errors.is_empty() {

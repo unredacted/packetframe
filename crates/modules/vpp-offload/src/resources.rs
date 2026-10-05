@@ -256,13 +256,6 @@ pub struct ResourceState {
     /// invalidates a record that outlived a downgrade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger_token: Option<u64>,
-    /// Whether PacketFrame mounted the sampler's tmpfs
-    /// ([`crate::sampler`]): released by unmounting, after VPP is gone. A
-    /// mount someone else made is used but never recorded, so never
-    /// unmounted. `serde(default)` without a version bump, as for
-    /// `ledger_token`: absent (an older build's file) is "not ours".
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub sampler_mount: bool,
 }
 
 /// Config field name → its rendered value, for the fields a running VPP
@@ -287,7 +280,6 @@ impl ResourceState {
             boot_id: None,
             restart_only: None,
             ledger_token: None,
-            sampler_mount: false,
         }
     }
 

@@ -829,8 +829,7 @@ pub fn bring_up(
         return Err(err);
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let (mut state, acquired) = acquire::acquire(
+    let (state, acquired) = acquire::acquire(
         &paths.sys,
         &ports,
         pages,
@@ -839,13 +838,12 @@ pub fn bring_up(
     )?;
 
     // The VPP sampler's directory, before VPP can start. Never fatal
-    // (`crate::sampler`); a mount it makes is recorded in `state` first,
-    // so the rollback below and every later release unmount it.
+    // (`crate::sampler`); a mount it makes is recorded before this
+    // returns, so the rollback below and every later release unmount it.
     #[cfg(target_os = "linux")]
     let sampler_dir = crate::sampler::prepare_recorded(
         &paths.sys.sampler_dir,
         startup_conf::thread_count(sizing.workers) as usize,
-        &mut state,
         &paths.sys.state_dir,
     );
     #[cfg(not(target_os = "linux"))]

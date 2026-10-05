@@ -37,18 +37,24 @@ pub const IMPLEMENTED: u64 = 1 << Class::Ingress as u64;
 /// largest page size the fleet runs (64 KiB, two pages each).
 const SMALL_FILES: u64 = 256 << 10;
 
-/// The tmpfs size the sampler directory needs for a VPP of `threads`
-/// threads (main and workers, `n_vlib_mains`): three epochs, the budget
-/// [`Epoch::create`]'s reclaim order leaves — the previous run's, the new
-/// one, and one more a stalled reader pins — plus the small files.
-pub fn dir_budget(threads: usize) -> Result<u64, String> {
+/// The bytes of one epoch file for a VPP of `threads` threads (main and
+/// workers, `n_vlib_mains`).
+pub fn epoch_len(threads: usize) -> Result<u64, String> {
     let layout = Layout::new(
         threads.clamp(1, packetframe_sampler_shm::layout::MAX_WORKERS),
         SLOTS_PER_RING,
         HEADER_CAPACITY,
     )
     .map_err(|e| e.to_string())?;
-    Ok(3 * layout.file_len() as u64 + SMALL_FILES)
+    Ok(layout.file_len() as u64)
+}
+
+/// The tmpfs size the sampler directory needs for a VPP of `threads`
+/// threads: three epochs, the budget [`Epoch::create`]'s reclaim order
+/// leaves — the previous run's, the new one, and one more a stalled reader
+/// pins — plus the small files.
+pub fn dir_budget(threads: usize) -> Result<u64, String> {
+    Ok(3 * epoch_len(threads)? + SMALL_FILES)
 }
 
 const TICK_NS: u64 = 100_000_000;
