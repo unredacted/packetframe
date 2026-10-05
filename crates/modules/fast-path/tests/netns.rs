@@ -640,7 +640,7 @@ fn delta_labels(before: &[u64], after: &[u64]) -> Vec<(&'static str, u64)> {
         .zip(after.iter())
         .enumerate()
         .filter_map(|(i, (b, a))| {
-            if a > b {
+            if a > b && !packetframe_fast_path::metrics::INTERNAL_SLOTS.contains(&i) {
                 // `.get()` rather than `names[i]`: the snapshot is sized
                 // from the test-local STATS_COUNT, so a counter appended
                 // to StatIdx without a name landing here yet would

@@ -63,8 +63,8 @@ use crate::maps::{
     FP_CFG_FLAG_VLAN_PRESENT, MUTATION_CTX, TC_MUTATION_PROGS, TC_REDIRECT_TARGETS, VLAN_RESOLVE,
 };
 use crate::{
-    fib, ICMPV6_ND_TYPE_MAX, ICMPV6_ND_TYPE_MIN, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, VLAN_HDR_LEN,
-    VLAN_NONE,
+    fib, sample, ICMPV6_ND_TYPE_MAX, ICMPV6_ND_TYPE_MIN, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP,
+    VLAN_HDR_LEN, VLAN_NONE,
 };
 
 /// `bpf_redirect()`'s success return (uapi TC_ACT_REDIRECT). Returned
@@ -92,14 +92,57 @@ pub fn tc_fast_path(ctx: TcContext) -> i32 {
     // No head-shift here: the rvu-nicpf xdp_buff mis-sizing bug lives
     // in the driver's XDP path; by clsact time the skb is normalized.
 
-    match tc_try_fast_path(&ctx, stats, cfg_flags, dry_run, mss_clamp_global) {
+    sample::tick(stats);
+
+    let verdict = match tc_try_fast_path(&ctx, stats, cfg_flags, dry_run, mss_clamp_global) {
         Ok(verdict) => verdict,
         Err(()) => {
             bump(stats, StatIdx::ErrParse);
             bump(stats, StatIdx::ErrParseTc);
             TC_ACT_OK as i32
         }
+    };
+    // As in main.rs: forwarded packets were emitted in tc_forward_success.
+    let disposition = if verdict == TC_ACT_SHOT as i32 {
+        sample::DISPOSITION_DROP
+    } else {
+        sample::DISPOSITION_PASS
+    };
+    sample_tc(&ctx, stats, disposition, 0);
+    verdict
+}
+
+/// Emit the packet in hand if it is selected (`sample.rs`). An offloaded
+/// VLAN tag is not in the bytes, so it travels in the record.
+#[inline(always)]
+fn sample_tc(ctx: &TcContext, stats: StatsPtr, disposition: u32, egress_ifindex: u32) {
+    if !sample::pending(stats) {
+        return;
     }
+    let skb = ctx.skb.skb;
+    let (len, ifindex, tagged, tci, proto) = unsafe {
+        (
+            (*skb).len,
+            (*skb).ifindex,
+            (*skb).vlan_present != 0,
+            (*skb).vlan_tci,
+            (*skb).vlan_proto,
+        )
+    };
+    let vlan = if tagged {
+        (tci & 0xffff) | u32::from(u16::from_be(proto as u16)) << 16
+    } else {
+        0
+    };
+    sample::emit(
+        ctx,
+        stats,
+        len,
+        ifindex,
+        egress_ifindex,
+        sample::PATH_TC | disposition << 8 | u32::from(tagged) << 16,
+        vlan,
+    );
 }
 
 #[inline(always)]
@@ -447,6 +490,9 @@ fn tc_forward_success(
         bump(stats, StatIdx::PassFragNeeded);
         return Ok(TC_ACT_OK as i32);
     }
+
+    // Past every pristine-packet fallback: sample the redirect intent.
+    sample_tc(ctx, stats, sample::DISPOSITION_REDIRECT, egress_ifindex);
 
     // Direct packet writes; sched_cls supports them and the verifier
     // has the ranges from the callers' bounds checks.

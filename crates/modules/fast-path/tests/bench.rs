@@ -256,3 +256,70 @@ fn bench_allowlist_miss() {
 
     eprintln!("bench_allowlist_miss: {ns} ns/pkt (median of {calls} x {repeat})");
 }
+
+/// The flow-export sampler's cost on the forward path: sampling off
+/// against 1:1000, the rate the 5% worker budget is qualified at. Two
+/// harnesses, one per setting, whose runs interleave so host drift lands
+/// on both; a trimmed mean of the per-call figures, since each is a whole
+/// number of ns and a median would round the difference away.
+///
+/// Prints the overhead; `PACKETFRAME_BENCH_SAMPLING_GATE=1` fails it
+/// above 2% (opt-in, like the baseline gate: not for shared runners).
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test --test bench -- --ignored --nocapture`"]
+fn bench_sampling_overhead() {
+    if bench_skip() {
+        return;
+    }
+    // One CPU: the countdown is per-CPU, and so is the measurement.
+    common::on_one_cpu(|| {
+        let off = packetframe_fib_harness();
+        let mut on = packetframe_fib_harness();
+        let mut tap = on.sample_tap();
+        on.set_sample_cfg(1000, 128, 1);
+        let pkt = fwd_packet(TCP_FLAG_ACK);
+
+        let (repeat, calls) = bench_params(FWD_REPEAT, FWD_CALLS);
+        let (mut a, mut b) = (Vec::with_capacity(calls), Vec::with_capacity(calls));
+        let mut samples = 0;
+        for i in 0..calls {
+            let (va, ns_a) = off.run_timed(&pkt, repeat);
+            let (vb, ns_b) = on.run_timed(&pkt, repeat);
+            assert_eq!(
+                (va, vb),
+                (xdp_action::XDP_REDIRECT, xdp_action::XDP_REDIRECT)
+            );
+            a.push(ns_a);
+            b.push(ns_b);
+            // Keep the rings from filling: a refused output is cheaper
+            // than a delivered one and would flatter the figure.
+            if i % 50 == 49 {
+                samples += tap.events().len();
+            }
+        }
+        samples += tap.events().len();
+        let executed = (repeat as u64) * (calls as u64);
+        assert_eq!(on.stat(StatIdx::FwdOk), executed);
+        assert_eq!(on.stat(StatIdx::SampleEmitFailed), 0);
+        assert_eq!(on.stat(StatIdx::SampleSelected), samples as u64);
+        assert!(samples > 0 || executed < 1000, "no samples at 1:1000");
+
+        let (off_ns, on_ns) = (trimmed_mean(a), trimmed_mean(b));
+        let overhead = (on_ns / off_ns - 1.0) * 100.0;
+        eprintln!(
+            "bench_sampling_overhead: off {off_ns:.2} ns/pkt, 1:1000 {on_ns:.2} ns/pkt \
+             ({overhead:+.2}%), {samples} samples of {executed}"
+        );
+        if std::env::var_os("PACKETFRAME_BENCH_SAMPLING_GATE").is_some() {
+            assert!(overhead <= 2.0, "sampling at 1:1000 costs {overhead:.2}%");
+        }
+    });
+}
+
+/// Mean of the middle 80%.
+fn trimmed_mean(mut v: Vec<u32>) -> f64 {
+    v.sort_unstable();
+    let cut = v.len() / 10;
+    let mid = &v[cut..v.len() - cut];
+    mid.iter().map(|&x| f64::from(x)).sum::<f64>() / mid.len() as f64
+}
