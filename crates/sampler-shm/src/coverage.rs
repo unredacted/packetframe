@@ -92,21 +92,29 @@ pub fn assess(o: &Observation<'_>) -> (Coverage, String) {
             format!("heartbeat {} ms old", o.heartbeat_age_ns / 1_000_000),
         );
     }
-    match s.state {
-        State::Initializing => return (Coverage::Unavailable, "plugin initialising".into()),
-        State::Disabled => return (Coverage::Disabled, reason::describe(s.reason).into()),
-        State::Enabled => {}
+    if s.state == State::Initializing {
+        return (Coverage::Unavailable, "plugin initialising".into());
     }
+    // A refusal comes before Disabled: a first desired.conf refused leaves
+    // the plugin disabled, and that is a configuration error, not an
+    // operator sampling nothing.
     if s.rejected_reason != 0 {
         let kind =
             ErrorKind::from_code(s.rejected_reason).map_or("unknown reason", ErrorKind::describe);
+        let kept = match s.state {
+            State::Enabled => format!("generation {} still applied", s.applied_generation),
+            _ => "no valid configuration applied, so nothing is sampled".into(),
+        };
         return (
             Coverage::Degraded,
             format!(
-                "desired.conf generation {} refused ({kind}, line {}); generation {} still applied",
-                s.rejected_generation, s.rejected_line, s.applied_generation
+                "desired.conf generation {} refused ({kind}, line {}); {kept}",
+                s.rejected_generation, s.rejected_line
             ),
         );
+    }
+    if s.state == State::Disabled {
+        return (Coverage::Disabled, reason::describe(s.reason).into());
     }
     match o.desired_generation {
         None => {
@@ -259,6 +267,15 @@ mod tests {
         s.state = State::Disabled;
         s.reason = reason::NO_INTERFACES;
         assert_eq!(judge(obs(&s)), Coverage::Disabled);
+        // The first desired.conf refused: disabled, but not by choice.
+        s.reason = reason::NO_VALID_CONFIG;
+        s.applied_generation = 0;
+        s.rejected_generation = 4;
+        s.rejected_reason = ErrorKind::Checksum.code();
+        let (c, why) = assess(&obs(&s));
+        assert_eq!(c, Coverage::Degraded);
+        assert!(why.contains("nothing is sampled"), "{why}");
+        let mut s = status();
         s.state = State::Initializing;
         assert_eq!(judge(obs(&s)), Coverage::Unavailable);
     }

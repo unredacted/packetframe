@@ -13,7 +13,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::current::Current;
+use crate::current::{Current, CurrentError};
 use crate::fs::{open_epoch, Lock, OpenError, Opened, CONSUMER_LOCK, CURRENT};
 use crate::layout::LayoutError;
 use crate::ring;
@@ -92,7 +92,7 @@ impl Follower {
                     Some(o) if o.header.epoch == to => None,
                     old => {
                         let from = old.as_ref().map(|o| o.header.epoch);
-                        let abandoned = old.as_ref().map_or(0, queued);
+                        let abandoned = old.as_ref().map_or(0, queued_in);
                         // `old` is unmapped here, as it is dropped.
                         Some(Switch {
                             from,
@@ -120,11 +120,16 @@ impl Follower {
         self.error.as_ref()
     }
 
-    /// Whether the last failure was a layout this build cannot read.
+    /// Whether the last failure was a format this build cannot read: a
+    /// newer `current` or epoch layout, which no amount of waiting fixes.
     pub fn incompatible(&self) -> bool {
         matches!(
             self.error,
-            Some(OpenError::Incompatible(_) | OpenError::Layout(LayoutError::Version { .. }))
+            Some(
+                OpenError::Incompatible(_)
+                    | OpenError::Current(CurrentError::Version(_))
+                    | OpenError::Layout(LayoutError::Version { .. })
+            )
         )
     }
 
@@ -138,13 +143,16 @@ impl Follower {
     }
 }
 
-/// Samples written to an epoch's rings but not yet consumed.
-fn queued(o: &Opened) -> u64 {
+/// Samples written to a ring but not yet consumed, from one look at its
+/// counters. `head` is read before `tail`, so a consumer draining
+/// meanwhile can leave `tail` past the `head` seen: nothing queued.
+pub fn queued(c: &ring::Counters) -> u64 {
+    c.head.saturating_sub(c.tail)
+}
+
+fn queued_in(o: &Opened) -> u64 {
     (0..o.layout().workers)
-        .map(|r| {
-            let c = ring::counters(o.layout(), o.file(), r);
-            c.head.wrapping_sub(c.tail)
-        })
+        .map(|r| queued(&ring::counters(o.layout(), o.file(), r)))
         .sum()
 }
 
@@ -239,6 +247,20 @@ mod tests {
     }
 
     #[test]
+    fn a_tail_past_the_head_seen_is_nothing_queued() {
+        let c = |head, tail| ring::Counters {
+            head,
+            tail,
+            selected: 0,
+            written: 0,
+            dropped_full: 0,
+            pool: Vec::new(),
+        };
+        assert_eq!(queued(&c(10, 4)), 6);
+        assert_eq!(queued(&c(10, 12)), 0, "a drain between the two loads");
+    }
+
+    #[test]
     fn an_unreadable_new_epoch_keeps_the_old_one_open() {
         let d = tempdir();
         let (_l, _m) = run(&d, 3);
@@ -251,6 +273,14 @@ mod tests {
         std::fs::write(d.join(CURRENT), "pf-sampler-current 1\nepoch 0000000000000009\nfile epoch-0000000000000009.shm\nlayout 2\nsize 8\n").unwrap();
         f.refresh();
         assert!(f.incompatible());
+        // A newer `current` format is as permanent as a newer layout.
+        std::fs::write(
+            d.join(CURRENT),
+            "pf-sampler-current 2\nepoch 0000000000000009\n",
+        )
+        .unwrap();
+        f.refresh();
+        assert!(f.incompatible(), "{:?}", f.error());
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

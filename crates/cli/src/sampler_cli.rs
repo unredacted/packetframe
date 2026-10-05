@@ -27,12 +27,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Subcommand;
 use packetframe_sampler_shm::coverage::{assess, Coverage, NoStatus, Observation};
 use packetframe_sampler_shm::desired::Desired;
-use packetframe_sampler_shm::follow::Follower;
+use packetframe_sampler_shm::follow::{self, Follower};
 use packetframe_sampler_shm::fs::{
     usage, write_atomic, Lock, Opened, DEFAULT_DIR, DESIRED, DESIRED_LOCK, ENV_DIR,
 };
 use packetframe_sampler_shm::ring::{self, Counters, Drained, Sample};
-use packetframe_sampler_shm::status::Status;
+use packetframe_sampler_shm::status::{Interface, Status};
 use packetframe_sampler_shm::{valid_interface_name, Class};
 
 use crate::{parse_duration, EXIT_OK, EXIT_RUNTIME_ERROR, EXIT_STARTUP_ERROR};
@@ -269,7 +269,7 @@ fn status(dir: &Path) -> ExitCode {
             c.selected,
             c.written,
             c.dropped_full,
-            c.head.wrapping_sub(c.tail)
+            follow::queued(c)
         );
     }
     if seen.coverage.is_healthy() {
@@ -287,11 +287,16 @@ struct Window {
     drained: Vec<u64>,
     corrupt: u64,
     skipped: u64,
-    latency_ns: Vec<u64>,
+    latency: Latency,
     shown: Vec<(usize, Sample)>,
     /// What epochs left during the window counted after its start:
     /// pool, selected, written, dropped-full, drained.
     carried: [u64; 5],
+    /// Every name each pool index stood for in the open epoch during the
+    /// window, and each generation applied: a configuration change
+    /// mid-window must not hand what one interface counted to another.
+    names: BTreeMap<u8, Vec<String>>,
+    generations: Vec<u64>,
 }
 
 /// Pool, selected, written and dropped-full counted between `base` and
@@ -325,16 +330,20 @@ impl Window {
             base,
             corrupt: 0,
             skipped: 0,
-            latency_ns: Vec::new(),
+            latency: Latency::default(),
             shown: Vec::new(),
             carried: [0; 5],
+            names: BTreeMap::new(),
+            generations: Vec::new(),
         }
     }
 
     /// The epoch changed: keep what the one left (`last`, its counters
     /// just before the switch) counted in this window, and count the new
-    /// one from its own start.
-    fn rebase(&mut self, f: &Follower, last: Option<&[Counters]>) {
+    /// one from zero when it is `fresh` (made after this run began, so all
+    /// it counted before the switch was noticed is this run's), else from
+    /// now.
+    fn rebase(&mut self, f: &Follower, last: Option<&[Counters]>, fresh: bool) {
         if let Some(last) = last {
             let g = growth(last, &self.base);
             for (c, v) in self.carried.iter_mut().zip(g) {
@@ -342,8 +351,26 @@ impl Window {
             }
         }
         self.carried[4] += self.drained.iter().sum::<u64>();
-        self.base = f.opened().map(counters).unwrap_or_default();
-        self.drained = vec![0; self.base.len()];
+        self.base = match f.opened() {
+            Some(o) if !fresh => counters(o),
+            _ => Vec::new(),
+        };
+        self.drained = vec![0; f.opened().map_or(0, |o| o.layout().workers)];
+        // The new epoch's pool indexes are its own plugin's.
+        self.names.clear();
+        self.generations.clear();
+    }
+
+    fn note(&mut self, s: &Status) {
+        for i in &s.interfaces {
+            let names = self.names.entry(i.pool_index).or_default();
+            if !names.contains(&i.name) {
+                names.push(i.name.clone());
+            }
+        }
+        if self.generations.last() != Some(&s.applied_generation) {
+            self.generations.push(s.applied_generation);
+        }
     }
 
     fn take(&mut self, r: usize, d: Drained, out: &mut Vec<Sample>, now_ns: u64, show: usize) {
@@ -353,7 +380,7 @@ impl Window {
         self.corrupt += d.corrupt;
         self.skipped += d.skipped;
         for s in out.drain(..) {
-            self.latency_ns.push(now_ns.saturating_sub(s.meta.time_ns));
+            self.latency.add(now_ns.saturating_sub(s.meta.time_ns));
             if self.shown.len() < show {
                 self.shown.push((r, s));
             }
@@ -374,11 +401,114 @@ struct Totals {
     abandoned: u64,
 }
 
-fn percentile(sorted: &[u64], p: f64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
+/// Buckets per power of two in [`Latency`], as a shift.
+const LATENCY_SUB: u32 = 3;
+const LATENCY_BUCKETS: usize = 64 << LATENCY_SUB;
+
+/// Sample-to-receipt latencies in a log-linear histogram: 8 buckets to
+/// each power of two, so a quantile is within 12.5% and a window holds 4
+/// KiB however many samples it drains (1:1 sampling drains millions).
+struct Latency {
+    counts: Vec<u64>,
+    n: u64,
+    max: u64,
+}
+
+impl Default for Latency {
+    fn default() -> Self {
+        Self {
+            counts: vec![0; LATENCY_BUCKETS],
+            n: 0,
+            max: 0,
+        }
     }
-    sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+}
+
+impl Latency {
+    fn bucket(ns: u64) -> usize {
+        if ns < 1 << LATENCY_SUB {
+            return ns as usize;
+        }
+        let octave = 63 - ns.leading_zeros();
+        let sub = (ns >> (octave - LATENCY_SUB)) & ((1 << LATENCY_SUB) - 1);
+        ((u64::from(octave - LATENCY_SUB + 1) << LATENCY_SUB) | sub) as usize
+    }
+
+    /// The smallest value bucket `b` holds.
+    fn floor(b: usize) -> u64 {
+        let b = b as u64;
+        if b < 1 << LATENCY_SUB {
+            return b;
+        }
+        let octave = (b >> LATENCY_SUB) as u32 + LATENCY_SUB - 1;
+        ((1 << LATENCY_SUB) | (b & ((1 << LATENCY_SUB) - 1))) << (octave - LATENCY_SUB)
+    }
+
+    fn add(&mut self, ns: u64) {
+        self.counts[Self::bucket(ns)] += 1;
+        self.n += 1;
+        self.max = self.max.max(ns);
+    }
+
+    /// The `p` quantile, as the floor of the bucket it falls in.
+    fn quantile(&self, p: f64) -> u64 {
+        let rank = ((self.n as f64 * p).ceil() as u64).max(1);
+        let mut seen = 0;
+        for (b, &c) in self.counts.iter().enumerate() {
+            seen += c;
+            if seen >= rank {
+                return Self::floor(b);
+            }
+        }
+        self.max
+    }
+}
+
+/// Each configured interface's packets in the window, and every pool that
+/// counted in it: an interface configured earlier in the window still
+/// shows, under the names its pool had.
+fn interface_lines(
+    current: &[Interface],
+    pools: &BTreeMap<u8, u64>,
+    names: &BTreeMap<u8, Vec<String>>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for i in current {
+        let at = match i.sw_if_index {
+            Some(sw) => format!("sw_if_index {sw}"),
+            None => "UNRESOLVED".into(),
+        };
+        let before: Vec<&str> = names
+            .get(&i.pool_index)
+            .into_iter()
+            .flatten()
+            .filter(|n| **n != i.name)
+            .map(String::as_str)
+            .collect();
+        let shared = if before.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (its pool also counted {} in this window)",
+                before.join(", ")
+            )
+        };
+        out.push(format!(
+            "  {} ({at}): +{} packets{shared}",
+            i.name,
+            pools.get(&i.pool_index).copied().unwrap_or(0)
+        ));
+    }
+    for (p, n) in pools {
+        if current.iter().any(|i| i.pool_index == *p) {
+            continue;
+        }
+        let who = names
+            .get(p)
+            .map_or_else(|| format!("pool {p}"), |names| names.join(", "));
+        out.push(format!("  {who} (no longer configured): +{n} packets"));
+    }
+    out
 }
 
 /// Prints the window's report; returns the counter snapshot it was taken
@@ -449,6 +579,7 @@ fn report(
         ms(seen.heartbeat_age_ns),
     );
     if let Some(s) = &seen.status {
+        w.note(s);
         println!(
             "  generation applied {} desired {}, rate 1:{}, header {} bytes",
             s.applied_generation,
@@ -456,18 +587,18 @@ fn report(
             s.rate,
             s.header_bytes
         );
-        for i in &s.interfaces {
-            let at = match i.sw_if_index {
-                Some(sw) => format!("sw_if_index {sw}"),
-                None => "UNRESOLVED".into(),
-            };
-            println!(
-                "  {} ({at}): +{} packets",
-                i.name,
-                pools.get(&i.pool_index).copied().unwrap_or(0)
-            );
-        }
     }
+    if w.generations.len() > 1 {
+        let g: Vec<String> = w.generations.iter().map(u64::to_string).collect();
+        println!(
+            "  generation changed in this window ({}): each count below spans the change",
+            g.join(" -> ")
+        );
+    }
+    let current = seen.status.as_ref().map_or(&[][..], |s| &s.interfaces[..]);
+    interface_lines(current, &pools, &w.names)
+        .iter()
+        .for_each(|l| println!("{l}"));
     ring_lines.iter().for_each(|l| println!("{l}"));
     let effective = if selected > 0 {
         format!("1:{:.0}", pool as f64 / selected as f64)
@@ -479,15 +610,14 @@ fn report(
          lost: ring full {full}, corrupt {}, skipped {}",
         w.corrupt, w.skipped
     );
-    if !w.latency_ns.is_empty() {
-        w.latency_ns.sort_unstable();
-        let l = &w.latency_ns;
+    let l = &w.latency;
+    if l.n > 0 {
         println!(
             "  sample-to-receipt: p50 {} p99 {} max {} over {} samples",
-            ms(percentile(l, 0.5)),
-            ms(percentile(l, 0.99)),
-            ms(*l.last().unwrap()),
-            l.len()
+            ms(l.quantile(0.5)),
+            ms(l.quantile(0.99)),
+            ms(l.max),
+            l.n
         );
     }
     if let Ok((u, total)) = usage(f.dir()) {
@@ -535,6 +665,7 @@ fn watch(
         }
     }
     let run_start = Instant::now();
+    let run_start_ns = realtime_ns();
     let refresh_every = Duration::from_millis(100);
     let mut next_refresh = run_start;
     let mut w = Window::new(&f);
@@ -557,7 +688,13 @@ fn watch(
                         t.abandoned += sw.abandoned;
                     }
                 }
-                w.rebase(&f, last.as_deref());
+                let fresh = sw.from.is_some()
+                    || f.opened()
+                        .is_some_and(|o| o.header.created_ns >= run_start_ns);
+                w.rebase(&f, last.as_deref(), fresh);
+            }
+            if let Some(s) = f.opened().and_then(|o| o.status().read().ok()) {
+                w.note(&s);
             }
             next_refresh = now + refresh_every;
         }
@@ -596,9 +733,9 @@ fn watch(
     }
 }
 
-/// One past every generation in sight: the file's, and what the plugin
-/// last applied or refused.
-fn next_generation(dir: &Path) -> u64 {
+/// The newest generation in sight: the file's, and what the plugin last
+/// applied or refused.
+fn newest_generation(dir: &Path) -> Option<u64> {
     let mut f = Follower::observer(dir);
     f.refresh();
     let status = f.opened().and_then(|o| o.status().read().ok());
@@ -610,8 +747,20 @@ fn next_generation(dir: &Path) -> u64 {
     .into_iter()
     .flatten()
     .max()
-    .unwrap_or(0)
-        + 1
+}
+
+/// The generation to write: one past the newest in sight by default; an
+/// explicit one must be past it too, or the status already showing it
+/// would read as this configuration applied (or refused) before the plugin
+/// has even read the file.
+fn pick_generation(explicit: Option<u64>, newest: Option<u64>) -> Result<u64, String> {
+    match (explicit, newest) {
+        (None, n) => Ok(n.map_or(1, |n| n + 1)),
+        (Some(g), Some(n)) if g <= n => Err(format!(
+            "generation {g} is not past {n}, the newest the file and the plugin show"
+        )),
+        (Some(g), _) => Ok(g),
+    }
 }
 
 fn take_desired_lock(dir: &Path) -> Result<Lock, ExitCode> {
@@ -645,7 +794,13 @@ fn configure(
         Ok(l) => l,
         Err(code) => return code,
     };
-    let generation = generation.unwrap_or_else(|| next_generation(dir));
+    let generation = match pick_generation(generation, newest_generation(dir)) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("sampler configure: {e}");
+            return ExitCode::from(EXIT_STARTUP_ERROR);
+        }
+    };
     let d = Desired {
         generation,
         rate,
@@ -766,12 +921,36 @@ fn ipv6(p: &[u8]) -> String {
         return "ipv6, header cut short".into();
     }
     let addr = |b: &[u8]| Ipv6Addr::from(<[u8; 16]>::try_from(b).expect("16 bytes"));
-    transport(
-        p[6],
-        IpAddr::V6(addr(&p[8..24])),
-        IpAddr::V6(addr(&p[24..40])),
-        &p[40..],
-    )
+    let (src, dst) = (IpAddr::V6(addr(&p[8..24])), IpAddr::V6(addr(&p[24..40])));
+    let cut = || format!("ipv6 {src} -> {dst}, extension headers cut short");
+    // Extension headers chain from the fixed header to the transport's.
+    let (mut next, mut at) = (p[6], 40);
+    for _ in 0..8 {
+        let len = match next {
+            // Hop-by-Hop, Routing, Destination Options, Mobility, HIP,
+            // Shim6: a length in 8-byte units, not counting the first 8.
+            0 | 43 | 60 | 135 | 139 | 140 => p.get(at + 1).map(|&l| (usize::from(l) + 1) * 8),
+            // AH counts 4-byte units, not counting the first 8 bytes.
+            51 => p.get(at + 1).map(|&l| (usize::from(l) + 2) * 4),
+            44 => {
+                let Some(frag) = p.get(at..at + 8) else {
+                    return cut();
+                };
+                // Only the first fragment carries the transport header.
+                if u16::from_be_bytes([frag[2], frag[3]]) >> 3 != 0 {
+                    return transport(frag[0], src, dst, &[]);
+                }
+                Some(8)
+            }
+            _ => break,
+        };
+        let (Some(len), Some(&n)) = (len, p.get(at)) else {
+            return cut();
+        };
+        next = n;
+        at += len;
+    }
+    transport(next, src, dst, p.get(at..).unwrap_or(&[]))
 }
 
 fn transport(proto: u8, src: IpAddr, dst: IpAddr, l4: &[u8]) -> String {
@@ -838,6 +1017,40 @@ mod tests {
         );
     }
 
+    fn udp6(next: u8, ext: &[u8]) -> Vec<u8> {
+        let mut h = eth(0x86dd);
+        h.extend_from_slice(&[0x60, 0, 0, 0, 0, 20, next, 64]);
+        h.extend_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        h.extend_from_slice(&"2001:db8::2".parse::<Ipv6Addr>().unwrap().octets());
+        h.extend_from_slice(ext);
+        h.extend_from_slice(&[0x04, 0x00, 0x00, 0x35, 0, 12, 0, 0]);
+        h
+    }
+
+    #[test]
+    fn ipv6_extension_headers_are_walked_to_the_ports() {
+        let want = "udp [2001:db8::1]:1024 -> [2001:db8::2]:53";
+        // Hop-by-Hop (8 bytes), then a Destination Options of 16.
+        let mut ext = vec![60, 0, 1, 4, 0, 0, 0, 0];
+        ext.extend_from_slice(&[17, 1]);
+        ext.extend_from_slice(&[0; 14]);
+        assert_eq!(describe_packet(&udp6(0, &ext)), want);
+        // A first fragment carries the ports; a later one does not.
+        assert_eq!(describe_packet(&udp6(44, &[17, 0, 0, 1, 0, 0, 0, 7])), want);
+        assert_eq!(
+            describe_packet(&udp6(44, &[17, 0, 0x05, 0x01, 0, 0, 0, 7])),
+            "udp 2001:db8::1 -> 2001:db8::2"
+        );
+        // AH: (2 + 2) * 4 = 16 bytes.
+        let mut ah = vec![17, 2];
+        ah.extend_from_slice(&[0; 14]);
+        assert_eq!(describe_packet(&udp6(51, &ah)), want);
+        // A chain the copied header ends inside.
+        let mut short = udp6(0, &[]);
+        short.truncate(14 + 40);
+        assert!(describe_packet(&short).contains("cut short"));
+    }
+
     #[test]
     fn short_and_unknown_headers_say_so() {
         assert!(describe_packet(&[0; 10]).contains("too short"));
@@ -871,10 +1084,107 @@ mod tests {
     }
 
     #[test]
-    fn percentiles_pick_from_the_sorted_samples() {
-        let v: Vec<u64> = (1..=100).collect();
-        assert_eq!(percentile(&v, 0.5), 51);
-        assert_eq!(percentile(&v, 0.99), 99);
-        assert_eq!(percentile(&[], 0.5), 0);
+    fn a_new_epoch_counts_from_its_own_start() {
+        use packetframe_sampler_shm::fs::{
+            create_epoch, ensure_dir, publish_current, random_epoch,
+        };
+        use packetframe_sampler_shm::layout::Layout;
+        use packetframe_sampler_shm::ring::RingWriter;
+        let d = std::env::temp_dir().join(format!("pf-cli-rebase-{}", random_epoch()));
+        ensure_dir(&d).unwrap();
+        let l = Layout::new(1, 8, 16).unwrap();
+        let m1 = create_epoch(&d, &l, 1, realtime_ns(), 0, "t").unwrap();
+        publish_current(&d, 1, &l).unwrap();
+        let mut f = Follower::consumer(&d).unwrap();
+        let mut w = Window::new(&f);
+        f.refresh().unwrap();
+        w.rebase(&f, None, false);
+        RingWriter::new(&l, m1.words(), 0).add_pool(0, Class::Ingress, 5);
+        // VPP restarts; its epoch counts 7 before the switch is noticed.
+        let last = f.opened().map(counters);
+        let m2 = create_epoch(&d, &l, 2, realtime_ns(), 0, "t").unwrap();
+        publish_current(&d, 2, &l).unwrap();
+        RingWriter::new(&l, m2.words(), 0).add_pool(0, Class::Ingress, 7);
+        let sw = f.refresh().unwrap();
+        w.rebase(&f, last.as_deref(), sw.from.is_some());
+        let now = counters(f.opened().unwrap());
+        assert_eq!(growth(&now, &w.base)[0] + w.carried[0], 5 + 7);
+        assert_eq!(
+            w.drained.len(),
+            1,
+            "the new epoch's rings drain into the window"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_config_change_mid_window_keeps_each_interface_its_packets() {
+        let iface = |name: &str, pool| Interface {
+            name: name.into(),
+            sw_if_index: Some(1),
+            pool_index: pool,
+            unresolved_since_ns: 0,
+        };
+        let mut w = Window::from(Vec::new());
+        let before = Status {
+            applied_generation: 4,
+            interfaces: vec![iface("octeon0/0", 0), iface("octeon1/0", 1)],
+            ..Status::default()
+        };
+        // octeon0/0 is dropped; pool 1 later goes to a new interface.
+        let after = Status {
+            applied_generation: 5,
+            interfaces: vec![iface("octeon2/0", 1)],
+            ..Status::default()
+        };
+        w.note(&before);
+        w.note(&after);
+        assert_eq!(w.generations, [4, 5]);
+        let pools = BTreeMap::from([(0, 30), (1, 70)]);
+        assert_eq!(
+            interface_lines(&after.interfaces, &pools, &w.names),
+            [
+                "  octeon2/0 (sw_if_index 1): +70 packets (its pool also counted octeon1/0 in this window)",
+                "  octeon0/0 (no longer configured): +30 packets",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_explicit_generation_must_be_past_every_one_in_sight() {
+        assert_eq!(pick_generation(None, None), Ok(1));
+        assert_eq!(pick_generation(None, Some(4)), Ok(5));
+        assert_eq!(pick_generation(Some(9), Some(4)), Ok(9));
+        assert_eq!(pick_generation(Some(9), None), Ok(9));
+        assert!(
+            pick_generation(Some(4), Some(4)).is_err(),
+            "already applied"
+        );
+        assert!(pick_generation(Some(3), Some(4)).is_err());
+    }
+
+    #[test]
+    fn latency_quantiles_are_within_an_eighth_in_fixed_memory() {
+        // Every bucket's floor maps back to that bucket, in order.
+        for b in 0..Latency::bucket(u64::MAX) {
+            assert_eq!(Latency::bucket(Latency::floor(b)), b);
+            assert!(Latency::floor(b) < Latency::floor(b + 1));
+        }
+        assert!(Latency::bucket(u64::MAX) < LATENCY_BUCKETS);
+        let mut l = Latency::default();
+        for ns in 1..=100_000u64 {
+            l.add(ns * 1000);
+        }
+        for (p, exact) in [(0.5, 50_000_000u64), (0.99, 99_000_000)] {
+            let q = l.quantile(p);
+            assert!(q <= exact && exact - q <= exact / 8, "p{p}: {q} vs {exact}");
+        }
+        assert_eq!(l.max, 100_000_000);
+        assert_eq!(
+            l.counts.len(),
+            LATENCY_BUCKETS,
+            "the same 4 KiB at any count"
+        );
+        assert_eq!(Latency::default().quantile(0.5), 0);
     }
 }
