@@ -218,7 +218,10 @@ pub enum EpochError {
 /// A random epoch identifier.
 pub fn random_epoch() -> u64 {
     let mut b = [0u8; 8];
-    let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
+    // The system call, not glibc's wrapper: that arrived in glibc 2.25,
+    // and PacketFrame's packages link against cross's 2.23.
+    // SAFETY: an 8-byte buffer of exactly that length.
+    let n = unsafe { libc::syscall(libc::SYS_getrandom, b.as_mut_ptr(), b.len(), 0) };
     if n != 8 {
         // getrandom cannot fail for 8 bytes once the pool is seeded; fall
         // back to the clock rather than a constant if it ever does.
