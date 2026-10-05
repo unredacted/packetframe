@@ -1,0 +1,35 @@
+[package]
+name = "pf-sampler"
+version = "0.5.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/unredacted/packetframe"
+description = "PacketFrame's VPP sampler plugin: VPP glue around packetframe-sampler-core"
+publish = false
+
+# Its own workspace: it builds only against one VPP's headers (vpp-plugin
+# runs bindgen at build time), so it is excluded from PacketFrame's and
+# built by CI's arm64 VPP job. See the root Cargo.toml.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Our fork: the fixes this plugin needs, upstream's as PRs (VPP 26.06, the
+# baseline node variant, the x4 feature-next fix, version_required:
+# rshearman/vpp-plugin-rs#11-#14) and the fork's own (VPP_BUILD_VER read
+# past a line marker, SwIfIndex Display, the WARNING severity). Pinned by
+# commit; the tag pf/2026-10-05 keeps it reachable.
+vpp-plugin = { git = "https://github.com/unredacted/vpp-plugin-rs", rev = "36c14ef09ffaef6474828fd1bb22de1bd4b4783c", features = ["process-node"] }
+packetframe-sampler-core = { path = "../pf-sampler-core" }
+packetframe-sampler-shm = { path = "../../sampler-shm" }
+arrayvec = "0.7.6"
+libc = "0.2"
+
+[profile.release]
+# A panic inside VPP cannot unwind across its C frames anyway; abort is
+# what would happen, without the unwinding tables.
+panic = "abort"
+# Line tables, so a crash in VPP's core dump names the line.
+debug = 1

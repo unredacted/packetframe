@@ -1,7 +1,8 @@
 //! The sampler directory's files (Linux).
 //!
-//! - The plugin calls [`check_dir`], [`create_epoch`], [`publish_current`]
-//!   and [`reclaim`], in that order, once per VPP run.
+//! - The plugin calls [`check_dir`], [`reclaim`] (keeping the epoch
+//!   `current` names), [`create_epoch`] and [`publish_current`], in that
+//!   order, once per VPP run.
 //! - The consumer takes [`CONSUMER_LOCK`] with [`Lock::try_exclusive`] and
 //!   keeps it across epochs, then [`open_epoch`]s whatever `current` names.
 //! - PacketFrame writes `desired.conf` with [`write_atomic`] while holding

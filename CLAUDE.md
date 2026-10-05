@@ -14,6 +14,7 @@ PacketFrame is a modular eBPF data plane written in pure Rust (aya + aya-ebpf). 
 - `crates/modules/guard/`: tc-egress frame policer (ARP/NS per-target rate limit, LLDP drop, foreign-src-MAC drop, bcast/mcast catch-all) for the IX-facing bridges; runbook at `docs/runbooks/guard.md`
 - `crates/modules/neigh-snoop/`: passive ARP/ND neighbour snooper for the IX-facing bridges (receive-only AF_PACKET + cBPF, learns third-party pairs, installs NUD_STALE, persists per bridge, tracks bridges by name, `ix-mode` into fast-path's resolver, FRR next-hop gate feed); runbook at `docs/runbooks/neigh-snoop.md`. No site-specific addresses in code, tests or docs: RFC 5737/3849 prefixes and `02:…` MACs only
 - `crates/sampler-shm/`: the shared-memory protocol between PacketFrame and its VPP sampler plugin (flow export): `desired.conf` and `current` text formats, epoch-file layout, SPSC drop-on-full rings and a seqlocked status, all word-atomic; the Linux file operations (size-limited tmpfs check, epoch create/open/reclaim, locks). Loom models in `tests/loom.rs` (`RUSTFLAGS="--cfg loom"`), two-process stress and root-only tmpfs tests run on CI's arm64 job
+- `crates/vpp-plugins/`: the VPP sampler plugin. `pf-sampler-core` (workspace member) holds all its logic — selection, pool indices, the desired.conf → interfaces → status controller, the epoch-file driver — tested on any host; `pf-sampler` is the cdylib glue (node, features, barrier, process node, CLI), excluded from the workspace because it builds only against one VPP's headers, on `vpp-plugin` pinned to the unredacted fork by commit. CI's `sampler plugin (arm64, VPP)` job builds it in bullseye against the SOURCE.json release and runs it in a real VPP (`pf-sampler/ci/smoke.sh`)
 - `conf/example.conf`: reference config per SPEC.md §4.8
 - `docs/runbooks/packetframe-fib.md`: Option F operations runbook (healthy state, triage by symptom, cutover + rollback, Phase 4 config snippets)
 - `.github/workflows/`: `ci.yml` (fmt/clippy/test + 4× cross-build), `qemu-verifier.yml` (integration tests on 5.15 + 6.6 kernels), `release.yml` (tag-triggered tarballs), `hardware-artifacts.yml` (per-main-push aarch64 test-binary + CLI bundle for on-router runs)
@@ -58,7 +59,7 @@ CI runs `cargo clippy --workspace --all-targets --all-features -- -D warnings`. 
 
 ## PR workflow
 
-One feature branch per slice. Commit messages explain **why**, not what the diff already shows. CI must be green before asking for review (eight jobs: fmt+clippy+test, four cross-builds, sampler-shm on arm64, two qemu kernels). Amending unreviewed commits and `git push --force-with-lease` on a feature branch is fine pre-review; force-push to `main` is never fine. For multi-phase work (e.g. the Option F rollout) the slicing lives in the plan file; keep PRs scoped to a single slice.
+One feature branch per slice. Commit messages explain **why**, not what the diff already shows. CI must be green before asking for review (nine jobs: fmt+clippy+test, four cross-builds, sampler-shm on arm64, the sampler plugin in VPP on arm64, two qemu kernels). Amending unreviewed commits and `git push --force-with-lease` on a feature branch is fine pre-review; force-push to `main` is never fine. For multi-phase work (e.g. the Option F rollout) the slicing lives in the plan file; keep PRs scoped to a single slice.
 
 ## What not to change casually
 
