@@ -723,6 +723,7 @@ dependencies = [
  "packetframe-guard",
  "packetframe-neigh-snoop",
  "packetframe-probe",
+ "packetframe-sampler-shm",
  "packetframe-vpp-offload",
  "serde",
  "serde_json",
