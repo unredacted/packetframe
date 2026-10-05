@@ -9,9 +9,10 @@
 //! crates.
 //!
 //! - [`publish`] stores the set, then places every thread of this
-//!   process that exists under a [`CONTROL_PLANE_THREADS`] name. It runs
-//!   once vpp-offload's attach has succeeded, when every one of them is
-//!   already running.
+//!   process that exists under a [`CONTROL_PLANE_THREADS`] name — all of
+//!   them, even while other threads exit, which a plain walk of
+//!   `/proc/self/task` cannot promise. It runs once vpp-offload's attach
+//!   has succeeded, when every one of them is already running.
 //! - [`join`] places the calling thread, if a set has been published —
 //!   the fast-path runtime's `on_thread_start`, so a blocking-pool thread
 //!   born after the publish is placed whichever thread spawned it.
@@ -161,28 +162,154 @@ mod imp {
         wrote.map(|()| Outcome::Placed)
     }
 
-    pub fn publish(cpus: &[u16]) -> Result<Placed, String> {
-        // Stored BEFORE the walk: a thread starting concurrently either
-        // sees the set in `join`, or already exists when the walk reads
-        // the task directory. Placing one twice is idempotent.
-        *SET.lock().unwrap_or_else(|e| e.into_inner()) = Some(cpus.to_vec());
-        let tasks =
-            std::fs::read_dir("/proc/self/task").map_err(|e| format!("/proc/self/task: {e}"))?;
-        let mut out = Placed::default();
-        for entry in tasks.flatten() {
-            let Some(tid) = entry
-                .file_name()
-                .to_str()
+    /// How long [`existing_threads`] keeps re-reading a list that comes
+    /// back short, and the pauses between reads, doubling from the first
+    /// to the last.
+    ///
+    /// Timed, not counted: a read stops at a thread caught between its
+    /// pid being detached and its leaving the list (`__unhash_process`).
+    /// That gap is a few instructions under `tasklist_lock`, but in a VM
+    /// it lasts as long as the host keeps that vCPU off, and every read
+    /// meanwhile stops at the same thread: on a 4-CPU Linux VM under
+    /// load, 32 back-to-back reads once all did. Paced like this, no call
+    /// in 6,000 stressed runs of this module's tests needed more than
+    /// six reads or 60 ms.
+    const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+    const PAUSES: [std::time::Duration; 2] = [
+        std::time::Duration::from_micros(20),
+        std::time::Duration::from_millis(5),
+    ];
+
+    /// Room one `/proc/self/task` entry can take: the `linux_dirent64`
+    /// header, a tid of up to ten digits and its NUL, rounded up to 8.
+    const ENTRY_MAX: usize = 32;
+
+    /// Offsets in `struct linux_dirent64` (include/linux/dirent.h):
+    /// `u64 d_ino, s64 d_off, u16 d_reclen, u8 d_type`, then the name.
+    const RECLEN_AT: usize = 16;
+    const NAME_AT: usize = 19;
+
+    fn gettid() -> libc::pid_t {
+        unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
+    }
+
+    /// The tids ONE `getdents64` call on a fresh `/proc/self/task`
+    /// handle lists, and whether `buf` was too full to be sure the call
+    /// did not stop for room.
+    fn read_tasks_once(buf: &mut [u8]) -> std::io::Result<(Vec<libc::pid_t>, bool)> {
+        use std::os::fd::AsRawFd;
+        let dir = std::fs::File::open("/proc/self/task")?;
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                dir.as_raw_fd(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let n = n as usize;
+        let mut tids = Vec::new();
+        let mut at = 0;
+        while at < n {
+            let reclen = usize::from(u16::from_ne_bytes([
+                buf[at + RECLEN_AT],
+                buf[at + RECLEN_AT + 1],
+            ]));
+            if reclen <= NAME_AT || at + reclen > n {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("a directory entry of {reclen} bytes at offset {at} of {n}"),
+                ));
+            }
+            let name = &buf[at + NAME_AT..at + reclen];
+            let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+            // `.`, `..`, and the tid 0 a 5.15 kernel lists for a thread
+            // caught mid-exit, are not threads to place.
+            if let Some(tid) = std::str::from_utf8(name)
+                .ok()
                 .and_then(|s| s.parse::<libc::pid_t>().ok())
-            else {
-                continue;
-            };
+                .filter(|&tid| tid > 0)
+            {
+                tids.push(tid);
+            }
+            at += reclen;
+        }
+        Ok((tids, buf.len() - n < ENTRY_MAX))
+    }
+
+    /// Every thread of this process that existed before this call and
+    /// is still alive when the list is read.
+    ///
+    /// Not `read_dir`: a walk of `/proc/self/task` that spans more than
+    /// one `getdents` call can silently miss a live thread. A call ends
+    /// early, as if at the end of the list, when the thread it has just
+    /// reached exits before the next is looked up (`next_tid` in
+    /// fs/proc/base.c). With no tid cached to resume from, the next
+    /// call counts from the leader as many threads as the earlier calls
+    /// walked, in a list that has since lost every thread that exited,
+    /// so it lands past live ones or, by its `nr >= get_nr_threads`
+    /// check, past the end (`first_tid`). Under cargo test's thread
+    /// churn that is how `publish` missed a parked `packetframe-fib`
+    /// (CI flake since #275).
+    ///
+    /// A single call never resumes: it follows the list link by link
+    /// from the leader until the end or an early stop. A new thread
+    /// joins the list at its tail (`copy_process`), so the reader
+    /// spawned here comes after every thread that already existed, and
+    /// a call that lists the reader walked past all of them. A call
+    /// that does not, cut short by an exit, a signal or room, is
+    /// retried within [`READ_BUDGET`].
+    pub(super) fn existing_threads() -> Result<Vec<libc::pid_t>, String> {
+        let reader = std::thread::Builder::new()
+            .name("pf-placement".into())
+            .spawn(|| {
+                let me = gettid();
+                let deadline = std::time::Instant::now() + READ_BUDGET;
+                let mut pause = PAUSES[0];
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    let (mut tids, full) =
+                        read_tasks_once(&mut buf).map_err(|e| format!("/proc/self/task: {e}"))?;
+                    if let Some(i) = tids.iter().position(|&t| t == me) {
+                        tids.swap_remove(i);
+                        return Ok(tids);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "/proc/self/task: no read in {READ_BUDGET:?} came back complete"
+                        ));
+                    }
+                    if full {
+                        buf.resize(buf.len() * 2, 0);
+                    } else {
+                        std::thread::sleep(pause);
+                        pause = (pause * 2).min(PAUSES[1]);
+                    }
+                }
+            })
+            .map_err(|e| format!("spawning the thread-list reader: {e}"))?;
+        reader
+            .join()
+            .map_err(|_| "the thread-list reader panicked".to_string())?
+    }
+
+    pub fn publish(cpus: &[u16]) -> Result<Placed, String> {
+        // Stored BEFORE the list is read: a thread starting concurrently
+        // either sees the set in `join`, or predates the reader
+        // `existing_threads` spawns and so is listed. Placing one twice
+        // is idempotent.
+        *SET.lock().unwrap_or_else(|e| e.into_inner()) = Some(cpus.to_vec());
+        let mut out = Placed::default();
+        for tid in existing_threads()? {
             // Identity before name, so the name read belongs to the
             // thread `place_thread` then re-verifies.
             let Some(started) = own_thread_started(tid) else {
-                continue; // exited between readdir and here
+                continue; // exited since the list was read
             };
-            let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+            let Ok(comm) = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")) else {
                 continue;
             };
             let comm = comm.trim_end();
@@ -252,8 +379,8 @@ mod imp {
 
 /// Store `cpus` as the control-plane set and place every existing
 /// [`CONTROL_PLANE_THREADS`] thread of this process on it. `Err` only
-/// when the thread list cannot be read at all; per-thread failures are
-/// in the report.
+/// when the thread list cannot be read, or no read of it comes back
+/// complete, with nothing placed; per-thread failures are in the report.
 #[cfg(target_os = "linux")]
 pub fn publish(cpus: &[u16]) -> Result<Placed, String> {
     imp::publish(cpus)
@@ -335,7 +462,7 @@ mod parse_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::imp::{place_self, place_thread, Outcome};
+    use super::imp::{existing_threads, place_self, place_thread, Outcome};
     use super::*;
 
     fn mask_of(tid: libc::pid_t) -> Vec<usize> {
@@ -445,6 +572,39 @@ mod tests {
         assert!(!gone.exists(), "task {tid} never left /proc");
         let e = place_thread(tid, real, &[a]).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::ESRCH), "{e}");
+    }
+
+    /// The thread list leaves out no live thread older than the read,
+    /// while older threads exit around it — the churn under which a
+    /// `read_dir` walk skipped one. Each round parks a thread behind a
+    /// batch that exits as the list is read.
+    #[test]
+    fn existing_threads_lists_every_older_thread_while_others_exit() {
+        const ROUNDS: usize = 200;
+        const DOOMED: usize = 16;
+        for round in 0..ROUNDS {
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(DOOMED + 1));
+            let doomed: Vec<_> = (0..DOOMED)
+                .map(|_| {
+                    let gate = gate.clone();
+                    std::thread::spawn(move || {
+                        gate.wait();
+                    })
+                })
+                .collect();
+            let (tid, done, h) = parked("pf-test-older");
+            gate.wait();
+            let listed = existing_threads().expect("read the thread list");
+            assert!(
+                listed.contains(&tid),
+                "round {round}: live tid {tid} missing from {listed:?}"
+            );
+            for d in doomed {
+                d.join().unwrap();
+            }
+            drop(done);
+            h.join().unwrap();
+        }
     }
 
     /// `publish` places the named threads that already exist and no
