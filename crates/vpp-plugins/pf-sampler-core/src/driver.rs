@@ -55,9 +55,9 @@ pub struct Epoch {
 }
 
 impl Epoch {
-    /// Creates the epoch file for `workers` rings, names it in `current`,
-    /// and unlinks every other epoch file but the one `current` named
-    /// before (a reader may still be switching away from it).
+    /// Unlinks every epoch file but the one `current` names (a reader may
+    /// still be switching away from it), then creates the epoch file for
+    /// `workers` rings and names it in `current`.
     pub fn create(
         dir: &Path,
         workers: usize,
@@ -72,6 +72,11 @@ impl Epoch {
             .ok()
             .and_then(|t| Current::parse(&t).ok())
             .map(|c| c.epoch);
+        // Before the new file, not after: a restart then needs room for
+        // two epochs, the previous and the new, and a reader stalled on an
+        // older one pins one more, unlinked: the budget of three. A
+        // leftover that cannot be removed costs budget, not correctness.
+        let _ = reclaim(dir, previous.as_slice());
         let id = loop {
             let e = random_epoch();
             if e != 0 && Some(e) != previous {
@@ -88,9 +93,6 @@ impl Epoch {
             let _ = fs::remove_file(dir.join(epoch_file_name(id)));
             return Err(format!("{CURRENT}: {e}"));
         }
-        let keep: Vec<u64> = std::iter::once(id).chain(previous).collect();
-        // A leftover that cannot be removed costs budget, not correctness.
-        let _ = reclaim(dir, &keep);
         Ok(Self { id, layout, map })
     }
 

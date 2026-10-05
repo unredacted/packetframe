@@ -227,6 +227,35 @@ fn an_epoch_that_cannot_be_published_is_not_left_behind() {
     std::fs::remove_dir(&d).unwrap();
 }
 
+/// A restart needs room for two epochs, the previous and the new: what
+/// `current` no longer names goes before the new file is made, so a tmpfs
+/// of twice an epoch takes any number of restarts while no reader pins an
+/// older one.
+#[test]
+#[ignore = "needs root to mount a tmpfs"]
+fn a_restart_needs_room_for_two_epochs() {
+    use packetframe_sampler_core::driver::{HEADER_CAPACITY, SLOTS_PER_RING};
+    use packetframe_sampler_shm::current::is_epoch_file_name;
+    use packetframe_sampler_shm::layout::Layout;
+    let d = tempdir("two");
+    let len = Layout::new(2, SLOTS_PER_RING, HEADER_CAPACITY)
+        .unwrap()
+        .file_len();
+    // The slack is `current` and its temporary, at 64 KiB pages.
+    mount_tmpfs(&d, &format!("size={},mode=0700", 2 * len + (256 << 10)));
+    for run in 0..4u64 {
+        // Each run's epoch is dropped (unmapped) as its VPP exits.
+        drop(Epoch::create(&d, 2, "test", run, run).unwrap_or_else(|e| panic!("run {run}: {e}")));
+    }
+    let left = std::fs::read_dir(&d)
+        .unwrap()
+        .filter(|e| is_epoch_file_name(e.as_ref().unwrap().file_name().to_str().unwrap()))
+        .count();
+    assert_eq!(left, 2);
+    umount(&d);
+    std::fs::remove_dir(&d).unwrap();
+}
+
 /// A full budget: no epoch, VPP untouched, retried every 5 s, and the
 /// first retry after room appears succeeds.
 #[test]
