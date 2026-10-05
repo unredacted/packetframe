@@ -82,29 +82,39 @@ mod tests {
 
     #[test]
     fn concurrent_readers_never_see_a_mixed_snapshot() {
+        use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
         let seq = Arc::new(AtomicU64::new(0));
         let p: Arc<[AtomicU64]> = words(8).into();
+        let enough = Arc::new(AtomicBool::new(false));
         write(&seq, &p, &[0; 8]);
+        // The writer runs until the reader has seen enough snapshots (or a
+        // cap), so the two overlap however fast either is: a fixed count of
+        // writes let a release-build writer finish before the reader's
+        // first look.
         let writer = {
-            let (seq, p) = (seq.clone(), p.clone());
+            let (seq, p, enough) = (seq.clone(), p.clone(), enough.clone());
             std::thread::spawn(move || {
-                for k in 1..=20_000u64 {
+                let mut k = 0u64;
+                while !enough.load(Ordering::Relaxed) && k < 50_000_000 {
+                    k += 1;
                     write(&seq, &p, &[k; 8]);
                 }
+                k
             })
         };
         let mut out = [0; 8];
         let mut seen = 0;
-        while !writer.is_finished() {
+        while seen < 10_000 && !writer.is_finished() {
             if read(&seq, &p, &mut out, 64) {
                 assert!(out.iter().all(|&v| v == out[0]), "mixed: {out:?}");
                 seen += 1;
             }
         }
-        writer.join().unwrap();
+        enough.store(true, Ordering::Relaxed);
+        let last = writer.join().unwrap();
         assert!(read(&seq, &p, &mut out, 64));
-        assert_eq!(out, [20_000; 8]);
+        assert_eq!(out, [last; 8]);
         assert!(seen > 0);
     }
 }
