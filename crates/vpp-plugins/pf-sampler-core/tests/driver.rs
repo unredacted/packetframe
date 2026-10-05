@@ -39,6 +39,15 @@ fn the_watch_reports_every_kind_of_change_once() {
     );
     std::fs::remove_file(&p).unwrap();
     assert_eq!(w.poll(&p), Some(None));
+
+    // There but unreadable (here, a directory): not reported as gone, and
+    // read again on every poll until it can be.
+    std::fs::create_dir(&p).unwrap();
+    assert_eq!(w.poll(&p), None);
+    assert_eq!(w.poll(&p), None);
+    std::fs::remove_dir(&p).unwrap();
+    write_atomic(&d, DESIRED, b"two").unwrap();
+    assert_eq!(w.poll(&p), Some(Some("two".into())));
     std::fs::remove_dir_all(&d).unwrap();
 }
 
@@ -56,6 +65,9 @@ impl Vpp for FakeHost {
     }
     fn sampling_enabled(&mut self, i: u32) -> bool {
         self.enabled.contains(&i)
+    }
+    fn sampling_disabled(&mut self, i: u32) -> bool {
+        !self.enabled.contains(&i)
     }
     fn apply(&mut self, cfg: &WorkerConfig, enable: &[u32], disable: &[u32]) {
         for i in disable {
@@ -178,6 +190,39 @@ fn a_vpp_run_from_epoch_to_status() {
         assert!(d.join(epoch_file_name(*e)).exists());
     }
     assert_eq!(open_epoch(&d, false).unwrap().header.epoch, h.epochs[2]);
+    umount(&d);
+    std::fs::remove_dir(&d).unwrap();
+}
+
+/// A tmpfs the epoch fills exactly: `current` cannot be written, and the
+/// unpublished epoch file is removed rather than left holding the budget
+/// against every retry.
+#[test]
+#[ignore = "needs root to mount a tmpfs"]
+fn an_epoch_that_cannot_be_published_is_not_left_behind() {
+    use packetframe_sampler_core::driver::{HEADER_CAPACITY, SLOTS_PER_RING};
+    use packetframe_sampler_shm::current::is_epoch_file_name;
+    use packetframe_sampler_shm::layout::Layout;
+    let d = tempdir("publish");
+    let size = Layout::new(2, SLOTS_PER_RING, HEADER_CAPACITY)
+        .unwrap()
+        .file_len();
+    mount_tmpfs(&d, &format!("size={size},mode=0700"));
+    let mut h = FakeHost::default();
+    let mut drv = Driver::new(d.clone(), 2, "test".into());
+    drv.tick(&mut h, 1, 0);
+    assert!(h.epochs.is_empty());
+    assert!(
+        drv.describe()[1].contains("current"),
+        "{:?}",
+        drv.describe()
+    );
+    let left: Vec<String> = std::fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| is_epoch_file_name(n))
+        .collect();
+    assert!(left.is_empty(), "orphaned: {left:?}");
     umount(&d);
     std::fs::remove_dir(&d).unwrap();
 }

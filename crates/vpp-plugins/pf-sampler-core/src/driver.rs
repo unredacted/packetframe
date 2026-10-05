@@ -12,7 +12,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use packetframe_sampler_shm::current::Current;
+use packetframe_sampler_shm::current::{epoch_file_name, Current};
 use packetframe_sampler_shm::desired::ErrorKind;
 use packetframe_sampler_shm::fs::{
     check_dir, create_epoch, publish_current, random_epoch, reclaim, Mapping, CURRENT, DEFAULT_DIR,
@@ -80,7 +80,14 @@ impl Epoch {
         };
         let map = create_epoch(dir, &layout, id, realtime_ns, monotonic_ns, build)
             .map_err(|e| e.to_string())?;
-        publish_current(dir, id, &layout).map_err(|e| format!("{CURRENT}: {e}"))?;
+        if let Err(e) = publish_current(dir, id, &layout) {
+            // Unpublished, the file would hold its share of the budget
+            // forever, failing every retry: and a tmpfs the epoch just
+            // filled fails exactly here, writing `current`'s temporary.
+            drop(map);
+            let _ = fs::remove_file(dir.join(epoch_file_name(id)));
+            return Err(format!("{CURRENT}: {e}"));
+        }
         let keep: Vec<u64> = std::iter::once(id).chain(previous).collect();
         // A leftover that cannot be removed costs budget, not correctness.
         let _ = reclaim(dir, &keep);
@@ -129,10 +136,23 @@ impl DesiredWatch {
         if self.last == Some(stamp) {
             return None;
         }
+        let text = match stamp {
+            None => None,
+            Some(_) => match fs::read_to_string(path) {
+                Ok(t) => Some(t),
+                // Gone between the two calls: it is gone, and whatever
+                // replaces it has a stamp of its own.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.last = Some(None);
+                    return Some(None);
+                }
+                // There but unreadable: not a change to act on, and the
+                // stamp stays unrecorded so the next poll reads it again.
+                Err(_) => return None,
+            },
+        };
         self.last = Some(stamp);
-        // A file that vanished between the two calls reads as gone; the
-        // next poll sees whatever replaced it.
-        Some(stamp.and_then(|_| fs::read_to_string(path).ok()))
+        Some(text)
     }
 }
 

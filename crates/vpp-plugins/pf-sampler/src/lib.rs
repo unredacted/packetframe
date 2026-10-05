@@ -356,6 +356,11 @@ impl Vpp for Glue<'_> {
         feature_enabled(PORT_RX_ARC, sw_if_index) && feature_enabled(DEVICE_INPUT_ARC, sw_if_index)
     }
 
+    fn sampling_disabled(&mut self, sw_if_index: u32) -> bool {
+        !feature_enabled(PORT_RX_ARC, sw_if_index)
+            && !feature_enabled(DEVICE_INPUT_ARC, sw_if_index)
+    }
+
     fn apply(&mut self, cfg: &WorkerConfig, enable: &[u32], disable: &[u32]) {
         with_barrier(self.vm, |bvm| {
             let feats = [

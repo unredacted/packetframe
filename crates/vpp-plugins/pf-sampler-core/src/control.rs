@@ -50,8 +50,11 @@ impl WorkerConfig {
 pub trait Vpp {
     /// The `sw_if_index` of the interface named exactly `name`.
     fn resolve(&mut self, name: &str) -> Option<u32>;
-    /// Whether the sampling feature is enabled on `sw_if_index` now.
+    /// Whether the sampling feature is on `sw_if_index` now, on every arc
+    /// it belongs to.
     fn sampling_enabled(&mut self, sw_if_index: u32) -> bool;
+    /// Whether it is off `sw_if_index` now, on every arc.
+    fn sampling_disabled(&mut self, sw_if_index: u32) -> bool;
     /// Under VPP's barrier: give the workers `cfg`, enable sampling on each
     /// of `enable` where it is not enabled, and disable it on each of
     /// `disable` where it is.
@@ -215,7 +218,12 @@ impl Controller {
                 self.touch(now_ns);
             }
             self.worker = worker;
-            self.enabled = want;
+            // A disable VPP refused leaves the feature on: keep that index
+            // among the enabled, so the next reconcile disables it again.
+            let mut enabled = want;
+            enabled.extend(disable.into_iter().filter(|&i| !vpp.sampling_disabled(i)));
+            enabled.sort_unstable();
+            self.enabled = enabled;
         }
         if interfaces != self.interfaces {
             self.interfaces = interfaces;
@@ -284,6 +292,8 @@ mod tests {
     struct FakeVpp {
         names: HashMap<String, u32>,
         enabled: BTreeSet<u32>,
+        /// Indices whose disable VPP refuses.
+        stuck: BTreeSet<u32>,
         applied: Vec<(WorkerConfig, Vec<u32>, Vec<u32>)>,
     }
 
@@ -294,9 +304,14 @@ mod tests {
         fn sampling_enabled(&mut self, i: u32) -> bool {
             self.enabled.contains(&i)
         }
+        fn sampling_disabled(&mut self, i: u32) -> bool {
+            !self.enabled.contains(&i)
+        }
         fn apply(&mut self, cfg: &WorkerConfig, enable: &[u32], disable: &[u32]) {
             for i in disable {
-                self.enabled.remove(i);
+                if !self.stuck.contains(i) {
+                    self.enabled.remove(i);
+                }
             }
             self.enabled.extend(enable);
             self.applied
@@ -440,6 +455,28 @@ mod tests {
             (c.status().applied_generation, c.status().rejected_reason),
             (7, 0)
         );
+    }
+
+    #[test]
+    fn a_refused_disable_is_retried_until_it_takes() {
+        let mut c = ctl();
+        let mut v = FakeVpp::default();
+        v.names.insert("a".into(), 3);
+        v.names.insert("b".into(), 4);
+        c.desired(Some(&desired(1, &["a", "b"])), 1);
+        c.reconcile(&mut v, 1);
+        v.stuck.insert(3);
+        c.desired(Some(&desired(2, &["b"])), 2);
+        c.reconcile(&mut v, 2);
+        assert!(v.enabled.contains(&3), "VPP refused");
+        c.reconcile(&mut v, 3);
+        assert_eq!(v.applied.last().unwrap().2, [3], "tried again");
+        v.stuck.clear();
+        c.reconcile(&mut v, 4);
+        assert_eq!(v.enabled, BTreeSet::from([4]));
+        let applies = v.applied.len();
+        c.reconcile(&mut v, 5);
+        assert_eq!(v.applied.len(), applies, "settled: no more barriers");
     }
 
     #[test]
