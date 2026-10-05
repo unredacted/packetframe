@@ -280,3 +280,22 @@ fn a_full_budget_is_retried_until_it_fits() {
     umount(&d);
     std::fs::remove_dir(&d).unwrap();
 }
+
+/// The tmpfs `dir_budget` sizes takes every restart even while a stalled
+/// reader pins an epoch the plugin has already unlinked: three epochs and
+/// the small files.
+#[test]
+#[ignore = "needs root to mount a tmpfs"]
+fn the_budget_survives_restarts_under_a_stalled_reader() {
+    use packetframe_sampler_core::driver::dir_budget;
+    let d = tempdir("budget");
+    mount_tmpfs(&d, &format!("size={},mode=0700", dir_budget(2).unwrap()));
+    drop(Epoch::create(&d, 2, "test", 0, 0).unwrap());
+    let stalled = open_epoch(&d, false).unwrap();
+    for run in 1..5u64 {
+        drop(Epoch::create(&d, 2, "test", run, run).unwrap_or_else(|e| panic!("run {run}: {e}")));
+    }
+    drop(stalled);
+    umount(&d);
+    std::fs::remove_dir(&d).unwrap();
+}

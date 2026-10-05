@@ -18,6 +18,7 @@ pub mod frr;
 pub mod module;
 pub mod placement;
 pub mod probe;
+pub mod sampler_ports;
 #[cfg(target_os = "linux")]
 pub mod statefile;
 pub mod topology;

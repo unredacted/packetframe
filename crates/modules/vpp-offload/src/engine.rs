@@ -3048,6 +3048,17 @@ impl ConvergenceEngine {
 
     /// Every attached port's `(name, sw_if_index)`, for persisting to
     /// the state file so the next run can adopt rather than re-attach.
+    /// The ports the last attach left in place.
+    pub fn attached_ports(&self) -> &[AttachedPort] {
+        &self.attached
+    }
+
+    /// What an attach would leave, for tests outside this module.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn set_attached_for_test(&mut self, attached: Vec<AttachedPort>) {
+        self.attached = attached;
+    }
+
     pub fn attached_indices(&self) -> Vec<(String, u32)> {
         self.attached
             .iter()
@@ -4593,6 +4604,7 @@ mod tests {
             port: "eth4".into(),
             dev_index: Some(0),
             sw_if_index: 3,
+            vpp_name: "octeon0/0".into(),
             subifs: vec![],
         });
         let m = mirror(4);
@@ -4980,6 +4992,7 @@ mod tests {
             port: "eth4".into(),
             dev_index: Some(0),
             sw_if_index: 3,
+            vpp_name: "octeon0/0".into(),
             subifs: vec![],
         });
 
@@ -5038,6 +5051,7 @@ mod tests {
             port: "eth4".into(),
             dev_index: Some(0),
             sw_if_index: 3,
+            vpp_name: "octeon0/0".into(),
             subifs: vec![],
         });
         e.test_dead_members = Some(vec![DeadInterface {
@@ -5069,6 +5083,7 @@ mod tests {
             port: "eth4".into(),
             dev_index: Some(0),
             sw_if_index: 3,
+            vpp_name: "octeon0/0".into(),
             subifs: vec![],
         });
         // No verify yet: nothing contradicts, so it reads up — bounded by

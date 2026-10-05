@@ -82,6 +82,18 @@ assets = [
     ["../../docs/runbooks/*.md", "/usr/share/doc/packetframe/runbooks/", "644"],
 ]
 
+# The arm64 package also carries the VPP sampler plugin (flow export),
+# built against the VPP crates/modules/vpp-offload/vpp-api/SOURCE.json
+# names. vpp-offload's startup.conf `add-path`s its directory; a VPP the
+# plugin was not built for refuses it and starts the same. release.yml
+# and hardware-artifacts.yml place the plugin and pass
+# `--variant vpp-sampler`; the package keeps its name.
+[package.metadata.deb.variants.vpp-sampler]
+name = "packetframe"
+merge-assets.append = [
+    ["../../target/vpp-plugins/pf_sampler_plugin.so", "/usr/lib/packetframe/vpp_plugins/pf_sampler_plugin.so", "644"],
+]
+
 # systemd-units: cargo-deb installs debian/packetframe.service as the
 # packetframe.service system unit. It does NOT generate
 # maintainer scripts — that needs `maintainer-scripts` set, and it is

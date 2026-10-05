@@ -68,6 +68,9 @@ pub struct SysPaths {
     /// record of THIS boot's resources from one a reboot has already
     /// released — see [`recorded_on_an_earlier_boot`].
     pub boot_id: Option<String>,
+    /// The VPP sampler's directory ([`crate::sampler`]), where its tmpfs
+    /// is mounted.
+    pub sampler_dir: PathBuf,
 }
 
 impl SysPaths {
@@ -94,9 +97,14 @@ impl SysPaths {
             hugetlbfs: PathBuf::from("/dev/hugepages"),
             state_dir: state_dir.into(),
             boot_id: crate::process::boot_id().ok(),
+            sampler_dir: PathBuf::from(SAMPLER_DIR),
         }
     }
 }
+
+/// The plugin's default directory, which VPP is spawned without
+/// overriding.
+pub const SAMPLER_DIR: &str = "/run/packetframe/vpp/sampler";
 
 /// Whether a state file describes resources from an EARLIER boot — and
 /// so describes nothing that still exists.
@@ -498,6 +506,16 @@ pub fn release(paths: &SysPaths, state: ResourceState) -> Result<(), String> {
                 }
                 Err(e) => errors.push(format!("restore {}: {e}", nr.display())),
             }
+        }
+    }
+
+    // The sampler's tmpfs, if it is ours. VPP is gone by now (every
+    // caller releases after the kill, or before any spawn), and a reader
+    // still mapping an epoch keeps only that memory, not the mount.
+    if state.sampler_mount {
+        match crate::sampler::release_mount(&paths.sampler_dir) {
+            Ok(()) => remaining.sampler_mount = false,
+            Err(e) => errors.push(e),
         }
     }
 
@@ -949,6 +967,7 @@ mod tests {
                 hugetlbfs,
                 state_dir: base.join("state"),
                 boot_id: Some(BOOT.into()),
+                sampler_dir: base.join("sampler"),
             };
             Self { base, paths }
         }

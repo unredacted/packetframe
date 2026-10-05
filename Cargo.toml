@@ -58,6 +58,7 @@ packetframe-neigh-snoop = { path = "crates/modules/neigh-snoop" }
 packetframe-probe = { path = "crates/modules/probe" }
 packetframe-vpp-offload = { path = "crates/modules/vpp-offload" }
 packetframe-sampler-shm = { path = "crates/sampler-shm" }
+packetframe-sampler-core = { path = "crates/vpp-plugins/pf-sampler-core" }
 
 anyhow = "1.0"
 thiserror = "2.0"

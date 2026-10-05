@@ -851,6 +851,8 @@ dependencies = [
  "netlink-packet-route",
  "netlink-sys",
  "packetframe-common",
+ "packetframe-sampler-core",
+ "packetframe-sampler-shm",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

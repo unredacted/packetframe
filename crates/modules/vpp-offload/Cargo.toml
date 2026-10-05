@@ -23,6 +23,10 @@ libc = { workspace = true }
 # The same message crates fast-path's resolver decodes with, minus
 # rtnetlink — this crate has no async runtime to park a connection on.
 [target.'cfg(target_os = "linux")'.dependencies]
+# The VPP sampler's directory (flow export): its tmpfs is mounted here
+# before VPP starts, sized for the plugin's epochs.
+packetframe-sampler-shm = { workspace = true }
+packetframe-sampler-core = { workspace = true }
 netlink-packet-core = { workspace = true }
 netlink-packet-route = { workspace = true }
 netlink-sys = "0.9"

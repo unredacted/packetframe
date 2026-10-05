@@ -33,6 +33,24 @@ pub const HEADER_CAPACITY: usize = 256;
 /// The classes this plugin samples.
 pub const IMPLEMENTED: u64 = 1 << Class::Ingress as u64;
 
+/// Room for `current` and its temporary beside the epochs, at the
+/// largest page size the fleet runs (64 KiB, two pages each).
+const SMALL_FILES: u64 = 256 << 10;
+
+/// The tmpfs size the sampler directory needs for a VPP of `threads`
+/// threads (main and workers, `n_vlib_mains`): three epochs, the budget
+/// [`Epoch::create`]'s reclaim order leaves — the previous run's, the new
+/// one, and one more a stalled reader pins — plus the small files.
+pub fn dir_budget(threads: usize) -> Result<u64, String> {
+    let layout = Layout::new(
+        threads.clamp(1, packetframe_sampler_shm::layout::MAX_WORKERS),
+        SLOTS_PER_RING,
+        HEADER_CAPACITY,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(3 * layout.file_len() as u64 + SMALL_FILES)
+}
+
 const TICK_NS: u64 = 100_000_000;
 const RECONCILE_NS: u64 = 1_000_000_000;
 const EPOCH_RETRY_NS: u64 = 5_000_000_000;
