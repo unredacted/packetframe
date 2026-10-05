@@ -9,7 +9,9 @@
 use aya_ebpf::{
     bindings::bpf_fib_lookup,
     macros::map,
-    maps::{Array, DevMapHash, HashMap, LpmTrie, PerCpuArray, ProgramArray, RingBuf},
+    maps::{
+        Array, DevMapHash, HashMap, LpmTrie, PerCpuArray, PerfEventArray, ProgramArray, RingBuf,
+    },
 };
 
 /// Runtime flags poked by userspace via the `cfg` map. `version` is a
@@ -262,12 +264,28 @@ pub enum StatIdx {
     /// `fwd_ok` falling by as much, means a port's receive MACs are
     /// missing: see docs/runbooks/packetframe-fib.md.
     PassNotForUs = 50,
+    // --- Flow-export sampler (`sample.rs`). Append-only. ----------------
+    /// Not a counter: packets left before this CPU's next sample. 0 while
+    /// the packet in hand is selected and not yet emitted. Hidden from
+    /// every counter surface (`metrics::INTERNAL_SLOTS`).
+    SampleCountdown = 51,
+    /// Not a counter: the generation (high 32 bits) and rate (low 32 bits)
+    /// this CPU's countdown was drawn with, carried by the sample it
+    /// selects. Rate 0 is sampling off. Hidden like `SampleCountdown`.
+    SampleArmed = 52,
+    /// Selected packets that reached an emission point: one per sample,
+    /// whatever became of its perf output.
+    SampleSelected = 53,
+    /// Of `sample_selected`, the ones `bpf_perf_event_output` refused (no
+    /// reader on that CPU, or its buffer full): samples the reader never
+    /// saw.
+    SampleEmitFailed = 54,
 }
 
 /// Total counter count. Sizes the `[u64; N]` value of the single-entry
 /// `STATS` per-CPU map. New counters bump this; dashboards keying on
 /// indices keep working.
-pub const STATS_COUNT: u32 = 51;
+pub const STATS_COUNT: u32 = 55;
 
 /// `STATS_COUNT` as usize, for the array-of-counters value type.
 pub const STATS_COUNT_USIZE: usize = STATS_COUNT as usize;
@@ -925,6 +943,63 @@ pub static FIB_CACHE_V6: PerCpuArray<FibCacheEntryV6> =
 
 #[map]
 pub static FIB_CACHE_CFG: Array<FibCacheCfg> = Array::with_max_entries(1, 0);
+
+// --- Flow-export sampler (`sample.rs`) ---------------------------------
+
+/// The sampler's configuration. Written only by flow-export; the zeroed
+/// value (no `module flow-export`) is rate 0, sampling off.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SampleCfg {
+    /// The rate (low 32 bits: mean packets per sample, 0 off) and
+    /// flow-export's generation for it (high 32 bits). One aligned word,
+    /// read in one load: userspace replaces the value with a plain copy,
+    /// and a rate must never be paired with another rate's generation.
+    pub rate_generation: u64,
+    /// Packet bytes copied after each record, from the frame's start.
+    pub header_bytes: u32,
+    pub _pad: u32,
+}
+
+/// What each `SAMPLES` event begins with; the kernel appends
+/// `captured` packet bytes after it. 40 bytes in u32 words or wider, so
+/// every store is one register wide and none is zero-merge bait.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SampleRecord {
+    pub ktime_ns: u64,
+    /// The generation and rate this sample was selected at (`SampleArmed`),
+    /// not the current `SAMPLE_CFG`.
+    pub generation: u32,
+    pub rate: u32,
+    pub ingress_ifindex: u32,
+    /// The port a redirect was decided for; 0 when the packet was not
+    /// redirected.
+    pub egress_ifindex: u32,
+    /// The packet's length as the program saw it (tc: without an
+    /// offloaded VLAN tag).
+    pub frame_len: u32,
+    pub captured: u32,
+    /// `path | disposition << 8 | vlan_present << 16`.
+    pub meta: u32,
+    /// tc only: `vlan_tci | vlan_proto << 16`, host order, for an
+    /// offloaded tag; 0 otherwise.
+    pub vlan: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<SampleRecord>() == 40);
+
+#[map]
+pub static SAMPLE_CFG: Array<SampleCfg> = Array::with_max_entries(1, 0);
+
+/// One perf ring per CPU, opened by flow-export. A CPU with no reader
+/// refuses output (`SampleEmitFailed`).
+#[map]
+pub static SAMPLES: PerfEventArray<SampleRecord> = PerfEventArray::new(0);
+
+/// Per-CPU staging for the record: a stack copy would be memset bait.
+#[map]
+pub static SAMPLE_SCRATCH: PerCpuArray<SampleRecord> = PerCpuArray::with_max_entries(1, 0);
 
 // --- Stat increment helpers ----------------------------------------------
 

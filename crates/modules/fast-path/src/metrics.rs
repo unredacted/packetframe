@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 /// operators (19 hid `err_head_shift`; 33 hid the mss-clamp and
 /// tail-call diagnostics from the Prometheus export; a separate
 /// hardcoded 37 hid `pass_ndp` from `packetframe status`).
-pub const COUNTER_NAMES: [&str; 51] = [
+pub const COUNTER_NAMES: [&str; 55] = [
     "rx_total",
     "matched_v4",
     "matched_v6",
@@ -98,6 +98,12 @@ pub const COUNTER_NAMES: [&str; 51] = [
     // --- destination-MAC check: matched frames not addressed to the
     // router at their ingress port, handed to the kernel untouched ---
     "pass_not_for_us",
+    // --- flow-export sampler. The first two are its per-CPU selection
+    // state, not counters: see `INTERNAL_SLOTS`. ---
+    "sample_countdown",
+    "sample_armed",
+    "sample_selected",
+    "sample_emit_failed",
 ];
 
 /// `COUNTER_NAMES.len()` as a named const. Sizes the `[u64; N]` value
@@ -106,6 +112,22 @@ pub const COUNTER_NAMES: [&str; 51] = [
 /// `STATS_COUNT`.
 pub const COUNTER_COUNT: usize = COUNTER_NAMES.len();
 
+/// STATS slots that hold the sampler's per-CPU state rather than a
+/// count: summed across CPUs they mean nothing, so no counter surface
+/// shows them. Named in `COUNTER_NAMES` only to keep it index-aligned.
+pub const INTERNAL_SLOTS: [usize; 2] = [51, 52];
+
+/// The `(name, value)` of every real counter in a STATS read: what the
+/// operator-facing surfaces print.
+pub fn counters(stats: &[u64]) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+    COUNTER_NAMES
+        .iter()
+        .zip(stats)
+        .enumerate()
+        .filter(|(i, _)| !INTERNAL_SLOTS.contains(i))
+        .map(|(_, (name, value))| (*name, *value))
+}
+
 /// Render a Prometheus textfile body from stat values + module uptime.
 /// Every counter gets `# TYPE` and `# HELP` headers so Prometheus's
 /// textfile collector categorizes it correctly. Counter names that
@@ -113,7 +135,7 @@ pub const COUNTER_COUNT: usize = COUNTER_NAMES.len();
 /// Prometheus convention requires one `_total` suffix, not two.
 pub fn render_textfile(stats: &[u64], uptime_seconds: u64) -> String {
     let mut out = String::with_capacity(4096);
-    for (name, value) in COUNTER_NAMES.iter().zip(stats.iter()) {
+    for (name, value) in counters(stats) {
         let metric = if name.ends_with("_total") {
             format!("packetframe_{name}")
         } else {
@@ -300,7 +322,7 @@ mod tests {
         // Mirror of `STATS_COUNT` from `bpf/src/maps.rs`. If these
         // drift, the zip() in render_textfile silently truncates
         // this test catches that at unit-test time.
-        assert_eq!(COUNTER_NAMES.len(), 51);
+        assert_eq!(COUNTER_NAMES.len(), 55);
         assert_eq!(COUNTER_NAMES.len(), COUNTER_COUNT);
         // The newest counters, as a canary that the tail of the list
         // stayed aligned with the `StatIdx` discriminants.
@@ -315,13 +337,34 @@ mod tests {
         assert_eq!(COUNTER_NAMES[48], "err_parse_tc_l3_v4");
         assert_eq!(COUNTER_NAMES[49], "err_parse_tc_l3_v6");
         assert_eq!(COUNTER_NAMES[50], "pass_not_for_us");
+        assert_eq!(COUNTER_NAMES[51], "sample_countdown");
+        assert_eq!(COUNTER_NAMES[52], "sample_armed");
+        assert_eq!(COUNTER_NAMES[53], "sample_selected");
+        assert_eq!(COUNTER_NAMES[54], "sample_emit_failed");
+    }
+
+    #[test]
+    fn the_sampler_state_is_never_shown_as_a_counter() {
+        let stats: Vec<u64> = (0..COUNTER_COUNT as u64).collect();
+        let shown: Vec<_> = counters(&stats).collect();
+        assert_eq!(shown.len(), COUNTER_COUNT - INTERNAL_SLOTS.len());
+        for i in INTERNAL_SLOTS {
+            assert!(COUNTER_NAMES[i].starts_with("sample_"));
+            assert!(shown
+                .iter()
+                .all(|(n, v)| *n != COUNTER_NAMES[i] && *v != i as u64));
+        }
+        let body = render_textfile(&stats, 0);
+        assert!(!body.contains("sample_countdown"));
+        assert!(!body.contains("sample_armed"));
+        assert!(body.contains("packetframe_sample_selected_total{module=\"fast-path\"} 53"));
     }
 
     #[test]
     fn rendered_output_contains_every_counter() {
         let stats = vec![0u64; COUNTER_NAMES.len()];
         let body = render_textfile(&stats, 42);
-        for name in COUNTER_NAMES {
+        for (name, _) in counters(&stats) {
             let metric = if name.ends_with("_total") {
                 format!("packetframe_{name}")
             } else {
@@ -346,8 +389,8 @@ mod tests {
         let stats = vec![1u64; COUNTER_NAMES.len()];
         let body = render_textfile(&stats, 0);
         let type_lines = body.lines().filter(|l| l.starts_with("# TYPE")).count();
-        // COUNTER_NAMES.len() counters + 1 uptime gauge.
-        assert_eq!(type_lines, COUNTER_NAMES.len() + 1);
+        // Every real counter + 1 uptime gauge.
+        assert_eq!(type_lines, COUNTER_NAMES.len() - INTERNAL_SLOTS.len() + 1);
     }
 
     #[test]
