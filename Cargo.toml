@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/common",
     "crates/cli",
+    "crates/flow-encode",
     "crates/modules/fast-path",
     "crates/modules/guard",
     "crates/modules/neigh-snoop",
@@ -50,6 +51,7 @@ repository = "https://github.com/unredacted/packetframe"
 
 [workspace.dependencies]
 packetframe-common = { path = "crates/common" }
+packetframe-flow-encode = { path = "crates/flow-encode" }
 packetframe-fast-path = { path = "crates/modules/fast-path" }
 packetframe-guard = { path = "crates/modules/guard" }
 packetframe-neigh-snoop = { path = "crates/modules/neigh-snoop" }

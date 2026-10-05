@@ -719,6 +719,7 @@ dependencies = [
  "libc",
  "packetframe-common",
  "packetframe-fast-path",
+ "packetframe-flow-encode",
  "packetframe-guard",
  "packetframe-neigh-snoop",
  "packetframe-probe",
@@ -768,6 +769,10 @@ dependencies = [
  "tokio-util",
  "tracing",
 ]
+
+[[package]]
+name = "packetframe-flow-encode"
+version = "0.5.0"
 
 [[package]]
 name = "packetframe-guard"
