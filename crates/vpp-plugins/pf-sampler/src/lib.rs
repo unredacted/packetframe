@@ -4,10 +4,10 @@
 //!
 //! - **`pf-sampler-rx`**: a feature on `port-rx-eth` (vnet/dev drivers such
 //!   as octeon) and `device-input` (everything else, and the packet
-//!   generator), enabled and disabled together per interface. Per frame it
-//!   counts the sample pool, consumes the selection gap, and copies each
-//!   selected packet's leading bytes into this thread's ring; a frame with
-//!   nothing selected costs a few comparisons beyond passing it on.
+//!   generator), enabled and disabled together per interface. One pass
+//!   over a frame's buffers counts the sample pool and moves each on to
+//!   the next feature; then the selection gap is consumed and each
+//!   selected packet's leading bytes are copied into this thread's ring.
 //! - **`pf-sampler-control`**: a process node running the core's control
 //!   loop every 100 ms: the epoch file, `desired.conf`, interface
 //!   resolution, the heartbeat and the status.
@@ -27,6 +27,7 @@ use std::sync::{Mutex, OnceLock};
 use arrayvec::ArrayVec;
 use packetframe_sampler_core::control::{NOT_SAMPLED, Vpp, WorkerConfig};
 use packetframe_sampler_core::driver::{Driver, Epoch, Host, sampler_dir};
+use packetframe_sampler_core::pass::{ArcBuffers, Next, advance};
 use packetframe_sampler_core::select::Selector;
 use packetframe_sampler_shm::Class;
 use packetframe_sampler_shm::layout::MAX_WORKERS;
@@ -34,13 +35,15 @@ use packetframe_sampler_shm::ring::{RingWriter, SampleMeta};
 use vpp_plugin::{
     ErrorCounters, NextNodes,
     bindings::{
-        vlib_get_thread_main_not_inline, vlib_helper_unformat_get_input,
+        vlib_buffer_func_main, vlib_get_thread_main_not_inline, vlib_helper_unformat_get_input,
         vlib_helper_unformat_vnet_sw_interface, vlib_worker_thread_barrier_release,
         vlib_worker_thread_barrier_sync_int, vnet_feature_is_enabled, vnet_get_main,
     },
     vlib::{
-        self, BarrierHeldMainRef, BufferIndex, BufferRef, MainRef, main::sync::BarrierRwLock,
-        node::FRAME_SIZE, process_node::sleep,
+        self, BarrierHeldMainRef, BufferIndex, BufferRef, MainRef,
+        main::sync::BarrierRwLock,
+        node::{FRAME_SIZE, NodeRuntimeRef, VectorBufferIndex},
+        process_node::sleep,
     },
     vlib_cli_command, vlib_init_function, vlib_node, vlib_plugin_register, vlib_process_node,
     vnet::types::SwIfIndex,
@@ -151,38 +154,54 @@ fn rx(b: &BufferRef<()>) -> u32 {
     b.vnet_buffer().rx_sw_if_index().into()
 }
 
-/// Counts the frame's sample pool and copies out the packets the selector
-/// picks; returns (sampled, dropped for a full ring).
+/// VPP's buffers, as the core's pass reads and writes them.
+struct Vlib;
+
+impl<'a> ArcBuffers<&'a mut BufferRef<()>> for Vlib {
+    #[inline(always)]
+    fn rx(&self, b: &&'a mut BufferRef<()>) -> u32 {
+        rx(b)
+    }
+
+    #[inline(always)]
+    fn config_index(&self, b: &&'a mut BufferRef<()>) -> u32 {
+        b.current_config_index()
+    }
+
+    #[inline(always)]
+    fn set_config_index(&self, b: &mut &'a mut BufferRef<()>, index: u32) {
+        b.set_current_config_index(index);
+    }
+
+    #[inline(always)]
+    unsafe fn feature_next(&self, b: &mut &'a mut BufferRef<()>) -> u16 {
+        // SAFETY: the caller's: `b` is on an arc this node is part of.
+        unsafe { b.vnet_feature_next() }.0 as u16
+    }
+}
+
+/// Adds a run of `k` packets received on `sw` to its pool, if it has one.
 #[inline(always)]
-fn sample_frame(
+fn count(ring: &RingWriter<'static>, cfg: &WorkerConfig, sw: u32, k: usize) {
+    let pool = cfg.pool_of(sw);
+    if pool != NOT_SAMPLED {
+        ring.add_pool(usize::from(pool), Class::Ingress, k as u64);
+    }
+}
+
+/// Copies out the packets the selector picks; returns (sampled, dropped
+/// for a full ring). Touches only the buffers picked.
+#[inline(always)]
+fn select(
     vm: &MainRef,
     b: &mut ArrayVec<&mut BufferRef<()>, FRAME_SIZE>,
     ring: &RingWriter<'static>,
     cfg: &WorkerConfig,
     st: &ThreadState,
 ) -> (u64, u64) {
-    let n = b.len();
-    // The pool, per run of one receive interface: a frame on these arcs is
-    // one port's, so normally one run.
-    let count = |sw: u32, k: usize| {
-        let pool = cfg.pool_of(sw);
-        if pool != NOT_SAMPLED {
-            ring.add_pool(usize::from(pool), Class::Ingress, k as u64);
-        }
-    };
-    let (mut run_start, mut run_sw) = (0, rx(b[0]));
-    for (i, b0) in b.iter().enumerate().skip(1) {
-        let sw = rx(b0);
-        if sw != run_sw {
-            count(run_sw, i - run_start);
-            (run_start, run_sw) = (i, sw);
-        }
-    }
-    count(run_sw, n - run_start);
-
     let (mut sampled, mut dropped) = (0, 0);
     let mut sel = st.selector.get();
-    sel.frame(n, |i| {
+    sel.frame(b.len(), |i| {
         let b0 = &mut *b[i];
         let sw = rx(b0);
         let pool = cfg.pool_of(sw);
@@ -214,6 +233,34 @@ fn sample_frame(
     (sampled, dropped)
 }
 
+/// The whole frame to one next node: VPP's
+/// `vlib_buffer_enqueue_to_single_next`, which the crate does not wrap.
+///
+/// # Safety
+///
+/// As `MainRef::buffer_enqueue_to_next` with every next equal to `next`.
+#[inline(always)]
+unsafe fn enqueue_to_single_next(
+    vm: &MainRef,
+    node: &mut NodeRuntimeRef<SamplerNode>,
+    from: &[BufferIndex],
+    next: u16,
+) {
+    // SAFETY: VPP fills `vlib_buffer_func_main` at startup, before any
+    // node runs; the rest is the caller's.
+    unsafe {
+        (vlib_buffer_func_main
+            .buffer_enqueue_to_single_next_fn
+            .unwrap_unchecked())(
+            vm.as_ptr(),
+            node.as_ptr(),
+            VectorBufferIndex::as_u32_slice(from).as_ptr().cast_mut(),
+            next,
+            from.len() as u32,
+        )
+    }
+}
+
 impl vlib::node::Node for SamplerNode {
     type Vector = BufferIndex;
     type Scalar = ();
@@ -240,10 +287,21 @@ impl vlib::node::Node for SamplerNode {
         if n == 0 {
             return 0;
         }
-
         let t = usize::from(vm.thread_index());
         let w = WORKER.read(vm);
-        if let (Some(ring), Some(st)) = (w.rings.get(t), THREADS.0.get(t)) {
+        let ring = w.rings.get(t);
+
+        let mut nexts = [MaybeUninit::<u16>::uninit(); FRAME_SIZE];
+        // SAFETY: every buffer of this frame is on the arc this node is on.
+        let next = unsafe {
+            advance(&Vlib, &mut b, &mut nexts, |sw, k| {
+                if let Some(ring) = ring {
+                    count(ring, &w.cfg, sw, k);
+                }
+            })
+        };
+
+        if let (Some(ring), Some(st)) = (ring, THREADS.0.get(t)) {
             if st.generation.get() != w.cfg.generation {
                 let mut s = Selector::new();
                 s.set_rate(
@@ -253,7 +311,7 @@ impl vlib::node::Node for SamplerNode {
                 st.selector.set(s);
                 st.generation.set(w.cfg.generation);
             }
-            let (sampled, dropped) = sample_frame(vm, &mut b, ring, &w.cfg, st);
+            let (sampled, dropped) = select(vm, &mut b, ring, &w.cfg, st);
             if sampled > 0 {
                 node.increment_error_counter(vm, SamplerCounter::Sampled, sampled);
             }
@@ -263,34 +321,13 @@ impl vlib::node::Node for SamplerNode {
         }
         drop(w);
 
-        // On to the next feature. From VPP 26.06 every arc's feature
-        // strings share one heap, so equal config indices mean the same
-        // next feature: one lookup serves a frame from one interface, and
-        // every buffer's index still advances past this node.
-        let mut nexts = [MaybeUninit::<u16>::uninit(); FRAME_SIZE];
-        let c0 = b[0].current_config_index();
-        if b.iter().all(|b0| b0.current_config_index() == c0) {
-            // SAFETY: the buffer is on a feature arc this node is part of.
-            let next = unsafe { b[0].vnet_feature_next() }.0 as u16;
-            let advanced = b[0].current_config_index();
-            for b0 in b.iter_mut().skip(1) {
-                b0.set_current_config_index(advanced);
-            }
-            for x in &mut nexts[..n] {
-                x.write(next);
-            }
-        } else {
-            for (x, b0) in nexts.iter_mut().zip(b.iter_mut()) {
-                // SAFETY: as above.
-                x.write(unsafe { b0.vnet_feature_next() }.0 as u16);
-            }
-        }
-        // SAFETY: the first `n` entries were written above; `from` came
-        // from this frame, and every next is a node on the arc taking
-        // buffer indices.
+        // SAFETY: `from` came from this frame, and every next is a node on
+        // the arc taking buffer indices, one per buffer.
         unsafe {
-            let nexts = std::slice::from_raw_parts(nexts.as_ptr().cast::<u16>(), n);
-            vm.buffer_enqueue_to_next(node, from, nexts);
+            match next {
+                Next::Single(x) => enqueue_to_single_next(vm, node, from, x),
+                Next::Each(nexts) => vm.buffer_enqueue_to_next(node, from, nexts),
+            }
         }
         n as u16
     }
