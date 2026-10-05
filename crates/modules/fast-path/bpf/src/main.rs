@@ -33,6 +33,7 @@ mod datapath;
 mod fib;
 mod finalize;
 mod maps;
+mod sample;
 mod tc;
 
 use datapath::{
@@ -145,13 +146,44 @@ pub fn fast_path(ctx: XdpContext) -> u32 {
         }
     }
 
-    match try_fast_path(&ctx, stats, cfg_flags, dry_run, mss_clamp_global) {
+    // After the head shift, whose failures leave the frame unreadable:
+    // every packet counted from here reaches an emission point.
+    sample::tick(stats);
+
+    let action = match try_fast_path(&ctx, stats, cfg_flags, dry_run, mss_clamp_global) {
         Ok(action) => action,
         Err(()) => {
             bump(stats, StatIdx::ErrParse);
             xdp_action::XDP_PASS
         }
+    };
+    // A forwarded packet was emitted in `forward_success`; this catches
+    // everything else, a failed tail call's pass included (the latch
+    // makes it a no-op there).
+    let disposition = if action == xdp_action::XDP_DROP {
+        sample::DISPOSITION_DROP
+    } else {
+        sample::DISPOSITION_PASS
+    };
+    sample_xdp(&ctx, stats, disposition, 0);
+    action
+}
+
+/// Emit the packet in hand if it is selected (`sample.rs`).
+#[inline(always)]
+fn sample_xdp(ctx: &XdpContext, stats: StatsPtr, disposition: u32, egress_ifindex: u32) {
+    if !sample::pending(stats) {
+        return;
     }
+    sample::emit(
+        ctx,
+        stats,
+        (ctx.data_end() - ctx.data()) as u32,
+        unsafe { (*ctx.ctx).ingress_ifindex },
+        egress_ifindex,
+        sample::PATH_XDP | disposition << 8,
+        0,
+    );
 }
 
 /// Returns Err(()) on bounds-check failure (always counted as
@@ -734,6 +766,9 @@ fn forward_success(
         bump(stats, StatIdx::PassNotInDevmap);
         return Ok(xdp_action::XDP_PASS);
     }
+
+    // Last point the packet is as received: sample the redirect intent.
+    sample_xdp(ctx, stats, sample::DISPOSITION_REDIRECT, egress_ifindex);
 
     // TTL/hop_limit + csum, IP header's position in memory doesn't
     // change with adjust_head, only its offset from `data`. Safe to do

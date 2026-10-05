@@ -55,7 +55,7 @@ pub struct FpCfg {
 unsafe impl Pod for FpCfg {}
 
 pub const FP_CFG_VERSION_V2: u32 = 1;
-pub const STATS_COUNT: u32 = 51;
+pub const STATS_COUNT: u32 = 55;
 
 /// This mirror cannot drift from the library's count again.
 ///
@@ -154,6 +154,10 @@ pub enum StatIdx {
     ErrParseTcL3V4 = 48,
     ErrParseTcL3V6 = 49,
     PassNotForUs = 50,
+    SampleCountdown = 51,
+    SampleArmed = 52,
+    SampleSelected = 53,
+    SampleEmitFailed = 54,
 }
 
 /// `ingress_ifindex` of every `BPF_PROG_TEST_RUN` XDP execution: with no
@@ -760,6 +764,137 @@ impl Harness {
         let per_cpu = stats.get(&0, 0).expect("STATS get");
         per_cpu.iter().map(|block| block[idx as usize]).sum()
     }
+}
+
+// --- flow-export sampler ------------------------------------------------
+
+#[allow(unused_imports)] // each test file uses its own subset
+pub use packetframe_fast_path::sample::{
+    parse as parse_sample, Disposition, Path as SamplePath, Sample, SampleCfg,
+};
+
+impl Harness {
+    /// Write `SAMPLE_CFG` as flow-export does.
+    pub fn set_sample_cfg(&mut self, rate: u32, header_bytes: u32, generation: u32) {
+        let map = self.bpf.map_mut("SAMPLE_CFG").expect("SAMPLE_CFG map");
+        let mut arr: Array<_, SampleCfg> = Array::try_from(map).expect("SAMPLE_CFG try_from");
+        let cfg = SampleCfg::new(rate, header_bytes, generation);
+        arr.set(0, cfg, 0).expect("SAMPLE_CFG set");
+    }
+
+    /// Open a perf ring on every online CPU, as flow-export does. Until
+    /// this runs, every emission fails (`SampleEmitFailed`).
+    pub fn sample_tap(&mut self) -> SampleTap {
+        let map = self.bpf.map("SAMPLES").expect("SAMPLES map");
+        let aya::maps::Map::PerfEventArray(data) = map else {
+            panic!("SAMPLES is not a perf event array");
+        };
+        let cpus = aya::util::online_cpus().expect("online cpus");
+        let rings =
+            packetframe_fast_path::sample_rings::SampleRings::open(data.fd().as_fd(), &cpus, 16)
+                .expect("open sample rings");
+        SampleTap { rings }
+    }
+
+    /// Empty slot 0 of `MUTATION_PROGS` or `TC_MUTATION_PROGS`, so the
+    /// stage-1 tail call fails and falls back to a pass.
+    pub fn clear_tail_call(&mut self, map: &str) {
+        let map = self.bpf.map_mut(map).expect("prog array map");
+        let mut arr: ProgramArray<_> = ProgramArray::try_from(map).expect("ProgramArray");
+        arr.clear_index(&0).expect("clear slot 0");
+    }
+}
+
+pub struct SampleTap {
+    rings: packetframe_fast_path::sample_rings::SampleRings,
+}
+
+impl SampleTap {
+    /// Every event emitted since the last drain, and the count the rings
+    /// lost.
+    pub fn drain(&mut self) -> (Vec<Vec<u8>>, u64) {
+        let mut events = Vec::new();
+        let lost = self.rings.drain(|_, e| events.push(e.to_vec()));
+        (events, lost)
+    }
+
+    /// Drain, asserting nothing was lost.
+    pub fn events(&mut self) -> Vec<Vec<u8>> {
+        let (events, lost) = self.drain();
+        assert_eq!(lost, 0, "perf ring lost events");
+        events
+    }
+}
+
+/// Run `f` on a thread pinned to one CPU: the sampler's countdown is
+/// per-CPU, so a test that migrates between runs would see another
+/// CPU's.
+pub fn on_one_cpu<F: FnOnce() + Send>(f: F) {
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let cpu = unsafe { libc::sched_getcpu() };
+            assert!(cpu >= 0, "sched_getcpu");
+            let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            unsafe { libc::CPU_SET(cpu as usize, &mut set) };
+            let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) };
+            assert_eq!(
+                rc,
+                0,
+                "sched_setaffinity: {}",
+                std::io::Error::last_os_error()
+            );
+            f()
+        });
+    });
+}
+
+/// Move the calling thread into a network namespace of its own, with a
+/// route for `198.51.100.0/24` via `192.0.2.1` out of a dummy device of
+/// MTU 1280, and forwarding on: under TEST_RUN, `bpf_fib_lookup` then
+/// succeeds toward the dummy, and `bpf_check_mtu` has an egress to
+/// refuse. Returns the dummy's ifindex. Only the calling thread moves:
+/// call it inside [`on_one_cpu`].
+pub fn enter_routed_netns() -> u32 {
+    let rc = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+    assert_eq!(rc, 0, "unshare: {}", std::io::Error::last_os_error());
+    // Children inherit the calling thread's namespaces.
+    let ip = |args: &[&str]| {
+        let st = std::process::Command::new("ip")
+            .args(args)
+            .status()
+            .expect("spawn ip");
+        assert!(st.success(), "ip {args:?}");
+    };
+    ip(&["link", "set", "lo", "up"]);
+    ip(&["link", "add", "pfs0", "type", "dummy"]);
+    ip(&["link", "set", "pfs0", "mtu", "1280", "up"]);
+    ip(&["addr", "add", "192.0.2.254/24", "dev", "pfs0"]);
+    ip(&[
+        "neigh",
+        "add",
+        "192.0.2.1",
+        "lladdr",
+        "02:00:00:00:5e:01",
+        "dev",
+        "pfs0",
+        "nud",
+        "permanent",
+    ]);
+    ip(&[
+        "route",
+        "add",
+        "198.51.100.0/24",
+        "via",
+        "192.0.2.1",
+        "dev",
+        "pfs0",
+    ]);
+    // /proc/sys/net resolves against the opening thread's namespace.
+    std::fs::write("/proc/sys/net/ipv4/conf/all/forwarding", "1").expect("forwarding");
+    let name = std::ffi::CString::new("pfs0").unwrap();
+    let ifindex = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    assert_ne!(ifindex, 0, "pfs0 ifindex");
+    ifindex
 }
 
 // --- Raw bpf(BPF_PROG_TEST_RUN) ----------------------------------------

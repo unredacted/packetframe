@@ -3055,7 +3055,7 @@ fn print_stats(bpffs_root: &Path) {
             println!();
             println!("counters (from {}):", bpffs_root.display());
             let name_w = names.iter().map(|n| n.len()).max().unwrap_or(20);
-            for (name, value) in names.iter().zip(values.iter()) {
+            for (name, value) in packetframe_fast_path::metrics::counters(&values) {
                 println!("  {name:<name_w$}  {value}");
             }
         }

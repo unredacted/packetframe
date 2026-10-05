@@ -25,6 +25,8 @@ pub mod metrics;
 pub mod pin;
 pub mod registry;
 pub mod rx_macs;
+pub mod sample;
+pub mod sample_rings;
 pub mod softnet;
 pub mod tc_links;
 pub mod wan_egress;
