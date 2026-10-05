@@ -26,6 +26,8 @@ pub(crate) mod logging;
 mod metrics;
 #[cfg(feature = "probe")]
 mod probe;
+#[cfg(all(target_os = "linux", feature = "vpp-offload"))]
+mod sampler_cli;
 mod scrub;
 
 use std::path::PathBuf;
@@ -175,6 +177,13 @@ enum Command {
     /// Low-rate by design; built only with the `dev-tools` feature.
     #[cfg(feature = "dev-tools")]
     FlowSynth(flow_synth::FlowSynthArgs),
+    /// The VPP sampler (flow export, lab tooling): its coverage and
+    /// counters, its samples, and the desired.conf it samples by.
+    #[cfg(all(target_os = "linux", feature = "vpp-offload"))]
+    Sampler {
+        #[command(subcommand)]
+        op: sampler_cli::SamplerOp,
+    },
 
     /// Attach a diagnostic XDP program, dump the first 16 bytes of a
     /// sample of incoming packets, detach. Built to answer "what does
@@ -209,7 +218,11 @@ enum Command {
     },
 }
 
-#[cfg(any(feature = "probe", feature = "dev-tools"))]
+#[cfg(any(
+    feature = "probe",
+    feature = "dev-tools",
+    all(target_os = "linux", feature = "vpp-offload")
+))]
 fn parse_duration(s: &str) -> Result<Duration, String> {
     // Unit suffixes: `ms`, `s`, `m`, parsed in longest-match order so
     // `ms` wins over `s`. Bare integers are treated as seconds, which
@@ -387,6 +400,8 @@ fn main() -> ExitCode {
         Command::Fib { op } => fib_cli::run(op),
         #[cfg(feature = "dev-tools")]
         Command::FlowSynth(args) => flow_synth::run(args),
+        #[cfg(all(target_os = "linux", feature = "vpp-offload"))]
+        Command::Sampler { op } => sampler_cli::run(op),
         #[cfg(feature = "probe")]
         Command::Probe {
             iface,

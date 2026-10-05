@@ -472,6 +472,21 @@ pub fn open_epoch(dir: &Path, consume: bool) -> Result<Opened, OpenError> {
     })
 }
 
+/// Bytes in use on `dir`'s filesystem, and its size: for the sampler
+/// tmpfs, the memory epoch files hold against the budget.
+pub fn usage(dir: &Path) -> io::Result<(u64, u64)> {
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Field widths differ between glibc and musl.
+    #[allow(clippy::unnecessary_cast)]
+    let (frsize, blocks, free) = (st.f_frsize as u64, st.f_blocks as u64, st.f_bfree as u64);
+    Ok(((blocks - free) * frsize, blocks * frsize))
+}
+
 /// Creates `dir` with mode 0700 if it does not exist (for tests and lab
 /// tools; in production PacketFrame mounts the tmpfs there).
 pub fn ensure_dir(dir: &Path) -> io::Result<()> {
@@ -633,6 +648,12 @@ mod tests {
         assert!(d.join("desired.conf").exists());
         assert!(d.join("epoch-notanepoch.shm").exists());
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn usage_reports_the_filesystem() {
+        let (used, total) = usage(&std::env::temp_dir()).unwrap();
+        assert!(total > 0 && used <= total);
     }
 
     #[test]
