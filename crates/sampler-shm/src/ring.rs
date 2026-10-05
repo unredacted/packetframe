@@ -120,20 +120,25 @@ impl<'a> RingWriter<'a> {
             layout.slots(file, ring),
             layout.tail(&file[layout.consumer_off..], ring),
             layout.slot_words,
+            layout.header_capacity,
         )
     }
 
     /// A ring over bare regions: `slots` holds a power-of-two number of
-    /// `slot_words`-word slots; `producer` is [`PRODUCER_WORDS`] long in an
-    /// epoch file, shorter (fewer pool entries) in a model.
+    /// `slot_words`-word slots, each carrying at most `header_capacity`
+    /// packet bytes — the epoch's declared capacity, not the word-rounded
+    /// room a slot has for them. `producer` is [`PRODUCER_WORDS`] long in
+    /// an epoch file, shorter (fewer pool entries) in a model.
     pub fn from_parts(
         producer: &'a [AtomicU64],
         slots: &'a [AtomicU64],
         tail: &'a AtomicU64,
         slot_words: usize,
+        header_capacity: usize,
     ) -> Self {
         assert!(producer.len() >= p::POOL && producer.len() <= PRODUCER_WORDS);
         assert!(slot_words >= SLOT_FIXED_WORDS);
+        assert!(header_capacity <= (slot_words - SLOT_FIXED_WORDS) * WORD);
         let n = slots.len() / slot_words;
         assert!(n.is_power_of_two() && n * slot_words == slots.len());
         Self {
@@ -141,7 +146,7 @@ impl<'a> RingWriter<'a> {
             slots,
             tail,
             slot_words,
-            capacity: (slot_words - SLOT_FIXED_WORDS) * WORD,
+            capacity: header_capacity,
             mask: n as u64 - 1,
         }
     }
@@ -217,6 +222,7 @@ impl<'a> RingReader<'a> {
             layout.slots(file, ring),
             layout.tail(consumer, ring),
             layout.slot_words,
+            layout.header_capacity,
         )
     }
 
@@ -225,8 +231,9 @@ impl<'a> RingReader<'a> {
         slots: &'a [AtomicU64],
         tail: &'a AtomicU64,
         slot_words: usize,
+        header_capacity: usize,
     ) -> Self {
-        let w = RingWriter::from_parts(producer, slots, tail, slot_words);
+        let w = RingWriter::from_parts(producer, slots, tail, slot_words, header_capacity);
         Self {
             producer,
             slots,
@@ -366,10 +373,10 @@ mod tests {
             }
         }
         fn writer(&self) -> RingWriter<'_> {
-            RingWriter::from_parts(&self.producer, &self.slots, &self.tail, SLOT_WORDS)
+            RingWriter::from_parts(&self.producer, &self.slots, &self.tail, SLOT_WORDS, 16)
         }
         fn reader(&self) -> RingReader<'_> {
-            RingReader::from_parts(&self.producer, &self.slots, &self.tail, SLOT_WORDS)
+            RingReader::from_parts(&self.producer, &self.slots, &self.tail, SLOT_WORDS, 16)
         }
     }
 
@@ -471,6 +478,28 @@ mod tests {
         let mut rest = Vec::new();
         b.reader().drain(&mut rest, usize::MAX);
         assert_eq!(rest.iter().map(|s| s.seq).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    /// A capacity that is not a whole number of words is still the
+    /// capacity: the slot's rounding-up room is never used, and a slot
+    /// claiming more than the epoch declares is refused.
+    #[test]
+    fn the_declared_header_capacity_is_exact() {
+        let l = Layout::new(1, 4, 1).unwrap();
+        assert_eq!(l.slot_words, SLOT_FIXED_WORDS + 1);
+        let f = words(l.file_words);
+        let consumer = &f[l.consumer_off..];
+        let w = RingWriter::new(&l, &f, 0);
+        assert!(w.push(&meta(0), &[9; 8]));
+        let r = RingReader::new(&l, &f, consumer, 0);
+        let mut out = Vec::new();
+        r.drain(&mut out, usize::MAX);
+        assert_eq!(out[0].header, [9]);
+
+        assert!(w.push(&meta(1), &[9; 8]));
+        let at = l.slots_off + l.slot_words + s::LENS;
+        f[at].store(8, Ordering::Relaxed); // the slot claims 8 bytes
+        assert_eq!(r.drain(&mut out, usize::MAX).corrupt, 1);
     }
 
     #[test]

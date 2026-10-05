@@ -96,7 +96,8 @@ fn ring_delivers_whole_samples_in_order_or_counts_the_drop() {
         let producer = {
             let (ring, done) = (ring.clone(), done.clone());
             thread::spawn(move || {
-                let w = RingWriter::from_parts(&ring.producer, &ring.slots, &ring.tail, SLOT_WORDS);
+                let w =
+                    RingWriter::from_parts(&ring.producer, &ring.slots, &ring.tail, SLOT_WORDS, 8);
                 let pushed = (1..=3u64)
                     .filter(|&g| w.push(&meta(g), &[g as u8; 8]))
                     .count();
@@ -104,7 +105,7 @@ fn ring_delivers_whole_samples_in_order_or_counts_the_drop() {
                 pushed
             })
         };
-        let r = RingReader::from_parts(&ring.producer, &ring.slots, &ring.tail, SLOT_WORDS);
+        let r = RingReader::from_parts(&ring.producer, &ring.slots, &ring.tail, SLOT_WORDS, 8);
         let mut out = Vec::new();
         let mut corrupt = 0;
         loop {

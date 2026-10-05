@@ -171,17 +171,25 @@ impl Status {
             return Err(StatusError::Invalid("interface count"));
         }
         let small = |i: usize, what| u32::try_from(v[i]).map_err(|_| StatusError::Invalid(what));
-        let mut interfaces = Vec::with_capacity(n);
+        let mut interfaces: Vec<Interface> = Vec::with_capacity(n);
         for i in 0..n {
             let at = w::FIXED + i * IFACE_WORDS;
             let name = get_text_from(&v[at..at + NAME_WORDS]);
             if !valid_interface_name(&name) {
                 return Err(StatusError::Invalid("interface name"));
             }
+            if interfaces.iter().any(|f| f.name == name) {
+                return Err(StatusError::Invalid("duplicate interface name"));
+            }
             let idx = v[at + NAME_WORDS];
             let pool_index = (idx >> 40) as u8;
             if usize::from(pool_index) >= MAX_INTERFACES || idx >> 48 != 0 {
                 return Err(StatusError::Invalid("pool index"));
+            }
+            // Samples and pool counters name an interface only by this, so
+            // two interfaces sharing one would make every count ambiguous.
+            if interfaces.iter().any(|f| f.pool_index == pool_index) {
+                return Err(StatusError::Invalid("duplicate pool index"));
             }
             interfaces.push(Interface {
                 name,
@@ -331,6 +339,18 @@ mod tests {
         let mut v = sample().encode();
         v[w::FIXED + NAME_WORDS] = 64 << 40;
         assert_eq!(Status::decode(&v), Err(StatusError::Invalid("pool index")));
+        let mut dup = sample();
+        dup.interfaces[2].pool_index = dup.interfaces[0].pool_index;
+        assert_eq!(
+            Status::decode(&dup.encode()),
+            Err(StatusError::Invalid("duplicate pool index"))
+        );
+        let mut dup = sample();
+        dup.interfaces[2].name = dup.interfaces[0].name.clone();
+        assert_eq!(
+            Status::decode(&dup.encode()),
+            Err(StatusError::Invalid("duplicate interface name"))
+        );
         let mut v = sample().encode();
         v[w::RATE] = u64::MAX;
         assert_eq!(Status::decode(&v), Err(StatusError::Invalid("rate")));

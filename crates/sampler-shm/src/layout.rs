@@ -107,8 +107,8 @@ pub struct Layout {
     pub file_words: usize,
 }
 
-fn round_up(n: usize, to: usize) -> usize {
-    n.div_ceil(to) * to
+fn round_up(n: u64, to: usize) -> u64 {
+    n.div_ceil(to as u64) * to as u64
 }
 
 impl Layout {
@@ -124,29 +124,35 @@ impl Layout {
         if header_capacity > HEADER_CAPACITY_MAX {
             return Err(LayoutError::Geometry("header capacity must be <= 512"));
         }
-        let slot_words = crate::ring::SLOT_FIXED_WORDS + header_capacity.div_ceil(WORD);
-        let status_off = round_up(hdr::WORDS, LINE_WORDS);
-        let producer_off = round_up(status_off + crate::status::REGION_WORDS, LINE_WORDS);
-        let producer_stride = round_up(crate::ring::PRODUCER_WORDS, LINE_WORDS);
-        let slots_off = producer_off + workers * producer_stride;
-        let ring_stride = round_up(slots * slot_words, LINE_WORDS);
-        let consumer_off = round_up(slots_off + workers * ring_stride, CONSUMER_ALIGN_WORDS);
-        let file_words = consumer_off + round_up(workers * LINE_WORDS, CONSUMER_ALIGN_WORDS);
-        if file_words * WORD > MAX_FILE_BYTES {
+        // In u64, so no target's usize can wrap before the size check (the
+        // largest parameters describe about 9 GB); once the file is known
+        // to be at most 1 GiB every value fits any usize.
+        let (workers64, slots64) = (workers as u64, slots as u64);
+        let slot_words = (crate::ring::SLOT_FIXED_WORDS + header_capacity.div_ceil(WORD)) as u64;
+        let status_off = round_up(hdr::WORDS as u64, LINE_WORDS);
+        let producer_off = round_up(status_off + crate::status::REGION_WORDS as u64, LINE_WORDS);
+        let producer_stride = round_up(crate::ring::PRODUCER_WORDS as u64, LINE_WORDS);
+        let slots_off = producer_off + workers64 * producer_stride;
+        let ring_stride = round_up(slots64 * slot_words, LINE_WORDS);
+        let consumer_off = round_up(slots_off + workers64 * ring_stride, CONSUMER_ALIGN_WORDS);
+        let file_words =
+            consumer_off + round_up(workers64 * LINE_WORDS as u64, CONSUMER_ALIGN_WORDS);
+        if file_words * WORD as u64 > MAX_FILE_BYTES as u64 {
             return Err(LayoutError::Geometry("the file would exceed 1 GiB"));
         }
+        let n = |v: u64| v as usize;
         Ok(Self {
             workers,
             slots,
             header_capacity,
-            slot_words,
-            status_off,
-            producer_off,
-            producer_stride,
-            slots_off,
-            ring_stride,
-            consumer_off,
-            file_words,
+            slot_words: n(slot_words),
+            status_off: n(status_off),
+            producer_off: n(producer_off),
+            producer_stride: n(producer_stride),
+            slots_off: n(slots_off),
+            ring_stride: n(ring_stride),
+            consumer_off: n(consumer_off),
+            file_words: n(file_words),
         })
     }
 
