@@ -47,7 +47,7 @@ An **integrity authority** (`integrity-authority birdc` or `frr`) compares Packe
 
 ### VPP offload (`vpp-offload`)
 
-This module adds a second forwarding tier. The NIC's hardware classifier (ntuple rules in the MCAM) sends allowlisted traffic to an SR-IOV virtual function. On that VF, a [VPP](https://fd.io/) process that PacketFrame starts and supervises forwards it. Steered traffic bypasses the kernel entirely and uses dedicated worker cores.
+This module adds a second forwarding tier, on Marvell OCTEON NICs only ([supported hardware](crates/modules/vpp-offload/README.md#supported-hardware)). The NIC's hardware classifier (ntuple rules in the MCAM) sends allowlisted traffic to an SR-IOV virtual function. On that VF, a [VPP](https://fd.io/) process that PacketFrame starts and supervises forwards it. Steered traffic bypasses the kernel entirely and uses dedicated worker cores.
 
 - **Routes.** VPP gets fast-path's resolved FIB, including `fallback-default`, over the VPP binary API. PacketFrame reads the routes back to verify them and scans for drift.
 - **IPv4** is steered by allowlisted prefix.
@@ -116,7 +116,7 @@ Later, the same router moved IPv6 into VPP alongside IPv4 (four steered ports, f
 - Root access.
 - The `.deb` needs glibc 2.31 or newer (Debian 11, Ubuntu 20.04 or later). The musl tarballs run on any Linux.
 - For `packetframe-fib`: FRR or BIRD, configured to export to PacketFrame over iBGP.
-- For vpp-offload: a NIC with SR-IOV and ntuple flow steering to a VF, plus hugepages and spare cores for VPP workers. It has been built and tested only on UniFi gateways with Marvell OCTEON TX2 (`rvu-nicpf`) NICs. Read [the runbook](docs/runbooks/vpp-offload.md) before trying other hardware.
+- For vpp-offload: a Marvell OCTEON NIC (PF driver `rvu_nicpf`, as on UniFi EFG gateways), an active IOMMU, hugepages, spare cores for VPP workers, and a VPP build with the native `octeon` driver. Attach refuses any other NIC; fast-path has no such requirement. See [supported hardware](crates/modules/vpp-offload/README.md#supported-hardware).
 
 ## Install
 
