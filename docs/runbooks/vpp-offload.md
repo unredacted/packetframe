@@ -79,6 +79,7 @@ running badly.
 
 ## Contents
 
+- [Supported hardware](#supported-hardware)
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Healthy state](#healthy-state)
 - [Everyday inspection commands](#everyday-inspection-commands)
@@ -94,6 +95,34 @@ running badly.
 - [Install and upgrade on the router](#install-and-upgrade-on-the-router)
 - [IRQ affinity before attach](#irq-affinity-before-attach)
 - [Constraints worth knowing before you debug](#constraints-worth-knowing-before-you-debug)
+
+## Supported hardware
+
+Marvell OCTEON NICs only: every `port` must be a PF on the `rvu_nicpf`
+driver. Steering, VF handling and the VPP device driver (`octeon`) are
+all specific to that NIC. The module README's
+[Supported hardware](../../crates/modules/vpp-offload/README.md#supported-hardware)
+lists how.
+
+Attach checks each port's driver before it touches any NIC and refuses
+the whole attach, naming every port that fails:
+
+```text
+eth2 is driven by `ixgbe`; br0 has no device driver behind it (…).
+vpp-offload supports only Marvell OCTEON NICs (PF driver `rvu_nicpf`): …
+```
+
+`packetframe feasibility` gives the same verdict per port as
+`vpp.<port>.driver`. On a port that fails it, `vpp.steering.budget`
+reads `not planned`, because the rule table it would plan against is
+not one this module programs. To see what a port is driven by:
+
+```sh
+readlink /sys/class/net/eth2/device/driver
+```
+
+On other hardware, remove the `module vpp-offload` section and run the
+eBPF fast-path alone.
 
 ## Architecture at a glance
 

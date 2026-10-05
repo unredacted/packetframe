@@ -66,6 +66,7 @@ pub mod fib_sync;
 pub mod handback;
 pub mod ledger_record;
 pub mod liveness;
+pub mod nic;
 pub mod ntuple;
 pub mod process;
 pub mod resources;
@@ -1569,6 +1570,18 @@ impl Module for VppOffloadModule {
                 ),
             ));
         }
+        // Every member port on the one NIC this module drives, before
+        // anything below touches a NIC: `steer-capacity` writes the
+        // driver's devlink parameter, the budget query issues its ntuple
+        // ioctl, and `acquire` creates and rebinds VFs. See [`nic`].
+        let members: Vec<&str> = self
+            .cfg
+            .ports
+            .iter()
+            .map(|(iface, _, _, _, _)| iface.as_str())
+            .collect();
+        nic::check_ports_in(&paths.sys.sysfs_net, &members)
+            .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         // Size the rule tables BEFORE the budget is read, so the plan is
         // drawn from the table the NIC actually holds afterwards — and
         // hand the entries back if attach then refuses, since the shared
@@ -2397,6 +2410,56 @@ mod tests {
             msg.contains("second supervisor"),
             "the consequence must be stated: {msg}"
         );
+    }
+
+    /// The NIC gate has a caller: attach refuses a member port that is not
+    /// on the supported driver, and refuses before acquiring anything.
+    ///
+    /// The port cannot exist on any host, so its driver is unreadable
+    /// everywhere and the verdict does not depend on the test machine.
+    #[test]
+    fn attach_refuses_a_port_off_the_supported_nic_before_acquiring() {
+        use packetframe_common::config::{GlobalConfig, ModuleDirective, ModuleSection};
+        use packetframe_common::module::{Module as _, ModuleConfig};
+
+        let state = std::env::temp_dir().join(format!("pf-nic-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+
+        let mut m = VppOffloadModule::new();
+        m.state_dir = state.clone();
+        m.set_route_source(Box::new(NoRoutes));
+        m.cfg = VppOffloadConfig::from_directives(&[ModuleDirective::VppPort {
+            iface: "pf-no-such-nic".into(),
+            cores: 1,
+            steer: false,
+            vlans: vec![],
+            vlans_all: false,
+            direction: None,
+            v6_divert: None,
+            line: 1,
+        }]);
+
+        let section = ModuleSection {
+            name: "vpp-offload".into(),
+            directives: Vec::new(),
+        };
+        let global = GlobalConfig::default();
+        let msg = m
+            .attach(&ModuleConfig::new(&section, &global))
+            .expect_err("a port off the supported NIC must refuse")
+            .to_string();
+        assert!(
+            msg.contains("pf-no-such-nic: its driver could not be read"),
+            "{msg}"
+        );
+        assert!(msg.contains(nic::SUPPORTED_NIC), "{msg}");
+        assert_eq!(
+            std::fs::read_dir(&state).unwrap().count(),
+            0,
+            "nothing may be acquired or recorded before the gate"
+        );
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     /// A teardown that finished cleanly clears the provisional failure.

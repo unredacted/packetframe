@@ -21,6 +21,8 @@ use std::path::Path;
 
 use packetframe_common::probe::Capability;
 
+use crate::nic::PortNic;
+
 // One argument per attach-gated directive; the CLI groups them in
 // `VppProbeInputs`, the module boundary keeps plain args.
 #[allow(clippy::too_many_arguments)]
@@ -36,7 +38,17 @@ pub(crate) fn run(
     steer_capacity: Option<u16>,
     section: &[packetframe_common::config::ModuleDirective],
 ) -> Vec<Capability> {
-    let mut caps = Vec::with_capacity(6 + ports.len());
+    let mut caps = Vec::with_capacity(6 + 2 * ports.len());
+    // The NIC first: on any other one, every verdict below describes
+    // hardware this module would refuse anyway. Read once, so the driver
+    // lines and the steering-budget decision below cannot disagree.
+    let nics: Vec<(&String, std::io::Result<PortNic>)> = ports
+        .iter()
+        .map(|p| (p, crate::nic::port_nic_in(Path::new("/sys/class/net"), p)))
+        .collect();
+    for (iface, read) in &nics {
+        caps.push(probe_driver(iface, read));
+    }
     caps.push(probe_iommu());
     caps.push(probe_vfio());
     caps.push(probe_hugepages());
@@ -63,17 +75,77 @@ pub(crate) fn run(
     // to the kernel bridge included.
     let v6cfg = crate::VppOffloadConfig::from_directives(section);
     let v6_for = |port: &str| v6cfg.v6_steering(port, &crate::topology::kernel_tagged_vlans);
-    caps.push(probe_steering_budget_v6(
-        ports,
-        steer_ports,
-        allowlist,
-        directions,
-        steer_exempts,
-        steer_capacity,
-        &crate::topology::kernel_receive_macs,
-        &v6_for,
-    ));
+    // The plan is the supported NIC's rule table. Asked of another
+    // driver, the same ioctl and devlink reads answer about a table this
+    // module would never program, so the line would be a verdict on the
+    // wrong hardware. The driver lines above already block the summary.
+    let foreign: Vec<&str> = nics
+        .iter()
+        .filter(|(_, read)| !matches!(read, Ok(PortNic::Supported)))
+        .map(|(p, _)| p.as_str())
+        .collect();
+    caps.push(if foreign.is_empty() {
+        probe_steering_budget_v6(
+            ports,
+            steer_ports,
+            allowlist,
+            directions,
+            steer_exempts,
+            steer_capacity,
+            &crate::topology::kernel_receive_macs,
+            &v6_for,
+        )
+    } else {
+        Capability::unknown(
+            "vpp.steering.budget",
+            format!(
+                "not planned: {foreign:?} are not on `{}`, the only NIC whose rule table \
+                 steering programs (see their `driver` lines)",
+                crate::nic::SUPPORTED_PF_DRIVER
+            ),
+            false,
+        )
+    });
     caps
+}
+
+/// One member port's NIC, as attach's gate judges it
+/// ([`crate::nic::check_ports_in`]): the same read, the same reasons.
+/// Required on every arm, since attach refuses whatever is not a PASS.
+fn probe_driver(iface: &str, read: &std::io::Result<PortNic>) -> Capability {
+    let name = format!("vpp.{iface}.driver");
+    match (read, crate::nic::unsupported_reason(iface, read)) {
+        (_, None) => Capability::pass(
+            &name,
+            format!(
+                "`{}` (Marvell OCTEON), the NIC this module drives",
+                crate::nic::SUPPORTED_PF_DRIVER
+            ),
+            true,
+        ),
+        (Err(_), Some(why)) => Capability::unknown(
+            &name,
+            format!("{why} — attach refuses a port it cannot identify"),
+            true,
+        ),
+        (Ok(nic), Some(why)) => {
+            // Only another driver is a hardware answer; a driverless
+            // netdev is a `port` line naming the wrong device.
+            let elsewhere = if matches!(nic, PortNic::Other(_)) {
+                ". The eBPF fast-path runs on this NIC without the vpp-offload section"
+            } else {
+                ""
+            };
+            Capability::fail(
+                &name,
+                format!(
+                    "{why} — attach will refuse; {}{elsewhere}",
+                    crate::nic::SUPPORTED_NIC
+                ),
+                true,
+            )
+        }
+    }
 }
 
 /// Do any NIC queue IRQs currently fire on the cores VPP would burn?
@@ -1277,6 +1349,68 @@ mod steering_probe_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The driver line passes only the supported NIC, fails another
+    /// driver or a driverless netdev, and is Unknown — still required —
+    /// when sysfs cannot say, each with the reason attach would give.
+    #[test]
+    fn the_driver_line_judges_each_port_as_attach_does() {
+        let ok = probe_driver("eth4", &Ok(PortNic::Supported));
+        assert_eq!(ok.status, CapabilityStatus::Pass, "{ok:?}");
+        assert_eq!(ok.name, "vpp.eth4.driver");
+
+        let other = probe_driver("eth4", &Ok(PortNic::Other("mlx5_core".into())));
+        assert_eq!(other.status, CapabilityStatus::Fail, "{other:?}");
+        assert!(other.detail.contains("driven by `mlx5_core`"), "{other:?}");
+        assert!(other.detail.contains("attach will refuse"), "{other:?}");
+        assert!(
+            other.detail.contains(crate::nic::SUPPORTED_NIC),
+            "{other:?}"
+        );
+        assert!(
+            other.detail.contains("fast-path runs on this NIC"),
+            "{other:?}"
+        );
+
+        // A bridge is the wrong device, not the wrong hardware: no advice
+        // to run fast-path on it.
+        let none = probe_driver("br0", &Ok(PortNic::NoDriver));
+        assert_eq!(none.status, CapabilityStatus::Fail, "{none:?}");
+        assert!(none.detail.contains("physical port"), "{none:?}");
+        assert!(!none.detail.contains("fast-path runs"), "{none:?}");
+
+        let unread = probe_driver(
+            "eth4",
+            &Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        );
+        assert_eq!(unread.status, CapabilityStatus::Unknown, "{unread:?}");
+        assert!(unread.required, "attach refuses this too: {unread:?}");
+    }
+
+    /// On a port off the supported NIC the steering plan is not drawn:
+    /// its rule table is not one this module programs, so the budget
+    /// line says why it is absent instead of judging that table. The
+    /// port cannot exist, so this holds on any host.
+    #[test]
+    fn no_budget_is_planned_against_a_foreign_nic() {
+        let ports = vec!["pf-no-such-nic".to_string()];
+        let caps = run(&ports, &ports, 1, None, None, &[], &[], &[], None, &[]);
+        let driver = caps
+            .iter()
+            .find(|c| c.name == "vpp.pf-no-such-nic.driver")
+            .expect("every member port gets a driver line");
+        assert!(driver.required, "{driver:?}");
+        let budget = caps
+            .iter()
+            .find(|c| c.name == "vpp.steering.budget")
+            .expect("the budget line is replaced, not dropped");
+        assert_eq!(budget.status, CapabilityStatus::Unknown, "{budget:?}");
+        assert!(budget.detail.contains("not planned"), "{budget:?}");
+        assert!(
+            !budget.required,
+            "the driver line gates, not this: {budget:?}"
+        );
+    }
+
     /// The `loopback-address6` probe FAILS on an address the host holds
     /// — `::1` is on every host's `lo` — exactly where `bring_up`
     /// refuses, and passes on one nothing holds.
@@ -1310,6 +1444,10 @@ mod steering_probe_tests {
             // fact), so the invariant is asserted on a passing path.
             probe_vpp_binary(Some("/bin/sh")),
             probe_sriov("eth-nonexistent"),
+            probe_driver(
+                "eth-nonexistent",
+                &crate::nic::port_nic_in(Path::new("/sys/class/net"), "eth-nonexistent"),
+            ),
             probe_irq_affinity(&[], 1),
             probe_loopback6(std::net::Ipv6Addr::LOCALHOST),
             probe_loopback6("2001:db8::ffff".parse().unwrap()),

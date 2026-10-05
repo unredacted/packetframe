@@ -20,6 +20,34 @@ enabling it anywhere, read the opening section of the
 [runbook](../../../docs/runbooks/vpp-offload.md) and walk its canary
 ladder.
 
+## Supported hardware
+
+**Marvell OCTEON NICs only** (PF driver `rvu_nicpf`). It has run on
+UniFi EFG gateways (OCTEON TX2 CN9670) and nowhere else. Everything
+that touches the NIC is specific to it:
+
+- **Steering** programs the NIC's ntuple table (its MCAM) the way this
+  driver reads it: rules that send a flow to a VF, a table of 16 rules
+  per port unless `steer-capacity` enlarges it, and no IPv6 address
+  match, which is why IPv6 is steered by frame.
+- **VPP** drives the VF with its native `octeon` device driver, so the
+  VPP build must include that driver. DPDK is disabled.
+  [vpp-unifi](https://github.com/unredacted/vpp-unifi) builds one for
+  UniFi gateways from unmodified upstream source.
+- **VF handling** returns a VF to the kernel's `rvu_nicvf` driver
+  when VPP releases it.
+
+Attach reads each `port`'s driver before it touches any NIC, and
+refuses, naming each port that is not on `rvu_nicpf`. `packetframe
+feasibility` reports the same verdict per port as `vpp.<port>.driver`.
+Other OCTEON parts on the same driver pass that check but are
+untested.
+
+On any other NIC, leave out the `module vpp-offload` section. The eBPF
+fast-path has no such requirement. Supporting another NIC family would
+need its own steering and VPP driver backends, validated on that
+hardware; none is in progress.
+
 ## How it works
 
 ```text
