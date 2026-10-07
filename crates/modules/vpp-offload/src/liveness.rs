@@ -10,6 +10,12 @@
 //!
 //! [`Event::Wedged`]: crate::supervisor::Event::Wedged
 //!
+//! "Answering" means answering ANYTHING: a pong, or a reply to a route
+//! batch or a verify probe. The ping is how the detector asks when the
+//! loop has nothing else to ask; it is not the only thing that can prove
+//! the main thread is scheduling requests. See
+//! [`WedgeDetector::on_answer`].
+//!
 //! Like [`crate::supervisor`], this is pure logic with the clock passed
 //! in. Timing code that calls `Instant::now()` internally can only be
 //! tested by sleeping, which makes for slow tests that are flaky under
@@ -77,20 +83,112 @@ pub const fn budget_for(steered: bool, converging: bool) -> Duration {
 }
 
 /// Worst-case time from "VPP wedges" to "we notice", for a given
-/// silence budget.
+/// silence budget, measured on a supervision loop that is running.
 ///
 /// The bad case is a wedge that starts immediately after a successful
 /// pong: the budget must elapse, and we only observe it on the next
 /// scheduled ping, so the interval adds on top.
+///
+/// After a stall of the loop itself (see [`WedgeDetector::on_loop_gap`])
+/// the same bound runs from the RESUME, not from the last pong: nothing
+/// that happened while the loop was not asking is evidence about VPP. A
+/// stall therefore delays the verdict on a VPP that hung during it by at
+/// most the stall itself — the time no detector running on that loop
+/// could have acted in anyway.
 pub const fn worst_case_detection(budget: Duration) -> Duration {
     budget.saturating_add(PING_INTERVAL)
 }
 
-/// Tracks API liveness from ping/pong timestamps.
+/// How many unanswered probes `budget` absorbs as jitter: one fewer than
+/// fit in it. Two for [`PING_BUDGET`] — the "two missed pings" its doc
+/// promises to tolerate.
+///
+/// Also the limit on forgiving the loop's own stalls (see
+/// [`WedgeDetector::on_loop_gap`]): once VPP has missed more probes than
+/// jitter explains, the silence is VPP's, and a stall that follows does
+/// not erase it.
+pub const fn tolerated_misses(budget: Duration) -> u32 {
+    let fit = budget.as_millis() / PING_INTERVAL.as_millis();
+    (fit as u32).saturating_sub(1)
+}
+
+/// What one gap between supervision passes meant to the detector. See
+/// [`WedgeDetector::on_loop_gap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopGap {
+    /// Inside the budget: ordinary cadence, counted as silence as always.
+    Ordinary,
+    /// The loop itself was away for longer than the budget. Silence
+    /// before this instant is no longer evidence; the window restarts.
+    Excused,
+    /// The loop was away for longer than the budget, but VPP had already
+    /// missed `unanswered` probes before it — more than jitter explains —
+    /// so the silence stands.
+    Unexcused { unanswered: u32 },
+}
+
+/// Why a wedge was called, for the journal and the event log.
+///
+/// "Since the last answer" below means VPP's last reply of any kind, a
+/// pong or anything else ([`WedgeDetector::on_answer`]).
+///
+/// The incident this exists for (2026-10-07) tore down a steered VPP
+/// with nothing in the journal but the teardown itself: no failed ping,
+/// no silence figure, no hint whether VPP or the host had gone quiet.
+/// Every field here answers one of those.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WedgeReport {
+    /// Since the last answer, on the wall clock.
+    pub silent_for: Duration,
+    /// The part the verdict counted: since the last answer or the last
+    /// excused stall, whichever is later.
+    pub counted: Duration,
+    /// The budget in force.
+    pub budget: Duration,
+    /// Whether traffic was steered into VPP — which budget applied.
+    pub steered: bool,
+    /// Probes sent since the last answer and not answered.
+    pub unanswered: u32,
+    /// The last probe's error, verbatim.
+    pub last_error: Option<String>,
+    /// The longest the loop was away between passes, not counting time
+    /// spent waiting on VPP's socket, since the last answer. Large here
+    /// and small `vpp_wait` = the host or PacketFrame stalled; the
+    /// reverse = VPP stopped answering.
+    pub worst_loop_gap: Duration,
+    /// Loop stalls excused since the last answer.
+    pub stalls_excused: u32,
+    /// Time spent blocked on VPP's API socket since the last answer.
+    pub vpp_wait: Duration,
+}
+
+/// Tracks API liveness from ping/pong timestamps, and from every other
+/// answer VPP gives ([`Self::on_answer`]).
 ///
 /// Deliberately does NOT own the transport. The detector decides
 /// *when* to ask and *what the silence means*; the caller owns the
 /// socket and can pipeline the ping alongside real work.
+///
+/// ## Silence is evidence only while the loop is listening
+///
+/// The detector lives on the supervision loop, and that loop also
+/// makes kernel calls — ethtool ioctls for the steering audit, netlink
+/// dumps for the hand-back path — that wait on `rtnl_lock`. When the
+/// kernel holds that lock (a bridge flushing a million routes appears
+/// to have held it for ~40 s on 2026-10-07) the loop sends no pings,
+/// and the silence clock used to run on regardless: the first probe
+/// after the loop resumed was judged against 40 s of "silence", so one
+/// unanswered probe was a wedge with none of the tolerance
+/// [`PING_BUDGET`] promises. A teardown on a steered gateway costs the
+/// eBPF tier carrying everything until the route mirror reloads —
+/// minutes.
+///
+/// So a pass that arrives longer than the budget after the previous
+/// one, *not counting time spent blocked on VPP's own socket*, restarts
+/// the evidence window ([`Self::on_loop_gap`]). The exclusion is what
+/// keeps this from excusing a hung VPP: a ping to one blocks the loop
+/// for the full socket deadline, and that wait is VPP's silence, not
+/// the loop's.
 #[derive(Debug, Clone)]
 pub struct WedgeDetector {
     /// Last time the API actually answered.
@@ -98,6 +196,22 @@ pub struct WedgeDetector {
     /// Last time we sent a ping — tracked separately so a ping that
     /// never answers does not also suppress the next attempt.
     last_attempt: Instant,
+    /// Last time VPP answered ANYTHING — a pong, or a reply to a route
+    /// batch, a verify probe, any request on the API. What silence is
+    /// measured from. Kept apart from `last_ok` because the probe gates
+    /// ([`Self::answered_last_probe`], [`Self::answered_since`]) ask
+    /// about pings specifically, and a reply to something else must not
+    /// pass for the answer to a ping that failed.
+    last_alive: Instant,
+    /// Where the evidence window starts if later than `last_alive`: the
+    /// resume after the loop's last excused stall.
+    evidence_from: Instant,
+    /// Probes sent since the last answer that went unanswered.
+    unanswered: u32,
+    /// Diagnostics since the last answer; see [`WedgeReport`].
+    last_error: Option<String>,
+    worst_loop_gap: Duration,
+    stalls_excused: u32,
 }
 
 impl WedgeDetector {
@@ -109,6 +223,12 @@ impl WedgeDetector {
         Self {
             last_ok: now,
             last_attempt: now,
+            last_alive: now,
+            evidence_from: now,
+            unanswered: 0,
+            last_error: None,
+            worst_loop_gap: Duration::ZERO,
+            stalls_excused: 0,
         }
     }
 
@@ -127,6 +247,8 @@ impl WedgeDetector {
 
     pub fn on_ping_sent(&mut self, now: Instant) {
         self.last_attempt = now;
+        // Counted as unanswered until the pong says otherwise.
+        self.unanswered = self.unanswered.saturating_add(1);
     }
 
     pub fn on_pong(&mut self, now: Instant) {
@@ -137,19 +259,122 @@ impl WedgeDetector {
         if now > self.last_attempt {
             self.last_attempt = now;
         }
+        self.on_answer(now);
     }
 
-    /// How long the API has been silent.
+    /// VPP answered something other than a ping no earlier than `at`: a
+    /// route batch, a verify probe, any reply on the API.
+    ///
+    /// Proof of life, because the thread that answers those is the one a
+    /// ping exists to prove is scheduling. A ping can queue behind work
+    /// VPP is visibly getting through — on 2026-10-07 a burst of next-hop
+    /// flaps re-queued every route through each re-resolved IX next hop —
+    /// and calling that VPP wedged tears down a dataplane that was
+    /// answering to the end. Silence is measured from the last answer of
+    /// ANY kind; a VPP that answers nothing is held to the same budget as
+    /// before.
+    ///
+    /// `at` must not be later than the answer: the caller passes a clock
+    /// reading from before it, never after. Not a pong: the probe gates
+    /// still need one.
+    pub fn on_answer(&mut self, at: Instant) {
+        if at > self.last_alive {
+            self.last_alive = at;
+        }
+        // An answer older than the latest probe says nothing about that
+        // probe, and must not erase its failure.
+        if at >= self.last_attempt {
+            self.unanswered = 0;
+            self.last_error = None;
+            self.worst_loop_gap = Duration::ZERO;
+            self.stalls_excused = 0;
+        }
+    }
+
+    /// Why the last probe failed — kept for [`WedgeReport`] only.
+    pub fn on_probe_failed(&mut self, error: impl Into<String>) {
+        self.last_error = Some(error.into());
+    }
+
+    /// The supervision loop is back after `loop_gap` away, NOT counting
+    /// time it spent blocked on VPP's socket (the caller subtracts that;
+    /// see [`crate::driver::Observe::api_wait`]).
+    ///
+    /// A gap longer than `budget` means the loop could not have asked
+    /// VPP anything for longer than the whole budget, for reasons of its
+    /// own: a kernel call waiting on `rtnl_lock`, a host too starved to
+    /// schedule it. Silence that accrued then says nothing about VPP, so
+    /// the window restarts here — and [`Self::is_wedged`] then needs a
+    /// probe sent from now on AND the full budget measured from now.
+    ///
+    /// Not excused once VPP has missed more probes than `budget`
+    /// tolerates as jitter ([`tolerated_misses`]): that silence was
+    /// earned while the loop was listening. Without this limit a loop
+    /// that stalls on every pass would restart the window every pass
+    /// and never call a hung VPP wedged; with it, at most
+    /// `tolerated_misses + 1` stalls are forgiven per silence.
+    pub fn on_loop_gap(&mut self, now: Instant, loop_gap: Duration, budget: Duration) -> LoopGap {
+        self.worst_loop_gap = self.worst_loop_gap.max(loop_gap);
+        if loop_gap <= budget {
+            return LoopGap::Ordinary;
+        }
+        if self.unanswered > tolerated_misses(budget) {
+            return LoopGap::Unexcused {
+                unanswered: self.unanswered,
+            };
+        }
+        self.evidence_from = now;
+        self.stalls_excused = self.stalls_excused.saturating_add(1);
+        LoopGap::Excused
+    }
+
+    /// How long the API has been silent: the age of its last answer of
+    /// any kind ([`Self::on_answer`]), on the wall clock. What status
+    /// reports; NOT what the verdict counts — see
+    /// [`Self::counted_silence`].
     pub fn silent_for(&self, now: Instant) -> Duration {
-        now.duration_since(self.last_ok)
+        now.saturating_duration_since(self.last_alive)
+    }
+
+    /// The silence the verdict counts: since the last answer or the last
+    /// excused loop stall, whichever is later.
+    pub fn counted_silence(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_alive.max(self.evidence_from))
     }
 
     /// Has it been silent past `budget`? Get `budget` from
     /// [`budget_for`] rather than picking a constant directly — the
     /// choice depends on whether traffic is steered, and getting it
     /// from "am I resyncing" is the bug [`budget_for`] documents.
+    ///
+    /// Two conditions, and the second is not implied by the first: the
+    /// counted silence is past the budget, AND a probe has gone out
+    /// since the window last restarted. Silence nobody asked about is
+    /// not an answer.
     pub fn is_wedged(&self, now: Instant, budget: Duration) -> bool {
-        self.silent_for(now) > budget
+        self.counted_silence(now) > budget && self.last_attempt >= self.evidence_from
+    }
+
+    /// The evidence behind a verdict, for the journal and the event log.
+    /// `steered` and `vpp_wait` are the caller's to know.
+    pub fn report(
+        &self,
+        now: Instant,
+        budget: Duration,
+        steered: bool,
+        vpp_wait: Duration,
+    ) -> WedgeReport {
+        WedgeReport {
+            silent_for: self.silent_for(now),
+            counted: self.counted_silence(now),
+            budget,
+            steered,
+            unanswered: self.unanswered,
+            last_error: self.last_error.clone(),
+            worst_loop_gap: self.worst_loop_gap,
+            stalls_excused: self.stalls_excused,
+            vpp_wait,
+        }
     }
 
     /// Did the most recent probe get an answer?
@@ -325,5 +550,154 @@ mod tests {
         d.on_pong(at(t0, 510));
         assert!(!d.ping_due(at(t0, 900)));
         assert!(d.ping_due(at(t0, 1_010)));
+    }
+
+    /// The stall rule and the budget's own promise are one number: the
+    /// steady budget tolerates exactly two missed pings, and a stall is
+    /// forgiven only while no more than that have been missed.
+    #[test]
+    fn the_steady_budget_tolerates_two_missed_pings() {
+        assert_eq!(tolerated_misses(PING_BUDGET), 2);
+        assert!(tolerated_misses(SYNC_PING_BUDGET) > tolerated_misses(PING_BUDGET));
+    }
+
+    /// The 2026-10-07 shape on the detector alone. The last pong lands,
+    /// the loop is held in the kernel for 40 s, and the first probe after
+    /// it goes unanswered. Silence since the last pong is 40 s, but none
+    /// of it was asked about: the window restarts at the resume, and a
+    /// wedge needs the full budget from there.
+    #[test]
+    fn a_loop_stall_restarts_the_evidence_window() {
+        let t0 = Instant::now();
+        let mut d = WedgeDetector::started(t0);
+        let resume = at(t0, 40_000);
+
+        assert_eq!(
+            d.on_loop_gap(resume, Duration::from_secs(40), PING_BUDGET),
+            LoopGap::Excused
+        );
+        d.on_ping_sent(resume);
+        d.on_probe_failed("socket I/O: Resource temporarily unavailable");
+        assert!(
+            !d.is_wedged(resume, PING_BUDGET),
+            "one unanswered probe after a stall is not a wedge"
+        );
+        assert_eq!(
+            d.silent_for(resume),
+            Duration::from_secs(40),
+            "status still sees the age"
+        );
+        assert!(
+            !d.is_wedged(resume + PING_BUDGET, PING_BUDGET),
+            "exactly at budget"
+        );
+        assert!(d.is_wedged(resume + PING_BUDGET + Duration::from_millis(1), PING_BUDGET));
+    }
+
+    /// The window restarts, but a verdict still needs a probe sent inside
+    /// it. Unreachable from the driver today — a gap past the budget
+    /// always leaves a ping due — so this pins the detector's own rule
+    /// rather than the driver's ordering.
+    #[test]
+    fn silence_nobody_asked_about_is_not_a_wedge() {
+        let t0 = Instant::now();
+        let mut d = WedgeDetector::started(t0);
+        let resume = at(t0, 40_000);
+        d.on_loop_gap(resume, Duration::from_secs(40), PING_BUDGET);
+        assert!(
+            !d.is_wedged(resume + Duration::from_secs(5), PING_BUDGET),
+            "no probe since the resume"
+        );
+        d.on_ping_sent(resume + Duration::from_secs(5));
+        assert!(d.is_wedged(resume + Duration::from_secs(5), PING_BUDGET));
+    }
+
+    /// A gap inside the budget is ordinary cadence: counted, not excused.
+    #[test]
+    fn a_gap_inside_the_budget_is_counted() {
+        let t0 = Instant::now();
+        let mut d = WedgeDetector::started(t0);
+        assert_eq!(
+            d.on_loop_gap(at(t0, 1_500), PING_BUDGET, PING_BUDGET),
+            LoopGap::Ordinary
+        );
+        d.on_ping_sent(at(t0, 1_500));
+        assert!(!d.is_wedged(at(t0, 1_500), PING_BUDGET));
+        assert!(
+            d.is_wedged(at(t0, 1_501), PING_BUDGET),
+            "measured from the pong"
+        );
+    }
+
+    /// Silence VPP earned while the loop WAS listening is not erased by a
+    /// stall that follows it. Without this, a loop stalling on every pass
+    /// would restart the window every pass and never call a hung VPP
+    /// wedged.
+    #[test]
+    fn a_stall_does_not_excuse_silence_vpp_already_earned() {
+        let t0 = Instant::now();
+        let mut d = WedgeDetector::started(t0);
+        for ms in [500, 1_000, 1_400] {
+            d.on_ping_sent(at(t0, ms));
+        }
+        assert_eq!(
+            d.on_loop_gap(at(t0, 30_000), Duration::from_secs(28), PING_BUDGET),
+            LoopGap::Unexcused { unanswered: 3 }
+        );
+        d.on_ping_sent(at(t0, 30_000));
+        assert!(d.is_wedged(at(t0, 30_000), PING_BUDGET));
+    }
+
+    /// The tolerance is per silence: a pong resets it, and the next
+    /// stall is forgiven again.
+    #[test]
+    fn a_pong_resets_what_a_stall_may_forgive() {
+        let t0 = Instant::now();
+        let mut d = WedgeDetector::started(t0);
+        for ms in [500, 1_000, 1_400] {
+            d.on_ping_sent(at(t0, ms));
+        }
+        d.on_pong(at(t0, 1_400));
+        assert_eq!(
+            d.on_loop_gap(at(t0, 30_000), Duration::from_secs(28), PING_BUDGET),
+            LoopGap::Excused
+        );
+    }
+
+    /// The report says what the verdict saw — including what the loop
+    /// did — and a pong clears the episode's diagnostics.
+    #[test]
+    fn the_report_names_the_silence_the_probe_and_the_loop() {
+        let t0 = Instant::now();
+        let mut d = WedgeDetector::started(t0);
+        d.on_loop_gap(at(t0, 400), Duration::from_millis(400), PING_BUDGET);
+        d.on_ping_sent(at(t0, 500));
+        d.on_probe_failed("no answer");
+        let r = d.report(
+            at(t0, 2_000),
+            PING_BUDGET,
+            true,
+            Duration::from_millis(1_500),
+        );
+        assert_eq!(
+            r,
+            WedgeReport {
+                silent_for: Duration::from_millis(2_000),
+                counted: Duration::from_millis(2_000),
+                budget: PING_BUDGET,
+                steered: true,
+                unanswered: 1,
+                last_error: Some("no answer".into()),
+                worst_loop_gap: Duration::from_millis(400),
+                stalls_excused: 0,
+                vpp_wait: Duration::from_millis(1_500),
+            }
+        );
+        d.on_pong(at(t0, 2_100));
+        let r = d.report(at(t0, 2_100), PING_BUDGET, true, Duration::ZERO);
+        assert_eq!(
+            (r.unanswered, r.last_error, r.worst_loop_gap),
+            (0, None, Duration::ZERO)
+        );
     }
 }

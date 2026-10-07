@@ -296,7 +296,7 @@ current value without a mapping table:
 | `packetframe_vpp_kernel_path_dropping{port}` | `1` — a steered port's PF is dropping exempt traffic in the kernel's receive (`packetframe_vpp_kernel_rx_drops_per_second` at 100/s or more). See [the kernel path for exempt traffic](#the-kernel-path-for-exempt-traffic) |
 | `packetframe_vpp_keep_rss{port}` | `0` is not an alarm by itself — that port's driver declined RSS keeps, so its exempt traffic lands on PF queue 0 (`packetframe_vpp_queue0_irq_cpu` says where that queue's IRQ was placed). Watch `packetframe_vpp_kernel_rx_fps{queue="0"}` against `{queue="all"}` on it |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
-| `packetframe_vpp_api_silent_seconds` | approaching the wedge budget (1.5 s steered) |
+| `packetframe_vpp_api_silent_seconds` | approaching the wedge budget (1.5 s steered). It can pass the budget without a teardown just after the supervision loop itself stalled, because that time is not counted ([why](#a-teardown-with-causewedged)) |
 | `packetframe_vpp_glean_sent{family}` / `packetframe_vpp_glean_throttled{family}` | informational, never a health input — cumulative; watch the RATE. See [Glean and ARP counters](#glean-and-arp-counters) for normal vs a scan |
 | `packetframe_vpp_arp_replies_sent` | informational — a step on a box whose `loopback-address` nobody should be asking for |
 
@@ -3221,9 +3221,94 @@ carrying the check, attach refuses this shape before it can start.
 
 A socket timeout (`Resource temporarily unavailable`) or `binary API is
 not connected` during attach, resync or verify no longer restarts
-anything on current builds. The next section covers it. If a loop
+anything on current builds. The section after next covers it. If a loop
 like that still shows `event=ConvergenceFailed`, the step was
 *refused*, and the error text says by what.
+
+### A teardown with `cause=Wedged`
+
+The wedge detector decided VPP had stopped answering its binary API:
+silent past the budget, which is **1.5 s while steered** and 10 s for an
+unsteered convergence. Silent means it answered *nothing*: no ping, and
+no reply to anything else the module sent, such as a route batch or a
+verify probe. A VPP that keeps answering a long route burst is busy,
+not wedged, however late a ping queued behind that burst comes back.
+On a steered gateway a teardown is expensive. Traffic
+returns to the eBPF tier, and the fresh VPP is not steered again until
+its table has reloaded and verified. The journal line just before the
+teardown gives the evidence, and the `vpp_teardown` event carries the
+same fields:
+
+```
+WARN VPP's binary API stayed silent past the wedge budget; calling it wedged. ... silent_ms=2004 counted_ms=2004 budget_ms=1500 steered=true unanswered_probes=2 last_probe_error="socket I/O: Resource temporarily unavailable (os error 11)" vpp_wait_ms=1998 loop_gap_ms=48 stalls_excused=0
+```
+
+How to read it:
+
+- **`vpp_wait_ms` close to `counted_ms`.** VPP kept the loop waiting.
+  The thread that answers the API is VPP's main thread, which is not
+  the thread that forwards. The workers may have been forwarding
+  throughout, and this detector cannot see them. Look on VPP's side for
+  what held the main thread (`/var/log/packetframe/vpp.log`,
+  `vppctl show log`). The module's own work is the first suspect. Each
+  next hop that loses and regains resolution costs a neighbour delete
+  and a neighbour add, and in VPP each of those walks every route that
+  resolves through the adjacency, on the main thread and under the
+  worker barrier. A bridge next hop that comes back also re-sends every
+  route through it. Look for `nexthop lost resolution` and `nexthop
+  re-resolved` in the journal around the time, and for
+  `packetframe_vpp_pending_ops` climbing. A plugin following the
+  kernel's routing table is not a candidate: VPP's `linux_cp` and
+  `linux_nl` plugins ship disabled by default and are not loaded on the
+  reference build (`vppctl show plugins`).
+- **`last_probe_error`.** `Resource temporarily unavailable` means a
+  request hit its socket deadline. `reconnect refused: …` means VPP's
+  socket would not take a connection or finish the handshake within
+  500 ms. `did not accept the connection` means VPP stopped draining
+  its socket's backlog.
+- **`loop_gap_ms` large and `vpp_wait_ms` small.** The supervision loop
+  itself was away: blocked in the kernel, or not scheduled. Such a
+  stall is excused (below), so a wedge with this shape had VPP silent
+  for a full budget after the loop came back as well.
+  `stalls_excused` counts the stalls in that silence.
+
+**A stall of the loop is not VPP's silence.** The loop that pings VPP
+also makes kernel calls that wait on `rtnl_lock`: the steering audit's
+ethtool ioctls and the hand-back path's netlink reads. When the kernel
+holds that lock, the loop sends no pings. On a production gateway, a
+bridge going down with a full table appears to have held it for about
+40 s. Those 40 s used to count as VPP's silence, so one unanswered
+probe after the loop resumed was enough to tear down a steered VPP.
+Now a pass that arrives more than the budget after the previous one
+restarts the measurement. Time spent waiting on VPP's own
+socket does not count toward the gap. The journal says when this
+happens:
+
+```
+WARN the supervision loop was away longer than the wedge budget, and not waiting on VPP — a stall of this host or of PacketFrame itself. ... loop_gap_ms=40112 budget_ms=1500 steered=true silent_ms=40112
+```
+
+From there VPP is called wedged only if it stays silent for the full
+budget across fresh probes. For a VPP that really hung, that is at
+most 2 s after the loop resumes: the usual bound, measured from the
+resume. A broken connection is not counted as silence either. If
+something else dropped the socket in the meantime, such as the
+error-counter read in the status publish, the probe reconnects
+first. A socket the drain loses on the same pass is reconnected at the
+start of the next pass, one ping interval into the budget. Two limits
+stop this from hiding a dead VPP:
+
+- Time the loop spends blocked on VPP's socket is never excused. A
+  hung VPP holds every probe for the full deadline, and that wait is
+  the evidence. A reconnect counts the same way. It gives up after
+  500 ms, the socket's own connect included, so a VPP that stopped
+  accepting connections cannot park the loop inside one.
+- Once VPP has missed more probes than the budget tolerates as jitter
+  (two, while steered), a later stall no longer erases them. The
+  journal then says `VPP had already left more probes unanswered than
+  jitter explains`.
+
+A VPP that exits is caught by its pidfd whatever the loop is doing.
 
 ### `binary API lost; VPP is not torn down for this` during a convergence
 
@@ -3269,7 +3354,9 @@ drained until the attach completes.
 - the process exits (pidfd);
 - VPP stays silent past the wedge budget: **1.5 s while steered**,
   which is the published bound and applies to a steered adoptee
-  exactly as before, or 10 s for an unsteered convergence;
+  exactly as before, or 10 s for an unsteered convergence. It is
+  measured while the supervision loop is running; see [A teardown with
+  `cause=Wedged`](#a-teardown-with-causewedged);
 - the convergence deadline runs out — 120 s on a small table, scaled
   up to 600 s on a big one (see [What a keep-vpp restart costs
   now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)).

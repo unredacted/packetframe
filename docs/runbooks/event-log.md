@@ -99,7 +99,7 @@ Kinds are stable: scripts and alerts may key on them.
 | `adoption_path` | How a start took over VPP's FIB | `path` (`preserved-ledger`, `readback`, `readback-deferred`, `fresh`), `routes` |
 | `preserved_ledger_rejected` | The preserved route ledger was not used | `stage`, `reason` |
 | `ledger_preserved` | A preserving stop handed (or failed to hand) the ledger to the next start | `preserved`, `routes` or `reason`, `state` |
-| `vpp_teardown` | The supervisor ordered VPP torn down | `cause`, `from_state`, `to_state` |
+| `vpp_teardown` | The supervisor ordered VPP torn down | `cause`, `from_state`, `to_state`; with `cause: Wedged` also the evidence: `silent_ms`, `counted_ms`, `budget_ms`, `steered`, `unanswered_probes`, `last_probe_error`, `vpp_wait_ms`, `loop_gap_ms`, `stalls_excused` ([reading them](vpp-offload.md#a-teardown-with-causewedged)) |
 | `handback_ready` / `handback_held_back` | The IPv6 hand-back path changed readiness; the v6 half of steering follows it | `detail` |
 | `keep_queue0_fallback` | A port's driver refused an RSS-action keep rule or stored it without RSS, so that port's keeps deliver to PF queue 0. Once per port per daemon | `port`, `detail` (the driver's answer) |
 | `kernel_path_dropping` | A steered port's kernel path started dropping frames (`dropping: true`), or stopped (`false`). At most one `true` per port every ten minutes | `port`, `dropping`, `drops_per_second`, `queue0_share`, `keep_form` |
