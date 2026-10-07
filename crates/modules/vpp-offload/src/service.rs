@@ -1581,6 +1581,7 @@ fn run_loop(
             rs.drift_v6,
         );
         snap.neighbour_counters = rs.neighbour_counters;
+        snap.drift_scan_ms = rs.drift_scan_ms;
         snap.unresolvable_named = rs.unresolvable_named;
         snap.unresolvable_named_v6 = rs.unresolvable_named_v6;
         let report = snap.report();
