@@ -1373,6 +1373,23 @@ fn finish(
         .max(1500);
     let handback_wanted = crate::handback::plans_divert_v6(&held_steering.targets);
     let loop_accepts6 = drift_accepts6.clone();
+    // The kernel path's host side ([`crate::kernel_path::LiveKernelPath`]),
+    // built on the loop thread from these: where the IRQs and counters
+    // live, every CPU VPP is on (derived AND observed — the same set the
+    // attach-time IRQ moves vacated), and the control-plane CPUs, which a
+    // queue-0 placement takes only after every other eligible CPU
+    // (`cores::plan_queue0_irqs`).
+    let kernel_path_inputs = (
+        paths.sys.sysfs_net.clone(),
+        paths.proc_irq.clone(),
+        paths.sysfs_cpu.clone(),
+        paths.sys.state_dir.clone(),
+        vacate.clone(),
+        control_plane
+            .as_ref()
+            .map(|cp| cp.cpus.clone())
+            .unwrap_or_default(),
+    );
     let factory: LoopFactory = Box::new(move || {
         // What VPP can egress, for the exemption tripwire: the member
         // ports, the kernel bridges `local-route` and `local-route6`
@@ -1477,6 +1494,20 @@ fn finish(
         // log is itself the diagnostic.
         #[cfg(target_os = "linux")]
         runtime.rx_mode_kick(Box::new(crate::runtime::AllmultiKick));
+        // The kernel path exempt traffic takes: queue-0 IRQ placement
+        // while a port's keeps pin to queue 0, and the counters the
+        // `kernel-path` row reports. Loads the previous daemon's
+        // placement record, so a `--keep-vpp` restart restores the
+        // ORIGINAL affinity on its eventual teardown.
+        #[cfg(target_os = "linux")]
+        {
+            let (net, irq, cpu, state, vpp, avoid) = kernel_path_inputs;
+            runtime.kernel_path(Box::new(crate::kernel_path::LiveKernelPath::new(
+                net, irq, cpu, state, vpp, avoid,
+            )));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = kernel_path_inputs;
         // The exemption tripwire, installed whenever this box could
         // steer at all — the hole it names opens the instant a port
         // does, so an operator wants it BEFORE the canary rather than

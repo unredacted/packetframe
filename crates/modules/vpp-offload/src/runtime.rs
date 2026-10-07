@@ -50,6 +50,7 @@ use packetframe_common::events::{self as event_log, kind as event_kind};
 use crate::driver::Observe;
 use crate::engine::{ConvergenceEngine, EngineError, RouteSource};
 use crate::executor::{Effects, StepError};
+use crate::kernel_path::KernelWatch;
 use crate::process::{terminate_or_leak, Disposition, VppProcess};
 use crate::supervisor::Event;
 
@@ -329,6 +330,12 @@ pub struct SteeringAudit {
     /// were neither confirmed present nor confirmed missing, so
     /// `missing` is a floor rather than a count.
     pub unreadable: Option<String>,
+    /// `(iface, form)` for every keep rule the pass found present: the
+    /// form the NIC actually holds it in, read back, as opposed to the
+    /// form a steer meant to install ([`Steering::keep_forms`]). A
+    /// queue-0 keep on a port whose driver takes RSS is one an older
+    /// daemon installed and no steer has rewritten yet.
+    pub keeps_observed: Vec<(String, crate::ntuple::KeepForm)>,
 }
 
 impl SteeringAudit {
@@ -419,6 +426,20 @@ pub trait Steering {
     fn missing_from_nic(&self) -> Result<SteeringAudit, String>;
 
     fn installed(&self) -> Vec<(String, u32)>;
+    /// Every port with keep rules in the ledger, with the form this
+    /// process installed them in — RSS, or the queue-0 fallback where
+    /// the driver declined RSS — or `None` where they were inherited and
+    /// not yet re-installed. What decides the queue-0 IRQ placement
+    /// ([`crate::kernel_path`]).
+    ///
+    /// A default returning nothing because only a seam that installs
+    /// keeps has anything to say, and every test double here installs
+    /// none. A real seam that forgot it would cost the IRQ placement
+    /// and the status line, not a rule left in the NIC — unlike
+    /// [`Self::installed_plan`], which is why that one has no default.
+    fn keep_forms(&self) -> Vec<crate::ntuple::KeepPort> {
+        Vec::new()
+    }
     /// `(iface, VF, plan)` the ledger above was last successfully
     /// installed under — empty where nothing has been.
     ///
@@ -593,6 +614,13 @@ struct Core {
     /// attach. [`NoKick`] until the attach wiring installs
     /// [`AllmultiKick`] on Linux. See [`RxModeKick`] for the incident.
     rx_kick: Box<dyn RxModeKick>,
+    /// The kernel path exempt traffic takes: queue-0 IRQ placement and
+    /// the receive counters ([`crate::kernel_path`]).
+    /// [`crate::kernel_path::NoKernelPath`] until the attach wiring
+    /// installs the live one on Linux.
+    kernel_path: Box<dyn crate::kernel_path::KernelPath>,
+    /// What the kernel path has been observed doing, per steered port.
+    kernel_watch: KernelWatch,
     /// When the NIC was last audited against the steering ledger, and
     /// how many rules it was missing. See [`STEER_AUDIT_EVERY`].
     last_steer_audit: Option<std::time::Instant>,
@@ -1600,6 +1628,8 @@ impl Runtime {
                 deferred_resync: None,
                 fresh_hold: None,
                 rx_kick: Box::new(NoKick),
+                kernel_path: Box::new(crate::kernel_path::NoKernelPath),
+                kernel_watch: KernelWatch::default(),
                 last_steer_audit: None,
                 last_null_sample: None,
                 last_placement: None,
@@ -1787,6 +1817,14 @@ impl Runtime {
         self.core.borrow_mut().rx_kick = k;
     }
 
+    /// Install the kernel-path seam: queue-0 IRQ placement while a
+    /// port's keeps pin to queue 0, and the counters status reports.
+    /// The attach wiring installs [`crate::kernel_path::LiveKernelPath`];
+    /// everything else keeps [`crate::kernel_path::NoKernelPath`].
+    pub fn kernel_path(&self, k: Box<dyn crate::kernel_path::KernelPath>) {
+        self.core.borrow_mut().kernel_path = k;
+    }
+
     /// Point steering at a new set of ports and rules.
     ///
     /// Records intent only — see [`Steering::retarget`]. The caller must
@@ -1916,6 +1954,7 @@ impl Runtime {
                 c.steer_stray = 0;
                 c.steer_audit_error = None;
                 c.last_steer_audit = None;
+                c.kernel_watch.clear();
             }
             let due = c
                 .last_steer_audit
@@ -1959,6 +1998,7 @@ impl Runtime {
                             );
                         }
                         c.steer_stray = audit.stray.len();
+                        c.kernel_watch.keeps_observed = audit.keeps_observed;
                         // Taken from the audit rather than cleared: a
                         // pass that proved drift AND could not read the
                         // rest is an incomplete answer, and clearing
@@ -1986,6 +2026,21 @@ impl Runtime {
                         c.steer_audit_error = Some(e);
                     }
                 }
+            }
+            // The kernel path every port with rules in the ledger hands
+            // its exempt traffic to: queue-0 and total receive, and the
+            // PF's drops, every `kernel_path::SAMPLE_EVERY` on the real
+            // clock — a host read, like the audit above, not a
+            // supervision deadline.
+            let mut ports: Vec<String> =
+                c.steering.installed().into_iter().map(|(i, _)| i).collect();
+            ports.sort();
+            ports.dedup();
+            if !ports.is_empty() {
+                let keeps = c.steering.keep_forms();
+                let core = &mut *c;
+                core.kernel_watch
+                    .tick(now, &ports, core.kernel_path.as_mut(), &keeps);
             }
         }
         {
@@ -2143,6 +2198,9 @@ impl Runtime {
             },
             null_drops: c.engine.null_drops(),
             neighbour_counters: c.engine.neighbour_counters(),
+            kernel_path: c
+                .kernel_watch
+                .report(&c.steering.keep_forms(), &c.kernel_path.queue0_irqs()),
             neighbours_unplaced: c
                 .engine
                 .unplaced_neighbours()
@@ -2420,6 +2478,10 @@ pub struct RuntimeStatus {
     /// VPP's glean and ARP-reply transmit counters as last sampled,
     /// absent until read. See [`crate::engine::NeighbourCounters`].
     pub neighbour_counters: Option<crate::engine::NeighbourCounters>,
+    /// The kernel path each port with rules in the ledger hands its
+    /// exempt traffic to: keep form, queue-0 IRQ placement, counters.
+    /// See [`crate::kernel_path`].
+    pub kernel_path: Vec<crate::kernel_path::PortReport>,
     /// Bridge neighbours the FDB has never placed behind a member port,
     /// `"<nexthop> on <device>"` each: their routes are unresolvable.
     pub neighbours_unplaced: Vec<String>,
@@ -2565,6 +2627,34 @@ impl Core {
         let plans = self.steering.installed_plan();
         let r = self.store.steering_changed(&rules, &plans);
         let _ = self.note_persist(r);
+        self.place_queue0_irqs();
+    }
+
+    /// Bring the queue-0 IRQ placements in line with the keeps the
+    /// ledger now holds ([`crate::kernel_path`]): placed for every port
+    /// whose keeps this process installed in the queue-0 form, left
+    /// alone for ports whose keeps it has not re-installed (inherited —
+    /// their form is unknown until the next steer), restored for every
+    /// other. Here, on every steer and unsteer, because those are the
+    /// only moments the answer changes — and the unsteer of a teardown
+    /// is what takes a placement back off.
+    fn place_queue0_irqs(&mut self) {
+        let ports = self.steering.keep_forms();
+        let want: Vec<String> = ports
+            .iter()
+            .filter(|p| {
+                p.verdict
+                    .as_ref()
+                    .is_some_and(|v| v.form == crate::ntuple::KeepForm::Queue0)
+            })
+            .map(|p| p.iface.clone())
+            .collect();
+        let hold: Vec<String> = ports
+            .iter()
+            .filter(|p| p.verdict.is_none())
+            .map(|p| p.iface.clone())
+            .collect();
+        self.kernel_path.reconcile_queue0(&want, &hold);
     }
 
     /// Point steering at a new target, and invalidate the cached audit.
@@ -5491,6 +5581,99 @@ mod tests {
         assert!(!obs.api_ready(), "nothing is listening");
         assert!(obs.ping().is_err());
         assert!(obs.drain_batch(std::time::Instant::now()).is_err());
+    }
+
+    /// Every queue-0 reconcile the runtime asked for, `(want, hold)`.
+    type Queue0Log = std::rc::Rc<std::cell::RefCell<Vec<(Vec<String>, Vec<String>)>>>;
+
+    #[derive(Clone, Default)]
+    struct RecordingKernelPath(Queue0Log);
+
+    impl crate::kernel_path::KernelPath for RecordingKernelPath {
+        fn reconcile_queue0(&mut self, want: &[String], hold: &[String]) {
+            self.0.borrow_mut().push((want.to_vec(), hold.to_vec()));
+        }
+        fn queue0_irqs(&self) -> Vec<(String, crate::kernel_path::Queue0Irq)> {
+            Vec::new()
+        }
+        fn queue0_delivery(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn counters(&mut self, _: &str) -> Result<crate::kernel_path::QueueCounters, String> {
+            Err("no counters in this fixture".into())
+        }
+    }
+
+    /// The queue-0 IRQ follows the keeps, through the real steering and
+    /// the fake NIC: placed for the port whose driver refused RSS and
+    /// for no other, reported on the status surface with the form each
+    /// port's keeps were installed in AND read back in, and given back by
+    /// the unsteer of a teardown.
+    #[test]
+    fn the_queue0_irq_is_placed_only_while_a_ports_keeps_pin_queue0() {
+        crate::ntuple::sys::reset();
+        crate::ntuple::sys::refuse_rss("eth4");
+        let plan = crate::steer::RuleSet::plan(
+            &[packetframe_common::fib::IpPrefix::V4 {
+                addr: [198, 51, 100, 0],
+                prefix_len: 24,
+            }],
+            &[],
+            crate::steer::McamBudget::default(),
+            packetframe_common::config::VppSteerDirection::Both,
+            &[],
+        )
+        .expect("fits");
+        let ports = ["eth4", "eth5"];
+        let steering = crate::ntuple::NtupleSteering::new(
+            ports.iter().map(|p| (p.to_string(), 0)).collect(),
+            ports
+                .iter()
+                .map(|p| (p.to_string(), 0, plan.clone()))
+                .collect(),
+        );
+        let log = Queue0Log::default();
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(steering),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        rt.kernel_path(Box::new(RecordingKernelPath(std::rc::Rc::clone(&log))));
+        let (_, mut fx) = rt.views();
+        fx.restore_steer().expect("installs");
+        assert_eq!(
+            log.borrow().last(),
+            Some(&(vec!["eth4".to_string()], Vec::new())),
+            "eth4's keeps fell back to queue 0; eth5's spread over RSS and need nothing"
+        );
+
+        let reports = rt.status().kernel_path;
+        let report = |i: &str| reports.iter().find(|r| r.iface == i).expect("reported");
+        assert_eq!(
+            report("eth4").verdict.as_ref().map(|v| v.form),
+            Some(crate::ntuple::KeepForm::Queue0)
+        );
+        assert!(report("eth4").observed_queue0 > 0 && report("eth4").observed_rss == 0);
+        assert_eq!(
+            report("eth5").verdict.as_ref().map(|v| v.form),
+            Some(crate::ntuple::KeepForm::Rss)
+        );
+        assert!(report("eth5").observed_rss > 0 && report("eth5").observed_queue0 == 0);
+        assert!(
+            report("eth4").unreadable.is_some(),
+            "a counter read that failed is said, never shown as zero"
+        );
+
+        fx.unsteer().expect("removes");
+        assert_eq!(
+            log.borrow().last(),
+            Some(&(Vec::new(), Vec::new())),
+            "no keep left, so every placement is given back"
+        );
     }
 
     /// A store that fails at spawn time must kill the child. A VPP

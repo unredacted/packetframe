@@ -2509,6 +2509,20 @@ fn handback_leftover(e: String) -> String {
     )
 }
 
+/// Put back every queue-0 IRQ affinity the daemon placed while a port's
+/// keep rules pinned to queue 0 (`packetframe_vpp_offload::kernel_path`).
+/// A leftover is reported, never a reason to refuse the rest of the
+/// teardown: an IRQ on a CPU of its own forwards correctly.
+#[cfg(feature = "vpp-offload")]
+fn restore_queue0_irqs(state_dir: &Path) {
+    use packetframe_vpp_offload::kernel_path::{current_boot_id, restore_recorded};
+    match restore_recorded(state_dir, Path::new("/proc/irq"), &current_boot_id()) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(restored = n, "vpp-offload: queue-0 IRQ affinities restored"),
+        Err(e) => tracing::warn!(error = %e, "vpp-offload: queue-0 IRQ affinities left placed"),
+    }
+}
+
 /// [`detach_vpp_offload`] with the hand-back teardown as a seam.
 #[cfg(feature = "vpp-offload")]
 fn detach_vpp_offload_with(
@@ -2528,6 +2542,8 @@ fn detach_vpp_offload_with(
         // record (a teardown that released the VFs and could not remove
         // the veth), and this command is the remedy the daemon names for
         // exactly that. No VPP to kill first: there is no record of one.
+        // A queue-0 IRQ placement whose restore failed outlives it too.
+        restore_queue0_irqs(state_dir);
         return teardown_handback().map_err(handback_leftover);
     };
 
@@ -2610,6 +2626,9 @@ fn detach_vpp_offload_with(
         }
         tracing::info!("vpp-offload: MCAM steering rules removed");
     }
+    // No keep rule is left to pin traffic to queue 0, so any queue-0 IRQ
+    // the daemon placed for one goes back to what it was.
+    restore_queue0_irqs(state_dir);
 
     // Kill the recorded VPP first, if it is still the process we recorded.
     //
