@@ -4374,7 +4374,13 @@ daemon wrote: something else moved it since, and its value is kept.
 `--keep-vpp` restarts leave the placement and the record in place, and
 the next daemon restores the original prior on its teardown. With no
 CPU to move to, the port is reported `queue-0 IRQ NOT moved (no CPU
-outside VPP's cores …)` and nothing is written.
+outside VPP's cores …)` and nothing is written. A placement counts only
+once `effective_affinity_list` says the IRQ fires there: a kernel that
+takes the mask and keeps delivering elsewhere (a kernel-managed or
+driver-pinned vector) is reported `queue-0 IRQ NOT moved (cpu N was
+written to its mask but the kernel still delivers it on M)`, retried on
+every steer, and its mask is still put back on teardown. A write the
+kernel refuses leaves the record exactly as it was.
 
 The otx2 PF re-applies its own affinity hint whenever it re-opens a
 port (ring resize, link bounce, provisioning push), which puts queue 0

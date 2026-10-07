@@ -640,6 +640,20 @@ fn write_affinity(proc_irq: &Path, irq: u32, cpus: &str) -> Result<(), String> {
     std::fs::write(&p, format!("{cpus}\n")).map_err(|e| format!("write {}: {e}", p.display()))
 }
 
+/// Where `irq` is DELIVERED: `effective_affinity_list`, falling back to
+/// the mask on kernels without the effective file — the reading the
+/// attach-time IRQ mover uses ([`cores::nic_irq_conflicts`]). The mask
+/// is permission; this is the fact.
+fn read_delivery(proc_irq: &Path, irq: u32) -> Result<String, String> {
+    let eff = proc_irq
+        .join(irq.to_string())
+        .join("effective_affinity_list");
+    match std::fs::read_to_string(&eff) {
+        Ok(s) => Ok(s.trim().to_string()),
+        Err(_) => read_affinity(proc_irq, irq),
+    }
+}
+
 /// Whether a `/proc/irq` CPU list names exactly `cpu`.
 fn exactly(list: &str, cpu: u16) -> bool {
     cores::parse_cpu_list(list).ok() == Some(vec![cpu])
@@ -1032,11 +1046,7 @@ impl KernelPath for LiveKernelPath {
 
     fn queue0_delivery(&self, iface: &str) -> Option<String> {
         let irq = cores::queue0_irq(&self.sysfs_net, &self.proc_irq, iface).ok()??;
-        let dir = self.proc_irq.join(irq.to_string());
-        std::fs::read_to_string(dir.join("effective_affinity_list"))
-            .or_else(|_| std::fs::read_to_string(dir.join("smp_affinity_list")))
-            .ok()
-            .map(|s| s.trim().to_string())
+        read_delivery(&self.proc_irq, irq).ok()
     }
 
     fn counters(&mut self, iface: &str) -> Result<QueueCounters, String> {
@@ -1070,8 +1080,14 @@ impl LiveKernelPath {
                 return;
             }
         };
-        if previous.as_ref().is_some_and(|p| p.placed == choice.cpu) && exactly(&now, choice.cpu) {
-            return; // already where it should be
+        // Already placed means the mask is ours AND the kernel delivers
+        // there: a mask the kernel did not follow is retried (and
+        // reported) every reconcile, not taken as done.
+        if previous.as_ref().is_some_and(|p| p.placed == choice.cpu)
+            && exactly(&now, choice.cpu)
+            && read_delivery(&self.proc_irq, choice.irq).is_ok_and(|d| exactly(&d, choice.cpu))
+        {
+            return;
         }
         // The prior survives a re-placement and a daemon restart: it is
         // what was there before PacketFrame first wrote, not what the
@@ -1105,14 +1121,42 @@ impl LiveKernelPath {
             return;
         }
         match (self.write)(&self.proc_irq, choice.irq, &choice.cpu.to_string()) {
-            Ok(()) => tracing::info!(
-                iface = %choice.iface,
-                irq = choice.irq,
-                was = %now,
-                now = choice.cpu,
-                "queue-0 IRQ placed on a CPU of its own: this port's keep rules deliver to \
-                 queue 0, and every exempt frame on it is handled where this IRQ fires"
-            ),
+            // The written mask is permission; where the IRQ fires is the
+            // fact — the attach-time mover's rule, applied here too. A
+            // kernel-managed or driver-pinned vector takes the write and
+            // stays put, and reporting that as placed would tell the
+            // operator a core was relieved when it was not.
+            Ok(()) => match read_delivery(&self.proc_irq, choice.irq) {
+                Ok(d) if exactly(&d, choice.cpu) => tracing::info!(
+                    iface = %choice.iface,
+                    irq = choice.irq,
+                    was = %now,
+                    now = choice.cpu,
+                    "queue-0 IRQ placed on a CPU of its own: this port's keep rules deliver \
+                     to queue 0, and every exempt frame on it is handled where this IRQ fires"
+                ),
+                delivered => {
+                    let on = delivered.unwrap_or_else(|e| format!("an unreadable CPU ({e})"));
+                    tracing::warn!(
+                        iface = %choice.iface,
+                        irq = choice.irq,
+                        wrote = choice.cpu,
+                        delivered_on = %on,
+                        "the kernel accepted the queue-0 IRQ's new mask but did not move \
+                         delivery; probably kernel-managed or pinned by its driver"
+                    );
+                    // The mask IS ours now, so the record stays: the
+                    // teardown recognises it and puts the prior back.
+                    self.unplaced.push((
+                        choice.iface,
+                        format!(
+                            "cpu {} was written to its mask but the kernel still delivers it on \
+                             {on}",
+                            choice.cpu
+                        ),
+                    ));
+                }
+            },
             Err(e) => {
                 tracing::warn!(
                     iface = %choice.iface,
@@ -1483,6 +1527,63 @@ mod tests {
         kp.reconcile_queue0(&[], &[]);
         assert_eq!(h.affinity(100), theirs);
         assert!(!record_path(&h.state()).exists(), "the record is dropped");
+    }
+
+    /// The kernel takes the mask and does not move delivery (a
+    /// kernel-managed or driver-pinned vector). That is NOT a placement:
+    /// the port is reported unplaced with where it really fires, the
+    /// record stays so the mask can be put back, and every later
+    /// reconcile judges by delivery — including one whose mask still
+    /// reads as ours while delivery has moved away.
+    #[test]
+    fn a_mask_the_kernel_does_not_follow_is_not_a_placement() {
+        let h = Host::new("follow");
+        h.port("eth2", 100, 4);
+        let set_effective = |v: &str| {
+            std::fs::write(
+                h.irq().join("100").join("effective_affinity_list"),
+                format!("{v}\n"),
+            )
+            .unwrap()
+        };
+        set_effective("0");
+        let want = vec!["eth2".to_string()];
+        let mut kp = h.path(vec![3]);
+        kp.reconcile_queue0(&want, &[]);
+        let rec = load(&h.state()).unwrap().irqs[0].clone();
+        assert_eq!(
+            h.affinity(100),
+            rec.placed.to_string(),
+            "the mask was written"
+        );
+        assert!(
+            matches!(&kp.queue0_irqs()[..], [(_, Queue0Irq::Unplaced { why })]
+                if why.contains("still delivers it on 0")),
+            "{:?}",
+            kp.queue0_irqs()
+        );
+
+        // The kernel follows late: now it is placed.
+        set_effective(&rec.placed.to_string());
+        kp.reconcile_queue0(&want, &[]);
+        assert!(matches!(
+            &kp.queue0_irqs()[..],
+            [(_, Queue0Irq::Placed { cpu, .. })] if *cpu == rec.placed
+        ));
+
+        // Delivery moves away while the mask still reads as ours: the
+        // reconcile compares delivery, not the mask, and says so.
+        set_effective("5");
+        kp.reconcile_queue0(&want, &[]);
+        assert!(matches!(
+            &kp.queue0_irqs()[..],
+            [(_, Queue0Irq::Unplaced { why })] if why.contains("still delivers it on 5")
+        ));
+
+        // The record kept the prior: the teardown puts the mask back.
+        kp.reconcile_queue0(&[], &[]);
+        assert_eq!(h.affinity(100), "0");
+        assert!(!record_path(&h.state()).exists());
     }
 
     /// A RE-placement whose write is refused leaves the record saying
