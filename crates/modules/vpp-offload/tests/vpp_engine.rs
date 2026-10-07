@@ -4836,13 +4836,14 @@ fn a_verify_re_run_publishes_its_link_scan() {
 /// What the wedge detector subtracts from a gap between supervision
 /// passes to tell "the loop was away" from "VPP kept it waiting": a ping
 /// VPP leaves unanswered is charged its socket deadline, and the charge
-/// outlives the transport the failure drops.
+/// outlives the transport the failure drops. The answer count beside it —
+/// the detector's proof of life — counts the reply and not the timeout.
 ///
 /// Read the other way, this is what stops a hung VPP excusing itself: the
 /// deadline the loop spends blocked on it is VPP's silence, and only what
 /// is left of a gap after this is the loop's own.
 #[test]
-fn an_unanswered_ping_is_charged_its_deadline_and_kept_across_the_drop() {
+fn an_unanswered_ping_is_charged_its_deadline_and_both_meters_survive_the_drop() {
     use packetframe_vpp_offload::liveness::PING_BUDGET;
     let fake = Fake::start_behaving(
         "api-wait",
@@ -4853,13 +4854,20 @@ fn an_unanswered_ping_is_charged_its_deadline_and_kept_across_the_drop() {
     );
     let mut e = engine_for(&fake);
     assert!(e.api_ready());
+    let before = e.api_answers();
     e.ping().expect("the first ping is answered");
     let answered = e.api_wait();
+    assert_eq!(e.api_answers(), before + 1, "a reply is an answer");
 
     let started = std::time::Instant::now();
     assert!(e.ping().is_err(), "the second goes unanswered");
     let took = started.elapsed();
     assert!(!e.is_connected(), "and the failure drops the transport");
+    assert_eq!(
+        e.api_answers(),
+        before + 1,
+        "a timeout is no answer, and the count survives the drop"
+    );
 
     let charged = e.api_wait() - answered;
     assert!(

@@ -128,6 +128,8 @@ pub struct Transport {
     /// While connecting: the instant the whole connect must be done by.
     /// Every socket operation re-arms its timeout to what is left of it.
     connect_deadline: Option<Instant>,
+    /// Frames VPP has sent us since the handshake. See [`Self::answers`].
+    answers: u64,
 }
 
 impl Transport {
@@ -169,6 +171,7 @@ impl Transport {
             timeout,
             waited: Duration::ZERO,
             connect_deadline: Some(deadline),
+            answers: 0,
         };
         t.handshake()?;
         t.connect_deadline = None;
@@ -177,6 +180,7 @@ impl Transport {
         // whole connect itself, and counting the handshake here too would
         // charge it twice.
         t.waited = Duration::ZERO;
+        t.answers = 0;
         Ok(t)
     }
 
@@ -446,6 +450,18 @@ impl Transport {
         self.waited
     }
 
+    /// Frames read whole from VPP since the handshake: every reply,
+    /// refusals included, and every item of a dump.
+    ///
+    /// Each one is VPP's main thread doing what the wedge detector's ping
+    /// asks it to prove it can — scheduling API requests — so the
+    /// supervision loop counts them as proof of life alongside the pongs.
+    /// A VPP busy applying a route batch it keeps answering is not wedged,
+    /// whatever a ping queued behind that batch says.
+    pub fn answers(&self) -> u64 {
+        self.answers
+    }
+
     fn charge(&mut self, started: Instant) {
         self.waited += started.elapsed().min(self.timeout.saturating_mul(2));
     }
@@ -482,6 +498,9 @@ impl Transport {
         let started = Instant::now();
         let r = self.read_frame_unmetered();
         self.charge(started);
+        if r.is_ok() {
+            self.answers += 1;
+        }
         r
     }
 
@@ -653,6 +672,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             waited: Duration::ZERO,
             connect_deadline: None,
+            answers: 0,
         };
         t.verify_against(&reply)
     }
@@ -729,6 +749,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             waited: Duration::ZERO,
             connect_deadline: None,
+            answers: 0,
         };
         t.set_timeout(deadline).unwrap();
 
@@ -744,8 +765,10 @@ mod tests {
         write_frame_header(&mut frame, 4);
         frame.extend_from_slice(&[0, 1, 2, 3]);
         theirs.write_all(&frame).unwrap();
+        assert_eq!(t.answers(), 0, "a read that failed is no answer");
         assert_eq!(t.read_frame().unwrap(), vec![0, 1, 2, 3]);
         assert!(t.waited() >= unanswered && t.waited() <= unanswered + deadline * 2);
+        assert_eq!(t.answers(), 1);
     }
 
     #[test]

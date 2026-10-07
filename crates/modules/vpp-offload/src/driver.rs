@@ -187,6 +187,18 @@ pub trait Observe {
         None
     }
 
+    /// How many replies VPP has sent so far — to anything: route batches,
+    /// verify probes, pings. Monotonic.
+    ///
+    /// Any increase is proof of life for the wedge detector
+    /// ([`crate::liveness::WedgeDetector::on_answer`]): a VPP busy with
+    /// work it keeps answering is not wedged, however long a ping queued
+    /// behind that work takes. The default, zero, is a double that never
+    /// answers anything but pings.
+    fn api_answers(&self) -> u64 {
+        0
+    }
+
     /// Whether the module has any reason of its own to refuse or defer
     /// a steer right now.
     ///
@@ -344,10 +356,13 @@ pub struct Driver {
     /// the next tick measures the loop's own time away against. Every
     /// tick sets it, whatever the state, so a gap is always pass to pass.
     last_pass: Option<(Instant, Duration)>,
-    /// [`Observe::api_wait`] at the last pong (or when the detector
+    /// [`Observe::api_wait`] at the last answer (or when the detector
     /// first saw a tick), so a wedge report can say how much of the
     /// silence VPP kept the loop waiting. Dropped with the detector.
-    api_wait_at_pong: Option<Duration>,
+    api_wait_at_answer: Option<Duration>,
+    /// [`Observe::api_answers`] at its last reading, so an increase can be
+    /// credited to the detector. Dropped with the detector.
+    answers_seen: Option<u64>,
     /// The evidence behind the most recent `Wedged`, for the teardown's
     /// event and for tests. See [`crate::liveness::WedgeReport`].
     wedge_report: Option<WedgeReport>,
@@ -373,7 +388,8 @@ impl Driver {
             resume_attempts: 0,
             convergence_budget: crate::supervisor::CONVERGENCE_BUDGET,
             last_pass: None,
-            api_wait_at_pong: None,
+            api_wait_at_answer: None,
+            answers_seen: None,
             wedge_report: None,
         }
     }
@@ -467,14 +483,30 @@ impl Driver {
         // Measured on every pass so the gap is always pass to pass; acted
         // on below only by a detector that existed at entry.
         let api_wait = obs.api_wait();
-        let loop_gap = self.last_pass.map(|(then, waited)| {
+        let prev_pass = self.last_pass.replace((now, api_wait));
+        let loop_gap = prev_pass.map(|(then, waited)| {
             now.saturating_duration_since(then)
                 .saturating_sub(api_wait.saturating_sub(waited))
         });
-        self.last_pass = Some((now, api_wait));
-        if api_up_at_entry && self.api_wait_at_pong.is_none() {
+        if api_up_at_entry && self.api_wait_at_answer.is_none() {
             // A detector armed by an injection, which has no `Observe`.
-            self.api_wait_at_pong = Some(api_wait);
+            self.api_wait_at_answer = Some(api_wait);
+        }
+        // Answers since the last reading came between passes: the status
+        // publish's counter read, a step an injected event ran. They are
+        // credited at the PREVIOUS pass's clock, which is no later than
+        // they were — crediting them at `now` would claim VPP answered
+        // after a stall that may have followed them.
+        if api_up_at_entry {
+            let answers = obs.api_answers();
+            if let (Some(seen), Some((then, _))) = (self.answers_seen, prev_pass) {
+                if answers > seen {
+                    if let Some(d) = self.detector.as_mut() {
+                        d.on_answer(then);
+                    }
+                }
+            }
+            self.answers_seen = Some(answers);
         }
         // The budget this table needs, learned before the deadline is
         // judged: a phase armed with less (the flat budget an injected
@@ -515,7 +547,8 @@ impl Driver {
             // forever without ever emitting `Wedged`.
             if before.has_process() && self.detector.is_none() && obs.api_ready() {
                 self.detector = Some(WedgeDetector::started(now));
-                self.api_wait_at_pong = Some(obs.api_wait());
+                self.api_wait_at_answer = Some(obs.api_wait());
+                self.answers_seen = Some(obs.api_answers());
                 // Only a startup transition needs announcing; an
                 // adopted process is already past `ApiUp`.
                 if before == State::Starting {
@@ -752,7 +785,8 @@ impl Driver {
         // an applied event asking for another immediate tick.
         if !self.sup.state().has_process() {
             self.detector = None;
-            self.api_wait_at_pong = None;
+            self.api_wait_at_answer = None;
+            self.answers_seen = None;
         }
         self.track_resume(now);
 
@@ -930,6 +964,17 @@ impl Driver {
         let Some(d) = self.detector.as_mut() else {
             return Vec::new();
         };
+        // What VPP answered during this pass — the drain's route batches,
+        // above all — is proof of life, credited at the pass's clock
+        // (no later than the answers) and BEFORE this pass's probe, which
+        // came after them: a probe that fails now is newer evidence than
+        // the batch answered a moment ago, and must stay counted.
+        let answers = obs.api_answers();
+        if self.answers_seen.is_some_and(|seen| answers > seen) {
+            d.on_answer(now);
+            self.api_wait_at_answer = Some(obs.api_wait());
+        }
+        self.answers_seen = Some(answers);
         if d.ping_due(now) {
             // Recorded before the result is known, so an unanswered ping
             // cannot make the next one immediately due and spin.
@@ -956,10 +1001,13 @@ impl Driver {
             } else {
                 Err(reconnect_error(obs))
             };
+            // The probe's own reply is the pong below, not a second
+            // answer for the next pass to credit.
+            self.answers_seen = Some(obs.api_answers());
             match probe {
                 Ok(()) => {
                     d.on_pong(now);
-                    self.api_wait_at_pong = Some(obs.api_wait());
+                    self.api_wait_at_answer = Some(obs.api_wait());
                 }
                 Err(e) => {
                     d.on_probe_failed(e);
@@ -991,7 +1039,7 @@ impl Driver {
         // could not be told after the fact.
         let vpp_wait = obs
             .api_wait()
-            .saturating_sub(self.api_wait_at_pong.unwrap_or_default());
+            .saturating_sub(self.api_wait_at_answer.unwrap_or_default());
         let r = d.report(now, budget, steered, vpp_wait);
         tracing::warn!(
             silent_ms = ms(r.silent_for),
@@ -1364,11 +1412,20 @@ mod tests {
         /// `api_wait` — a connect into a backlog a hung VPP never drains.
         /// Seen only with `model_transport`.
         connect_blocks: Duration,
+        /// What `api_answers` reports: replies VPP has sent. A pong adds
+        /// one, a successful drain `answers_per_drain`.
+        answers: u64,
+        /// Replies each successful drain brings back — a route batch VPP
+        /// is getting through. Zero by default.
+        answers_per_drain: u64,
     }
 
     impl Observe for World {
         fn api_wait(&self) -> Duration {
             self.api_wait
+        }
+        fn api_answers(&self) -> u64 {
+            self.answers
         }
         fn api_error(&self) -> Option<String> {
             (!self.api || self.dead).then(|| "connecting to the API socket: refused".into())
@@ -1410,6 +1467,7 @@ mod tests {
                 self.api_wait += self.ping_blocks;
                 Err("no answer".into())
             } else {
+                self.answers += 1;
                 Ok(())
             }
         }
@@ -1444,6 +1502,7 @@ mod tests {
                 return Ok(Drain::AwaitingSource { have: 0, want: 1 });
             }
             self.batches = self.batches.saturating_sub(1);
+            self.answers += self.answers_per_drain;
             Ok(if self.batches == 0 {
                 Drain::Idle
             } else {
@@ -2806,6 +2865,124 @@ mod tests {
         assert_eq!(
             d.last_wedge().map(|r| r.stalls_excused),
             Some(crate::liveness::tolerated_misses(PING_BUDGET) + 1)
+        );
+    }
+
+    // ---- Any answer is proof of life ----
+
+    /// The 2026-10-07 shape on the VPP side: next hops flap, every route
+    /// through each re-resolved one is re-queued, and the drain pushes
+    /// batch after batch that VPP keeps answering — while pings, queued
+    /// behind that work, miss the deadline. VPP is busy, not wedged, and
+    /// must not be torn down for it. Without proof of life this is a
+    /// `Wedged` 1.5 s into the burst.
+    #[test]
+    fn a_vpp_that_keeps_answering_a_long_drain_is_not_wedged() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        w.batches = usize::MAX;
+        w.answers_per_drain = 256;
+        w.ping_fails = true;
+        w.ping_blocks = PING_BUDGET;
+        let mut now = at(t0, 500);
+        let pings = w.pings;
+        for _ in 0..40 {
+            now += Duration::from_millis(250);
+            let t = d.tick(now, &mut w, &mut fx);
+            assert!(
+                !t.events.contains(&Event::Wedged),
+                "{:?} after {:?}",
+                t.events,
+                now - at(t0, 500)
+            );
+        }
+        assert!(
+            now - at(t0, 500) > 4 * PING_BUDGET,
+            "the premise: long past the budget"
+        );
+        assert!(
+            w.pings - pings >= 10,
+            "and pings kept failing: {}",
+            w.pings - pings
+        );
+        assert_eq!(d.state(), State::Steered);
+        assert!(
+            d.detector
+                .as_ref()
+                .is_some_and(|det| !det.answered_last_probe()),
+            "a batch answered is not the answer to a probe: the probe gates still wait for a pong"
+        );
+    }
+
+    /// The control: the same drain and the same failing pings, but VPP
+    /// answers nothing. The published bound holds, measured from the
+    /// last pong.
+    #[test]
+    fn a_vpp_that_answers_nothing_is_still_wedged_within_the_bound() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        w.batches = usize::MAX;
+        w.answers_per_drain = 0;
+        w.ping_fails = true;
+        let mut now = at(t0, 500);
+        let wedged_after = loop {
+            now += Duration::from_millis(250);
+            if d.tick(now, &mut w, &mut fx).events.contains(&Event::Wedged) {
+                break now - at(t0, 500);
+            }
+            assert!(now - at(t0, 500) < Duration::from_secs(10), "never wedged");
+        };
+        assert!(wedged_after > PING_BUDGET, "{wedged_after:?}");
+        assert!(
+            wedged_after <= crate::liveness::worst_case_detection(PING_BUDGET),
+            "{wedged_after:?}"
+        );
+    }
+
+    /// An answer that arrived between passes is credited no later than it
+    /// happened: at the previous pass's clock, not at the next pass's.
+    /// Crediting it at the next pass would claim VPP answered after
+    /// whatever the loop did in between, and push a real verdict back.
+    #[test]
+    fn an_answer_between_passes_is_credited_no_later_than_it_came() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        // VPP answers the status publish's counter read, then nothing.
+        w.answers += 1;
+        w.ping_fails = true;
+        for ms in [1_000, 1_500] {
+            let t = d.tick(at(t0, ms), &mut w, &mut fx);
+            assert!(!t.events.contains(&Event::Wedged), "{:?}", t.events);
+        }
+        let t = d.tick(at(t0, 2_001), &mut w, &mut fx);
+        assert!(
+            t.events.contains(&Event::Wedged),
+            "silence counted from the pass the answer followed (500 ms), not the one after: {:?}",
+            t.events
         );
     }
 

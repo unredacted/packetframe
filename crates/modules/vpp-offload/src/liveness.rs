@@ -10,6 +10,12 @@
 //!
 //! [`Event::Wedged`]: crate::supervisor::Event::Wedged
 //!
+//! "Answering" means answering ANYTHING: a pong, or a reply to a route
+//! batch or a verify probe. The ping is how the detector asks when the
+//! loop has nothing else to ask; it is not the only thing that can prove
+//! the main thread is scheduling requests. See
+//! [`WedgeDetector::on_answer`].
+//!
 //! Like [`crate::supervisor`], this is pure logic with the clock passed
 //! in. Timing code that calls `Instant::now()` internally can only be
 //! tested by sleeping, which makes for slow tests that are flaky under
@@ -123,37 +129,41 @@ pub enum LoopGap {
 
 /// Why a wedge was called, for the journal and the event log.
 ///
+/// "Since the last answer" below means VPP's last reply of any kind, a
+/// pong or anything else ([`WedgeDetector::on_answer`]).
+///
 /// The incident this exists for (2026-10-07) tore down a steered VPP
 /// with nothing in the journal but the teardown itself: no failed ping,
 /// no silence figure, no hint whether VPP or the host had gone quiet.
 /// Every field here answers one of those.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WedgeReport {
-    /// Since the last pong, on the wall clock.
+    /// Since the last answer, on the wall clock.
     pub silent_for: Duration,
-    /// The part the verdict counted: since the last pong or the last
+    /// The part the verdict counted: since the last answer or the last
     /// excused stall, whichever is later.
     pub counted: Duration,
     /// The budget in force.
     pub budget: Duration,
     /// Whether traffic was steered into VPP — which budget applied.
     pub steered: bool,
-    /// Probes sent since the last pong and not answered.
+    /// Probes sent since the last answer and not answered.
     pub unanswered: u32,
     /// The last probe's error, verbatim.
     pub last_error: Option<String>,
     /// The longest the loop was away between passes, not counting time
-    /// spent waiting on VPP's socket, since the last pong. Large here
+    /// spent waiting on VPP's socket, since the last answer. Large here
     /// and small `vpp_wait` = the host or PacketFrame stalled; the
     /// reverse = VPP stopped answering.
     pub worst_loop_gap: Duration,
-    /// Loop stalls excused since the last pong.
+    /// Loop stalls excused since the last answer.
     pub stalls_excused: u32,
-    /// Time spent blocked on VPP's API socket since the last pong.
+    /// Time spent blocked on VPP's API socket since the last answer.
     pub vpp_wait: Duration,
 }
 
-/// Tracks API liveness from ping/pong timestamps.
+/// Tracks API liveness from ping/pong timestamps, and from every other
+/// answer VPP gives ([`Self::on_answer`]).
 ///
 /// Deliberately does NOT own the transport. The detector decides
 /// *when* to ask and *what the silence means*; the caller owns the
@@ -186,12 +196,19 @@ pub struct WedgeDetector {
     /// Last time we sent a ping — tracked separately so a ping that
     /// never answers does not also suppress the next attempt.
     last_attempt: Instant,
-    /// Where the evidence window starts if later than `last_ok`: the
+    /// Last time VPP answered ANYTHING — a pong, or a reply to a route
+    /// batch, a verify probe, any request on the API. What silence is
+    /// measured from. Kept apart from `last_ok` because the probe gates
+    /// ([`Self::answered_last_probe`], [`Self::answered_since`]) ask
+    /// about pings specifically, and a reply to something else must not
+    /// pass for the answer to a ping that failed.
+    last_alive: Instant,
+    /// Where the evidence window starts if later than `last_alive`: the
     /// resume after the loop's last excused stall.
     evidence_from: Instant,
-    /// Probes sent since the last pong that went unanswered.
+    /// Probes sent since the last answer that went unanswered.
     unanswered: u32,
-    /// Diagnostics since the last pong; see [`WedgeReport`].
+    /// Diagnostics since the last answer; see [`WedgeReport`].
     last_error: Option<String>,
     worst_loop_gap: Duration,
     stalls_excused: u32,
@@ -206,6 +223,7 @@ impl WedgeDetector {
         Self {
             last_ok: now,
             last_attempt: now,
+            last_alive: now,
             evidence_from: now,
             unanswered: 0,
             last_error: None,
@@ -241,10 +259,36 @@ impl WedgeDetector {
         if now > self.last_attempt {
             self.last_attempt = now;
         }
-        self.unanswered = 0;
-        self.last_error = None;
-        self.worst_loop_gap = Duration::ZERO;
-        self.stalls_excused = 0;
+        self.on_answer(now);
+    }
+
+    /// VPP answered something other than a ping no earlier than `at`: a
+    /// route batch, a verify probe, any reply on the API.
+    ///
+    /// Proof of life, because the thread that answers those is the one a
+    /// ping exists to prove is scheduling. A ping can queue behind work
+    /// VPP is visibly getting through — on 2026-10-07 a burst of next-hop
+    /// flaps re-queued every route through each re-resolved IX next hop —
+    /// and calling that VPP wedged tears down a dataplane that was
+    /// answering to the end. Silence is measured from the last answer of
+    /// ANY kind; a VPP that answers nothing is held to the same budget as
+    /// before.
+    ///
+    /// `at` must not be later than the answer: the caller passes a clock
+    /// reading from before it, never after. Not a pong: the probe gates
+    /// still need one.
+    pub fn on_answer(&mut self, at: Instant) {
+        if at > self.last_alive {
+            self.last_alive = at;
+        }
+        // An answer older than the latest probe says nothing about that
+        // probe, and must not erase its failure.
+        if at >= self.last_attempt {
+            self.unanswered = 0;
+            self.last_error = None;
+            self.worst_loop_gap = Duration::ZERO;
+            self.stalls_excused = 0;
+        }
     }
 
     /// Why the last probe failed — kept for [`WedgeReport`] only.
@@ -284,17 +328,18 @@ impl WedgeDetector {
         LoopGap::Excused
     }
 
-    /// How long the API has been silent: the age of the last pong, on
-    /// the wall clock. What status reports; NOT what the verdict counts
-    /// — see [`Self::counted_silence`].
+    /// How long the API has been silent: the age of its last answer of
+    /// any kind ([`Self::on_answer`]), on the wall clock. What status
+    /// reports; NOT what the verdict counts — see
+    /// [`Self::counted_silence`].
     pub fn silent_for(&self, now: Instant) -> Duration {
-        now.saturating_duration_since(self.last_ok)
+        now.saturating_duration_since(self.last_alive)
     }
 
-    /// The silence the verdict counts: since the last pong or the last
+    /// The silence the verdict counts: since the last answer or the last
     /// excused loop stall, whichever is later.
     pub fn counted_silence(&self, now: Instant) -> Duration {
-        now.saturating_duration_since(self.last_ok.max(self.evidence_from))
+        now.saturating_duration_since(self.last_alive.max(self.evidence_from))
     }
 
     /// Has it been silent past `budget`? Get `budget` from

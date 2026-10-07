@@ -3170,6 +3170,10 @@ impl Observe for ObserveView {
         self.core.borrow().engine.api_wait()
     }
 
+    fn api_answers(&self) -> u64 {
+        self.core.borrow().engine.api_answers()
+    }
+
     fn api_error(&self) -> Option<String> {
         self.core
             .borrow()

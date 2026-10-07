@@ -3201,7 +3201,11 @@ like that still shows `event=ConvergenceFailed`, the step was
 
 The wedge detector decided VPP had stopped answering its binary API:
 silent past the budget, which is **1.5 s while steered** and 10 s for an
-unsteered convergence. On a steered gateway this is expensive. Traffic
+unsteered convergence. Silent means it answered *nothing*: no ping, and
+no reply to anything else the module sent, such as a route batch or a
+verify probe. A VPP that keeps answering a long route burst is busy,
+not wedged, however late a ping queued behind that burst comes back.
+On a steered gateway a teardown is expensive. Traffic
 returns to the eBPF tier, and the fresh VPP is not steered again until
 its table has reloaded and verified. The journal line just before the
 teardown gives the evidence, and the `vpp_teardown` event carries the
@@ -3218,12 +3222,17 @@ How to read it:
   the thread that forwards. The workers may have been forwarding
   throughout, and this detector cannot see them. Look on VPP's side for
   what held the main thread (`/var/log/packetframe/vpp.log`,
-  `vppctl show log`). One candidate is a burst of route changes this
-  module was pushing; check `packetframe_vpp_pending_ops` and
-  `packetframe_vpp_source_backlog` around the time. Another is a plugin
-  that follows the kernel's routing table: the rendered `startup.conf`
-  disables only the DPDK plugin, so `vppctl show plugins` is the list
-  of what loaded.
+  `vppctl show log`). The module's own work is the first suspect. Each
+  next hop that loses and regains resolution costs a neighbour delete
+  and a neighbour add, and in VPP each of those walks every route that
+  resolves through the adjacency, on the main thread and under the
+  worker barrier. A bridge next hop that comes back also re-sends every
+  route through it. Look for `nexthop lost resolution` and `nexthop
+  re-resolved` in the journal around the time, and for
+  `packetframe_vpp_pending_ops` climbing. A plugin following the
+  kernel's routing table is not a candidate: VPP's `linux_cp` and
+  `linux_nl` plugins ship disabled by default and are not loaded on the
+  reference build (`vppctl show plugins`).
 - **`last_probe_error`.** `Resource temporarily unavailable` means a
   request hit its socket deadline. `reconnect refused: …` means VPP's
   socket would not take a connection or finish the handshake within

@@ -672,6 +672,9 @@ pub struct ConvergenceEngine {
     /// Time spent blocked on VPP's API socket by connections already
     /// dropped, and by connect attempts. See [`Self::api_wait`].
     api_waited: Duration,
+    /// Frames VPP sent on connections already dropped. See
+    /// [`Self::api_answers`].
+    api_answered: u64,
 
     ports: Vec<PortAttach>,
     /// Locally terminated prefixes VPP delivers itself: an attached
@@ -955,6 +958,7 @@ impl ConvergenceEngine {
             api_socket: api_socket.into(),
             transport: None,
             api_waited: Duration::ZERO,
+            api_answered: 0,
             ports,
             local_routes: Vec::new(),
             attached_at: std::collections::HashMap::new(),
@@ -2569,10 +2573,19 @@ impl ConvergenceEngine {
                 .map_or(Duration::ZERO, Transport::waited)
     }
 
-    /// Drop the connection, keeping what it waited on the books.
+    /// Frames VPP has answered with, ever, across every connection this
+    /// engine has held. Monotonic. The wedge detector counts any increase
+    /// as proof of life; see `Transport::answers`.
+    pub fn api_answers(&self) -> u64 {
+        self.api_answered + self.transport.as_ref().map_or(0, Transport::answers)
+    }
+
+    /// Drop the connection, keeping what it waited and answered on the
+    /// books.
     fn drop_transport(&mut self) {
         if let Some(t) = self.transport.take() {
             self.api_waited += t.waited();
+            self.api_answered += t.answers();
         }
     }
 
