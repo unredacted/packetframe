@@ -277,14 +277,15 @@ pub enum RuleAction {
     /// kernel bridge. The kernel is the only correct owner of that
     /// traffic; a `Keep` rule is how it stays there.
     ///
-    /// `ring_cookie` 0 = PF queue 0 (`otx2_add_flow_msg`: a cookie
-    /// with no VF bits becomes `NIX_RX_ACTIONOP_UCAST` toward the PF).
-    /// One queue instead of RSS is an accepted cost for this traffic
-    /// class — it is control-plane volume, not transit. The v6 keeps
-    /// stretch that: they are port-wide, so ALL of a port's DNS lands on
-    /// one queue while the port diverts v6. The runbook
-    /// names the cost; per-VLAN keeps (`tcp6 … vlan <vid>` inserts too)
-    /// are the remedy if queue 0 ever shows it.
+    /// `ring_cookie` 0 = the PF. HOW the PF receives it is
+    /// [`crate::ntuple::KeepForm`]: spread over its queues by RSS on the
+    /// default context, or — where the driver declines that — onto PF
+    /// queue 0 (`otx2_add_flow_msg`: `NIX_RX_ACTIONOP_UCAST`). One queue
+    /// was once an accepted cost, on the theory that this was
+    /// control-plane volume; exemptions grew into NAT return paths, LAN
+    /// subnets and IX LANs, and on 2026-10-07 queue 0's one CPU ran a
+    /// production gateway's exempt traffic into the ground
+    /// ([`crate::kernel_path`] has the incident).
     Keep,
 }
 

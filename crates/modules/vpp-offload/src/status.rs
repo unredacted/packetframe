@@ -81,6 +81,10 @@ pub const SUBSYS_HANDBACK: &str = "v6-handback";
 /// IPv6 address to source ICMPv6 errors from (`loopback-address6`
 /// unset). See [`StatusSnapshot::v6_errors_unsourced`].
 pub const SUBSYS_ICMP6_SOURCE: &str = "icmp6-source";
+/// The kernel path a steered port's exempt traffic takes
+/// ([`crate::kernel_path`]): present while any port has rules in the
+/// ledger, Degraded when it drops.
+pub const SUBSYS_KERNEL_PATH: &str = "kernel-path";
 
 /// Liveness of the binary API, as observed from ping/pong timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,6 +463,14 @@ pub struct StatusSnapshot {
     /// a glean burst is a scan or a new host, not a fault. Not an
     /// `observe_parts` argument; the service sets it on the snapshot.
     pub neighbour_counters: Option<crate::engine::NeighbourCounters>,
+    /// The kernel path each port with rules in the ledger hands its
+    /// exempt traffic to ([`crate::kernel_path`]): keep form, queue-0
+    /// IRQ placement, receive and drop rates. Degraded, port named, when
+    /// it drops at [`crate::kernel_path::DROPS_DEGRADED_PER_SEC`]. Not an
+    /// `observe_parts` argument; the service sets it on the snapshot, as
+    /// it does `neighbour_counters`. Empty means nothing was observed,
+    /// which renders no row and no gauge.
+    pub kernel_path: Vec<crate::kernel_path::PortReport>,
     /// Bridge neighbours the FDB has never placed behind a member port
     /// (`"<nexthop> on <device>"`): VPP cannot reach them, so their
     /// routes are unresolvable. Degraded, neighbour named.
@@ -664,6 +676,7 @@ impl StatusSnapshot {
             unresolvable_named_v6: Vec::new(),
             null_drops,
             neighbour_counters: None,
+            kernel_path: Vec::new(),
             neighbours_unplaced,
             neighbour_moves,
             neighbours_flooded,
@@ -757,6 +770,7 @@ impl StatusSnapshot {
         ];
         subsystems.extend(self.fib_v6_health());
         subsystems.extend(self.handback_health());
+        subsystems.extend(self.kernel_path_health());
         // Only present when the runtime actually failed to persist
         // something, so the subsystem list does not carry a permanent
         // "state-file: fine" row nobody reads.
@@ -1008,6 +1022,10 @@ impl StatusSnapshot {
             // `v6-handback` row says Degraded, and overall must not
             // outrank it.
             && !self.handback_withholding()
+            // Exempt traffic dying in a steered port's kernel receive:
+            // the 2026-10-07 signature. The `kernel-path` row says
+            // Degraded for it, so overall must too.
+            && !self.kernel_path.iter().any(crate::kernel_path::PortReport::dropping)
     }
 
     /// `"; N kernel-delivered (…)"` for the `fib-synced` row when any
@@ -1022,6 +1040,148 @@ impl StatusSnapshot {
              VPP cannot reach — by design, never unresolvable)",
             self.kernel_delivered_routes
         )
+    }
+
+    /// The `kernel-path` row: present while any port has rules in the
+    /// ledger, one clause per port.
+    ///
+    /// DEGRADED, port named, when a port's PF drops at
+    /// [`crate::kernel_path::DROPS_DEGRADED_PER_SEC`]: that is exempt
+    /// traffic — NAT return paths, LAN, IX — dying in the kernel's
+    /// receive, the 2026-10-07 incident's signature, which ran a week
+    /// with no surface saying anything until BGP fell. Every other
+    /// finding is said, not degraded: a queue-0 fallback with its IRQ on
+    /// a CPU of its own is the designed answer to a driver without RSS,
+    /// and forwards correctly until it is outrun — at which point the
+    /// drop arm fires.
+    fn kernel_path_health(&self) -> Option<SubsystemHealth> {
+        if self.kernel_path.is_empty() {
+            return None;
+        }
+        let mut clauses = Vec::new();
+        let mut dropping = Vec::new();
+        for p in &self.kernel_path {
+            let keeps = match (&p.verdict, p.observed_rss, p.observed_queue0) {
+                (Some(v), _, q0) if v.form == crate::ntuple::KeepForm::Rss => {
+                    if q0 > 0 {
+                        format!(
+                            "keeps spread over RSS, but {q0} read back pinned to queue 0 — \
+                             left by an older daemon or changed out of band; `packetframe \
+                             reconfigure` rewrites them"
+                        )
+                    } else {
+                        "keeps spread over RSS".to_string()
+                    }
+                }
+                (Some(v), _, _) => format!(
+                    "keeps pinned to PF queue 0 (fallback: {})",
+                    v.why.as_deref().unwrap_or("the driver declined RSS")
+                ),
+                (None, 0, 0) => "no keep rules".to_string(),
+                (None, rss, q0) => format!(
+                    "keeps inherited from a previous daemon ({rss} on RSS, {q0} on queue 0); \
+                     the next steer rewrites them in the form the driver takes"
+                ),
+            };
+            let irq = match &p.irq {
+                Some(crate::kernel_path::Queue0Irq::Placed { irq, cpu, prior }) => format!(
+                    "; queue-0 IRQ {irq} placed on cpu {cpu} (was {prior}){}",
+                    match &p.irq_delivered_on {
+                        Some(on) if *on != cpu.to_string() => format!(
+                            ", but it is delivered on {on} now — a port re-open resets it; \
+                             the next steer places it again"
+                        ),
+                        _ => String::new(),
+                    }
+                ),
+                Some(crate::kernel_path::Queue0Irq::Unplaced { why }) => format!(
+                    "; queue-0 IRQ NOT moved ({why}){}",
+                    p.irq_delivered_on
+                        .as_ref()
+                        .map(|on| format!(", delivered on cpu {on}"))
+                        .unwrap_or_default()
+                ),
+                None => String::new(),
+            };
+            let traffic = match (&p.rates, &p.unreadable) {
+                (Some(r), _) => format!(
+                    "; receive {:.0} fps, queue 0 {:.0} fps{}, drops {:.0}/s",
+                    r.rx_fps,
+                    r.queue0_fps,
+                    r.queue0_share()
+                        .map(|s| format!(" ({:.0}%)", s * 100.0))
+                        .unwrap_or_default(),
+                    r.drops_ps
+                ),
+                (None, Some(e)) => format!("; counters unreadable ({e})"),
+                (None, None) => "; counters: first sample pending".to_string(),
+            };
+            if p.dropping() {
+                dropping.push(p);
+            }
+            // The one thing no readback can prove: that the driver
+            // programs the RSS action it echoes back.
+            let suspect = if p.rss_suspect() {
+                " — queue 0 is taking most of the receive although the keeps read back as \
+                 RSS: one elephant flow can do that, but if it persists across many flows \
+                 the driver may not be honouring the RSS action (compare `rxq<N>: frames` \
+                 in `ethtool -S`)"
+            } else {
+                ""
+            };
+            clauses.push(format!("{}: {keeps}{irq}{traffic}{suspect}", p.iface));
+        }
+        if dropping.is_empty() {
+            return Some(SubsystemHealth {
+                name: SUBSYS_KERNEL_PATH.into(),
+                state: HealthState::Healthy,
+                message: Some(clauses.join(". ")),
+                last_success_age_seconds: None,
+            });
+        }
+        let named: Vec<String> = dropping
+            .iter()
+            .map(|p| {
+                let r = p.rates.expect("dropping() requires rates");
+                let remedy = if p.pins_queue0() {
+                    format!(
+                        "its keeps pin to queue 0, so one CPU takes all of it: move that queue's \
+                         IRQ to an idle CPU outside VPP's cores (`grep '{0}-rxtx-0' \
+                         /proc/interrupts`, then `echo <cpu> > \
+                         /proc/irq/<irq>/smp_affinity_list`)",
+                        p.iface
+                    )
+                } else {
+                    format!(
+                        "its keeps spread over RSS, so the PF's queues together are outrun: \
+                         compare `ethtool -S {0} | grep 'rxq.*frames'` across queues (one hot \
+                         queue means the spread is not happening) and the per-CPU softirq load",
+                        p.iface
+                    )
+                };
+                format!(
+                    "{} is DROPPING {:.0} frames/s in the kernel's receive{} — {remedy}",
+                    p.iface,
+                    r.drops_ps,
+                    r.queue0_share()
+                        .map(|s| format!(" with queue 0 taking {:.0}% of it", s * 100.0))
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
+        Some(SubsystemHealth {
+            name: SUBSYS_KERNEL_PATH.into(),
+            state: HealthState::Degraded,
+            message: Some(format!(
+                "the kernel path for exempt traffic is dropping: {}. Exempt traffic is the \
+                 router's own, NAT return paths and every `steer-exempt` prefix; dropping it \
+                 starves BGP and pings first (docs/runbooks/vpp-offload.md, \"The kernel path \
+                 for exempt traffic\"). Per port: {}",
+                named.join("; "),
+                clauses.join(". ")
+            )),
+            last_success_age_seconds: None,
+        })
     }
 
     /// The target diverts IPv6 and the hand-back path is not ready, so the
@@ -2731,7 +2891,160 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
         }
     }
 
+    render_kernel_path(&mut out, &snap.kernel_path, module);
     out
+}
+
+/// The `kernel-path` gauges, per port with rules in the ledger; nothing
+/// at all when no port has any. Each family is emitted only for the
+/// ports that have the fact — absent rather than zero, so a counter
+/// that could not be read cannot impersonate a quiet port.
+fn render_kernel_path(out: &mut String, ports: &[crate::kernel_path::PortReport], module: &str) {
+    if ports.is_empty() {
+        return;
+    }
+    let decided: Vec<(&str, bool)> = ports
+        .iter()
+        .filter_map(|p| {
+            p.verdict
+                .as_ref()
+                .map(|v| (p.iface.as_str(), v.form == crate::ntuple::KeepForm::Rss))
+        })
+        .collect();
+    if !decided.is_empty() {
+        gauge(
+            out,
+            "packetframe_vpp_keep_rss",
+            "1 when this port's keep rules spread over RSS, 0 when they pin to PF queue 0",
+        );
+        for (port, rss) in decided {
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_keep_rss{{module=\"{module}\",port=\"{}\"}} {}",
+                label(port),
+                u8::from(rss)
+            );
+        }
+    }
+    gauge(
+        out,
+        "packetframe_vpp_keeps_observed",
+        "keep rules the last steering audit read back, per delivery form",
+    );
+    for p in ports {
+        for (form, n) in [("rss", p.observed_rss), ("queue0", p.observed_queue0)] {
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_keeps_observed{{module=\"{module}\",port=\"{}\",form=\"{form}\"}} \
+                 {n}",
+                label(&p.iface)
+            );
+        }
+    }
+    let placed: Vec<(&str, u32, u16)> = ports
+        .iter()
+        .filter_map(|p| match &p.irq {
+            Some(crate::kernel_path::Queue0Irq::Placed { irq, cpu, .. }) => {
+                Some((p.iface.as_str(), *irq, *cpu))
+            }
+            _ => None,
+        })
+        .collect();
+    if !placed.is_empty() {
+        gauge(
+            out,
+            "packetframe_vpp_queue0_irq_cpu",
+            "the CPU a port's queue-0 IRQ was placed on while its keeps pin to queue 0",
+        );
+        for (port, irq, cpu) in placed {
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_queue0_irq_cpu{{module=\"{module}\",port=\"{}\",irq=\"{irq}\"}} \
+                 {cpu}",
+                label(port)
+            );
+        }
+    }
+    let sampled: Vec<(&str, crate::kernel_path::QueueCounters)> = ports
+        .iter()
+        .filter_map(|p| p.counters.map(|c| (p.iface.as_str(), c)))
+        .collect();
+    if !sampled.is_empty() {
+        gauge(
+            out,
+            "packetframe_vpp_kernel_rx_frames",
+            "frames the PF's kernel receive has taken, cumulative (driver counters), on queue \
+             0 and on all queues",
+        );
+        for (port, c) in &sampled {
+            for (queue, n) in [("0", c.queue0_frames), ("all", c.rx_frames)] {
+                let _ = writeln!(
+                    out,
+                    "packetframe_vpp_kernel_rx_frames{{module=\"{module}\",port=\"{}\",queue=\"{queue}\"}} {n}",
+                    label(port)
+                );
+            }
+        }
+        gauge(
+            out,
+            "packetframe_vpp_kernel_rx_drops",
+            "frames the PF's kernel receive dropped, cumulative (`rx_drops`)",
+        );
+        for (port, c) in &sampled {
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_kernel_rx_drops{{module=\"{module}\",port=\"{}\"}} {}",
+                label(port),
+                c.rx_drops
+            );
+        }
+    }
+    let rated: Vec<(&str, crate::kernel_path::Rates, bool)> = ports
+        .iter()
+        .filter_map(|p| p.rates.map(|r| (p.iface.as_str(), r, p.dropping())))
+        .collect();
+    if !rated.is_empty() {
+        gauge(
+            out,
+            "packetframe_vpp_kernel_rx_fps",
+            "frames per second the PF's kernel receive took over the last sample window",
+        );
+        for (port, r, _) in &rated {
+            for (queue, v) in [("0", r.queue0_fps), ("all", r.rx_fps)] {
+                let _ = writeln!(
+                    out,
+                    "packetframe_vpp_kernel_rx_fps{{module=\"{module}\",port=\"{}\",queue=\"{queue}\"}} {v:.1}",
+                    label(port)
+                );
+            }
+        }
+        gauge(
+            out,
+            "packetframe_vpp_kernel_rx_drops_per_second",
+            "frames per second the PF's kernel receive dropped over the last sample window",
+        );
+        for (port, r, _) in &rated {
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_kernel_rx_drops_per_second{{module=\"{module}\",port=\"{}\"}} {:.1}",
+                label(port),
+                r.drops_ps
+            );
+        }
+        gauge(
+            out,
+            "packetframe_vpp_kernel_path_dropping",
+            "1 when a port's kernel path drops at the rate that degrades the kernel-path row",
+        );
+        for (port, _, dropping) in &rated {
+            let _ = writeln!(
+                out,
+                "packetframe_vpp_kernel_path_dropping{{module=\"{module}\",port=\"{}\"}} {}",
+                label(port),
+                u8::from(*dropping)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6355,5 +6668,195 @@ mod tests {
             msg.contains("1 unresolvable (next hop not on a VPP port): 2001:db8:1::/48 via"),
             "{msg}"
         );
+    }
+
+    fn kernel_port(
+        iface: &str,
+        form: crate::ntuple::KeepForm,
+        drops_ps: f64,
+    ) -> crate::kernel_path::PortReport {
+        use crate::kernel_path::{PortReport, Queue0Irq, QueueCounters, Rates};
+        let queue0 = form == crate::ntuple::KeepForm::Queue0;
+        PortReport {
+            iface: iface.into(),
+            verdict: Some(crate::ntuple::KeepVerdict {
+                form,
+                why: queue0.then(|| "the driver refused an RSS-action rule (EINVAL)".into()),
+            }),
+            observed_rss: if queue0 { 0 } else { 5 },
+            observed_queue0: if queue0 { 5 } else { 0 },
+            irq: queue0.then(|| Queue0Irq::Placed {
+                irq: 140,
+                cpu: 6,
+                prior: "0".into(),
+            }),
+            irq_delivered_on: queue0.then(|| "6".into()),
+            counters: Some(QueueCounters {
+                queue0_frames: 1_000,
+                rx_frames: 2_000,
+                rx_drops: 50,
+                queues: 18,
+            }),
+            rates: Some(Rates {
+                queue0_fps: 5_800.0,
+                rx_fps: 6_000.0,
+                drops_ps,
+            }),
+            unreadable: None,
+        }
+    }
+
+    /// The incident's signature — a steered port's PF dropping exempt
+    /// traffic by the thousand — degrades the module on BOTH surfaces,
+    /// names the port, the rate and queue 0's share, and points at the
+    /// remedy for the form its keeps are in. A fallback that is keeping
+    /// up is said, not degraded.
+    #[test]
+    fn a_dropping_kernel_path_degrades_and_is_named_on_both_surfaces() {
+        use crate::ntuple::KeepForm;
+        let row = |s: &StatusSnapshot| {
+            s.report()
+                .subsystems
+                .into_iter()
+                .find(|x| x.name == SUBSYS_KERNEL_PATH)
+        };
+        let mut s = snap_of(
+            &steered_supervisor(),
+            &ledger_with(10, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_secs(1),
+            },
+            verified(5),
+            ports_up(),
+        );
+        assert!(
+            row(&s).is_none(),
+            "nothing steered into the kernel path, no row"
+        );
+        assert_eq!(s.report().overall, HealthState::Healthy);
+
+        s.kernel_path = vec![
+            kernel_port("eth2", KeepForm::Queue0, 0.0),
+            kernel_port("eth3", KeepForm::Rss, 0.0),
+        ];
+        let calm = row(&s).expect("present while steered");
+        assert_eq!(calm.state, HealthState::Healthy, "{:?}", calm.message);
+        let msg = calm.message.unwrap();
+        assert!(
+            msg.contains("eth2: keeps pinned to PF queue 0 (fallback: the driver refused"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("queue-0 IRQ 140 placed on cpu 6 (was 0)"),
+            "{msg}"
+        );
+        assert!(msg.contains("eth3: keeps spread over RSS"), "{msg}");
+        assert_eq!(
+            msg.matches("may not be honouring the RSS action").count(),
+            1,
+            "said for the RSS port whose queue 0 takes 97% of a busy receive, and only \
+             for it: {msg}"
+        );
+        assert_eq!(s.report().overall, HealthState::Healthy);
+
+        s.kernel_path[0].rates.as_mut().unwrap().drops_ps = 3_900.0;
+        let bad = row(&s).expect("present");
+        assert_eq!(bad.state, HealthState::Degraded);
+        let msg = bad.message.unwrap();
+        assert!(msg.contains("eth2 is DROPPING 3900 frames/s"), "{msg}");
+        assert!(msg.contains("queue 0 taking 97%"), "{msg}");
+        assert!(msg.contains("grep 'eth2-rxtx-0' /proc/interrupts"), "{msg}");
+        assert!(!msg.contains("eth3 is DROPPING"), "{msg}");
+        assert_eq!(s.report().overall, HealthState::Degraded);
+
+        let m = render_metrics(&s, "vpp-offload");
+        for line in [
+            "packetframe_vpp_health{module=\"vpp-offload\",state=\"degraded\"} 1",
+            "packetframe_vpp_kernel_path_dropping{module=\"vpp-offload\",port=\"eth2\"} 1",
+            "packetframe_vpp_kernel_path_dropping{module=\"vpp-offload\",port=\"eth3\"} 0",
+            "packetframe_vpp_keep_rss{module=\"vpp-offload\",port=\"eth2\"} 0",
+            "packetframe_vpp_keep_rss{module=\"vpp-offload\",port=\"eth3\"} 1",
+            "packetframe_vpp_keeps_observed{module=\"vpp-offload\",port=\"eth2\",form=\"queue0\"} 5",
+            "packetframe_vpp_queue0_irq_cpu{module=\"vpp-offload\",port=\"eth2\",irq=\"140\"} 6",
+            "packetframe_vpp_kernel_rx_frames{module=\"vpp-offload\",port=\"eth2\",queue=\"0\"} 1000",
+            "packetframe_vpp_kernel_rx_drops{module=\"vpp-offload\",port=\"eth2\"} 50",
+            "packetframe_vpp_kernel_rx_drops_per_second{module=\"vpp-offload\",port=\"eth2\"} 3900.0",
+            "packetframe_vpp_kernel_rx_fps{module=\"vpp-offload\",port=\"eth2\",queue=\"0\"} 5800.0",
+        ] {
+            assert!(m.contains(line), "missing {line}:\n{m}");
+        }
+        // Every sample under a TYPE header.
+        let declared: Vec<&str> = m
+            .lines()
+            .filter_map(|l| l.strip_prefix("# TYPE "))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        for line in m.lines().filter(|l| !l.starts_with('#')) {
+            let name = line.split(['{', ' ']).next().unwrap();
+            assert!(declared.contains(&name), "{name} undeclared");
+        }
+
+        // An RSS port dropping gets the RSS remedy.
+        s.kernel_path[0] = kernel_port("eth2", KeepForm::Rss, 3_900.0);
+        let msg = row(&s).unwrap().message.unwrap();
+        assert!(
+            msg.contains("compare `ethtool -S eth2 | grep 'rxq.*frames'`"),
+            "{msg}"
+        );
+    }
+
+    /// Inherited keeps of unknown form, and a counter read that failed,
+    /// are said as such rather than read as a verdict or as zero.
+    #[test]
+    fn inherited_keeps_and_unreadable_counters_are_said_not_guessed() {
+        use crate::kernel_path::PortReport;
+        let mut s = snap_of(
+            &steered_supervisor(),
+            &ledger_with(10, 0, 0),
+            ApiHealth::Answering {
+                silent_for: Duration::from_secs(1),
+            },
+            verified(5),
+            ports_up(),
+        );
+        s.kernel_path = vec![PortReport {
+            iface: "eth4".into(),
+            verdict: None,
+            observed_rss: 0,
+            observed_queue0: 3,
+            irq: None,
+            irq_delivered_on: None,
+            counters: None,
+            rates: None,
+            unreadable: Some("the driver exports no `rxq0: frames` statistic".into()),
+        }];
+        let r = s
+            .report()
+            .subsystems
+            .into_iter()
+            .find(|x| x.name == SUBSYS_KERNEL_PATH)
+            .unwrap();
+        assert_eq!(r.state, HealthState::Healthy);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains("keeps inherited from a previous daemon (0 on RSS, 3 on queue 0)"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("counters unreadable (the driver exports no"),
+            "{msg}"
+        );
+        let m = render_metrics(&s, "vpp-offload");
+        assert!(
+            !m.contains("packetframe_vpp_kernel_rx_frames"),
+            "absent, not zero"
+        );
+        assert!(
+            !m.contains("packetframe_vpp_keep_rss"),
+            "no verdict, no gauge"
+        );
+        assert!(m.contains(
+            "packetframe_vpp_keeps_observed{module=\"vpp-offload\",port=\"eth4\",form=\"queue0\"} 3"
+        ));
     }
 }

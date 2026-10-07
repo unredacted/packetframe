@@ -134,6 +134,14 @@ pub mod kind {
     /// The set of named unresolvable routes changed (rate-limited at the
     /// source); `detail` "none" once it empties.
     pub const UNRESOLVABLE_ROUTES: &str = "unresolvable_routes";
+    /// A port's driver declined an RSS-action keep rule, so its keeps
+    /// deliver to PF queue 0 (`port`, `detail` the driver's answer). Once
+    /// per port per process.
+    pub const KEEP_QUEUE0_FALLBACK: &str = "keep_queue0_fallback";
+    /// A steered port's kernel path started or stopped dropping frames
+    /// (`port`, `drops_per_second`, `queue0_share`, `dropping`).
+    /// Rate-limited at the source.
+    pub const KERNEL_PATH_DROPPING: &str = "kernel_path_dropping";
 
     // --- fast-path ---
     /// `wan-egress` put back policy rules that had disappeared from the

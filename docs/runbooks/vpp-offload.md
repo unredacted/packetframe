@@ -93,6 +93,7 @@ running badly.
 - [Triage by symptom](#triage-by-symptom)
 - [Numbers: measured vs published-on-faith](#numbers-measured-vs-published-on-faith)
 - [Install and upgrade on the router](#install-and-upgrade-on-the-router)
+- [The kernel path for exempt traffic](#the-kernel-path-for-exempt-traffic)
 - [IRQ affinity before attach](#irq-affinity-before-attach)
 - [Constraints worth knowing before you debug](#constraints-worth-knowing-before-you-debug)
 
@@ -291,6 +292,8 @@ current value without a mapping table:
 | `packetframe_vpp_exempt_drift_v6_accepted` | not an alarm — v6 findings a `drift-accept6` covers (still blackholed if diverted). Present exactly when the series above is; a step up means a new route appeared under an accepted prefix |
 | `packetframe_vpp_neighbours_unplaced` | `> 0` — a bridge neighbour the kernel FDB has not placed behind any member port; routes through it are unresolvable |
 | `packetframe_vpp_neighbour_moves` | a step — spanning tree moved neighbours between trunks and VPP followed; worth correlating with switch events |
+| `packetframe_vpp_kernel_path_dropping{port}` | `1` — a steered port's PF is dropping exempt traffic in the kernel's receive (`packetframe_vpp_kernel_rx_drops_per_second` at 100/s or more). See [the kernel path for exempt traffic](#the-kernel-path-for-exempt-traffic) |
+| `packetframe_vpp_keep_rss{port}` | `0` is not an alarm by itself — that port's driver declined RSS keeps, so its exempt traffic lands on PF queue 0 (`packetframe_vpp_queue0_irq_cpu` says where that queue's IRQ was placed). Watch `packetframe_vpp_kernel_rx_fps{queue="0"}` against `{queue="all"}` on it |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
 | `packetframe_vpp_api_silent_seconds` | approaching the wedge budget (1.5 s steered) |
 | `packetframe_vpp_glean_sent{family}` / `packetframe_vpp_glean_throttled{family}` | informational, never a health input — cumulative; watch the RATE. See [Glean and ARP counters](#glean-and-arp-counters) for normal vs a scan |
@@ -2001,9 +2004,11 @@ Four consequences to decide on before listing a VLAN:
 
 ### The keeps
 
-Kernel-delivery rules (`ring_cookie` 0, PF queue 0) at **lower
-locations than every diversion** — lower location is higher priority on
-this NIC — so they are matched first:
+Kernel-delivery rules (`ring_cookie` 0 — the PF; spread over its queues
+by RSS, or on PF queue 0 where the driver declines RSS, see [the kernel
+path for exempt traffic](#the-kernel-path-for-exempt-traffic)) at
+**lower locations than every diversion** — lower location is higher
+priority on this NIC — so they are matched first:
 
 | Keep | Why |
 | --- | --- |
@@ -2027,11 +2032,10 @@ they apply port-wide and also keep DNS and BGP toward **external**
 hosts on the eBPF tier. That is intended: correct, and a
 small slice. Two costs to know: they occupy MCAM slots only while some
 port diverts v6 (a port with `steer-keep6` lines and no `v6-divert`
-plans none), and everything they match lands on PF queue 0 rather than
-RSS — all of the port's DNS and BGP, every VLAN. If queue 0's softirq
-core shows it, per-VLAN keeps are the remedy (`tcp6 dst-port N vlan
-<vid> m 0xf000` inserts on this kernel too); they are not built yet
-because they multiply slots by the VLAN count.
+plans none), and on a port whose driver declines RSS keeps everything
+they match lands on PF queue 0 — all of the port's DNS and BGP, every
+VLAN. Where the driver takes RSS (the production firmware does) they
+spread like any other kernel traffic.
 
 ### Budget
 
@@ -2157,8 +2161,9 @@ checked against — that restart may take the dump path.
 # The rules the NIC holds. The diversions read "TCP over IPv6" / "UDP
 # over IPv6" with no ports, the router MAC as the destination MAC and
 # the VLAN, "Action: Direct to VF 0 queue 0"; the keeps "TCP over IPv6"
-# / "UDP over IPv6" with a port and no MAC, "Action: Direct to queue 0"
-# — four built-ins (TCP 53, UDP 53, TCP dst 179, TCP src 179) plus
+# / "UDP over IPv6" with a port and no MAC, "RSS Context ID: 0" (absent
+# on a port whose driver declined RSS keeps) and "Action: Direct to
+# queue 0" — four built-ins (TCP 53, UDP 53, TCP dst 179, TCP src 179) plus
 # yours. No rule may read "Flow Type: Raw Ethernet" or name an L4
 # protocol number. Every keep's location must be LOWER than every
 # diversion's. Masks print complemented (ethtool shows ignored bits), as
@@ -4175,6 +4180,165 @@ new packetframe release is answered by the `generated.rs` diff during
 the re-vendor. The full compatibility model and bump procedure:
 `crates/modules/vpp-offload/vpp-api/README.md`.
 
+## The kernel path for exempt traffic
+
+Steering diverts allowlisted traffic to VPP. Everything a **keep** rule
+matches stays on the kernel: the router's own traffic, the built-in
+exemptions, every `steer-exempt` prefix and, on a v6-diverting port,
+the v6 keeps. Keeps sit above every diversion in the MCAM and hand
+their frames to the PF, where the kernel receives them like any
+unsteered frame.
+
+That is not control-plane trickle on a real box. Exemptions grow into
+bulk traffic: the WAN /31s (the return path of every NAT'd flow), whole
+LAN subnets, the IX LANs, another site's /24, a CGNAT /10. **Which PF
+queue a keep delivers to is therefore a capacity decision**, and one
+queue is one CPU: its IRQ, and the softirq that drains it, run on one
+core.
+
+### What happened on 2026-10-07
+
+Until 0.6.0 every keep delivered to **PF queue 0** (`ring_cookie` 0, no
+RSS). Every port's queue-0 IRQ defaults to cpu0. On a production gateway
+(18 CPUs, 18 queues per port, queue N's IRQ on CPU N), about three
+minutes after a lever move that steered, cpu0 sat at 99% softirq and 0%
+idle while the other non-VPP CPUs were 50-76% idle. Queue 0 took ~5.8k,
+~5.2k and ~6.0k frames/s on three ports, two of them dropping ~3.9k and
+~1.6k frames/s (`rx_drops`). A ping to the directly connected transit
+next hop lost 30% at 618 ms; transit BGP sessions fell on hold-timer
+expiry; the platform's WAN monitor flapped the uplink, and every flap
+emptied conntrack, loading cpu0 further. The same config had run steered
+for a week without visible trouble: a latent capacity limit with no
+warning. Moving the queue-0 IRQs of the three busy ports to CPUs of
+their own fixed it within seconds: 0% loss, 0.15 ms RTT, 0 drops/s,
+cpu0 74% idle.
+
+### RSS keeps, and the queue-0 fallback
+
+Since 0.6.0 a keep is an **RSS rule on the PF's default context**
+(`FLOW_RSS`, context 0; the CLI's `context 0 action 0`): its frames are
+hashed across the PF's queues exactly as unsteered traffic is. Whether
+the vendor driver takes that is checked at run time, per port, by the
+first keep the daemon installs there. It inserts the RSS form and reads
+it back:
+
+- accepted, and read back with `FLOW_RSS` and context 0: the port's
+  keeps spread over RSS (log line `keep rules on this port spread over
+  RSS`);
+- refused (`EINVAL`/`EOPNOTSUPP`), or accepted but read back **without**
+  the flag or on another context: the same rule is installed in the
+  queue-0 form at the same slot, and that port's keeps stay on queue 0
+  for the life of the daemon. It says so three ways: a `warn` line
+  (`keep rules on this port fall back to PF queue 0`), a
+  `keep_queue0_fallback` event naming the driver's answer, and the
+  `kernel-path` status row. Other ports are unaffected.
+
+A lab probe on the production firmware (driver `rvu-nicpf`, vendor
+5.15) accepted `context 0 action 0` and read it back with `RSS Context
+ID: 0`. That proves acceptance and readback only: a driver can echo the
+stored spec without programming the action. The proof that frames
+actually spread is the per-queue counters below, on a port carrying
+many flows.
+
+Keeps from an older daemon are queue-0 keeps. They are recognised as
+this module's in either form (audit, slot reuse, teardown), the status
+row counts them (`keeps inherited from a previous daemon (… on queue
+0)`), and the next steer rewrites them in place as RSS keeps. An
+adopted restart steers again at the end of its resync; `packetframe
+reconfigure` does it sooner.
+
+### Queue-0 IRQ placement, while keeps pin to queue 0
+
+On a port whose keeps fell back to queue 0, the daemon moves that
+port's queue-0 IRQ (the vector named `<port>-rxtx-0`) to **a CPU of its
+own**: never one of VPP's cores (main and workers), never an isolated
+CPU, never cpu0; the published control-plane CPUs only as a last resort;
+otherwise the CPU carrying the fewest of PacketFrame's queue-0
+placements, then the fewest NIC queue IRQs. The prior affinity is
+written to `<state-dir>/vpp-queue0-irqs.json` **before** the move, and
+put back when the port's keeps stop needing it: a steer that leaves the
+port on RSS or unsteered, the module's teardown, or `packetframe
+detach`. A record from another boot is dropped unrestored (the reboot
+reset the IRQs), and so is one whose IRQ no longer holds the CPU the
+daemon wrote: something else moved it since, and its value is kept.
+`--keep-vpp` restarts leave the placement and the record in place, and
+the next daemon restores the original prior on its teardown. With no
+CPU to move to, the port is reported `queue-0 IRQ NOT moved (no CPU
+outside VPP's cores …)` and nothing is written.
+
+The otx2 PF re-applies its own affinity hint whenever it re-opens a
+port (ring resize, link bounce, provisioning push), which puts queue 0
+back on cpu0. The row shows where the IRQ is delivered now; the next
+steer places it again.
+
+**Does a daemon restart undo a manual placement?** No, unless you
+picked one of VPP's cores. The attach-time pass (`crates/modules/
+vpp-offload/src/bringup.rs`, the `cores::clear_irqs_off` call before
+VPP starts, and again after adopting a VPP observed on other cores)
+moves only member IRQs whose effective affinity is on a VPP core; a
+queue-0 IRQ moved by hand to any other CPU is left alone. What does
+undo it is a port re-open (above), and a reboot.
+
+### How to check
+
+```bash
+# The keeps: "RSS Context ID: 0" on an RSS keep, absent on a queue-0
+# one; "Action: Direct to queue 0" on both (for an RSS rule the queue is
+# an offset into the one the hash picks). Keeps sit at lower locations
+# than every diversion ("Direct to VF 0 ...").
+ethtool -n <port>
+
+# Where each queue's IRQ fires, and how often. "<port>-rxtx-0" is queue 0.
+grep '<port>-rxtx-' /proc/interrupts
+cat /proc/irq/<irq>/effective_affinity_list
+
+# Per-queue receive and the port's drops. Twice, ten seconds apart:
+# with RSS keeps `rxq0: frames` grows at roughly the others' rate; with
+# queue-0 keeps carrying the bulk it outgrows all of them together.
+# `rx_drops` should not move at all on a steered port.
+ethtool -S <port> | grep -E 'rxq[0-9]+: frames|rx_drops'
+
+# Which core is drowning: softirq per CPU.
+mpstat -P ALL 1 5   # or: top, then 1
+```
+
+`packetframe status` carries a `kernel-path` row while any port has
+rules installed: per port, the keep form (and the driver's answer on a
+fallback), the queue-0 IRQ placement, and receive, queue-0 and drop
+rates sampled every 10 s from the same counters. It is **Degraded**,
+port named, when a port drops 100 frames/s or more — with the remedy for
+the form its keeps are in. The `kernel_path_dropping` event records the
+start (at most once per port every ten minutes while it lasts) and the
+end. Gauges: `packetframe_vpp_keep_rss`, `packetframe_vpp_keeps_observed`,
+`packetframe_vpp_queue0_irq_cpu`, `packetframe_vpp_kernel_rx_frames`,
+`packetframe_vpp_kernel_rx_drops`, `packetframe_vpp_kernel_rx_fps`,
+`packetframe_vpp_kernel_rx_drops_per_second` and
+`packetframe_vpp_kernel_path_dropping`.
+
+### Emergency lever: move the IRQ by hand
+
+If a core is saturated and exempt traffic is dropping, do not wait for a
+release. Move the hot queue's IRQ to an idle CPU that is not one of
+VPP's (the attach log names VPP's cores: `vpp-offload attached`,
+`main_core`, `workers`) and not isolated:
+
+```bash
+grep '<port>-rxtx-0' /proc/interrupts          # first column is the IRQ
+echo <cpu> > /proc/irq/<irq>/smp_affinity_list
+cat /proc/irq/<irq>/effective_affinity_list    # must now read <cpu>
+```
+
+One port per CPU. It takes effect immediately and lasts until the port
+is re-opened or the box reboots. On the incident box it took loss from
+30% to 0 within seconds.
+
+### Downgrading below 0.6.0
+
+An older daemon reads an RSS keep as somebody else's rule: its teardown
+would leave the keeps in the MCAM and its planner would route around
+their slots. Run **this** release's `packetframe detach --all` before
+installing an older one.
+
 ## IRQ affinity before attach
 
 VPP workers are poll-mode: each one owns its CPU at 100% duty cycle
@@ -4214,7 +4378,9 @@ apply by hand. On UniFi a hand-written affinity is gone at the next
 reboot, provision cycle or ring resize, so the refusal fired after
 every one of them. The moves are not undone on detach: putting an IRQ
 back on a CPU VPP no longer uses would only re-create the conflict for
-the next attach. With a config that
+the next attach. (The queue-0 placement for keeps that pin to queue 0
+is different, and is restored: see [the kernel path for exempt
+traffic](#the-kernel-path-for-exempt-traffic).) With a config that
 declares the module, the no-CPU-left failure is `required`: it makes
 the summary read "vpp-offload attach BLOCKED" (exit non-zero) rather
 than PASS. Effective, not

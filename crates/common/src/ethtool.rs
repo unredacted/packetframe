@@ -8,6 +8,10 @@
 //! restore logic is testable on hosts with no ethtool at all; the
 //! pure pieces ([`CoalesceSpec`] and the struct layout) carry no
 //! platform gate.
+//!
+//! Also the `ethtool -S` read ([`read_stats`]), for vpp-offload's view
+//! of the kernel path a steered port's exempt traffic takes (per-queue
+//! frames and drops).
 
 use std::fmt;
 use std::io;
@@ -281,6 +285,117 @@ impl CoalesceIo for SiocEthtool {
 
 #[cfg(target_os = "linux")]
 fn siocethtool(iface: &str, value: &mut EthtoolCoalesce) -> io::Result<()> {
+    // SAFETY: `value` is a live repr(C) struct of the exact size the
+    // kernel copies for the two coalescing commands.
+    unsafe { siocethtool_raw(iface, (value as *mut EthtoolCoalesce).cast()) }
+}
+
+/// `ETHTOOL_GSSET_INFO`: how many entries a string set has.
+pub const ETHTOOL_GSSET_INFO: u32 = 0x0000_0037;
+/// `ETHTOOL_GSTRINGS`: a string set's names.
+pub const ETHTOOL_GSTRINGS: u32 = 0x0000_001b;
+/// `ETHTOOL_GSTATS`: the `ETH_SS_STATS` values, in name order.
+pub const ETHTOOL_GSTATS: u32 = 0x0000_001d;
+/// `ETH_SS_STATS`, the string set `ethtool -S` prints.
+pub const ETH_SS_STATS: u32 = 1;
+/// `ETH_GSTRING_LEN`: every name is a fixed 32-byte, NUL-padded slot.
+pub const ETH_GSTRING_LEN: usize = 32;
+
+/// The names in an `ETHTOOL_GSTRINGS` payload: `n` slots of
+/// [`ETH_GSTRING_LEN`] bytes, each cut at its first NUL. Pure, so the
+/// slicing is testable off Linux.
+pub fn parse_gstrings(data: &[u8], n: usize) -> Vec<String> {
+    data.chunks(ETH_GSTRING_LEN)
+        .take(n)
+        .map(|slot| {
+            let end = slot.iter().position(|b| *b == 0).unwrap_or(slot.len());
+            String::from_utf8_lossy(&slot[..end]).into_owned()
+        })
+        .collect()
+}
+
+/// `ethtool -S <iface>`: every named statistic the driver exports, as
+/// `(name, value)` in the driver's order.
+///
+/// Three ioctls, the way the CLI does it: the count (`GSSET_INFO`), the
+/// names (`GSTRINGS`), the values (`GSTATS`). The kernel sizes the last
+/// two from the DRIVER's count, not the caller's, and writes that many
+/// entries — so each buffer is allocated with room to spare beyond the
+/// count just read, and a reply naming more entries than the buffer
+/// holds, or names and values that disagree in number (a queue-count
+/// change between the calls), is an error rather than a parse.
+#[cfg(target_os = "linux")]
+pub fn read_stats(iface: &str) -> io::Result<Vec<(String, u64)>> {
+    // `ethtool_sset_info`: cmd, reserved, sset_mask (u64), data[] (u32).
+    // One bit asked for, so one u32 of data: 20 bytes, in three u64s.
+    // Built in u64s for the alignment `sset_mask` needs; the u32 fields
+    // go in by native byte order, the way the kernel reads them.
+    let low_u32 = |v: u32| {
+        let mut b = [0u8; 8];
+        b[..4].copy_from_slice(&v.to_ne_bytes());
+        u64::from_ne_bytes(b)
+    };
+    let u32_at = |word: u64, half: usize| {
+        let b = word.to_ne_bytes();
+        u32::from_ne_bytes(b[half * 4..half * 4 + 4].try_into().expect("4 bytes"))
+    };
+    let mut info = [low_u32(ETHTOOL_GSSET_INFO), 1u64 << ETH_SS_STATS, 0];
+    // SAFETY: 24 bytes, more than the 20 the kernel writes for one set.
+    unsafe { siocethtool_raw(iface, info.as_mut_ptr().cast())? };
+    if info[1] & (1u64 << ETH_SS_STATS) == 0 {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    let n = u32_at(info[2], 0) as usize;
+    let room = n * 2 + 64;
+
+    // `ethtool_gstrings`: cmd, string_set, len (u32 each), data[].
+    let mut names = vec![0u8; 12 + room * ETH_GSTRING_LEN];
+    names[0..4].copy_from_slice(&ETHTOOL_GSTRINGS.to_ne_bytes());
+    names[4..8].copy_from_slice(&ETH_SS_STATS.to_ne_bytes());
+    // SAFETY: the buffer holds `room` slots past the header, and the
+    // kernel writes its own count of them — checked below.
+    unsafe { siocethtool_raw(iface, names.as_mut_ptr().cast())? };
+    let len = u32::from_ne_bytes(names[8..12].try_into().expect("4 bytes")) as usize;
+
+    // `ethtool_stats`: cmd, n_stats (u32 each), data[] (u64).
+    let mut stats = vec![0u64; 1 + room];
+    stats[0] = low_u32(ETHTOOL_GSTATS);
+    // SAFETY: as above, `room` values past the header.
+    unsafe { siocethtool_raw(iface, stats.as_mut_ptr().cast())? };
+    let n_stats = u32_at(stats[0], 1) as usize;
+
+    if len > room || n_stats > room {
+        return Err(io::Error::other(format!(
+            "{iface} reported {len} statistic names and {n_stats} values, more than the {room} \
+             asked room for"
+        )));
+    }
+    if len != n_stats {
+        return Err(io::Error::other(format!(
+            "{iface} reported {len} statistic names but {n_stats} values; the set changed \
+             between the reads"
+        )));
+    }
+    let names = parse_gstrings(&names[12..], len);
+    Ok(names
+        .into_iter()
+        .zip(stats[1..=n_stats].iter().copied())
+        .collect())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_stats(_iface: &str) -> io::Result<Vec<(String, u64)>> {
+    Err(io::Error::from_raw_os_error(libc::ENOSYS))
+}
+
+/// One `SIOCETHTOOL` round trip with a caller-built buffer.
+///
+/// # Safety
+/// `data` must point at a buffer laid out as the command in its first
+/// four bytes expects, large enough for everything the kernel writes
+/// back for that command, and live for the call.
+#[cfg(target_os = "linux")]
+unsafe fn siocethtool_raw(iface: &str, data: *mut libc::c_void) -> io::Result<()> {
     // Width-neutral: libc::ioctl's request parameter is `c_ulong` on
     // glibc but `c_int` on musl, so the constant is a plain u32 and
     // the call site casts with `as _` (same pattern as the GRO probe).
@@ -298,15 +413,15 @@ fn siocethtool(iface: &str, value: &mut EthtoolCoalesce) -> io::Result<()> {
     for (dst, src) in ifr.ifr_name.iter_mut().zip(name_bytes) {
         *dst = *src as libc::c_char;
     }
-    ifr.ifr_ifru.ifru_data = value as *mut EthtoolCoalesce as *mut libc::c_char;
+    ifr.ifr_ifru.ifru_data = data.cast::<libc::c_char>();
 
     // SAFETY: plain socket(2); the fd is closed below on every path.
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if sock < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `ifr` points at `value`, a live repr(C) struct of the
-    // exact size the kernel copies for these two commands.
+    // SAFETY: `ifr` points at `data`, which the caller guarantees is
+    // large enough for what the kernel writes for its command.
     #[allow(clippy::unnecessary_cast)]
     let r = unsafe { libc::ioctl(sock, SIOCETHTOOL as _, &mut ifr) };
     let err = io::Error::last_os_error();
@@ -346,6 +461,28 @@ mod tests {
     fn command_numbers_match_uapi() {
         assert_eq!(ETHTOOL_GCOALESCE, 14);
         assert_eq!(ETHTOOL_SCOALESCE, 15);
+        assert_eq!(ETHTOOL_GSTRINGS, 27);
+        assert_eq!(ETHTOOL_GSTATS, 29);
+        assert_eq!(ETHTOOL_GSSET_INFO, 55);
+    }
+
+    /// Fixed 32-byte slots, each cut at its NUL — including a name that
+    /// fills its slot with no terminator, and nothing past `n`.
+    #[test]
+    fn gstrings_are_fixed_slots_cut_at_nul() {
+        let mut data = vec![0u8; ETH_GSTRING_LEN * 3];
+        data[..12].copy_from_slice(b"rxq0: frames");
+        data[32..40].copy_from_slice(b"rx_drops");
+        data[64..96].copy_from_slice(&[b'x'; 32]);
+        assert_eq!(
+            parse_gstrings(&data, 3),
+            vec![
+                "rxq0: frames".to_string(),
+                "rx_drops".to_string(),
+                "x".repeat(32)
+            ]
+        );
+        assert_eq!(parse_gstrings(&data, 1), vec!["rxq0: frames".to_string()]);
     }
 
     fn stock() -> EthtoolCoalesce {
