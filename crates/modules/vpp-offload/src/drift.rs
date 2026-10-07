@@ -1731,22 +1731,15 @@ impl DriftWatch for KernelDriftWatch {
         // a stale one would drop a route via a bridge VPP no longer
         // reaches as if it were still a path VPP can take.
         self.refresh_bridged();
-        // The rules first: they say which tables to dump. A rule dump
-        // that fails filters nothing rather than failing the scan — the
-        // routes are the finding, the rules only narrow them, and losing
-        // the narrowing costs noise where losing the scan costs the
-        // blackhole.
-        let tables =
-            dump_rule_tables(netlink_packet_route::AddressFamily::Inet).unwrap_or_else(|e| {
-                tracing::debug!(error = %e, "policy-rule dump failed; dumping every table");
-                None
-            });
         let links = &mut self.links;
         let mut interrupt = || match links {
             Some(l) if interruptible => l.changed(),
             _ => None,
         };
-        let v4 = dump_routes(&self.reach, tables.as_deref(), &mut interrupt)?;
+        let (v4, tables) = dump_selected(
+            || selected_tables(netlink_packet_route::AddressFamily::Inet),
+            |t| dump_routes(&self.reach, t, &mut interrupt),
+        )?;
         let v4_ms = started.elapsed().as_millis() as u64;
         let divertible = match &self.scope.dst_only {
             Some(allow) => Divertible::OnlyDst(allow),
@@ -1813,11 +1806,10 @@ fn scan_v6(
     reach: &VppReach,
     interrupt: &mut dyn FnMut() -> Option<String>,
 ) -> Result<(V6Scan, usize), ScanError> {
-    let tables = dump_rule_tables(netlink_packet_route::AddressFamily::Inet6).unwrap_or_else(|e| {
-        tracing::debug!(error = %e, "IPv6 policy-rule dump failed; dumping every table");
-        None
-    });
-    let dump = dump_routes_v6(reach, tables.as_deref(), interrupt)?;
+    let (dump, tables) = dump_selected(
+        || selected_tables(netlink_packet_route::AddressFamily::Inet6),
+        |t| dump_routes_v6(reach, t, &mut *interrupt),
+    )?;
     Ok((
         classify_v6(&dump.routes, dump.link_local, reach, tables.as_deref()),
         dump.read,
@@ -1826,7 +1818,6 @@ fn scan_v6(
 
 /// One family's route dump: what [`dump_family`] kept, and how many
 /// routes it read to get there.
-#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 pub struct RouteDump<P> {
     /// The routes [`reach_clears`] does not clear, less the link-local
@@ -1836,6 +1827,63 @@ pub struct RouteDump<P> {
     pub link_local: Vec<LinkLocalRoute>,
     /// Route messages read off the socket, kept or not: the dump's cost.
     pub read: usize,
+}
+
+/// A family's routes from the tables its policy rules select, with the
+/// selection to judge them under (`None` = every table).
+///
+/// The rules are read before the routes, to know which tables to ask
+/// for, and again after: a rule added while the routes were being read
+/// selects a table the first read did not, and judging only the first
+/// selection would publish a clean verdict over its paths (review
+/// finding). Tables the second read adds are fetched then, and the
+/// second read is the selection — as it was when the rules were read
+/// only after the routes. If the selection stopped being knowable in
+/// between, every table is dumped.
+#[cfg(any(target_os = "linux", test))]
+fn dump_selected<P>(
+    mut rules: impl FnMut() -> Option<Vec<u32>>,
+    mut dump: impl FnMut(Option<&[u32]>) -> Result<RouteDump<P>, ScanError>,
+) -> Result<(RouteDump<P>, Option<Vec<u32>>), ScanError> {
+    let first = rules();
+    let mut got = dump(first.as_deref())?;
+    let last = rules();
+    match (&first, &last) {
+        (Some(before), Some(after)) => {
+            let missed: Vec<u32> = after
+                .iter()
+                .copied()
+                .filter(|t| !before.contains(t))
+                .collect();
+            if !missed.is_empty() {
+                let more = dump(Some(&missed))?;
+                got.routes.extend(more.routes);
+                got.link_local.extend(more.link_local);
+                got.read += more.read;
+            }
+        }
+        (Some(_), None) => {
+            let all = dump(None)?;
+            got = RouteDump {
+                read: got.read + all.read,
+                ..all
+            };
+        }
+        (None, _) => {}
+    }
+    Ok((got, last))
+}
+
+/// The tables `family`'s policy rules select ([`dump_rule_tables`]). A
+/// rule dump that fails filters nothing rather than failing the scan —
+/// the routes are the finding, the rules only narrow them, and losing the
+/// narrowing costs noise where losing the scan costs the blackhole.
+#[cfg(target_os = "linux")]
+fn selected_tables(family: netlink_packet_route::AddressFamily) -> Option<Vec<u32>> {
+    dump_rule_tables(family).unwrap_or_else(|e| {
+        tracing::debug!(error = %e, ?family, "policy-rule dump failed; dumping every table");
+        None
+    })
 }
 
 /// One blocking strict-check RTM_GETROUTE dump per table in `tables` —
@@ -2099,14 +2147,17 @@ fn dump_family<P>(
                 if len == 0 {
                     break;
                 }
-                // The kernel sets NLM_F_DUMP_INTR when the table changed
-                // under the dump, which makes the result a mix of two
-                // states rather than a snapshot. On a box with a live BGP
-                // feed that is not rare, and a partial list fails the
-                // dangerous way: a missing route reads as "no such path"
-                // and a missing rule narrows the filter onto an active
-                // table. Refuse it; the caller keeps its previous verdict
-                // and the next scan is a minute away (review finding).
+                // NLM_F_DUMP_INTR says the kernel saw the table change
+                // under the dump, making the result a mix of two states.
+                // Refuse it; the caller keeps its previous verdict and the
+                // next scan is a minute away (review finding). But route
+                // dumps on 5.15 never set it — neither family's dump keeps
+                // the sequence it checks — so it is not what keeps a scan
+                // honest. No route dump is a snapshot: the kernel serves
+                // it chunk by chunk and table by table, releasing the lock
+                // in between, so a route added to a table already read is
+                // missed — by one request per table or one for all alike —
+                // and is the next scan's to find.
                 if pkt.header.flags & NLM_F_DUMP_INTR != 0 {
                     return Err(ScanError::Unreadable(
                         "the kernel interrupted the dump (NLM_F_DUMP_INTR): the \
@@ -2412,11 +2463,29 @@ fn describe_link_state(state: u32) -> &'static str {
     }
 }
 
+/// The first device whose [`link_state`] differs between two readings, by
+/// ifindex, with its later state. A device absent from a reading counts as
+/// down there, so one that appears is a change only if it appears up, and
+/// one that vanishes only if it was up.
+#[cfg(any(target_os = "linux", test))]
+fn link_transition(
+    before: &std::collections::HashMap<u32, u32>,
+    after: &std::collections::HashMap<u32, u32>,
+) -> Option<(u32, u32)> {
+    let mut indexes: Vec<u32> = before.keys().chain(after.keys()).copied().collect();
+    indexes.sort_unstable();
+    indexes.dedup();
+    indexes.into_iter().find_map(|i| {
+        let now = after.get(&i).copied().unwrap_or(0);
+        (before.get(&i).copied().unwrap_or(0) != now).then_some((i, now))
+    })
+}
+
 /// Link up/down transitions, read from `RTNLGRP_LINK` without blocking,
 /// for [`Pacing`].
 ///
-/// Seeded with one link dump at open, so the first event a device sends
-/// is compared against its real state rather than read as news. A device
+/// Seeded with a link dump at open, so the first event a device sends is
+/// compared against its real state rather than read as news. A device
 /// that appears is a change only if it appears up, and one that vanishes
 /// only if it was up: an unconfigured interface coming and going moves no
 /// routes.
@@ -2424,6 +2493,9 @@ fn describe_link_state(state: u32) -> &'static str {
 pub struct KernelLinkWatch {
     socket: netlink_sys::Socket,
     state: std::collections::HashMap<u32, u32>,
+    /// A transition seen while seeding, reported by the first
+    /// [`Self::changed`].
+    pending: Option<String>,
     buf: Vec<u8>,
 }
 
@@ -2435,18 +2507,33 @@ impl KernelLinkWatch {
         socket
             .bind_auto()
             .map_err(|e| format!("netlink bind: {e}"))?;
-        // Subscribed before the seed dump, so a change between the two is
-        // queued rather than lost; replayed against the seed, it counts
-        // only if it differs.
+        // Seeded on both sides of the subscription. A change after it is
+        // queued, but replayed against a seed read after the change it
+        // compares equal and would be lost (review finding); a change
+        // before it is never queued at all. Either shows as a difference
+        // between the two seeds, so that is reported instead, and the
+        // events queued in between count only if they differ from the
+        // later seed.
+        let before = dump_link_states()?;
         socket
             .add_membership(libc::RTNLGRP_LINK)
             .map_err(|e| format!("RTNLGRP_LINK: {e}"))?;
         socket
             .set_non_blocking(true)
             .map_err(|e| format!("netlink non-blocking: {e}"))?;
+        let state = dump_link_states()?;
+        let pending = link_transition(&before, &state).map(|(index, now)| {
+            let name = crate::fdb::ifname(index);
+            if state.contains_key(&index) {
+                format!("{name} {}", describe_link_state(now))
+            } else {
+                format!("{name} removed")
+            }
+        });
         Ok(Self {
             socket,
-            state: dump_link_states()?,
+            state,
+            pending,
             buf: vec![0u8; 64 * 1024],
         })
     }
@@ -2467,7 +2554,7 @@ impl KernelLinkWatch {
                 })
                 .unwrap_or_else(|| crate::fdb::ifname(m.header.index))
         };
-        let mut latest = None;
+        let mut latest = self.pending.take();
         loop {
             let n = match self.socket.recv(&mut &mut self.buf[..], 0) {
                 Ok(n) => n,
@@ -3574,6 +3661,96 @@ mod tests {
             report.took
         );
         assert_eq!(report.result, Err("netlink recv: EIO".to_string()));
+    }
+
+    /// A dump stand-in for [`dump_selected`]: one route per table asked
+    /// for (`None` = tables 254 and 200), recording each request.
+    fn table_dump(
+        asked: &mut Vec<Option<Vec<u32>>>,
+        tables: Option<&[u32]>,
+    ) -> Result<RouteDump<Ipv4Prefix>, ScanError> {
+        asked.push(tables.map(<[u32]>::to_vec));
+        let routes: Vec<KernelRoute> = tables
+            .unwrap_or(&[254, 200])
+            .iter()
+            .map(|&t| {
+                let mut r = route(p(192, 0, 2, 0, 24), "vti64");
+                r.table = t;
+                r
+            })
+            .collect();
+        Ok(RouteDump {
+            read: routes.len(),
+            routes,
+            link_local: Vec::new(),
+        })
+    }
+
+    /// A rule added while the routes were being read selects a table the
+    /// first rule read did not; its routes are fetched before the scan is
+    /// judged, under the later selection.
+    #[test]
+    fn a_rule_added_mid_dump_has_its_table_dumped_too() {
+        let mut reads = vec![Some(vec![255, 254]), Some(vec![255, 254, 200])].into_iter();
+        let mut asked = Vec::new();
+        let (got, selection) =
+            dump_selected(|| reads.next().unwrap(), |t| table_dump(&mut asked, t)).unwrap();
+        assert_eq!(asked, vec![Some(vec![255, 254]), Some(vec![200])]);
+        assert_eq!(selection, Some(vec![255, 254, 200]));
+        let tables: Vec<u32> = got.routes.iter().map(|r| r.table).collect();
+        assert_eq!(tables, vec![255, 254, 200]);
+        assert_eq!(got.read, 3);
+    }
+
+    /// Rules that stop being knowable mid-scan leave nothing to filter by,
+    /// so every table is dumped; rules unknown from the start were already
+    /// dumped whole, and the later read narrows the judging only.
+    #[test]
+    fn a_selection_that_becomes_unknowable_dumps_every_table() {
+        let mut reads = vec![Some(vec![254]), None].into_iter();
+        let mut asked = Vec::new();
+        let (got, selection) =
+            dump_selected(|| reads.next().unwrap(), |t| table_dump(&mut asked, t)).unwrap();
+        assert_eq!(asked, vec![Some(vec![254]), None]);
+        assert_eq!(selection, None);
+        assert_eq!(
+            got.routes.len(),
+            2,
+            "the full dump replaces the partial one"
+        );
+        assert_eq!(got.read, 3, "both reads count as cost");
+
+        let mut reads = vec![None, Some(vec![254])].into_iter();
+        let mut asked = Vec::new();
+        let (_, selection) =
+            dump_selected(|| reads.next().unwrap(), |t| table_dump(&mut asked, t)).unwrap();
+        assert_eq!(asked, vec![None], "one dump, of every table");
+        assert_eq!(selection, Some(vec![254]));
+    }
+
+    /// The two link seeds are compared by up/down state, absent = down.
+    #[test]
+    fn a_transition_between_the_link_seeds_is_found() {
+        use std::collections::HashMap;
+        let up = (libc::IFF_UP | libc::IFF_RUNNING) as u32;
+        let before: HashMap<u32, u32> = [(1, up), (2, up), (3, 0)].into();
+        assert_eq!(link_transition(&before, &before), None);
+        let mut after = before.clone();
+        after.insert(4, 0);
+        assert_eq!(
+            link_transition(&before, &after),
+            None,
+            "a device appearing down is no transition"
+        );
+        after.insert(2, 0);
+        assert_eq!(link_transition(&before, &after), Some((2, 0)));
+        let mut after = before.clone();
+        after.remove(&1);
+        assert_eq!(
+            link_transition(&before, &after),
+            Some((1, 0)),
+            "an up device vanishing is one"
+        );
     }
 
     /// The operator-facing line names the three things needed to act:
