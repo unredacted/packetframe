@@ -241,6 +241,33 @@ pub trait RouteSource {
     /// inherited a default and silently dropped work.
     fn requeue_via(&self, _nexthops: &[IpAddr]) {}
 
+    /// Drop every queued ROUTE delta, because a resync walk is about to
+    /// read the whole mirror and supersedes them.
+    ///
+    /// [`ConvergenceEngine::begin_resync`] calls this immediately before
+    /// its walk. Everything queued until then describes a state the walk
+    /// reads — an updated prefix holds its latest nexthops in the mirror —
+    /// or one the diff derives: a withdrawn prefix is absent from the
+    /// mirror, and the diff withdraws whatever the ledger knows and the
+    /// walk does not see. Left queued, those deltas came back through
+    /// `apply_changes` on the ticks after the diff and re-sent every
+    /// route the diff had just classified unchanged, as a replace, which
+    /// is the whole table when the mirror filled while a deferral held
+    /// the drain (a ledger seed, or a full reload): ~1.35M route ops VPP
+    /// already held, and a first-steer gate that waits for them (review
+    /// finding, PR #324).
+    ///
+    /// Deltas written AFTER this call stay queued, including those for
+    /// prefixes the walk reads after they change: the walk is not a
+    /// coherent snapshot, and a change landing behind its cursor is caught
+    /// only as a delta. Neighbour deltas are kept — a handful, and
+    /// `apply_neighbour` skips one VPP already holds.
+    ///
+    /// A default no-op, because only the live feed queues anything. The
+    /// delegating `Arc<RouteFeed>` forwards it explicitly and a test pins
+    /// that, as for [`Self::requeue_via`].
+    fn discard_route_deltas(&self) {}
+
     /// How many changes are queued but not yet handed over.
     ///
     /// Reported so a source that is filling faster than the engine drains
@@ -3772,6 +3799,10 @@ impl ConvergenceEngine {
         self.fib_match_spent = Duration::ZERO;
         self.fib_match_halted = None;
         let families = self.drainer.families();
+        // Immediately before the walk, never earlier: what is queued now
+        // is what the walk supersedes, and anything written from here on
+        // stays a delta. See `RouteSource::discard_route_deltas`.
+        src.discard_route_deltas();
         src.for_each_route(&mut |prefix, nexthops| {
             // A family VPP does not carry never enters the diff — the
             // route-side twin of the neighbour filter

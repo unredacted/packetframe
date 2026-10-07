@@ -4319,6 +4319,116 @@ mod seeded_mirror {
         }
         (now, seen)
     }
+
+    /// A static mirror whose neighbour sits on a REAL host interface, so a
+    /// later daemon can read the same table out of the production
+    /// `RouteFeed` (whose neighbour walk names devices with
+    /// `if_indextoname`) and resolve it identically.
+    pub struct DevMirror {
+        pub routes: Vec<IpPrefix>,
+        pub dev: String,
+    }
+    impl RouteSource for DevMirror {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
+        fn route_count(&self) -> u64 {
+            self.routes.len() as u64
+        }
+        fn change_seq(&self) -> u64 {
+            self.routes.len() as u64
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for p in &self.routes {
+                visit(*p, &[fake_vpp::nh()]);
+            }
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(fake_vpp::nh(), &self.dev, MAC);
+        }
+    }
+
+    /// A runtime whose one port is the host interface `dev`.
+    pub fn runtime_on(
+        fake: &Fake,
+        dev: &str,
+        source: Box<dyn RouteSource>,
+        steering: Box<dyn packetframe_vpp_offload::runtime::Steering>,
+        store: Box<dyn packetframe_vpp_offload::runtime::IdentityStore>,
+    ) -> Runtime {
+        let engine = ConvergenceEngine::new(
+            &fake.path,
+            vec![PortAttach {
+                port: dev.into(),
+                pci_addr: "0002:07:00.1".into(),
+                port_id: 0,
+                num_rx_queues: 1,
+                pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                accept_macs: vec![],
+                mtu: None,
+                vlans: vec![],
+            }],
+            vec![dev.into()],
+            1_000_000,
+            FamilyPolicy::V4Only,
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            },
+        );
+        Runtime::new(
+            engine,
+            source,
+            steering,
+            store,
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        )
+    }
+
+    /// The previous daemon: converges `routes` onto the fake through
+    /// `dev`, unsteered, and preserves VPP's route ledger.
+    pub fn daemon_a_on(
+        fake: &Fake,
+        dev: &str,
+        routes: Vec<IpPrefix>,
+    ) -> packetframe_vpp_offload::ledger_record::LedgerBody {
+        let captured = Arc::new(Mutex::new(None));
+        {
+            let rt = runtime_on(
+                fake,
+                dev,
+                Box::new(DevMirror {
+                    routes,
+                    dev: dev.into(),
+                }),
+                Box::new(SteeringUnavailable),
+                Box::new(super::preserved::CaptureStore(captured.clone())),
+            );
+            {
+                let (mut obs, _) = rt.views();
+                use packetframe_vpp_offload::driver::Observe as _;
+                assert!(obs.api_ready(), "the fake must answer the handshake");
+            }
+            let mut d = Driver::new();
+            let t0 = Instant::now();
+            {
+                let (_, mut fx) = rt.views();
+                d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+            }
+            run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+            rt.preserve(d.state())
+                .expect("a converged ledger preserves");
+        }
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the ledger was left");
+        let _ = fake.drain_events();
+        body
+    }
 }
 
 /// The restart this exists for: a VPP that was not steered when the
@@ -4431,4 +4541,140 @@ fn a_reconnect_shuts_the_seeded_door_until_the_replay_goes_quiet() {
 
     let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Ready);
     assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+}
+
+/// What the seeded door must not cost: re-sending the table. The
+/// production `RouteFeed` queues a delta for every route the fast-path
+/// seed resolved, and the deferral drains none of them; the diff then
+/// classifies those routes unchanged against the preserved VPP ledger —
+/// and before the resync discarded the deltas it supersedes, the next
+/// ticks pulled them all back through `apply_changes` and re-sent the
+/// whole table as replaces, holding the first steer behind ~1.35M route
+/// ops VPP already had (review finding, PR #324).
+///
+/// The feed here moved while the daemon was down: one route withdrawn,
+/// one new, the rest identical. VPP must see exactly that delta, the
+/// feed's backlog must be empty at `Ready`, and a route learned
+/// afterwards must still reach VPP.
+#[test]
+fn a_seeded_release_sends_vpp_only_what_changed() {
+    use packetframe_common::fib::ResolvedRouteSink as _;
+    use packetframe_common::fib::{AuthorityObservation, CompletenessReport, TableCompleteness};
+    use packetframe_vpp_offload::feed::RouteFeed;
+    use std::sync::{Arc, Mutex};
+
+    let (ifindex, dev) = local_interface();
+    let fake = Fake::start_behaving(
+        "seeded-delta",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let table = seeded_mirror::seed();
+    let body = seeded_mirror::daemon_a_on(&fake, &dev, table.clone());
+
+    // The fast-path seed lands in the production feed before vpp-offload
+    // adopts, and the route source changed two routes meanwhile.
+    let gone = table[0];
+    let new = IpPrefix::V4 {
+        addr: [198, 51, 100, 64],
+        prefix_len: 26,
+    };
+    let feed = Arc::new(RouteFeed::new());
+    feed.neighbour_resolved(fake_vpp::nh(), MAC, ifindex);
+    for p in table.iter().skip(1).copied().chain([new]) {
+        feed.route_resolved(p, &[fake_vpp::nh()]);
+    }
+    assert_eq!(feed.stats().pending, 6, "a delta per seeded route");
+
+    let log: steered::Log = Arc::new(Mutex::new(Vec::new()));
+    let rt = seeded_mirror::runtime_on(
+        &fake,
+        &dev,
+        Box::new(feed.clone()),
+        Box::new(steered::RecordingSteering {
+            rules: Vec::new(),
+            log: log.clone(),
+        }),
+        Box::new(NullStore),
+    );
+    let session = Arc::new(packetframe_common::fib::FeedSession::new());
+    session.mark_mirror_seeded();
+    rt.feed_session(session.clone());
+    let authority = Arc::new(TableCompleteness::new());
+    rt.require_table_complete(authority.clone());
+    rt.seed_ledger(preserved::record(body));
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+    session.set_up(true);
+    authority.record(AuthorityObservation::Clean(CompletenessReport {
+        authority_routes: 6,
+        mirror_routes: 6,
+        at: std::time::Instant::now(),
+    }));
+
+    let f = seeded_mirror::Fixture {
+        fake,
+        log,
+        rt,
+        session,
+        authority,
+    };
+    let (mut now, seen) = seeded_mirror::replay(&mut d, &f, t0, 400, |d| d.state() == State::Ready);
+    assert_eq!(d.state(), State::Ready, "{seen:?}");
+    let events = f.fake.drain_events();
+    assert_eq!(preserved::dumps(&events), 0, "VPP's FIB was never read");
+    let IpPrefix::V4 {
+        addr: gone_addr, ..
+    } = gone
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        preserved::route_ops(&events),
+        vec![(false, gone_addr), (true, [198, 51, 100, 64])],
+        "only what changed reached VPP, not the seeded table again"
+    );
+    assert_eq!(feed.stats().pending, 0, "the backlog the steer gate reads");
+
+    // A change after the walk is an ordinary delta.
+    let late = IpPrefix::V4 {
+        addr: [198, 51, 100, 128],
+        prefix_len: 26,
+    };
+    feed.route_resolved(late, &[fake_vpp::nh()]);
+    let mut saw_late = false;
+    {
+        let (mut obs, mut fx) = f.rt.views();
+        for _ in 0..64 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in f.rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            saw_late |= f.fake.drain_events().iter().any(|e| {
+                matches!(e, fake_vpp::Event::Route(r) if r.is_add && r.addr == [198, 51, 100, 128])
+            });
+            if saw_late {
+                break;
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        saw_late,
+        "a route learned after the release still reaches VPP"
+    );
 }
