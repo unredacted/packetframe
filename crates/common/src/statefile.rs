@@ -429,6 +429,27 @@ pub fn renameat_within(dir: &std::fs::File, from: &str, to: &str) -> std::io::Re
 /// intermediate component can redirect the write. A symlink planted at
 /// `<name>` is replaced by the rename, never written through.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_atomic_gated(path, contents, &|| true).map(|_| ())
+}
+
+/// [`write_atomic`], asking `commit` between the fsync and the rename
+/// whether the record should still go into place. `Ok(false)` when it
+/// said no: the temp file is removed (best effort) and nothing is
+/// renamed, so the path holds whatever it held before.
+///
+/// For a writer bounded by a deadline it cannot enforce on the
+/// filesystem calls themselves: the caller gives up from another
+/// thread, and this one, when its I/O finally returns, finds the gate
+/// closed instead of renaming a record its caller has already reported
+/// as not written. A temp file left by a process that exits first is
+/// never read (readers open the final name only) and is replaced by the
+/// next write's `O_EXCL` retry.
+pub fn write_atomic_gated(
+    path: &Path,
+    contents: &[u8],
+    commit: &dyn Fn() -> bool,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = file_name(path)?;
     let dir = create_and_open_dir_no_follow(parent)?;
@@ -438,7 +459,14 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         f.write_all(contents)?;
         f.sync_all()?;
     }
-    renameat_within(&dir, &tmp, name)
+    if !commit() {
+        if let Ok(c) = std::ffi::CString::new(tmp) {
+            unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) };
+        }
+        return Ok(false);
+    }
+    renameat_within(&dir, &tmp, name)?;
+    Ok(true)
 }
 
 /// Why [`read_owned_no_follow`] returned no contents.
@@ -1081,6 +1109,23 @@ mod tests {
         );
         std::os::unix::fs::chown(&dir, Some(0), None).unwrap();
         assert!(read_owned_no_follow(&rec, 64).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate is asked after the fsync and before the rename: a closed
+    /// gate leaves neither the record nor its temp file.
+    #[test]
+    fn a_closed_gate_renames_nothing_into_place() {
+        let dir = closed_tmpdir("gated");
+        let rec = dir.join("record.bin");
+        assert!(!write_atomic_gated(&rec, b"payload", &|| false).unwrap());
+        assert!(!rec.exists());
+        assert!(!dir.join("record.bin.tmp").exists());
+        assert!(write_atomic_gated(&rec, b"payload", &|| true).unwrap());
+        assert_eq!(std::fs::read(&rec).unwrap(), b"payload");
+        // A closed gate over an existing record leaves it as it was.
+        assert!(!write_atomic_gated(&rec, b"other", &|| false).unwrap());
+        assert_eq!(std::fs::read(&rec).unwrap(), b"payload");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

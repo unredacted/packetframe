@@ -743,14 +743,17 @@ impl RouteController {
     ///
     /// Only on the preserving exit (`Module::exit_preserving`), before the
     /// controller is dropped. The programmer snapshots the mirror on its
-    /// own task, so the record is one consistent moment; this thread
-    /// waits at most [`crate::fib::route_ledger::PRESERVE_BUDGET`] for it
-    /// and writes nothing past that — the next start then loads cold,
-    /// which is what every start did before. Then the write: temp file,
-    /// fsync, rename, so a stop that dies mid-write leaves no record
-    /// rather than half of one.
+    /// own task, so the record is one consistent moment. The snapshot and
+    /// the write (temp file, fsync, rename) share one deadline,
+    /// [`crate::fib::route_ledger::PRESERVE_BUDGET`] from the call: this
+    /// is the loader's signal thread, and neither a wedged programmer nor
+    /// a wedged filesystem may hold the exit past it. Past it nothing is
+    /// renamed into place ([`crate::fib::route_ledger::write_within`]) and
+    /// the next start loads cold, which is what every start did before; a
+    /// stop that dies mid-write likewise leaves no record rather than half
+    /// of one.
     pub fn preserve_route_ledger(&self, state_dir: &Path) -> Preserved {
-        use crate::fib::route_ledger::{now_unix, write, PRESERVE_BUDGET};
+        use crate::fib::route_ledger::{now_unix, write_within, PRESERVE_BUDGET};
         let Some(identity) = self.ledger_identity.clone() else {
             return Preserved::NotWritten(
                 "no route source is configured, so no start could ever match a ledger".into(),
@@ -762,6 +765,7 @@ impl RouteController {
         let prog = self.prog_handle.clone();
         let written_at_unix = now_unix();
         let started = Instant::now();
+        let deadline = started + PRESERVE_BUDGET;
         let encoded = runtime.block_on(async move {
             tokio::time::timeout(
                 PRESERVE_BUDGET,
@@ -780,14 +784,26 @@ impl RouteController {
             Ok(Ok(e)) => e,
         };
         let encode = started.elapsed();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Preserved::NotWritten(format!(
+                "the snapshot used the whole {} s budget, leaving none for the write",
+                PRESERVE_BUDGET.as_secs()
+            ));
+        }
+        let (counts, bytes, confirmed_at_unix) = (
+            encoded.counts,
+            encoded.bytes.len(),
+            encoded.confirmed_at_unix,
+        );
         let started = Instant::now();
-        if let Err(e) = write(state_dir, &encoded.bytes) {
+        if let Err(e) = write_within(state_dir, encoded.bytes, remaining) {
             return Preserved::NotWritten(e);
         }
         Preserved::Written {
-            counts: encoded.counts,
-            bytes: encoded.bytes.len(),
-            confirmed_at_unix: encoded.confirmed_at_unix,
+            counts,
+            bytes,
+            confirmed_at_unix,
             written_at_unix,
             encode,
             write: started.elapsed(),

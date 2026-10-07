@@ -79,7 +79,8 @@
 //! route and ~24 per v6, peers and nexthops interned once, a trailing
 //! FNV-1a checksum. Written with the hardened state-directory primitives
 //! (component-wise no-follow walk, `O_EXCL|O_NOFOLLOW` temp file, fsync,
-//! `renameat`).
+//! `renameat`), within [`PRESERVE_BUDGET`] together with the snapshot
+//! ([`write_within`]).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -106,12 +107,15 @@ const MAGIC: &[u8; 8] = b"PFFIBLGR";
 /// across the restart.
 pub const CLOCK_SLACK: Duration = Duration::from_secs(60);
 
-/// How long a preserving stop waits for the programmer to snapshot the
-/// mirror. The same five seconds vpp-offload gives its own ledger: long
-/// enough for a 1.35M-route mirror several times over (see the PR's
-/// measurement), short enough that a wedged programmer cannot hold a
-/// `systemctl stop` hostage. Past it nothing is written, and the next
-/// start loads cold.
+/// How long a preserving stop spends on the whole ledger: the
+/// programmer's snapshot and encode, then the write, fsync and rename,
+/// against one deadline. The same five seconds vpp-offload gives its
+/// own ledger (its `PRESERVE_BUDGET`, which bounds its loop's write the
+/// same way): long enough for a 1.35M-route mirror several times over
+/// (~340 ms to encode, ~10 ms to write, measured), short enough that a
+/// wedged programmer or a wedged filesystem cannot hold a `systemctl
+/// stop` hostage. Past it nothing is renamed into place (see
+/// [`write_within`]), and the next start loads cold.
 pub const PRESERVE_BUDGET: Duration = Duration::from_secs(5);
 
 /// Widest unsigned LEB128 encoding of a `u32`.
@@ -1014,7 +1018,128 @@ pub fn path_in(state_dir: &Path) -> PathBuf {
 /// written through.
 pub fn write(state_dir: &Path, bytes: &[u8]) -> Result<(), String> {
     let path = path_in(state_dir);
-    write_record(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))
+    write_record_gated(&path, bytes, &|| true)
+        .map(|_| ())
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// [`write`], given up after `budget`: the preserving stop's write.
+///
+/// Every step of the write (the directory walk, the temp file, its
+/// fsync, the rename) is a filesystem call nothing can interrupt, so it
+/// runs on a helper thread and this one waits at most `budget` for it —
+/// the shape vpp-offload's `shutdown_preserving` gives its own ledger
+/// write. Past the deadline the write is abandoned and the stop goes on:
+/// the helper, whenever its I/O returns, finds the commit gate closed
+/// and removes its temp file instead of renaming it into place, so no
+/// record appears after the caller has reported none. A process that
+/// exits first leaves at most the temp file, which no start reads (it
+/// opens the record's own name only) and the next write replaces. The
+/// one case the deadline cannot settle is a rename already under way
+/// when it passes; `rename` is atomic, so that ends in a whole record or
+/// none, and the error says so.
+pub fn write_within(state_dir: &Path, bytes: Vec<u8>, budget: Duration) -> Result<(), String> {
+    write_within_using(state_dir, bytes, budget, write_record_gated)
+}
+
+/// Whether a helper's write may still rename its record into place.
+/// Exactly one of [`Self::commit`] and [`Self::abandon`] succeeds.
+#[derive(Default)]
+struct CommitGate(std::sync::atomic::AtomicU8);
+
+const GATE_OPEN: u8 = 0;
+const GATE_COMMITTING: u8 = 1;
+const GATE_ABANDONED: u8 = 2;
+
+impl CommitGate {
+    /// The writer, between its fsync and its rename.
+    fn commit(&self) -> bool {
+        self.swap_from_open(GATE_COMMITTING)
+    }
+
+    /// The waiter, at its deadline.
+    fn abandon(&self) -> bool {
+        self.swap_from_open(GATE_ABANDONED)
+    }
+
+    fn swap_from_open(&self, to: u8) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0
+            .compare_exchange(GATE_OPEN, to, SeqCst, SeqCst)
+            .is_ok()
+    }
+}
+
+/// [`write_within`] with the write itself supplied, so a test can stand
+/// in for a filesystem that wedges.
+fn write_within_using<W>(
+    state_dir: &Path,
+    bytes: Vec<u8>,
+    budget: Duration,
+    writer: W,
+) -> Result<(), String>
+where
+    W: FnOnce(&Path, &[u8], &dyn Fn() -> bool) -> std::io::Result<bool> + Send + 'static,
+{
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+    let path = path_in(state_dir);
+    let gate = Arc::new(CommitGate::default());
+    let (tx, rx) = sync_channel(1);
+    let spawned = {
+        let gate = gate.clone();
+        let path = path.clone();
+        std::thread::Builder::new()
+            .name("pf-ledger-write".into())
+            .spawn(move || {
+                let outcome = writer(&path, &bytes, &|| gate.commit());
+                let _ = tx.send(outcome);
+            })
+    };
+    if let Err(e) = spawned {
+        return Err(format!(
+            "write {}: could not start the write thread: {e}",
+            path.display()
+        ));
+    }
+    let budget_ms = budget.as_millis();
+    let outcome = match rx.recv_timeout(budget) {
+        Ok(outcome) => outcome,
+        Err(RecvTimeoutError::Disconnected) => {
+            return Err(format!(
+                "write {}: the write thread ended without an outcome",
+                path.display()
+            ))
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            if gate.abandon() {
+                return Err(format!(
+                    "write {}: did not finish within its {budget_ms} ms budget (a slow or wedged \
+                     filesystem); abandoned before the rename, so no record is in place",
+                    path.display()
+                ));
+            }
+            // The writer took the gate first: its rename is under way.
+            match rx.try_recv() {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return Err(format!(
+                        "write {}: did not finish within its {budget_ms} ms budget; its rename \
+                         was already under way, so the record is either whole or absent",
+                        path.display()
+                    ))
+                }
+            }
+        }
+    };
+    match outcome {
+        Ok(true) => Ok(()),
+        // Only a closed gate says no, and only `abandon` closes it.
+        Ok(false) => Err(format!(
+            "write {}: abandoned before the rename",
+            path.display()
+        )),
+        Err(e) => Err(format!("write {}: {e}", path.display())),
+    }
 }
 
 /// Remove the record if there is one. `packetframe detach` (a full one)
@@ -1033,12 +1158,20 @@ pub fn remove(state_dir: &Path) -> Result<(), String> {
 // ledger and fast-path's coalescing record make. Nothing privileged runs
 // off Linux.
 #[cfg(target_os = "linux")]
-fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    packetframe_common::statefile::write_atomic(path, contents)
+fn write_record_gated(
+    path: &Path,
+    contents: &[u8],
+    commit: &dyn Fn() -> bool,
+) -> std::io::Result<bool> {
+    packetframe_common::statefile::write_atomic_gated(path, contents, commit)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+fn write_record_gated(
+    path: &Path,
+    contents: &[u8],
+    commit: &dyn Fn() -> bool,
+) -> std::io::Result<bool> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1049,7 +1182,12 @@ fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         f.write_all(contents)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    if !commit() {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(false);
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(true)
 }
 
 /// Why the record could not be read, before any check of its contents.
@@ -2192,6 +2330,61 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A filesystem that wedges mid-write: the record reaches its temp
+    /// file and the fsync, which then returns only long after the
+    /// deadline. The stop gives up within its budget; when the fsync
+    /// finally returns, the gate is closed, so nothing is renamed into
+    /// place and the temp file goes too — the next start finds no
+    /// ledger, rather than one the stop reported as never written.
+    #[test]
+    fn a_stuck_write_times_out_within_its_budget_and_leaves_nothing_a_start_accepts() {
+        use std::sync::mpsc;
+        let dir = tmpdir("stuck");
+        let budget = Duration::from_millis(200);
+        let wedge = Duration::from_millis(1500);
+        let (done_tx, done_rx) = mpsc::channel();
+        let started = Instant::now();
+        let r = write_within_using(
+            &dir,
+            encode(&meta(), &routes()).unwrap(),
+            budget,
+            move |path, contents, commit| {
+                let r = write_record_gated(path, contents, &|| {
+                    std::thread::sleep(wedge);
+                    commit()
+                });
+                let _ = done_tx.send(r.as_ref().ok().copied());
+                r
+            },
+        );
+        let took = started.elapsed();
+        let e = r.unwrap_err();
+        assert!(e.contains("did not finish within"), "{e}");
+        assert!(
+            took >= budget && took < budget + Duration::from_millis(500),
+            "gave up after {took:?}, not within its {budget:?} budget"
+        );
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Some(false),
+            "the late writer found the gate closed"
+        );
+        assert!(!path_in(&dir).exists(), "nothing renamed into place");
+        assert!(
+            !path_in(&dir).with_extension("bin.tmp").exists(),
+            "and no temp file left"
+        );
+        assert!(matches!(
+            consume(&dir, &expect()),
+            Consumed::Refused(Refusal::Missing)
+        ));
+
+        // The same write, unwedged, lands within the budget.
+        write_within(&dir, encode(&meta(), &routes()).unwrap(), budget).unwrap();
+        assert!(matches!(consume(&dir, &expect()), Consumed::Seed(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

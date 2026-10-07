@@ -999,9 +999,21 @@ confirms it route by route instead of building it.
 
 Only at a **clean preserving exit** — SIGTERM / `systemctl stop`, where
 the loader calls `Module::exit_preserving` just before it drops the
-modules. A crash, a `kill -9`, a circuit-breaker trip, or a snapshot
-that takes longer than 5 s writes nothing, and the next start loads
-cold, as every start used to.
+modules. A crash, a `kill -9` or a circuit-breaker trip writes nothing,
+and the next start loads cold, as every start used to.
+
+The snapshot and the write (temp file, fsync, rename) share one **5 s
+budget**, so neither a wedged programmer nor a wedged filesystem can
+hold the exit. The write runs on a helper thread; past the deadline the
+stop gives up and goes on (`reason=... did not finish within its 5000
+ms budget ...`), and when the helper's I/O finally returns it removes
+its temp file instead of renaming it into place. So a stop that gave up
+leaves no ledger, and the next start loads cold. (A temp file left by a
+process that exited first is never read: a start opens only the
+ledger's own name, and the next write replaces it. The one outcome the
+deadline cannot settle is a rename already under way when it passes;
+`rename` is atomic, so that ends in a whole ledger or none, and the
+reason says so.)
 
 ```
 preserved the route mirror as the route ledger: the next start seeds from it ...
