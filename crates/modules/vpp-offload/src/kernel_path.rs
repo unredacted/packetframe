@@ -640,6 +640,11 @@ fn write_affinity(proc_irq: &Path, irq: u32, cpus: &str) -> Result<(), String> {
     std::fs::write(&p, format!("{cpus}\n")).map_err(|e| format!("write {}: {e}", p.display()))
 }
 
+/// Whether a `/proc/irq` CPU list names exactly `cpu`.
+fn exactly(list: &str, cpu: u16) -> bool {
+    cores::parse_cpu_list(list).ok() == Some(vec![cpu])
+}
+
 /// What restoring one record did.
 #[derive(Debug, PartialEq, Eq)]
 enum Restore {
@@ -732,6 +737,11 @@ pub fn restore_recorded(state_dir: &Path, proc_irq: &Path, boot_id: &str) -> Res
 /// `ethtool -S` for one interface: `(name, value)` in the driver's order.
 type StatsReader = Box<dyn FnMut(&str) -> std::io::Result<Vec<(String, u64)>>>;
 
+/// The `smp_affinity_list` write a placement makes: `(proc_irq, irq,
+/// cpus)`. A seam so a refused write can be tested — root writes
+/// through file permissions, so a fixture cannot refuse one otherwise.
+type AffinityWriter = Box<dyn FnMut(&Path, u32, &str) -> Result<(), String>>;
+
 /// The real [`KernelPath`]: `/proc/irq`, sysfs and `SIOCETHTOOL`.
 pub struct LiveKernelPath {
     sysfs_net: PathBuf,
@@ -745,6 +755,8 @@ pub struct LiveKernelPath {
     boot_id: String,
     /// `ethtool -S`, a seam for tests.
     stats: StatsReader,
+    /// The placement write, a seam for tests.
+    write: AffinityWriter,
     unplaced: Vec<(String, String)>,
     placed: Vec<Queue0Record>,
     /// Why the record could not be read, if it could not. Placement is
@@ -793,12 +805,20 @@ impl LiveKernelPath {
             avoid,
             boot_id,
             stats,
+            write: Box::new(write_affinity),
             unplaced: Vec::new(),
             placed: Vec::new(),
             frozen: None,
         };
         me.load_current();
         me
+    }
+
+    /// Replace the placement write — tests only.
+    #[cfg(test)]
+    fn with_writer(mut self, write: AffinityWriter) -> Self {
+        self.write = write;
+        self
     }
 
     /// The record as this boot sees it: another boot's is dropped, an
@@ -983,10 +1003,14 @@ impl KernelPath for LiveKernelPath {
         self.log_unplaced();
     }
 
+    /// One entry per port: a port this reconcile could not place is
+    /// reported unplaced even where an earlier placement's record stands
+    /// (kept so it can be restored), since the reason is what is current.
     fn queue0_irqs(&self) -> Vec<(String, Queue0Irq)> {
         let mut out: Vec<(String, Queue0Irq)> = self
             .placed
             .iter()
+            .filter(|r| !self.unplaced.iter().any(|(i, _)| *i == r.iface))
             .map(|r| {
                 (
                     r.iface.clone(),
@@ -1022,12 +1046,23 @@ impl KernelPath for LiveKernelPath {
 }
 
 impl LiveKernelPath {
+    /// Put `previous` back as the record for `choice`'s IRQ — or no
+    /// record, when there was none.
+    fn reinstate(&mut self, choice: &Queue0Choice, previous: Option<Queue0Record>) {
+        self.placed
+            .retain(|r| !(r.iface == choice.iface && r.irq == choice.irq));
+        self.placed.extend(previous);
+    }
+
     /// Write one placement, recording the prior affinity FIRST.
     fn place(&mut self, choice: Queue0Choice) {
         let existing = self
             .placed
             .iter()
             .position(|r| r.iface == choice.iface && r.irq == choice.irq);
+        // What the record said before this attempt, so a write that does
+        // not land leaves it saying exactly that.
+        let previous: Option<Queue0Record> = existing.map(|k| self.placed[k].clone());
         let now = match read_affinity(&self.proc_irq, choice.irq) {
             Ok(s) => s,
             Err(e) => {
@@ -1035,17 +1070,13 @@ impl LiveKernelPath {
                 return;
             }
         };
-        if let Some(k) = existing {
-            if self.placed[k].placed == choice.cpu
-                && cores::parse_cpu_list(&now).ok() == Some(vec![choice.cpu])
-            {
-                return; // already where it should be
-            }
+        if previous.as_ref().is_some_and(|p| p.placed == choice.cpu) && exactly(&now, choice.cpu) {
+            return; // already where it should be
         }
         // The prior survives a re-placement and a daemon restart: it is
         // what was there before PacketFrame first wrote, not what the
         // last placement left.
-        let prior = existing.map_or(now.clone(), |k| self.placed[k].prior.clone());
+        let prior = previous.as_ref().map_or(now.clone(), |p| p.prior.clone());
         let rec = Queue0Record {
             iface: choice.iface.clone(),
             irq: choice.irq,
@@ -1065,13 +1096,15 @@ impl LiveKernelPath {
                 "could not record the queue-0 IRQ's prior affinity, so it is not moved: a \
                  placement that cannot be restored is not made"
             );
-            self.placed
-                .retain(|r| !(r.iface == choice.iface && r.irq == choice.irq));
+            // The file still holds the previous record; so does memory
+            // now. Dropping it here instead lost an existing placement's
+            // prior, and the next persist would have written that loss.
+            self.reinstate(&choice, previous);
             self.unplaced
                 .push((choice.iface, format!("recording it: {e}")));
             return;
         }
-        match write_affinity(&self.proc_irq, choice.irq, &choice.cpu.to_string()) {
+        match (self.write)(&self.proc_irq, choice.irq, &choice.cpu.to_string()) {
             Ok(()) => tracing::info!(
                 iface = %choice.iface,
                 irq = choice.irq,
@@ -1087,16 +1120,22 @@ impl LiveKernelPath {
                     error = %e,
                     "could not place the queue-0 IRQ; it stays where it was"
                 );
-                // Nothing was written: the record must not claim a
-                // placement, or a later restore would compare against a
-                // CPU this module never set.
-                match existing {
-                    Some(_) => {} // the previous placement record still stands
-                    None => self
-                        .placed
-                        .retain(|r| !(r.iface == choice.iface && r.irq == choice.irq)),
+                // Nothing was written, so the record goes back to what
+                // it said before. Leaving the new CPU in it — which this
+                // did for a RE-placement — recorded a CPU the IRQ never
+                // held, and the teardown then read the IRQ's real CPU as
+                // someone else's change and dropped the record without
+                // restoring the prior (review finding).
+                let left_on = previous.as_ref().map(|p| p.placed);
+                self.reinstate(&choice, previous);
+                if let Err(pe) = self.persist() {
+                    tracing::warn!(error = %pe, "could not write the queue-0 IRQ record");
                 }
-                self.unplaced.push((choice.iface, e));
+                let why = match left_on {
+                    Some(cpu) => format!("{e}; still on cpu {cpu}, where it was placed before"),
+                    None => e,
+                };
+                self.unplaced.push((choice.iface, why));
             }
         }
     }
@@ -1444,6 +1483,46 @@ mod tests {
         kp.reconcile_queue0(&[], &[]);
         assert_eq!(h.affinity(100), theirs);
         assert!(!record_path(&h.state()).exists(), "the record is dropped");
+    }
+
+    /// A RE-placement whose write is refused leaves the record saying
+    /// where the IRQ really is. Here the CPU it was placed on has become
+    /// one of VPP's, the move to another is refused, and the record
+    /// must still name the old CPU — so the teardown recognises the
+    /// IRQ as ours and puts the ORIGINAL prior back, rather than reading
+    /// it as moved by someone else and dropping the record.
+    #[test]
+    fn a_refused_replacement_keeps_the_record_restorable() {
+        let h = Host::new("refused");
+        h.port("eth2", 100, 4);
+        let want = vec!["eth2".to_string()];
+        h.path(vec![17]).reconcile_queue0(&want, &[]);
+        let first = load(&h.state()).unwrap().irqs[0].clone();
+        assert_eq!(first.prior, "0");
+        assert_eq!(h.affinity(100), first.placed.to_string());
+
+        // VPP now owns that CPU, so the planner must move the IRQ — and
+        // the kernel refuses the write.
+        let mut kp = h
+            .path(vec![first.placed, 17])
+            .with_writer(Box::new(|_, _, _| Err("write refused (EIO)".to_string())));
+        kp.reconcile_queue0(&want, &[]);
+        assert_eq!(h.affinity(100), first.placed.to_string(), "nothing moved");
+        assert_eq!(
+            load(&h.state()).unwrap().irqs,
+            vec![first.clone()],
+            "the record still names the CPU the IRQ is on, and the original prior"
+        );
+        assert!(matches!(
+            &kp.queue0_irqs()[..],
+            [(_, Queue0Irq::Unplaced { why })] if why.contains("write refused")
+                && why.contains(&format!("still on cpu {}", first.placed))
+        ));
+
+        // The teardown restores the original affinity.
+        h.path(vec![17]).reconcile_queue0(&[], &[]);
+        assert_eq!(h.affinity(100), "0");
+        assert!(!record_path(&h.state()).exists());
     }
 
     /// No eligible CPU: everything is VPP's, isolated or cpu0. The IRQ
