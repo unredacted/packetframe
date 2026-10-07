@@ -865,7 +865,7 @@ protocol number (the same tag the `anyip` route wears):
 31998:  from <src> to <keep> lookup main     # one per (source, keep) pair
 31999:  from <src> goto 32001                # one per source
 32000:  from all lookup main                 # the platform's own rule
-32001:  from all nop                         # the anchor, only when 32001 is free
+32001:  from all lookup local                # the anchor, only when 32001 is free
 ```
 
 (Priorities for a `lookup main` at 32000; on stock Linux, where `main`
@@ -889,8 +889,20 @@ anchor is needed.)
   its target priority. An unresolved goto is skipped, which would
   quietly put the sources back in `main`. The gotos therefore always
   target `main + 1`, and when nothing foreign sits there PacketFrame
-  installs a `nop` there. Evaluation continues from it into the
+  installs `from all lookup local` there. That lookup always misses:
+  the `local` table was already consulted at priority 0 with the same
+  flow and missed, or evaluation would not have got this far. So it
+  behaves exactly like a `nop`, and evaluation continues into the
   platform's own rules, whatever they are.
+- **Why not a `nop`.** UniFi's udapi-server reads every policy rule
+  when it starts and aborts (`neither table nor goto is defined for
+  routing rule`) on any rule with neither a table nor a goto. It checks
+  only at start, so a `nop` anchor sits harmless until udapi-server
+  restarts, and then systemd's restarts all fail until the rule is
+  deleted. Builds before this change wrote a `nop` anchor; the first
+  pass of a newer daemon adds the `lookup local` anchor, then deletes
+  the `nop` (the kernel moves the goto to the remaining rule at that
+  priority) and logs `32001: from all nop (legacy anchor)` as removed.
 - **Ownership.** A rule wearing `proto 199` is PacketFrame's: adopted
   when a new daemon finds it, repaired or removed as the config says.
   A rule without the tag is never modified or deleted.
@@ -929,6 +941,17 @@ in force:
 | degraded, `a second unconditional lookup main at S follows the one at F` | Skipping the first `main` would only reach the second; nothing written or changed | Usually a provisioning pass caught half-way; if it persists, find which one the platform meant to keep |
 | degraded, `repair failing: X of Y rules in place; ...` | A dump or write failed. Writes stop at the first failed stage (anchor, then keep, then goto), and nothing old is removed until every new rule is in, so a partial pass never leaves a goto without its keep rules | The error names the rule and the netlink error; it retries every pass |
 | degraded, `removed from the config, but its rules could not all be removed` | A reload dropped the directive and the removal did not finish | It retries every pass and on the next reload; `packetframe detach` also removes them |
+
+**udapi-server will not start and logs `neither table nor goto is
+defined for routing rule`.** List the rules it objects to with
+`ip -4 rule show | grep -v -E 'lookup|goto'`. A `from all nop proto 199`
+there is the anchor of a PacketFrame build from before the `lookup
+local` anchor; delete it with `ip -4 rule del pref <prio> nop`. While
+that build is running it puts the rule back within a second, so stop
+it first, or remove `wan-egress` from the config and reload. udapi-server
+also deletes the wan-egress goto when it starts; a running daemon puts
+it back on the rule event, so after starting udapi-server with
+PacketFrame stopped, the sources stay in `main` until PacketFrame runs.
 
 The textfile metrics carry `packetframe_wan_egress_rules{state="desired"}`,
 `packetframe_wan_egress_rules{state="present"}` and

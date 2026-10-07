@@ -17,12 +17,18 @@
 //!   the operator's own prefixes) still resolve there;
 //! - **goto**: `from <src> goto <main+1>`, one per source, at the
 //!   priority just below `main`, jumping over it;
-//! - **anchor**: a `nop` at `main+1` when nothing else sits there. The
-//!   kernel resolves a goto only to a rule that exists at its target
-//!   priority (an unresolved goto is skipped, which would silently put
-//!   the sources back in `main`), so the anchor guarantees a target
-//!   whatever the platform does to the rules after `main`. Evaluation
-//!   continues from it into the platform's own rules.
+//! - **anchor**: `from all lookup local` at `main+1` when nothing else
+//!   sits there. The kernel resolves a goto only to a rule that exists
+//!   at its target priority (an unresolved goto is skipped, which would
+//!   silently put the sources back in `main`), so the anchor guarantees
+//!   a target whatever the platform does to the rules after `main`.
+//!   It changes no lookup: `local` was already consulted at priority 0
+//!   with the same key and missed, so it misses again and evaluation
+//!   continues into the platform's own rules, exactly as from a `nop`.
+//!   It is not a `nop` because UniFi's udapi-server refuses to start
+//!   while any rule has neither a table nor a goto, and a `nop` anchor
+//!   kept it down after a watchdog restart. Daemons before this change
+//!   wrote the `nop`; a pass replaces it ([`ObservedRule::is_legacy_anchor`]).
 //!
 //! Ownership is the protocol tag: a rule wearing it is ours, adopted
 //! from a previous daemon or repaired in place; a rule without it is
@@ -59,6 +65,9 @@ pub const SUBSYSTEM_NAME: &str = "wan-egress";
 
 /// The kernel's `main` routing table id.
 pub const MAIN_TABLE: u32 = 254;
+
+/// The kernel's `local` routing table id, which the anchor looks up.
+pub const LOCAL_TABLE: u32 = 255;
 
 /// How far below `main` the keep and goto rules may be placed when the
 /// priorities right below it are taken by foreign rules.
@@ -238,7 +247,7 @@ impl ObservedRule {
             return None;
         }
         match (self.action, self.src, self.dst) {
-            (RuleAction::Nop, None, None) => Some(OwnedRule::Anchor {
+            (RuleAction::ToTable(LOCAL_TABLE), None, None) => Some(OwnedRule::Anchor {
                 priority: self.priority,
             }),
             (RuleAction::ToTable(MAIN_TABLE), Some(src), Some(dst)) => Some(OwnedRule::Keep {
@@ -253,6 +262,19 @@ impl ObservedRule {
             }),
             _ => None,
         }
+    }
+
+    /// The `nop` anchor daemons before the `lookup local` one wrote. It
+    /// is not ours as we write rules now, so a pass removes it like any
+    /// stale rule, after the new anchor is in: two rules then share
+    /// `main+1`, and deleting the first moves every goto aimed at it to
+    /// the second.
+    pub fn is_legacy_anchor(&self) -> bool {
+        self.owned
+            && !self.other_selectors
+            && self.action == RuleAction::Nop
+            && self.src.is_none()
+            && self.dst.is_none()
     }
 }
 
@@ -305,7 +327,7 @@ impl fmt::Display for OwnedRule {
     /// `ip rule show` by eye.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Anchor { priority } => write!(f, "{priority}: from all nop"),
+            Self::Anchor { priority } => write!(f, "{priority}: from all lookup local"),
             Self::Keep { priority, src, dst } => write!(
                 f,
                 "{priority}: from {} to {} lookup main",
@@ -485,9 +507,14 @@ impl Diff {
 
 /// Where an owned rule falls in removal order, which runs from the
 /// highest stage down: unrecognised owned rules (3) first, then goto,
-/// keep, anchor.
+/// keep, anchor. A legacy `nop` anchor goes with the anchors, so a full
+/// removal never leaves a goto without its target.
 fn removal_stage(r: &ObservedRule) -> u8 {
-    r.as_owned().map_or(3, |o| o.stage())
+    match r.as_owned() {
+        Some(o) => o.stage(),
+        None if r.is_legacy_anchor() => 0,
+        None => 3,
+    }
 }
 
 /// Desired against owned, as multisets: a duplicate of a desired rule
@@ -577,7 +604,7 @@ impl Status {
                         l.goto,
                         l.target,
                         l.main,
-                        if l.anchor { " (nop anchor)" } else { "" }
+                        if l.anchor { " (anchor)" } else { "" }
                     ),
                     None => String::new(),
                 };
@@ -709,7 +736,7 @@ mod tests {
         match *r {
             OwnedRule::Anchor { priority } => ObservedRule {
                 priority,
-                action: RuleAction::Nop,
+                action: RuleAction::ToTable(LOCAL_TABLE),
                 src: None,
                 dst: None,
                 owned: true,
@@ -964,7 +991,7 @@ mod tests {
         assert_eq!(
             rules,
             vec![
-                "32001: from all nop",
+                "32001: from all lookup local",
                 "31998: from 198.18.0.0/24 to 10.0.0.0/8 lookup main",
                 "31998: from 198.18.0.0/24 to 192.0.2.0/24 lookup main",
                 "31998: from 198.18.1.0/24 to 10.0.0.0/8 lookup main",
@@ -1084,7 +1111,74 @@ mod tests {
         let d = diff(&desired_rules(&s, &l), &obs);
         assert!(d.add.is_empty());
         assert_eq!(d.remove.len(), 1);
-        assert_eq!(obs[d.remove[0]].action, RuleAction::Nop);
+        assert_eq!(obs[d.remove[0]].action, RuleAction::ToTable(LOCAL_TABLE));
+    }
+
+    fn legacy_anchor(priority: u32) -> ObservedRule {
+        ObservedRule {
+            priority,
+            action: RuleAction::Nop,
+            src: None,
+            dst: None,
+            owned: true,
+            other_selectors: false,
+        }
+    }
+
+    #[test]
+    fn a_legacy_nop_anchor_is_replaced_by_the_lookup_local_one() {
+        let s = spec(&["198.18.0.0/24"], &["10.0.0.0/8"]);
+        let mut obs = platform(32000);
+        let want = desired_rules(&s, &plan_layout(&obs).unwrap());
+        // What a daemon before the change left: keep and goto as now,
+        // the anchor as a `nop`.
+        obs.extend(
+            want.iter()
+                .filter(|r| !matches!(r, OwnedRule::Anchor { .. }))
+                .map(owned_from),
+        );
+        obs.push(legacy_anchor(32001));
+        let l = plan_layout(&obs).unwrap();
+        assert!(l.anchor, "our own legacy anchor does not count as foreign");
+        let d = diff(&desired_rules(&s, &l), &obs);
+        assert_eq!(d.add, vec![OwnedRule::Anchor { priority: 32001 }]);
+        assert_eq!(d.present, s.rule_count_without_anchor());
+        assert_eq!(d.remove.len(), 1);
+        assert!(obs[d.remove[0]].is_legacy_anchor());
+    }
+
+    #[test]
+    fn a_full_removal_takes_a_legacy_anchor_last() {
+        let s = spec(&["198.18.0.0/24"], &["10.0.0.0/8"]);
+        let mut obs = platform(32000);
+        obs.push(legacy_anchor(32001));
+        let want = desired_rules(&s, &plan_layout(&obs).unwrap());
+        obs.extend(
+            want.iter()
+                .filter(|r| !matches!(r, OwnedRule::Anchor { .. }))
+                .map(owned_from),
+        );
+        let d = diff(&[], &obs);
+        let order: Vec<RuleAction> = d.remove.iter().map(|&i| obs[i].action).collect();
+        assert_eq!(
+            order,
+            vec![
+                RuleAction::Goto(32001),
+                RuleAction::ToTable(MAIN_TABLE),
+                RuleAction::Nop
+            ],
+            "goto, keep, then the anchor it jumps to"
+        );
+    }
+
+    #[test]
+    fn the_platforms_own_local_rule_is_not_an_anchor() {
+        // Priority 0 `lookup local` looks like the anchor but is foreign.
+        assert_eq!(
+            foreign(0, RuleAction::ToTable(LOCAL_TABLE)).as_owned(),
+            None
+        );
+        assert!(!foreign(32001, RuleAction::Nop).is_legacy_anchor());
     }
 
     // --- status ---
@@ -1105,7 +1199,7 @@ mod tests {
         let msg = h.message.unwrap();
         assert!(msg.starts_with("3 rules in place"), "{msg}");
         assert!(
-            msg.contains("past main at 32000") && msg.contains("nop anchor"),
+            msg.contains("past main at 32000") && msg.contains("(anchor)"),
             "{msg}"
         );
 
