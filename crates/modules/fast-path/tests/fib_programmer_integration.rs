@@ -3211,7 +3211,20 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
     let ctrl = RouteController::start(
         &pins.dir,
         RouteFeed {
-            source: None,
+            // A real listener nothing will dial: with no route source at
+            // all the controller declares the feed reconciled by
+            // definition, which is not the restart under test.
+            source: Some(
+                packetframe_fast_path::fib::controller::RouteSourceConfig::Bgp {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    local_as: 64512,
+                    peer_as: 64512,
+                    router_id: Ipv4Addr::new(192, 0, 2, 10),
+                    peer_acl: Vec::new(),
+                    expected_peer_ip: None,
+                    anyip: false,
+                },
+            ),
             integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::None,
         },
         ResolverPolicy::default(),
@@ -3238,9 +3251,11 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
         (2, 1),
         "the seed is in before the first command is served"
     );
+    let seen = session.liveness();
     assert!(
-        session.liveness().mirror_seeded,
-        "the second tier is told the mirror is a seed, not a table loading from empty"
+        seen.mirror_seeded && !seen.up,
+        "the second tier is told the mirror is a seed, not a table loading from empty, \
+         before any route source has spoken: {seen:?}"
     );
 
     let written = ctrl.preserve_route_ledger(&state_dir);
