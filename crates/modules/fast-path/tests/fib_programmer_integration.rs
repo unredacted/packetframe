@@ -2972,6 +2972,56 @@ fn a_seed_is_confirmed_by_the_replay_and_collected_by_the_gc() {
     assert_eq!(s.reconciled.map(|(_, removed)| removed), Some(2));
 }
 
+/// A live session whose only UPDATE is an empty End-of-RIB — or a BMP
+/// stream whose route monitoring carried no route — fires
+/// `InitiationComplete` without a single Add or Del. That reconciles the
+/// seed (the GC takes all of it: the source has nothing) and is proof the
+/// session spoke, so the seed must stop blocking attestation, and the
+/// authority's early check must be due, rather than both waiting forever
+/// on a first route that never comes.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn an_empty_end_of_rib_reconciles_the_seed_and_releases_attestation() {
+    use ledger::*;
+    let seed = ledger(
+        &[route(quarter(0), nh_a()), route(v6_48(), nh6())],
+        now_unix(),
+    );
+    let (h, _sink, status) = ProgrammerHarness::with_seed(Some(seed));
+    assert_eq!(
+        h.run(async { h.handle.mirror_counts().await })
+            .expect("counts"),
+        (1, 1)
+    );
+    assert!(status.lock().unwrap().attestation_blocker().is_some());
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+            .expect("InitiationComplete")
+    });
+    assert_eq!(
+        h.run(async { h.handle.mirror_counts().await })
+            .expect("counts"),
+        (0, 0),
+        "the source re-advertised nothing, so the GC took the whole seed"
+    );
+    let st = status.lock().unwrap();
+    let s = st.seed.as_ref().unwrap();
+    assert_eq!(s.reconciled.map(|(_, removed)| removed), Some(2));
+    assert!(
+        s.stream_started_at.is_some(),
+        "the reconciliation is the session speaking: {s:?}"
+    );
+    assert!(
+        st.attestation_blocker().is_none(),
+        "a reconciled seed blocks nothing: {:?}",
+        st.attestation_blocker()
+    );
+    assert!(st.stream_started(), "and the early check is due");
+}
+
 /// No route event overtakes the seed. The seed goes in a chunk at a time
 /// and the run loop keeps serving neighbour events between chunks, but
 /// never a command — so a live advertisement sent while the seed is

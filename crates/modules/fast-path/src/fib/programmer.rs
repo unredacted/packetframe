@@ -1377,6 +1377,14 @@ impl FibProgrammer {
             return;
         }
         self.seed_open = false;
+        // The reconciliation is itself proof that a live session spoke:
+        // only a route source dispatches `InitiationComplete`, and only
+        // after a stream of its own. A session whose only UPDATE was an
+        // empty End-of-RIB (or a BMP stream whose route monitoring
+        // carried no route) gets here with no Add or Del, so
+        // `note_session_route` never ran; without this its seed stayed
+        // "not yet spoken to" and blocked attestation for good.
+        self.seed_stream_started = true;
         let removed = removed.unwrap_or(0) as u64;
         info!(
             gc_removed = removed,
@@ -1391,8 +1399,10 @@ impl FibProgrammer {
         .emit();
         if let Some(status) = &self.ledger_status {
             if let Some(s) = status.lock().expect("ledger status lock").seed.as_mut() {
+                let now = Instant::now();
                 s.unconfirmed = self.unseen_session;
-                s.reconciled = Some((Instant::now(), removed));
+                s.reconciled = Some((now, removed));
+                s.stream_started_at.get_or_insert(now);
             }
         }
     }

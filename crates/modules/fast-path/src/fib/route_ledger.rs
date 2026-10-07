@@ -1057,10 +1057,22 @@ pub struct SeedReport {
     pub unconfirmed: u64,
     /// When the first route-source advertisement or withdrawal reached
     /// the mirror after the seed: the live session has started speaking.
+    /// Set at the first `InitiationComplete` after the seed if nothing
+    /// set it earlier — a session whose only UPDATE is an empty
+    /// End-of-RIB has spoken too, with an empty table.
     pub stream_started_at: Option<Instant>,
     /// When the first `InitiationComplete` after the seed GC'd the rest,
     /// and how many advertisements that removed.
     pub reconciled: Option<(Instant, u64)>,
+}
+
+impl SeedReport {
+    /// Whether a live session has spoken to the seed: its first route
+    /// arrived, or its `InitiationComplete` reconciled the seed without
+    /// one (see [`LedgerStatus::attestation_blocker`]).
+    pub fn spoken_for(&self) -> bool {
+        self.stream_started_at.is_some() || self.reconciled.is_some()
+    }
 }
 
 impl LedgerStatus {
@@ -1075,9 +1087,17 @@ impl LedgerStatus {
     /// update. Once the live session has delivered its first route, the
     /// comparison means what it always meant (count agreement within the
     /// drift bound), and the replay corrects the rest as it arrives.
+    ///
+    /// A reconciled seed blocks nothing either, whether or not a route
+    /// arrived first: an `InitiationComplete` is a live session's whole
+    /// table having been delivered, and a session whose only UPDATE was an
+    /// empty End-of-RIB (or a BMP stream whose route monitoring carried no
+    /// route) reaches it without one. Its GC has removed every seeded
+    /// route the session did not confirm, so nothing of the seed is left
+    /// unspoken for.
     pub fn attestation_blocker(&self) -> Option<String> {
         let seed = self.seed.as_ref()?;
-        if seed.stream_started_at.is_some() {
+        if seed.spoken_for() {
             return None;
         }
         Some(if seed.applied_at.is_none() {
@@ -1095,18 +1115,14 @@ impl LedgerStatus {
     /// Whether a seed is waiting for the live session's first route —
     /// the moment a completeness check becomes worth running early.
     pub fn awaiting_stream(&self) -> bool {
-        self.seed
-            .as_ref()
-            .is_some_and(|s| s.stream_started_at.is_none())
+        self.seed.as_ref().is_some_and(|s| !s.spoken_for())
     }
 
     /// Whether a seed exists whose first post-stream check is still
     /// owed: the stream has started, so an authority may check now
     /// rather than at its next interval.
     pub fn stream_started(&self) -> bool {
-        self.seed
-            .as_ref()
-            .is_some_and(|s| s.stream_started_at.is_some())
+        self.seed.as_ref().is_some_and(SeedReport::spoken_for)
     }
 
     /// The `route-ledger` health row. Healthy unless the ledger itself
@@ -1919,6 +1935,40 @@ mod tests {
         assert!(st.attestation_blocker().is_none());
         assert!(!st.awaiting_stream());
         assert!(st.stream_started());
+    }
+
+    /// A session whose only UPDATE is an empty End-of-RIB (or a BMP
+    /// stream whose route monitoring carried no route) reconciles the
+    /// seed without a single Add or Del. That is still a live session
+    /// having delivered its whole table: the reconciled seed must not
+    /// block attestation forever.
+    #[test]
+    fn a_reconciled_seed_blocks_nothing_even_without_a_route() {
+        let mut st = LedgerStatus {
+            start: StartReport::Seeded,
+            seed: Some(SeedReport {
+                writer_version: "0.6.0".into(),
+                written_at_unix: NOW - 120,
+                confirmed_at_unix: NOW - 120,
+                counts: LedgerCounts::default(),
+                applied_at: Some(Instant::now()),
+                apply_took: None,
+                failed: 0,
+                unconfirmed: 5,
+                stream_started_at: None,
+                reconciled: None,
+            }),
+        };
+        assert!(st.attestation_blocker().is_some());
+        let s = st.seed.as_mut().unwrap();
+        s.reconciled = Some((Instant::now(), 5));
+        s.unconfirmed = 0;
+        assert!(st.attestation_blocker().is_none(), "{st:?}");
+        assert!(!st.awaiting_stream());
+        assert!(
+            st.stream_started(),
+            "the authority's early check is owed at reconciliation too"
+        );
     }
 
     #[test]
