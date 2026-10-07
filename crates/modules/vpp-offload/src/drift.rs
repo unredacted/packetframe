@@ -1245,22 +1245,142 @@ impl DriftAccepts6 {
     }
 }
 
+/// Why a scan produced no verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanError {
+    /// The kernel would not answer. The caller keeps its previous
+    /// verdict and publishes the failure.
+    Unreadable(String),
+    /// A link changed state while the scan was reading, named here. Never
+    /// published: the scanner waits for links to settle and scans again
+    /// ([`Pacing`]).
+    Interrupted(String),
+}
+
+impl From<String> for ScanError {
+    fn from(why: String) -> Self {
+        Self::Unreadable(why)
+    }
+}
+
 /// The scan seam the runtime holds, mirroring [`crate::runtime::RxModeKick`]:
 /// a trait so tests record calls and non-Linux builds never pretend.
 pub trait DriftWatch {
-    /// The scan's findings, empty when the exemptions hold. `Err` =
-    /// the kernel would not answer; the caller keeps its previous
-    /// verdict.
-    fn uncovered(&mut self) -> Result<DriftFindings, String>;
+    /// The scan's findings, empty when the exemptions hold. With
+    /// `interruptible`, a link changing state mid-scan abandons it
+    /// ([`ScanError::Interrupted`]); without, the scan reads to the end.
+    fn uncovered(&mut self, interruptible: bool) -> Result<DriftFindings, ScanError>;
 
     /// Adopt a reloaded scope. Called from the same place the steering
     /// target is retargeted, so the scan judges the config the operator
     /// just applied rather than the one at attach.
     fn set_scope(&mut self, scope: DriftScope);
+
+    /// The latest link up/down transition since the last call, named for
+    /// the log. `None` when there was none, or when this watch cannot see
+    /// links. Each change is reported once.
+    fn link_changed(&mut self) -> Option<String> {
+        None
+    }
 }
 
-/// A completed pass and the scope generation it judged under.
-type StampedResult = (u64, Result<DriftFindings, String>);
+/// One finished pass: the scope generation it judged under, its verdict,
+/// and how long it took.
+#[derive(Debug)]
+pub struct ScanReport {
+    pub generation: u64,
+    pub result: Result<DriftFindings, String>,
+    /// Wall time of the pass: what it held the kernel's routing lock for,
+    /// at most, one dump chunk at a time.
+    pub took: std::time::Duration,
+}
+
+/// When the scanner runs.
+///
+/// Every dump chunk is served under `rtnl_mutex` (5.15), the lock every
+/// route and link change needs too. A full-table scan is thousands of
+/// chunks, and the worst time to take them is right after a link changes
+/// state: the kernel flushes the routes through it, the routing daemon
+/// withdraws and reinstalls its sessions' routes, all under the same lock.
+/// A v6 dump fares worst — each chunk that finds the tree changed re-walks
+/// it from the root, under the table lock with bottom halves off. On
+/// 2026-10-07 a platform daemon toggling IX bridges flushed ~225k routes
+/// and the box stalled ~40 s. So a pass that falls due within `settle` of
+/// a link change waits, and a pass a change catches mid-read is abandoned.
+///
+/// Bounded by `max_defer`: a link that never stops flapping must not blind
+/// the tripwire. A pass that has waited that long runs to the end, changes
+/// or not.
+#[derive(Debug, Clone, Copy)]
+pub struct Pacing {
+    /// Between the end of one pass and the start of the next.
+    pub every: std::time::Duration,
+    /// How long links must have been quiet before a pass starts.
+    pub settle: std::time::Duration,
+    /// The longest a due pass waits for links to settle, counted from when
+    /// it fell due.
+    pub max_defer: std::time::Duration,
+}
+
+impl Pacing {
+    /// When a pass due since `due` may start, given the last link change:
+    /// `None` = now. Capped at `due + max_defer`.
+    fn hold_until(
+        &self,
+        now: std::time::Instant,
+        due: std::time::Instant,
+        last_change: Option<std::time::Instant>,
+    ) -> Option<std::time::Instant> {
+        let cap = due + self.max_defer;
+        let settled = last_change? + self.settle;
+        (now < settled && now < cap).then(|| settled.min(cap))
+    }
+
+    /// Whether a pass starting at `now` may be abandoned for a link change.
+    /// Not once it has waited out `max_defer`, or a flapping link would
+    /// abandon every attempt.
+    fn interruptible(&self, now: std::time::Instant, due: std::time::Instant) -> bool {
+        now < due + self.max_defer
+    }
+}
+
+/// What woke the scan thread from a rest.
+enum Woke {
+    Stop,
+    Scope,
+    Slept,
+}
+
+/// Rest up to `slice`, waking early for a teardown and, when `scope_wakes`,
+/// for a scope handover.
+fn rest(
+    inbox: &(std::sync::Mutex<ScannerInbox>, std::sync::Condvar),
+    slice: std::time::Duration,
+    scope_wakes: bool,
+) -> Woke {
+    let woke = |i: &ScannerInbox| {
+        if i.stop {
+            Some(Woke::Stop)
+        } else if scope_wakes && i.pending.is_some() {
+            Some(Woke::Scope)
+        } else {
+            None
+        }
+    };
+    let guard = inbox.0.lock().expect("drift inbox lock");
+    if let Some(w) = woke(&guard) {
+        return w;
+    }
+    let (guard, _) = inbox
+        .1
+        .wait_timeout(guard, slice)
+        .expect("drift inbox wait");
+    woke(&guard).unwrap_or(Woke::Slept)
+}
+
+/// How often the scan thread looks up from a rest: the stop latency, and
+/// how stale a link change's timestamp can be.
+const REST_SLICE: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[derive(Default)]
 struct ScannerInbox {
@@ -1312,16 +1432,23 @@ struct ScannerInbox {
 /// Until a result for the current generation arrives, the tripwire
 /// reports that it has not scanned this configuration yet — never a
 /// clean zero it has not earned.
+///
+/// ## Paced around link churn
+///
+/// See [`Pacing`]. A pass held for links to settle adopts no scope until
+/// it runs, so a reconfigure landing meanwhile reads as "not scanned yet"
+/// for the current generation, which it is.
 pub struct DriftScanner {
-    latest: std::sync::Arc<std::sync::Mutex<Option<StampedResult>>>,
+    latest: std::sync::Arc<std::sync::Mutex<Option<ScanReport>>>,
     inbox: std::sync::Arc<(std::sync::Mutex<ScannerInbox>, std::sync::Condvar)>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DriftScanner {
-    /// Start scanning every `every`, beginning immediately.
-    pub fn spawn(mut watch: Box<dyn DriftWatch + Send>, every: std::time::Duration) -> Self {
-        let latest: std::sync::Arc<std::sync::Mutex<Option<StampedResult>>> =
+    /// Start scanning, beginning immediately unless a link has just
+    /// changed state.
+    pub fn spawn(watch: Box<dyn DriftWatch + Send>, pacing: Pacing) -> Self {
+        let latest: std::sync::Arc<std::sync::Mutex<Option<ScanReport>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let inbox = std::sync::Arc::new((
             std::sync::Mutex::new(ScannerInbox::default()),
@@ -1330,38 +1457,7 @@ impl DriftScanner {
         let (l, ib) = (latest.clone(), inbox.clone());
         let handle = std::thread::Builder::new()
             .name("pf-drift-scan".into())
-            .spawn(move || loop {
-                // Adopt and stamp under ONE lock hold, so
-                // `scanned_under` names exactly the scope the watcher
-                // is about to scan with.
-                let scanned_under = {
-                    let mut inbox = ib.0.lock().expect("drift inbox lock");
-                    if inbox.stop {
-                        return;
-                    }
-                    if let Some(scope) = inbox.pending.take() {
-                        watch.set_scope(scope);
-                    }
-                    inbox.generation
-                };
-                let result = watch.uncovered();
-                *l.lock().expect("drift result lock") = Some((scanned_under, result));
-
-                let mut inbox = ib.0.lock().expect("drift inbox lock");
-                let mut waited = std::time::Duration::ZERO;
-                // Wake early for a new scope or a teardown; otherwise
-                // sleep out the interval in slices so a stop is not
-                // waiting on a full one.
-                while !inbox.stop && inbox.pending.is_none() && waited < every {
-                    let slice = std::time::Duration::from_millis(200);
-                    let (guard, _) = ib.1.wait_timeout(inbox, slice).expect("drift inbox wait");
-                    inbox = guard;
-                    waited += slice;
-                }
-                if inbox.stop {
-                    return;
-                }
-            })
+            .spawn(move || scan_loop(watch, pacing, &l, &ib))
             .ok();
         Self {
             latest,
@@ -1373,10 +1469,10 @@ impl DriftScanner {
     /// The newest COMPLETED result, if one has arrived since the last
     /// look. `None` means nothing new — the caller keeps what it had.
     ///
-    /// Returns the generation it was scanned under so the caller can
+    /// Carries the generation it was scanned under so the caller can
     /// tell a verdict about the current configuration from one about
     /// a superseded scope.
-    pub fn take_result(&self) -> Option<StampedResult> {
+    pub fn take_result(&self) -> Option<ScanReport> {
         self.latest.lock().expect("drift result lock").take()
     }
 
@@ -1394,6 +1490,114 @@ impl DriftScanner {
         inbox.generation += 1;
         inbox.pending = Some(scope);
         self.inbox.1.notify_all();
+    }
+}
+
+/// The scan thread: hold while links settle, scan, publish, rest.
+fn scan_loop(
+    mut watch: Box<dyn DriftWatch + Send>,
+    pacing: Pacing,
+    latest: &std::sync::Mutex<Option<ScanReport>>,
+    inbox: &(std::sync::Mutex<ScannerInbox>, std::sync::Condvar),
+) {
+    use std::time::Instant;
+    // When the next pass fell due. Kept across abandoned attempts, so
+    // `max_defer` bounds the whole delay rather than each attempt.
+    let mut due = Instant::now();
+    // The latest link change, and when it was seen. Polled on every rest
+    // slice, so it is timed within a slice of when it happened.
+    let mut last_change: Option<(Instant, String)> = None;
+    loop {
+        let mut held = false;
+        loop {
+            if let Some(what) = watch.link_changed() {
+                if held {
+                    tracing::debug!(link = %what, "links still changing; drift scan held");
+                }
+                last_change = Some((Instant::now(), what));
+            }
+            let now = Instant::now();
+            let Some(until) = pacing.hold_until(now, due, last_change.as_ref().map(|c| c.0)) else {
+                break;
+            };
+            if !held {
+                held = true;
+                if let Some((_, what)) = &last_change {
+                    tracing::info!(
+                        link = %what,
+                        settle_s = pacing.settle.as_secs(),
+                        "a link changed state; holding the drift scan until links settle"
+                    );
+                }
+            }
+            if let Woke::Stop = rest(inbox, REST_SLICE.min(until - now), false) {
+                return;
+            }
+        }
+        // Adopt and stamp under ONE lock hold, so `scanned_under` names
+        // exactly the scope the watcher is about to scan with.
+        let scanned_under = {
+            let mut inbox = inbox.0.lock().expect("drift inbox lock");
+            if inbox.stop {
+                return;
+            }
+            if let Some(scope) = inbox.pending.take() {
+                watch.set_scope(scope);
+            }
+            inbox.generation
+        };
+        let started = Instant::now();
+        let interruptible = pacing.interruptible(started, due);
+        if held && !interruptible {
+            tracing::info!(
+                waited_s = started.duration_since(due).as_secs(),
+                "links have not settled; running the drift scan anyway"
+            );
+        }
+        let outcome = watch.uncovered(interruptible);
+        let took = started.elapsed();
+        let result = match outcome {
+            Ok(found) => Ok(found),
+            Err(ScanError::Unreadable(why)) => Err(why),
+            Err(ScanError::Interrupted(what)) => {
+                tracing::info!(
+                    link = %what,
+                    after_ms = took.as_millis() as u64,
+                    "a link changed state mid-scan; abandoned the drift scan until links settle"
+                );
+                last_change = Some((Instant::now(), what));
+                continue;
+            }
+        };
+        tracing::debug!(
+            took_ms = took.as_millis() as u64,
+            ok = result.is_ok(),
+            "drift scan finished"
+        );
+        *latest.lock().expect("drift result lock") = Some(ScanReport {
+            generation: scanned_under,
+            result,
+            took,
+        });
+
+        // Wake early for a new scope or a teardown; otherwise rest out the
+        // interval in slices so a stop is not waiting on a full one.
+        let rested = Instant::now();
+        loop {
+            if let Some(what) = watch.link_changed() {
+                tracing::debug!(link = %what, "a link changed state between drift scans");
+                last_change = Some((Instant::now(), what));
+            }
+            let Some(left) = pacing.every.checked_sub(rested.elapsed()) else {
+                break;
+            };
+            match rest(inbox, REST_SLICE.min(left), true) {
+                Woke::Stop => return,
+                Woke::Scope => break,
+                Woke::Slept => {}
+            }
+        }
+        due = Instant::now();
     }
 }
 
@@ -1451,9 +1655,10 @@ impl Drop for DriftScanner {
     }
 }
 
-/// The production scan: dump the IPv4 routes of every table the reach
-/// does not clear ([`dump_routes`]), compare — and, while some port
-/// diverts IPv6, the same for IPv6 ([`dump_routes_v6`]).
+/// The production scan: dump the IPv4 routes the reach does not clear
+/// from every table a policy rule selects ([`dump_routes`]), compare —
+/// and, while some port diverts IPv6, the same for IPv6
+/// ([`dump_routes_v6`]).
 #[cfg(target_os = "linux")]
 pub struct KernelDriftWatch {
     /// `bridged_devices` is recomputed on every scan
@@ -1470,6 +1675,10 @@ pub struct KernelDriftWatch {
     /// health message told them to (review finding) — and the same goes
     /// for a `v6-divert` added or dropped under a running daemon.
     pub scope: DriftScope,
+    /// Link up/down transitions, for [`Pacing`]. `None` when the watch
+    /// could not be opened: scans then run on the clock alone, as they did
+    /// before pacing existed.
+    pub links: Option<KernelLinkWatch>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1516,21 +1725,29 @@ impl KernelDriftWatch {
 
 #[cfg(target_os = "linux")]
 impl DriftWatch for KernelDriftWatch {
-    fn uncovered(&mut self) -> Result<DriftFindings, String> {
+    fn uncovered(&mut self, interruptible: bool) -> Result<DriftFindings, ScanError> {
+        let started = std::time::Instant::now();
         // Refreshed BEFORE the dump, which discards against this reach:
         // a stale one would drop a route via a bridge VPP no longer
         // reaches as if it were still a path VPP can take.
         self.refresh_bridged();
-        let routes = dump_routes(&self.reach)?;
-        // A rule dump that fails filters nothing rather than failing
-        // the scan: the routes are the finding, the rules only narrow
-        // them, and losing the narrowing costs noise where losing the
-        // scan costs the blackhole.
+        // The rules first: they say which tables to dump. A rule dump
+        // that fails filters nothing rather than failing the scan — the
+        // routes are the finding, the rules only narrow them, and losing
+        // the narrowing costs noise where losing the scan costs the
+        // blackhole.
         let tables =
             dump_rule_tables(netlink_packet_route::AddressFamily::Inet).unwrap_or_else(|e| {
-                tracing::debug!(error = %e, "policy-rule dump failed; not filtering by table");
+                tracing::debug!(error = %e, "policy-rule dump failed; dumping every table");
                 None
             });
+        let links = &mut self.links;
+        let mut interrupt = || match links {
+            Some(l) if interruptible => l.changed(),
+            _ => None,
+        };
+        let v4 = dump_routes(&self.reach, tables.as_deref(), &mut interrupt)?;
+        let v4_ms = started.elapsed().as_millis() as u64;
         let divertible = match &self.scope.dst_only {
             Some(allow) => Divertible::OnlyDst(allow),
             None => Divertible::Any,
@@ -1539,19 +1756,36 @@ impl DriftWatch for KernelDriftWatch {
             reach: &self.reach,
             exempts: &self.scope.exempts,
             divertible,
+            // Already applied by the dump; kept so the comparison stands
+            // on its own whatever produced the routes.
             selected_tables: tables.as_deref(),
         };
-        let found = uncovered_paths(&routes, &scope);
+        let found = uncovered_paths(&v4.routes, &scope);
         // After the v4 half, which keeps its verdict whatever the v6 dump
-        // does: each family's read failure is its own.
-        let v6 = if self.scope.scans_v6 {
-            match self.scan_v6() {
-                Ok(scan) => V6Drift::Scanned(scan),
-                Err(e) => V6Drift::Unreadable(e),
+        // does: each family's read failure is its own. A link change is
+        // not a read failure — it abandons the whole scan.
+        let v6_started = std::time::Instant::now();
+        let (v6, v6_read) = if self.scope.scans_v6 {
+            match scan_v6(&self.reach, &mut interrupt) {
+                Ok((scan, read)) => (V6Drift::Scanned(scan), Some(read)),
+                Err(ScanError::Unreadable(e)) => (V6Drift::Unreadable(e), None),
+                Err(interrupted) => return Err(interrupted),
             }
         } else {
-            V6Drift::Inactive
+            (V6Drift::Inactive, None)
         };
+        // What the scan cost the kernel, beside the gauge the runtime
+        // publishes: whether the dump was filtered, and what each family
+        // read and took.
+        tracing::debug!(
+            v4_tables = ?tables,
+            v4_routes_read = v4.read,
+            v4_routes_kept = v4.routes.len(),
+            v4_ms,
+            v6_routes_read = ?v6_read,
+            v6_ms = v6_started.elapsed().as_millis() as u64,
+            "drift scan read the kernel's routes"
+        );
         Ok(DriftFindings {
             routes: found.iter().map(Uncovered::routes).sum(),
             lines: found.iter().map(Uncovered::to_string).collect(),
@@ -1559,76 +1793,114 @@ impl DriftWatch for KernelDriftWatch {
         })
     }
 
+    fn link_changed(&mut self) -> Option<String> {
+        self.links.as_mut()?.changed()
+    }
+
     fn set_scope(&mut self, scope: DriftScope) {
         self.scope = scope;
     }
 }
 
+/// The IPv6 half: the v6 routes the v6 reach does not clear, from the
+/// tables the v6 policy rules select. Same failure rules as the v4 half —
+/// an unreadable rule set filters nothing, an unreadable route dump is
+/// the half's `Err`. Unsettled: the loop settles the link-local
+/// candidates against VPP's table ([`V6Scan::settle`]). Also returns how
+/// many routes the dump read.
 #[cfg(target_os = "linux")]
-impl KernelDriftWatch {
-    /// The IPv6 half: the v6 routes the v6 reach does not clear, judged
-    /// under the v6 policy rules. Same failure rules as the v4 half — an
-    /// unreadable rule set filters nothing, an unreadable route dump is
-    /// the half's `Err`. Unsettled: the loop settles the link-local
-    /// candidates against VPP's table ([`V6Scan::settle`]).
-    fn scan_v6(&self) -> Result<V6Scan, String> {
-        let (routes, candidates) = dump_routes_v6(&self.reach)?;
-        let tables =
-            dump_rule_tables(netlink_packet_route::AddressFamily::Inet6).unwrap_or_else(|e| {
-                tracing::debug!(error = %e, "IPv6 policy-rule dump failed; not filtering by table");
-                None
-            });
-        Ok(classify_v6(
-            &routes,
-            candidates,
-            &self.reach,
-            tables.as_deref(),
-        ))
-    }
+fn scan_v6(
+    reach: &VppReach,
+    interrupt: &mut dyn FnMut() -> Option<String>,
+) -> Result<(V6Scan, usize), ScanError> {
+    let tables = dump_rule_tables(netlink_packet_route::AddressFamily::Inet6).unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "IPv6 policy-rule dump failed; dumping every table");
+        None
+    });
+    let dump = dump_routes_v6(reach, tables.as_deref(), interrupt)?;
+    Ok((
+        classify_v6(&dump.routes, dump.link_local, reach, tables.as_deref()),
+        dump.read,
+    ))
 }
 
-/// One blocking RTM_GETROUTE dump across every table, returning only
-/// the routes [`reach_clears`] does not clear under `reach`.
+/// One family's route dump: what [`dump_family`] kept, and how many
+/// routes it read to get there.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+pub struct RouteDump<P> {
+    /// The routes [`reach_clears`] does not clear, less the link-local
+    /// candidates.
+    pub routes: Vec<KernelRoute<P>>,
+    /// IPv6 only: the link-local candidates, compact ([`LinkLocalRoute`]).
+    pub link_local: Vec<LinkLocalRoute>,
+    /// Route messages read off the socket, kept or not: the dump's cost.
+    pub read: usize,
+}
+
+/// One blocking strict-check RTM_GETROUTE dump per table in `tables` —
+/// every table when `None` — returning only the routes [`reach_clears`]
+/// does not clear under `reach`. `interrupt` is polled after every read;
+/// `Some` abandons the dump ([`ScanError::Interrupted`]).
 ///
 /// Hand-rolled on `netlink-sys` for the same reason [`crate::fdb`] is:
 /// this crate runs a supervision loop, not an async runtime, and one
 /// dump per minute does not earn one.
 ///
-/// **Why the dump returns so little.** On a full-table router the main
+/// **Which routes the verdict can depend on.** Routes via a device VPP
+/// does not take (a tunnel, an unreached bridge, a bridged segment's
+/// connected subnet), the kernel's own addresses on `local-route`
+/// bridges, encapsulating and nexthop-object routes, and (IPv6) routes
+/// out owned devices via link-local next hops — in a table some policy
+/// rule selects ([`Scope::selected_tables`]). Nothing else can be a
+/// finding.
+///
+/// **What the kernel filters.** The table, nothing finer. `tables` is
+/// the rule set's selection ([`dump_rule_tables`]), so a table no rule
+/// names — an unreferenced VRF, a daemon's staging copy — is never
+/// serialised at all, and the comparison skips the same tables, so the
+/// findings cannot change. A strict request also stops the kernel
+/// interleaving nexthop exceptions (cached PMTU and redirect entries,
+/// `RTM_F_CLONED`), which a legacy dump returns as /32 and /128 routes:
+/// copies of paths already judged, except where they are wrong — an
+/// exception on the tunnel leg of an ECMP route VPP takes read as a
+/// finding, and one under a link-local v6 route as a prefix VPP lacks.
+///
+/// **What it cannot filter.** The bulk: on a full-table router the main
 /// table holds ~1.06M routes, nearly all BGP-installed via a gateway on
-/// a member port — paths VPP takes, which can never be findings. They
-/// are still read off the socket and parsed, but judged before a
-/// `KernelRoute` is built, so the scan no longer allocates a
-/// million-entry list (a String per hop, a Vec regrown to the table's
-/// size) only to discard it a moment later. What comes back is what the
-/// verdict can depend on: routes via a device VPP does not take (a
-/// tunnel, an unreached bridge, a bridged segment's connected subnet),
-/// the kernel's own addresses on `local-route` bridges, and
-/// encapsulating and nexthop-object routes.
+/// a member port or bridged VLAN, and the main table is always selected.
+/// A strict dump narrows by table, route type, protocol and device, each
+/// as "only this one", never "all but", and none removes that bulk
+/// without hiding something above: a type filter keeps every unicast
+/// route; a protocol filter would hide BGP routes via an IPSec tunnel,
+/// the w26 finding; and dumping only the devices VPP does not take would
+/// hide encapsulation out a member port, connected subnets on bridged
+/// VLANs, nexthop-object routes and the v6 link-local candidates. Each
+/// filtered dump also walks the whole table in one lock hold when it
+/// matches little, so several of them would trade many short holds of
+/// the routing lock for a few long ones. The bulk is read and judged
+/// before a `KernelRoute` is built, so it costs parsing, not a
+/// million-entry allocation.
 ///
-/// **Why the kernel does not filter it instead.** A strict-check dump
-/// honours a table, a route type, a protocol and a device — each as
-/// "only this one", never "all but". None of them removes the bulk
-/// without hiding something the verdict needs: the main table is always
-/// selected; a type filter keeps every unicast route; a protocol filter
-/// would hide BGP routes via an IPSec tunnel, the w26 finding; and a
-/// device filter over the non-member devices would hide encapsulation
-/// out a member port, nexthop-object routes and the kernel's own
-/// addresses on `local-route` bridges.
-///
-/// The LOCAL table is included deliberately. Its entries are the
+/// The LOCAL table is always selected (rule 0). Its entries are the
 /// router's own addresses, and steered traffic to those dies in VPP
 /// exactly like tunnel-bound traffic does — that is the w23 blackhole
 /// (110,917 packets in five minutes) which `steer-exempt` was
 /// introduced to fix. A check that only looked at forwarding would
 /// have missed the first instance of the very class it exists for.
 #[cfg(target_os = "linux")]
-pub fn dump_routes(reach: &VppReach) -> Result<Vec<KernelRoute>, String> {
+pub fn dump_routes(
+    reach: &VppReach,
+    tables: Option<&[u32]>,
+    interrupt: &mut dyn FnMut() -> Option<String>,
+) -> Result<RouteDump<Ipv4Prefix>, ScanError> {
     use netlink_packet_route::route::RouteAddress;
     // No IPv4 gateway is link-local, so no candidate is ever built here.
-    let (routes, _) = dump_family(
+    let (routes, _, read) = dump_family(
         netlink_packet_route::AddressFamily::Inet,
         reach,
+        tables,
+        interrupt,
         |dst, prefix_len| Ipv4Prefix {
             // No RTA_DST = the default route.
             addr: match dst {
@@ -1638,7 +1910,11 @@ pub fn dump_routes(reach: &VppReach) -> Result<Vec<KernelRoute>, String> {
             prefix_len,
         },
     )?;
-    Ok(routes)
+    Ok(RouteDump {
+        routes,
+        link_local: Vec::new(),
+        read,
+    })
 }
 
 /// [`dump_routes`] for IPv6, against the v6 reach ([`VppReach::for_v6`])
@@ -1651,11 +1927,15 @@ pub fn dump_routes(reach: &VppReach) -> Result<Vec<KernelRoute>, String> {
 #[cfg(target_os = "linux")]
 pub fn dump_routes_v6(
     reach: &VppReach,
-) -> Result<(Vec<KernelRoute<Ipv6Prefix>>, Vec<LinkLocalRoute>), String> {
+    tables: Option<&[u32]>,
+    interrupt: &mut dyn FnMut() -> Option<String>,
+) -> Result<RouteDump<Ipv6Prefix>, ScanError> {
     use netlink_packet_route::route::RouteAddress;
-    let (routes, candidates) = dump_family(
+    let (routes, candidates, read) = dump_family(
         netlink_packet_route::AddressFamily::Inet6,
         &reach.for_v6(),
+        tables,
+        interrupt,
         |dst, prefix_len| Ipv6Prefix {
             addr: match dst {
                 Some(RouteAddress::Inet6(a)) => *a,
@@ -1664,7 +1944,7 @@ pub fn dump_routes_v6(
             prefix_len,
         },
     )?;
-    let candidates = candidates
+    let link_local = candidates
         .into_iter()
         .map(|(prefix, table, oif, unowned)| LinkLocalRoute {
             prefix,
@@ -1673,7 +1953,11 @@ pub fn dump_routes_v6(
             unowned,
         })
         .collect();
-    Ok((routes, candidates))
+    Ok(RouteDump {
+        routes,
+        link_local,
+        read,
+    })
 }
 
 /// Link-local candidates as [`dump_family`] builds them:
@@ -1682,17 +1966,24 @@ pub fn dump_routes_v6(
 #[cfg(target_os = "linux")]
 type Candidates<P> = Vec<(P, u32, std::sync::Arc<str>, Option<std::sync::Arc<str>>)>;
 
+/// What [`dump_family`] returns: the routes kept, the link-local
+/// candidates, and how many route messages it read.
+#[cfg(target_os = "linux")]
+type FamilyDump<P> = (Vec<KernelRoute<P>>, Candidates<P>, usize);
+
 /// The dump both families share; `prefix` builds the destination from
 /// `RTA_DST` (absent for a default route) and the header's length.
 /// Returns the routes [`reach_clears`] does not clear, less the
 /// link-local candidates ([`link_local_candidate`]), which come back
-/// separately and compact.
+/// separately and compact, and how many route messages it read.
 #[cfg(target_os = "linux")]
 fn dump_family<P>(
     family: netlink_packet_route::AddressFamily,
     reach: &VppReach,
+    tables: Option<&[u32]>,
+    interrupt: &mut dyn FnMut() -> Option<String>,
     prefix: impl Fn(Option<&netlink_packet_route::route::RouteAddress>, u8) -> P,
-) -> Result<(Vec<KernelRoute<P>>, Candidates<P>), String> {
+) -> Result<FamilyDump<P>, ScanError> {
     use netlink_packet_core::{
         NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_REQUEST,
     };
@@ -1743,24 +2034,21 @@ fn dump_family<P>(
     // waiting on it, so "forever" would mean a thread and its socket
     // held for the daemon's life.
     crate::fdb::bound_recv(&socket)?;
+    // Strict: the kernel honours the table in the request, and refuses
+    // a request it cannot honour rather than quietly dumping everything
+    // — the same pattern as neigh-snoop's coverage dump. The request
+    // carries no protocol, type or device: strict check reads each as a
+    // filter (rtnetlink's builder presets `protocol = Static`, which
+    // neigh-snoop has to clear; `RouteMessage::default()` sets none).
+    socket
+        .set_netlink_get_strict_chk(true)
+        .map_err(|e| format!("NETLINK_GET_STRICT_CHK: {e}"))?;
     socket
         .bind_auto()
         .map_err(|e| format!("netlink bind: {e}"))?;
     socket
         .connect(&SocketAddr::new(0, 0))
         .map_err(|e| format!("netlink connect: {e}"))?;
-
-    let mut route = RouteMessage::default();
-    route.header.address_family = family;
-    let mut msg = NetlinkMessage::from(RouteNetlinkMessage::GetRoute(route));
-    msg.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
-    msg.header.sequence_number = 1;
-    msg.finalize();
-    let mut send_buf = vec![0u8; msg.header.length as usize];
-    msg.serialize(&mut send_buf);
-    socket
-        .send(&send_buf, 0)
-        .map_err(|e| format!("netlink send: {e}"))?;
 
     // Interface names are resolved once per dump rather than per
     // route: a full table can carry thousands of entries out of a
@@ -1770,169 +2058,220 @@ fn dump_family<P>(
         std::collections::HashMap::new();
     let mut out = Vec::new();
     let mut candidates: Candidates<P> = Vec::new();
+    let mut read = 0usize;
     let mut recv_buf = vec![0u8; 64 * 1024];
-    'dump: loop {
-        let n = socket
-            .recv(&mut &mut recv_buf[..], 0)
-            .map_err(|e| format!("netlink recv: {e}"))?;
-        let mut offset = 0usize;
-        while offset < n {
-            let pkt = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&recv_buf[offset..n])
-                .map_err(|e| format!("netlink parse: {e}"))?;
-            let len = pkt.header.length as usize;
-            if len == 0 {
-                break;
+    // `None` = one request for every table.
+    let requests: Vec<Option<u32>> = match tables {
+        Some(t) => t.iter().copied().map(Some).collect(),
+        None => vec![None],
+    };
+    for (seq, wanted) in (1u32..).zip(requests) {
+        let mut route = RouteMessage::default();
+        route.header.address_family = family;
+        // RTA_TABLE, not the header's u8: policy tables live above 255.
+        if let Some(t) = wanted {
+            route.attributes.push(RouteAttribute::Table(t));
+        }
+        let mut msg = NetlinkMessage::from(RouteNetlinkMessage::GetRoute(route));
+        msg.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+        msg.header.sequence_number = seq;
+        msg.finalize();
+        let mut send_buf = vec![0u8; msg.header.length as usize];
+        msg.serialize(&mut send_buf);
+        socket
+            .send(&send_buf, 0)
+            .map_err(|e| format!("netlink send: {e}"))?;
+        'dump: loop {
+            let n = socket
+                .recv(&mut &mut recv_buf[..], 0)
+                .map_err(|e| format!("netlink recv: {e}"))?;
+            // Between chunks, where abandoning costs nothing: the kernel
+            // serves the next chunk only when asked, and closing the socket
+            // frees the dump.
+            if let Some(what) = interrupt() {
+                return Err(ScanError::Interrupted(what));
             }
-            // The kernel sets NLM_F_DUMP_INTR when the table changed
-            // under the dump, which makes the result a mix of two
-            // states rather than a snapshot. On a box with a live BGP
-            // feed that is not rare, and a partial list fails the
-            // dangerous way: a missing route reads as "no such path"
-            // and a missing rule narrows the filter onto an active
-            // table. Refuse it; the caller keeps its previous verdict
-            // and the next scan is a minute away (review finding).
-            if pkt.header.flags & NLM_F_DUMP_INTR != 0 {
-                return Err("the kernel interrupted the dump (NLM_F_DUMP_INTR): the \
-                            table changed underneath it, so this result is not a \
-                            snapshot"
-                    .into());
-            }
-            match pkt.payload {
-                NetlinkPayload::Done(_) => break 'dump,
-                NetlinkPayload::Error(e) => return Err(format!("netlink error: {e}")),
-                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(m)) => {
-                    let mut dst: Option<&RouteAddress> = None;
-                    let mut oifs: Vec<u32> = Vec::new();
-                    // Multipath hops, each with its own gateway flags;
-                    // single-path `oifs` take the top-level ones.
-                    let mut hop_oifs: Vec<(u32, bool, bool)> = Vec::new();
-                    let mut nexthop_object = false;
-                    let mut gatewayed = false;
-                    let mut link_local = false;
-                    let mut encap: Option<String> = None;
-                    let mut table = u32::from(m.header.table);
-                    for attr in &m.attributes {
-                        match attr {
-                            RouteAttribute::Destination(a) => dst = Some(a),
-                            RouteAttribute::Oif(i) => oifs.push(*i),
-                            RouteAttribute::Gateway(_) | RouteAttribute::Via(_) => {
-                                gatewayed = true;
-                                link_local = link_local_gateway(attr);
-                            }
-                            // `RTA_ENCAP_TYPE`: the route hands the
-                            // packet to a lightweight tunnel before it
-                            // leaves. See `KernelRoute::encap` for why
-                            // the ordinary `oif` makes this the
-                            // quietest failure in the dump.
-                            RouteAttribute::EncapType(t) => {
-                                encap = encap.take().or_else(|| encap_name(*t))
-                            }
-                            // ECMP puts its nexthops HERE and leaves
-                            // RTA_OIF unset, so a route read only for
-                            // RTA_OIF looks device-less and gets
-                            // skipped — an all-tunnel ECMP route would
-                            // blackhole under a clean health surface
-                            // (review finding).
-                            RouteAttribute::MultiPath(hops) => {
-                                hop_oifs.extend(hops.iter().map(|h| {
-                                    let gw = h.attributes.iter().any(|a| {
-                                        matches!(
-                                            a,
-                                            RouteAttribute::Gateway(_) | RouteAttribute::Via(_)
+            let mut offset = 0usize;
+            while offset < n {
+                let pkt = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&recv_buf[offset..n])
+                    .map_err(|e| format!("netlink parse: {e}"))?;
+                let len = pkt.header.length as usize;
+                if len == 0 {
+                    break;
+                }
+                // The kernel sets NLM_F_DUMP_INTR when the table changed
+                // under the dump, which makes the result a mix of two
+                // states rather than a snapshot. On a box with a live BGP
+                // feed that is not rare, and a partial list fails the
+                // dangerous way: a missing route reads as "no such path"
+                // and a missing rule narrows the filter onto an active
+                // table. Refuse it; the caller keeps its previous verdict
+                // and the next scan is a minute away (review finding).
+                if pkt.header.flags & NLM_F_DUMP_INTR != 0 {
+                    return Err(ScanError::Unreadable(
+                        "the kernel interrupted the dump (NLM_F_DUMP_INTR): the \
+                         table changed underneath it, so this result is not a \
+                         snapshot"
+                            .into(),
+                    ));
+                }
+                match pkt.payload {
+                    // A dump reports its own failure HERE, as a negative errno
+                    // in the DONE message, not as NLMSG_ERROR — a strict
+                    // request the kernel refuses ends this way, and reading it
+                    // as a clean end would publish an empty table as a clean
+                    // scan.
+                    NetlinkPayload::Done(d) if d.code == 0 => break 'dump,
+                    // A table a rule names but no route has created: nothing
+                    // in it to find. Every box has one — `lookup default`.
+                    NetlinkPayload::Done(d) if wanted.is_some() && d.code == -libc::ENOENT => {
+                        break 'dump
+                    }
+                    NetlinkPayload::Done(d) => {
+                        return Err(ScanError::Unreadable(format!(
+                            "route dump{}: {}",
+                            wanted.map_or(String::new(), |t| format!(" of table {t}")),
+                            std::io::Error::from_raw_os_error(-d.code)
+                        )))
+                    }
+                    NetlinkPayload::Error(e) => {
+                        return Err(ScanError::Unreadable(format!("netlink error: {e}")))
+                    }
+                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(m)) => {
+                        read += 1;
+                        let mut dst: Option<&RouteAddress> = None;
+                        let mut oifs: Vec<u32> = Vec::new();
+                        // Multipath hops, each with its own gateway flags;
+                        // single-path `oifs` take the top-level ones.
+                        let mut hop_oifs: Vec<(u32, bool, bool)> = Vec::new();
+                        let mut nexthop_object = false;
+                        let mut gatewayed = false;
+                        let mut link_local = false;
+                        let mut encap: Option<String> = None;
+                        let mut table = u32::from(m.header.table);
+                        for attr in &m.attributes {
+                            match attr {
+                                RouteAttribute::Destination(a) => dst = Some(a),
+                                RouteAttribute::Oif(i) => oifs.push(*i),
+                                RouteAttribute::Gateway(_) | RouteAttribute::Via(_) => {
+                                    gatewayed = true;
+                                    link_local = link_local_gateway(attr);
+                                }
+                                // `RTA_ENCAP_TYPE`: the route hands the
+                                // packet to a lightweight tunnel before it
+                                // leaves. See `KernelRoute::encap` for why
+                                // the ordinary `oif` makes this the
+                                // quietest failure in the dump.
+                                RouteAttribute::EncapType(t) => {
+                                    encap = encap.take().or_else(|| encap_name(*t))
+                                }
+                                // ECMP puts its nexthops HERE and leaves
+                                // RTA_OIF unset, so a route read only for
+                                // RTA_OIF looks device-less and gets
+                                // skipped — an all-tunnel ECMP route would
+                                // blackhole under a clean health surface
+                                // (review finding).
+                                RouteAttribute::MultiPath(hops) => {
+                                    hop_oifs.extend(hops.iter().map(|h| {
+                                        let gw = h.attributes.iter().any(|a| {
+                                            matches!(
+                                                a,
+                                                RouteAttribute::Gateway(_) | RouteAttribute::Via(_)
+                                            )
+                                        });
+                                        let ll = h.attributes.iter().any(link_local_gateway);
+                                        (h.interface_index, gw, ll)
+                                    }));
+                                    // Encapsulation is per PATH, and ECMP
+                                    // puts each path's attributes here. A
+                                    // route with one plain path and one
+                                    // encapped path is reported: VPP would
+                                    // install both and hash traffic into
+                                    // the one it cannot reproduce.
+                                    encap = encap.take().or_else(|| {
+                                        hops.iter().flat_map(|h| h.attributes.iter()).find_map(
+                                            |a| match a {
+                                                RouteAttribute::EncapType(t) => encap_name(*t),
+                                                _ => None,
+                                            },
                                         )
                                     });
-                                    let ll = h.attributes.iter().any(link_local_gateway);
-                                    (h.interface_index, gw, ll)
-                                }));
-                                // Encapsulation is per PATH, and ECMP
-                                // puts each path's attributes here. A
-                                // route with one plain path and one
-                                // encapped path is reported: VPP would
-                                // install both and hash traffic into
-                                // the one it cannot reproduce.
-                                encap = encap.take().or_else(|| {
-                                    hops.iter().flat_map(|h| h.attributes.iter()).find_map(|a| {
-                                        match a {
-                                            RouteAttribute::EncapType(t) => encap_name(*t),
-                                            _ => None,
-                                        }
-                                    })
-                                });
+                                }
+                                // RTA_TABLE carries ids past the u8 header
+                                // field — policy tables live up there.
+                                RouteAttribute::Table(t) => table = *t,
+                                // RTA_NH_ID: a route carrying it names its
+                                // devices in a nexthop object, nowhere this
+                                // scan can read. See
+                                // [`KernelRoute::via_nexthop_object`].
+                                RouteAttribute::NhId(_) => nexthop_object = true,
+                                _ => {}
                             }
-                            // RTA_TABLE carries ids past the u8 header
-                            // field — policy tables live up there.
-                            RouteAttribute::Table(t) => table = *t,
-                            // RTA_NH_ID: a route carrying it names its
-                            // devices in a nexthop object, nowhere this
-                            // scan can read. See
-                            // [`KernelRoute::via_nexthop_object`].
-                            RouteAttribute::NhId(_) => nexthop_object = true,
-                            _ => {}
+                        }
+                        let hops: Vec<(u32, bool, bool)> = oifs
+                            .into_iter()
+                            .map(|i| (i, gatewayed, link_local))
+                            .chain(hop_oifs)
+                            .collect();
+                        let kind = RouteKind {
+                            drops: matches!(
+                                m.header.kind,
+                                RouteType::BlackHole | RouteType::Unreachable | RouteType::Prohibit
+                            ),
+                            kernel_delivers: matches!(
+                                m.header.kind,
+                                RouteType::Local | RouteType::Broadcast | RouteType::Anycast
+                            ),
+                            via_nexthop_object: nexthop_object,
+                            encapsulated: encap.is_some(),
+                        };
+                        for &(i, _, _) in &hops {
+                            names
+                                .entry(i)
+                                .or_insert_with(|| crate::fdb::ifname(i).into());
+                        }
+                        let name = |i: u32| &*names[&i];
+                        let judged = || {
+                            hops.iter().map(|&(i, gatewayed, link_local)| Hop {
+                                dev: name(i),
+                                gatewayed,
+                                link_local,
+                            })
+                        };
+                        // Judged here, before anything is allocated for it:
+                        // on a full-table box nearly every route is cleared,
+                        // and under a link-local mesh nearly every v6 one is
+                        // a candidate.
+                        if link_local_candidate(kind, judged, reach) {
+                            let (ll, unowned) = candidate_hops(judged(), reach);
+                            let dev = |at: usize| names[&hops[at].0].clone();
+                            candidates.push((
+                                prefix(dst, m.header.destination_prefix_length),
+                                table,
+                                dev(ll),
+                                unowned.map(dev),
+                            ));
+                        } else if !reach_clears(kind, judged(), reach) {
+                            out.push(KernelRoute {
+                                prefix: prefix(dst, m.header.destination_prefix_length),
+                                oifs: hops.iter().map(|&(i, _, _)| name(i).to_string()).collect(),
+                                table,
+                                drops: kind.drops,
+                                kernel_delivers: kind.kernel_delivers,
+                                via_nexthop_object: nexthop_object,
+                                gatewayed: hops.iter().map(|&(_, gw, _)| gw).collect(),
+                                link_local: hops.iter().map(|&(_, _, ll)| ll).collect(),
+                                encap,
+                            });
                         }
                     }
-                    let hops: Vec<(u32, bool, bool)> = oifs
-                        .into_iter()
-                        .map(|i| (i, gatewayed, link_local))
-                        .chain(hop_oifs)
-                        .collect();
-                    let kind = RouteKind {
-                        drops: matches!(
-                            m.header.kind,
-                            RouteType::BlackHole | RouteType::Unreachable | RouteType::Prohibit
-                        ),
-                        kernel_delivers: matches!(
-                            m.header.kind,
-                            RouteType::Local | RouteType::Broadcast | RouteType::Anycast
-                        ),
-                        via_nexthop_object: nexthop_object,
-                        encapsulated: encap.is_some(),
-                    };
-                    for &(i, _, _) in &hops {
-                        names
-                            .entry(i)
-                            .or_insert_with(|| crate::fdb::ifname(i).into());
-                    }
-                    let name = |i: u32| &*names[&i];
-                    let judged = || {
-                        hops.iter().map(|&(i, gatewayed, link_local)| Hop {
-                            dev: name(i),
-                            gatewayed,
-                            link_local,
-                        })
-                    };
-                    // Judged here, before anything is allocated for it:
-                    // on a full-table box nearly every route is cleared,
-                    // and under a link-local mesh nearly every v6 one is
-                    // a candidate.
-                    if link_local_candidate(kind, judged, reach) {
-                        let (ll, unowned) = candidate_hops(judged(), reach);
-                        let dev = |at: usize| names[&hops[at].0].clone();
-                        candidates.push((
-                            prefix(dst, m.header.destination_prefix_length),
-                            table,
-                            dev(ll),
-                            unowned.map(dev),
-                        ));
-                    } else if !reach_clears(kind, judged(), reach) {
-                        out.push(KernelRoute {
-                            prefix: prefix(dst, m.header.destination_prefix_length),
-                            oifs: hops.iter().map(|&(i, _, _)| name(i).to_string()).collect(),
-                            table,
-                            drops: kind.drops,
-                            kernel_delivers: kind.kernel_delivers,
-                            via_nexthop_object: nexthop_object,
-                            gatewayed: hops.iter().map(|&(_, gw, _)| gw).collect(),
-                            link_local: hops.iter().map(|&(_, _, ll)| ll).collect(),
-                            encap,
-                        });
-                    }
+                    _ => {}
                 }
-                _ => {}
+                offset += len;
             }
-            offset += len;
         }
     }
-    Ok((out, candidates))
+    Ok((out, candidates, read))
 }
 
 /// The table ids some policy rule can select, or `None` when they
@@ -2049,6 +2388,214 @@ pub fn dump_rule_tables(
     Ok((!out.is_empty()).then_some(out))
 }
 
+/// The link state [`KernelLinkWatch`] compares: administratively up,
+/// operationally up, carrier. A change in any of them moves routes; the
+/// rest of `ifi_flags` (promiscuity, allmulti) does not, and toggles under
+/// a running daemon — neigh-snoop's promisc, the rx-mode kick, a tcpdump.
+#[cfg(target_os = "linux")]
+fn link_state(flags: netlink_packet_route::link::LinkFlags) -> u32 {
+    use netlink_packet_route::link::LinkFlags;
+    (flags & (LinkFlags::Up | LinkFlags::Running | LinkFlags::LowerUp)).bits()
+}
+
+/// A link state as the log names it.
+#[cfg(target_os = "linux")]
+fn describe_link_state(state: u32) -> &'static str {
+    let up = state & libc::IFF_UP as u32 != 0;
+    let running = state & libc::IFF_RUNNING as u32 != 0;
+    let carrier = state & libc::IFF_LOWER_UP as u32 != 0;
+    match (up, carrier, running) {
+        (false, _, _) => "down",
+        (true, false, _) => "up without carrier",
+        (true, true, false) => "up, not running",
+        (true, true, true) => "up",
+    }
+}
+
+/// Link up/down transitions, read from `RTNLGRP_LINK` without blocking,
+/// for [`Pacing`].
+///
+/// Seeded with one link dump at open, so the first event a device sends
+/// is compared against its real state rather than read as news. A device
+/// that appears is a change only if it appears up, and one that vanishes
+/// only if it was up: an unconfigured interface coming and going moves no
+/// routes.
+#[cfg(target_os = "linux")]
+pub struct KernelLinkWatch {
+    socket: netlink_sys::Socket,
+    state: std::collections::HashMap<u32, u32>,
+    buf: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl KernelLinkWatch {
+    pub fn open() -> Result<Self, String> {
+        use netlink_sys::{protocols::NETLINK_ROUTE, Socket};
+        let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
+        socket
+            .bind_auto()
+            .map_err(|e| format!("netlink bind: {e}"))?;
+        // Subscribed before the seed dump, so a change between the two is
+        // queued rather than lost; replayed against the seed, it counts
+        // only if it differs.
+        socket
+            .add_membership(libc::RTNLGRP_LINK)
+            .map_err(|e| format!("RTNLGRP_LINK: {e}"))?;
+        socket
+            .set_non_blocking(true)
+            .map_err(|e| format!("netlink non-blocking: {e}"))?;
+        Ok(Self {
+            socket,
+            state: dump_link_states()?,
+            buf: vec![0u8; 64 * 1024],
+        })
+    }
+
+    /// The latest transition queued since the last call, `"<dev> <state>"`,
+    /// or `None`. Drains the socket.
+    pub fn changed(&mut self) -> Option<String> {
+        use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
+        use netlink_packet_route::link::{LinkAttribute, LinkMessage};
+        use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+
+        let name = |m: &LinkMessage| {
+            m.attributes
+                .iter()
+                .find_map(|a| match a {
+                    LinkAttribute::IfName(n) => Some(n.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| crate::fdb::ifname(m.header.index))
+        };
+        let mut latest = None;
+        loop {
+            let n = match self.socket.recv(&mut &mut self.buf[..], 0) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                // The queue overflowed: more link events than it holds
+                // since the last look, which is churn whatever they said.
+                // The lost ones leave `state` stale, so it is re-read; an
+                // event queued before the re-read and replayed after it can
+                // only over-report.
+                Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                    latest = Some("link notifications overflowed".to_string());
+                    match dump_link_states() {
+                        Ok(state) => self.state = state,
+                        Err(e) => tracing::debug!(error = %e, "link state re-read failed"),
+                    }
+                    continue;
+                }
+                // Not churn, and nothing to hold a scan for. A socket that
+                // keeps failing leaves scans on the clock alone.
+                Err(e) => {
+                    tracing::debug!(error = %e, "link watch unreadable");
+                    break;
+                }
+            };
+            let mut offset = 0usize;
+            while offset < n {
+                let Ok(pkt) =
+                    NetlinkMessage::<RouteNetlinkMessage>::deserialize(&self.buf[offset..n])
+                else {
+                    break;
+                };
+                let len = pkt.header.length as usize;
+                if len == 0 {
+                    break;
+                }
+                offset += len;
+                // AF_BRIDGE messages describe bridge PORTS (STP state, a
+                // port leaving its bridge); the device's own message is
+                // AF_UNSPEC.
+                let (m, gone) = match pkt.payload {
+                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(m)) => (m, false),
+                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelLink(m)) => (m, true),
+                    _ => continue,
+                };
+                if m.header.interface_family != AddressFamily::Unspec {
+                    continue;
+                }
+                let index = m.header.index;
+                let now = if gone { 0 } else { link_state(m.header.flags) };
+                let was = if gone {
+                    self.state.remove(&index)
+                } else {
+                    self.state.insert(index, now)
+                }
+                .unwrap_or(0);
+                if was != now {
+                    latest = Some(if gone {
+                        format!("{} removed", name(&m))
+                    } else {
+                        format!("{} {}", name(&m), describe_link_state(now))
+                    });
+                }
+            }
+        }
+        latest
+    }
+}
+
+/// Every link's [`link_state`], by ifindex: one RTM_GETLINK dump.
+#[cfg(target_os = "linux")]
+fn dump_link_states() -> Result<std::collections::HashMap<u32, u32>, String> {
+    use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_REQUEST};
+    use netlink_packet_route::link::LinkMessage;
+    use netlink_packet_route::RouteNetlinkMessage;
+    use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
+
+    let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
+    crate::fdb::bound_recv(&socket)?;
+    socket
+        .bind_auto()
+        .map_err(|e| format!("netlink bind: {e}"))?;
+    socket
+        .connect(&SocketAddr::new(0, 0))
+        .map_err(|e| format!("netlink connect: {e}"))?;
+    let mut msg = NetlinkMessage::from(RouteNetlinkMessage::GetLink(LinkMessage::default()));
+    msg.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+    msg.header.sequence_number = 1;
+    msg.finalize();
+    let mut send_buf = vec![0u8; msg.header.length as usize];
+    msg.serialize(&mut send_buf);
+    socket
+        .send(&send_buf, 0)
+        .map_err(|e| format!("netlink send: {e}"))?;
+
+    let mut out = std::collections::HashMap::new();
+    let mut recv_buf = vec![0u8; 64 * 1024];
+    'dump: loop {
+        let n = socket
+            .recv(&mut &mut recv_buf[..], 0)
+            .map_err(|e| format!("netlink recv: {e}"))?;
+        let mut offset = 0usize;
+        while offset < n {
+            let pkt = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&recv_buf[offset..n])
+                .map_err(|e| format!("netlink parse: {e}"))?;
+            let len = pkt.header.length as usize;
+            if len == 0 {
+                break;
+            }
+            match pkt.payload {
+                NetlinkPayload::Done(d) if d.code == 0 => break 'dump,
+                NetlinkPayload::Done(d) => {
+                    return Err(format!(
+                        "link dump: {}",
+                        std::io::Error::from_raw_os_error(-d.code)
+                    ))
+                }
+                NetlinkPayload::Error(e) => return Err(format!("netlink error: {e}")),
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(m)) => {
+                    out.insert(m.header.index, link_state(m.header.flags));
+                }
+                _ => {}
+            }
+            offset += len;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2072,6 +2619,16 @@ mod tests {
             gatewayed: vec![false],
             link_local: Vec::new(),
             encap: None,
+        }
+    }
+
+    /// [`Pacing`] in milliseconds: interval, settle, max deferral.
+    fn pacing(every: u64, settle: u64, max_defer: u64) -> Pacing {
+        let ms = std::time::Duration::from_millis;
+        Pacing {
+            every: ms(every),
+            settle: ms(settle),
+            max_defer: ms(max_defer),
         }
     }
 
@@ -2718,7 +3275,7 @@ mod tests {
             exempts: usize,
         }
         impl DriftWatch for Recorder {
-            fn uncovered(&mut self) -> Result<DriftFindings, String> {
+            fn uncovered(&mut self, _: bool) -> Result<DriftFindings, ScanError> {
                 self.seen.lock().unwrap().push(self.exempts);
                 Ok(DriftFindings::default())
             }
@@ -2733,7 +3290,7 @@ mod tests {
                 seen: seen.clone(),
                 exempts: 0,
             }),
-            std::time::Duration::from_millis(50),
+            pacing(50, 0, 0),
         );
         // Generation starts at zero and only a hand-off moves it.
         assert_eq!(scanner.generation(), 0);
@@ -2747,7 +3304,10 @@ mod tests {
         // that existed, and the newest one is eventually reported.
         let mut stamped_current = false;
         for _ in 0..200 {
-            if let Some((gen, _)) = scanner.take_result() {
+            if let Some(ScanReport {
+                generation: gen, ..
+            }) = scanner.take_result()
+            {
                 assert!(gen <= scanner.generation(), "no stamp from the future");
                 if gen == 1 {
                     stamped_current = true;
@@ -2783,7 +3343,7 @@ mod tests {
             entered: Arc<(Mutex<bool>, Condvar)>,
         }
         impl DriftWatch for Blocking {
-            fn uncovered(&mut self) -> Result<DriftFindings, String> {
+            fn uncovered(&mut self, _: bool) -> Result<DriftFindings, ScanError> {
                 {
                     let mut in_dump = self.entered.0.lock().unwrap();
                     *in_dump = true;
@@ -2800,7 +3360,7 @@ mod tests {
             Box::new(Blocking {
                 entered: entered.clone(),
             }),
-            std::time::Duration::from_secs(60),
+            pacing(60_000, 0, 0),
         );
         // Only meaningful once the worker is actually inside the dump.
         let mut in_dump = entered.0.lock().unwrap();
@@ -2822,6 +3382,198 @@ mod tests {
             "teardown waited {waited:?} on a monitoring scan; the detach budget is 900 ms for \
              the whole supervision thread"
         );
+    }
+
+    /// The hold rule itself: a pass due within `settle` of a link change
+    /// waits for it, never past `max_defer` from when it fell due, and is
+    /// interruptible only until then.
+    #[test]
+    fn a_due_scan_waits_out_link_churn_but_never_past_max_defer() {
+        use std::time::{Duration, Instant};
+        let pace = pacing(60_000, 60_000, 300_000);
+        let s = Duration::from_secs;
+        let due = Instant::now();
+
+        assert_eq!(pace.hold_until(due, due, None), None, "quiet links: now");
+        assert_eq!(
+            pace.hold_until(due + s(5), due, Some(due)),
+            Some(due + s(60)),
+            "a change 5 s ago holds until 60 s after it"
+        );
+        assert_eq!(
+            pace.hold_until(due + s(61), due, Some(due)),
+            None,
+            "settled: now"
+        );
+        assert_eq!(
+            pace.hold_until(due + s(280), due, Some(due + s(270))),
+            Some(due + s(300)),
+            "a hold never reaches past due + max_defer"
+        );
+        assert_eq!(
+            pace.hold_until(due + s(300), due, Some(due + s(299))),
+            None,
+            "and at max_defer the pass runs, changes or not"
+        );
+
+        assert!(pace.interruptible(due + s(299), due));
+        assert!(
+            !pace.interruptible(due + s(300), due),
+            "a pass that waited out max_defer reads to the end"
+        );
+    }
+
+    /// Link changes as a test scripts them, beside the scans it saw.
+    struct Churn {
+        /// What `link_changed` returns, call by call; `None` once empty,
+        /// or forever `Some` when `endless`.
+        changes: Vec<&'static str>,
+        endless: bool,
+        /// The `interruptible` of each scan, in order.
+        scans: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+        /// How many interruptible scans to abandon before one completes.
+        abandon: usize,
+    }
+    impl DriftWatch for Churn {
+        fn uncovered(&mut self, interruptible: bool) -> Result<DriftFindings, ScanError> {
+            let mut scans = self.scans.lock().unwrap();
+            scans.push(interruptible);
+            if interruptible && self.abandon > 0 {
+                self.abandon -= 1;
+                return Err(ScanError::Interrupted("eth9 down".into()));
+            }
+            Ok(DriftFindings {
+                lines: vec![format!("scan {}", scans.len())],
+                ..DriftFindings::default()
+            })
+        }
+        fn set_scope(&mut self, _scope: DriftScope) {}
+        fn link_changed(&mut self) -> Option<String> {
+            if self.endless {
+                return Some("eth9 flapping".into());
+            }
+            (!self.changes.is_empty()).then(|| self.changes.remove(0).to_string())
+        }
+    }
+
+    /// Wait for the scanner's next report.
+    fn next_report(scanner: &DriftScanner, within: std::time::Duration) -> ScanReport {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if let Some(r) = scanner.take_result() {
+                return r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no report within {within:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A link that has just changed holds the first pass for `settle`
+    /// instead of scanning into the churn it starts.
+    #[test]
+    fn a_link_change_holds_the_scan_until_links_settle() {
+        let scans = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started = std::time::Instant::now();
+        let scanner = DriftScanner::spawn(
+            Box::new(Churn {
+                changes: vec!["br1 down"],
+                endless: false,
+                scans: scans.clone(),
+                abandon: 0,
+            }),
+            pacing(60_000, 300, 60_000),
+        );
+        let report = next_report(&scanner, std::time::Duration::from_secs(5));
+        // The change is seen after `started`, so the hold ends at least
+        // `settle` after it.
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(300),
+            "scanned {waited:?} after a link change; it should have waited out the 300 ms settle"
+        );
+        assert_eq!(report.result.unwrap().lines, vec!["scan 1".to_string()]);
+        assert_eq!(*scans.lock().unwrap(), vec![true]);
+    }
+
+    /// A pass a link change catches mid-read publishes nothing — not a
+    /// clean verdict, not a failure — and runs again once links settle.
+    #[test]
+    fn a_link_change_mid_scan_abandons_it_unpublished_and_it_reruns_after_settle() {
+        let scans = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started = std::time::Instant::now();
+        let scanner = DriftScanner::spawn(
+            Box::new(Churn {
+                changes: Vec::new(),
+                endless: false,
+                scans: scans.clone(),
+                abandon: 1,
+            }),
+            pacing(60_000, 300, 60_000),
+        );
+        let report = next_report(&scanner, std::time::Duration::from_secs(5));
+        assert_eq!(
+            report.result.unwrap().lines,
+            vec!["scan 2".to_string()],
+            "the first report is the rerun's; the abandoned pass published nothing"
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "the rerun waited out the settle after the change that abandoned the first"
+        );
+        assert_eq!(*scans.lock().unwrap(), vec![true, true]);
+    }
+
+    /// Links that never settle cannot blind the tripwire: at `max_defer`
+    /// the pass runs and is not abandoned, though changes keep coming.
+    #[test]
+    fn links_that_never_settle_hold_the_scan_no_longer_than_max_defer() {
+        let scans = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started = std::time::Instant::now();
+        let scanner = DriftScanner::spawn(
+            Box::new(Churn {
+                changes: Vec::new(),
+                endless: true,
+                scans: scans.clone(),
+                abandon: usize::MAX,
+            }),
+            pacing(60_000, 60_000, 300),
+        );
+        let report = next_report(&scanner, std::time::Duration::from_secs(5));
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(300),
+            "ran after {waited:?}, before max_defer"
+        );
+        assert!(report.result.is_ok(), "the forced pass completes");
+        assert_eq!(
+            *scans.lock().unwrap(),
+            vec![false],
+            "one pass, run uninterruptible, never abandoned"
+        );
+    }
+
+    /// The report carries the pass's wall time, for the gauge.
+    #[test]
+    fn a_report_carries_how_long_the_scan_took() {
+        struct Slow;
+        impl DriftWatch for Slow {
+            fn uncovered(&mut self, _: bool) -> Result<DriftFindings, ScanError> {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                Err(ScanError::Unreadable("netlink recv: EIO".into()))
+            }
+            fn set_scope(&mut self, _scope: DriftScope) {}
+        }
+        let scanner = DriftScanner::spawn(Box::new(Slow), pacing(60_000, 0, 0));
+        let report = next_report(&scanner, std::time::Duration::from_secs(5));
+        assert!(
+            report.took >= std::time::Duration::from_millis(60),
+            "a failed pass is timed too: {:?}",
+            report.took
+        );
+        assert_eq!(report.result, Err("netlink recv: EIO".to_string()));
     }
 
     /// The operator-facing line names the three things needed to act:
