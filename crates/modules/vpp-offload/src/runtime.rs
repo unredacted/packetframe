@@ -1365,6 +1365,78 @@ fn source_quiet_rate_per_sec(adopted: u64) -> u64 {
     (adopted / 1024).max(64)
 }
 
+/// Whether an UNSTEERED adoption's resync diff may run against the mirror
+/// now, because the fast-path seeded it from its route ledger, rather
+/// than after the route source's replay has gone quiet.
+///
+/// **What the quiet protects, and against what.** The diff withdraws
+/// from VPP every route the mirror lacks, so it is only as good as the
+/// mirror is complete; "a diff against a loading source is ~all
+/// withdrawals" (drill (d)). Quiet is how the gate tells a loaded mirror
+/// from a loading one when nothing else can, and since #153 it counts
+/// every element the route source streams, changed or not, because a
+/// reconnect's reannouncement leaves the mirror's own counter still: a
+/// mirror quiet by mutations could be mid-reload. That protection is
+/// untouched here for every mirror that was NOT seeded — a cold start
+/// fills from empty, and nothing but the stream going quiet says it has
+/// finished.
+///
+/// **Why a seeded mirror does not owe it — every one of these, together:**
+/// - `mirror_seeded`: the mirror holds the previous process's whole
+///   table from before the route source connected. It is not a table
+///   filling from empty, so the withdrawal universe the gate guards is
+///   not at stake: the diff withdraws only what VPP holds and the
+///   previous process's mirror had already let go of.
+/// - the feed session is up, in its FIRST epoch
+///   ([`FIRST_FEED_EPOCH`]): the route source is streaming to this
+///   process now, and has not dropped and reconnected since it began.
+/// - the completeness authority's CURRENT word is yes
+///   ([`authority_current`]: its last report permits steering, and its
+///   count is within `STEER_MAX_DRIFT` of the mirror as it is now). The
+///   fast-path authorities never attest a seed before the route source's
+///   first route, so a yes in the first epoch was measured while THIS
+///   stream was live; and a source that dropped part of the table while
+///   this process was down shows as drift, refusing the door until the
+///   replay's GC removes it. With no authority configured there is
+///   nothing to vouch for the seed, and the door stays shut: the quiet
+///   gate alone decides.
+/// - and the ordinary floor, for completeness' sake.
+///
+/// **Why the first epoch only.** That first-route block is the one thing
+/// that ties an authority report to a stream, and it applies once: to
+/// the first session after the seed. After a reconnect the cached report
+/// may predate the new stream, and a report taken since is the evidence
+/// the steered gate already refuses after a flap (see `read_fallback`):
+/// counts compared over a mirror whose previous-session routes are being
+/// re-announced stay aligned whether or not the new stream has caught
+/// up. There, only the GC restores trust — and the first GC also ends
+/// the seed. So a reconnect shuts this door for good, and the replay has
+/// to go quiet like any other (review finding, PR #324).
+///
+/// **What it costs.** Routes the source changed while the daemon was
+/// down reach VPP when the replay re-advertises them, as ordinary
+/// deltas, and routes it withdrew leave VPP when the route source's GC
+/// withdraws them from the mirror — exactly as on the eBPF tier, which
+/// forwards on the same seed. VPP carries no traffic at this stage
+/// either way; what the door changes is that verify, and with it the
+/// first steer, need not wait out the replay.
+fn seeded_mirror_releases_diff(
+    liveness: Option<packetframe_common::fib::FeedLiveness>,
+    authority: Option<bool>,
+    have: u64,
+    floor: u64,
+) -> bool {
+    liveness.is_some_and(|l| l.mirror_seeded && l.up && l.epoch == FIRST_FEED_EPOCH)
+        && authority == Some(true)
+        && have >= floor
+}
+
+/// The feed session's epoch after its first down-to-up transition in this
+/// process ([`packetframe_common::fib::FeedSession::set_up`]). A seed is
+/// handed over before any route source can connect, so this is the first
+/// session after the seed.
+const FIRST_FEED_EPOCH: u64 = 1;
+
 /// The authority's CURRENT word, or `None` when no authority is
 /// configured: the cached verdict must still permit steering AND the
 /// report must still describe the mirror as it is now (its authority
@@ -3768,10 +3840,34 @@ impl ObserveView {
                             SOURCE_QUIET_FOR,
                         )
                         .released;
-                    if !released {
+                    // The second door, for a mirror the fast-path seeded
+                    // from its route ledger: see
+                    // `seeded_mirror_releases_diff` for when the replay's
+                    // quiet is not owed. Observed every tick above all the
+                    // same, so the rate baseline stays current if this
+                    // door never opens.
+                    let seeded_release = !released
+                        && seeded_mirror_releases_diff(
+                            c.feed_session.as_ref().map(|f| f.liveness()),
+                            authority_current(&c.completeness, have),
+                            have,
+                            gate.floor,
+                        );
+                    if !released && !seeded_release {
                         let want = gate.floor;
                         c.deferred_resync = Some(DeferredResync::AwaitingDiff { adopted, gate });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                    }
+                    if seeded_release {
+                        tracing::info!(
+                            have,
+                            adopted,
+                            "the route mirror was seeded from the fast-path route ledger, the \
+                             route source is streaming and the completeness authority agrees \
+                             with it: running the adopted resync diff now rather than after the \
+                             replay goes quiet (VPP carries no traffic; the replay's changes \
+                             follow as ordinary updates)"
+                        );
                     }
                     // The unsteered seeded adoption re-checks too (see the
                     // steered arm). Nothing is on VPP here, so the dump
@@ -4564,6 +4660,74 @@ mod tests {
     // Only the Linux-gated process tests need these.
     #[cfg(target_os = "linux")]
     use std::sync::{Arc, Mutex};
+
+    /// The seeded-mirror door needs every leg, and each one alone is
+    /// refused: a seed with no stream, a stream with no seed, a seed the
+    /// authority does not vouch for (or no authority at all), a seed
+    /// below the floor.
+    #[test]
+    fn the_seeded_mirror_door_needs_seed_stream_and_authority() {
+        use packetframe_common::fib::FeedLiveness;
+        let live = |up, mirror_seeded| {
+            Some(FeedLiveness {
+                up,
+                epoch: 1,
+                reconciled: false,
+                mirror_seeded,
+            })
+        };
+        assert!(seeded_mirror_releases_diff(
+            live(true, true),
+            Some(true),
+            100,
+            50
+        ));
+        let reconnected = Some(FeedLiveness {
+            up: true,
+            epoch: 2,
+            reconciled: false,
+            mirror_seeded: true,
+        });
+        for (liveness, authority, have, why) in [
+            (
+                reconnected,
+                Some(true),
+                100,
+                "a reconnect: the yes may predate this stream",
+            ),
+            (
+                live(true, false),
+                Some(true),
+                100,
+                "no seed: the quiet gate decides",
+            ),
+            (
+                live(false, true),
+                Some(true),
+                100,
+                "the route source is not streaming",
+            ),
+            (
+                live(true, true),
+                Some(false),
+                100,
+                "the authority does not agree",
+            ),
+            (
+                live(true, true),
+                None,
+                100,
+                "no authority to vouch for the seed",
+            ),
+            (live(true, true), Some(true), 49, "below the floor"),
+            (None, Some(true), 100, "no feed session handle at all"),
+        ] {
+            assert!(
+                !seeded_mirror_releases_diff(liveness, authority, have, 50),
+                "{why}"
+            );
+        }
+    }
 
     /// The named unresolvable routes reach the event log once per change,
     /// never per tick, and no more than once a minute; a change inside the

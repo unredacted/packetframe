@@ -665,6 +665,10 @@ pub struct FeedLiveness {
     /// The stale-route GC has completed for THIS epoch. See
     /// [`FeedSession::mark_reconciled`].
     pub reconciled: bool,
+    /// The mirror was seeded from the fast-path route ledger and no
+    /// stale-route GC has run since. See
+    /// [`FeedSession::mark_mirror_seeded`].
+    pub mirror_seeded: bool,
 }
 
 impl FeedSession {
@@ -682,8 +686,17 @@ impl FeedSession {
     /// transition, set only by [`FeedSession::mark_reconciled`].
     const RECONCILED_BIT: u64 = 1 << 1;
 
-    /// The epoch occupies the remaining 62 bits.
-    const EPOCH_SHIFT: u32 = 2;
+    /// Bit 2 of `state`: the mirror holds a seed from the fast-path
+    /// route ledger that no GC has reconciled yet. Unlike
+    /// [`Self::RECONCILED_BIT`] it is a fact about the MIRROR, not an
+    /// epoch: a reconnect does not clear it (the seed's unconfirmed routes
+    /// are still there), the first GC does (it removed every seeded route
+    /// the source did not re-advertise). In the same word so a consumer
+    /// reads it with the liveness it is judged alongside.
+    const MIRROR_SEEDED_BIT: u64 = 1 << 2;
+
+    /// The epoch occupies the remaining 61 bits.
+    const EPOCH_SHIFT: u32 = 3;
 
     pub fn new() -> Self {
         Self::default()
@@ -715,11 +728,27 @@ impl FeedSession {
                 }
                 Some(
                     (epoch << Self::EPOCH_SHIFT)
+                        | (cur & Self::MIRROR_SEEDED_BIT)
                         | if reconciled { Self::RECONCILED_BIT } else { 0 }
                         | u64::from(up),
                 )
             },
         );
+    }
+
+    /// The mirror was seeded from the fast-path route ledger: it holds
+    /// the previous process's whole table, every route unconfirmed until
+    /// the route source re-advertises it. Set once, by the control plane,
+    /// before the route source can connect; cleared by the first
+    /// [`Self::mark_reconciled`].
+    ///
+    /// What it lets a consumer conclude, and what it does not: the
+    /// mirror is NOT a table still loading from empty — a diff against it
+    /// is not "~all withdrawals" — but neither is it current. Pair it with
+    /// the completeness authority's word before acting on it.
+    pub fn mark_mirror_seeded(&self) {
+        self.state
+            .fetch_or(Self::MIRROR_SEEDED_BIT, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// The session owner reports that the stale-route GC has completed
@@ -738,9 +767,15 @@ impl FeedSession {
     /// sole writer of this word and its raise and its GC completion are
     /// sequential within one task; nothing can clear the epoch between
     /// the GC and this call.
+    ///
+    /// The same GC is what reconciles a ledger seed, so this also clears
+    /// [`Self::MIRROR_SEEDED_BIT`].
     pub fn mark_reconciled(&self) {
-        self.state
-            .fetch_or(Self::RECONCILED_BIT, std::sync::atomic::Ordering::AcqRel);
+        let _ = self.state.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| Some((cur | Self::RECONCILED_BIT) & !Self::MIRROR_SEEDED_BIT),
+        );
     }
 
     /// Liveness, epoch and reconciliation as one observation. Prefer
@@ -750,6 +785,7 @@ impl FeedSession {
         FeedLiveness {
             up: s & Self::UP_BIT != 0,
             reconciled: s & Self::RECONCILED_BIT != 0,
+            mirror_seeded: s & Self::MIRROR_SEEDED_BIT != 0,
             epoch: s >> Self::EPOCH_SHIFT,
         }
     }
@@ -1147,6 +1183,7 @@ mod tests {
             up,
             epoch,
             reconciled,
+            mirror_seeded: false,
         };
         let s = FeedSession::new();
         assert_eq!(s.liveness(), l(false, 0, false));
@@ -1199,6 +1236,41 @@ mod tests {
         s.mark_reconciled();
         assert!(s.liveness().reconciled);
         assert_eq!(s.liveness().epoch, 2, "reconciling does not move the epoch");
+    }
+
+    /// A ledger seed is a fact about the mirror, not about an epoch: it
+    /// outlives a reconnect (the seed's unconfirmed routes are still
+    /// there) and ends at the first GC (which removed them) — and it
+    /// shares the word without disturbing what else the word carries.
+    #[test]
+    fn a_mirror_seed_lasts_until_the_first_gc() {
+        let s = FeedSession::new();
+        s.mark_mirror_seeded();
+        let seen = s.liveness();
+        assert!(
+            seen.mirror_seeded && !seen.up && seen.epoch == 0,
+            "{seen:?}"
+        );
+        s.set_up(true);
+        s.set_up(false);
+        s.set_up(true);
+        let seen = s.liveness();
+        assert!(
+            seen.mirror_seeded && seen.up && seen.epoch == 2 && !seen.reconciled,
+            "a reconnect is not a reconciliation of the seed: {seen:?}"
+        );
+        s.mark_reconciled();
+        let seen = s.liveness();
+        assert!(
+            !seen.mirror_seeded && seen.reconciled && seen.up && seen.epoch == 2,
+            "{seen:?}"
+        );
+        s.set_up(false);
+        s.set_up(true);
+        assert!(
+            !s.liveness().mirror_seeded,
+            "nothing re-seeds a mirror mid-process"
+        );
     }
 
     #[test]

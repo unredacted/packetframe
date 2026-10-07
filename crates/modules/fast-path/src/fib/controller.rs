@@ -408,6 +408,13 @@ impl RouteController {
         programmer.set_ledger_status(ledger_status.clone());
         if let Some(seed) = seed {
             programmer.set_seed(seed);
+            // Told to the second tier before the route source can
+            // connect, through the handle its gates already read: the
+            // mirror is not a table loading from empty. Cleared by the
+            // route source's first GC (`mark_reconciled`).
+            if let Some(h) = &feed_session {
+                h.mark_mirror_seeded();
+            }
         }
 
         // v0.2.1: enable the connected fast-path when the operator

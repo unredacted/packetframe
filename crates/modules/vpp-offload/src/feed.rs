@@ -367,6 +367,13 @@ impl RouteSource for RouteFeed {
         }
     }
 
+    /// Route deltas only, under the same lock every writer takes: a
+    /// `route_resolved` that lands after this re-queues its prefix, so
+    /// nothing written after the resync walk began is lost.
+    fn discard_route_deltas(&self) {
+        self.lock().pending.clear();
+    }
+
     fn backlog(&self) -> u64 {
         let g = self.lock();
         (g.pending.len() + g.neigh_pending.len()) as u64
@@ -450,6 +457,9 @@ impl RouteSource for std::sync::Arc<RouteFeed> {
     }
     fn requeue_via(&self, nexthops: &[IpAddr]) {
         (**self).requeue_via(nexthops)
+    }
+    fn discard_route_deltas(&self) {
+        (**self).discard_route_deltas()
     }
     fn backlog(&self) -> u64 {
         (**self).backlog()
@@ -824,6 +834,32 @@ mod tests {
             seq + 1,
             "only the withdrawal is source activity"
         );
+    }
+
+    /// A resync walk supersedes the route deltas queued before it, and
+    /// only those: route deltas go, a neighbour delta stays, a change
+    /// written afterwards is queued as usual, the mirror and the activity
+    /// counter are untouched — through the `Arc` the loader boxes.
+    #[test]
+    fn a_resync_discards_only_the_route_deltas_queued_before_it() {
+        let f = std::sync::Arc::new(RouteFeed::new());
+        f.route_resolved(v4(192, 0), &[nh(1)]);
+        f.route_resolved(v4(192, 1), &[nh(1)]);
+        f.route_withdrawn(v4(192, 1));
+        f.neighbour_resolved(nh(1), [2, 0, 0, 0, 0, 1], u32::MAX);
+        let seq = f.change_seq();
+        let src: &dyn RouteSource = &f;
+
+        src.discard_route_deltas();
+        assert_eq!(f.stats().pending, 0, "route deltas superseded by the walk");
+        assert_eq!(f.stats().pending_neighbours, 1, "neighbour deltas kept");
+        assert_eq!(f.stats().routes, 1, "the mirror itself is untouched");
+        assert_eq!(f.change_seq(), seq, "and so is the activity counter");
+
+        // Written after the walk began: an ordinary delta.
+        f.route_resolved(v4(192, 2), &[nh(1)]);
+        let got = f.drain_changes(64).routes;
+        assert_eq!(got, vec![(v4(192, 2), Some(vec![nh(1)]))]);
     }
 
     /// A neighbour whose link is gone is skipped, not reported with a
