@@ -21,6 +21,10 @@
 //! 7. Stopping the reconciler without removal (the breaker-trip and
 //!    `detach --keep-vpp` paths) leaves working rules, and a new
 //!    reconciler adopts them without writing anything.
+//! 8. Every rule names a table or a goto (UniFi's udapi-server refuses
+//!    to start otherwise), and the `nop` anchor an older daemon left is
+//!    replaced by the `lookup local` one without the goto losing its
+//!    target.
 //!
 //! The topology mirrors the platform shape the feature exists for:
 //! `main` moved from 32766 to 32000 and holding a specific route via
@@ -40,8 +44,8 @@ use futures::TryStreamExt;
 use netlink_packet_route::rule::RuleAttribute;
 use packetframe_common::config::Config;
 use packetframe_fast_path::wan_egress::{
-    reconcile_once, remove_all_owned, spec_from_directives, Condition, Layout, PlanError,
-    WanEgress, WanEgressSpec,
+    reconcile_once, remove_all_owned, spec_from_directives, Condition, Layout, OwnedRule,
+    PlanError, WanEgress, WanEgressSpec,
 };
 use packetframe_fast_path::PACKETFRAME_RT_PROTOCOL;
 
@@ -257,6 +261,18 @@ fn rules_text(n: &Names) -> String {
     ns_output(&n.netns, &["ip", "-4", "rule", "show"])
 }
 
+/// The check UniFi's udapi-server makes at start, which aborts it on a
+/// rule with neither a table nor a goto.
+fn assert_every_rule_has_a_table_or_goto(n: &Names) {
+    let text = rules_text(n);
+    for line in text.lines() {
+        assert!(
+            line.contains("lookup") || line.contains("goto"),
+            "`{line}` has neither a table nor a goto:\n{text}"
+        );
+    }
+}
+
 /// Owned rules, counted from a netlink dump (iproute2's rendering of a
 /// rule's protocol differs across versions).
 async fn owned_count() -> usize {
@@ -322,6 +338,9 @@ fn wan_egress_steers_repairs_stays_quiet_and_detaches() {
         n.ix,
         "other sources untouched"
     );
+    let text = rules_text(&n);
+    assert!(text.contains("32001:\tfrom all lookup local"), "{text}");
+    assert_every_rule_has_a_table_or_goto(&n);
 
     // 2. The anchor is load-bearing, and repaired.
     ns_run(&n.netns, &["ip", "rule", "del", "pref", "32001"]);
@@ -514,4 +533,44 @@ fn wan_egress_thread_repairs_on_the_rule_event() {
     w.stop();
     assert_eq!(rt.block_on(owned_count()), 0);
     assert_eq!(egress(&n, VIA_IX, SRC), n.ix);
+}
+
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn wan_egress_replaces_a_legacy_nop_anchor() {
+    let n = Names::new("d");
+    let _guard = NetnsGuard::setup(&n);
+    let _ns = enter_netns(&n.netns);
+    let rt = runtime();
+    let spec = spec();
+
+    // What a daemon from before the `lookup local` anchor left behind:
+    // the same keep and goto rules, the anchor as a tagged `nop`.
+    let report = rt.block_on(reconcile_once(&spec)).expect("reconcile");
+    assert!(report.converged(), "{report:?}");
+    ns_run(&n.netns, &["ip", "rule", "del", "pref", "32001"]);
+    ns_run(
+        &n.netns,
+        &[
+            "ip", "rule", "add", "pref", "32001", "nop", "protocol", "199",
+        ],
+    );
+    assert_eq!(rt.block_on(owned_count()), 8);
+    assert_eq!(egress(&n, VIA_IX, SRC), n.wan, "the old anchor is a target");
+
+    // One pass adds the new anchor, then removes the old one. Deleting
+    // the first of two rules at 32001 moves the goto to the second; if
+    // it did not, the goto would sit there unresolved and, matching the
+    // desired set, never be rewritten.
+    let report = rt.block_on(reconcile_once(&spec)).expect("replace anchor");
+    assert!(report.converged(), "{report:?}");
+    assert_eq!(report.added, vec![OwnedRule::Anchor { priority: 32001 }]);
+    assert_eq!(report.removed, vec!["32001: from all nop (legacy anchor)"]);
+    assert_eq!(egress(&n, VIA_IX, SRC), n.wan, "the goto kept its target");
+    assert_eq!(egress(&n, KEPT, SRC), n.ix);
+    assert_eq!(rt.block_on(owned_count()), 8);
+    assert_every_rule_has_a_table_or_goto(&n);
+
+    let report = rt.block_on(reconcile_once(&spec)).expect("quiet pass");
+    assert!(report.converged() && !report.wrote(), "{report:?}");
 }

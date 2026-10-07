@@ -20,7 +20,8 @@ use tracing::{info, warn};
 
 use super::{
     desired_rules, diff, plan_layout, removal_stage, Condition, Layout, ObservedRule, OwnedRule,
-    PlanError, RepairLimiter, RuleAction, Status, WanEgressSpec, MAIN_TABLE, RECONCILE_INTERVAL,
+    PlanError, RepairLimiter, RuleAction, Status, WanEgressSpec, LOCAL_TABLE, MAIN_TABLE,
+    RECONCILE_INTERVAL,
 };
 use crate::{MODULE_NAME, PACKETFRAME_RT_PROTOCOL};
 
@@ -135,7 +136,11 @@ fn message_for(rule: &OwnedRule) -> RuleMessage {
         m.attributes.push(RuleAttribute::Source(IpAddr::V4(p.addr)));
     }
     match rule {
-        OwnedRule::Anchor { .. } => m.header.action = NlAction::Nop,
+        OwnedRule::Anchor { .. } => {
+            m.header.action = NlAction::ToTable;
+            m.header.table = LOCAL_TABLE as u8;
+            m.attributes.push(RuleAttribute::Table(LOCAL_TABLE));
+        }
         OwnedRule::Keep { src, dst, .. } => {
             m.header.action = NlAction::ToTable;
             m.header.table = MAIN_TABLE as u8;
@@ -157,6 +162,7 @@ fn message_for(rule: &OwnedRule) -> RuleMessage {
 fn describe(r: &ObservedRule) -> String {
     match r.as_owned() {
         Some(o) => o.to_string(),
+        None if r.is_legacy_anchor() => format!("{}: from all nop (legacy anchor)", r.priority),
         None => format!("{}: {:?} (unrecognised owned rule)", r.priority, r.action),
     }
 }
@@ -704,6 +710,52 @@ mod tests {
             assert!(seen.owned, "{rule}: protocol tag lost");
             assert_eq!(seen.as_owned(), Some(rule));
         }
+    }
+
+    /// UniFi's udapi-server aborts at start on any rule with neither a
+    /// table nor a goto, so nothing we write may be one.
+    #[test]
+    fn every_written_rule_names_a_table_or_a_goto() {
+        for rule in [
+            OwnedRule::Anchor { priority: 32001 },
+            OwnedRule::Keep {
+                priority: 31998,
+                src: p("198.18.0.0/24"),
+                dst: p("10.0.0.0/8"),
+            },
+            OwnedRule::Goto {
+                priority: 31999,
+                src: p("198.18.0.0/24"),
+                target: 32001,
+            },
+        ] {
+            let m = message_for(&rule);
+            let names_table = m.header.action == NlAction::ToTable
+                && m.attributes
+                    .iter()
+                    .any(|a| matches!(a, RuleAttribute::Table(t) if *t != 0));
+            let names_goto = m.header.action == NlAction::Goto
+                && m.attributes
+                    .iter()
+                    .any(|a| matches!(a, RuleAttribute::Goto(_)));
+            assert!(names_table || names_goto, "{rule}: {m:?}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_nop_anchor_observes_as_one() {
+        let mut m = RuleMessage::default();
+        m.header.family = AddressFamily::Inet;
+        m.header.action = NlAction::Nop;
+        m.attributes = vec![
+            RuleAttribute::Priority(32001),
+            RuleAttribute::Protocol(RouteProtocol::Other(PACKETFRAME_RT_PROTOCOL)),
+            RuleAttribute::SuppressPrefixLen(u32::MAX),
+        ];
+        let o = observe(&m).unwrap();
+        assert!(o.is_legacy_anchor(), "{o:?}");
+        assert_eq!(o.as_owned(), None, "replaced, not adopted");
+        assert_eq!(describe(&o), "32001: from all nop (legacy anchor)");
     }
 
     #[test]
