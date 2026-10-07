@@ -4399,3 +4399,36 @@ fn a_seed_the_authority_disputes_waits_for_the_replay() {
     assert_eq!(d.state(), State::Syncing, "{seen:?}");
     assert!(!seen.contains(&Event::SyncComplete), "{seen:?}");
 }
+
+/// A reconnect shuts the seeded door (review finding, PR #324). The
+/// agreeing report was taken in the first session; after the route source
+/// drops and comes back, nothing ties it — or a report taken since — to
+/// the new stream, which is replaying over a mirror whose counts stay
+/// aligned either way. The diff waits for the replay to go quiet, as any
+/// other would, and then the ordinary door releases it.
+#[test]
+fn a_reconnect_shuts_the_seeded_door_until_the_replay_goes_quiet() {
+    use packetframe_common::fib::{AuthorityObservation, CompletenessReport};
+    let mut d = Driver::new();
+    // Seed, session up, an agreeing report: the door would open on the
+    // next tick.
+    let (f, t0) = seeded_mirror::adopted("seeded-reconnect", true, &mut d);
+    // The route source drops and reconnects before it does.
+    f.session.set_up(false);
+    f.session.set_up(true);
+    assert_eq!(f.session.liveness().epoch, 2);
+    assert!(f.session.liveness().mirror_seeded, "no GC has run");
+    // Even a report taken after the reconnect does not reopen it.
+    f.authority
+        .record(AuthorityObservation::Clean(CompletenessReport {
+            authority_routes: 6,
+            mirror_routes: 6,
+            at: std::time::Instant::now(),
+        }));
+    let (now, seen) = seeded_mirror::replay(&mut d, &f, t0, 200, |_| false);
+    assert_eq!(d.state(), State::Syncing, "{seen:?}");
+    assert!(!seen.contains(&Event::SyncComplete), "{seen:?}");
+
+    let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Ready);
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+}

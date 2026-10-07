@@ -1355,18 +1355,31 @@ fn source_quiet_rate_per_sec(adopted: u64) -> u64 {
 ///   filling from empty, so the withdrawal universe the gate guards is
 ///   not at stake: the diff withdraws only what VPP holds and the
 ///   previous process's mirror had already let go of.
-/// - the feed session is up: the route source is streaming to this
-///   process now, so the seed is being confirmed rather than frozen.
+/// - the feed session is up, in its FIRST epoch
+///   ([`FIRST_FEED_EPOCH`]): the route source is streaming to this
+///   process now, and has not dropped and reconnected since it began.
 /// - the completeness authority's CURRENT word is yes
 ///   ([`authority_current`]: its last report permits steering, and its
 ///   count is within `STEER_MAX_DRIFT` of the mirror as it is now). The
 ///   fast-path authorities never attest a seed before the route source's
-///   first route, so this also proves the stream has spoken; and a
-///   source that dropped part of the table while this process was down
-///   shows as drift, refusing the door until the replay's GC removes it.
-///   With no authority configured there is nothing to vouch for the
-///   seed, and the door stays shut: the quiet gate alone decides.
+///   first route, so a yes in the first epoch was measured while THIS
+///   stream was live; and a source that dropped part of the table while
+///   this process was down shows as drift, refusing the door until the
+///   replay's GC removes it. With no authority configured there is
+///   nothing to vouch for the seed, and the door stays shut: the quiet
+///   gate alone decides.
 /// - and the ordinary floor, for completeness' sake.
+///
+/// **Why the first epoch only.** That first-route block is the one thing
+/// that ties an authority report to a stream, and it applies once: to
+/// the first session after the seed. After a reconnect the cached report
+/// may predate the new stream, and a report taken since is the evidence
+/// the steered gate already refuses after a flap (see `read_fallback`):
+/// counts compared over a mirror whose previous-session routes are being
+/// re-announced stay aligned whether or not the new stream has caught
+/// up. There, only the GC restores trust — and the first GC also ends
+/// the seed. So a reconnect shuts this door for good, and the replay has
+/// to go quiet like any other (review finding, PR #324).
 ///
 /// **What it costs.** Routes the source changed while the daemon was
 /// down reach VPP when the replay re-advertises them, as ordinary
@@ -1381,8 +1394,16 @@ fn seeded_mirror_releases_diff(
     have: u64,
     floor: u64,
 ) -> bool {
-    liveness.is_some_and(|l| l.mirror_seeded && l.up) && authority == Some(true) && have >= floor
+    liveness.is_some_and(|l| l.mirror_seeded && l.up && l.epoch == FIRST_FEED_EPOCH)
+        && authority == Some(true)
+        && have >= floor
 }
+
+/// The feed session's epoch after its first down-to-up transition in this
+/// process ([`packetframe_common::fib::FeedSession::set_up`]). A seed is
+/// handed over before any route source can connect, so this is the first
+/// session after the seed.
+const FIRST_FEED_EPOCH: u64 = 1;
 
 /// The authority's CURRENT word, or `None` when no authority is
 /// configured: the cached verdict must still permit steering AND the
@@ -4524,7 +4545,19 @@ mod tests {
             100,
             50
         ));
+        let reconnected = Some(FeedLiveness {
+            up: true,
+            epoch: 2,
+            reconciled: false,
+            mirror_seeded: true,
+        });
         for (liveness, authority, have, why) in [
+            (
+                reconnected,
+                Some(true),
+                100,
+                "a reconnect: the yes may predate this stream",
+            ),
             (
                 live(true, false),
                 Some(true),
