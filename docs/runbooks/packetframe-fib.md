@@ -379,9 +379,17 @@ birdc enable bmp1
 ```
 
 packetframe emits `RouteEvent::Resync` on disconnect and receives
-the fresh dump on reconnect. Stale entries from before the
-reconnect are GC'd by `InitiationComplete` (fires after 5 s of
-post-first-update quiescence) or the next Resync.
+the fresh dump on reconnect. Routes the new session does not
+re-announce are GC'd at `InitiationComplete`, which fires after 5 s of
+post-first-update quiescence. A session that drops before then GCs
+nothing; the next session's `InitiationComplete` does.
+
+The GC covers the feed's routes only. The `fallback-default` 0/0 and
+the `local-prefix` host routes come from the neighbour resolver, not
+the feed, and stay in place in both the FIB and VPP. Before 0.6.0
+every reconnect deleted them (and FRR on UniFi reconnects at every
+config upload); a host route came back at the kernel's next update
+of its neighbour entry, the default only at a daemon restart.
 
 ### Inspecting the FIB programmatically
 
@@ -783,6 +791,15 @@ XDP redirects directly to upstream: same upstream rejection behavior,
 just no kernel / conntrack involvement. Measured ~25% reduction in
 steady-state conntrack pressure on a busy Tor exit relay.
 
+The /0 follows its interface. It lives under the interface's
+`local_arp` peer, like the `local-prefix` host routes, so deleting the
+interface withdraws it from the PacketFrame FIB and, through the route
+sink, from VPP (`fallback-default iface deleted; 0.0.0.0/0 withdrawn
+until its RTM_NEWLINK`). When an interface by that name appears again,
+or for the first time if it was absent at startup, its `RTM_NEWLINK`
+injects the /0 under the new ifindex (`v0.2.1 fallback-default 0.0.0.0/0
+injected`). No restart is needed.
+
 The /0 only ever sees frames addressed to the router. Broadcast,
 multicast and bridged host-to-host frames never reach the FIB
 (`pass_not_for_us`), so a subnet broadcast or an mDNS packet from an
@@ -865,7 +882,7 @@ protocol number (the same tag the `anyip` route wears):
 31998:  from <src> to <keep> lookup main     # one per (source, keep) pair
 31999:  from <src> goto 32001                # one per source
 32000:  from all lookup main                 # the platform's own rule
-32001:  from all nop                         # the anchor, only when 32001 is free
+32001:  from all lookup local                # the anchor, only when 32001 is free
 ```
 
 (Priorities for a `lookup main` at 32000; on stock Linux, where `main`
@@ -889,8 +906,20 @@ anchor is needed.)
   its target priority. An unresolved goto is skipped, which would
   quietly put the sources back in `main`. The gotos therefore always
   target `main + 1`, and when nothing foreign sits there PacketFrame
-  installs a `nop` there. Evaluation continues from it into the
+  installs `from all lookup local` there. That lookup always misses:
+  the `local` table was already consulted at priority 0 with the same
+  flow and missed, or evaluation would not have got this far. So it
+  behaves exactly like a `nop`, and evaluation continues into the
   platform's own rules, whatever they are.
+- **Why not a `nop`.** UniFi's udapi-server reads every policy rule
+  when it starts and aborts (`neither table nor goto is defined for
+  routing rule`) on any rule with neither a table nor a goto. It checks
+  only at start, so a `nop` anchor sits harmless until udapi-server
+  restarts, and then systemd's restarts all fail until the rule is
+  deleted. Builds before this change wrote a `nop` anchor; the first
+  pass of a newer daemon adds the `lookup local` anchor, then deletes
+  the `nop` (the kernel moves the goto to the remaining rule at that
+  priority) and logs `32001: from all nop (legacy anchor)` as removed.
 - **Ownership.** A rule wearing `proto 199` is PacketFrame's: adopted
   when a new daemon finds it, repaired or removed as the config says.
   A rule without the tag is never modified or deleted.
@@ -929,6 +958,17 @@ in force:
 | degraded, `a second unconditional lookup main at S follows the one at F` | Skipping the first `main` would only reach the second; nothing written or changed | Usually a provisioning pass caught half-way; if it persists, find which one the platform meant to keep |
 | degraded, `repair failing: X of Y rules in place; ...` | A dump or write failed. Writes stop at the first failed stage (anchor, then keep, then goto), and nothing old is removed until every new rule is in, so a partial pass never leaves a goto without its keep rules | The error names the rule and the netlink error; it retries every pass |
 | degraded, `removed from the config, but its rules could not all be removed` | A reload dropped the directive and the removal did not finish | It retries every pass and on the next reload; `packetframe detach` also removes them |
+
+**udapi-server will not start and logs `neither table nor goto is
+defined for routing rule`.** List the rules it objects to with
+`ip -4 rule show | grep -v -E 'lookup|goto'`. A `from all nop proto 199`
+there is the anchor of a PacketFrame build from before the `lookup
+local` anchor; delete it with `ip -4 rule del pref <prio> nop`. While
+that build is running it puts the rule back within a second, so stop
+it first, or remove `wan-egress` from the config and reload. udapi-server
+also deletes the wan-egress goto when it starts; a running daemon puts
+it back on the rule event, so after starting udapi-server with
+PacketFrame stopped, the sources stay in `main` until PacketFrame runs.
 
 The textfile metrics carry `packetframe_wan_egress_rules{state="desired"}`,
 `packetframe_wan_egress_rules{state="present"}` and
@@ -976,9 +1016,21 @@ confirms it route by route instead of building it.
 
 Only at a **clean preserving exit** — SIGTERM / `systemctl stop`, where
 the loader calls `Module::exit_preserving` just before it drops the
-modules. A crash, a `kill -9`, a circuit-breaker trip, or a snapshot
-that takes longer than 5 s writes nothing, and the next start loads
-cold, as every start used to.
+modules. A crash, a `kill -9` or a circuit-breaker trip writes nothing,
+and the next start loads cold, as every start used to.
+
+The snapshot and the write (temp file, fsync, rename) share one **5 s
+budget**, so neither a wedged programmer nor a wedged filesystem can
+hold the exit. The write runs on a helper thread; past the deadline the
+stop gives up and goes on (`reason=... did not finish within its 5000
+ms budget ...`), and when the helper's I/O finally returns it removes
+its temp file instead of renaming it into place. So a stop that gave up
+leaves no ledger, and the next start loads cold. (A temp file left by a
+process that exited first is never read: a start opens only the
+ledger's own name, and the next write replaces it. The one outcome the
+deadline cannot settle is a rename already under way when it passes;
+`rename` is atomic, so that ends in a whole ledger or none, and the
+reason says so.)
 
 ```
 preserved the route mirror as the route ledger: the next start seeds from it ...
@@ -990,14 +1042,21 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
 - **File:** `<state-dir>/fast-path-route-ledger.bin`, ~14 bytes a route
   (~19 MB for 1.1M IPv4 + 250k IPv6), written temp file → fsync →
   rename through the same no-follow state-dir primitives as every other
-  record. A trailing checksum covers all of it.
+  record, mode 0600 and owned by the daemon's uid. A trailing checksum
+  covers all of it — integrity, not provenance: the next start reads it
+  only if its ownership and modes, and those of `state-dir` and its
+  ancestors, show no other account could have written it (`untrusted`
+  below). A keyed MAC would add nothing: its key would have to live
+  where other accounts cannot write, which is the same guarantee, one
+  file away.
 - **Contents:** every advertisement from the route source — prefix,
   peer id, path id, nexthops, local-pref — and **nothing the neighbour
   resolver injected** (`fallback-default`'s 0/0, the `local-prefix`
   host routes). The resolver re-injects those at every start from the
   live kernel, which is fresher than a file. Plus the format version,
   the writing version, the write time, the route-source identity (mode,
-  listen address and port, ASNs, peer pin) and per-family counts.
+  listen address and port, ASNs, peer pin, and the `peer-from` ACL when
+  no pin names the speaker) and per-family counts.
 - **How old its routes are**, which is not always the write time. A
   route the live session had not re-advertised by the stop — the session
   was down (a `Resync` with no new session yet), or the stop came before
@@ -1030,10 +1089,12 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
    | `forwarding-mode` | Not `packetframe-fib`. `compare` validates the PacketFrame FIB against the kernel's, and stale seeded routes would read as disagreements |
    | `no-route-source` | No `route-source`, so nothing could ever reconcile a seed |
    | `unreadable` | It could not be read (I/O error, planted symlink); removed anyway |
+   | `untrusted` | Untrusted ownership/permissions: the file is not owned by the daemon's uid or is group- or world-writable, or so is the directory holding it, or an ancestor directory is owned by someone other than root or is writable by group or others without the sticky bit (so another account could rename `state-dir` away), or it is not a regular file. Judged on the open descriptors before a byte is read; removed unread. Its routes would be installed by root, so a file another account could have written is never trusted, whatever its checksum says. Fix the state-dir's ownership and modes (`chown root:root`, `chmod 755` or tighter) |
+   | `too-large` | Larger than the largest ledger a FIB at capacity could encode to (about 585 MB; a full table is ~19 MB). Judged from the file's size before a byte is read; removed unread |
    | `unremovable` | It could not be removed, so it cannot be consumed once. Status degrades; remove it by hand |
    | `corrupt` | Truncated, checksum mismatch, structurally wrong, empty, or naming a resolver peer id |
    | `format-version` | Written by a build with another layout |
-   | `identity` | Written for a different route source (mode, address, port, ASNs or peer pin changed). `router-id`, `anyip` and the `peer-from` ACL are not identity |
+   | `identity` | Written for a different route source (mode, address, port, ASNs or peer pin changed, or the `peer-from` ACL wherever no peer pin names the speaker: always for BMP, and for BGP without `peer-ip`). `router-id`, `anyip`, and the ACL under a `peer-ip` pin are not identity |
    | `too-old` | Its oldest routes were last confirmed longer ago than `max-age` (default 30 minutes) |
    | `clock` | Confirmed more than a minute in the future: the clock moved across the restart, so no age can be established |
    | `peer-id` | A BGP ledger names a peer id this build's listener would not use for that route source (the id derivation changed between versions); seeded routes would never be replaced |

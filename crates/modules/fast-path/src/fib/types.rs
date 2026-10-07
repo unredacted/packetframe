@@ -187,6 +187,19 @@ unsafe impl aya::Pod for NexthopEntry {}
 /// Mirror `MAX_ECMP_PATHS` in bpf/src/maps.rs.
 pub const MAX_ECMP_PATHS: usize = 8;
 
+/// Capped by `NEXTHOPS_MAX_ENTRIES` in bpf/src/maps.rs. Keep in sync
+/// if either side changes.
+pub const NEXTHOPS_CAP: u32 = 8_192;
+
+/// Capped by `FIB_V4_MAX_ENTRIES` in bpf/src/maps.rs.
+pub const FIB_V4_CAP: u32 = 2_097_152;
+
+/// Capped by `FIB_V6_MAX_ENTRIES` in bpf/src/maps.rs.
+pub const FIB_V6_CAP: u32 = 1_048_576;
+
+/// Capped by `ECMP_GROUPS_MAX_ENTRIES` in bpf/src/maps.rs.
+pub const ECMP_GROUPS_CAP: u32 = 1_024;
+
 /// Sentinel: unused `nh_idx` slot in an `EcmpGroup`.
 pub const ECMP_NH_UNUSED: u32 = u32::MAX;
 

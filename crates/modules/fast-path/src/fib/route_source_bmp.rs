@@ -43,8 +43,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -403,9 +401,11 @@ impl BmpStation {
                             self.lower_session();
                             // Resync contract: any prior-session mirrored
                             // state is now potentially stale. Programmer
-                            // flips seen_this_session=false on all routes;
-                            // the next Add storm clears marks; unmarked
-                            // entries get GC'd on InitiationComplete.
+                            // flips seen_this_session=false on every
+                            // route-source advertisement (never the
+                            // resolver's local_arp routes); the next Add
+                            // storm clears marks; still-marked entries
+                            // get GC'd on InitiationComplete.
                             if let Err(e) = self
                                 .prog_handle
                                 .apply_route_event(RouteEvent::Resync)
@@ -1026,12 +1026,12 @@ async fn reader_task(
 /// `peer_ip + peer_distinguisher + peer_type` together uniquely
 /// identify one peer, two BGP sessions to the same peer IP that
 /// differ in RD or peer-type hash to distinct IDs.
+///
+/// Through [`PeerId::route_source`], never a raw hash: the sender picks
+/// the distinguisher, so a raw hash could be steered into the
+/// resolver's local-ARP namespace, which the reconnect GC exempts.
 fn peer_id_from_header(pph: &BmpPerPeerHeader) -> PeerId {
-    let mut hasher = DefaultHasher::new();
-    pph.peer_ip.hash(&mut hasher);
-    pph.peer_distinguisher.hash(&mut hasher);
-    (pph.peer_type as u8).hash(&mut hasher);
-    PeerId(hasher.finish())
+    PeerId::route_source(&(pph.peer_ip, pph.peer_distinguisher, pph.peer_type as u8))
 }
 
 fn network_prefix_to_ip_prefix(np: &NetworkPrefix) -> Option<IpPrefix> {

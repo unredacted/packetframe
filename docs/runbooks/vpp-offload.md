@@ -289,6 +289,7 @@ current value without a mapping table:
 | `packetframe_vpp_exempt_drift` | `> 0` — a kernel path VPP cannot take has no `steer-exempt`; steered traffic for it is (or will be) blackholed. ALSO alarm on `absent()` while attached: the gauge is omitted, never zeroed, when the scan cannot read the kernel |
 | `packetframe_vpp_exempt_drift_v6` | `> 0` — an IPv6 kernel path VPP cannot take while a port carries `v6-divert`; diverted v6 for it is (or will be) blackholed. Present ONLY while some port carries `v6-divert` under `v6 on`, so alarm on `absent()` only on boxes configured that way: it is omitted, never zeroed, when the v6 scan cannot read. Counts only findings no `drift-accept6` covers |
 | `packetframe_vpp_exempt_drift_v6_accepted` | not an alarm — v6 findings a `drift-accept6` covers (still blackholed if diverted). Present exactly when the series above is; a step up means a new route appeared under an accepted prefix |
+| `packetframe_vpp_drift_scan_ms` | informational — wall time of the latest drift scan; absent until one finishes. A sustained rise means the kernel's tables grew or its routing lock is contended. See [The exemption tripwire](#the-exemption-tripwire-exempt-drift) |
 | `packetframe_vpp_neighbours_unplaced` | `> 0` — a bridge neighbour the kernel FDB has not placed behind any member port; routes through it are unresolvable |
 | `packetframe_vpp_neighbour_moves` | a step — spanning tree moved neighbours between trunks and VPP followed; worth correlating with switch events |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
@@ -1578,7 +1579,7 @@ and the sets that produce it are edited by routing daemons — bird
 announces a remote host route and the hole re-opens with nobody
 touching packetframe. So it is watched on a clock rather than
 validated once: every 60 s the module dumps the kernel's IPv4 routes
-across all tables and reports any path VPP cannot take that no
+from every table a policy rule selects and reports any path VPP cannot take that no
 `steer-exempt` covers — and, while a port diverts IPv6, the kernel's
 IPv6 routes too ([IPv6 findings](#ipv6-findings-exempt-drift-v6)
 below).
@@ -1602,6 +1603,28 @@ cannot be cancelled and a monitoring scan holds none of the resources
 a detach must release. A `detach` that reported "resources may still
 be held" while only a scan remained would be a false alarm about the
 one thing that alarm must stay trustworthy for.
+
+**It stays out of the way of link churn.** Every chunk of a route dump
+is served under the kernel's routing lock (`rtnl_mutex` on 5.15), the
+same lock every route and link change needs, and the worst moment to
+take thousands of them is right after a link changes state, while the
+kernel and the routing daemon flush and reinstall the routes through
+it. So the scan watches link up/down transitions (`RTNLGRP_LINK`; not
+promiscuity or allmulti toggles): a scan that falls due within 60 s of
+one waits until links have been quiet for 60 s, and a scan a transition
+catches mid-dump is abandoned and rerun once they settle. Neither
+publishes anything, so the last verdict stands meanwhile. The wait is
+capped at five minutes from when the scan fell due: under a link that
+never stops flapping, the scan runs anyway, to the end. Each case logs
+at info: `holding the drift scan until links settle`, `abandoned the
+drift scan until links settle`, `running the drift scan anyway`, each
+naming the link.
+
+`packetframe_vpp_drift_scan_ms` is how long the latest scan took, rule
+and route dumps of both families, whatever it concluded: how long it
+contended with route and link changes. At debug level each scan also
+logs what it read per family (`drift scan read the kernel's routes`:
+routes read, routes kept, ms, and the tables dumped).
 
 `packetframe_vpp_exempt_drift` carries the count; **alarm on `> 0`,
 and on `absent()` while the module is attached** — the gauge is
@@ -1690,9 +1713,9 @@ so a row that persists means the read itself needs looking at.
 rule carries table id 0 and resolves to a VRF's table per packet, so
 the enumeration cannot be complete — filtering by the tables that ARE
 named would drop every VRF route and report clean while steered
-traffic blackholed. A host with one gets no table filtering at all
-(the behaviour before the filter existed), and so does a rule dump
-that fails or comes back empty.
+traffic blackholed. A host with one gets every table dumped and
+judged (the behaviour before the filter existed), and so does a rule
+dump that fails or comes back empty.
 
 Everything the scan judges against is hot: `steer-exempt`, the
 allowlist, and both direction knobs are rebuilt on `packetframe

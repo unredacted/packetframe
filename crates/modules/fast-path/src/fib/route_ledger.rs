@@ -47,6 +47,16 @@
 //! - *Which mode.* Only `forwarding-mode packetframe-fib` seeds.
 //!   `compare` exists to validate the PacketFrame FIB against the kernel's,
 //!   and stale seeded routes would read as disagreements.
+//! - *Whose.* Its routes are installed by a root daemon, so a ledger
+//!   another account could have written is a route injection, whatever
+//!   its checksum says (an unkeyed checksum proves integrity, not
+//!   provenance). Before a byte is read, the open descriptors must show
+//!   a regular file owned by the daemon's uid and closed to group and
+//!   others, in a directory likewise, under ancestors nobody else can
+//!   rename; anything else is refused (`untrusted`). See `read_record`
+//!   for why that, and not a keyed MAC.
+//! - *How big.* Past [`MAX_LEDGER_BYTES`] (what a FIB at capacity could
+//!   encode to) it is refused from `fstat` (`too-large`), never read.
 //! - *Intact.* A truncated, corrupt or other-version file is refused
 //!   whole, never half-seeded; counts are checked against the routes
 //!   actually read.
@@ -69,7 +79,8 @@
 //! route and ~24 per v6, peers and nexthops interned once, a trailing
 //! FNV-1a checksum. Written with the hardened state-directory primitives
 //! (component-wise no-follow walk, `O_EXCL|O_NOFOLLOW` temp file, fsync,
-//! `renameat`).
+//! `renameat`), within [`PRESERVE_BUDGET`] together with the snapshot
+//! ([`write_within`]).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -96,13 +107,62 @@ const MAGIC: &[u8; 8] = b"PFFIBLGR";
 /// across the restart.
 pub const CLOCK_SLACK: Duration = Duration::from_secs(60);
 
-/// How long a preserving stop waits for the programmer to snapshot the
-/// mirror. The same five seconds vpp-offload gives its own ledger: long
-/// enough for a 1.35M-route mirror several times over (see the PR's
-/// measurement), short enough that a wedged programmer cannot hold a
-/// `systemctl stop` hostage. Past it nothing is written, and the next
-/// start loads cold.
+/// How long a preserving stop spends on the whole ledger: the
+/// programmer's snapshot and encode, then the write, fsync and rename,
+/// against one deadline. The same five seconds vpp-offload gives its
+/// own ledger (its `PRESERVE_BUDGET`, which bounds its loop's write the
+/// same way): long enough for a 1.35M-route mirror several times over
+/// (~340 ms to encode, ~10 ms to write, measured), short enough that a
+/// wedged programmer or a wedged filesystem cannot hold a `systemctl
+/// stop` hostage. Past it nothing is renamed into place (see
+/// [`write_within`]), and the next start loads cold.
 pub const PRESERVE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Widest unsigned LEB128 encoding of a `u32`.
+const VARINT_U32_MAX: u64 = 5;
+
+/// One advertisement at its widest: peer index, flags, path id,
+/// local-pref, a nexthop count of one, and that nexthop's index. Both
+/// route sources file exactly one nexthop per advertisement.
+const ADVERT_MAX_BYTES: u64 =
+    VARINT_U32_MAX + 1 + VARINT_U32_MAX + VARINT_U32_MAX + 1 + VARINT_U32_MAX;
+
+/// One prefix at its widest: length, address, a one-byte advertisement
+/// count, and a full ECMP group's worth of advertisements.
+const fn route_max_bytes(addr_len: u64) -> u64 {
+    1 + addr_len + 1 + crate::fib::types::MAX_ECMP_PATHS as u64 * ADVERT_MAX_BYTES
+}
+
+/// Everything but the routes, at its widest: magic, format version, the
+/// two strings at their `u16` limit, the two times, the four counts,
+/// peer and nexthop tables at the NEXTHOPS map's size each (a BGP
+/// listener names one peer; a FIB cannot hold more nexthops than that
+/// map), and the checksum.
+const HEADER_MAX_BYTES: u64 = 8
+    + 4
+    + (2 + u16::MAX as u64)
+    + 8
+    + 8
+    + (2 + u16::MAX as u64)
+    + 16
+    + 4
+    + crate::fib::types::NEXTHOPS_CAP as u64 * 8
+    + 4
+    + crate::fib::types::NEXTHOPS_CAP as u64 * 17
+    + 8;
+
+/// The largest file a start will read as a route ledger, judged from
+/// `fstat` before a byte of it is read: a mirror at the FIB's capacity
+/// in both families ([`crate::fib::types::FIB_V4_CAP`] and
+/// [`crate::fib::types::FIB_V6_CAP`] prefixes), each at
+/// `route_max_bytes`, plus `HEADER_MAX_BYTES`. About 585 MB, against
+/// ~19 MB for today's full table: generous enough that no ledger a FIB
+/// could hold is refused, and a bound all the same, so a huge or sparse
+/// file in `state-dir` cannot make a start allocate without limit. A
+/// larger file is refused (`too-large`) and removed unread.
+pub const MAX_LEDGER_BYTES: u64 = HEADER_MAX_BYTES
+    + crate::fib::types::FIB_V4_CAP as u64 * route_max_bytes(4)
+    + crate::fib::types::FIB_V6_CAP as u64 * route_max_bytes(16);
 
 /// Subsystem name on the health surface. Append-safe, rename-unsafe.
 pub const SUBSYS_ROUTE_LEDGER: &str = "route-ledger";
@@ -705,6 +765,14 @@ pub enum Refusal {
     /// A BGP ledger names a peer id this build's listener would not use
     /// for this route source.
     PeerId { recorded: u64, expected: u64 },
+    /// Someone other than this daemon's uid could have written it or put
+    /// it there: the file is owned by another uid or writable by group or
+    /// others, so is the directory holding it, or an ancestor lets a
+    /// third account rename the directories under it (or it is not a
+    /// regular file). Never read; removed.
+    Untrusted(String),
+    /// Larger than [`MAX_LEDGER_BYTES`]. Never read; removed.
+    TooLarge { len: u64, max: u64 },
 }
 
 impl Refusal {
@@ -723,6 +791,8 @@ impl Refusal {
             Refusal::TooOld { .. } => "too-old",
             Refusal::Clock { .. } => "clock",
             Refusal::PeerId { .. } => "peer-id",
+            Refusal::Untrusted(_) => "untrusted",
+            Refusal::TooLarge { .. } => "too-large",
         }
     }
 
@@ -792,6 +862,15 @@ impl Refusal {
                  listener uses {expected:#x} for the same route source; seeded routes would \
                  never be replaced by the live session's"
             ),
+            Refusal::Untrusted(why) => format!(
+                "untrusted ownership/permissions: {why}. A ledger is read only when this \
+                 daemon's own uid wrote it, into a state-dir no other account can write, under \
+                 ancestors no other account can rename; removed unread"
+            ),
+            Refusal::TooLarge { len, max } => format!(
+                "it is too large: {len} bytes, past the {max} bytes the largest ledger a FIB \
+                 at capacity could encode to; removed unread"
+            ),
         }
     }
 }
@@ -848,7 +927,9 @@ pub fn consume(state_dir: &Path, exp: &Expectations<'_>) -> Consumed {
             };
         }
         Ok(Some(b)) => Ok(b),
-        Err(e) => Err(format!("{}: {e}", path.display())),
+        Err(ReadFailure::Io(e)) => Err(Refusal::Unreadable(format!("{}: {e}", path.display()))),
+        Err(ReadFailure::Untrusted(why)) => Err(Refusal::Untrusted(why)),
+        Err(ReadFailure::TooLarge { len, max }) => Err(Refusal::TooLarge { len, max }),
     };
     // `unlinkat` removes a planted symlink itself, never its target.
     if let Err(e) = remove(state_dir) {
@@ -856,7 +937,7 @@ pub fn consume(state_dir: &Path, exp: &Expectations<'_>) -> Consumed {
     }
     let bytes = match bytes {
         Ok(b) => b,
-        Err(e) => return Consumed::Refused(Refusal::Unreadable(e)),
+        Err(r) => return Consumed::Refused(r),
     };
     match judge(bytes, exp) {
         Ok(ledger) => Consumed::Seed(ledger),
@@ -937,7 +1018,128 @@ pub fn path_in(state_dir: &Path) -> PathBuf {
 /// written through.
 pub fn write(state_dir: &Path, bytes: &[u8]) -> Result<(), String> {
     let path = path_in(state_dir);
-    write_record(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))
+    write_record_gated(&path, bytes, &|| true)
+        .map(|_| ())
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// [`write`], given up after `budget`: the preserving stop's write.
+///
+/// Every step of the write (the directory walk, the temp file, its
+/// fsync, the rename) is a filesystem call nothing can interrupt, so it
+/// runs on a helper thread and this one waits at most `budget` for it —
+/// the shape vpp-offload's `shutdown_preserving` gives its own ledger
+/// write. Past the deadline the write is abandoned and the stop goes on:
+/// the helper, whenever its I/O returns, finds the commit gate closed
+/// and removes its temp file instead of renaming it into place, so no
+/// record appears after the caller has reported none. A process that
+/// exits first leaves at most the temp file, which no start reads (it
+/// opens the record's own name only) and the next write replaces. The
+/// one case the deadline cannot settle is a rename already under way
+/// when it passes; `rename` is atomic, so that ends in a whole record or
+/// none, and the error says so.
+pub fn write_within(state_dir: &Path, bytes: Vec<u8>, budget: Duration) -> Result<(), String> {
+    write_within_using(state_dir, bytes, budget, write_record_gated)
+}
+
+/// Whether a helper's write may still rename its record into place.
+/// Exactly one of [`Self::commit`] and [`Self::abandon`] succeeds.
+#[derive(Default)]
+struct CommitGate(std::sync::atomic::AtomicU8);
+
+const GATE_OPEN: u8 = 0;
+const GATE_COMMITTING: u8 = 1;
+const GATE_ABANDONED: u8 = 2;
+
+impl CommitGate {
+    /// The writer, between its fsync and its rename.
+    fn commit(&self) -> bool {
+        self.swap_from_open(GATE_COMMITTING)
+    }
+
+    /// The waiter, at its deadline.
+    fn abandon(&self) -> bool {
+        self.swap_from_open(GATE_ABANDONED)
+    }
+
+    fn swap_from_open(&self, to: u8) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0
+            .compare_exchange(GATE_OPEN, to, SeqCst, SeqCst)
+            .is_ok()
+    }
+}
+
+/// [`write_within`] with the write itself supplied, so a test can stand
+/// in for a filesystem that wedges.
+fn write_within_using<W>(
+    state_dir: &Path,
+    bytes: Vec<u8>,
+    budget: Duration,
+    writer: W,
+) -> Result<(), String>
+where
+    W: FnOnce(&Path, &[u8], &dyn Fn() -> bool) -> std::io::Result<bool> + Send + 'static,
+{
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+    let path = path_in(state_dir);
+    let gate = Arc::new(CommitGate::default());
+    let (tx, rx) = sync_channel(1);
+    let spawned = {
+        let gate = gate.clone();
+        let path = path.clone();
+        std::thread::Builder::new()
+            .name("pf-ledger-write".into())
+            .spawn(move || {
+                let outcome = writer(&path, &bytes, &|| gate.commit());
+                let _ = tx.send(outcome);
+            })
+    };
+    if let Err(e) = spawned {
+        return Err(format!(
+            "write {}: could not start the write thread: {e}",
+            path.display()
+        ));
+    }
+    let budget_ms = budget.as_millis();
+    let outcome = match rx.recv_timeout(budget) {
+        Ok(outcome) => outcome,
+        Err(RecvTimeoutError::Disconnected) => {
+            return Err(format!(
+                "write {}: the write thread ended without an outcome",
+                path.display()
+            ))
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            if gate.abandon() {
+                return Err(format!(
+                    "write {}: did not finish within its {budget_ms} ms budget (a slow or wedged \
+                     filesystem); abandoned before the rename, so no record is in place",
+                    path.display()
+                ));
+            }
+            // The writer took the gate first: its rename is under way.
+            match rx.try_recv() {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return Err(format!(
+                        "write {}: did not finish within its {budget_ms} ms budget; its rename \
+                         was already under way, so the record is either whole or absent",
+                        path.display()
+                    ))
+                }
+            }
+        }
+    };
+    match outcome {
+        Ok(true) => Ok(()),
+        // Only a closed gate says no, and only `abandon` closes it.
+        Ok(false) => Err(format!(
+            "write {}: abandoned before the rename",
+            path.display()
+        )),
+        Err(e) => Err(format!("write {}: {e}", path.display())),
+    }
 }
 
 /// Remove the record if there is one. `packetframe detach` (a full one)
@@ -956,12 +1158,20 @@ pub fn remove(state_dir: &Path) -> Result<(), String> {
 // ledger and fast-path's coalescing record make. Nothing privileged runs
 // off Linux.
 #[cfg(target_os = "linux")]
-fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    packetframe_common::statefile::write_atomic(path, contents)
+fn write_record_gated(
+    path: &Path,
+    contents: &[u8],
+    commit: &dyn Fn() -> bool,
+) -> std::io::Result<bool> {
+    packetframe_common::statefile::write_atomic_gated(path, contents, commit)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+fn write_record_gated(
+    path: &Path,
+    contents: &[u8],
+    commit: &dyn Fn() -> bool,
+) -> std::io::Result<bool> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -972,21 +1182,80 @@ fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         f.write_all(contents)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
-}
-
-#[cfg(target_os = "linux")]
-fn read_record(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    packetframe_common::statefile::read_no_follow(path)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_record(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    match std::fs::read(path) {
-        Ok(r) => Ok(Some(r)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    if !commit() {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(false);
     }
+    std::fs::rename(&tmp, path)?;
+    Ok(true)
+}
+
+/// Why the record could not be read, before any check of its contents.
+#[derive(Debug)]
+enum ReadFailure {
+    Io(String),
+    // Only the Linux reader judges provenance; see the stub below.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Untrusted(String),
+    TooLarge {
+        len: u64,
+        max: u64,
+    },
+}
+
+/// Read the record only if this daemon's own uid could have put it
+/// there, and only up to [`MAX_LEDGER_BYTES`]. Its contents are routes
+/// this root daemon installs, so a ledger anyone else could have
+/// written is a route injection; see
+/// [`packetframe_common::statefile::read_owned_no_follow`] for exactly
+/// what is checked (on the open descriptors, not by path).
+///
+/// Why ownership and not a keyed MAC: a key would have to live
+/// somewhere the daemon reads and other accounts cannot, which is
+/// exactly the property checked here directly — an account able to
+/// write `state-dir` could not forge a MAC, but an account able to
+/// write where the key lives could, so the MAC would move the trust
+/// question, not answer it.
+#[cfg(target_os = "linux")]
+fn read_record(path: &Path) -> Result<Option<Vec<u8>>, ReadFailure> {
+    use packetframe_common::statefile::{read_owned_no_follow, OwnedReadError};
+    read_owned_no_follow(path, MAX_LEDGER_BYTES).map_err(|e| match e {
+        OwnedReadError::Untrusted(why) => ReadFailure::Untrusted(why),
+        OwnedReadError::TooLarge { len, max } => ReadFailure::TooLarge { len, max },
+        OwnedReadError::Io(e) => ReadFailure::Io(e.to_string()),
+    })
+}
+
+/// The dev-laptop stub keeps the size bound (it is what keeps a huge
+/// file from being read whole) and leaves provenance to the Linux build:
+/// nothing privileged runs here.
+#[cfg(not(target_os = "linux"))]
+fn read_record(path: &Path) -> Result<Option<Vec<u8>>, ReadFailure> {
+    use std::io::Read as _;
+    let io = |e: std::io::Error| ReadFailure::Io(e.to_string());
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io(e)),
+    };
+    let len = f.metadata().map_err(io)?.len();
+    if len > MAX_LEDGER_BYTES {
+        return Err(ReadFailure::TooLarge {
+            len,
+            max: MAX_LEDGER_BYTES,
+        });
+    }
+    let mut buf = Vec::with_capacity(len as usize);
+    f.take(MAX_LEDGER_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(io)?;
+    if buf.len() as u64 > MAX_LEDGER_BYTES {
+        return Err(ReadFailure::TooLarge {
+            len: buf.len() as u64,
+            max: MAX_LEDGER_BYTES,
+        });
+    }
+    Ok(Some(buf))
 }
 
 #[cfg(target_os = "linux")]
@@ -1057,10 +1326,22 @@ pub struct SeedReport {
     pub unconfirmed: u64,
     /// When the first route-source advertisement or withdrawal reached
     /// the mirror after the seed: the live session has started speaking.
+    /// Set at the first `InitiationComplete` after the seed if nothing
+    /// set it earlier — a session whose only UPDATE is an empty
+    /// End-of-RIB has spoken too, with an empty table.
     pub stream_started_at: Option<Instant>,
     /// When the first `InitiationComplete` after the seed GC'd the rest,
     /// and how many advertisements that removed.
     pub reconciled: Option<(Instant, u64)>,
+}
+
+impl SeedReport {
+    /// Whether a live session has spoken to the seed: its first route
+    /// arrived, or its `InitiationComplete` reconciled the seed without
+    /// one (see [`LedgerStatus::attestation_blocker`]).
+    pub fn spoken_for(&self) -> bool {
+        self.stream_started_at.is_some() || self.reconciled.is_some()
+    }
 }
 
 impl LedgerStatus {
@@ -1075,9 +1356,17 @@ impl LedgerStatus {
     /// update. Once the live session has delivered its first route, the
     /// comparison means what it always meant (count agreement within the
     /// drift bound), and the replay corrects the rest as it arrives.
+    ///
+    /// A reconciled seed blocks nothing either, whether or not a route
+    /// arrived first: an `InitiationComplete` is a live session's whole
+    /// table having been delivered, and a session whose only UPDATE was an
+    /// empty End-of-RIB (or a BMP stream whose route monitoring carried no
+    /// route) reaches it without one. Its GC has removed every seeded
+    /// route the session did not confirm, so nothing of the seed is left
+    /// unspoken for.
     pub fn attestation_blocker(&self) -> Option<String> {
         let seed = self.seed.as_ref()?;
-        if seed.stream_started_at.is_some() {
+        if seed.spoken_for() {
             return None;
         }
         Some(if seed.applied_at.is_none() {
@@ -1095,18 +1384,14 @@ impl LedgerStatus {
     /// Whether a seed is waiting for the live session's first route —
     /// the moment a completeness check becomes worth running early.
     pub fn awaiting_stream(&self) -> bool {
-        self.seed
-            .as_ref()
-            .is_some_and(|s| s.stream_started_at.is_none())
+        self.seed.as_ref().is_some_and(|s| !s.spoken_for())
     }
 
     /// Whether a seed exists whose first post-stream check is still
     /// owed: the stream has started, so an authority may check now
     /// rather than at its next interval.
     pub fn stream_started(&self) -> bool {
-        self.seed
-            .as_ref()
-            .is_some_and(|s| s.stream_started_at.is_some())
+        self.seed.as_ref().is_some_and(SeedReport::spoken_for)
     }
 
     /// The `route-ledger` health row. Healthy unless the ledger itself
@@ -1416,9 +1701,13 @@ mod tests {
     const NOW: u64 = 1_790_000_000;
 
     fn tmpdir(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
         let d = std::env::temp_dir().join(format!("pf-fp-ledger-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        // Pinned, not left to the umask: the reader refuses a state-dir
+        // group or others can write.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
         d
     }
 
@@ -1807,6 +2096,8 @@ mod tests {
                 recorded: 1,
                 expected: 2,
             },
+            Refusal::Untrusted("x".into()),
+            Refusal::TooLarge { len: 2, max: 1 },
         ];
         let codes: std::collections::HashSet<_> = all.iter().map(Refusal::code).collect();
         assert_eq!(codes.len(), all.len());
@@ -1890,6 +2181,213 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The bound is what a FIB at capacity could encode to: one prefix
+    /// at its widest (a full ECMP group of advertisements, every varint
+    /// at its widest) fits `route_max_bytes`, and the whole is far past
+    /// today's full table (~19 MB), so no real ledger meets it.
+    #[test]
+    fn the_size_bound_holds_any_ledger_a_full_fib_could_write() {
+        let prefix = IpPrefix::V6 {
+            addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).octets(),
+            prefix_len: 64,
+        };
+        let adverts: Vec<LedgerAdvert> = (0..crate::fib::types::MAX_ECMP_PATHS as u32)
+            .map(|i| LedgerAdvert {
+                peer: PEER,
+                path_id: Some(u32::MAX - i),
+                local_pref: Some(u32::MAX),
+                nexthops: vec![v6nh(1)],
+            })
+            .collect();
+        let refs: Vec<AdvertRef<'_>> = adverts
+            .iter()
+            .map(|a| AdvertRef {
+                peer: a.peer,
+                path_id: a.path_id,
+                local_pref: a.local_pref,
+                nexthops: &a.nexthops,
+            })
+            .collect();
+        let with = |n: u32| {
+            let counts = LedgerCounts {
+                v4: FamilyCounts::default(),
+                v6: FamilyCounts {
+                    prefixes: n,
+                    advertisements: n * refs.len() as u32,
+                },
+            };
+            let mut enc = LedgerEncoder::new(&meta(), counts, &[PEER], &[v6nh(1)]);
+            if n == 1 {
+                enc.route(prefix, &refs).unwrap();
+            }
+            enc.finish().unwrap().len() as u64
+        };
+        let one_route = with(1) - with(0);
+        assert!(
+            one_route <= route_max_bytes(16),
+            "{one_route} > {}",
+            route_max_bytes(16)
+        );
+        // Far past today's full table, and still a bound.
+        const { assert!(MAX_LEDGER_BYTES > 20 * 19_000_000) };
+        const { assert!(MAX_LEDGER_BYTES < 1 << 30) };
+    }
+
+    /// Larger than the bound: refused by name from the file's size,
+    /// never read — the file here is sparse, and reading it whole would
+    /// allocate the lot — and consumed like any refusal.
+    #[test]
+    fn a_ledger_past_the_size_bound_is_refused_unread() {
+        let dir = tmpdir("too-large");
+        write(&dir, &encode(&meta(), &routes()).unwrap()).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path_in(&dir))
+            .unwrap();
+        f.set_len(MAX_LEDGER_BYTES + 1).unwrap();
+        drop(f);
+        match consume(&dir, &expect()) {
+            Consumed::Refused(r @ Refusal::TooLarge { len, max }) => {
+                assert_eq!((len, max), (MAX_LEDGER_BYTES + 1, MAX_LEDGER_BYTES));
+                assert_eq!(r.code(), "too-large");
+                assert!(r.describe().contains("too large"), "{}", r.describe());
+                assert!(r.is_warning());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!path_in(&dir).exists(), "consumed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ledger anyone but this daemon's uid could have written is
+    /// refused by name and never read, whatever its contents: here a
+    /// perfectly good record, made group- or world-writable, or sitting
+    /// in a directory others can write.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_ledger_others_could_have_written_is_refused_unread() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tmpdir("untrusted");
+        let good = || encode(&meta(), &routes()).unwrap();
+        let untrusted = |dir: &Path| match consume(dir, &expect()) {
+            Consumed::Refused(r @ Refusal::Untrusted(_)) => {
+                assert_eq!(r.code(), "untrusted");
+                assert!(r.is_warning());
+                r.describe()
+            }
+            other => panic!("{other:?}"),
+        };
+        for mode in [0o620, 0o602] {
+            write(&dir, &good()).unwrap();
+            std::fs::set_permissions(path_in(&dir), std::fs::Permissions::from_mode(mode)).unwrap();
+            let why = untrusted(&dir);
+            assert!(
+                why.contains("untrusted ownership/permissions")
+                    && why.contains("writable by group or others"),
+                "{mode:o}: {why}"
+            );
+            assert!(!path_in(&dir).exists(), "{mode:o}: consumed");
+        }
+        write(&dir, &good()).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let why = untrusted(&dir);
+        assert!(why.contains("the directory"), "{why}");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The same record, from a trusted place, is accepted.
+        write(&dir, &good()).unwrap();
+        assert!(matches!(consume(&dir, &expect()), Consumed::Seed(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Owned by another uid, the file or its directory. Needs root.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_ledger_owned_by_another_uid_is_refused_when_running_as_root() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to chown");
+            return;
+        }
+        const NOBODY: u32 = 65534;
+        let dir = tmpdir("foreign");
+        write(&dir, &encode(&meta(), &routes()).unwrap()).unwrap();
+        std::os::unix::fs::chown(path_in(&dir), Some(NOBODY), None).unwrap();
+        match consume(&dir, &expect()) {
+            Consumed::Refused(Refusal::Untrusted(why)) => {
+                assert!(why.contains("owned by uid 65534"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!path_in(&dir).exists(), "consumed");
+
+        write(&dir, &encode(&meta(), &routes()).unwrap()).unwrap();
+        std::os::unix::fs::chown(&dir, Some(NOBODY), None).unwrap();
+        match consume(&dir, &expect()) {
+            Consumed::Refused(Refusal::Untrusted(why)) => {
+                assert!(
+                    why.contains("the directory") && why.contains("owned by uid 65534"),
+                    "{why}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A filesystem that wedges mid-write: the record reaches its temp
+    /// file and the fsync, which then returns only long after the
+    /// deadline. The stop gives up within its budget; when the fsync
+    /// finally returns, the gate is closed, so nothing is renamed into
+    /// place and the temp file goes too — the next start finds no
+    /// ledger, rather than one the stop reported as never written.
+    #[test]
+    fn a_stuck_write_times_out_within_its_budget_and_leaves_nothing_a_start_accepts() {
+        use std::sync::mpsc;
+        let dir = tmpdir("stuck");
+        let budget = Duration::from_millis(200);
+        let wedge = Duration::from_millis(1500);
+        let (done_tx, done_rx) = mpsc::channel();
+        let started = Instant::now();
+        let r = write_within_using(
+            &dir,
+            encode(&meta(), &routes()).unwrap(),
+            budget,
+            move |path, contents, commit| {
+                let r = write_record_gated(path, contents, &|| {
+                    std::thread::sleep(wedge);
+                    commit()
+                });
+                let _ = done_tx.send(r.as_ref().ok().copied());
+                r
+            },
+        );
+        let took = started.elapsed();
+        let e = r.unwrap_err();
+        assert!(e.contains("did not finish within"), "{e}");
+        assert!(
+            took >= budget && took < budget + Duration::from_millis(500),
+            "gave up after {took:?}, not within its {budget:?} budget"
+        );
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Some(false),
+            "the late writer found the gate closed"
+        );
+        assert!(!path_in(&dir).exists(), "nothing renamed into place");
+        assert!(
+            !path_in(&dir).with_extension("bin.tmp").exists(),
+            "and no temp file left"
+        );
+        assert!(matches!(
+            consume(&dir, &expect()),
+            Consumed::Refused(Refusal::Missing)
+        ));
+
+        // The same write, unwedged, lands within the budget.
+        write_within(&dir, encode(&meta(), &routes()).unwrap(), budget).unwrap();
+        assert!(matches!(consume(&dir, &expect()), Consumed::Seed(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_seed_blocks_attestation_until_the_stream_starts() {
         let mut st = LedgerStatus::default();
@@ -1919,6 +2417,40 @@ mod tests {
         assert!(st.attestation_blocker().is_none());
         assert!(!st.awaiting_stream());
         assert!(st.stream_started());
+    }
+
+    /// A session whose only UPDATE is an empty End-of-RIB (or a BMP
+    /// stream whose route monitoring carried no route) reconciles the
+    /// seed without a single Add or Del. That is still a live session
+    /// having delivered its whole table: the reconciled seed must not
+    /// block attestation forever.
+    #[test]
+    fn a_reconciled_seed_blocks_nothing_even_without_a_route() {
+        let mut st = LedgerStatus {
+            start: StartReport::Seeded,
+            seed: Some(SeedReport {
+                writer_version: "0.6.0".into(),
+                written_at_unix: NOW - 120,
+                confirmed_at_unix: NOW - 120,
+                counts: LedgerCounts::default(),
+                applied_at: Some(Instant::now()),
+                apply_took: None,
+                failed: 0,
+                unconfirmed: 5,
+                stream_started_at: None,
+                reconciled: None,
+            }),
+        };
+        assert!(st.attestation_blocker().is_some());
+        let s = st.seed.as_mut().unwrap();
+        s.reconciled = Some((Instant::now(), 5));
+        s.unconfirmed = 0;
+        assert!(st.attestation_blocker().is_none(), "{st:?}");
+        assert!(!st.awaiting_stream());
+        assert!(
+            st.stream_started(),
+            "the authority's early check is owed at reconciliation too"
+        );
     }
 
     #[test]

@@ -1181,16 +1181,37 @@ impl RouteSourceSpec {
     /// Only the fields that decide WHICH table arrives and under which
     /// peer it is keyed: the mode, the listen endpoint, the ASNs and the
     /// peer pin for BGP (the listener's peer id hashes the listen address
-    /// and the peer AS), the Loc-RIB requirement for BMP. `router-id`,
-    /// `anyip`, `allow-remote` and the `peer-from` ACL change who may
-    /// connect or how the session is announced, not the routes, so
-    /// editing them keeps a ledger usable. Rendered from the parsed
-    /// values rather than the text, so `192.0.2.1` and `192.000.002.001`
-    /// are one identity.
+    /// and the peer AS), the Loc-RIB requirement for BMP — and the
+    /// `peer-from` ACL wherever no peer pin names the one speaker that
+    /// may supply the table. Without a pin the ACL is what decides that:
+    /// two routers in one AS behind one listen address file their tables
+    /// under the same BGP peer id, so an ACL moved from one to the other
+    /// across a restart must not accept the first router's ledger for the
+    /// second. BMP has no pin, so its ACL is always identity. `router-id`,
+    /// `anyip` and `allow-remote` change how the session is announced or
+    /// bound, not whose routes arrive, so editing them keeps a ledger
+    /// usable; so does the ACL under a BGP peer pin, which already names
+    /// the speaker. A loopback listen has no ACL and renders none.
+    ///
+    /// Rendered from the parsed values rather than the text, so
+    /// `192.0.2.1` and `192.000.002.001` are one identity, and the ACL
+    /// sorted, deduplicated and with host bits cleared, so the order it
+    /// was written in and `192.0.2.7/24` for `192.0.2.0/24` (the same
+    /// match) do not change it.
     pub fn ledger_identity(&self) -> String {
         fn addr(raw: &str) -> String {
             raw.parse::<IpAddr>()
                 .map_or_else(|_| raw.to_string(), |a| a.to_string())
+        }
+        fn acl(peer_from: &[ipnet::IpNet]) -> String {
+            let mut nets: Vec<ipnet::IpNet> = peer_from.iter().map(|n| n.trunc()).collect();
+            nets.sort();
+            nets.dedup();
+            if nets.is_empty() {
+                return String::new();
+            }
+            let nets: Vec<String> = nets.iter().map(ToString::to_string).collect();
+            format!(" peer-from {}", nets.join(","))
         }
         match self {
             RouteSourceSpec::Bgp {
@@ -1199,21 +1220,29 @@ impl RouteSourceSpec {
                 local_as,
                 peer_as,
                 peer_ip,
+                peer_from,
                 ..
             } => format!(
-                "bgp listen {} port {port} local-as {local_as} peer-as {peer_as} peer-ip {}",
+                "bgp listen {} port {port} local-as {local_as} peer-as {peer_as} peer-ip {}{}",
                 addr(a),
-                peer_ip.map_or_else(|| "any".to_string(), |p| p.to_string())
+                peer_ip.map_or_else(|| "any".to_string(), |p| p.to_string()),
+                if peer_ip.is_some() {
+                    String::new()
+                } else {
+                    acl(peer_from)
+                }
             ),
             RouteSourceSpec::Bmp {
                 addr: a,
                 port,
                 require_loc_rib,
+                peer_from,
                 ..
             } => format!(
-                "bmp listen {} port {port} require-loc-rib {}",
+                "bmp listen {} port {port} require-loc-rib {}{}",
                 addr(a),
-                if *require_loc_rib { "on" } else { "off" }
+                if *require_loc_rib { "on" } else { "off" },
+                acl(peer_from)
             ),
         }
     }
@@ -6333,19 +6362,49 @@ module fast-path
         ] {
             assert_ne!(identity(other), base, "{other}");
         }
-        // On a remote listen: who may connect (the ACL, `anyip`) is not
-        // identity; the peer pin is.
+        // On a remote listen with no peer pin, the ACL decides which
+        // speaker supplies the table, so it is identity: moving it from
+        // one router to another in the same AS (same listener, same peer
+        // id) must not accept the first router's ledger.
         let remote = identity(
             "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
              peer-from 192.0.2.0/24",
         );
         assert_eq!(
+            remote,
+            "bgp listen 192.0.2.1 port 179 local-as 65000 peer-as 65000 peer-ip any \
+             peer-from 192.0.2.0/24"
+        );
+        assert_ne!(
             identity(
                 "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
-                 peer-from 198.51.100.0/24 anyip"
+                 peer-from 198.51.100.0/24"
             ),
             remote
         );
+        // Normalised: host bits, order and repeats are not identity, and
+        // neither is `anyip`.
+        assert_eq!(
+            identity(
+                "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
+                 peer-from 192.0.2.77/24 anyip"
+            ),
+            remote
+        );
+        let two = identity(
+            "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
+             peer-from 198.51.100.0/24 peer-from 192.0.2.0/24",
+        );
+        assert_eq!(
+            identity(
+                "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
+                 peer-from 192.0.2.0/24 peer-from 198.51.100.0/24 peer-from 192.0.2.0/24"
+            ),
+            two
+        );
+        assert_ne!(two, remote);
+        // A peer pin names the speaker itself, so under one the ACL is
+        // not identity; the pin is.
         let pinned = identity(
             "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
              peer-from 192.0.2.0/24 peer-ip 192.0.2.2",
@@ -6353,8 +6412,31 @@ module fast-path
         assert_ne!(pinned, remote);
         assert!(pinned.ends_with("peer-ip 192.0.2.2"), "{pinned}");
         assert_eq!(
+            identity(
+                "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
+                 peer-from 192.0.2.0/25 peer-ip 192.0.2.2"
+            ),
+            pinned
+        );
+        assert_eq!(
             identity("route-source bmp 127.0.0.1:6543 require-loc-rib"),
             "bmp listen 127.0.0.1 port 6543 require-loc-rib on"
+        );
+        // BMP has no pin: its ACL is always identity.
+        let bmp = identity(
+            "route-source bmp 192.0.2.1:6543 require-loc-rib allow-remote \
+             peer-from 192.0.2.0/24",
+        );
+        assert_eq!(
+            bmp,
+            "bmp listen 192.0.2.1 port 6543 require-loc-rib on peer-from 192.0.2.0/24"
+        );
+        assert_ne!(
+            identity(
+                "route-source bmp 192.0.2.1:6543 require-loc-rib allow-remote \
+                 peer-from 198.51.100.0/24"
+            ),
+            bmp
         );
     }
 

@@ -503,6 +503,11 @@ pub struct StatusSnapshot {
     /// Degraded for the same reason an unreadable scan is: neither
     /// answer it could give would be true.
     pub drift_scope_stale: Option<String>,
+    /// How long the latest finished drift scan took, ms. Every chunk of a
+    /// route dump holds the kernel's routing lock, so this is how long the
+    /// scan contended with route and link changes. `None` until one
+    /// finishes; set after construction, like `neighbour_counters`.
+    pub drift_scan_ms: Option<u64>,
     /// The tripwire's IPv6 half: kernel v6 paths VPP cannot take while
     /// some port diverts IPv6. Degraded when it has findings or cannot
     /// read, and silent — no row, no gauge — while inactive. Pending and
@@ -673,6 +678,7 @@ impl StatusSnapshot {
             drift_pending,
             drift_unreadable,
             drift_scope_stale,
+            drift_scan_ms: None,
             drift_v6,
         }
     }
@@ -2574,6 +2580,20 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
             out,
             "packetframe_vpp_exempt_drift_v6_accepted{{module=\"{module}\"}} {}",
             v6.accepted_routes
+        );
+    }
+
+    // Present whatever the verdict: a scan that failed or judged a
+    // superseded scope still held the routing lock for this long.
+    if let Some(ms) = snap.drift_scan_ms {
+        gauge(
+            &mut out,
+            "packetframe_vpp_drift_scan_ms",
+            "wall time of the latest exemption-drift scan (rule and route dumps, both families), ms",
+        );
+        let _ = writeln!(
+            out,
+            "packetframe_vpp_drift_scan_ms{{module=\"{module}\"}} {ms}"
         );
     }
 
