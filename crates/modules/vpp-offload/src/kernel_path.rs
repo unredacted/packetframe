@@ -764,7 +764,8 @@ pub struct LiveKernelPath {
     state_dir: PathBuf,
     /// Every CPU VPP is on (main and workers, derived or observed).
     vpp_cores: Vec<u16>,
-    /// The published control-plane CPUs: a last resort.
+    /// The published control-plane CPUs: used after every other eligible
+    /// CPU, before any CPU takes a second queue 0.
     avoid: Vec<u16>,
     boot_id: String,
     /// `ethtool -S`, a seam for tests.

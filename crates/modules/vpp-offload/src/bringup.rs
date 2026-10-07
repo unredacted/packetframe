@@ -1377,7 +1377,8 @@ fn finish(
     // built on the loop thread from these: where the IRQs and counters
     // live, every CPU VPP is on (derived AND observed — the same set the
     // attach-time IRQ moves vacated), and the control-plane CPUs, which a
-    // queue-0 placement takes only as a last resort.
+    // queue-0 placement takes only after every other eligible CPU
+    // (`cores::plan_queue0_irqs`).
     let kernel_path_inputs = (
         paths.sys.sysfs_net.clone(),
         paths.proc_irq.clone(),

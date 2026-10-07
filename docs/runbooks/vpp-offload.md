@@ -4362,9 +4362,11 @@ reconfigure` does it sooner.
 On a port whose keeps fell back to queue 0, the daemon moves that
 port's queue-0 IRQ (the vector named `<port>-rxtx-0`) to **a CPU of its
 own**: never one of VPP's cores (main and workers), never an isolated
-CPU, never cpu0; the published control-plane CPUs only as a last resort;
-otherwise the CPU carrying the fewest of PacketFrame's queue-0
-placements, then the fewest NIC queue IRQs. The prior affinity is
+CPU, never cpu0. Every eligible CPU takes one port's queue 0 before any
+takes a second; the published control-plane CPUs (where they exist —
+on a box where every CPU takes NIC interrupts there are none) are used
+after the others but before any sharing; ties go to the CPU with the
+fewest NIC queue IRQs. The prior affinity is
 written to `<state-dir>/vpp-queue0-irqs.json` **before** the move, and
 put back when the port's keeps stop needing it: a steer that leaves the
 port on RSS or unsteered, the module's teardown, or `packetframe

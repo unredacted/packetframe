@@ -1130,17 +1130,24 @@ pub struct Queue0Plan {
 /// - **Never** cpu0: it is where every queue 0 already is, and the
 ///   housekeeping core. Placing there is the status quo, so a box with
 ///   nothing else left reports the port UNPLACED rather than pretending.
+/// - **One port per CPU first**: the CPU carrying the fewest of
+///   PacketFrame's queue-0 IRQs wins, so no CPU takes a second while
+///   any eligible CPU has none. Two hot queues on one core is the
+///   incident's own shape, so it is the last resort, not a tie-break.
 /// - `avoid` — the CPUs the control-plane threads were published onto
 ///   ([`control_plane_cpus`], free of NIC interrupts by construction) —
-///   only when nothing else is left, since an interrupt there takes the
-///   one property they were chosen for.
-/// - Among the rest: the CPU carrying the fewest of THIS plan's queue-0
-///   IRQs first — so each port gets its own CPU while there are CPUs to
-///   go round — then the fewest NIC queue IRQs in `irq_map` (the IRQs
-///   being placed excluded: they are moving), then the lowest number.
+///   only after every other eligible CPU has one, but BEFORE any CPU
+///   takes a second: an interrupt there costs the control plane the
+///   property it was placed for, which is a slower route push; a shared
+///   queue-0 core costs dropped exempt traffic, which is BGP and NAT
+///   return paths (review finding: preferring a shared CPU left spare
+///   avoided CPUs idle).
+/// - Then the fewest NIC queue IRQs in `irq_map` (the IRQs being placed
+///   excluded: they are moving), then the lowest number.
 /// - **Stable**: a port already placed (`current`) on a CPU that is
 ///   still eligible and not wanted by an earlier port keeps it, so a
-///   re-steer never moves an IRQ that is where it should be.
+///   re-steer never moves an IRQ that is where it should be — except
+///   off an avoided CPU, when a CPU outside `avoid` is free for it.
 ///
 /// Pure — every input is a reading the caller made — so the policy is
 /// testable without a NIC.
@@ -1163,16 +1170,7 @@ pub fn plan_queue0_irqs(
         v.dedup();
         v
     };
-    let preferred: Vec<u16> = eligible
-        .iter()
-        .copied()
-        .filter(|c| !avoid.contains(c))
-        .collect();
-    let pool: &[u16] = if preferred.is_empty() {
-        &eligible
-    } else {
-        &preferred
-    };
+    let avoided = |c: u16| avoid.contains(&c);
     let moving: Vec<u32> = wanted.iter().map(|(_, irq)| *irq).collect();
     let load = |cpu: u16| {
         irq_map
@@ -1190,25 +1188,52 @@ pub fn plan_queue0_irqs(
         .collect();
     let mut plan = Queue0Plan::default();
     let mut chosen: Vec<Option<u16>> = vec![None; wanted.len()];
-    // Pass 1: keep what is already right.
-    for (k, (iface, irq)) in wanted.iter().enumerate() {
-        let kept = current
+    let ours = |chosen: &[Option<u16>], cpu: u16| {
+        chosen.iter().filter(|c| **c == Some(cpu)).count()
+            + held.iter().filter(|c| **c == cpu).count()
+    };
+    let current_of = |iface: &str, irq: u32| {
+        current
             .iter()
-            .find(|c| c.iface == *iface && c.irq == *irq && pool.contains(&c.cpu))
+            .find(|c| c.iface == iface && c.irq == irq && eligible.contains(&c.cpu))
             .map(|c| c.cpu)
+    };
+    // Pass 1: keep what is already right — on a CPU outside `avoid`.
+    for (k, (iface, irq)) in wanted.iter().enumerate() {
+        let kept = current_of(iface, *irq)
+            .filter(|cpu| !avoided(*cpu))
             .filter(|cpu| !chosen.contains(&Some(*cpu)));
         chosen[k] = kept;
     }
-    // Pass 2: place the rest.
+    // Pass 1b: an IRQ on an avoided CPU stays only while the ports still
+    // to place outnumber the free CPUs outside `avoid` — otherwise pass 2
+    // has a better home for it.
+    for (k, (iface, irq)) in wanted.iter().enumerate() {
+        if chosen[k].is_some() {
+            continue;
+        }
+        let Some(cpu) = current_of(iface, *irq).filter(|c| avoided(*c)) else {
+            continue;
+        };
+        let unplaced = chosen.iter().filter(|c| c.is_none()).count();
+        let free = eligible
+            .iter()
+            .filter(|c| !avoided(**c) && ours(&chosen, **c) == 0)
+            .count();
+        if free < unplaced && ours(&chosen, cpu) == 0 {
+            chosen[k] = Some(cpu);
+        }
+    }
+    // Pass 2: place the rest — every CPU once (outside `avoid` first),
+    // and only then a second on any.
     for k in 0..wanted.len() {
         if chosen[k].is_some() {
             continue;
         }
-        let ours = |cpu: u16| {
-            chosen.iter().filter(|c| **c == Some(cpu)).count()
-                + held.iter().filter(|c| **c == cpu).count()
-        };
-        chosen[k] = pool.iter().copied().min_by_key(|&c| (ours(c), load(c), c));
+        chosen[k] = eligible
+            .iter()
+            .copied()
+            .min_by_key(|&c| (ours(&chosen, c), avoided(c), load(c), c));
     }
     for ((iface, irq), cpu) in wanted.iter().zip(chosen) {
         match cpu {
@@ -1941,7 +1966,7 @@ mod tests {
         assert!(cpu("eth5") < 12 && cpu("eth5") != cpu("eth2") && cpu("eth5") != 10);
     }
 
-    /// The control-plane CPUs are a last resort, and no eligible CPU at
+    /// The control-plane CPUs come after the rest, and no eligible CPU at
     /// all — only VPP's, the isolated one and cpu0 — leaves the port
     /// unplaced rather than "placing" it on cpu0, where it already is.
     #[test]
@@ -1959,6 +1984,53 @@ mod tests {
         let plan = plan_queue0_irqs(&online, &[3], &[1, 2, 4, 5], &[], &map, &[], &want);
         assert!(plan.choices.is_empty());
         assert_eq!(plan.unplaced, vec![("eth2".to_string(), 100)]);
+    }
+
+    /// More queue-0 ports than CPUs outside `avoid`: every eligible CPU
+    /// takes one — the avoided ones after the rest — before any takes a
+    /// second. Two hot queue-0 IRQs on one core is the incident; an
+    /// interrupt on a control-plane CPU is a slower route push.
+    #[test]
+    fn the_queue0_planner_spills_to_avoided_cpus_before_sharing() {
+        let online: Vec<u16> = (0..8).collect();
+        let map: Vec<(u32, Vec<u16>)> = (0..8u16).map(|q| (500 + u32::from(q), vec![q])).collect();
+        let ports = |n: u32| -> Vec<(String, u32)> {
+            (0..n).map(|i| (format!("eth{i}"), 100 + i)).collect()
+        };
+        let avoid = [5u16, 6];
+        let plan = plan_queue0_irqs(&online, &[], &[7], &avoid, &map, &[], &ports(6));
+        let cpus: Vec<u16> = plan.choices.iter().map(|c| c.cpu).collect();
+        assert_eq!(
+            cpus,
+            vec![1, 2, 3, 4, 5, 6],
+            "one per CPU, the avoided ones last, none shared"
+        );
+
+        let plan = plan_queue0_irqs(&online, &[], &[7], &avoid, &map, &[], &ports(7));
+        let seventh = plan.choices[6].cpu;
+        assert!(
+            (1..=4).contains(&seventh),
+            "only now does a CPU take a second, outside `avoid`: {seventh}"
+        );
+        assert!(plan.choices.iter().all(|c| c.cpu != 0 && c.cpu != 7));
+
+        // Stability off an avoided CPU: kept while the ports outnumber
+        // the free CPUs outside `avoid`, moved when one is free for it.
+        let on5 = vec![Queue0Choice {
+            iface: "eth0".into(),
+            irq: 100,
+            cpu: 5,
+        }];
+        let plan = plan_queue0_irqs(&online, &[], &[7], &avoid, &map, &on5, &ports(1));
+        assert_eq!(
+            plan.choices[0].cpu, 1,
+            "a free CPU outside `avoid` takes it"
+        );
+        let plan = plan_queue0_irqs(&online, &[], &[7], &avoid, &map, &on5, &ports(5));
+        assert_eq!(plan.choices[0].cpu, 5, "stays: the other four fill 1-4");
+        let mut rest: Vec<u16> = plan.choices[1..].iter().map(|c| c.cpu).collect();
+        rest.sort_unstable();
+        assert_eq!(rest, vec![1, 2, 3, 4]);
     }
 
     /// The queue-0 vector is found by its handler name, never by
