@@ -386,9 +386,11 @@ impl BmpStation {
                             self.lower_session();
                             // Resync contract: any prior-session mirrored
                             // state is now potentially stale. Programmer
-                            // flips seen_this_session=false on all routes;
-                            // the next Add storm clears marks; unmarked
-                            // entries get GC'd on InitiationComplete.
+                            // flips seen_this_session=false on every
+                            // route-source advertisement (never the
+                            // resolver's local_arp routes); the next Add
+                            // storm clears marks; still-marked entries
+                            // get GC'd on InitiationComplete.
                             if let Err(e) = self
                                 .prog_handle
                                 .apply_route_event(RouteEvent::Resync)

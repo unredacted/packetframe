@@ -84,9 +84,14 @@ pub enum RouteEvent {
     /// collect entries left over from a prior session.
     InitiationComplete,
     /// The RouteSource reconnected after a disconnect. Programmer
-    /// should stale-and-reconcile: mark all entries "not-yet-seen",
-    /// clear the mark as `Add` events arrive, and GC anything still
-    /// marked at the next `InitiationComplete`.
+    /// should stale-and-reconcile: mark the RouteSource's entries
+    /// "not-yet-seen", clear the mark as `Add` events arrive, and GC
+    /// anything still marked at the next `InitiationComplete`.
+    ///
+    /// Entries under a [`PeerId::local_arp`] peer are not the
+    /// RouteSource's and are never marked. The neighbour resolver
+    /// injects them and no session re-announces them, so marking them
+    /// made every reconnect delete them.
     Resync,
 }
 
@@ -105,7 +110,7 @@ pub enum RouteEvent {
 /// effectively never produce values with both halves of this layout
 /// (the high bit set + 31 zero bits + a small u32-shaped low half),
 /// so collision with a hash-allocated PeerId is mathematically
-/// negligible. `is_local_arp` recovers the per-iface scope so the
+/// negligible. `as_local_arp_ifindex` recovers the per-iface scope so the
 /// programmer can withdraw a single iface's worth of /32s on
 /// `RTM_DELLINK`.
 /// `Ord` / `PartialOrd` are derived (lexicographic on the wrapped
