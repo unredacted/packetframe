@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::codec::{
     encode_request, parse_frame_header, peek_context, peek_msg_id, write_frame_header, Decode,
@@ -120,6 +120,11 @@ pub struct Transport {
     /// per route.
     tx: Vec<u8>,
     rx: Vec<u8>,
+    /// The read/write deadline in force — see [`Self::waited`].
+    timeout: Duration,
+    /// Wall time spent blocked in frame I/O since the handshake. See
+    /// [`Self::waited`].
+    waited: Duration,
 }
 
 impl Transport {
@@ -148,8 +153,15 @@ impl Transport {
             next_context: 1,
             tx: Vec::with_capacity(4096),
             rx: Vec::with_capacity(4096),
+            timeout,
+            waited: Duration::ZERO,
         };
         t.handshake()?;
+        // The meter starts after the handshake: a connect that fails
+        // leaves no transport to read it from, so the caller times the
+        // whole connect itself, and counting the handshake here too would
+        // charge it twice.
+        t.waited = Duration::ZERO;
         Ok(t)
     }
 
@@ -375,7 +387,30 @@ impl Transport {
     pub fn set_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
         self.sock.set_read_timeout(Some(timeout))?;
         self.sock.set_write_timeout(Some(timeout))?;
+        self.timeout = timeout;
         Ok(())
+    }
+
+    /// Wall time this connection has spent blocked writing requests to
+    /// VPP or waiting for its replies, since the handshake.
+    ///
+    /// What the wedge detector subtracts from a gap between supervision
+    /// passes to tell "the loop was away" from "VPP kept the loop
+    /// waiting" (see `liveness::WedgeDetector::on_loop_gap`). Without it,
+    /// a ping to a hung VPP — which holds the loop for the full deadline —
+    /// would read as the loop stalling, and excuse the very silence it
+    /// is evidence of.
+    ///
+    /// Each frame is charged at most the deadline in force. A call can
+    /// legitimately wait that long for VPP; anything beyond it is this
+    /// thread not being scheduled to notice the timeout, which is the
+    /// host's stall and not VPP's.
+    pub fn waited(&self) -> Duration {
+        self.waited
+    }
+
+    fn charge(&mut self, started: Instant) {
+        self.waited += started.elapsed().min(self.timeout);
     }
 
     /// Message id table, for callers that need to recognise async
@@ -385,6 +420,13 @@ impl Transport {
     }
 
     fn write_frame(&mut self) -> Result<(), TransportError> {
+        let started = Instant::now();
+        let r = self.write_frame_unmetered();
+        self.charge(started);
+        r
+    }
+
+    fn write_frame_unmetered(&mut self) -> Result<(), TransportError> {
         let mut framed = Vec::with_capacity(MSG_HEADER_LEN + self.tx.len());
         write_frame_header(&mut framed, self.tx.len());
         framed.extend_from_slice(&self.tx);
@@ -399,6 +441,13 @@ impl Transport {
     /// deliver a frame across several reads, and treating a short read
     /// as a complete message is how a parser silently desynchronises.
     fn read_frame(&mut self) -> Result<Vec<u8>, TransportError> {
+        let started = Instant::now();
+        let r = self.read_frame_unmetered();
+        self.charge(started);
+        r
+    }
+
+    fn read_frame_unmetered(&mut self) -> Result<Vec<u8>, TransportError> {
         let mut hdr = [0u8; MSG_HEADER_LEN];
         self.sock.read_exact(&mut hdr).map_err(|e| {
             // A closed socket mid-frame is VPP exiting, which the
@@ -487,6 +536,8 @@ mod tests {
             next_context: 1,
             tx: Vec::new(),
             rx: Vec::new(),
+            timeout: Duration::from_secs(1),
+            waited: Duration::ZERO,
         };
         t.verify_against(&reply)
     }
@@ -543,6 +594,42 @@ mod tests {
             })
             .collect();
         assert!(verify(&entries, 0).is_ok());
+    }
+
+    /// The wait meter charges what VPP kept the caller waiting, and no
+    /// more than the deadline per frame: a reply that never comes costs
+    /// one deadline, and an answered frame costs what it took.
+    #[test]
+    fn the_wait_meter_charges_at_most_the_deadline_per_frame() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let deadline = Duration::from_millis(30);
+        let mut t = Transport {
+            sock: ours,
+            client_index: 0,
+            ids: HashMap::new(),
+            context_offsets: HashMap::new(),
+            next_context: 1,
+            tx: Vec::new(),
+            rx: Vec::new(),
+            timeout: Duration::from_secs(1),
+            waited: Duration::ZERO,
+        };
+        t.set_timeout(deadline).unwrap();
+
+        assert!(t.read_frame().is_err(), "nothing was sent");
+        let unanswered = t.waited();
+        assert!(
+            unanswered <= deadline,
+            "capped at the deadline: {unanswered:?}"
+        );
+        assert!(unanswered >= deadline / 2, "and charged: {unanswered:?}");
+
+        let mut frame = Vec::new();
+        write_frame_header(&mut frame, 4);
+        frame.extend_from_slice(&[0, 1, 2, 3]);
+        theirs.write_all(&frame).unwrap();
+        assert_eq!(t.read_frame().unwrap(), vec![0, 1, 2, 3]);
+        assert!(t.waited() >= unanswered && t.waited() <= unanswered + deadline);
     }
 
     #[test]

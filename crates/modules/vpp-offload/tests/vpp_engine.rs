@@ -4828,3 +4828,46 @@ fn a_verify_re_run_publishes_its_link_scan() {
         "the ports row reads the re-run's observation: {links:?}"
     );
 }
+
+/// What the wedge detector subtracts from a gap between supervision
+/// passes to tell "the loop was away" from "VPP kept it waiting": a ping
+/// VPP leaves unanswered is charged its socket deadline, and the charge
+/// outlives the transport the failure drops.
+///
+/// Read the other way, this is what stops a hung VPP excusing itself: the
+/// deadline the loop spends blocked on it is VPP's silence, and only what
+/// is left of a gap after this is the loop's own.
+#[test]
+fn an_unanswered_ping_is_charged_its_deadline_and_kept_across_the_drop() {
+    use packetframe_vpp_offload::liveness::PING_BUDGET;
+    let fake = Fake::start_behaving(
+        "api-wait",
+        Behaviour {
+            stall_pings_after: Some(1),
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.ping().expect("the first ping is answered");
+    let answered = e.api_wait();
+
+    let started = std::time::Instant::now();
+    assert!(e.ping().is_err(), "the second goes unanswered");
+    let took = started.elapsed();
+    assert!(!e.is_connected(), "and the failure drops the transport");
+
+    let charged = e.api_wait() - answered;
+    assert!(
+        charged <= took,
+        "never more than the wall clock: {charged:?} > {took:?}"
+    );
+    assert!(
+        charged >= PING_BUDGET / 2,
+        "the unanswered read is VPP's time: {charged:?}"
+    );
+    assert!(
+        charged <= PING_BUDGET + std::time::Duration::from_millis(50),
+        "capped at the deadline in force: {charged:?}"
+    );
+}

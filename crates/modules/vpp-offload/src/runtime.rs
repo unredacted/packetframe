@@ -3166,6 +3166,18 @@ impl Observe for ObserveView {
             .map_err(|e| e.to_string())
     }
 
+    fn api_wait(&self) -> Duration {
+        self.core.borrow().engine.api_wait()
+    }
+
+    fn api_error(&self) -> Option<String> {
+        self.core
+            .borrow()
+            .engine
+            .last_api_error()
+            .map(str::to_string)
+    }
+
     fn steer_permitted(&mut self) -> bool {
         let c = self.core.borrow();
         // Both gates, through the same accessors the steer path and the
