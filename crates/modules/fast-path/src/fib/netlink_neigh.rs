@@ -1485,19 +1485,38 @@ impl NetlinkNeighborResolver {
             Some(ifindex) => ifindex,
             // The RTM_GETLINK dump can have failed, or predate an iface
             // created since, and a stable iface never sends another
-            // RTM_NEWLINK; ask the kernel directly, as `ix_oifs` does.
-            // Recorded so the iface's RTM_DELLINK is recognised as
-            // carrying the /0.
-            None => match ifindex_by_name(&iface) {
-                Some(ifindex) => {
+            // RTM_NEWLINK; ask the kernel for this one link. Both caches
+            // are filled from the reply, as the dump and RTM_NEWLINK fill
+            // them: the name so the iface's RTM_DELLINK is recognised as
+            // carrying the /0, and the MAC because every Learned on an
+            // uncached iface carries a zeroed src_mac, which the
+            // programmer writes as Resolved — the /0 would then forward
+            // frames with no source address (review finding on #319).
+            None => match get_link_by_name(&iface).await {
+                Ok(Some((ifindex, mac))) => {
+                    if let Some(mac) = mac {
+                        self.iface_mac.insert(ifindex, mac);
+                    }
                     self.iface_to_ifindex.insert(iface, ifindex);
                     ifindex
                 }
-                None => {
+                Ok(None) => {
                     warn!(
                         iface = %iface,
                         "fallback-default iface does not exist; 0.0.0.0/0 will be injected \
                          when its RTM_NEWLINK arrives"
+                    );
+                    return;
+                }
+                // Neither the ifindex nor the MAC is established, so
+                // nothing is injected rather than a /0 with a zeroed
+                // source address.
+                Err(e) => {
+                    warn!(
+                        iface = %iface,
+                        error = %e,
+                        "fallback-default iface lookup failed; 0.0.0.0/0 waits for the iface's \
+                         next RTM_NEWLINK"
                     );
                     return;
                 }
@@ -1898,6 +1917,25 @@ async fn dump_link_info() -> Result<(HashMap<u32, [u8; 6]>, HashMap<String, u32>
         }
     }
     Ok((macs, names))
+}
+
+/// One link's `(ifindex, MAC)` by name: a single non-dump RTM_GETLINK,
+/// answered with the same message the dump and RTM_NEWLINK deliver, so
+/// a caller fills both caches from one observation. `Ok(None)` means
+/// the kernel has no link by that name (`ENODEV`). The MAC is `None`
+/// for a link without a hardware address, exactly as the dump records
+/// it.
+async fn get_link_by_name(name: &str) -> Result<Option<(u32, Option<[u8; 6]>)>, NeighError> {
+    let (connection, handle, _) =
+        new_connection().map_err(|e| NeighError::new(format!("new_connection: {e}")))?;
+    tokio::spawn(connection);
+    let mut links = handle.link().get().match_name(name).execute();
+    match links.try_next().await {
+        Ok(Some(msg)) => Ok(Some((msg.header.index, extract_link_mac(&msg)))),
+        Ok(None) => Ok(None),
+        Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -libc::ENODEV => Ok(None),
+        Err(e) => Err(NeighError::new(format!("link get {name}: {e}"))),
+    }
 }
 
 /// Pull the `IfName` (IFLA_IFNAME) attribute out of a `LinkMessage`.
@@ -2494,5 +2532,56 @@ mod read_back_tests {
             }
             other => panic!("expected GetNeighbour, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod link_lookup_tests {
+    use super::*;
+
+    /// `get_link_by_name` returns the ifindex AND the MAC from one
+    /// reply, which is what lets the fallback-default seed fill both
+    /// caches; an absent name is `Ok(None)` (`ENODEV`), not an error,
+    /// because the two lead to different log lines.
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+    fn get_link_by_name_reads_ifindex_and_mac_from_one_reply() {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Only this thread moves, and its namespace goes with it.
+                let rc = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+                assert_eq!(rc, 0, "unshare: {}", std::io::Error::last_os_error());
+                let st = std::process::Command::new("ip")
+                    .args([
+                        "link",
+                        "add",
+                        "pfgl0",
+                        "address",
+                        "02:00:00:00:fd:02",
+                        "type",
+                        "dummy",
+                    ])
+                    .status()
+                    .expect("spawn ip");
+                assert!(st.success(), "ip link add");
+                let ifindex = ifindex_by_name("pfgl0").expect("the dummy exists");
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("current-thread runtime");
+                rt.block_on(async {
+                    assert_eq!(
+                        get_link_by_name("pfgl0").await.expect("lookup"),
+                        Some((ifindex, Some([0x02, 0, 0, 0, 0xfd, 0x02])))
+                    );
+                    assert_eq!(
+                        get_link_by_name("pfgl-absent")
+                            .await
+                            .expect("an absent link is not a lookup failure"),
+                        None
+                    );
+                });
+            });
+        });
     }
 }
