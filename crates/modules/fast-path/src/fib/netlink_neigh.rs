@@ -98,8 +98,10 @@ pub struct LocalPrefixSpec {
 
 /// Operator-declared synthetic IPv4 default route (v0.2.1, issue #31).
 /// The resolver injects a single `RouteEvent::Add { 0.0.0.0/0,
-/// nexthops: [nexthop] }` at startup so the PacketFrame FIB has a
-/// catch-all for destinations bird's iBGP feed doesn't cover (RFC 1918,
+/// nexthops: [nexthop] }` under `iface`'s `local_arp` peer, at startup
+/// and again whenever the iface appears (its `RTM_NEWLINK`), so the
+/// PacketFrame FIB has a catch-all for destinations bird's iBGP feed
+/// doesn't cover (RFC 1918,
 /// CGNAT, test-net, anything not in DFZ). Otherwise those packets
 /// miss LPM, fall to slow-path through netfilter / conntrack, and
 /// get dropped upstream anyway. With this directive they XDP-redirect
@@ -295,9 +297,18 @@ pub struct NetlinkNeighborResolver {
     /// e.g., the existing netns ARP-walk tests).
     prog_handle: Option<FibProgrammerHandle>,
     /// v0.2.1 issue #31: optional synthetic 0.0.0.0/0 catch-all.
-    /// `None` = no fallback (default). `Some(spec)` = inject a /0
-    /// RouteEvent::Add at startup once the iface is resolvable.
+    /// `None` = no fallback (default). `Some(spec)` = a /0
+    /// RouteEvent::Add under the iface's `local_arp` peer while the
+    /// iface exists: injected at startup and on its RTM_NEWLINK,
+    /// withdrawn with that peer on its RTM_DELLINK.
     fallback_default: Option<FallbackDefaultSpec>,
+    /// The ifindex the fallback /0 was last acknowledged under by the
+    /// programmer; cleared by that iface's RTM_DELLINK. Picks the log
+    /// level only, never whether the Add is sent: the re-send every
+    /// RTM_NEWLINK for the iface causes logs at debug, while the first
+    /// injection, or the first after a failure or a recreate, logs at
+    /// info.
+    fallback_injected_on: Option<u32>,
     /// v0.2.9 FDB-pin chains: neighbor-bearing bridge ifindex (e.g.
     /// br1337) → (underlying bridge whose FDB decides the member port,
     /// e.g. switch0, egress VID). Snapshot from discovery at attach;
@@ -395,6 +406,7 @@ impl NetlinkNeighborResolver {
                 local_prefixes: Vec::new(),
                 prog_handle: None,
                 fallback_default: None,
+                fallback_injected_on: None,
                 pin_chains: HashMap::new(),
                 fdb: HashMap::new(),
                 fdb_pins_sent: 0,
@@ -577,13 +589,6 @@ impl NetlinkNeighborResolver {
         // wrapper); this is the documented usage pattern.
         if let Some(prog) = self.prog_handle.clone() {
             self.seed_local_prefix_routes(&prog).await;
-            // v0.2.1 issue #31: inject the synthetic 0.0.0.0/0 if the
-            // operator declared `fallback-default`. Order matters: the
-            // /0 goes in *after* the per-/32 seed so ECMP-group dedup
-            // signatures don't accidentally collapse the catch-all
-            // with a real route. Bird's actual /0 (if any) wins via
-            // peer_id scoping inside FibProgrammer.
-            self.seed_fallback_default(&prog).await;
         } else if !self.local_prefixes.is_empty() || self.fallback_default.is_some() {
             warn!(
                 local_prefixes = self.local_prefixes.len(),
@@ -602,6 +607,20 @@ impl NetlinkNeighborResolver {
             groups = ?groups,
             "NeighborResolver netlink multicast subscription live"
         );
+
+        // v0.2.1 issue #31: inject the synthetic 0.0.0.0/0 if the
+        // operator declared `fallback-default`. Order matters: the
+        // /0 goes in *after* the per-/32 seed so ECMP-group dedup
+        // signatures don't accidentally collapse the catch-all
+        // with a real route. Bird's actual /0 (if any) wins via
+        // peer_id scoping inside FibProgrammer.
+        //
+        // After the subscription, not beside the /32 seed above: an
+        // iface missing here is then certain to reach handle_packet's
+        // RTM_NEWLINK arm when it appears, which is the only other
+        // place the /0 is injected. Before it, an iface created in
+        // between was neither seen here nor heard about there.
+        self.seed_fallback_default().await;
 
         // v0.2.9 FDB-pin: seed the bridge FDB view and push initial
         // pin state for every already-known neighbor on a pin chain.
@@ -904,20 +923,42 @@ impl NetlinkNeighborResolver {
                 // local-prefix that the operator staged in config
                 // becomes resolvable now.
                 if let Some(name) = extract_link_name(&msg) {
+                    let is_fallback = self
+                        .fallback_default
+                        .as_ref()
+                        .is_some_and(|spec| spec.iface == name);
                     self.iface_to_ifindex.insert(name, ifindex);
+                    // v0.2.1 issue #31: the fallback-default /0 follows
+                    // its iface. Absent at startup, or recreated after
+                    // the RTM_DELLINK arm below withdrew it, the iface
+                    // gets its /0 here. Every other RTM_NEWLINK for it
+                    // (flags, carrier, MTU) re-sends the same Add, which
+                    // the programmer's unchanged-nexthop shortcut absorbs.
+                    if is_fallback {
+                        self.inject_fallback_default(ifindex).await;
+                    }
                 }
             }
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelLink(msg)) => {
                 let ifindex = msg.header.index;
+                // Read before the purge below drops the name.
+                let carried_fallback = self.fallback_default.as_ref().is_some_and(|spec| {
+                    self.iface_to_ifindex.get(&spec.iface).copied() == Some(ifindex)
+                });
+                if self.fallback_injected_on == Some(ifindex) {
+                    self.fallback_injected_on = None;
+                }
                 self.iface_mac.remove(&ifindex);
                 // Drop the name→ifindex mapping for this iface (single
                 // pass; rare event).
                 self.iface_to_ifindex.retain(|_, &mut v| v != ifindex);
-                // v0.2.1: if this iface backed a local-prefix, withdraw
-                // every /32 we registered for it. Cheap PeerDown event
-                // to FibProgrammer; FibProgrammer's existing peer-walk
-                // does the table sweep.
-                self.maybe_emit_local_arp_peerdown(ifindex).await;
+                // v0.2.1: if this iface backed a local-prefix or the
+                // fallback-default, withdraw every route we registered
+                // for it. Cheap PeerDown event to FibProgrammer;
+                // FibProgrammer's existing peer-walk does the table
+                // sweep.
+                self.maybe_emit_local_arp_peerdown(ifindex, carried_fallback)
+                    .await;
                 debug!(ifindex, "RTM_DELLINK observed; iface caches purged");
             }
             NetlinkPayload::Error(err) => {
@@ -1427,28 +1468,58 @@ impl NetlinkNeighborResolver {
         }
     }
 
-    /// v0.2.1 issue #31. Inject a synthetic IPv4 default route into
-    /// the PacketFrame FIB if the operator declared `fallback-default`.
-    /// One-shot at startup; no ongoing maintenance because the
-    /// /0 doesn't change (operator restarts to remove it). Uses a
-    /// dedicated PeerId derived from the iface ifindex so it scopes
-    /// cleanly the same way local-prefix /32s do.
-    async fn seed_fallback_default(&mut self, prog: &FibProgrammerHandle) {
+    /// v0.2.1 issue #31. Inject the synthetic IPv4 default route at
+    /// startup if the operator declared `fallback-default` and its
+    /// iface exists. An iface that does not exist yet gets its /0 from
+    /// its RTM_NEWLINK instead (see `handle_packet`), which is why
+    /// `run()` calls this only once the multicast subscription is live.
+    async fn seed_fallback_default(&mut self) {
+        let Some(iface) = self
+            .fallback_default
+            .as_ref()
+            .map(|spec| spec.iface.clone())
+        else {
+            return;
+        };
+        let ifindex = match self.iface_to_ifindex.get(&iface).copied() {
+            Some(ifindex) => ifindex,
+            // The RTM_GETLINK dump can have failed, or predate an iface
+            // created since, and a stable iface never sends another
+            // RTM_NEWLINK; ask the kernel directly, as `ix_oifs` does.
+            // Recorded so the iface's RTM_DELLINK is recognised as
+            // carrying the /0.
+            None => match ifindex_by_name(&iface) {
+                Some(ifindex) => {
+                    self.iface_to_ifindex.insert(iface, ifindex);
+                    ifindex
+                }
+                None => {
+                    warn!(
+                        iface = %iface,
+                        "fallback-default iface does not exist; 0.0.0.0/0 will be injected \
+                         when its RTM_NEWLINK arrives"
+                    );
+                    return;
+                }
+            },
+        };
+        self.inject_fallback_default(ifindex).await;
+    }
+
+    /// Send the fallback-default /0 to the FibProgrammer under
+    /// `ifindex`'s `local_arp` peer, the same per-iface scope the
+    /// local-prefix /32s use, so the iface's RTM_DELLINK PeerDown
+    /// withdraws it with them. The only place the event is built,
+    /// shared by the startup seed and the RTM_NEWLINK arm.
+    async fn inject_fallback_default(&mut self, ifindex: u32) {
         let Some(spec) = self.fallback_default.clone() else {
             return;
         };
-        let Some(&ifindex) = self.iface_to_ifindex.get(&spec.iface) else {
-            warn!(
-                iface = %spec.iface,
-                "fallback-default iface not yet known to the kernel; will retry on RTM_NEWLINK \
-                 (config validates iface exists at startup, so this should only fire on transient \
-                 races)"
-            );
+        let Some(prog) = self.prog_handle.clone() else {
             return;
         };
-        let peer_id = PeerId::local_arp(ifindex);
         let event = RouteEvent::Add {
-            peer_id,
+            peer_id: PeerId::local_arp(ifindex),
             prefix: IpPrefix::V4 {
                 addr: [0, 0, 0, 0],
                 prefix_len: 0,
@@ -1458,13 +1529,31 @@ impl NetlinkNeighborResolver {
             local_pref: None,
         };
         match prog.apply_route_event(event).await {
-            Ok(()) => info!(
+            Ok(()) => {
+                // A re-send under the ifindex already acknowledged is a
+                // no-op in the programmer; a flag or carrier change
+                // must not read as a new injection.
+                if self.fallback_injected_on.replace(ifindex) == Some(ifindex) {
+                    debug!(
+                        iface = %spec.iface,
+                        ifindex,
+                        "fallback-default 0.0.0.0/0 re-sent on RTM_NEWLINK"
+                    );
+                } else {
+                    info!(
+                        iface = %spec.iface,
+                        ifindex,
+                        nexthop = %spec.nexthop,
+                        "v0.2.1 fallback-default 0.0.0.0/0 injected"
+                    );
+                }
+            }
+            Err(e) => warn!(
                 iface = %spec.iface,
                 ifindex,
-                nexthop = %spec.nexthop,
-                "v0.2.1 fallback-default 0.0.0.0/0 injected"
+                error = %e,
+                "fallback-default injection failed"
             ),
-            Err(e) => warn!(error = %e, "fallback-default injection failed"),
         }
     }
 
@@ -1542,38 +1631,43 @@ impl NetlinkNeighborResolver {
         }
     }
 
-    /// On RTM_DELLINK for any iface that backed at least one
-    /// local-prefix, send a single PeerDown to the FibProgrammer.
-    /// Cheaper than walking the cache to emit per-/32 Dels and
-    /// matches the existing semantics for BGP peer departure.
-    async fn maybe_emit_local_arp_peerdown(&mut self, ifindex: u32) {
-        // Only interesting if at least one local-prefix names this iface.
-        let was_local = self.local_prefixes.iter().any(|spec| {
-            self.iface_to_ifindex
-                .get(&spec.iface)
-                .copied()
-                .map(|i| i == ifindex)
-                .unwrap_or(false)
-        });
-        // After the iface_to_ifindex purge above, we may have already
-        // lost the entry, fall back to comparing against any cached
-        // matching done in seed time. For now the simpler heuristic is
-        // "always emit a PeerDown if local-prefixes are configured at
-        // all", wasteful for ifaces that weren't local-prefix targets,
-        // but safe (programmer's PeerDown handler is a HashMap walk
-        // that does nothing for an unknown peer_id).
-        if !was_local && self.local_prefixes.is_empty() {
+    /// On RTM_DELLINK, send a single PeerDown for the departed iface's
+    /// `local_arp` peer, withdrawing everything injected under it: its
+    /// local-prefix host routes and, if it was the fallback-default
+    /// iface, the /0. Cheaper than walking the cache to emit per-/32
+    /// Dels and matches the existing semantics for BGP peer departure.
+    ///
+    /// With any local-prefix configured this fires for every iface: the
+    /// caller has already purged the departed name from
+    /// `iface_to_ifindex`, so which iface backed a local-prefix is not
+    /// recoverable here. Wasteful for ifaces that weren't local-prefix
+    /// targets, but safe (programmer's PeerDown handler is a HashMap
+    /// walk that does nothing for an unknown peer_id).
+    ///
+    /// `carried_fallback`, read by the caller before that purge, covers
+    /// a fallback-default with no local-prefix beside it; when the
+    /// iface returns, its RTM_NEWLINK re-injects the /0 under the new
+    /// ifindex's peer.
+    async fn maybe_emit_local_arp_peerdown(&mut self, ifindex: u32, carried_fallback: bool) {
+        if self.local_prefixes.is_empty() && !carried_fallback {
             return;
         }
         let Some(prog) = self.prog_handle.clone() else {
             return;
         };
         let peer_id = PeerId::local_arp(ifindex);
-        if let Err(e) = prog
+        match prog
             .apply_route_event(RouteEvent::PeerDown { peer_id })
             .await
         {
-            warn!(ifindex, error = %e, "local-prefix RouteEvent::PeerDown dispatch failed");
+            Ok(()) if carried_fallback => info!(
+                ifindex,
+                "fallback-default iface deleted; 0.0.0.0/0 withdrawn until its RTM_NEWLINK"
+            ),
+            Ok(()) => {}
+            Err(e) => {
+                warn!(ifindex, error = %e, "local_arp RouteEvent::PeerDown dispatch failed")
+            }
         }
     }
 
