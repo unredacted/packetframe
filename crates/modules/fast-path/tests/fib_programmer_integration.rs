@@ -3207,6 +3207,7 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
         route(v6_48(), nh6()),
     ];
     let status = shared_status();
+    let session = Arc::new(packetframe_common::fib::FeedSession::new());
     let ctrl = RouteController::start(
         &pins.dir,
         RouteFeed {
@@ -3216,7 +3217,10 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
         ResolverPolicy::default(),
         std::collections::HashMap::new(),
         None,
-        SecondTierSignals::default(),
+        SecondTierSignals {
+            completeness: None,
+            feed_session: Some(session.clone()),
+        },
         LedgerWiring {
             seed: Some(ledger(&routes, now_unix())),
             status: status.clone(),
@@ -3233,6 +3237,10 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
         rt.block_on(prog.mirror_counts()).expect("counts"),
         (2, 1),
         "the seed is in before the first command is served"
+    );
+    assert!(
+        session.liveness().mirror_seeded,
+        "the second tier is told the mirror is a seed, not a table loading from empty"
     );
 
     let written = ctrl.preserve_route_ledger(&state_dir);

@@ -1075,15 +1075,15 @@ daemon stopped. The age bound caps how far behind that can be.
   routes install as the seed lands, and the verify hold releases on that
   first attested check with the source's backlog drained. A first steer
   no longer waits for the replay.
-- **vpp-offload, unsteered adopted VPP**: the adopted diff waits behind
-  the loaded-and-quiet gate, and "quiet" there counts every element the
-  route source streams, changed or not (see the vpp-offload runbook's
-  release-gate section — deliberately, since #153). The seed puts the
-  mirror over the floor at once, so the diff releases as soon as the
-  seed has been quiet for 2 s **if the route source has not started
-  streaming by then**; if it has, the diff waits for the replay to go
-  quiet, as before. The first steer after that verify still needs the
-  attested check.
+- **vpp-offload, unsteered adopted VPP**: the adopted diff normally
+  waits behind the loaded-and-quiet gate, where "quiet" counts every
+  element the route source streams, changed or not (deliberately, since
+  #153). A seeded mirror has a second door that does not wait for the
+  replay: seed unreconciled, feed session up, and the authority's
+  current word yes ([the unsteered diff and a seeded
+  mirror](vpp-offload.md#the-unsteered-diff-and-a-seeded-mirror)). Verify
+  follows and the port is `Ready`; the first steer is then the operator's
+  `steer` flag, as always for a port that was not steered.
 - **vpp-offload, steered adopted VPP**: unchanged — it stays steered
   through the restart on its own preserved ledger, and its diff waits
   for the replay to go quiet, as before.

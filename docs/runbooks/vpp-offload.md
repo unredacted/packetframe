@@ -750,6 +750,49 @@ release: check the feed session actually started (`BGP client
 connected` + at least one UPDATE in the log), then check the mirror
 count against the floor in the health text.
 
+### The unsteered diff and a seeded mirror
+
+Everything above is the STEERED stages' release. An UNSTEERED adoption
+— its dump already ran, harmlessly, because nothing is on VPP — defers
+only its diff, behind the floor (half the adopted table) and the same
+stream-quiet rule: a reannouncement holds it loud until the stream
+ends. That still applies to every mirror that loaded from empty.
+
+When the fast-path seeded the mirror from its [route
+ledger](packetframe-fib.md#restarts-the-route-ledger), the diff has a
+second door, and it does not wait for the replay to go quiet. It opens
+when **all** of these hold:
+
+- the mirror holds a seed no route-source GC has reconciled yet (the
+  fast-path marks the feed session when it hands the seed over);
+- the feed session is up — the route source is streaming to this
+  process now;
+- the completeness authority's current word is yes: its last report
+  permits steering and its count is within 1% of the mirror as it is now
+  (the fast-path authorities never attest a seed before the route
+  source's first route, so this also proves the stream has spoken);
+- the floor.
+
+Why that is safe where quiet is not needed: the diff withdraws from VPP
+whatever the mirror lacks, so the danger is a mirror still filling from
+empty — "~all withdrawals". A seed is the previous process's whole
+table, present before the route source connected, and the authority's
+agreement rules out a seed that is substantially short of what the
+source has now. What the seed has that the source dropped leaves VPP
+when the route source's GC withdraws it; what changed reaches VPP as the
+replay re-advertises it — the same as on the eBPF tier, which forwards
+on the same seed. VPP carries no traffic at this stage either way. With
+`require-table-complete off` there is no authority to vouch for the
+seed, and only the quiet door exists.
+
+The journal says which door opened: `the route mirror was seeded from
+the fast-path route ledger, the route source is streaming and the
+completeness authority agrees with it: running the adopted resync diff
+now ...`. Verify follows, and then the port is `Ready`. **It does not
+steer on its own**: an adoption that was unsteered keeps the canary rule,
+so the first steer is still a `steer` flag you move — after `Ready`; a
+move while still converging is refused as before.
+
 ## What a keep-vpp restart costs now: the preserved route ledger
 
 **The incident this answers (primary, 2026-09-26, ~1.09M v4 routes).**
@@ -844,8 +887,10 @@ source's replay: the release floor is met at once, and the
 completeness authority attests the seeded mirror at the route source's
 first route. The diff described here still waits for the replay to go
 quiet — "quiet" counts every streamed element — so a steered adoption
-behaves as before; what changes is an UNSTEERED VPP's first steer (the
-fresh-convergence hold releases on that first attested check).
+behaves as before. What changes is an UNSTEERED VPP: a fresh one's
+convergence hold releases on that first attested check, and an adopted
+one's diff takes the seeded-mirror door ([the unsteered diff and a
+seeded mirror](#the-unsteered-diff-and-a-seeded-mirror)).
 
 What you see: `fib-synced DEGRADED — resync deferred ... the adopted FIB
 keeps forwarding untouched` while the feed reloads (on the primary the

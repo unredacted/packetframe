@@ -4189,3 +4189,213 @@ fn an_incomplete_verdict_is_re_run_once_its_unresolvable_route_is_gone() {
     assert!(!d.supervisor().is_steered());
     assert!(rt.status().last_verify.is_some_and(|v| v.passed()));
 }
+
+/// An UNSTEERED adoption over a mirror the fast-path seeded from its
+/// route ledger: the restart this gate change exists for.
+mod seeded_mirror {
+    use super::*;
+    use packetframe_common::fib::{
+        AuthorityObservation, CompletenessReport, FeedSession, TableCompleteness,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// The surviving VPP's table, which the previous process's mirror —
+    /// and so the seed — also held.
+    pub const EXISTING: &[([u8; 4], u8, u32, bool)] = &[
+        ([203, 0, 113, 0], 27, ASSIGNED_INDEX, true),
+        ([203, 0, 113, 32], 27, ASSIGNED_INDEX, true),
+        ([203, 0, 113, 64], 27, ASSIGNED_INDEX, true),
+        ([203, 0, 113, 96], 27, ASSIGNED_INDEX, true),
+        ([203, 0, 113, 128], 27, ASSIGNED_INDEX, true),
+        ([203, 0, 113, 160], 27, ASSIGNED_INDEX, true),
+    ];
+
+    pub fn seed() -> Vec<IpPrefix> {
+        EXISTING
+            .iter()
+            .map(|(addr, prefix_len, _, _)| IpPrefix::V4 {
+                addr: *addr,
+                prefix_len: *prefix_len,
+            })
+            .collect()
+    }
+
+    pub struct Fixture {
+        pub fake: Fake,
+        pub log: steered::Log,
+        pub rt: Runtime,
+        pub session: Arc<FeedSession>,
+        pub authority: Arc<TableCompleteness>,
+    }
+
+    /// An unsteered adoption of the six-route VPP, a frozen mirror
+    /// holding the same six, `require-table-complete on`, and a feed
+    /// session that is up — seeded or not as asked. Adopted and ticked
+    /// once, so the dump has run and the diff is deferred.
+    pub fn adopted(name: &str, seeded: bool, d: &mut Driver) -> (Fixture, Instant) {
+        let fake = Fake::start_behaving(
+            name,
+            fake_vpp::Behaviour {
+                existing_routes: EXISTING,
+                ..Default::default()
+            },
+        );
+        let log: steered::Log = Arc::new(Mutex::new(Vec::new()));
+        let rt = runtime_custom(
+            &fake,
+            Box::new(steered::SharedMirror(Arc::new(Mutex::new(seed())))),
+            Box::new(steered::RecordingSteering {
+                rules: Vec::new(),
+                log: log.clone(),
+            }),
+            1_000_000,
+        );
+        let session = Arc::new(FeedSession::new());
+        if seeded {
+            session.mark_mirror_seeded();
+        }
+        rt.feed_session(session.clone());
+        let authority = Arc::new(TableCompleteness::new());
+        rt.require_table_complete(authority.clone());
+        {
+            let (mut obs, _) = rt.views();
+            use packetframe_vpp_offload::driver::Observe as _;
+            assert!(obs.api_ready(), "the fake must answer the handshake");
+        }
+        let t0 = Instant::now();
+        {
+            let (_, mut fx) = rt.views();
+            d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+        }
+        assert_eq!(d.state(), State::Syncing);
+        // The route source is up and streaming, and the authority
+        // agrees with the mirror's count — what the fast-path publishes
+        // once the source's first route has reached a seeded mirror.
+        session.set_up(true);
+        authority.record(AuthorityObservation::Clean(CompletenessReport {
+            authority_routes: 6,
+            mirror_routes: 6,
+            at: std::time::Instant::now(),
+        }));
+        (
+            Fixture {
+                fake,
+                log,
+                rt,
+                session,
+                authority,
+            },
+            t0,
+        )
+    }
+
+    /// Tick with the route source replaying its table — 200 identical
+    /// elements per tick, far above the quiet rate at any cadence, and
+    /// not one of them moving the mirror — until `stop` or `ticks`.
+    pub fn replay(
+        d: &mut Driver,
+        f: &Fixture,
+        mut now: Instant,
+        ticks: usize,
+        stop: impl Fn(&Driver) -> bool,
+    ) -> (Instant, Vec<Event>) {
+        let (mut obs, mut fx) = f.rt.views();
+        let mut seen = Vec::new();
+        for _ in 0..ticks {
+            if stop(d) {
+                break;
+            }
+            f.session.pulse_n(200);
+            let t = d.tick(now, &mut obs, &mut fx);
+            seen.extend(t.events.clone());
+            for e in f.rt.take_pending() {
+                seen.extend(d.inject(now, e, &mut fx).events);
+            }
+            f.rt.set_steered(d.supervisor().is_steered());
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+        (now, seen)
+    }
+}
+
+/// The restart this exists for: a VPP that was not steered when the
+/// daemon stopped, a mirror seeded from the route ledger, and the route
+/// source replaying its whole table — every element identical to what
+/// the seed holds. The diff runs WHILE the replay streams, verify passes,
+/// the canary rule still holds (nothing steers on its own), and the
+/// operator's lever then steers at once through the completeness gate.
+#[test]
+fn a_seeded_mirror_releases_an_unsteered_diff_while_the_replay_streams() {
+    let mut d = Driver::new();
+    let (f, t0) = seeded_mirror::adopted("seeded-release", true, &mut d);
+    let (now, seen) = seeded_mirror::replay(&mut d, &f, t0, 400, |d| d.state() == State::Ready);
+    assert_eq!(
+        d.state(),
+        State::Ready,
+        "the diff and verify must not wait for the replay to go quiet: {seen:?}"
+    );
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+    assert!(
+        steered::deletes(&f.fake).is_empty(),
+        "the seed is the table VPP holds: the diff withdraws nothing"
+    );
+    assert!(
+        f.log.lock().unwrap().is_empty(),
+        "an unsteered port never steers on its own — the first steer is the operator's"
+    );
+
+    // The lever, with the replay still streaming.
+    {
+        let (_, mut fx) = f.rt.views();
+        d.inject(now, Event::SteerRequested, &mut fx);
+    }
+    let (_, seen) = seeded_mirror::replay(&mut d, &f, now, 64, |d| d.state() == State::Steered);
+    assert_eq!(d.state(), State::Steered, "{seen:?}");
+    assert_eq!(f.log.lock().unwrap().as_slice(), &["steer"]);
+    assert!(f.authority.verdict().permits_steering());
+}
+
+/// #153's protection, kept for every mirror that was NOT seeded: the
+/// same streaming replay over a frozen mirror holds an unsteered diff,
+/// authority and all, because a cold mirror's count says nothing about
+/// whether the reload has finished. Once the stream goes quiet, the
+/// ordinary door releases it.
+#[test]
+fn an_unseeded_mirror_still_waits_for_the_replay_to_go_quiet() {
+    let mut d = Driver::new();
+    let (f, t0) = seeded_mirror::adopted("seeded-unseeded", false, &mut d);
+    let (now, seen) = seeded_mirror::replay(&mut d, &f, t0, 200, |_| false);
+    assert_eq!(d.state(), State::Syncing, "{seen:?}");
+    assert!(
+        !seen.contains(&Event::SyncComplete),
+        "nothing may complete while the stream is loud: {seen:?}"
+    );
+    assert!(f.rt.status().resync_deferred.is_some());
+
+    let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Ready);
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+}
+
+/// A seed the authority does not vouch for keeps the quiet gate: here
+/// the route source holds twice what the seed does (it gained routes
+/// while the daemon was down, or the seed is from the wrong table), so
+/// the authority reads the mirror as short and the door stays shut
+/// through the replay.
+#[test]
+fn a_seed_the_authority_disputes_waits_for_the_replay() {
+    use packetframe_common::fib::{AuthorityObservation, CompletenessReport};
+    let mut d = Driver::new();
+    let (f, t0) = seeded_mirror::adopted("seeded-disputed", true, &mut d);
+    f.authority
+        .record(AuthorityObservation::Clean(CompletenessReport {
+            authority_routes: 12,
+            mirror_routes: 6,
+            at: std::time::Instant::now(),
+        }));
+    let (_, seen) = seeded_mirror::replay(&mut d, &f, t0, 200, |_| false);
+    assert_eq!(d.state(), State::Syncing, "{seen:?}");
+    assert!(!seen.contains(&Event::SyncComplete), "{seen:?}");
+}
