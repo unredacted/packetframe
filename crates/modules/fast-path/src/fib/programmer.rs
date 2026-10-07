@@ -482,6 +482,11 @@ struct NexthopRecord {
 /// route only on a kernel neighbour update, so no session re-announced
 /// them, and every reconnect's GC deleted them: the fallback default in
 /// both tiers.
+///
+/// Sound only because route sources build their ids with
+/// [`PeerId::route_source`], which cannot produce a local-ARP id. Were a
+/// feed id hashed straight from sender-chosen fields, a sender could
+/// land one in that namespace and exempt its routes from the GC.
 fn is_session_peer(peer: PeerId) -> bool {
     peer.as_local_arp_ifindex().is_none()
 }
