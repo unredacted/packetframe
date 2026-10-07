@@ -96,6 +96,19 @@ pub const RESUME_BASE: Duration = crate::liveness::PING_INTERVAL;
 /// within seconds.
 pub const RESUME_MAX: Duration = Duration::from_secs(8);
 
+/// Whole milliseconds, for log and event fields.
+fn ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A probe that could not be sent because VPP did not take a connection.
+fn reconnect_error(obs: &dyn Observe) -> String {
+    match obs.api_error() {
+        Some(e) => format!("reconnect refused: {e}"),
+        None => "reconnect refused".into(),
+    }
+}
+
 fn resume_delay(attempts: u32) -> Duration {
     RESUME_BASE
         .checked_mul(1u32 << attempts.min(16))
@@ -104,7 +117,7 @@ fn resume_delay(attempts: u32) -> Duration {
 }
 
 use crate::executor::{execute, Effects, Outcome, StepError};
-use crate::liveness::{budget_for, WedgeDetector};
+use crate::liveness::{budget_for, LoopGap, WedgeDetector, WedgeReport};
 use crate::schedule::Schedule;
 use crate::supervisor::{Event, State, Supervisor};
 
@@ -149,6 +162,42 @@ pub trait Observe {
 
     /// Send a ping and read its reply.
     fn ping(&mut self) -> Result<(), String>;
+
+    /// Wall time spent blocked on VPP's API socket so far — requests,
+    /// replies and connect attempts — on the real clock. Monotonic.
+    ///
+    /// What lets the driver tell a stall of its OWN loop from VPP keeping
+    /// it waiting: the gap between two passes, less this, is time the
+    /// loop was away for reasons that are not VPP's (a kernel call on
+    /// `rtnl_lock`, a starved host). Only that part excuses silence — see
+    /// [`crate::liveness::WedgeDetector::on_loop_gap`]. Getting it wrong
+    /// in the other direction would be the dangerous one: a ping to a
+    /// hung VPP holds the loop for the whole socket deadline, and read as
+    /// the loop's stall it would excuse the silence it is evidence of.
+    ///
+    /// The default, zero, says every gap is the loop's own — exact for a
+    /// double whose calls do not block.
+    fn api_wait(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Why the last connect attempt failed, for the wedge report. `None`
+    /// when unknown.
+    fn api_error(&self) -> Option<String> {
+        None
+    }
+
+    /// How many replies VPP has sent so far — to anything: route batches,
+    /// verify probes, pings. Monotonic.
+    ///
+    /// Any increase is proof of life for the wedge detector
+    /// ([`crate::liveness::WedgeDetector::on_answer`]): a VPP busy with
+    /// work it keeps answering is not wedged, however long a ping queued
+    /// behind that work takes. The default, zero, is a double that never
+    /// answers anything but pings.
+    fn api_answers(&self) -> u64 {
+        0
+    }
 
     /// Whether the module has any reason of its own to refuse or defer
     /// a steer right now.
@@ -303,6 +352,20 @@ pub struct Driver {
     /// at the latest tick. Kept because `inject` arms phases too and has
     /// no `Observe` to ask.
     convergence_budget: Duration,
+    /// The previous tick's clock and [`Observe::api_wait`] reading — what
+    /// the next tick measures the loop's own time away against. Every
+    /// tick sets it, whatever the state, so a gap is always pass to pass.
+    last_pass: Option<(Instant, Duration)>,
+    /// [`Observe::api_wait`] at the last answer (or when the detector
+    /// first saw a tick), so a wedge report can say how much of the
+    /// silence VPP kept the loop waiting. Dropped with the detector.
+    api_wait_at_answer: Option<Duration>,
+    /// [`Observe::api_answers`] at its last reading, so an increase can be
+    /// credited to the detector. Dropped with the detector.
+    answers_seen: Option<u64>,
+    /// The evidence behind the most recent `Wedged`, for the teardown's
+    /// event and for tests. See [`crate::liveness::WedgeReport`].
+    wedge_report: Option<WedgeReport>,
 }
 
 impl Default for Driver {
@@ -324,7 +387,17 @@ impl Driver {
             drain_gate: None,
             resume_attempts: 0,
             convergence_budget: crate::supervisor::CONVERGENCE_BUDGET,
+            last_pass: None,
+            api_wait_at_answer: None,
+            answers_seen: None,
+            wedge_report: None,
         }
+    }
+
+    /// The evidence behind the most recent `Wedged`, if there has been
+    /// one.
+    pub fn last_wedge(&self) -> Option<&WedgeReport> {
+        self.wedge_report.as_ref()
     }
 
     /// The supervisor's phase, with the convergence budget scaled to the
@@ -405,6 +478,36 @@ impl Driver {
         // was on entry — draining on the tick that first saw the API
         // would act on a transition the supervisor has not applied yet.
         let api_up_at_entry = self.detector.is_some();
+        // How long the loop was away since the last pass for reasons of
+        // its own: the wall gap, less what VPP's socket kept it waiting.
+        // Measured on every pass so the gap is always pass to pass; acted
+        // on below only by a detector that existed at entry.
+        let api_wait = obs.api_wait();
+        let prev_pass = self.last_pass.replace((now, api_wait));
+        let loop_gap = prev_pass.map(|(then, waited)| {
+            now.saturating_duration_since(then)
+                .saturating_sub(api_wait.saturating_sub(waited))
+        });
+        if api_up_at_entry && self.api_wait_at_answer.is_none() {
+            // A detector armed by an injection, which has no `Observe`.
+            self.api_wait_at_answer = Some(api_wait);
+        }
+        // Answers since the last reading came between passes: the status
+        // publish's counter read, a step an injected event ran. They are
+        // credited at the PREVIOUS pass's clock, which is no later than
+        // they were — crediting them at `now` would claim VPP answered
+        // after a stall that may have followed them.
+        if api_up_at_entry {
+            let answers = obs.api_answers();
+            if let (Some(seen), Some((then, _))) = (self.answers_seen, prev_pass) {
+                if answers > seen {
+                    if let Some(d) = self.detector.as_mut() {
+                        d.on_answer(then);
+                    }
+                }
+            }
+            self.answers_seen = Some(answers);
+        }
         // The budget this table needs, learned before the deadline is
         // judged: a phase armed with less (the flat budget an injected
         // adoption starts from, before any dump has measured the table)
@@ -428,6 +531,13 @@ impl Driver {
         events.extend(self.sched.fired(now, self.sup.may_restart()));
 
         if exited.is_none() {
+            // The loop's own gap goes to the detector before anything
+            // this pass can block on: it is about the time BEFORE the
+            // pass, and the budget in force then.
+            if let Some(gap) = loop_gap.filter(|_| api_up_at_entry) {
+                self.note_loop_gap(now, gap);
+            }
+
             // Start the liveness clock at the first answer from ANY
             // process, not only a freshly spawned one. Gating this on
             // `Starting` meant an adopted VPP never got a detector at
@@ -437,6 +547,8 @@ impl Driver {
             // forever without ever emitting `Wedged`.
             if before.has_process() && self.detector.is_none() && obs.api_ready() {
                 self.detector = Some(WedgeDetector::started(now));
+                self.api_wait_at_answer = Some(obs.api_wait());
+                self.answers_seen = Some(obs.api_answers());
                 // Only a startup transition needs announcing; an
                 // adopted process is already past `ApiUp`.
                 if before == State::Starting {
@@ -471,8 +583,13 @@ impl Driver {
             // Reconnect first, if the last drain lost the socket. The
             // engine drops its transport on any drain error, and nothing
             // else on this path would ever call `api_ready` again.
+            //
+            // Remembered when it fails, so the probe below does not spend
+            // a second handshake deadline on the same refusal this pass.
+            let mut reconnect_refused = false;
             if api_up_at_entry && self.reconnect_wanted {
                 self.reconnect_wanted = !obs.api_ready();
+                reconnect_refused = self.reconnect_wanted;
             }
 
             let resyncing = matches!(before, State::Syncing | State::AdoptedResyncing);
@@ -629,7 +746,7 @@ impl Driver {
                 }
             }
 
-            events.extend(self.poll_liveness(now, obs));
+            events.extend(self.poll_liveness(now, obs, reconnect_refused));
             events.extend(self.poll_resume(now));
             // A drain gate that opened asks for the batch at once, not a
             // ping later.
@@ -668,6 +785,8 @@ impl Driver {
         // an applied event asking for another immediate tick.
         if !self.sup.state().has_process() {
             self.detector = None;
+            self.api_wait_at_answer = None;
+            self.answers_seen = None;
         }
         self.track_resume(now);
 
@@ -795,40 +914,149 @@ impl Driver {
                 .is_some_and(|d| d.answered_last_probe() && d.answered_since(r.interrupted_at))
     }
 
+    /// Hand the detector this pass's gap, and say what it made of one
+    /// long enough to matter.
+    ///
+    /// A gap past the budget is rare and always worth a line: the loop
+    /// that answers pings, steering changes and stops was unable to run
+    /// for longer than VPP is allowed to stay silent.
+    fn note_loop_gap(&mut self, now: Instant, gap: Duration) {
+        let steered = self.sup.is_steered();
+        let budget = budget_for(steered, self.sup.is_converging());
+        let Some(d) = self.detector.as_mut() else {
+            return;
+        };
+        match d.on_loop_gap(now, gap, budget) {
+            LoopGap::Ordinary => {}
+            LoopGap::Excused => tracing::warn!(
+                loop_gap_ms = ms(gap),
+                budget_ms = ms(budget),
+                steered,
+                silent_ms = ms(d.silent_for(now)),
+                "the supervision loop was away longer than the wedge budget, and not waiting \
+                 on VPP — a stall of this host or of PacketFrame itself. The silence before \
+                 it is not counted against VPP, which is called wedged only if it now stays \
+                 silent for the full budget"
+            ),
+            LoopGap::Unexcused { unanswered } => tracing::warn!(
+                loop_gap_ms = ms(gap),
+                budget_ms = ms(budget),
+                steered,
+                unanswered_probes = unanswered,
+                "the supervision loop was away longer than the wedge budget, but VPP had \
+                 already left more probes unanswered than jitter explains before it; that \
+                 silence still counts"
+            ),
+        }
+    }
+
     /// Ping if due, and decide whether the silence has gone too far.
-    fn poll_liveness(&mut self, now: Instant, obs: &mut dyn Observe) -> Vec<Event> {
+    ///
+    /// `reconnect_refused`: this pass already tried to reconnect and VPP
+    /// did not complete the handshake, so the probe fails on that rather
+    /// than spending a second handshake deadline to learn it again.
+    fn poll_liveness(
+        &mut self,
+        now: Instant,
+        obs: &mut dyn Observe,
+        reconnect_refused: bool,
+    ) -> Vec<Event> {
         let Some(d) = self.detector.as_mut() else {
             return Vec::new();
         };
+        // What VPP answered during this pass — the drain's route batches,
+        // above all — is proof of life, credited at the pass's clock
+        // (no later than the answers) and BEFORE this pass's probe, which
+        // came after them: a probe that fails now is newer evidence than
+        // the batch answered a moment ago, and must stay counted.
+        let answers = obs.api_answers();
+        if self.answers_seen.is_some_and(|seen| answers > seen) {
+            d.on_answer(now);
+            self.api_wait_at_answer = Some(obs.api_wait());
+        }
+        self.answers_seen = Some(answers);
         if d.ping_due(now) {
             // Recorded before the result is known, so an unanswered ping
             // cannot make the next one immediately due and spin.
             d.on_ping_sent(now);
-            if obs.ping().is_ok() {
-                d.on_pong(now);
+            // Connected first, when the transport may have gone without
+            // the driver hearing of it: the error-counter read in the
+            // status publish drops it on any failure, and so can a step
+            // run by an injected event. A probe over no transport fails on
+            // `NotConnected` without asking VPP anything, and the detector
+            // would read OUR broken socket as VPP's silence — after a
+            // stall, possibly for the whole fresh budget. `api_ready` is
+            // free when connected.
+            //
+            // Not when this pass already knows: a reconnect it tried was
+            // refused (the probe fails on that, with its reason), or the
+            // drain lost the API moments ago. A second handshake against
+            // a VPP that just stonewalled the drain would only hold the
+            // verdict back by its deadline; the next pass reconnects
+            // first thing, as it always has.
+            let probe = if reconnect_refused {
+                Err(reconnect_error(obs))
+            } else if self.reconnect_wanted || obs.api_ready() {
+                obs.ping()
             } else {
-                // A failed ping drops the engine's transport, so every
-                // later one fails on `NotConnected` without asking VPP
-                // anything — and the detector then reads OUR silence as
-                // VPP's. Something has to reconnect. A drain used to be
-                // the only thing that noticed, and neither an interrupted
-                // step (drain withheld) nor `Verifying` (drain excluded)
-                // drains: a VPP that recovered a moment after one missed
-                // probe was torn down by the wedge budget anyway (review
-                // finding, PR #272).
-                self.reconnect_wanted = true;
+                Err(reconnect_error(obs))
+            };
+            // The probe's own reply is the pong below, not a second
+            // answer for the next pass to credit.
+            self.answers_seen = Some(obs.api_answers());
+            match probe {
+                Ok(()) => {
+                    d.on_pong(now);
+                    self.api_wait_at_answer = Some(obs.api_wait());
+                }
+                Err(e) => {
+                    d.on_probe_failed(e);
+                    // A failed ping drops the engine's transport, so every
+                    // later one fails on `NotConnected` without asking VPP
+                    // anything — and the detector then reads OUR silence as
+                    // VPP's. Something has to reconnect. A drain used to be
+                    // the only thing that noticed, and neither an interrupted
+                    // step (drain withheld) nor `Verifying` (drain excluded)
+                    // drains: a VPP that recovered a moment after one missed
+                    // probe was torn down by the wedge budget anyway (review
+                    // finding, PR #272).
+                    self.reconnect_wanted = true;
+                }
             }
         }
         // The budget depends on whether traffic is steered, NOT on
         // whether we are resyncing: an adopted resync forwards the whole
         // time, and the published bound applies whenever packets are on
         // VPP.
-        let budget = budget_for(self.sup.is_steered(), self.sup.is_converging());
-        if d.is_wedged(now, budget) {
-            vec![Event::Wedged]
-        } else {
-            Vec::new()
+        let steered = self.sup.is_steered();
+        let budget = budget_for(steered, self.sup.is_converging());
+        if !d.is_wedged(now, budget) {
+            return Vec::new();
         }
+        // The verdict names its evidence. The 2026-10-07 teardown left
+        // only the teardown itself in the journal — no failed probe, no
+        // silence figure — so whether VPP or the host had gone quiet
+        // could not be told after the fact.
+        let vpp_wait = obs
+            .api_wait()
+            .saturating_sub(self.api_wait_at_answer.unwrap_or_default());
+        let r = d.report(now, budget, steered, vpp_wait);
+        tracing::warn!(
+            silent_ms = ms(r.silent_for),
+            counted_ms = ms(r.counted),
+            budget_ms = ms(r.budget),
+            steered = r.steered,
+            unanswered_probes = r.unanswered,
+            last_probe_error = r.last_error.as_deref().unwrap_or("none"),
+            vpp_wait_ms = ms(r.vpp_wait),
+            loop_gap_ms = ms(r.worst_loop_gap),
+            stalls_excused = r.stalls_excused,
+            "VPP's binary API stayed silent past the wedge budget; calling it wedged. \
+             vpp_wait_ms near counted_ms: VPP kept the loop waiting. A large loop_gap_ms: \
+             the loop itself was away"
+        );
+        self.wedge_report = Some(r);
+        vec![Event::Wedged]
     }
 
     /// Take steering down when the table under it is empty. See
@@ -1035,14 +1263,31 @@ impl Driver {
                         to_state = ?self.sup.state(),
                         "supervisor ordered VPP teardown — the event is the cause"
                     );
-                    packetframe_common::events::Event::warn(
+                    let mut ev = packetframe_common::events::Event::warn(
                         crate::MODULE_NAME,
                         packetframe_common::events::kind::VPP_TEARDOWN,
                     )
                     .field("cause", format!("{e:?}"))
                     .field("from_state", format!("{prior:?}"))
-                    .field("to_state", format!("{:?}", self.sup.state()))
-                    .detail(
+                    .field("to_state", format!("{:?}", self.sup.state()));
+                    // A wedge carries its evidence, so the event log alone
+                    // can say whether VPP or the host went quiet.
+                    if let (Event::Wedged, Some(r)) = (&e, &self.wedge_report) {
+                        ev = ev
+                            .field("silent_ms", ms(r.silent_for))
+                            .field("counted_ms", ms(r.counted))
+                            .field("budget_ms", ms(r.budget))
+                            .field("steered", r.steered)
+                            .field("unanswered_probes", r.unanswered)
+                            .field(
+                                "last_probe_error",
+                                r.last_error.clone().unwrap_or_else(|| "none".into()),
+                            )
+                            .field("vpp_wait_ms", ms(r.vpp_wait))
+                            .field("loop_gap_ms", ms(r.worst_loop_gap))
+                            .field("stalls_excused", r.stalls_excused);
+                    }
+                    ev.detail(
                         "the supervisor ordered VPP torn down; `cause` is the event that did it",
                     )
                     .emit();
@@ -1157,9 +1402,34 @@ mod tests {
         budget: Option<Duration>,
         /// Times the driver offered a verify re-run.
         reverify_polls: usize,
+        /// What `api_wait` reports: real time spent blocked on VPP's
+        /// socket. Zero by default — every gap is the loop's own.
+        api_wait: Duration,
+        /// How long each unanswered ping holds the loop, added to
+        /// `api_wait` — a hung VPP keeps a probe for the socket deadline.
+        ping_blocks: Duration,
+        /// How long each reconnect attempt holds the loop, added to
+        /// `api_wait` — a connect into a backlog a hung VPP never drains.
+        /// Seen only with `model_transport`.
+        connect_blocks: Duration,
+        /// What `api_answers` reports: replies VPP has sent. A pong adds
+        /// one, a successful drain `answers_per_drain`.
+        answers: u64,
+        /// Replies each successful drain brings back — a route batch VPP
+        /// is getting through. Zero by default.
+        answers_per_drain: u64,
     }
 
     impl Observe for World {
+        fn api_wait(&self) -> Duration {
+            self.api_wait
+        }
+        fn api_answers(&self) -> u64 {
+            self.answers
+        }
+        fn api_error(&self) -> Option<String> {
+            (!self.api || self.dead).then(|| "connecting to the API socket: refused".into())
+        }
         fn poll_reverify(&mut self, _now: Instant) {
             self.reverify_polls += 1;
         }
@@ -1174,6 +1444,9 @@ mod tests {
         }
         fn api_ready(&mut self) -> bool {
             self.api_readies += 1;
+            if self.model_transport && self.disconnected {
+                self.api_wait += self.connect_blocks;
+            }
             let up = self.api && !self.dead;
             if up {
                 self.disconnected = false;
@@ -1191,8 +1464,10 @@ mod tests {
                 .inspect(|n| self.pings_lost = *n);
             if self.ping_fails || self.dead || lost.is_some() {
                 self.disconnected = true;
+                self.api_wait += self.ping_blocks;
                 Err("no answer".into())
             } else {
+                self.answers += 1;
                 Ok(())
             }
         }
@@ -1210,6 +1485,9 @@ mod tests {
             }
             if let Some(n) = self.drains_lose_api.checked_sub(1) {
                 self.drains_lose_api = n;
+                // The engine drops its transport on a lost drain
+                // (`runtime::step_error`). Seen only with `model_transport`.
+                self.disconnected = true;
                 return Err(StepError::ApiLost(
                     "socket I/O: Resource temporarily unavailable".into(),
                 ));
@@ -1224,6 +1502,7 @@ mod tests {
                 return Ok(Drain::AwaitingSource { have: 0, want: 1 });
             }
             self.batches = self.batches.saturating_sub(1);
+            self.answers += self.answers_per_drain;
             Ok(if self.batches == 0 {
                 Drain::Idle
             } else {
@@ -2155,6 +2434,556 @@ mod tests {
         }
         assert!(wedged, "silence past the budget must be a wedge");
         assert!(pings_seen >= 2, "each interval must retry: {pings_seen}");
+    }
+
+    // ---- Stalls of the loop itself (2026-10-07) ----
+
+    /// A steered VPP that answered a ping at `t0 + 500 ms`, the last pass
+    /// before whatever the test does next.
+    fn steered_and_answering(t0: Instant, d: &mut Driver, w: &mut World, fx: &mut Fx) {
+        d.inject(t0, Event::StartRequested, fx);
+        settle(d, t0, w, fx);
+        d.inject(at(t0, 20), Event::VerifyPassed, fx);
+        d.inject(at(t0, 21), Event::SteerRequested, fx);
+        assert_eq!(d.state(), State::Steered);
+        assert_eq!(
+            budget_for(d.supervisor().is_steered(), d.supervisor().is_converging()),
+            PING_BUDGET,
+            "the published bound governs"
+        );
+        let pings = w.pings;
+        let t = d.tick(at(t0, 500), w, fx);
+        assert_eq!(w.pings, pings + 1, "a probe went out");
+        assert!(t.events.is_empty(), "{:?}", t.events);
+    }
+
+    /// The loop held in the kernel for 40 s — a bridge flushing a million
+    /// routes held `rtnl_lock` that long, and the steering audit's ethtool
+    /// ioctls wait on it — and VPP answers the first probe after. Nothing
+    /// was wrong with VPP, and nothing may be torn down.
+    #[test]
+    fn a_loop_stall_followed_by_an_answered_ping_is_not_a_wedge() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+        fx.calls.clear();
+
+        let t = d.tick(at(t0, 40_500), &mut w, &mut fx);
+        assert!(!t.events.contains(&Event::Wedged), "{:?}", t.events);
+        assert_eq!(d.state(), State::Steered);
+        assert!(
+            fx.calls.is_empty(),
+            "nothing unsteered or killed: {:?}",
+            fx.calls
+        );
+    }
+
+    /// The 2026-10-07 teardown. The loop is away for 40 s and the first
+    /// probe after it goes unanswered — under the old clock that was 40 s
+    /// of "silence" and an immediate `Wedged`, with none of the two missed
+    /// pings the budget promises to tolerate. Now the silence before the
+    /// resume is not evidence: VPP must stay silent for the full budget
+    /// from the resume, across fresh probes, and is then still caught
+    /// inside the published bound measured from there.
+    #[test]
+    fn a_loop_stall_then_silence_wedges_only_a_full_budget_after_the_resume() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        w.ping_fails = true;
+        let resume = at(t0, 40_500);
+        let pings = w.pings;
+        let t = d.tick(resume, &mut w, &mut fx);
+        assert!(
+            !t.events.contains(&Event::Wedged),
+            "one unanswered probe after a stall is not a wedge: {:?}",
+            t.events
+        );
+        assert_eq!(w.pings, pings + 1, "the resume probes at once");
+
+        let mut wedged_at = None;
+        for step in 1..=8u32 {
+            let now = resume + PING_INTERVAL * step;
+            let t = d.tick(now, &mut w, &mut fx);
+            if t.events.contains(&Event::Wedged) {
+                wedged_at = Some(now - resume);
+                break;
+            }
+        }
+        let wedged_at = wedged_at.expect("a VPP that stays silent is still caught");
+        assert!(
+            wedged_at > PING_BUDGET,
+            "a full budget from the resume: {wedged_at:?}"
+        );
+        assert!(
+            wedged_at <= crate::liveness::worst_case_detection(PING_BUDGET),
+            "and inside the published bound, measured from the resume: {wedged_at:?}"
+        );
+        assert_eq!(d.state(), State::Backoff);
+        let pos = |c: &str| fx.calls.iter().position(|x| *x == c);
+        assert!(pos("unsteer").expect("unsteered") < pos("kill").expect("killed"));
+
+        let r = d.last_wedge().expect("the verdict names its evidence");
+        assert!(r.steered);
+        assert_eq!(r.budget, PING_BUDGET);
+        assert_eq!(r.stalls_excused, 1);
+        assert!(r.worst_loop_gap >= Duration::from_secs(40), "{r:?}");
+        assert!(r.silent_for > Duration::from_secs(40), "{r:?}");
+        assert_eq!(r.counted, wedged_at);
+        assert_eq!(r.last_error.as_deref(), Some("no answer"));
+        assert!(r.unanswered >= 4, "{r:?}");
+    }
+
+    /// The control. A hung VPP holds every probe for the socket deadline,
+    /// so the gap between passes is long — here past the budget — while
+    /// the loop itself was away for almost none of it. That time is VPP's
+    /// silence, and must not be excused as the loop's: the wedge comes on
+    /// the first pass after a probe waited out the deadline, exactly as
+    /// before. Without the wait accounting this pass would read as a
+    /// 1.6 s stall and the verdict would slip by a whole budget.
+    #[test]
+    fn a_hung_vpp_that_holds_the_loop_is_not_excused_as_a_stall() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        // VPP hangs right after the pong at 500 ms.
+        w.ping_fails = true;
+        w.ping_blocks = PING_BUDGET;
+        let t = d.tick(at(t0, 1_000), &mut w, &mut fx);
+        assert!(!t.events.contains(&Event::Wedged), "{:?}", t.events);
+
+        // The probe held the loop for the deadline; 100 ms of its own on top.
+        let next = at(t0, 1_000) + PING_BUDGET + Duration::from_millis(100);
+        assert!(
+            next - at(t0, 1_000) > PING_BUDGET,
+            "the premise: a wall gap past the budget"
+        );
+        let t = d.tick(next, &mut w, &mut fx);
+        assert!(t.events.contains(&Event::Wedged), "{:?}", t.events);
+        let r = d.last_wedge().expect("report");
+        assert_eq!(r.stalls_excused, 0, "{r:?}");
+        assert!(
+            r.vpp_wait >= PING_BUDGET,
+            "VPP kept the loop waiting: {r:?}"
+        );
+        assert!(
+            r.worst_loop_gap <= PING_INTERVAL,
+            "the loop was away for no more than its cadence: {r:?}"
+        );
+        assert!(
+            next - at(t0, 500)
+                <= crate::liveness::worst_case_detection(PING_BUDGET) + Duration::from_millis(100),
+            "the steady-state bound, plus only the loop's own 100 ms"
+        );
+    }
+
+    /// Something the driver does not see dropped the transport while the
+    /// loop was away — the status publish's error-counter read drops it
+    /// on any failure. The first probe after the stall must reconnect and
+    /// ask VPP, not fail on `NotConnected` and count our own broken
+    /// socket as VPP's silence. Before the probe reconnected, this was an
+    /// immediate `Wedged`: nothing had flagged the reconnect, and 40 s
+    /// had passed since the last pong.
+    #[test]
+    fn a_transport_broken_during_a_stall_is_reconnected_before_the_probe() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            model_transport: true,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        w.disconnected = true;
+        let (pings, readies) = (w.pings, w.api_readies);
+        let t = d.tick(at(t0, 40_500), &mut w, &mut fx);
+        assert!(!t.events.contains(&Event::Wedged), "{:?}", t.events);
+        assert!(w.api_readies > readies, "reconnected");
+        assert!(!w.disconnected, "before the probe");
+        assert_eq!(w.pings, pings + 1, "and the probe reached VPP");
+        assert!(
+            d.detector
+                .as_ref()
+                .is_some_and(|det| det.answered_last_probe()),
+            "and was answered"
+        );
+    }
+
+    /// The same broken socket, but with deltas pending: the drain finds
+    /// the transport gone before the probe does, and loses the API on it.
+    /// The probe that pass does not re-handshake (see the next test); the
+    /// next pass reconnects first thing, a ping interval into the fresh
+    /// budget, and VPP answering there ends it.
+    #[test]
+    fn a_drain_that_finds_the_socket_gone_after_a_stall_costs_one_interval() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            model_transport: true,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        w.disconnected = true;
+        w.drains_lose_api = 1;
+        let resume = at(t0, 40_500);
+        let t = d.tick(resume, &mut w, &mut fx);
+        assert!(!t.events.contains(&Event::Wedged), "{:?}", t.events);
+        assert!(
+            d.detector
+                .as_ref()
+                .is_some_and(|det| !det.answered_last_probe()),
+            "the probe over the dropped socket failed"
+        );
+
+        let t = d.tick(resume + PING_INTERVAL, &mut w, &mut fx);
+        assert!(!t.events.contains(&Event::Wedged), "{:?}", t.events);
+        assert!(!w.disconnected, "reconnected");
+        assert!(
+            d.detector
+                .as_ref()
+                .is_some_and(|det| det.answered_last_probe()),
+            "and VPP answered, inside the fresh budget"
+        );
+        assert_eq!(d.state(), State::Steered);
+    }
+
+    /// When this very pass's drain just lost the API, the probe does not
+    /// spend a second handshake on it. Against a hung VPP that handshake
+    /// is its full deadline, and it would hold the verdict back by that
+    /// much past the published bound; the next pass reconnects anyway.
+    #[test]
+    fn a_probe_does_not_re_handshake_a_socket_the_drain_just_lost() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            model_transport: true,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        w.drains_lose_api = 1;
+        let (readies, pings) = (w.api_readies, w.pings);
+        d.tick(at(t0, 1_000), &mut w, &mut fx);
+        assert_eq!(w.api_readies, readies, "no handshake this pass");
+        assert_eq!(w.pings, pings + 1, "the probe still went out, and failed");
+        d.tick(at(t0, 1_500), &mut w, &mut fx);
+        assert!(w.api_readies > readies, "the next pass reconnects first");
+        assert!(!w.disconnected);
+    }
+
+    /// A reconnect into a hung VPP's full backlog holds the loop for
+    /// however long the connect blocks, and all of it is VPP's silence,
+    /// not a stall of the loop (review finding, PR #322). The connect is
+    /// bounded now, but the driver must not depend on that: here it holds
+    /// the loop for 3 s, twice the budget, and the pass after it is still
+    /// judged rather than excused. Charged at the old 1 s cap, the other
+    /// 2 s read as a loop stall, the window restarted, and repeated
+    /// blocked reconnects kept a steered, unanswering VPP up for tens of
+    /// seconds.
+    #[test]
+    fn a_reconnect_blocked_on_a_hung_vpp_counts_as_its_silence() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            model_transport: true,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        // VPP hangs; the status publish's read dropped the socket.
+        w.disconnected = true;
+        w.api = false;
+        w.ping_fails = true;
+        w.connect_blocks = 2 * PING_BUDGET;
+        let t = d.tick(at(t0, 1_000), &mut w, &mut fx);
+        assert!(!t.events.contains(&Event::Wedged), "{:?}", t.events);
+
+        // The pass after the blocked connect.
+        let next = at(t0, 1_000) + w.connect_blocks;
+        let t = d.tick(next, &mut w, &mut fx);
+        assert!(
+            t.events.contains(&Event::Wedged),
+            "the connect's wait is VPP's silence, not an excused stall: {:?}",
+            t.events
+        );
+        let r = d.last_wedge().expect("report");
+        assert_eq!(r.stalls_excused, 0, "{r:?}");
+        assert!(r.vpp_wait >= w.connect_blocks, "{r:?}");
+        assert!(
+            r.last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("reconnect refused")),
+            "{r:?}"
+        );
+    }
+
+    /// And with the connect held to its real deadline, the published
+    /// bound holds while steered: a probe that has to reconnect first
+    /// blocks no longer than one that does not.
+    #[test]
+    fn a_bounded_reconnect_keeps_the_published_bound() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            model_transport: true,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        w.disconnected = true;
+        w.api = false;
+        w.ping_fails = true;
+        w.connect_blocks = crate::engine::HANDSHAKE_TIMEOUT;
+        let mut now = at(t0, 500);
+        let wedged_after = loop {
+            // Each pass is paced by the connect it blocks on.
+            now += w.connect_blocks;
+            if d.tick(now, &mut w, &mut fx).events.contains(&Event::Wedged) {
+                break now - at(t0, 500);
+            }
+            assert!(now - at(t0, 500) < Duration::from_secs(10), "never wedged");
+        };
+        assert!(wedged_after > PING_BUDGET, "{wedged_after:?}");
+        assert!(
+            wedged_after <= crate::liveness::worst_case_detection(PING_BUDGET),
+            "{wedged_after:?}"
+        );
+        assert_eq!(d.last_wedge().map(|r| r.stalls_excused), Some(0));
+    }
+
+    /// A reconnect that VPP refuses is a failed probe, not a free pass —
+    /// and the pass that already tried does not spend a second handshake
+    /// deadline on the same refusal.
+    #[test]
+    fn a_refused_reconnect_fails_the_probe_once_per_pass() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            model_transport: true,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        // The probe fails and drops the transport; then VPP stops
+        // accepting connections.
+        w.pings_lost = 1;
+        d.tick(at(t0, 1_000), &mut w, &mut fx);
+        w.api = false;
+        let (pings, readies) = (w.pings, w.api_readies);
+        let t = d.tick(at(t0, 1_500), &mut w, &mut fx);
+        assert_eq!(w.api_readies, readies + 1, "one reconnect attempt per pass");
+        assert_eq!(w.pings, pings, "no ping over a transport that is not there");
+        assert!(
+            !t.events.contains(&Event::Wedged),
+            "inside the budget: {:?}",
+            t.events
+        );
+
+        let t = d.tick(at(t0, 2_001), &mut w, &mut fx);
+        assert!(t.events.contains(&Event::Wedged), "{:?}", t.events);
+        let r = d.last_wedge().expect("report");
+        assert_eq!(
+            r.last_error.as_deref(),
+            Some("reconnect refused: connecting to the API socket: refused")
+        );
+    }
+
+    /// A loop that stalls on EVERY pass must not be able to postpone the
+    /// verdict on a silent VPP forever by restarting the window each
+    /// time. Once VPP has missed more probes than the budget tolerates as
+    /// jitter, a stall no longer erases them.
+    #[test]
+    fn a_loop_that_stalls_every_pass_still_wedges_a_silent_vpp() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        w.ping_fails = true;
+        let mut now = at(t0, 500);
+        let mut passes = 0;
+        let wedged = loop {
+            now += Duration::from_secs(3);
+            passes += 1;
+            if d.tick(now, &mut w, &mut fx).events.contains(&Event::Wedged) {
+                break true;
+            }
+            if passes > 10 {
+                break false;
+            }
+        };
+        assert!(wedged, "a stalling loop must not hide a silent VPP forever");
+        assert_eq!(
+            passes,
+            crate::liveness::tolerated_misses(PING_BUDGET) + 2,
+            "forgiven exactly as often as jitter would explain"
+        );
+        assert_eq!(
+            d.last_wedge().map(|r| r.stalls_excused),
+            Some(crate::liveness::tolerated_misses(PING_BUDGET) + 1)
+        );
+    }
+
+    // ---- Any answer is proof of life ----
+
+    /// The 2026-10-07 shape on the VPP side: next hops flap, every route
+    /// through each re-resolved one is re-queued, and the drain pushes
+    /// batch after batch that VPP keeps answering — while pings, queued
+    /// behind that work, miss the deadline. VPP is busy, not wedged, and
+    /// must not be torn down for it. Without proof of life this is a
+    /// `Wedged` 1.5 s into the burst.
+    #[test]
+    fn a_vpp_that_keeps_answering_a_long_drain_is_not_wedged() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        w.batches = usize::MAX;
+        w.answers_per_drain = 256;
+        w.ping_fails = true;
+        w.ping_blocks = PING_BUDGET;
+        let mut now = at(t0, 500);
+        let pings = w.pings;
+        for _ in 0..40 {
+            now += Duration::from_millis(250);
+            let t = d.tick(now, &mut w, &mut fx);
+            assert!(
+                !t.events.contains(&Event::Wedged),
+                "{:?} after {:?}",
+                t.events,
+                now - at(t0, 500)
+            );
+        }
+        assert!(
+            now - at(t0, 500) > 4 * PING_BUDGET,
+            "the premise: long past the budget"
+        );
+        assert!(
+            w.pings - pings >= 10,
+            "and pings kept failing: {}",
+            w.pings - pings
+        );
+        assert_eq!(d.state(), State::Steered);
+        assert!(
+            d.detector
+                .as_ref()
+                .is_some_and(|det| !det.answered_last_probe()),
+            "a batch answered is not the answer to a probe: the probe gates still wait for a pong"
+        );
+    }
+
+    /// The control: the same drain and the same failing pings, but VPP
+    /// answers nothing. The published bound holds, measured from the
+    /// last pong.
+    #[test]
+    fn a_vpp_that_answers_nothing_is_still_wedged_within_the_bound() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        w.batches = usize::MAX;
+        w.answers_per_drain = 0;
+        w.ping_fails = true;
+        let mut now = at(t0, 500);
+        let wedged_after = loop {
+            now += Duration::from_millis(250);
+            if d.tick(now, &mut w, &mut fx).events.contains(&Event::Wedged) {
+                break now - at(t0, 500);
+            }
+            assert!(now - at(t0, 500) < Duration::from_secs(10), "never wedged");
+        };
+        assert!(wedged_after > PING_BUDGET, "{wedged_after:?}");
+        assert!(
+            wedged_after <= crate::liveness::worst_case_detection(PING_BUDGET),
+            "{wedged_after:?}"
+        );
+    }
+
+    /// An answer that arrived between passes is credited no later than it
+    /// happened: at the previous pass's clock, not at the next pass's.
+    /// Crediting it at the next pass would claim VPP answered after
+    /// whatever the loop did in between, and push a real verdict back.
+    #[test]
+    fn an_answer_between_passes_is_credited_no_later_than_it_came() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        // VPP answers the status publish's counter read, then nothing.
+        w.answers += 1;
+        w.ping_fails = true;
+        for ms in [1_000, 1_500] {
+            let t = d.tick(at(t0, ms), &mut w, &mut fx);
+            assert!(!t.events.contains(&Event::Wedged), "{:?}", t.events);
+        }
+        let t = d.tick(at(t0, 2_001), &mut w, &mut fx);
+        assert!(
+            t.events.contains(&Event::Wedged),
+            "silence counted from the pass the answer followed (500 ms), not the one after: {:?}",
+            t.events
+        );
     }
 
     /// The budget follows steering, not resyncing — the correction from

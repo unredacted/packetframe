@@ -70,13 +70,19 @@ use crate::vpp_api::{Transport, TransportError};
 /// that nexthop.
 pub const IP_NEIGHBOR_STATIC: u8 = 1;
 
-/// How long to wait for the handshake on a connect attempt.
+/// How long one connect attempt may take, end to end: the socket's
+/// connect and the handshake together (`Transport::connect` holds the
+/// whole call to it).
 ///
 /// Short on purpose: `api_ready` is polled from the supervision loop and
 /// a long blocking connect would stall the tick that also services the
 /// pidfd and the wedge ping. A timeout here just means the next tick
 /// tries again; the *overall* patience for a slow start is
 /// `API_STARTUP_BUDGET`, which is the loop's business, not this call's.
+///
+/// Inside the steady wedge budget, which is what keeps the published
+/// bound: a probe that has to reconnect first blocks no longer than one
+/// that does not.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Socket timeout for requests after the handshake: **exactly the
@@ -690,6 +696,12 @@ impl From<AttachError> for EngineError {
 pub struct ConvergenceEngine {
     api_socket: std::path::PathBuf,
     transport: Option<Transport>,
+    /// Time spent blocked on VPP's API socket by connections already
+    /// dropped, and by connect attempts. See [`Self::api_wait`].
+    api_waited: Duration,
+    /// Frames VPP sent on connections already dropped. See
+    /// [`Self::api_answers`].
+    api_answered: u64,
 
     ports: Vec<PortAttach>,
     /// Locally terminated prefixes VPP delivers itself: an attached
@@ -972,6 +984,8 @@ impl ConvergenceEngine {
         Self {
             api_socket: api_socket.into(),
             transport: None,
+            api_waited: Duration::ZERO,
+            api_answered: 0,
             ports,
             local_routes: Vec::new(),
             attached_at: std::collections::HashMap::new(),
@@ -2564,8 +2578,41 @@ impl ConvergenceEngine {
         if let Some(t) = self.transport.as_mut() {
             // A socket that will not take a timeout is not one to keep.
             if t.set_timeout(d).is_err() {
-                self.transport = None;
+                self.drop_transport();
             }
+        }
+    }
+
+    /// Wall time spent blocked on VPP's binary-API socket, ever: every
+    /// request and reply on every connection this engine has held, and
+    /// every connect attempt. Monotonic.
+    ///
+    /// The supervision loop subtracts it from the gap between two of its
+    /// passes to learn how long it was away for reasons of its OWN — a
+    /// kernel call waiting on `rtnl_lock`, a starved host — as opposed
+    /// to VPP keeping it waiting. Only the first kind excuses silence;
+    /// see `liveness::WedgeDetector::on_loop_gap`.
+    pub fn api_wait(&self) -> Duration {
+        self.api_waited
+            + self
+                .transport
+                .as_ref()
+                .map_or(Duration::ZERO, Transport::waited)
+    }
+
+    /// Frames VPP has answered with, ever, across every connection this
+    /// engine has held. Monotonic. The wedge detector counts any increase
+    /// as proof of life; see `Transport::answers`.
+    pub fn api_answers(&self) -> u64 {
+        self.api_answered + self.transport.as_ref().map_or(0, Transport::answers)
+    }
+
+    /// Drop the connection, keeping what it waited and answered on the
+    /// books.
+    fn drop_transport(&mut self) {
+        if let Some(t) = self.transport.take() {
+            self.api_waited += t.waited();
+            self.api_answered += t.answers();
         }
     }
 
@@ -2578,7 +2625,18 @@ impl ConvergenceEngine {
         if self.transport.is_some() {
             return true;
         }
-        match Transport::connect(&self.api_socket, HANDSHAKE_TIMEOUT) {
+        let started = std::time::Instant::now();
+        let connected = Transport::connect(&self.api_socket, HANDSHAKE_TIMEOUT);
+        // A connect is time spent waiting on VPP whatever its outcome: a
+        // backlog VPP is not accepting from, a handshake it does not
+        // answer. ALL of it is charged, up to the connect's own deadline,
+        // which bounds the whole call (`Transport::connect`). Charging
+        // less is the dangerous direction: the rest would read as the
+        // loop's own stall and could excuse the very silence a hung VPP
+        // is showing (review finding, PR #322). Past the deadline is only
+        // this thread not being scheduled, the host's time.
+        self.api_waited += started.elapsed().min(HANDSHAKE_TIMEOUT);
+        match connected {
             Ok(mut t) => {
                 // Re-arm off the handshake value. It is deliberately short
                 // so a failed connect costs the loop one tick, but
@@ -2630,7 +2688,7 @@ impl ConvergenceEngine {
     /// may be desynchronised — a half-read reply would corrupt every
     /// subsequent context match.
     pub fn disconnect(&mut self) {
-        self.transport = None;
+        self.drop_transport();
     }
 
     fn transport(&mut self) -> Result<&mut Transport, EngineError> {
@@ -4871,6 +4929,15 @@ mod tests {
             e.recorded_indices.is_empty(),
             "recorded indices belong to the dead instance"
         );
+    }
+
+    /// `HANDSHAKE_TIMEOUT` bounds a whole connect, and a probe that has
+    /// to reconnect first must block no longer than a ping, or the
+    /// published bound stretches by the difference on every reconnecting
+    /// probe.
+    #[test]
+    fn a_reconnect_fits_inside_the_steady_wedge_budget() {
+        assert!(HANDSHAKE_TIMEOUT <= crate::liveness::PING_BUDGET);
     }
 
     /// The socket deadline must equal the budget in force — not the

@@ -64,6 +64,7 @@ pub mod fdb;
 pub mod feed;
 pub mod fib_sync;
 pub mod handback;
+pub mod kernel_path;
 pub mod ledger_record;
 pub mod liveness;
 pub mod nic;
