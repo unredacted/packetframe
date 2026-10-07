@@ -3226,13 +3226,10 @@ fn adoption_path(path: &'static str, routes: u64) {
 }
 
 /// The preserved ledger was not used (or was disproved); `stage` says
-/// which check refused it. The dump path follows.
+/// which check refused it. The dump path follows. Bring-up's own checks
+/// record the same event ([`crate::ledger_record::Refusal::code`]).
 fn ledger_rejected(stage: &'static str, why: &dyn std::fmt::Display) {
-    event_log::Event::warn(crate::MODULE_NAME, event_kind::PRESERVED_LEDGER_REJECTED)
-        .field("stage", stage)
-        .field("reason", why.to_string())
-        .detail("the preserved route ledger was not used; this adoption reads VPP's FIB instead")
-        .emit();
+    crate::ledger_record::rejected_event(stage, &why.to_string()).emit();
 }
 
 /// An engine failure, classified for the supervision loop: the binary

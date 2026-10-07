@@ -812,19 +812,24 @@ reached the preserve step (`preserved` true or false, with the reason
 when false), `adoption_path` at the start (`path=preserved-ledger`, or
 `readback` / `readback-deferred` for the dump path — this one records
 the fallback whatever happened at the stop), and
-`preserved_ledger_rejected` with the stage and reason when a record was
-found but not used.
+`preserved_ledger_rejected` when a record was found but not used: its
+`stage` names the check that refused it (the table below), its `reason`
+says why.
 
 **The start that finds it** adopts WITHOUT reading VPP's FIB and without
 unsteering, in this order:
 
 1. At bring-up, before anything touches VPP, the record is read and
    **removed** — whether or not it is used, so it is consumed once. It
-   must name the adopted process (pid + start ticks + boot id), carry the
-   token `vpp-offload.json` holds (any other adopter rewrites that file on
-   its attach, and an older build drops the field, so a record that
-   outlived a downgrade or a second adopter cannot match), and list the
-   same interfaces.
+   is read at all only if its ownership and modes, and those of
+   `state-dir` and its ancestors, show no other account could have
+   written it, and only if it is no larger than the widest record this
+   run's route capacity could encode to — both judged on the open file
+   before a byte of it is read. It must name the adopted process (pid +
+   start ticks + boot id), carry the token `vpp-offload.json` holds (any
+   other adopter rewrites that file on its attach, and an older build
+   drops the field, so a record that outlived a downgrade or a second
+   adopter cannot match), and list the same interfaces.
 2. At `StartResync`, VPP's per-length route counts must equal the
    recorded ones — anything that added or removed a route since (a
    `vppctl` edit, a stray client) shows up here. Then the engine's ledger
@@ -869,17 +874,30 @@ unsteered.
 
 **Every fallback is today's dump path, never a failed attach.** Each is
 logged with its reason (`preserved route ledger not used: ...` /
-`this adoption reads VPP's FIB instead`):
+`this adoption reads VPP's FIB instead`, the journal line carrying the
+`stage` too) and recorded as `preserved_ledger_rejected` with that
+`stage`:
 
-| Why | When it is caught |
-|---|---|
-| No record (unclean stop, crash, first start after upgrading, stop mid-convergence) | bring-up |
-| Record names a different pid / start time / boot | bring-up |
-| Token missing or different (another daemon adopted since, or a downgrade rewrote the state file) | bring-up |
-| Corrupt, truncated, planted symlink, or another format version | bring-up (the file is still removed) |
-| Interfaces differ from the state file's, or a recorded path egresses an interface this attach does not own | bring-up / seed |
-| VPP's route counts differ from the recorded ones, or the summary cannot be read | `StartResync`, and again when the deferred diff is released |
-| **Verify disagrees** (a prefix absent, or held through other paths) | the seeded verify |
+| Why | When it is caught | `stage` |
+|---|---|---|
+| No record (unclean stop, crash, first start after upgrading, stop mid-convergence) | bring-up | none: `adoption_path` records the dump path |
+| **Another account could have written it.** The file is not owned by the daemon's uid or is group- or world-writable, or so is `state-dir`, or an ancestor directory is owned by someone other than root or is writable by group or others without the sticky bit (so another account could rename `state-dir` away), or it is not a regular file. Its routes are what the adoption believes VPP holds, so a file another account could have written is never trusted, whatever its checksum says. Fix the state-dir's ownership and modes (`chown root:root`, `chmod 755` or tighter); fast-path's route ledger refuses the same directory for the same reason | bring-up (removed unread) | `untrusted` |
+| **Larger than this run's bound**: the widest record its route capacity (both families' high-water marks) could encode to, every route charged a path set of its own. About 500 MB at the default `expected-routes` with `v6 on`; a real one is ~10 bytes a route, ~11 MB at 1.09M | bring-up (removed unread) | `too-large` |
+| Unreadable, or a planted symlink | bring-up (the file is still removed) | `unreadable` |
+| Corrupt or truncated | bring-up (the file is still removed) | `corrupt` |
+| Another format version | bring-up (the file is still removed) | `format-version` |
+| Read but not removable, so it cannot be consumed once — remove it by hand | bring-up | `unremovable` |
+| Record names a different pid / start time / boot | bring-up | `process` |
+| Token missing or different (another daemon adopted since, or a downgrade rewrote the state file) | bring-up | `token` |
+| Interfaces differ from the state file's | bring-up | `interfaces` |
+| A recorded path egresses an interface this attach does not own | seed | `seed` |
+| VPP's route counts differ from the recorded ones, or the summary cannot be read | `StartResync`, and again when the deferred diff is released | `fingerprint`, then `fingerprint-moved` |
+| **Verify disagrees** (a prefix absent, or held through other paths) | the seeded verify | `verify` |
+
+A record found while nothing is being adopted (the VPP it describes
+died before this start) is discarded with an info line and no event:
+`adoption_path` says `fresh`. `vpp-offload` has no status row for any of
+these; the journal and the event log are where they show.
 
 The last one is `PreservedLedgerRejected`, deliberately not
 `VerifyFailed`: it disproves the RECORD, not VPP, so it is not a
