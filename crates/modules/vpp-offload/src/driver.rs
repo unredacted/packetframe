@@ -1360,6 +1360,10 @@ mod tests {
         /// How long each unanswered ping holds the loop, added to
         /// `api_wait` — a hung VPP keeps a probe for the socket deadline.
         ping_blocks: Duration,
+        /// How long each reconnect attempt holds the loop, added to
+        /// `api_wait` — a connect into a backlog a hung VPP never drains.
+        /// Seen only with `model_transport`.
+        connect_blocks: Duration,
     }
 
     impl Observe for World {
@@ -1383,6 +1387,9 @@ mod tests {
         }
         fn api_ready(&mut self) -> bool {
             self.api_readies += 1;
+            if self.model_transport && self.disconnected {
+                self.api_wait += self.connect_blocks;
+            }
             let up = self.api && !self.dead;
             if up {
                 self.disconnected = false;
@@ -2633,6 +2640,92 @@ mod tests {
         d.tick(at(t0, 1_500), &mut w, &mut fx);
         assert!(w.api_readies > readies, "the next pass reconnects first");
         assert!(!w.disconnected);
+    }
+
+    /// A reconnect into a hung VPP's full backlog holds the loop for
+    /// however long the connect blocks, and all of it is VPP's silence,
+    /// not a stall of the loop (review finding, PR #322). The connect is
+    /// bounded now, but the driver must not depend on that: here it holds
+    /// the loop for 3 s, twice the budget, and the pass after it is still
+    /// judged rather than excused. Charged at the old 1 s cap, the other
+    /// 2 s read as a loop stall, the window restarted, and repeated
+    /// blocked reconnects kept a steered, unanswering VPP up for tens of
+    /// seconds.
+    #[test]
+    fn a_reconnect_blocked_on_a_hung_vpp_counts_as_its_silence() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            model_transport: true,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        // VPP hangs; the status publish's read dropped the socket.
+        w.disconnected = true;
+        w.api = false;
+        w.ping_fails = true;
+        w.connect_blocks = 2 * PING_BUDGET;
+        let t = d.tick(at(t0, 1_000), &mut w, &mut fx);
+        assert!(!t.events.contains(&Event::Wedged), "{:?}", t.events);
+
+        // The pass after the blocked connect.
+        let next = at(t0, 1_000) + w.connect_blocks;
+        let t = d.tick(next, &mut w, &mut fx);
+        assert!(
+            t.events.contains(&Event::Wedged),
+            "the connect's wait is VPP's silence, not an excused stall: {:?}",
+            t.events
+        );
+        let r = d.last_wedge().expect("report");
+        assert_eq!(r.stalls_excused, 0, "{r:?}");
+        assert!(r.vpp_wait >= w.connect_blocks, "{r:?}");
+        assert!(
+            r.last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("reconnect refused")),
+            "{r:?}"
+        );
+    }
+
+    /// And with the connect held to its real deadline, the published
+    /// bound holds while steered: a probe that has to reconnect first
+    /// blocks no longer than one that does not.
+    #[test]
+    fn a_bounded_reconnect_keeps_the_published_bound() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            model_transport: true,
+            ..Default::default()
+        };
+        steered_and_answering(t0, &mut d, &mut w, &mut fx);
+
+        w.disconnected = true;
+        w.api = false;
+        w.ping_fails = true;
+        w.connect_blocks = crate::engine::HANDSHAKE_TIMEOUT;
+        let mut now = at(t0, 500);
+        let wedged_after = loop {
+            // Each pass is paced by the connect it blocks on.
+            now += w.connect_blocks;
+            if d.tick(now, &mut w, &mut fx).events.contains(&Event::Wedged) {
+                break now - at(t0, 500);
+            }
+            assert!(now - at(t0, 500) < Duration::from_secs(10), "never wedged");
+        };
+        assert!(wedged_after > PING_BUDGET, "{wedged_after:?}");
+        assert!(
+            wedged_after <= crate::liveness::worst_case_detection(PING_BUDGET),
+            "{wedged_after:?}"
+        );
+        assert_eq!(d.last_wedge().map(|r| r.stalls_excused), Some(0));
     }
 
     /// A reconnect that VPP refuses is a failed probe, not a free pass —

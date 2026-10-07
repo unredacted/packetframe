@@ -125,17 +125,30 @@ pub struct Transport {
     /// Wall time spent blocked in frame I/O since the handshake. See
     /// [`Self::waited`].
     waited: Duration,
+    /// While connecting: the instant the whole connect must be done by.
+    /// Every socket operation re-arms its timeout to what is left of it.
+    connect_deadline: Option<Instant>,
 }
 
 impl Transport {
-    /// Connect and complete the handshake.
+    /// Connect and complete the handshake, all of it within `timeout`.
     ///
     /// On return the connection is proven usable: VPP accepted us, and
     /// every message in our whitelist exists on the other side with a
     /// matching CRC.
+    ///
+    /// **Bounded end to end**, the socket's own connect included. A
+    /// plain `UnixStream::connect` is not: on Linux, connecting to a
+    /// listener whose backlog is full sleeps until VPP accepts, with no
+    /// timeout at all. A hung VPP does not accept, and every handshake
+    /// that times out against it leaves its connection queued, so a few
+    /// reconnects fill the backlog and the next one would park the
+    /// supervision loop for good — no ping, no wedge verdict, steering
+    /// left on a dead dataplane. See [`connect_within`].
     pub fn connect(path: impl AsRef<Path>, timeout: Duration) -> Result<Self, TransportError> {
         let path = path.as_ref();
-        let sock = UnixStream::connect(path).map_err(|source| TransportError::Connect {
+        let deadline = Instant::now() + timeout;
+        let sock = connect_within(path, timeout).map_err(|source| TransportError::Connect {
             path: path.display().to_string(),
             source,
         })?;
@@ -155,14 +168,34 @@ impl Transport {
             rx: Vec::with_capacity(4096),
             timeout,
             waited: Duration::ZERO,
+            connect_deadline: Some(deadline),
         };
         t.handshake()?;
+        t.connect_deadline = None;
         // The meter starts after the handshake: a connect that fails
         // leaves no transport to read it from, so the caller times the
         // whole connect itself, and counting the handshake here too would
         // charge it twice.
         t.waited = Duration::ZERO;
         Ok(t)
+    }
+
+    /// While connecting, give the next socket operation only what is
+    /// left of the connect's deadline. A no-op once connected.
+    fn arm_for_connect(&mut self) -> Result<(), TransportError> {
+        let Some(deadline) = self.connect_deadline else {
+            return Ok(());
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(TransportError::Io(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "VPP did not complete the handshake before the connect deadline",
+            )));
+        }
+        self.sock.set_read_timeout(Some(left))?;
+        self.sock.set_write_timeout(Some(left))?;
+        Ok(())
     }
 
     /// `sockclnt_create` and the table it returns.
@@ -401,16 +434,20 @@ impl Transport {
     /// would read as the loop stalling, and excuse the very silence it
     /// is evidence of.
     ///
-    /// Each frame is charged at most the deadline in force. A call can
-    /// legitimately wait that long for VPP; anything beyond it is this
-    /// thread not being scheduled to notice the timeout, which is the
-    /// host's stall and not VPP's.
+    /// Each frame is charged all of its wait up to what its deadline
+    /// allows, which is two deadlines: a frame is a header and a body,
+    /// and each is read (or written) under the deadline in force. Erring
+    /// short here is the dangerous direction — whatever is not charged
+    /// reads as the loop's own stall and can excuse VPP's silence — so
+    /// the cap sits at the most VPP could legitimately have held us.
+    /// Beyond it is this thread not being scheduled to notice the
+    /// timeout: the host's stall, not VPP's.
     pub fn waited(&self) -> Duration {
         self.waited
     }
 
     fn charge(&mut self, started: Instant) {
-        self.waited += started.elapsed().min(self.timeout);
+        self.waited += started.elapsed().min(self.timeout.saturating_mul(2));
     }
 
     /// Message id table, for callers that need to recognise async
@@ -427,6 +464,7 @@ impl Transport {
     }
 
     fn write_frame_unmetered(&mut self) -> Result<(), TransportError> {
+        self.arm_for_connect()?;
         let mut framed = Vec::with_capacity(MSG_HEADER_LEN + self.tx.len());
         write_frame_header(&mut framed, self.tx.len());
         framed.extend_from_slice(&self.tx);
@@ -448,6 +486,7 @@ impl Transport {
     }
 
     fn read_frame_unmetered(&mut self) -> Result<Vec<u8>, TransportError> {
+        self.arm_for_connect()?;
         let mut hdr = [0u8; MSG_HEADER_LEN];
         self.sock.read_exact(&mut hdr).map_err(|e| {
             // A closed socket mid-frame is VPP exiting, which the
@@ -465,9 +504,84 @@ impl Transport {
         }
         self.rx.clear();
         self.rx.resize(len as usize, 0);
+        self.arm_for_connect()?;
         self.sock.read_exact(&mut self.rx)?;
         Ok(std::mem::take(&mut self.rx))
     }
+}
+
+/// `connect(2)` to a Unix socket path, giving up after `timeout`.
+///
+/// The send timeout is set on the socket BEFORE the connect, because on
+/// Linux that is what bounds a stream connect: `unix_stream_connect`
+/// waits for room in the listener's backlog for as long as `SO_SNDTIMEO`
+/// allows — forever by default, which is what `UnixStream::connect`
+/// gets — and fails with `EAGAIN` when it runs out (socket(7) lists
+/// connect among the calls the option governs). A non-blocking connect
+/// plus a poll would not do it: for `AF_UNIX` a full backlog answers
+/// `EAGAIN` at once, never `EINPROGRESS`, so there is nothing to poll.
+/// BSD-derived kernels refuse a full backlog outright, so the option
+/// changes nothing there. The timeout is reported as `TimedOut`.
+pub fn connect_within(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: all-zero is a valid `sockaddr_un`.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    // Room for the terminating NUL the kernel reads up to.
+    if bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "socket path does not fit a sockaddr_un",
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = *src as libc::c_char;
+    }
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: plain socket(2); the result is checked before use.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor nothing else owns.
+    let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: fcntl(2) on a descriptor this function owns.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    stream.set_write_timeout(Some(timeout))?;
+    // SAFETY: `addr` is an initialised `sockaddr_un` and `len` covers
+    // the path and its NUL, inside the struct (checked above).
+    let rc = unsafe {
+        libc::connect(
+            stream.as_raw_fd(),
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            len as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(if e.kind() == ErrorKind::WouldBlock {
+            std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!("VPP did not accept the connection within {timeout:?}"),
+            )
+        } else {
+            e
+        });
+    }
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -538,6 +652,7 @@ mod tests {
             rx: Vec::new(),
             timeout: Duration::from_secs(1),
             waited: Duration::ZERO,
+            connect_deadline: None,
         };
         t.verify_against(&reply)
     }
@@ -596,11 +711,11 @@ mod tests {
         assert!(verify(&entries, 0).is_ok());
     }
 
-    /// The wait meter charges what VPP kept the caller waiting, and no
-    /// more than the deadline per frame: a reply that never comes costs
-    /// one deadline, and an answered frame costs what it took.
+    /// The wait meter charges what VPP kept the caller waiting, up to
+    /// what the deadline allows a frame: a reply that never comes costs
+    /// its deadline, and an answered frame costs what it took.
     #[test]
-    fn the_wait_meter_charges_at_most_the_deadline_per_frame() {
+    fn the_wait_meter_charges_a_frame_up_to_what_its_deadline_allows() {
         let (ours, mut theirs) = UnixStream::pair().unwrap();
         let deadline = Duration::from_millis(30);
         let mut t = Transport {
@@ -613,14 +728,15 @@ mod tests {
             rx: Vec::new(),
             timeout: Duration::from_secs(1),
             waited: Duration::ZERO,
+            connect_deadline: None,
         };
         t.set_timeout(deadline).unwrap();
 
         assert!(t.read_frame().is_err(), "nothing was sent");
         let unanswered = t.waited();
         assert!(
-            unanswered <= deadline,
-            "capped at the deadline: {unanswered:?}"
+            unanswered <= deadline * 2,
+            "capped at what the deadline allows a frame: {unanswered:?}"
         );
         assert!(unanswered >= deadline / 2, "and charged: {unanswered:?}");
 
@@ -629,7 +745,7 @@ mod tests {
         frame.extend_from_slice(&[0, 1, 2, 3]);
         theirs.write_all(&frame).unwrap();
         assert_eq!(t.read_frame().unwrap(), vec![0, 1, 2, 3]);
-        assert!(t.waited() >= unanswered && t.waited() <= unanswered + deadline);
+        assert!(t.waited() >= unanswered && t.waited() <= unanswered + deadline * 2);
     }
 
     #[test]

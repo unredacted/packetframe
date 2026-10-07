@@ -63,8 +63,12 @@ fn mirror(n: u8) -> Mirror {
 }
 
 fn engine_for(fake: &Fake) -> ConvergenceEngine {
+    engine_at(&fake.path)
+}
+
+fn engine_at(path: &std::path::Path) -> ConvergenceEngine {
     ConvergenceEngine::new(
-        &fake.path,
+        path,
         vec![PortAttach {
             port: "eth4".into(),
             pci_addr: "0002:07:00.1".into(),
@@ -4870,4 +4874,83 @@ fn an_unanswered_ping_is_charged_its_deadline_and_kept_across_the_drop() {
         charged <= PING_BUDGET + std::time::Duration::from_millis(50),
         "capped at the deadline in force: {charged:?}"
     );
+}
+
+/// A VPP that never accepts: its socket listens, but its backlog is full
+/// and nothing drains it — what a hung VPP's socket looks like after a
+/// few handshakes have timed out against it, each leaving its connection
+/// queued (review finding, PR #322).
+///
+/// A plain `UnixStream::connect` there sleeps until VPP accepts, with no
+/// timeout, on Linux: the supervision loop would be parked inside the
+/// reconnect, and with it every ping and every wedge verdict. The connect
+/// must give up at its deadline, and ALL of the time it spent must count
+/// as waiting on VPP — any part left uncounted reads as the loop's own
+/// stall, and a stall excuses silence.
+///
+/// Run on a thread with a guard, so a regression fails here instead of
+/// hanging the suite.
+#[test]
+fn a_connect_to_a_vpp_that_never_accepts_is_bounded_and_charged_as_its_wait() {
+    use packetframe_vpp_offload::engine::HANDSHAKE_TIMEOUT;
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    let path = std::env::temp_dir().join(format!("pf-na-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+    // Shrink the backlog to nothing, then fill it with one connection
+    // nobody will ever accept.
+    // SAFETY: listen(2) on a socket the listener owns.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+    let _queued = std::os::unix::net::UnixStream::connect(&path).expect("the first one queues");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let at = path.clone();
+    std::thread::spawn(move || {
+        let mut e = engine_at(&at);
+        let before = e.api_wait();
+        let started = Instant::now();
+        let ready = e.api_ready();
+        let took = started.elapsed();
+        let _ = tx.send((
+            ready,
+            took,
+            e.api_wait() - before,
+            e.last_api_error().map(str::to_string),
+        ));
+    });
+    let (ready, took, charged, error) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the connect never returned: the supervision loop would be parked in it");
+    drop(listener);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(!ready, "nothing accepted, so nothing is connected");
+    assert!(
+        took <= HANDSHAKE_TIMEOUT + Duration::from_millis(250),
+        "bounded by the connect deadline: {took:?}"
+    );
+    assert!(
+        charged + Duration::from_millis(20) >= took.min(HANDSHAKE_TIMEOUT),
+        "all of it is VPP's time: {charged:?} of {took:?}"
+    );
+    assert!(charged <= HANDSHAKE_TIMEOUT, "{charged:?}");
+    // Linux waits on a full backlog — the case that used to have no end;
+    // BSD-derived kernels refuse it at once, which needs no bound.
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            took >= HANDSHAKE_TIMEOUT / 2,
+            "the premise: the connect really waited on the backlog: {took:?}"
+        );
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains("did not accept")),
+            "{error:?}"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = error;
 }

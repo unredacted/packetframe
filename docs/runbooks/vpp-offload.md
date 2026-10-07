@@ -3226,7 +3226,9 @@ How to read it:
   of what loaded.
 - **`last_probe_error`.** `Resource temporarily unavailable` means a
   request hit its socket deadline. `reconnect refused: …` means VPP's
-  socket would not take a connection or finish the handshake.
+  socket would not take a connection or finish the handshake within
+  500 ms. `did not accept the connection` means VPP stopped draining
+  its socket's backlog.
 - **`loop_gap_ms` large and `vpp_wait_ms` small.** The supervision loop
   itself was away: blocked in the kernel, or not scheduled. Such a
   stall is excused (below), so a wedge with this shape had VPP silent
@@ -3261,7 +3263,9 @@ stop this from hiding a dead VPP:
 
 - Time the loop spends blocked on VPP's socket is never excused. A
   hung VPP holds every probe for the full deadline, and that wait is
-  the evidence.
+  the evidence. A reconnect counts the same way. It gives up after
+  500 ms, the socket's own connect included, so a VPP that stopped
+  accepting connections cannot park the loop inside one.
 - Once VPP has missed more probes than the budget tolerates as jitter
   (two, while steered), a later stall no longer erases them. The
   journal then says `VPP had already left more probes unanswered than

@@ -70,13 +70,19 @@ use crate::vpp_api::{Transport, TransportError};
 /// that nexthop.
 pub const IP_NEIGHBOR_STATIC: u8 = 1;
 
-/// How long to wait for the handshake on a connect attempt.
+/// How long one connect attempt may take, end to end: the socket's
+/// connect and the handshake together (`Transport::connect` holds the
+/// whole call to it).
 ///
 /// Short on purpose: `api_ready` is polled from the supervision loop and
 /// a long blocking connect would stall the tick that also services the
 /// pidfd and the wedge ping. A timeout here just means the next tick
 /// tries again; the *overall* patience for a slow start is
 /// `API_STARTUP_BUDGET`, which is the loop's business, not this call's.
+///
+/// Inside the steady wedge budget, which is what keeps the published
+/// bound: a probe that has to reconnect first blocks no longer than one
+/// that does not.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Socket timeout for requests after the handshake: **exactly the
@@ -2581,11 +2587,15 @@ impl ConvergenceEngine {
         }
         let started = std::time::Instant::now();
         let connected = Transport::connect(&self.api_socket, HANDSHAKE_TIMEOUT);
-        // A connect is time spent waiting on VPP whatever its outcome — a
-        // handshake that times out is VPP not answering. Capped at the
-        // two frames it can legitimately wait on, for the reason
-        // `Transport::waited` caps each frame.
-        self.api_waited += started.elapsed().min(HANDSHAKE_TIMEOUT * 2);
+        // A connect is time spent waiting on VPP whatever its outcome: a
+        // backlog VPP is not accepting from, a handshake it does not
+        // answer. ALL of it is charged, up to the connect's own deadline,
+        // which bounds the whole call (`Transport::connect`). Charging
+        // less is the dangerous direction: the rest would read as the
+        // loop's own stall and could excuse the very silence a hung VPP
+        // is showing (review finding, PR #322). Past the deadline is only
+        // this thread not being scheduled, the host's time.
+        self.api_waited += started.elapsed().min(HANDSHAKE_TIMEOUT);
         match connected {
             Ok(mut t) => {
                 // Re-arm off the handshake value. It is deliberately short
@@ -4875,6 +4885,15 @@ mod tests {
             e.recorded_indices.is_empty(),
             "recorded indices belong to the dead instance"
         );
+    }
+
+    /// `HANDSHAKE_TIMEOUT` bounds a whole connect, and a probe that has
+    /// to reconnect first must block no longer than a ping, or the
+    /// published bound stretches by the difference on every reconnecting
+    /// probe.
+    #[test]
+    fn a_reconnect_fits_inside_the_steady_wedge_budget() {
+        assert!(HANDSHAKE_TIMEOUT <= crate::liveness::PING_BUDGET);
     }
 
     /// The socket deadline must equal the budget in force — not the
