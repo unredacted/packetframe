@@ -47,6 +47,16 @@
 //! - *Which mode.* Only `forwarding-mode packetframe-fib` seeds.
 //!   `compare` exists to validate the PacketFrame FIB against the kernel's,
 //!   and stale seeded routes would read as disagreements.
+//! - *Whose.* Its routes are installed by a root daemon, so a ledger
+//!   another account could have written is a route injection, whatever
+//!   its checksum says (an unkeyed checksum proves integrity, not
+//!   provenance). Before a byte is read, the open descriptors must show
+//!   a regular file owned by the daemon's uid and closed to group and
+//!   others, in a directory likewise, under ancestors nobody else can
+//!   rename; anything else is refused (`untrusted`). See `read_record`
+//!   for why that, and not a keyed MAC.
+//! - *How big.* Past [`MAX_LEDGER_BYTES`] (what a FIB at capacity could
+//!   encode to) it is refused from `fstat` (`too-large`), never read.
 //! - *Intact.* A truncated, corrupt or other-version file is refused
 //!   whole, never half-seeded; counts are checked against the routes
 //!   actually read.
@@ -103,6 +113,52 @@ pub const CLOCK_SLACK: Duration = Duration::from_secs(60);
 /// `systemctl stop` hostage. Past it nothing is written, and the next
 /// start loads cold.
 pub const PRESERVE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Widest unsigned LEB128 encoding of a `u32`.
+const VARINT_U32_MAX: u64 = 5;
+
+/// One advertisement at its widest: peer index, flags, path id,
+/// local-pref, a nexthop count of one, and that nexthop's index. Both
+/// route sources file exactly one nexthop per advertisement.
+const ADVERT_MAX_BYTES: u64 =
+    VARINT_U32_MAX + 1 + VARINT_U32_MAX + VARINT_U32_MAX + 1 + VARINT_U32_MAX;
+
+/// One prefix at its widest: length, address, a one-byte advertisement
+/// count, and a full ECMP group's worth of advertisements.
+const fn route_max_bytes(addr_len: u64) -> u64 {
+    1 + addr_len + 1 + crate::fib::types::MAX_ECMP_PATHS as u64 * ADVERT_MAX_BYTES
+}
+
+/// Everything but the routes, at its widest: magic, format version, the
+/// two strings at their `u16` limit, the two times, the four counts,
+/// peer and nexthop tables at the NEXTHOPS map's size each (a BGP
+/// listener names one peer; a FIB cannot hold more nexthops than that
+/// map), and the checksum.
+const HEADER_MAX_BYTES: u64 = 8
+    + 4
+    + (2 + u16::MAX as u64)
+    + 8
+    + 8
+    + (2 + u16::MAX as u64)
+    + 16
+    + 4
+    + crate::fib::types::NEXTHOPS_CAP as u64 * 8
+    + 4
+    + crate::fib::types::NEXTHOPS_CAP as u64 * 17
+    + 8;
+
+/// The largest file a start will read as a route ledger, judged from
+/// `fstat` before a byte of it is read: a mirror at the FIB's capacity
+/// in both families ([`crate::fib::types::FIB_V4_CAP`] and
+/// [`crate::fib::types::FIB_V6_CAP`] prefixes), each at
+/// `route_max_bytes`, plus `HEADER_MAX_BYTES`. About 585 MB, against
+/// ~19 MB for today's full table: generous enough that no ledger a FIB
+/// could hold is refused, and a bound all the same, so a huge or sparse
+/// file in `state-dir` cannot make a start allocate without limit. A
+/// larger file is refused (`too-large`) and removed unread.
+pub const MAX_LEDGER_BYTES: u64 = HEADER_MAX_BYTES
+    + crate::fib::types::FIB_V4_CAP as u64 * route_max_bytes(4)
+    + crate::fib::types::FIB_V6_CAP as u64 * route_max_bytes(16);
 
 /// Subsystem name on the health surface. Append-safe, rename-unsafe.
 pub const SUBSYS_ROUTE_LEDGER: &str = "route-ledger";
@@ -705,6 +761,14 @@ pub enum Refusal {
     /// A BGP ledger names a peer id this build's listener would not use
     /// for this route source.
     PeerId { recorded: u64, expected: u64 },
+    /// Someone other than this daemon's uid could have written it or put
+    /// it there: the file is owned by another uid or writable by group or
+    /// others, so is the directory holding it, or an ancestor lets a
+    /// third account rename the directories under it (or it is not a
+    /// regular file). Never read; removed.
+    Untrusted(String),
+    /// Larger than [`MAX_LEDGER_BYTES`]. Never read; removed.
+    TooLarge { len: u64, max: u64 },
 }
 
 impl Refusal {
@@ -723,6 +787,8 @@ impl Refusal {
             Refusal::TooOld { .. } => "too-old",
             Refusal::Clock { .. } => "clock",
             Refusal::PeerId { .. } => "peer-id",
+            Refusal::Untrusted(_) => "untrusted",
+            Refusal::TooLarge { .. } => "too-large",
         }
     }
 
@@ -792,6 +858,15 @@ impl Refusal {
                  listener uses {expected:#x} for the same route source; seeded routes would \
                  never be replaced by the live session's"
             ),
+            Refusal::Untrusted(why) => format!(
+                "untrusted ownership/permissions: {why}. A ledger is read only when this \
+                 daemon's own uid wrote it, into a state-dir no other account can write, under \
+                 ancestors no other account can rename; removed unread"
+            ),
+            Refusal::TooLarge { len, max } => format!(
+                "it is too large: {len} bytes, past the {max} bytes the largest ledger a FIB \
+                 at capacity could encode to; removed unread"
+            ),
         }
     }
 }
@@ -848,7 +923,9 @@ pub fn consume(state_dir: &Path, exp: &Expectations<'_>) -> Consumed {
             };
         }
         Ok(Some(b)) => Ok(b),
-        Err(e) => Err(format!("{}: {e}", path.display())),
+        Err(ReadFailure::Io(e)) => Err(Refusal::Unreadable(format!("{}: {e}", path.display()))),
+        Err(ReadFailure::Untrusted(why)) => Err(Refusal::Untrusted(why)),
+        Err(ReadFailure::TooLarge { len, max }) => Err(Refusal::TooLarge { len, max }),
     };
     // `unlinkat` removes a planted symlink itself, never its target.
     if let Err(e) = remove(state_dir) {
@@ -856,7 +933,7 @@ pub fn consume(state_dir: &Path, exp: &Expectations<'_>) -> Consumed {
     }
     let bytes = match bytes {
         Ok(b) => b,
-        Err(e) => return Consumed::Refused(Refusal::Unreadable(e)),
+        Err(r) => return Consumed::Refused(r),
     };
     match judge(bytes, exp) {
         Ok(ledger) => Consumed::Seed(ledger),
@@ -975,18 +1052,72 @@ fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-#[cfg(target_os = "linux")]
-fn read_record(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    packetframe_common::statefile::read_no_follow(path)
+/// Why the record could not be read, before any check of its contents.
+#[derive(Debug)]
+enum ReadFailure {
+    Io(String),
+    // Only the Linux reader judges provenance; see the stub below.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Untrusted(String),
+    TooLarge {
+        len: u64,
+        max: u64,
+    },
 }
 
+/// Read the record only if this daemon's own uid could have put it
+/// there, and only up to [`MAX_LEDGER_BYTES`]. Its contents are routes
+/// this root daemon installs, so a ledger anyone else could have
+/// written is a route injection; see
+/// [`packetframe_common::statefile::read_owned_no_follow`] for exactly
+/// what is checked (on the open descriptors, not by path).
+///
+/// Why ownership and not a keyed MAC: a key would have to live
+/// somewhere the daemon reads and other accounts cannot, which is
+/// exactly the property checked here directly — an account able to
+/// write `state-dir` could not forge a MAC, but an account able to
+/// write where the key lives could, so the MAC would move the trust
+/// question, not answer it.
+#[cfg(target_os = "linux")]
+fn read_record(path: &Path) -> Result<Option<Vec<u8>>, ReadFailure> {
+    use packetframe_common::statefile::{read_owned_no_follow, OwnedReadError};
+    read_owned_no_follow(path, MAX_LEDGER_BYTES).map_err(|e| match e {
+        OwnedReadError::Untrusted(why) => ReadFailure::Untrusted(why),
+        OwnedReadError::TooLarge { len, max } => ReadFailure::TooLarge { len, max },
+        OwnedReadError::Io(e) => ReadFailure::Io(e.to_string()),
+    })
+}
+
+/// The dev-laptop stub keeps the size bound (it is what keeps a huge
+/// file from being read whole) and leaves provenance to the Linux build:
+/// nothing privileged runs here.
 #[cfg(not(target_os = "linux"))]
-fn read_record(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    match std::fs::read(path) {
-        Ok(r) => Ok(Some(r)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+fn read_record(path: &Path) -> Result<Option<Vec<u8>>, ReadFailure> {
+    use std::io::Read as _;
+    let io = |e: std::io::Error| ReadFailure::Io(e.to_string());
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io(e)),
+    };
+    let len = f.metadata().map_err(io)?.len();
+    if len > MAX_LEDGER_BYTES {
+        return Err(ReadFailure::TooLarge {
+            len,
+            max: MAX_LEDGER_BYTES,
+        });
     }
+    let mut buf = Vec::with_capacity(len as usize);
+    f.take(MAX_LEDGER_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(io)?;
+    if buf.len() as u64 > MAX_LEDGER_BYTES {
+        return Err(ReadFailure::TooLarge {
+            len: buf.len() as u64,
+            max: MAX_LEDGER_BYTES,
+        });
+    }
+    Ok(Some(buf))
 }
 
 #[cfg(target_os = "linux")]
@@ -1432,9 +1563,13 @@ mod tests {
     const NOW: u64 = 1_790_000_000;
 
     fn tmpdir(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
         let d = std::env::temp_dir().join(format!("pf-fp-ledger-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        // Pinned, not left to the umask: the reader refuses a state-dir
+        // group or others can write.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
         d
     }
 
@@ -1823,6 +1958,8 @@ mod tests {
                 recorded: 1,
                 expected: 2,
             },
+            Refusal::Untrusted("x".into()),
+            Refusal::TooLarge { len: 2, max: 1 },
         ];
         let codes: std::collections::HashSet<_> = all.iter().map(Refusal::code).collect();
         assert_eq!(codes.len(), all.len());
@@ -1903,6 +2040,158 @@ mod tests {
         write(&dir, b"x").unwrap();
         remove(&dir).unwrap();
         assert!(!path_in(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bound is what a FIB at capacity could encode to: one prefix
+    /// at its widest (a full ECMP group of advertisements, every varint
+    /// at its widest) fits `route_max_bytes`, and the whole is far past
+    /// today's full table (~19 MB), so no real ledger meets it.
+    #[test]
+    fn the_size_bound_holds_any_ledger_a_full_fib_could_write() {
+        let prefix = IpPrefix::V6 {
+            addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).octets(),
+            prefix_len: 64,
+        };
+        let adverts: Vec<LedgerAdvert> = (0..crate::fib::types::MAX_ECMP_PATHS as u32)
+            .map(|i| LedgerAdvert {
+                peer: PEER,
+                path_id: Some(u32::MAX - i),
+                local_pref: Some(u32::MAX),
+                nexthops: vec![v6nh(1)],
+            })
+            .collect();
+        let refs: Vec<AdvertRef<'_>> = adverts
+            .iter()
+            .map(|a| AdvertRef {
+                peer: a.peer,
+                path_id: a.path_id,
+                local_pref: a.local_pref,
+                nexthops: &a.nexthops,
+            })
+            .collect();
+        let with = |n: u32| {
+            let counts = LedgerCounts {
+                v4: FamilyCounts::default(),
+                v6: FamilyCounts {
+                    prefixes: n,
+                    advertisements: n * refs.len() as u32,
+                },
+            };
+            let mut enc = LedgerEncoder::new(&meta(), counts, &[PEER], &[v6nh(1)]);
+            if n == 1 {
+                enc.route(prefix, &refs).unwrap();
+            }
+            enc.finish().unwrap().len() as u64
+        };
+        let one_route = with(1) - with(0);
+        assert!(
+            one_route <= route_max_bytes(16),
+            "{one_route} > {}",
+            route_max_bytes(16)
+        );
+        // Far past today's full table, and still a bound.
+        const { assert!(MAX_LEDGER_BYTES > 20 * 19_000_000) };
+        const { assert!(MAX_LEDGER_BYTES < 1 << 30) };
+    }
+
+    /// Larger than the bound: refused by name from the file's size,
+    /// never read — the file here is sparse, and reading it whole would
+    /// allocate the lot — and consumed like any refusal.
+    #[test]
+    fn a_ledger_past_the_size_bound_is_refused_unread() {
+        let dir = tmpdir("too-large");
+        write(&dir, &encode(&meta(), &routes()).unwrap()).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path_in(&dir))
+            .unwrap();
+        f.set_len(MAX_LEDGER_BYTES + 1).unwrap();
+        drop(f);
+        match consume(&dir, &expect()) {
+            Consumed::Refused(r @ Refusal::TooLarge { len, max }) => {
+                assert_eq!((len, max), (MAX_LEDGER_BYTES + 1, MAX_LEDGER_BYTES));
+                assert_eq!(r.code(), "too-large");
+                assert!(r.describe().contains("too large"), "{}", r.describe());
+                assert!(r.is_warning());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!path_in(&dir).exists(), "consumed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ledger anyone but this daemon's uid could have written is
+    /// refused by name and never read, whatever its contents: here a
+    /// perfectly good record, made group- or world-writable, or sitting
+    /// in a directory others can write.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_ledger_others_could_have_written_is_refused_unread() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tmpdir("untrusted");
+        let good = || encode(&meta(), &routes()).unwrap();
+        let untrusted = |dir: &Path| match consume(dir, &expect()) {
+            Consumed::Refused(r @ Refusal::Untrusted(_)) => {
+                assert_eq!(r.code(), "untrusted");
+                assert!(r.is_warning());
+                r.describe()
+            }
+            other => panic!("{other:?}"),
+        };
+        for mode in [0o620, 0o602] {
+            write(&dir, &good()).unwrap();
+            std::fs::set_permissions(path_in(&dir), std::fs::Permissions::from_mode(mode)).unwrap();
+            let why = untrusted(&dir);
+            assert!(
+                why.contains("untrusted ownership/permissions")
+                    && why.contains("writable by group or others"),
+                "{mode:o}: {why}"
+            );
+            assert!(!path_in(&dir).exists(), "{mode:o}: consumed");
+        }
+        write(&dir, &good()).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let why = untrusted(&dir);
+        assert!(why.contains("the directory"), "{why}");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The same record, from a trusted place, is accepted.
+        write(&dir, &good()).unwrap();
+        assert!(matches!(consume(&dir, &expect()), Consumed::Seed(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Owned by another uid, the file or its directory. Needs root.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_ledger_owned_by_another_uid_is_refused_when_running_as_root() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to chown");
+            return;
+        }
+        const NOBODY: u32 = 65534;
+        let dir = tmpdir("foreign");
+        write(&dir, &encode(&meta(), &routes()).unwrap()).unwrap();
+        std::os::unix::fs::chown(path_in(&dir), Some(NOBODY), None).unwrap();
+        match consume(&dir, &expect()) {
+            Consumed::Refused(Refusal::Untrusted(why)) => {
+                assert!(why.contains("owned by uid 65534"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!path_in(&dir).exists(), "consumed");
+
+        write(&dir, &encode(&meta(), &routes()).unwrap()).unwrap();
+        std::os::unix::fs::chown(&dir, Some(NOBODY), None).unwrap();
+        match consume(&dir, &expect()) {
+            Consumed::Refused(Refusal::Untrusted(why)) => {
+                assert!(
+                    why.contains("the directory") && why.contains("owned by uid 65534"),
+                    "{why}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -78,18 +78,10 @@ use crate::pin;
 /// to the BMP reader which is correct.
 const COMMAND_CAPACITY: usize = 8_192;
 
-/// Capped by `NEXTHOPS_MAX_ENTRIES` in bpf/src/maps.rs. Keep in sync
-/// if either side changes.
-pub const NEXTHOPS_CAP: u32 = 8_192;
-
-/// Capped by `FIB_V4_MAX_ENTRIES` in bpf/src/maps.rs.
-pub const FIB_V4_CAP: u32 = 2_097_152;
-
-/// Capped by `FIB_V6_MAX_ENTRIES` in bpf/src/maps.rs.
-pub const FIB_V6_CAP: u32 = 1_048_576;
-
-/// Capped by `ECMP_GROUPS_MAX_ENTRIES` in bpf/src/maps.rs.
-pub const ECMP_GROUPS_CAP: u32 = 1_024;
+// The map capacities live with the other BPF mirrors in `types` (the
+// route ledger's size bound reads them on every platform); re-exported
+// here, where their users have always found them.
+pub use crate::fib::types::{ECMP_GROUPS_CAP, FIB_V4_CAP, FIB_V6_CAP, NEXTHOPS_CAP};
 
 /// Default-route (0.0.0.0/0 and ::/0) ID-reclaim grace period. An
 /// atomic `FibValue` overwrite is instantaneous from the BPF

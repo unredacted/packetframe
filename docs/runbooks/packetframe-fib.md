@@ -1013,7 +1013,13 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
 - **File:** `<state-dir>/fast-path-route-ledger.bin`, ~14 bytes a route
   (~19 MB for 1.1M IPv4 + 250k IPv6), written temp file → fsync →
   rename through the same no-follow state-dir primitives as every other
-  record. A trailing checksum covers all of it.
+  record, mode 0600 and owned by the daemon's uid. A trailing checksum
+  covers all of it — integrity, not provenance: the next start reads it
+  only if its ownership and modes, and those of `state-dir` and its
+  ancestors, show no other account could have written it (`untrusted`
+  below). A keyed MAC would add nothing: its key would have to live
+  where other accounts cannot write, which is the same guarantee, one
+  file away.
 - **Contents:** every advertisement from the route source — prefix,
   peer id, path id, nexthops, local-pref — and **nothing the neighbour
   resolver injected** (`fallback-default`'s 0/0, the `local-prefix`
@@ -1054,6 +1060,8 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
    | `forwarding-mode` | Not `packetframe-fib`. `compare` validates the PacketFrame FIB against the kernel's, and stale seeded routes would read as disagreements |
    | `no-route-source` | No `route-source`, so nothing could ever reconcile a seed |
    | `unreadable` | It could not be read (I/O error, planted symlink); removed anyway |
+   | `untrusted` | Untrusted ownership/permissions: the file is not owned by the daemon's uid or is group- or world-writable, or so is the directory holding it, or an ancestor directory is owned by someone other than root or is writable by group or others without the sticky bit (so another account could rename `state-dir` away), or it is not a regular file. Judged on the open descriptors before a byte is read; removed unread. Its routes would be installed by root, so a file another account could have written is never trusted, whatever its checksum says. Fix the state-dir's ownership and modes (`chown root:root`, `chmod 755` or tighter) |
+   | `too-large` | Larger than the largest ledger a FIB at capacity could encode to (about 585 MB; a full table is ~19 MB). Judged from the file's size before a byte is read; removed unread |
    | `unremovable` | It could not be removed, so it cannot be consumed once. Status degrades; remove it by hand |
    | `corrupt` | Truncated, checksum mismatch, structurally wrong, empty, or naming a resolver peer id |
    | `format-version` | Written by a build with another layout |

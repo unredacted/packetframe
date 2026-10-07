@@ -3250,6 +3250,12 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
     let state_dir = std::env::temp_dir().join(format!("pf-ledger-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state_dir);
     std::fs::create_dir_all(&state_dir).unwrap();
+    // Pinned, not left to the umask: the reader refuses a state-dir
+    // group or others can write.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     let routes = vec![
         route(quarter(0), nh_a()),

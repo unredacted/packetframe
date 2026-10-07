@@ -441,6 +441,230 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     renameat_within(&dir, &tmp, name)
 }
 
+/// Why [`read_owned_no_follow`] returned no contents.
+#[derive(Debug)]
+pub enum OwnedReadError {
+    /// Someone other than this process's effective uid could have
+    /// written the file or put it there: it, or the directory holding
+    /// it, is owned by another uid or writable by group or others, or an
+    /// ancestor directory lets a third account rename what it holds.
+    /// Also a final component that is not a regular file.
+    Untrusted(String),
+    /// Larger than the caller's bound; nothing was read.
+    TooLarge { len: u64, max: u64 },
+    /// Anything else: an I/O error, or a symlink at any component.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for OwnedReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OwnedReadError::Untrusted(why) => write!(f, "{why}"),
+            OwnedReadError::TooLarge { len, max } => {
+                write!(f, "{len} bytes, past the {max}-byte bound")
+            }
+            OwnedReadError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for OwnedReadError {
+    fn from(e: std::io::Error) -> Self {
+        OwnedReadError::Io(e)
+    }
+}
+
+/// Read `path` as [`read_no_follow`] does, but only a file this process
+/// can vouch for, and never more than `max_len` bytes.
+///
+/// For records whose contents the reader ACTS on as root — routes to
+/// install, say — where "no symlink" is not enough: if another account
+/// can write `state-dir`, it can create the file outright. Checked on
+/// descriptors, never by path, so what is checked is what is read:
+///
+/// - the file: a regular file, owned by this process's euid, not
+///   writable by group or others;
+/// - the directory holding it: owned by the euid, not writable by group
+///   or others — otherwise its contents are whoever-can-write's choice,
+///   whoever owns the files (a writable directory also lets `rename`
+///   bring in a root-owned file written for another purpose);
+/// - every ancestor, to `/`: owned by root or the euid, and either not
+///   writable by group or others or sticky. Under a parent a third
+///   account can write, two root-owned directories can have their names
+///   exchanged without a byte of either changing (the same rule
+///   `daemon_presence`'s `dir_is_authentic` applies to the pid file, for
+///   the same review finding).
+///
+/// Only then is the size compared with `max_len` (from `fstat`, before
+/// any read) and the file read through a reader that stops one byte past
+/// it, so a file that grows after the `fstat` is refused too. The open
+/// is `O_NONBLOCK`, so a FIFO at the name is refused rather than waited
+/// on.
+///
+/// `Ok(None)` when the file or a directory on the way does not exist.
+pub fn read_owned_no_follow(path: &Path, max_len: u64) -> Result<Option<Vec<u8>>, OwnedReadError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let euid = unsafe { libc::geteuid() };
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = file_name(path)?;
+    let dir = match open_owned_dir(parent, euid) {
+        Ok(d) => d,
+        Err(OwnedReadError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let c = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(e.into());
+    }
+    // SAFETY: `fd` was just returned by openat and is owned by nothing
+    // else.
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = f.metadata()?;
+    let ft = meta.file_type();
+    if !ft.is_file() {
+        let kind = if ft.is_fifo() {
+            "a FIFO"
+        } else if ft.is_dir() {
+            "a directory"
+        } else {
+            "not a regular file"
+        };
+        return Err(OwnedReadError::Untrusted(format!(
+            "{} is {kind}",
+            path.display()
+        )));
+    }
+    if meta.uid() != euid {
+        return Err(OwnedReadError::Untrusted(format!(
+            "{} is owned by uid {}, not this process's uid {euid}",
+            path.display(),
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(OwnedReadError::Untrusted(format!(
+            "{} is writable by group or others (mode {:04o})",
+            path.display(),
+            meta.mode() & 0o7777
+        )));
+    }
+    if meta.len() > max_len {
+        return Err(OwnedReadError::TooLarge {
+            len: meta.len(),
+            max: max_len,
+        });
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    (&f).take(max_len.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_len {
+        return Err(OwnedReadError::TooLarge {
+            len: buf.len() as u64,
+            max: max_len,
+        });
+    }
+    Ok(Some(buf))
+}
+
+/// The non-creating no-follow walk of [`open_dir_no_follow`], judging
+/// every directory on the way by its descriptor: each ancestor (root
+/// included) owned by root or `euid` and either closed to group and
+/// others or sticky, and the final directory owned by `euid` and closed
+/// to group and others. See [`read_owned_no_follow`].
+fn open_owned_dir(path: &Path, euid: libc::uid_t) -> Result<std::fs::File, OwnedReadError> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("state paths must be absolute: {}", path.display()),
+        )
+        .into());
+    }
+    let mut names = Vec::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(n) => names.push(n.to_owned()),
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing path component {other:?} in {}", path.display()),
+                )
+                .into())
+            }
+        }
+    }
+    let judge = |dir: &std::fs::File, shown: &Path, last: bool| -> Result<(), OwnedReadError> {
+        let meta = dir.metadata()?;
+        let (uid, mode) = (meta.uid(), meta.mode());
+        if last {
+            if uid != euid {
+                return Err(OwnedReadError::Untrusted(format!(
+                    "the directory {} is owned by uid {uid}, not this process's uid {euid}",
+                    shown.display()
+                )));
+            }
+            if mode & 0o022 != 0 {
+                return Err(OwnedReadError::Untrusted(format!(
+                    "the directory {} is writable by group or others (mode {:04o})",
+                    shown.display(),
+                    mode & 0o7777
+                )));
+            }
+        } else {
+            if uid != 0 && uid != euid {
+                return Err(OwnedReadError::Untrusted(format!(
+                    "its ancestor {} is owned by uid {uid}, not root",
+                    shown.display()
+                )));
+            }
+            // 0o1000: the sticky bit, under which only an entry's owner
+            // may rename or remove it.
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+                return Err(OwnedReadError::Untrusted(format!(
+                    "its ancestor {} is writable by group or others and not sticky (mode \
+                     {:04o}), so another account could rename the directories under it",
+                    shown.display(),
+                    mode & 0o7777
+                )));
+            }
+        }
+        Ok(())
+    };
+    let mut dir = std::fs::File::open("/")?;
+    let mut shown = PathBuf::from("/");
+    judge(&dir, &shown, names.is_empty())?;
+    for (i, name) in names.iter().enumerate() {
+        let c = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path component")
+        })?;
+        let fd = open_component(&dir, &c, false).map_err(|e: std::io::Error| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "open component {name:?} of {}: {e} (a symlink here is refused)",
+                    path.display()
+                ),
+            )
+        })?;
+        // SAFETY: `fd` was just returned by openat and is owned by
+        // nothing else.
+        dir = unsafe { std::fs::File::from_raw_fd(fd) };
+        shown.push(name);
+        judge(&dir, &shown, i + 1 == names.len())?;
+    }
+    Ok(dir)
+}
+
 /// Read `path` without following a symlink at any component. `Ok(None)`
 /// when the file (or its directory) does not exist; a symlink anywhere
 /// is an error (`ELOOP`), not a read of its target.
@@ -700,6 +924,163 @@ mod tests {
         assert!(follow(&dir.join(format!("l{MAX_LINKS}")), false).is_ok());
         let msg = refusal(follow(&dir.join(format!("l{}", MAX_LINKS + 1)), false));
         assert!(msg.contains("more than 8 symlinks"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn untrusted(r: Result<Option<Vec<u8>>, OwnedReadError>) -> String {
+        match r {
+            Err(OwnedReadError::Untrusted(why)) => why,
+            other => panic!("expected an untrusted refusal, got {other:?}"),
+        }
+    }
+
+    /// What `write_atomic` leaves is read back; absence is `None`; a
+    /// symlink is still an I/O refusal, not a read.
+    #[test]
+    fn an_owned_read_returns_what_this_process_wrote() {
+        let dir = closed_tmpdir("owned");
+        let rec = dir.join("record.bin");
+        assert!(read_owned_no_follow(&rec, 64).unwrap().is_none());
+        assert!(read_owned_no_follow(&dir.join("missing/record.bin"), 64)
+            .unwrap()
+            .is_none());
+        write_atomic(&rec, b"payload").unwrap();
+        assert_eq!(
+            read_owned_no_follow(&rec, 64).unwrap().as_deref(),
+            Some(&b"payload"[..])
+        );
+        // Exactly at the bound is fine.
+        assert!(read_owned_no_follow(&rec, 7).unwrap().is_some());
+        std::fs::remove_file(&rec).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere"), &rec).unwrap();
+        assert!(matches!(
+            read_owned_no_follow(&rec, 64),
+            Err(OwnedReadError::Io(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The size is judged from `fstat`, before any read: a sparse file
+    /// claiming 64 GiB is refused without a byte of it read (were it read,
+    /// this test would try to allocate all of it).
+    #[test]
+    fn an_owned_read_refuses_a_file_past_its_bound_before_reading() {
+        let dir = closed_tmpdir("owned-big");
+        let rec = dir.join("record.bin");
+        write_atomic(&rec, b"12345678").unwrap();
+        match read_owned_no_follow(&rec, 7) {
+            Err(OwnedReadError::TooLarge { len: 8, max: 7 }) => {}
+            other => panic!("{other:?}"),
+        }
+        let f = std::fs::OpenOptions::new().write(true).open(&rec).unwrap();
+        f.set_len(1 << 36).unwrap();
+        drop(f);
+        match read_owned_no_follow(&rec, 1 << 20) {
+            Err(OwnedReadError::TooLarge { len, max }) => {
+                assert_eq!((len, max), (1 << 36, 1 << 20));
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Group- or world-writable: the file, or the directory holding it.
+    /// Any uid can run this half (it only chmods its own files).
+    #[test]
+    fn an_owned_read_refuses_writable_files_and_directories() {
+        let dir = closed_tmpdir("owned-perm");
+        let rec = dir.join("record.bin");
+        write_atomic(&rec, b"payload").unwrap();
+        for mode in [0o620, 0o602, 0o666] {
+            std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(mode)).unwrap();
+            let why = untrusted(read_owned_no_follow(&rec, 64));
+            assert!(
+                why.contains("writable by group or others"),
+                "{mode:o}: {why}"
+            );
+        }
+        std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_owned_no_follow(&rec, 64).unwrap().is_some());
+        // Readable by others is not a write: 0644 is fine.
+        std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_owned_no_follow(&rec, 64).unwrap().is_some());
+
+        for mode in [0o775, 0o757, 0o1777] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let why = untrusted(read_owned_no_follow(&rec, 64));
+            assert!(
+                why.contains("the directory") && why.contains("writable by group or others"),
+                "{mode:o}: {why}"
+            );
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // An ancestor others can write lets them rename this directory
+        // away and another into its place — unless it is sticky.
+        let inner = dir.join("state");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rec = inner.join("record.bin");
+        write_atomic(&rec, b"payload").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let why = untrusted(read_owned_no_follow(&rec, 64));
+        assert!(why.contains("its ancestor"), "{why}");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(read_owned_no_follow(&rec, 64).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FIFO at the name is refused, not waited on: the open is
+    /// non-blocking and the type is checked before any read.
+    #[test]
+    fn an_owned_read_refuses_a_fifo_without_blocking() {
+        let dir = closed_tmpdir("owned-fifo");
+        let rec = dir.join("record.bin");
+        let c = std::ffi::CString::new(rec.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let why = untrusted(read_owned_no_follow(&rec, 64));
+        assert!(why.contains("FIFO"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Owned by another uid: the file, the directory holding it, or an
+    /// ancestor. Needs root to chown.
+    #[test]
+    fn an_owned_read_refuses_foreign_ownership_when_running_as_root() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to chown");
+            return;
+        }
+        const NOBODY: u32 = 65534;
+        let dir = closed_tmpdir("owned-chown");
+        let inner = dir.join("state");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rec = inner.join("record.bin");
+        write_atomic(&rec, b"payload").unwrap();
+        assert!(read_owned_no_follow(&rec, 64).unwrap().is_some());
+
+        std::os::unix::fs::chown(&rec, Some(NOBODY), None).unwrap();
+        let why = untrusted(read_owned_no_follow(&rec, 64));
+        assert!(why.contains("owned by uid 65534"), "{why}");
+        std::os::unix::fs::chown(&rec, Some(0), None).unwrap();
+
+        std::os::unix::fs::chown(&inner, Some(NOBODY), None).unwrap();
+        let why = untrusted(read_owned_no_follow(&rec, 64));
+        assert!(
+            why.contains("the directory") && why.contains("owned by uid 65534"),
+            "{why}"
+        );
+        std::os::unix::fs::chown(&inner, Some(0), None).unwrap();
+
+        std::os::unix::fs::chown(&dir, Some(NOBODY), None).unwrap();
+        let why = untrusted(read_owned_no_follow(&rec, 64));
+        assert!(
+            why.contains("its ancestor") && why.contains("owned by uid 65534"),
+            "{why}"
+        );
+        std::os::unix::fs::chown(&dir, Some(0), None).unwrap();
+        assert!(read_owned_no_follow(&rec, 64).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
