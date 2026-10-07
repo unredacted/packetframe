@@ -197,6 +197,18 @@ impl Meter {
         self.rates
     }
 
+    /// A sample could not be taken. The window that ended at the last
+    /// good sample is no longer CURRENT, so its rates go — left in
+    /// place, a drop rate measured before the read started failing kept
+    /// the port reported as dropping (or a stale zero kept it reported
+    /// as quiet) for as long as the counters stayed unreadable (review
+    /// finding). The last good counters stay as the baseline: the next
+    /// sample that succeeds rates the whole gap, which is an average
+    /// over a longer window, not a wrong one.
+    pub fn sample_failed(&mut self) {
+        self.rates = None;
+    }
+
     /// The last sample's raw counters.
     pub fn counters(&self) -> Option<QueueCounters> {
         self.last.map(|(_, c)| c)
@@ -344,6 +356,11 @@ impl KernelWatch {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(iface = %iface, error = %e, "kernel-path counters unreadable");
+                    // The last window is not current any more: nothing
+                    // may go on reporting it as though it were.
+                    if let Some((_, m)) = self.meters.iter_mut().find(|(i, _)| i == iface) {
+                        m.sample_failed();
+                    }
                     self.unreadable.push((iface.clone(), e));
                     continue;
                 }
@@ -430,6 +447,15 @@ impl KernelWatch {
                         .filter(|(i, form)| *i == iface && *form == f)
                         .count()
                 };
+                let unreadable = self
+                    .unreadable
+                    .iter()
+                    .find(|(i, _)| *i == iface)
+                    .map(|(_, e)| e.clone());
+                // Nothing from the last good sample is published while
+                // the counters cannot be read: the cumulative gauges are
+                // absent rather than frozen, as the rates are.
+                let meter = meter.filter(|_| unreadable.is_none());
                 PortReport {
                     verdict: keeps
                         .iter()
@@ -448,11 +474,7 @@ impl KernelWatch {
                         .map(|(_, d)| d.clone()),
                     counters: meter.and_then(Meter::counters),
                     rates: meter.and_then(|m| m.rates),
-                    unreadable: self
-                        .unreadable
-                        .iter()
-                        .find(|(i, _)| *i == iface)
-                        .map(|(_, e)| e.clone()),
+                    unreadable,
                     iface,
                 }
             })
@@ -1188,6 +1210,71 @@ mod tests {
             drops_ps: DROPS_DEGRADED_PER_SEC,
         });
         assert!(p.dropping());
+    }
+
+    /// Counters from a script: each `counters` call takes the next entry.
+    struct ScriptedCounters(std::collections::VecDeque<Result<QueueCounters, String>>);
+
+    impl KernelPath for ScriptedCounters {
+        fn reconcile_queue0(&mut self, _: &[String], _: &[String]) {}
+        fn queue0_irqs(&self) -> Vec<(String, Queue0Irq)> {
+            Vec::new()
+        }
+        fn queue0_delivery(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn counters(&mut self, _: &str) -> Result<QueueCounters, String> {
+            self.0.pop_front().expect("scripted")
+        }
+    }
+
+    /// A port that was dropping, whose counters then stop reading, is
+    /// NOT still dropping: the window it was measured over has ended.
+    /// No rates, no cumulative counters, no `dropping()` — the report
+    /// says unreadable and nothing else — and the next good sample
+    /// rates the whole gap from the last good baseline.
+    #[test]
+    fn a_failed_sample_retires_the_last_window() {
+        let c = |q0, rx, d| QueueCounters {
+            queue0_frames: q0,
+            rx_frames: rx,
+            rx_drops: d,
+            queues: 18,
+        };
+        let mut kp = ScriptedCounters(
+            [
+                Ok(c(0, 0, 0)),
+                Ok(c(10_000, 20_000, 39_000)),
+                Err("ethtool -S eth2: Operation not supported".to_string()),
+                Ok(c(10_000, 20_000, 39_000)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let ports = vec!["eth2".to_string()];
+        let t0 = Instant::now();
+        let mut w = KernelWatch::default();
+        let report = |w: &KernelWatch| w.report(&[], &[]).pop().expect("one port");
+        w.tick(t0, &ports, &mut kp, &[]);
+        w.tick(t0 + SAMPLE_EVERY, &ports, &mut kp, &[]);
+        assert!(report(&w).dropping(), "3,900/s over the first window");
+
+        w.tick(t0 + SAMPLE_EVERY * 2, &ports, &mut kp, &[]);
+        let r = report(&w);
+        assert!(r.unreadable.is_some());
+        assert_eq!(r.rates, None, "the old window is not current");
+        assert_eq!(r.counters, None, "nor are its cumulative counters");
+        assert!(
+            !r.dropping(),
+            "a port whose counters stopped is not still dropping"
+        );
+
+        w.tick(t0 + SAMPLE_EVERY * 3, &ports, &mut kp, &[]);
+        let r = report(&w);
+        assert_eq!(r.unreadable, None);
+        let rates = r.rates.expect("rated against the last good baseline");
+        assert_eq!(rates.drops_ps, 0.0, "nothing dropped across the gap");
+        assert!(!r.dropping());
     }
 
     /// A throwaway host: `sysfs_net/<iface>/device/msi_irqs/<irq>`,
