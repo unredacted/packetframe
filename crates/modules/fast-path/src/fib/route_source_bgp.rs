@@ -949,13 +949,11 @@ fn synthetic_peer_id(listen: SocketAddr, peer_asn: u32) -> PeerId {
     // Stable across reconnects. We use (listen_ip, peer_asn) so two
     // separately-configured BGP listeners (e.g., listening on
     // different loopback IPs for two different bird instances) get
-    // different peer IDs.
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    listen.ip().hash(&mut h);
-    peer_asn.hash(&mut h);
-    PeerId(h.finish())
+    // different peer IDs. Through `PeerId::route_source`, never a raw
+    // hash: the peer chooses its ASN, so a raw hash could be steered
+    // into the resolver's local-ARP namespace, which the reconnect GC
+    // exempts.
+    PeerId::route_source(&(listen.ip(), peer_asn))
 }
 
 /// Bind a `TcpListener` with `SO_REUSEADDR` enabled. v0.2.2 fix for the

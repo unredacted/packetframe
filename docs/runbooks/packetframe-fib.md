@@ -378,9 +378,17 @@ birdc enable bmp1
 ```
 
 packetframe emits `RouteEvent::Resync` on disconnect and receives
-the fresh dump on reconnect. Stale entries from before the
-reconnect are GC'd by `InitiationComplete` (fires after 5 s of
-post-first-update quiescence) or the next Resync.
+the fresh dump on reconnect. Routes the new session does not
+re-announce are GC'd at `InitiationComplete`, which fires after 5 s of
+post-first-update quiescence. A session that drops before then GCs
+nothing; the next session's `InitiationComplete` does.
+
+The GC covers the feed's routes only. The `fallback-default` 0/0 and
+the `local-prefix` host routes come from the neighbour resolver, not
+the feed, and stay in place in both the FIB and VPP. Before 0.6.0
+every reconnect deleted them (and FRR on UniFi reconnects at every
+config upload); a host route came back at the kernel's next update
+of its neighbour entry, the default only at a daemon restart.
 
 ### Inspecting the FIB programmatically
 
