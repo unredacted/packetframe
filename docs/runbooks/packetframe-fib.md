@@ -1020,7 +1020,8 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
   host routes). The resolver re-injects those at every start from the
   live kernel, which is fresher than a file. Plus the format version,
   the writing version, the write time, the route-source identity (mode,
-  listen address and port, ASNs, peer pin) and per-family counts.
+  listen address and port, ASNs, peer pin, and the `peer-from` ACL when
+  no pin names the speaker) and per-family counts.
 - **How old its routes are**, which is not always the write time. A
   route the live session had not re-advertised by the stop — the session
   was down (a `Resync` with no new session yet), or the stop came before
@@ -1056,7 +1057,7 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
    | `unremovable` | It could not be removed, so it cannot be consumed once. Status degrades; remove it by hand |
    | `corrupt` | Truncated, checksum mismatch, structurally wrong, empty, or naming a resolver peer id |
    | `format-version` | Written by a build with another layout |
-   | `identity` | Written for a different route source (mode, address, port, ASNs or peer pin changed). `router-id`, `anyip` and the `peer-from` ACL are not identity |
+   | `identity` | Written for a different route source (mode, address, port, ASNs or peer pin changed, or the `peer-from` ACL wherever no peer pin names the speaker: always for BMP, and for BGP without `peer-ip`). `router-id`, `anyip`, and the ACL under a `peer-ip` pin are not identity |
    | `too-old` | Its oldest routes were last confirmed longer ago than `max-age` (default 30 minutes) |
    | `clock` | Confirmed more than a minute in the future: the clock moved across the restart, so no age can be established |
    | `peer-id` | A BGP ledger names a peer id this build's listener would not use for that route source (the id derivation changed between versions); seeded routes would never be replaced |
