@@ -790,6 +790,15 @@ XDP redirects directly to upstream: same upstream rejection behavior,
 just no kernel / conntrack involvement. Measured ~25% reduction in
 steady-state conntrack pressure on a busy Tor exit relay.
 
+The /0 follows its interface. It lives under the interface's
+`local_arp` peer, like the `local-prefix` host routes, so deleting the
+interface withdraws it from the PacketFrame FIB and, through the route
+sink, from VPP (`fallback-default iface deleted; 0.0.0.0/0 withdrawn
+until its RTM_NEWLINK`). When an interface by that name appears again,
+or for the first time if it was absent at startup, its `RTM_NEWLINK`
+injects the /0 under the new ifindex (`v0.2.1 fallback-default 0.0.0.0/0
+injected`). No restart is needed.
+
 The /0 only ever sees frames addressed to the router. Broadcast,
 multicast and bridged host-to-host frames never reach the FIB
 (`pass_not_for_us`), so a subnet broadcast or an mDNS packet from an

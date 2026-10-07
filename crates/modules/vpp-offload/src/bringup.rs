@@ -1517,6 +1517,16 @@ fn finish(
             port_vlans: drift_port_vlans,
             trunk_ports: drift_trunks,
             scope: drift_scope,
+            // Without it the scan still runs, on the clock alone — what
+            // a monitoring scan can afford to lose, unlike its findings.
+            links: crate::drift::KernelLinkWatch::open()
+                .map_err(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "cannot watch link state; drift scans will not wait out link churn"
+                    )
+                })
+                .ok(),
         }));
         // Rules from a previous process are adopted below, and the
         // config on disk may have been edited while the daemon was

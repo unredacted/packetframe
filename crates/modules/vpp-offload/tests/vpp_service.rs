@@ -1818,7 +1818,13 @@ fn an_adopted_resync_says_an_identical_steer_is_inert_from_every_look() {
 fn an_all_off_reconfigure_with_no_rules_still_commits_the_drift_scope() {
     struct SpyDrift(std::sync::Arc<std::sync::Mutex<usize>>);
     impl packetframe_vpp_offload::drift::DriftWatch for SpyDrift {
-        fn uncovered(&mut self) -> Result<packetframe_vpp_offload::drift::DriftFindings, String> {
+        fn uncovered(
+            &mut self,
+            _: bool,
+        ) -> Result<
+            packetframe_vpp_offload::drift::DriftFindings,
+            packetframe_vpp_offload::drift::ScanError,
+        > {
             Ok(packetframe_vpp_offload::drift::DriftFindings::default())
         }
         fn set_scope(&mut self, _scope: packetframe_vpp_offload::drift::DriftScope) {
@@ -1916,6 +1922,125 @@ fn an_all_off_reconfigure_with_no_rules_still_commits_the_drift_scope() {
         *scopes.lock().unwrap() > before,
         "the reloaded exemptions must reach the scanner, or reconfigure reported \
          success while the scan kept judging the old config"
+    );
+
+    svc.stop();
+}
+
+/// A finished drift scan's wall time reaches the published metrics.
+///
+/// The scan runs on its own thread and its duration crosses three
+/// hand-offs — scanner to runtime, runtime status to snapshot, snapshot to
+/// the rendered textfile — any of which could drop it. The scan is held
+/// open by the test, so the gauge is first seen absent with no scan
+/// finished, then present with at least the time it was held.
+#[test]
+fn a_finished_drift_scan_publishes_how_long_it_took() {
+    use std::sync::mpsc;
+    struct HeldDrift(mpsc::Receiver<()>);
+    impl packetframe_vpp_offload::drift::DriftWatch for HeldDrift {
+        fn uncovered(
+            &mut self,
+            _: bool,
+        ) -> Result<
+            packetframe_vpp_offload::drift::DriftFindings,
+            packetframe_vpp_offload::drift::ScanError,
+        > {
+            let _ = self.0.recv();
+            Ok(packetframe_vpp_offload::drift::DriftFindings::default())
+        }
+        fn set_scope(&mut self, _scope: packetframe_vpp_offload::drift::DriftScope) {}
+    }
+
+    let fake = Fake::start("svc-drift-ms");
+    let sock = fake.path.clone();
+    let (release, held) = mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(Some(held));
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                    pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                    accept_macs: vec![],
+                    mtu: None,
+                    vlans: vec![],
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+                packetframe_common::config::Ipv4Prefix {
+                    addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                    prefix_len: 32,
+                },
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Mirror((0..6).map(|i| fake_vpp::v4(0, i)).collect())),
+                Box::new(SpySteering(std::sync::Arc::new(std::sync::Mutex::new(
+                    Vec::new(),
+                )))),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            let rx = held.lock().unwrap().take().expect("one factory call");
+            runtime.drift_watch(Box::new(HeldDrift(rx)));
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let metrics = || svc.status().map(|p| p.metrics).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while svc.status().map(|p| p.state) != Some(State::Ready) {
+        assert!(Instant::now() < deadline, "did not reach Ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !metrics().contains("packetframe_vpp_drift_scan_ms"),
+        "no scan has finished, so there is no duration to publish:\n{}",
+        metrics()
+    );
+
+    const HELD: Duration = Duration::from_millis(150);
+    std::thread::sleep(HELD);
+    release.send(()).expect("the scan is waiting");
+
+    let prefix = "packetframe_vpp_drift_scan_ms{module=\"vpp-offload\"} ";
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let published = loop {
+        if let Some(ms) = metrics()
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix).map(|v| v.parse::<u64>().unwrap()))
+        {
+            break ms;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the duration never reached the metrics"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        published >= HELD.as_millis() as u64,
+        "published {published} ms for a scan held {HELD:?}"
     );
 
     svc.stop();
