@@ -11,6 +11,7 @@ how to roll back to the kernel-FIB path if something goes wrong.
 - [Everyday inspection commands](#everyday-inspection-commands)
 - [Connected fast-path (v0.2.1)](#connected-fast-path-v021)
 - [WAN egress](#wan-egress)
+- [Restarts: the route ledger](#restarts-the-route-ledger)
 - [Cutover and rollback](#cutover-and-rollback)
 - [Triage by symptom](#triage-by-symptom)
 - [Resolved items](#resolved-items)
@@ -992,6 +993,210 @@ forwarded by XDP (and by VPP when steered) and never reaches kernel
 routing, these rules, or the platform's NAT. A `from` prefix that
 overlaps an `allow-prefix` is warned about at start and on reload, and
 wan-egress cannot affect those flows.
+
+## Restarts: the route ledger
+
+### What a restart cost, and what changed
+
+Every start used to load the route mirror from nothing. On the
+reference router the route source is FRR's bgpd over iBGP, and it sets
+the pace, not packetframe: measured 2026-10-07, the session came up at
+T, the mirror held 496k routes at T+4 min, and the full ~1.35M took
+about 11 minutes (~2,000 routes/s, bgpd at 80% CPU, packetframe's
+threads at ~7%). For those minutes the eBPF tier forwarded on a partial
+FIB (misses fell to `fallback-default` or the kernel), the completeness
+authority vetoed, and an unsteered VPP could not take its first steer.
+
+Now a clean stop leaves the mirror for the next start, and the next
+start seeds from it **before the route source connects**. The FIB is
+full within seconds of the start; the route source's replay then
+confirms it route by route instead of building it.
+
+### When it is written, and what is in it
+
+Only at a **clean preserving exit** — SIGTERM / `systemctl stop`, where
+the loader calls `Module::exit_preserving` just before it drops the
+modules. A crash, a `kill -9` or a circuit-breaker trip writes nothing,
+and the next start loads cold, as every start used to.
+
+The snapshot and the write (temp file, fsync, rename) share one **5 s
+budget**, so neither a wedged programmer nor a wedged filesystem can
+hold the exit. The write runs on a helper thread; past the deadline the
+stop gives up and goes on (`reason=... did not finish within its 5000
+ms budget ...`), and when the helper's I/O finally returns it removes
+its temp file instead of renaming it into place. So a stop that gave up
+leaves no ledger, and the next start loads cold. (A temp file left by a
+process that exited first is never read: a start opens only the
+ledger's own name, and the next write replaces it. The one outcome the
+deadline cannot settle is a rename already under way when it passes;
+`rename` is atomic, so that ends in a whole ledger or none, and the
+reason says so.)
+
+```
+preserved the route mirror as the route ledger: the next start seeds from it ...
+  prefixes_v4=... prefixes_v6=... bytes=... encode_ms=... write_ms=...
+# or
+the route mirror was not preserved; the next start loads it cold ... reason=...
+```
+
+- **File:** `<state-dir>/fast-path-route-ledger.bin`, ~14 bytes a route
+  (~19 MB for 1.1M IPv4 + 250k IPv6), written temp file → fsync →
+  rename through the same no-follow state-dir primitives as every other
+  record, mode 0600 and owned by the daemon's uid. A trailing checksum
+  covers all of it — integrity, not provenance: the next start reads it
+  only if its ownership and modes, and those of `state-dir` and its
+  ancestors, show no other account could have written it (`untrusted`
+  below). A keyed MAC would add nothing: its key would have to live
+  where other accounts cannot write, which is the same guarantee, one
+  file away.
+- **Contents:** every advertisement from the route source — prefix,
+  peer id, path id, nexthops, local-pref — and **nothing the neighbour
+  resolver injected** (`fallback-default`'s 0/0, the `local-prefix`
+  host routes). The resolver re-injects those at every start from the
+  live kernel, which is fresher than a file. Plus the format version,
+  the writing version, the write time, the route-source identity (mode,
+  listen address and port, ASNs, peer pin, and the `peer-from` ACL when
+  no pin names the speaker) and per-family counts.
+- **How old its routes are**, which is not always the write time. A
+  route the live session had not re-advertised by the stop — the session
+  was down (a `Resync` with no new session yet), or the stop came before
+  a previous seed's replay reached it — carries the time it was **last
+  confirmed**. The age check reads that, so a stale route cannot ride
+  from ledger to ledger across restarts that never reconcile it. The
+  `route_ledger_preserved` event carries `unconfirmed_for_secs` when this
+  applies.
+- **Cost, measured** (one run each, a Linux VM on Apple silicon; time it
+  on the gateway too): building the record from the mirror 340 ms for
+  1.35M routes; writing it ~10 ms; reading, removing and validating it
+  ~70 ms; seeding 1.35M routes into the real BPF maps 1.55 s.
+
+### What the next start does with it
+
+1. **Consumes it**, in every forwarding mode: read, then removed,
+   before anything else looks at it — whether or not it is used. A
+   crash loop never seeds from the same file twice, and a kernel-fib run
+   cannot leave a table that goes stale under it for a later
+   packetframe-fib start to find.
+2. **Checks it**, and refuses it by name — journal line
+   `route ledger not used; the route mirror loads cold`, event
+   `route_ledger_refused` with `reason`, and the `route-ledger` status
+   row:
+
+   | `reason` | When |
+   |---|---|
+   | `missing` | No file: the previous stop was not clean, preserved nothing, predates the ledger, or a full `packetframe detach` ran since |
+   | `disabled` | `route-ledger off`, and an earlier run had left one |
+   | `forwarding-mode` | Not `packetframe-fib`. `compare` validates the PacketFrame FIB against the kernel's, and stale seeded routes would read as disagreements |
+   | `no-route-source` | No `route-source`, so nothing could ever reconcile a seed |
+   | `unreadable` | It could not be read (I/O error, planted symlink); removed anyway |
+   | `untrusted` | Untrusted ownership/permissions: the file is not owned by the daemon's uid or is group- or world-writable, or so is the directory holding it, or an ancestor directory is owned by someone other than root or is writable by group or others without the sticky bit (so another account could rename `state-dir` away), or it is not a regular file. Judged on the open descriptors before a byte is read; removed unread. Its routes would be installed by root, so a file another account could have written is never trusted, whatever its checksum says. Fix the state-dir's ownership and modes (`chown root:root`, `chmod 755` or tighter) |
+   | `too-large` | Larger than the largest ledger a FIB at capacity could encode to (about 585 MB; a full table is ~19 MB). Judged from the file's size before a byte is read; removed unread |
+   | `unremovable` | It could not be removed, so it cannot be consumed once. Status degrades; remove it by hand |
+   | `corrupt` | Truncated, checksum mismatch, structurally wrong, empty, or naming a resolver peer id |
+   | `format-version` | Written by a build with another layout |
+   | `identity` | Written for a different route source (mode, address, port, ASNs or peer pin changed, or the `peer-from` ACL wherever no peer pin names the speaker: always for BMP, and for BGP without `peer-ip`). `router-id`, `anyip`, and the ACL under a `peer-ip` pin are not identity |
+   | `too-old` | Its oldest routes were last confirmed longer ago than `max-age` (default 30 minutes) |
+   | `clock` | Confirmed more than a minute in the future: the clock moved across the restart, so no age can be established |
+   | `peer-id` | A BGP ledger names a peer id this build's listener would not use for that route source (the id derivation changed between versions); seeded routes would never be replaced |
+
+3. **Seeds the mirror**, ahead of everything else the programmer does.
+   Every seeded advertisement goes in **unseen**, exactly as a session
+   loss (`Resync`) leaves the mirror. The route source may connect at
+   once: its UPDATEs queue behind the seed, never ahead of it. (Neighbour
+   events keep flowing between chunks of the seed, so the nexthops it
+   registers resolve while it runs. The resolver's own `fallback-default`
+   and `local-prefix` routes wait for it, too.) The second tier hears
+   every seeded route like any install. Event `route_ledger_seeded`.
+4. **Lets the live session reconcile it.** A re-advertisement of an
+   identical route marks it seen and changes nothing else: no FIB
+   write, no destination-cache flush, no route delta to VPP. A route
+   that changed while the daemon was down is an ordinary update. When
+   the session's initial dump goes quiet (`InitiationComplete`, 5 s of
+   silence), the GC removes every seeded route it did not re-advertise —
+   event `route_ledger_reconciled` with `gc_removed`.
+
+The staleness this accepts is the one a session loss already accepts:
+until the replay reaches a route, it forwards where it did when the
+daemon stopped. The age bound caps how far behind that can be.
+
+### What it means for the gates
+
+- **The completeness authority** (`integrity-authority frr` or `birdc`)
+  does **not** attest a seeded mirror until the route source's first
+  route has arrived. Until then FRR's count agrees with the seed by
+  construction, which says nothing about whether anything will ever
+  update it (a listener that never came up, an FRR that no longer peers
+  with this box). `frr` reports it as a disqualification — `the route
+  mirror was seeded from the route ledger and the route source has not
+  started streaming to this daemon yet` — and `birdc` withholds its
+  report. **The check after that runs the moment the first route
+  arrives**, not an interval later. From then on it is the ordinary
+  comparison: counts within 1% → `Converged`.
+- **vpp-offload, fresh VPP** (nothing to adopt — after a reboot, say):
+  routes install as the seed lands, and the verify hold releases on that
+  first attested check with the source's backlog drained. A first steer
+  no longer waits for the replay.
+- **vpp-offload, unsteered adopted VPP**: the adopted diff waits behind
+  the loaded-and-quiet gate, and "quiet" there counts every element the
+  route source streams, changed or not (see the vpp-offload runbook's
+  release-gate section — deliberately, since #153). The seed puts the
+  mirror over the floor at once, so the diff releases as soon as the
+  seed has been quiet for 2 s **if the route source has not started
+  streaming by then**; if it has, the diff waits for the replay to go
+  quiet, as before. The first steer after that verify still needs the
+  attested check.
+- **vpp-offload, steered adopted VPP**: unchanged — it stays steered
+  through the restart on its own preserved ledger, and its diff waits
+  for the replay to go quiet, as before.
+
+### What you see
+
+```
+route ledger accepted (consumed: the file is gone); seeding the route mirror ...
+route mirror seeded from the route ledger: forwarding on the previous process's table ...
+the route source's first route after the ledger seed arrived; its replay now confirms the seeded routes
+route ledger seed reconciled: the route source re-advertised the rest of the seeded table  gc_removed=N
+```
+
+`packetframe status` carries a `route-ledger` row whenever the
+PacketFrame FIB control plane runs: `seeded … from a ledger written … ago`
+and then `waiting for the route source's first route`, `the route
+source is replaying: N seeded advertisements not yet re-advertised`, and
+`reconciled … ago`; or `not used at this start (<reason>)`; or `off`.
+Textfile gauges:
+
+```
+packetframe_fib_route_ledger_seeded_routes{module="fast-path",family="ipv4|ipv6"}
+packetframe_fib_route_ledger_unconfirmed{module="fast-path"}   # falls to 0 as the replay confirms
+```
+
+### Turning it off, and `detach`
+
+```
+route-ledger off                 # every start loads cold
+route-ledger on max-age 600      # refuse ledgers whose routes are older than 10 minutes
+```
+
+Default `on`, `max-age 1800` (60..=86400 seconds). Reloadable: the stop
+writes according to the setting in force when it runs; the start reads
+the config it starts with.
+
+A full `packetframe detach` (and `detach --all`) removes the ledger:
+it is the recovery path, and the start after it should trust nothing a
+previous process preserved. `detach --keep-vpp` — the routine restart —
+keeps it.
+
+### Known limits
+
+- The GC needs the route source to pause for 5 s after its dump. A feed
+  that never pauses keeps seeded routes it no longer has until a later
+  session's GC — exactly what a session loss does today.
+- An ADD-PATH negotiation that differs from the previous run files the
+  live paths under different keys than the seeded ones, so both
+  contribute nexthops until the GC removes the seeded ones.
+- Over `route-source bmp`, the station counts seeded routes as an
+  earlier stream's: its feed raises after its first `InitiationComplete`
+  rather than on the first frame.
 
 ## Cutover and rollback
 

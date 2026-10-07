@@ -320,6 +320,23 @@ impl BmpStation {
             auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
             "BMP station listening"
         );
+        // The station's own start is a stream boundary too, and the
+        // mirror is asked here for the same reason it is at the others:
+        // a route ledger may have seeded it with the previous process's
+        // routes (or an earlier station instance on this retry loop left
+        // its stream's), and a first frame must not raise over floor
+        // credit no stream of this station earned. An empty mirror —
+        // every start without a seed — answers false, as before.
+        let stale = self.mirror_holds_state().await;
+        self.stale_state_possible
+            .store(stale, std::sync::atomic::Ordering::Relaxed);
+        if stale {
+            info!(
+                "BMP station: the route mirror already holds route-source routes (a ledger \
+                 seed, or an earlier stream); the feed raises after this stream's \
+                 InitiationComplete GC rather than on its first frame"
+            );
+        }
 
         // Optional stall monitor. Fires a warning log when no ROUTE
         // MONITORING frame arrives for `STALL_THRESHOLD` *and* the

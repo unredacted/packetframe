@@ -765,6 +765,14 @@ pub struct ActiveState {
     /// the SIGHUP reconcile. `detach` removes its rules; a drop (the
     /// preserve-attach exit) leaves them for the next start to adopt.
     pub wan_egress: Option<crate::wan_egress::WanEgress>,
+    /// The `route-ledger` directive in force. Refreshed by every SIGHUP
+    /// reconcile, because its write half runs at the preserving stop and
+    /// should honour the config in force then; its read half ran at this
+    /// start, from the config this start read.
+    pub route_ledger: packetframe_common::config::RouteLedgerSpec,
+    /// What this start did with the route ledger, and the seed's
+    /// progress since — shared with the control plane that applies it.
+    pub ledger_status: crate::fib::route_ledger::SharedLedgerStatus,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
@@ -888,7 +896,203 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         route_source_spec: route_source_spec_from_cfg(cfg),
         coalesce: coalesce_spec_from_cfg(cfg),
         wan_egress: None,
+        route_ledger: route_ledger_spec_from_cfg(cfg),
+        ledger_status: crate::fib::route_ledger::shared_status(),
     })
+}
+
+/// The `route-ledger` directive; absent ⇒ on, 30 minutes.
+pub(crate) fn route_ledger_spec_from_cfg(
+    cfg: &ModuleConfig<'_>,
+) -> packetframe_common::config::RouteLedgerSpec {
+    cfg.section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::RouteLedger { spec, .. } => Some(*spec),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The start's half of the route ledger: consume whatever `state-dir`
+/// holds, judge it against this config, say what happened (journal,
+/// event log, status), and hand back the seed if there is one.
+///
+/// Runs in every forwarding mode, so a start that will not use a ledger
+/// still consumes one: a kernel-fib run must not leave a table that goes
+/// stale under it for a later packetframe-fib start to find.
+fn take_route_ledger(
+    state: &ActiveState,
+    cfg: &ModuleConfig<'_>,
+) -> Option<crate::fib::route_ledger::RouteLedger> {
+    use crate::fib::route_ledger::{consume, Consumed, Expectations, StartReport};
+    use packetframe_common::events::{kind, Event};
+
+    let spec = state.route_ledger;
+    let forwarding_mode = forwarding_mode_from_cfg(cfg);
+    let identity = state
+        .route_source_spec
+        .as_ref()
+        .map(|s| s.ledger_identity());
+    // A BGP listener files every route under one peer id; a record
+    // naming any other cannot be reconciled by it.
+    let single_peer = match &state.route_source_spec {
+        Some(packetframe_common::config::RouteSourceSpec::Bgp {
+            addr,
+            port,
+            peer_as,
+            ..
+        }) => format!("{addr}:{port}")
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|listen| crate::fib::route_source_bgp::session_peer_id(listen, *peer_as)),
+        _ => None,
+    };
+    let exp = Expectations {
+        spec,
+        forwarding_mode,
+        identity: identity.as_deref(),
+        single_peer,
+        now_unix: crate::fib::route_ledger::now_unix(),
+    };
+    let outcome = consume(&state.state_dir, &exp);
+    let mut status = state.ledger_status.lock().expect("ledger status lock");
+    match outcome {
+        Consumed::Quiet => {
+            debug!("no route ledger to consider (route-ledger off, or not packetframe-fib)");
+            status.start = if spec.enabled {
+                // Compare mode runs the control plane, so the row shows;
+                // say why it never seeds rather than "not checked".
+                StartReport::Refused {
+                    code: "forwarding-mode",
+                    detail: crate::fib::route_ledger::Refusal::ForwardingMode(forwarding_mode)
+                        .describe(),
+                }
+            } else {
+                StartReport::Off
+            };
+            None
+        }
+        Consumed::Refused(r) => {
+            let detail = r.describe();
+            if r.is_warning() {
+                warn!(reason = r.code(), detail = %detail, "route ledger not used; the route mirror loads cold from the route source");
+            } else {
+                info!(reason = r.code(), detail = %detail, "route ledger not used; the route mirror loads cold from the route source");
+            }
+            let ev = if r.is_warning() {
+                Event::warn(MODULE_NAME, kind::ROUTE_LEDGER_REFUSED)
+            } else {
+                Event::info(MODULE_NAME, kind::ROUTE_LEDGER_REFUSED)
+            };
+            ev.field("reason", r.code()).detail(detail.clone()).emit();
+            status.start = if matches!(r, crate::fib::route_ledger::Refusal::Disabled) {
+                StartReport::Off
+            } else {
+                StartReport::Refused {
+                    code: r.code(),
+                    detail,
+                }
+            };
+            None
+        }
+        Consumed::Seed(ledger) => {
+            let age = exp.now_unix.saturating_sub(ledger.meta.written_at_unix);
+            info!(
+                prefixes_v4 = ledger.counts.v4.prefixes,
+                prefixes_v6 = ledger.counts.v6.prefixes,
+                advertisements = ledger.counts.advertisements(),
+                written_ago_secs = age,
+                writer_version = %ledger.meta.writer_version,
+                bytes = ledger.encoded_len(),
+                "route ledger accepted (consumed: the file is gone); seeding the route mirror \
+                 before the route source connects"
+            );
+            status.start = StartReport::Seeded;
+            // Present from here, so a completeness check that lands while
+            // the seed is still going in sees one and does not attest it.
+            status.seed = Some(crate::fib::route_ledger::SeedReport {
+                writer_version: ledger.meta.writer_version.clone(),
+                written_at_unix: ledger.meta.written_at_unix,
+                confirmed_at_unix: ledger.meta.confirmed_at_unix,
+                counts: ledger.counts,
+                applied_at: None,
+                apply_took: None,
+                failed: 0,
+                unconfirmed: ledger.counts.advertisements(),
+                stream_started_at: None,
+                reconciled: None,
+            });
+            Some(ledger)
+        }
+    }
+}
+
+/// The preserving stop's half of the route ledger: snapshot the mirror
+/// into `state-dir` for the next start, when the directive and the mode
+/// call for one. Bounded by the route ledger's own budget; never fails
+/// the exit.
+pub fn exit_preserving(state: &ActiveState) {
+    use packetframe_common::events::{kind, Event};
+
+    let Some(ctrl) = state.route_controller.as_ref() else {
+        return;
+    };
+    if !state.route_ledger.enabled {
+        info!("route ledger not preserved: `route-ledger off`");
+        return;
+    }
+    if state.route_source_spec.is_none() {
+        info!("route ledger not preserved: no `route-source`, so no start could match one");
+        return;
+    }
+    match ctrl.preserve_route_ledger(&state.state_dir) {
+        crate::fib::controller::Preserved::Written {
+            counts,
+            bytes,
+            confirmed_at_unix,
+            written_at_unix,
+            encode,
+            write,
+        } => {
+            let unconfirmed_secs = written_at_unix.saturating_sub(confirmed_at_unix);
+            info!(
+                prefixes_v4 = counts.v4.prefixes,
+                prefixes_v6 = counts.v6.prefixes,
+                advertisements = counts.advertisements(),
+                bytes,
+                encode_ms = encode.as_millis() as u64,
+                write_ms = write.as_millis() as u64,
+                unconfirmed_for_secs = unconfirmed_secs,
+                "preserved the route mirror as the route ledger: the next start seeds from it \
+                 instead of waiting for the route source's full replay"
+            );
+            let mut ev = Event::info(MODULE_NAME, kind::ROUTE_LEDGER_PRESERVED)
+                .field("preserved", true)
+                .field("routes_v4", u64::from(counts.v4.prefixes))
+                .field("routes_v6", u64::from(counts.v6.prefixes))
+                .field("advertisements", counts.advertisements())
+                .field("bytes", bytes as u64)
+                .field("encode_ms", encode.as_millis() as u64)
+                .field("write_ms", write.as_millis() as u64);
+            if unconfirmed_secs > 0 {
+                ev = ev.field("unconfirmed_for_secs", unconfirmed_secs);
+            }
+            ev.emit();
+        }
+        crate::fib::controller::Preserved::NotWritten(reason) => {
+            warn!(
+                reason = %reason,
+                "the route mirror was not preserved; the next start loads it cold from the \
+                 route source"
+            );
+            Event::warn(MODULE_NAME, kind::ROUTE_LEDGER_PRESERVED)
+                .field("preserved", false)
+                .field("reason", reason)
+                .emit();
+        }
+    }
 }
 
 /// The `coalesce` directive, if any (the parser refuses a second one).
@@ -1895,6 +2099,10 @@ pub fn attach(
         ),
     }
 
+    // The route ledger a clean stop left, consumed in every mode (see
+    // `take_route_ledger`) and seeded only under packetframe-fib.
+    let ledger_seed = take_route_ledger(state, cfg);
+
     // Start Option F's RouteController if the operator asked for the
     // PacketFrame FIB path. Uses `MapData::from_pin` internally, so it
     // must run after `pin_program_and_maps`. Kernel-fib mode skips
@@ -2084,6 +2292,14 @@ pub fn attach(
             crate::fib::controller::SecondTierSignals {
                 completeness,
                 feed_session,
+            },
+            crate::fib::controller::LedgerWiring {
+                seed: ledger_seed,
+                status: state.ledger_status.clone(),
+                identity: state
+                    .route_source_spec
+                    .as_ref()
+                    .map(|s| s.ledger_identity()),
             },
         )
         .map_err(|e| {
@@ -3490,6 +3706,21 @@ pub fn integrity_posture(state: &ActiveState) -> Option<crate::fib::integrity::I
     state.route_controller.as_ref()?.integrity_posture()
 }
 
+/// The route ledger's status, for the health and metrics surfaces.
+/// `None` in kernel-fib mode: no mirror, so no ledger to report on (a
+/// ledger such a start found was refused by name in the journal and the
+/// event log, which is where that belongs).
+pub fn route_ledger_status(state: &ActiveState) -> Option<crate::fib::route_ledger::LedgerStatus> {
+    state.route_controller.as_ref()?;
+    Some(
+        state
+            .ledger_status
+            .lock()
+            .expect("ledger status lock")
+            .clone(),
+    )
+}
+
 // Read current stats, aggregated across all CPUs.
 pub fn snapshot_stats(state: &ActiveState) -> ModuleResult<Vec<u64>> {
     use aya::maps::PerCpuArray;
@@ -4080,6 +4311,8 @@ mod tests {
             route_source_spec: None,
             coalesce: None,
             wan_egress: None,
+            route_ledger: packetframe_common::config::RouteLedgerSpec::default(),
+            ledger_status: crate::fib::route_ledger::shared_status(),
         };
 
         let bridge_idx = if_nametoindex(BRIDGE).unwrap();

@@ -139,6 +139,17 @@ pub mod kind {
     /// `wan-egress` put back policy rules that had disappeared from the
     /// kernel under an unchanged config. Rate-limited at the source.
     pub const WAN_EGRESS_REPAIRED: &str = "wan_egress_repaired";
+    /// A clean stop preserved (or failed to preserve) the route mirror
+    /// as the fast-path route ledger.
+    pub const ROUTE_LEDGER_PRESERVED: &str = "route_ledger_preserved";
+    /// A start seeded the route mirror from the route ledger.
+    pub const ROUTE_LEDGER_SEEDED: &str = "route_ledger_seeded";
+    /// A start found no usable route ledger; `reason` says why
+    /// (`missing` included), and the mirror loads cold.
+    pub const ROUTE_LEDGER_REFUSED: &str = "route_ledger_refused";
+    /// The route source's first completed initial dump after a seed
+    /// garbage-collected what it did not re-advertise.
+    pub const ROUTE_LEDGER_RECONCILED: &str = "route_ledger_reconciled";
 
     // --- the event log itself (module `event-log`) ---
     pub const EVENTS_DROPPED: &str = "events_dropped";

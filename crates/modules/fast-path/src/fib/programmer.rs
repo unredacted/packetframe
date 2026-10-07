@@ -64,6 +64,10 @@ use crate::fib::local_nexthops::{
     awaiting_summary, kernel_local_addrs, LocalNexthops, NeighVerdict, SlotAction,
 };
 use crate::fib::netlink_neigh::NeighborResolveHandle;
+use crate::fib::route_ledger::{
+    AdvertRef, LedgerAdvert, LedgerCounts, LedgerEncoder, LedgerMeta, RouteCursor, RouteLedger,
+    SeedReport, SharedLedgerStatus, StartReport,
+};
 use crate::fib::types::{
     EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, ECMP_NH_UNUSED, FIB_KIND_ECMP, MAX_ECMP_PATHS,
     NH_FAMILY_V4, NH_FAMILY_V6, NH_STATE_FAILED, NH_STATE_INCOMPLETE, NH_STATE_RESOLVED,
@@ -76,18 +80,10 @@ use crate::pin;
 /// to the BMP reader which is correct.
 const COMMAND_CAPACITY: usize = 8_192;
 
-/// Capped by `NEXTHOPS_MAX_ENTRIES` in bpf/src/maps.rs. Keep in sync
-/// if either side changes.
-pub const NEXTHOPS_CAP: u32 = 8_192;
-
-/// Capped by `FIB_V4_MAX_ENTRIES` in bpf/src/maps.rs.
-pub const FIB_V4_CAP: u32 = 2_097_152;
-
-/// Capped by `FIB_V6_MAX_ENTRIES` in bpf/src/maps.rs.
-pub const FIB_V6_CAP: u32 = 1_048_576;
-
-/// Capped by `ECMP_GROUPS_MAX_ENTRIES` in bpf/src/maps.rs.
-pub const ECMP_GROUPS_CAP: u32 = 1_024;
+// The map capacities live with the other BPF mirrors in `types` (the
+// route ledger's size bound reads them on every platform); re-exported
+// here, where their users have always found them.
+pub use crate::fib::types::{ECMP_GROUPS_CAP, FIB_V4_CAP, FIB_V6_CAP, NEXTHOPS_CAP};
 
 /// Default-route (0.0.0.0/0 and ::/0) ID-reclaim grace period. An
 /// atomic `FibValue` overwrite is instantaneous from the BPF
@@ -135,6 +131,16 @@ const REPROBE_MAX: Duration = Duration::from_secs(60);
 /// of nexthops) cannot saturate the resolver queue in one burst; what
 /// does not fit stays due and goes next tick.
 const REPROBE_BATCH: usize = 256;
+/// Ledger routes applied per pass of the run loop while a seed is going
+/// in. Between passes the loop serves neighbour events and its timers —
+/// so nexthops the seed registers resolve while it is still running —
+/// but never a command: every route event, and every question about the
+/// mirror, waits until the seed is whole. That ordering is the seed's
+/// correctness: a live advertisement applied first and then overwritten
+/// by its stale seeded copy would be garbage-collected as unseen at the
+/// next `InitiationComplete`, deleting a route the source still has.
+const SEED_CHUNK: usize = 2048;
+
 /// How often the pending re-probe set is summarised at info while it
 /// is non-empty. One line a minute at most, so a chronic loss is
 /// visible in the journal without a flapping neighbour flooding it.
@@ -331,6 +337,29 @@ impl FibProgrammerHandle {
             .map_err(|_| ProgrammerError::Shutdown)?;
         rx.await.map_err(|_| ProgrammerError::Shutdown)
     }
+
+    /// Snapshot the mirror's route-source advertisements as a route
+    /// ledger record for `identity` (the configured route source),
+    /// stamped `written_at_unix`. Queued behind every command already
+    /// sent, so it describes the mirror after them. `Err` with nothing to
+    /// preserve, or with the programmer gone.
+    pub async fn encode_ledger(
+        &self,
+        identity: String,
+        written_at_unix: u64,
+    ) -> Result<EncodedLedger, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::EncodeLedger {
+                identity,
+                written_at_unix,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| ProgrammerError::Shutdown.to_string())?;
+        rx.await
+            .map_err(|_| ProgrammerError::Shutdown.to_string())?
+    }
 }
 
 /// Shared log of every [`RouteEvent`] a [`recording_handle`] observed,
@@ -369,6 +398,14 @@ impl RouteEventLog {
 /// recorded events are observable.
 #[doc(hidden)]
 pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
+    recording_handle_reporting((0, 0))
+}
+
+/// [`recording_handle`], answering `mirror_counts` with `counts` — for
+/// the authority tests, which need a mirror that can agree with the
+/// authority's count.
+#[doc(hidden)]
+pub fn recording_handle_reporting(counts: (usize, usize)) -> (FibProgrammerHandle, RouteEventLog) {
     let (tx, mut rx) = mpsc::channel::<Command>(256);
     let log = RouteEventLog::default();
     let sink = log.clone();
@@ -392,13 +429,16 @@ pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
                     let _ = reply.send(Ok(()));
                 }
                 Command::MirrorCounts { reply } => {
-                    let _ = reply.send((0, 0));
+                    let _ = reply.send(counts);
                 }
                 Command::HasSessionRoutes { reply } => {
                     let _ = reply.send(false);
                 }
                 Command::SessionFamilies { reply } => {
                     let _ = reply.send((false, false));
+                }
+                Command::EncodeLedger { reply, .. } => {
+                    let _ = reply.send(Err("a recording handle holds no mirror".into()));
                 }
                 // Fire-and-forget; nothing to record or reply to.
                 Command::SetCacheEnabled { .. } | Command::SetNexthopPin { .. } => {}
@@ -451,6 +491,13 @@ enum Command {
     /// write. Idempotent: repeats with an unchanged pin are absorbed
     /// by the stored-state comparison.
     SetNexthopPin { ip: IpAddr, pin: Option<(u32, u16)> },
+    /// Snapshot the mirror's route-source advertisements as a route
+    /// ledger record. See [`FibProgrammerHandle::encode_ledger`].
+    EncodeLedger {
+        identity: String,
+        written_at_unix: u64,
+        reply: oneshot::Sender<Result<EncodedLedger, String>>,
+    },
 }
 
 /// Per-nexthop state tracked in userspace. Refcount lets multiple
@@ -774,6 +821,54 @@ pub struct FibProgrammer {
     /// the kernel never resolves and nothing re-probes
     /// ([`super::local_nexthops`]). Re-read with every re-probe summary.
     local: LocalNexthops,
+
+    // --- Route ledger ---
+    /// A ledger to seed the mirror from, handed over before `run` (see
+    /// [`Self::set_seed`]) and applied in [`SEED_CHUNK`]s at the top of
+    /// the run loop. `None` once applied.
+    seed: Option<PendingSeed>,
+    /// Route-source advertisements currently `seen_this_session = false`:
+    /// seeded and not yet re-advertised, or inherited across a `Resync`.
+    /// Maintained at every site that inserts, replaces or removes an
+    /// advertisement, and recounted at `Resync` and `InitiationComplete`.
+    unseen_session: u64,
+    /// Wall-clock seconds at which the oldest still-unseen route-source
+    /// advertisement was last confirmed by a live session: the session
+    /// loss a `Resync` reports, or a seed's own confirmation time. `None`
+    /// once a GC has removed every unseen one. Written into the ledger at
+    /// a stop, so a route nobody re-confirmed cannot be carried forward
+    /// as fresh by restarts that never reconcile it.
+    unconfirmed_since: Option<u64>,
+    /// Where the seed's progress is reported. `None` in harnesses.
+    ledger_status: Option<SharedLedgerStatus>,
+    /// A seed was applied and the first `InitiationComplete` after it has
+    /// not run yet: its progress is still worth reporting.
+    seed_open: bool,
+    /// The live route source has delivered its first route since the
+    /// seed.
+    seed_stream_started: bool,
+}
+
+/// A seed being applied: the validated ledger, how far in, and what it
+/// has cost so far.
+struct PendingSeed {
+    ledger: RouteLedger,
+    cursor: RouteCursor,
+    started: Instant,
+    advertisements: u64,
+    failed: u64,
+    first_error: Option<String>,
+}
+
+/// A snapshot of the mirror as a ledger, ready to write.
+#[derive(Debug)]
+pub struct EncodedLedger {
+    pub bytes: Vec<u8>,
+    pub counts: LedgerCounts,
+    /// See [`LedgerMeta::confirmed_at_unix`].
+    pub confirmed_at_unix: u64,
+    /// Time the programmer spent building it.
+    pub took: Duration,
 }
 
 /// One pending re-probe. `attempts` drives the backoff.
@@ -923,9 +1018,43 @@ impl FibProgrammer {
                 reprobe_recoveries: 0,
                 reprobe_last_stats: Instant::now(),
                 local: LocalNexthops::new(kernel_local_addrs()),
+                seed: None,
+                unseen_session: 0,
+                unconfirmed_since: None,
+                ledger_status: None,
+                seed_open: false,
+                seed_stream_started: false,
             },
             FibProgrammerHandle { tx: cmd_tx },
         )
+    }
+
+    /// Seed the mirror from a route ledger before serving anything else.
+    ///
+    /// Same window as [`Self::set_route_sink`], for a stronger reason: the
+    /// seed must be in the mirror before the first route event is
+    /// applied, or a stale seeded advertisement could replace a live one
+    /// (see [`SEED_CHUNK`]). `run` applies it first; commands queue
+    /// behind it.
+    ///
+    /// Every advertisement goes in `seen_this_session = false`, exactly
+    /// as a `Resync` would leave it: the live session's re-advertisements
+    /// mark them seen, and its `InitiationComplete` GCs the rest.
+    pub fn set_seed(&mut self, ledger: RouteLedger) {
+        self.seed = Some(PendingSeed {
+            cursor: ledger.cursor(),
+            ledger,
+            started: Instant::now(),
+            advertisements: 0,
+            failed: 0,
+            first_error: None,
+        });
+    }
+
+    /// Report the seed's progress (and the start's outcome, which the
+    /// caller has already recorded there) through `status`.
+    pub fn set_ledger_status(&mut self, status: SharedLedgerStatus) {
+        self.ledger_status = Some(status);
     }
 
     /// Register the second forwarding tier's sink.
@@ -962,6 +1091,11 @@ impl FibProgrammer {
                     info!("FibProgrammer shutdown requested");
                     return;
                 }
+                // The seed, a chunk at a time, while commands wait: see
+                // SEED_CHUNK for why no route event may overtake it.
+                () = std::future::ready(()), if self.seed.is_some() => {
+                    self.seed_chunk();
+                }
                 _ = reprobe_tick.tick() => {
                     self.fire_due_reprobes();
                 }
@@ -973,7 +1107,7 @@ impl FibProgrammer {
                         }
                     }
                 }
-                cmd = self.cmd_rx.recv() => {
+                cmd = self.cmd_rx.recv(), if self.seed.is_none() => {
                     match cmd {
                         Some(c) => self.on_command(c),
                         None => {
@@ -1044,7 +1178,368 @@ impl FibProgrammer {
             }
             Command::SetCacheEnabled { on } => self.set_cache_enabled(on),
             Command::SetNexthopPin { ip, pin } => self.set_nexthop_pin(ip, pin),
+            Command::EncodeLedger {
+                identity,
+                written_at_unix,
+                reply,
+            } => {
+                let _ = reply.send(self.encode_ledger(identity, written_at_unix));
+            }
         }
+    }
+
+    // --- Route ledger ---
+
+    /// Apply the next [`SEED_CHUNK`] routes of the pending seed, finishing
+    /// it when the ledger runs out.
+    fn seed_chunk(&mut self) {
+        let Some(mut p) = self.seed.take() else {
+            return;
+        };
+        for _ in 0..SEED_CHUNK {
+            let Some(route) = p.ledger.next_route(&mut p.cursor) else {
+                self.finish_seed(p);
+                return;
+            };
+            let prefix = route.prefix;
+            for a in route.adverts {
+                if self.seed_advertisement(prefix, a) {
+                    p.advertisements += 1;
+                }
+            }
+            if let Err(e) = self.recompute_fib_entry(prefix) {
+                // Left in the mirror exactly as a failed live install
+                // would be; the next change to the prefix retries it.
+                p.failed += 1;
+                if p.first_error.is_none() {
+                    p.first_error = Some(format!("{prefix:?}: {e}"));
+                }
+            }
+        }
+        self.seed = Some(p);
+    }
+
+    /// Insert one seeded advertisement, unseen. Never over an existing
+    /// one: nothing can precede the seed today (commands wait for it),
+    /// and if anything ever did it would be fresher than the ledger.
+    fn seed_advertisement(&mut self, prefix: IpPrefix, a: LedgerAdvert) -> bool {
+        let key = (a.peer, a.path_id);
+        let rec = self.upsert_empty_record(prefix);
+        let inserted = match rec.advertisements.entry(key) {
+            std::collections::btree_map::Entry::Occupied(_) => false,
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(Advertisement {
+                    nexthops: a.nexthops,
+                    local_pref: a.local_pref,
+                    seen_this_session: false,
+                });
+                true
+            }
+        };
+        self.routes_by_peer
+            .entry(a.peer)
+            .or_default()
+            .insert(prefix_peer_key(&prefix));
+        if inserted {
+            self.unseen_session += 1;
+        }
+        inserted
+    }
+
+    fn finish_seed(&mut self, p: PendingSeed) {
+        let took = p.started.elapsed();
+        let meta = &p.ledger.meta;
+        let counts = p.ledger.counts;
+        // The seed's routes were last confirmed when the ledger says;
+        // anything already unconfirmed (nothing, at a start) keeps the
+        // older time.
+        self.unconfirmed_since = Some(
+            self.unconfirmed_since
+                .map_or(meta.confirmed_at_unix, |t| t.min(meta.confirmed_at_unix)),
+        );
+        // Open until the first GC, whatever was inserted: the status
+        // reports a seed from here, and it is the stream's first route
+        // that lifts its attestation block — which only an open seed
+        // records.
+        self.seed_open = true;
+        if p.advertisements < counts.advertisements() {
+            // `decode` walked the whole record, so this means the record
+            // changed under us or a read failed regardless — say so
+            // rather than report a whole seed.
+            warn!(
+                seeded = p.advertisements,
+                recorded = counts.advertisements(),
+                "route ledger seed stopped short of the record"
+            );
+        }
+        let age = super::route_ledger::now_unix().saturating_sub(meta.written_at_unix);
+        info!(
+            prefixes_v4 = counts.v4.prefixes,
+            prefixes_v6 = counts.v6.prefixes,
+            advertisements = p.advertisements,
+            written_ago_secs = age,
+            took_ms = took.as_millis() as u64,
+            failed = p.failed,
+            first_error = p.first_error.as_deref().unwrap_or(""),
+            "route mirror seeded from the route ledger: forwarding on the previous process's \
+             table while the route source replays it; its re-advertisements confirm each \
+             route and its InitiationComplete removes what it no longer has"
+        );
+        let mut ev = packetframe_common::events::Event::info(
+            crate::MODULE_NAME,
+            packetframe_common::events::kind::ROUTE_LEDGER_SEEDED,
+        )
+        .field("routes_v4", u64::from(counts.v4.prefixes))
+        .field("routes_v6", u64::from(counts.v6.prefixes))
+        .field("advertisements", p.advertisements)
+        .field("age_secs", age)
+        .field("writer_version", meta.writer_version.clone())
+        .field("took_ms", took.as_millis() as u64);
+        if p.failed > 0 {
+            ev = ev.field("failed", p.failed);
+        }
+        ev.emit();
+        if let Some(status) = &self.ledger_status {
+            let mut st = status.lock().expect("ledger status lock");
+            st.start = StartReport::Seeded;
+            st.seed = Some(SeedReport {
+                writer_version: meta.writer_version.clone(),
+                written_at_unix: meta.written_at_unix,
+                confirmed_at_unix: meta.confirmed_at_unix,
+                counts,
+                applied_at: Some(Instant::now()),
+                apply_took: Some(took),
+                failed: p.failed,
+                unconfirmed: self.unseen_session,
+                stream_started_at: None,
+                reconciled: None,
+            });
+        }
+    }
+
+    /// Bookkeeping for a route-source advertisement or withdrawal having
+    /// reached the mirror: the first one after a seed is the live session
+    /// speaking.
+    fn note_session_route(&mut self, peer: PeerId) {
+        if !self.seed_open || self.seed_stream_started || !is_session_peer(peer) {
+            return;
+        }
+        self.seed_stream_started = true;
+        info!(
+            unconfirmed = self.unseen_session,
+            "the route source's first route after the ledger seed arrived; its replay now \
+             confirms the seeded routes"
+        );
+        if let Some(status) = &self.ledger_status {
+            if let Some(s) = status.lock().expect("ledger status lock").seed.as_mut() {
+                s.stream_started_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// A route-source advertisement that was unseen is gone or now seen.
+    fn note_unseen_cleared(&mut self, peer: PeerId, prior_unseen: bool) {
+        if !prior_unseen || !is_session_peer(peer) {
+            return;
+        }
+        self.unseen_session = self.unseen_session.saturating_sub(1);
+        self.publish_unconfirmed();
+    }
+
+    fn publish_unconfirmed(&self) {
+        if !self.seed_open {
+            return;
+        }
+        if let Some(status) = &self.ledger_status {
+            if let Some(s) = status.lock().expect("ledger status lock").seed.as_mut() {
+                s.unconfirmed = self.unseen_session;
+            }
+        }
+    }
+
+    /// Route-source advertisements currently unseen, counted afresh.
+    fn count_unseen_session(&self) -> u64 {
+        let count = |recs: &mut dyn Iterator<Item = &RouteRecord>| -> u64 {
+            recs.flat_map(|r| r.advertisements.iter())
+                .filter(|((p, _), a)| is_session_peer(*p) && !a.seen_this_session)
+                .count() as u64
+        };
+        count(&mut self.routes_v4.values()) + count(&mut self.routes_v6.values())
+    }
+
+    /// After a `Resync` marked the route source's advertisements unseen:
+    /// they are unconfirmed from now — or from earlier, if a seed or a
+    /// previous loss is still unreconciled.
+    fn after_resync(&mut self) {
+        self.unseen_session = self.count_unseen_session();
+        if self.unseen_session > 0 {
+            let now = super::route_ledger::now_unix();
+            self.unconfirmed_since = Some(self.unconfirmed_since.map_or(now, |t| t.min(now)));
+        }
+        self.publish_unconfirmed();
+    }
+
+    /// After an `InitiationComplete` GC: nothing unseen is left, so
+    /// nothing is unconfirmed. The first such GC after a seed closes it.
+    fn after_gc(&mut self, removed: Option<usize>) {
+        self.unseen_session = self.count_unseen_session();
+        if self.unseen_session == 0 {
+            self.unconfirmed_since = None;
+        }
+        if !self.seed_open {
+            return;
+        }
+        self.seed_open = false;
+        // The reconciliation is itself proof that a live session spoke:
+        // only a route source dispatches `InitiationComplete`, and only
+        // after a stream of its own. A session whose only UPDATE was an
+        // empty End-of-RIB (or a BMP stream whose route monitoring
+        // carried no route) gets here with no Add or Del, so
+        // `note_session_route` never ran; without this its seed stayed
+        // "not yet spoken to" and blocked attestation for good.
+        self.seed_stream_started = true;
+        let removed = removed.unwrap_or(0) as u64;
+        info!(
+            gc_removed = removed,
+            "route ledger seed reconciled: the route source re-advertised the rest of the \
+             seeded table"
+        );
+        packetframe_common::events::Event::info(
+            crate::MODULE_NAME,
+            packetframe_common::events::kind::ROUTE_LEDGER_RECONCILED,
+        )
+        .field("gc_removed", removed)
+        .emit();
+        if let Some(status) = &self.ledger_status {
+            if let Some(s) = status.lock().expect("ledger status lock").seed.as_mut() {
+                let now = Instant::now();
+                s.unconfirmed = self.unseen_session;
+                s.reconciled = Some((now, removed));
+                s.stream_started_at.get_or_insert(now);
+            }
+        }
+    }
+
+    /// The mirror's route-source advertisements as a ledger record.
+    ///
+    /// Two passes over the mirror: the first interns peers and nexthops
+    /// and counts, so the header is written once and exactly; the second
+    /// writes the routes straight out of the mirror without copying them.
+    /// The neighbour resolver's `local_arp` advertisements are left out —
+    /// it re-injects them at every start from the live kernel.
+    fn encode_ledger(
+        &self,
+        identity: String,
+        written_at_unix: u64,
+    ) -> Result<EncodedLedger, String> {
+        let started = Instant::now();
+        let session = |p: &PeerId, a: &Advertisement| is_session_peer(*p) && !a.nexthops.is_empty();
+        let mut peers: Vec<PeerId> = Vec::new();
+        let mut peer_set: HashSet<PeerId> = HashSet::new();
+        let mut nexthops: Vec<IpAddr> = Vec::new();
+        let mut nh_set: HashSet<IpAddr> = HashSet::new();
+        let mut counts = LedgerCounts::default();
+        let mut any_unseen = false;
+        let mut tally = |recs: &mut dyn Iterator<Item = &RouteRecord>,
+                         fam: &mut super::route_ledger::FamilyCounts| {
+            for rec in recs {
+                let mut n = 0u32;
+                for ((peer, _), adv) in &rec.advertisements {
+                    if !session(peer, adv) {
+                        continue;
+                    }
+                    n += 1;
+                    any_unseen |= !adv.seen_this_session;
+                    if peer_set.insert(*peer) {
+                        peers.push(*peer);
+                    }
+                    for nh in &adv.nexthops {
+                        if nh_set.insert(*nh) {
+                            nexthops.push(*nh);
+                        }
+                    }
+                }
+                if n > 0 {
+                    fam.prefixes += 1;
+                    fam.advertisements += n;
+                }
+            }
+        };
+        tally(&mut self.routes_v4.values(), &mut counts.v4);
+        tally(&mut self.routes_v6.values(), &mut counts.v6);
+        if counts.prefixes() == 0 {
+            return Err("the route mirror holds no route-source advertisements".into());
+        }
+        // A route nobody has re-confirmed carries the time it was last
+        // confirmed; with no such time on record (which no path produces)
+        // the epoch, so the next start refuses it as too old rather than
+        // trusting it as fresh.
+        let confirmed_at_unix = if any_unseen {
+            self.unconfirmed_since.unwrap_or(0).min(written_at_unix)
+        } else {
+            written_at_unix
+        };
+        let meta = LedgerMeta {
+            writer_version: env!("CARGO_PKG_VERSION").to_string(),
+            written_at_unix,
+            confirmed_at_unix,
+            identity,
+        };
+        let mut enc = LedgerEncoder::new(&meta, counts, &peers, &nexthops);
+        let mut scratch: Vec<AdvertRef<'_>> = Vec::new();
+        for ((addr, prefix_len), rec) in &self.routes_v4 {
+            scratch.clear();
+            scratch.extend(
+                rec.advertisements
+                    .iter()
+                    .filter(|((p, _), a)| session(p, a))
+                    .map(|((peer, path_id), a)| AdvertRef {
+                        peer: *peer,
+                        path_id: *path_id,
+                        local_pref: a.local_pref,
+                        nexthops: &a.nexthops,
+                    }),
+            );
+            if !scratch.is_empty() {
+                enc.route(
+                    IpPrefix::V4 {
+                        addr: *addr,
+                        prefix_len: *prefix_len,
+                    },
+                    &scratch,
+                )?;
+            }
+        }
+        for ((addr, prefix_len), rec) in &self.routes_v6 {
+            scratch.clear();
+            scratch.extend(
+                rec.advertisements
+                    .iter()
+                    .filter(|((p, _), a)| session(p, a))
+                    .map(|((peer, path_id), a)| AdvertRef {
+                        peer: *peer,
+                        path_id: *path_id,
+                        local_pref: a.local_pref,
+                        nexthops: &a.nexthops,
+                    }),
+            );
+            if !scratch.is_empty() {
+                enc.route(
+                    IpPrefix::V6 {
+                        addr: *addr,
+                        prefix_len: *prefix_len,
+                    },
+                    &scratch,
+                )?;
+            }
+        }
+        let bytes = enc.finish()?;
+        Ok(EncodedLedger {
+            bytes,
+            counts,
+            confirmed_at_unix,
+            took: started.elapsed(),
+        })
     }
 
     /// v0.2.9 FDB-pin: record the resolver's pin decision for `ip`
@@ -1844,14 +2339,21 @@ impl FibProgrammer {
                 nexthops,
                 path_id,
                 local_pref,
-            } => self.add_route(peer_id, prefix, nexthops, path_id, local_pref),
+            } => {
+                self.note_session_route(peer_id);
+                self.add_route(peer_id, prefix, nexthops, path_id, local_pref)
+            }
             RouteEvent::Del {
                 peer_id,
                 prefix,
                 path_id,
-            } => self.del_route(peer_id, prefix, path_id),
+            } => {
+                self.note_session_route(peer_id);
+                self.del_route(peer_id, prefix, path_id)
+            }
             RouteEvent::Resync => {
                 let marked = self.mark_session_unseen();
+                self.after_resync();
                 info!(
                     marked,
                     "Resync: route-source advertisements marked not-seen-this-session"
@@ -1859,7 +2361,12 @@ impl FibProgrammer {
                 Ok(())
             }
             RouteEvent::InitiationComplete => {
-                let gc_count = self.gc_unseen()?;
+                // The bookkeeping runs whatever the GC's outcome: a failed
+                // recompute leaves the prefix owed, but the unseen
+                // advertisements are already out of the mirror.
+                let gc = self.gc_unseen();
+                self.after_gc(gc.as_ref().ok().copied());
+                let gc_count = gc?;
                 info!(
                     gc_count,
                     "InitiationComplete: garbage-collected unseen advertisements"
@@ -2064,11 +2571,12 @@ impl FibProgrammer {
             seen_this_session: true,
         };
         let rec = self.upsert_empty_record(prefix);
-        rec.advertisements.insert(key, adv);
+        let prior = rec.advertisements.insert(key, adv);
         self.routes_by_peer
             .entry(peer_id)
             .or_default()
             .insert(prefix_peer_key(&prefix));
+        self.note_unseen_cleared(peer_id, prior.is_some_and(|p| !p.seen_this_session));
     }
 
     /// Remove a single advertisement. Returns `true` when an entry
@@ -2082,13 +2590,15 @@ impl FibProgrammer {
         path_id: Option<u32>,
     ) -> bool {
         let removed = match self.lookup_mirror_mut(prefix) {
-            Some(rec) => rec.advertisements.remove(&(peer_id, path_id)).is_some(),
-            None => false,
+            Some(rec) => rec.advertisements.remove(&(peer_id, path_id)),
+            None => None,
         };
-        if removed {
-            self.maybe_clear_peer_index(peer_id, prefix);
-        }
-        removed
+        let Some(removed) = removed else {
+            return false;
+        };
+        self.maybe_clear_peer_index(peer_id, prefix);
+        self.note_unseen_cleared(peer_id, !removed.seen_this_session);
+        true
     }
 
     /// Remove every advertisement on `prefix` that originated from
@@ -2096,14 +2606,26 @@ impl FibProgrammer {
     /// cleanup is the caller's responsibility (typically a bulk
     /// `drop_routes_for_peer`).
     fn drain_peer_advertisements(&mut self, peer_id: PeerId, prefix: &IpPrefix) -> usize {
-        match self.lookup_mirror_mut(prefix) {
+        let (drained, unseen) = match self.lookup_mirror_mut(prefix) {
             Some(rec) => {
                 let before = rec.advertisements.len();
-                rec.advertisements.retain(|(p, _), _| *p != peer_id);
-                before - rec.advertisements.len()
+                let mut unseen = 0usize;
+                rec.advertisements.retain(|(p, _), a| {
+                    let drop = *p == peer_id;
+                    if drop && !a.seen_this_session {
+                        unseen += 1;
+                    }
+                    !drop
+                });
+                (before - rec.advertisements.len(), unseen)
             }
-            None => 0,
+            None => (0, 0),
+        };
+        if unseen > 0 && is_session_peer(peer_id) {
+            self.unseen_session = self.unseen_session.saturating_sub(unseen as u64);
+            self.publish_unconfirmed();
         }
+        drained
     }
 
     /// Drop `prefix` from `routes_by_peer[peer_id]` when the peer has

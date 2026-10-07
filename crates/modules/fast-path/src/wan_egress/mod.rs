@@ -130,6 +130,16 @@ impl Teardown {
     pub fn removes_wan_egress_rules(self) -> bool {
         self == Self::Full
     }
+
+    /// Whether the fast-path route ledger goes too. A full detach is the
+    /// recovery path, and the start after it should trust nothing a
+    /// previous process preserved; `--keep-vpp` is the routine restart
+    /// the ledger exists for. (A breaker trip never finds one: a running
+    /// daemon consumed its ledger at start, and only a clean stop
+    /// writes the next.)
+    pub fn removes_route_ledger(self) -> bool {
+        self == Self::Full
+    }
 }
 
 /// The resolved directive: sources, and the full keep set.

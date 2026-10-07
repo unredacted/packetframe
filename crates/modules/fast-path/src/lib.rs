@@ -284,6 +284,17 @@ impl Module for FastPathModule {
         self.breaker_tripped = true;
     }
 
+    /// The preserving exit: leave the route mirror for the next start as
+    /// the route ledger ([`fib::route_ledger`]). Bounded, and never fails
+    /// the exit — a ledger that cannot be written is a cold reload next
+    /// time, which is what every start used to be.
+    #[cfg(target_os = "linux")]
+    fn exit_preserving(&mut self) {
+        if let Some(state) = self.state.as_ref() {
+            linux_impl::exit_preserving(state);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn detach(&mut self) -> ModuleResult<()> {
         if let Some(mut state) = self.state.take() {
@@ -310,6 +321,13 @@ impl Module for FastPathModule {
     fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
         if let Some(w) = self.state.as_ref().and_then(|s| s.wan_egress.as_ref()) {
             w.status().render_metrics(out.out);
+        }
+        if let Some(l) = self
+            .state
+            .as_ref()
+            .and_then(linux_impl::route_ledger_status)
+        {
+            l.render_metrics(out.out);
         }
         Ok(())
     }
@@ -338,6 +356,10 @@ impl Module for FastPathModule {
     /// A second row, `wan-egress`, whenever that directive is in force
     /// (in any forwarding mode): the policy rules in place, or why
     /// they are not.
+    ///
+    /// A third, `route-ledger`, whenever the PacketFrame FIB control
+    /// plane runs: seeded from a ledger (and how far the route source's
+    /// replay has confirmed it), or why this start loaded cold.
     #[cfg(target_os = "linux")]
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
         let mut subsystems: Vec<_> = self
@@ -349,6 +371,16 @@ impl Module for FastPathModule {
             .collect();
         if let Some(w) = self.state.as_ref().and_then(|s| s.wan_egress.as_ref()) {
             subsystems.push(w.status().subsystem_health(std::time::Instant::now()));
+        }
+        // `route-ledger`, whenever the PacketFrame FIB control plane runs:
+        // what this start did with the ledger, and how the seed is doing.
+        if let Some(l) = self
+            .state
+            .as_ref()
+            .and_then(linux_impl::route_ledger_status)
+        {
+            subsystems
+                .push(l.subsystem_health(fib::route_ledger::now_unix(), std::time::Instant::now()));
         }
         // `worse_of` rather than a hand-rolled escalation: a module that
         // reports Healthy over a Degraded subsystem disagrees with its
