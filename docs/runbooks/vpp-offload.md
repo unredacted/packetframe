@@ -765,13 +765,29 @@ when **all** of these hold:
 
 - the mirror holds a seed no route-source GC has reconciled yet (the
   fast-path marks the feed session when it hands the seed over);
-- the feed session is up — the route source is streaming to this
-  process now;
+- the feed session is up, and it is still the FIRST session of this
+  process — the route source is streaming now and has not dropped and
+  reconnected since;
 - the completeness authority's current word is yes: its last report
   permits steering and its count is within 1% of the mirror as it is now
   (the fast-path authorities never attest a seed before the route
-  source's first route, so this also proves the stream has spoken);
+  source's first route, so in the first session this also proves the
+  report was taken while that stream was live);
 - the floor.
+
+**A reconnect shuts this door for good.** After it, a cached yes may
+predate the new stream, and a newer one proves no more than it does
+for the steered stages after a flap (above): counts over a mirror
+being re-announced stay aligned whether or not the new stream has
+caught up. The replay then has to go quiet, as for any mirror; the
+first GC would end the seed anyway.
+
+Whichever door opens, the resync walk drops the route deltas the feed
+queued before it (the seed queued one per route) — the walk reads every
+route's current state and the diff derives the withdrawals — so VPP is
+sent only what differs from what it holds, not the seeded table again.
+Changes written after the walk began stay queued and follow as
+ordinary updates.
 
 Why that is safe where quiet is not needed: the diff withdraws from VPP
 whatever the mirror lacks, so the danger is a mirror still filling from
