@@ -836,6 +836,17 @@ unsteering, in this order:
 4. Verify runs its 64 probes with the **paths compared** too, still
    steered. Pass → `Ready` → the usual re-assert steer.
 
+**The fast-path tier has its own ledger now.** The same clean stop
+leaves the route mirror for the next start (see [the route
+ledger](packetframe-fib.md#restarts-the-route-ledger)), so the mirror is
+at full size seconds after the start instead of after the route
+source's replay: the release floor is met at once, and the
+completeness authority attests the seeded mirror at the route source's
+first route. The diff described here still waits for the replay to go
+quiet — "quiet" counts every streamed element — so a steered adoption
+behaves as before; what changes is an UNSTEERED VPP's first steer (the
+fresh-convergence hold releases on that first attested check).
+
 What you see: `fib-synced DEGRADED — resync deferred ... the adopted FIB
 keeps forwarding untouched` while the feed reloads (on the primary the
 iBGP refill is ~2 minutes), then briefly `resyncing the FIB the previous

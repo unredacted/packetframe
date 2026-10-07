@@ -107,6 +107,10 @@ Kinds are stable: scripts and alerts may key on them.
 | Kind | When | Fields |
 |---|---|---|
 | `wan_egress_repaired` | `wan-egress` put back policy rules that had disappeared from the kernel while the config was unchanged. At most one every five minutes; repairs in between are counted in the next one | `added`, `removed`, `suppressed`, `main_priority` |
+| `route_ledger_preserved` | A clean stop wrote (or failed to write) the route mirror as the route ledger. Not emitted with `route-ledger off` or without a `route-source` | `preserved`; when true `routes_v4`, `routes_v6`, `advertisements`, `bytes`, `encode_ms`, `write_ms`, and `unconfirmed_for_secs` when some routes had not been re-confirmed by a live session; when false `reason` |
+| `route_ledger_seeded` | A start seeded the route mirror from the ledger | `routes_v4`, `routes_v6`, `advertisements`, `age_secs`, `writer_version`, `took_ms`, `failed` when some prefixes could not be installed |
+| `route_ledger_refused` | A start did not seed (warn for the faults, info for the expected outcomes); the mirror loads cold | `reason` (`missing`, `disabled`, `forwarding-mode`, `no-route-source`, `unreadable`, `unremovable`, `corrupt`, `format-version`, `identity`, `too-old`, `clock`, `peer-id`), `detail` |
+| `route_ledger_reconciled` | The route source's first completed dump after a seed garbage-collected what it did not re-advertise | `gc_removed` |
 
 **The log itself (`module: event-log`)**
 
@@ -115,7 +119,7 @@ Kinds are stable: scripts and alerts may key on them.
 | `events_dropped` | The queue was full; recorded ahead of the next event written | `count` |
 | `event_log_recovered` | Writes succeed again after a failure | `lost`, `error` |
 
-A restart reads as `process_stop` → `ledger_preserved` (with `--keep-vpp`) → `process_start` → `module_attached` … → `adoption_path` → `verify_passed` → `steering_up` (or `steering_restored`). A crash loop reads as a column of `process_start` / `process_stop` pairs.
+A restart reads as `route_ledger_preserved` and `ledger_preserved` (both written by the stopping daemon before it records its exit) → `process_stop` → `process_start` → `module_attached` … → `route_ledger_seeded` → `adoption_path` → `verify_passed` → `steering_up` (or `steering_restored`), then `route_ledger_reconciled` once the route source's replay finishes. A crash loop reads as a column of `process_start` / `process_stop` pairs.
 
 ## Rotation and size
 

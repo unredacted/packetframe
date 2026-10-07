@@ -945,6 +945,15 @@ fn walk_open_capabilities(
 
 // --- Helpers ----------------------------------------------------------------
 
+/// The one [`PeerId`] a listener configured with `listen` and `peer_as`
+/// files its routes under — the session closes on any other peer AS, so
+/// this is every id it can produce. The route ledger checks a BGP
+/// record's ids against it: a seeded advertisement under any other id
+/// would never be replaced by the live session's re-advertisement.
+pub fn session_peer_id(listen: SocketAddr, peer_as: u32) -> PeerId {
+    synthetic_peer_id(listen, peer_as)
+}
+
 fn synthetic_peer_id(listen: SocketAddr, peer_asn: u32) -> PeerId {
     // Stable across reconnects. We use (listen_ip, peer_asn) so two
     // separately-configured BGP listeners (e.g., listening on

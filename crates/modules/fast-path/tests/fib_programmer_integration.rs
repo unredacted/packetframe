@@ -364,6 +364,59 @@ impl ProgrammerHarness {
         )
     }
 
+    /// `with_sink`, plus a route-ledger status handle and, when given, a
+    /// seed applied before the programmer serves anything — the way the
+    /// controller starts it.
+    fn with_seed(
+        seed: Option<packetframe_fast_path::fib::route_ledger::RouteLedger>,
+    ) -> (
+        Self,
+        Arc<RecordingSink>,
+        packetframe_fast_path::fib::route_ledger::SharedLedgerStatus,
+    ) {
+        let pins = PinDirs::setup();
+        let ebpf = load_and_pin(&pins);
+        let nexthops: Array<MapData, NexthopEntry> = open_array(&pins.path("NEXTHOPS"));
+        let fib_v4 = open_lpm_v4(&pins.path("FIB_V4"));
+        let fib_v6 = open_lpm_v6(&pins.path("FIB_V6"));
+        let ecmp_groups: Array<MapData, EcmpGroup> = open_array(&pins.path("ECMP_GROUPS"));
+        let shutdown = CancellationToken::new();
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+        let (mut programmer, handle) = FibProgrammer::new(
+            nexthops,
+            fib_v4,
+            fib_v6,
+            ecmp_groups,
+            events_rx,
+            shutdown.clone(),
+        );
+        let sink = Arc::new(RecordingSink::default());
+        programmer.set_route_sink(sink.clone());
+        let status = packetframe_fast_path::fib::route_ledger::shared_status();
+        programmer.set_ledger_status(status.clone());
+        if let Some(seed) = seed {
+            programmer.set_seed(seed);
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let task = rt.spawn(programmer.run());
+        (
+            Self {
+                pins,
+                _ebpf: ebpf,
+                rt,
+                shutdown,
+                handle,
+                task: Some(task),
+                events_tx: Some(events_tx),
+            },
+            sink,
+            status,
+        )
+    }
+
     /// `with_sink` plus a detached resolver handle, so a test can watch
     /// the programmer's `request_resolve` traffic: what it asks to have
     /// resolved and when. Nothing answers those requests — the test
@@ -2701,5 +2754,574 @@ fn freed_slot_reads_as_tombstone_not_as_failed_nexthop() {
         NexthopSlotClass::from_entry(freed.state, freed.family),
         NexthopSlotClass::Freed,
         "but reads as a tombstone, so status never counts it as a failed nexthop"
+    );
+}
+
+// ========== Route ledger ==========
+//
+// The seed a clean stop leaves for the next start, applied before any
+// route event and reconciled by the live session exactly as a `Resync`
+// is: re-advertisements confirm, `InitiationComplete` collects the rest.
+
+mod ledger {
+    use super::*;
+    use packetframe_fast_path::fib::route_ledger::{
+        encode, LedgerAdvert, LedgerMeta, LedgerRoute, RouteLedger, SharedLedgerStatus, StartReport,
+    };
+
+    pub const PEER: PeerId = PeerId(0x1ed9_e400_0000_0001);
+    pub const IDENTITY: &str =
+        "bgp listen 192.0.2.10 port 179 local-as 64512 peer-as 64512 peer-ip any";
+
+    pub fn nh_a() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))
+    }
+
+    pub fn nh_b() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))
+    }
+
+    pub fn nh6() -> IpAddr {
+        IpAddr::V6("2001:db8::1".parse().unwrap())
+    }
+
+    pub fn quarter(i: u8) -> IpPrefix {
+        IpPrefix::V4 {
+            addr: [203, 0, 113, i * 64],
+            prefix_len: 26,
+        }
+    }
+
+    pub fn v6_48() -> IpPrefix {
+        IpPrefix::V6 {
+            addr: v6("2001:db8:a::"),
+            prefix_len: 48,
+        }
+    }
+
+    pub fn now_unix() -> u64 {
+        packetframe_fast_path::fib::route_ledger::now_unix()
+    }
+
+    pub fn route(prefix: IpPrefix, nh: IpAddr) -> LedgerRoute {
+        LedgerRoute {
+            prefix,
+            adverts: vec![LedgerAdvert {
+                peer: PEER,
+                path_id: None,
+                local_pref: Some(100),
+                nexthops: vec![nh],
+            }],
+        }
+    }
+
+    pub fn ledger(routes: &[LedgerRoute], confirmed_at_unix: u64) -> RouteLedger {
+        let meta = LedgerMeta {
+            writer_version: "test".into(),
+            written_at_unix: now_unix(),
+            confirmed_at_unix,
+            identity: IDENTITY.into(),
+        };
+        RouteLedger::decode(encode(&meta, routes).expect("encode")).expect("decode")
+    }
+
+    pub fn add(prefix: IpPrefix, nh: IpAddr) -> RouteEvent {
+        RouteEvent::Add {
+            peer_id: PEER,
+            prefix,
+            nexthops: vec![nh],
+            path_id: None,
+            local_pref: Some(100),
+        }
+    }
+
+    pub fn fib_value(h: &ProgrammerHarness, p: IpPrefix) -> Option<FibValue> {
+        match p {
+            IpPrefix::V4 { addr, prefix_len } => h.read_fib_v4(addr, prefix_len),
+            IpPrefix::V6 { addr, prefix_len } => h.read_fib_v6(addr, prefix_len),
+        }
+    }
+
+    pub fn has(h: &ProgrammerHarness, p: IpPrefix) -> bool {
+        fib_value(h, p).is_some()
+    }
+
+    pub fn seeded(st: &SharedLedgerStatus) -> bool {
+        let st = st.lock().unwrap();
+        st.start == StartReport::Seeded && st.seed.as_ref().is_some_and(|s| s.applied_at.is_some())
+    }
+}
+
+/// The whole life of a seed: installed and announced before any route
+/// event; an identical re-advertisement changes nothing anywhere (no FIB
+/// write, no second-tier delta — the replay of a full table must read
+/// as quiet to everything but the stream counter); a changed one is an
+/// ordinary update; and the first `InitiationComplete` removes exactly
+/// what the replay did not confirm.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_seed_is_confirmed_by_the_replay_and_collected_by_the_gc() {
+    use ledger::*;
+    let seed = ledger(
+        &[
+            route(quarter(0), nh_a()),
+            route(quarter(1), nh_a()),
+            route(quarter(2), nh_a()),
+            route(quarter(3), nh_a()),
+            route(v6_48(), nh6()),
+        ],
+        now_unix(),
+    );
+    let (h, sink, status) = ProgrammerHarness::with_seed(Some(seed));
+
+    // Queued behind the seed, so this observes it whole.
+    let counts = h
+        .run(async { h.handle.mirror_counts().await })
+        .expect("counts");
+    assert_eq!(counts, (4, 1));
+    // The controller records the start's outcome; here the programmer's
+    // own report is what is under test.
+    assert!(seeded(&status));
+    for p in [quarter(0), quarter(1), quarter(2), quarter(3), v6_48()] {
+        assert!(has(&h, p), "{p:?} is in the FIB from the seed alone");
+    }
+    {
+        let st = status.lock().unwrap();
+        let s = st.seed.as_ref().unwrap();
+        assert_eq!(s.unconfirmed, 5);
+        assert!(s.stream_started_at.is_none());
+        assert!(
+            st.attestation_blocker().is_some(),
+            "a seed no session has spoken to is not attestable"
+        );
+    }
+    let after_seed = sink.calls();
+    assert_eq!(
+        after_seed
+            .iter()
+            .filter(|c| matches!(c, SinkCall::Resolved(..)))
+            .count(),
+        5,
+        "the second tier hears every seeded route like any install: {after_seed:?}"
+    );
+    let before = [fib_value(&h, quarter(0)), fib_value(&h, quarter(1))];
+
+    // The replay begins: two routes come back unchanged.
+    h.run(async {
+        for p in [quarter(0), quarter(1)] {
+            h.handle
+                .apply_route_event(add(p, nh_a()))
+                .await
+                .expect("replay");
+        }
+    });
+    assert_eq!(
+        sink.calls(),
+        after_seed,
+        "an identical re-advertisement is no delta for the second tier"
+    );
+    assert_eq!(
+        [fib_value(&h, quarter(0)), fib_value(&h, quarter(1))],
+        before,
+        "nor a FIB write"
+    );
+    {
+        let st = status.lock().unwrap();
+        let s = st.seed.as_ref().unwrap();
+        assert_eq!(s.unconfirmed, 3);
+        assert!(s.stream_started_at.is_some());
+        assert!(st.attestation_blocker().is_none());
+    }
+
+    // A route that changed while the daemon was down is an ordinary
+    // update.
+    h.run(async {
+        h.handle
+            .apply_route_event(add(quarter(2), nh_b()))
+            .await
+            .expect("changed route")
+    });
+    assert_eq!(
+        sink.calls().last(),
+        Some(&SinkCall::Resolved(quarter(2), vec![nh_b()]))
+    );
+    assert_eq!(status.lock().unwrap().seed.as_ref().unwrap().unconfirmed, 2);
+
+    // The dump ends: what it never re-advertised is gone.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+            .expect("InitiationComplete")
+    });
+    let counts = h
+        .run(async { h.handle.mirror_counts().await })
+        .expect("counts");
+    assert_eq!(counts, (3, 0));
+    assert!(!has(&h, quarter(3)));
+    assert!(!has(&h, v6_48()));
+    for p in [quarter(0), quarter(1), quarter(2)] {
+        assert!(has(&h, p), "{p:?} was confirmed and stays");
+    }
+    let tail: Vec<_> = sink.calls().split_off(after_seed.len());
+    assert!(tail.contains(&SinkCall::Withdrawn(quarter(3))), "{tail:?}");
+    assert!(tail.contains(&SinkCall::Withdrawn(v6_48())), "{tail:?}");
+    let st = status.lock().unwrap();
+    let s = st.seed.as_ref().unwrap();
+    assert_eq!(s.unconfirmed, 0);
+    assert_eq!(s.reconciled.map(|(_, removed)| removed), Some(2));
+}
+
+/// No route event overtakes the seed. The seed goes in a chunk at a time
+/// and the run loop keeps serving neighbour events between chunks, but
+/// never a command — so a live advertisement sent while the seed is
+/// still going in lands AFTER it. Were it the other way round, the stale
+/// seeded copy would replace the live one, and the GC would then delete a
+/// route the source still has.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_route_event_never_overtakes_the_seed() {
+    use ledger::*;
+    // Several chunks' worth, so the seed is still going in when the
+    // live advertisement is sent.
+    let prefixes: Vec<IpPrefix> = (0..10_000u32)
+        .map(|i| {
+            let mut a = v6("2001:db8:b::");
+            a[6..8].copy_from_slice(&(i as u16).to_be_bytes());
+            IpPrefix::V6 {
+                addr: a,
+                prefix_len: 64,
+            }
+        })
+        .collect();
+    let routes: Vec<_> = prefixes.iter().map(|p| route(*p, nh6())).collect();
+    let last = *prefixes.last().unwrap();
+    let live_nh = IpAddr::V6("2001:db8::2".parse().unwrap());
+    let (h, sink, _status) = ProgrammerHarness::with_seed(Some(ledger(&routes, now_unix())));
+
+    h.run(async {
+        // The first command sent sees the seed whole — not a count from
+        // partway through it.
+        assert_eq!(
+            h.handle.mirror_counts().await.expect("counts"),
+            (0, prefixes.len()),
+            "a command was served while the seed was still going in"
+        );
+        h.handle
+            .apply_route_event(add(last, live_nh))
+            .await
+            .expect("live advertisement");
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+            .expect("InitiationComplete");
+    });
+    let counts = h
+        .run(async { h.handle.mirror_counts().await })
+        .expect("counts");
+    assert_eq!(
+        counts,
+        (0, 1),
+        "the GC took every seeded route but the one the live session re-advertised"
+    );
+    assert!(has(&h, last));
+    let last_word = sink
+        .calls()
+        .into_iter()
+        .rev()
+        .find(|c| matches!(c, SinkCall::Resolved(p, _) | SinkCall::Withdrawn(p) if *p == last));
+    assert_eq!(
+        last_word,
+        Some(SinkCall::Resolved(last, vec![live_nh])),
+        "the live nexthop, not the seeded one"
+    );
+}
+
+/// What a stop writes: the route source's advertisements, and nothing
+/// the neighbour resolver injected — not its `local-prefix` host routes,
+/// not its `fallback-default`, not even where the fallback shares a
+/// prefix with a route-source default.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn the_ledger_holds_route_source_advertisements_only() {
+    use ledger::*;
+    use packetframe_fast_path::fib::route_ledger::RouteLedger;
+    let (h, _sink, _status) = ProgrammerHarness::with_seed(None);
+    let resolver = PeerId::local_arp(7);
+    let default = IpPrefix::V4 {
+        addr: [0, 0, 0, 0],
+        prefix_len: 0,
+    };
+    let host = IpPrefix::V4 {
+        addr: [203, 0, 113, 200],
+        prefix_len: 32,
+    };
+    let fallback_nh = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+    let encoded = h.run(async {
+        for ev in [
+            add(quarter(0), nh_a()),
+            add(default, nh_b()),
+            RouteEvent::Add {
+                peer_id: resolver,
+                prefix: default,
+                nexthops: vec![fallback_nh],
+                path_id: None,
+                local_pref: None,
+            },
+            RouteEvent::Add {
+                peer_id: resolver,
+                prefix: host,
+                nexthops: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200))],
+                path_id: None,
+                local_pref: None,
+            },
+        ] {
+            h.handle.apply_route_event(ev).await.expect("add");
+        }
+        h.handle
+            .encode_ledger(IDENTITY.into(), now_unix())
+            .await
+            .expect("encode")
+    });
+    let ledger = RouteLedger::decode(encoded.bytes).expect("decode");
+    assert_eq!(ledger.peers(), &[PEER], "no resolver peer is recorded");
+    let mut routes: Vec<_> = ledger.routes().collect();
+    routes.sort_by_key(|r| format!("{:?}", r.prefix));
+    let mut want = vec![route(quarter(0), nh_a()), route(default, nh_b())];
+    want.sort_by_key(|r| format!("{:?}", r.prefix));
+    assert_eq!(
+        routes, want,
+        "the default keeps only its route-source advertisement; the host route is absent"
+    );
+    assert_eq!(ledger.meta.identity, IDENTITY);
+}
+
+/// The confirmation time a stop records is the OLDEST unconfirmed
+/// route's, so a stale route cannot ride from ledger to ledger.
+///
+/// - every route confirmed by the session that is up: the write time;
+/// - the session lost (`Resync`) and nothing re-advertised: the loss;
+/// - re-advertised again: the write time;
+/// - a seed nobody replayed yet: the seed's own confirmation time, not
+///   this stop's.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_stop_records_when_its_oldest_route_was_last_confirmed() {
+    use ledger::*;
+    let later = now_unix() + 100;
+    let confirmed = |h: &ProgrammerHarness| {
+        h.run(async { h.handle.encode_ledger(IDENTITY.into(), later).await })
+            .expect("encode")
+            .confirmed_at_unix
+    };
+    let (h, _sink, _status) = ProgrammerHarness::with_seed(None);
+    h.run(async {
+        for p in [quarter(0), quarter(1)] {
+            h.handle
+                .apply_route_event(add(p, nh_a()))
+                .await
+                .expect("add");
+        }
+    });
+    assert_eq!(confirmed(&h), later);
+
+    let lost_at = now_unix();
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Resync)
+            .await
+            .expect("Resync")
+    });
+    let c = confirmed(&h);
+    assert!(
+        (lost_at..lost_at + 5).contains(&c),
+        "the session loss ({lost_at}), not the write ({later}): {c}"
+    );
+
+    h.run(async {
+        for p in [quarter(0), quarter(1)] {
+            h.handle
+                .apply_route_event(add(p, nh_a()))
+                .await
+                .expect("re-add");
+        }
+    });
+    assert_eq!(confirmed(&h), later, "all re-advertised: confirmed now");
+    drop(h);
+
+    let old = now_unix() - 600;
+    let (h, _sink, _status) =
+        ProgrammerHarness::with_seed(Some(ledger(&[route(quarter(0), nh_a())], old)));
+    assert_eq!(
+        confirmed(&h),
+        old,
+        "a stop before the replay reached the seed carries the seed's age forward"
+    );
+}
+
+/// A restart, end to end through the control plane — minus only the
+/// process boundary and the route source: a start seeds from a ledger,
+/// the preserving stop writes the mirror back out, and the next start's
+/// consume hands back the same routes for the same route source.
+///
+/// The `RouteController` is the production wiring (its own runtime, the
+/// netlink resolver, the programmer opened from production pin paths), so
+/// this is the one place the seed hand-over and `preserve_route_ledger`
+/// are exercised together rather than piece by piece.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs + netlink; run via sudo -E cargo test -- --ignored"]
+fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
+    use ledger::*;
+    use packetframe_fast_path::fib::controller::{
+        LedgerWiring, Preserved, ResolverPolicy, RouteController, RouteFeed, SecondTierSignals,
+    };
+    use packetframe_fast_path::fib::route_ledger::{
+        consume, shared_status, Consumed, Expectations,
+    };
+
+    // Production pin layout under a private bpffs directory.
+    let pins = PinDirs::setup();
+    let bytes = aligned_bpf_copy();
+    let ebpf = Ebpf::load(&bytes).expect("Ebpf::load");
+    let maps = pins.dir.join("fast-path").join("maps");
+    std::fs::create_dir_all(&maps).expect("maps dir");
+    for name in [
+        "NEXTHOPS",
+        "FIB_V4",
+        "FIB_V6",
+        "ECMP_GROUPS",
+        "FIB_CACHE_CFG",
+    ] {
+        ebpf.map(name)
+            .unwrap_or_else(|| panic!("{name} map missing from ELF"))
+            .pin(maps.join(name))
+            .unwrap_or_else(|e| panic!("pin {name}: {e}"));
+    }
+    let state_dir = std::env::temp_dir().join(format!("pf-ledger-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    let routes = vec![
+        route(quarter(0), nh_a()),
+        route(quarter(1), nh_b()),
+        route(v6_48(), nh6()),
+    ];
+    let status = shared_status();
+    let ctrl = RouteController::start(
+        &pins.dir,
+        RouteFeed {
+            source: None,
+            integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::None,
+        },
+        ResolverPolicy::default(),
+        std::collections::HashMap::new(),
+        None,
+        SecondTierSignals::default(),
+        LedgerWiring {
+            seed: Some(ledger(&routes, now_unix())),
+            status: status.clone(),
+            identity: Some(IDENTITY.into()),
+        },
+    )
+    .expect("RouteController::start");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let prog = ctrl.programmer_handle();
+    assert_eq!(
+        rt.block_on(prog.mirror_counts()).expect("counts"),
+        (2, 1),
+        "the seed is in before the first command is served"
+    );
+
+    let written = ctrl.preserve_route_ledger(&state_dir);
+    match &written {
+        Preserved::Written { counts, .. } => assert_eq!(counts.prefixes(), 3),
+        other => panic!("{other:?}"),
+    }
+    ctrl.shutdown();
+
+    let exp = Expectations {
+        spec: packetframe_common::config::RouteLedgerSpec::default(),
+        forwarding_mode: packetframe_common::config::ForwardingMode::PacketframeFib,
+        identity: Some(IDENTITY),
+        single_peer: None,
+        now_unix: now_unix(),
+    };
+    let again = match consume(&state_dir, &exp) {
+        Consumed::Seed(l) => l,
+        other => panic!("{other:?}"),
+    };
+    let mut got: Vec<_> = again.routes().collect();
+    got.sort_by_key(|r| format!("{:?}", r.prefix));
+    let mut want = routes;
+    want.sort_by_key(|r| format!("{:?}", r.prefix));
+    assert_eq!(
+        got, want,
+        "the next start gets back exactly what was seeded"
+    );
+    assert!(
+        !packetframe_fast_path::fib::route_ledger::path_in(&state_dir).exists(),
+        "and consumed it"
+    );
+    let _ = std::fs::remove_dir_all(&state_dir);
+    drop(ebpf);
+}
+
+/// One measured run of a seed at the production table's size, against
+/// real BPF maps: how long a start spends putting 1.35M routes into the
+/// FIB before the route source's first route is served, and how long a
+/// stop spends snapshotting them. IPv6 /64s from 2001:db8::/32 only
+/// (documentation space has no 1.1M distinct IPv4 prefixes), which makes
+/// it an upper bound: the v6 trie insert is the dearer one.
+///
+/// Gated on `PF_MEASURE_LEDGER_SEED=1` as well as `--ignored`, so the qemu
+/// job's `--ignored` run does not spend minutes on it.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; measurement, also needs PF_MEASURE_LEDGER_SEED=1"]
+fn measure_a_full_table_seed() {
+    use ledger::*;
+    if std::env::var("PF_MEASURE_LEDGER_SEED").is_err() {
+        eprintln!("skipped: set PF_MEASURE_LEDGER_SEED=1 to measure");
+        return;
+    }
+    const N: u32 = 1_350_000;
+    let nhs: Vec<IpAddr> = (1..=768u16)
+        .map(|i| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)))
+        .collect();
+    let routes: Vec<_> = (0..N)
+        .map(|i| {
+            let mut a = v6("2001:db8::");
+            a[4..8].copy_from_slice(&i.to_be_bytes());
+            route(
+                IpPrefix::V6 {
+                    addr: a,
+                    prefix_len: 64,
+                },
+                nhs[i as usize % nhs.len()],
+            )
+        })
+        .collect();
+    let seed = ledger(&routes, now_unix());
+    drop(routes);
+    let started = std::time::Instant::now();
+    let (h, _sink, status) = ProgrammerHarness::with_seed(Some(seed));
+    let counts = h
+        .run(async { h.handle.mirror_counts().await })
+        .expect("counts");
+    let seed_took = started.elapsed();
+    assert_eq!(counts, (0, N as usize));
+    let applied = status.lock().unwrap().seed.as_ref().unwrap().apply_took;
+    let started = std::time::Instant::now();
+    let enc = h
+        .run(async { h.handle.encode_ledger(IDENTITY.into(), now_unix()).await })
+        .expect("encode");
+    let encode_took = started.elapsed();
+    println!(
+        "seed of {N} routes into real BPF maps: {seed_took:?} until the first command was \
+         served (programmer's own figure {applied:?}); stop-side snapshot {encode_took:?} \
+         ({} bytes)",
+        enc.bytes.len()
     );
 }

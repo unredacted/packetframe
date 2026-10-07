@@ -197,6 +197,19 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     let devmap = reconcile_devmap(state)?;
     let rx_macs = reconcile_rx_macs(state)?;
     reconcile_fib_cache(state, cfg);
+    // `route-ledger`: nothing to apply now — its read half ran at this
+    // start — but the preserving stop writes per the setting in force
+    // when it runs, so a reload that turns it off (or back on) is
+    // honoured at the next stop rather than at the one after a restart.
+    let route_ledger = crate::linux_impl::route_ledger_spec_from_cfg(cfg);
+    if route_ledger != state.route_ledger {
+        info!(
+            from = ?state.route_ledger,
+            to = ?route_ledger,
+            "route-ledger changed; the next preserving stop follows it"
+        );
+        state.route_ledger = route_ledger;
+    }
     // The watcher derives VLAN_RESOLVE from the same directives
     // (`bridge-resolve`), so a reload that changes them must reach it
     // or its next refresh would undo this one.

@@ -2285,6 +2285,29 @@ mod fast_path_teardown_tests {
         assert!(super::fast_path_teardown(false).removes_wan_egress_rules());
         assert!(!super::fast_path_teardown(true).removes_wan_egress_rules());
     }
+
+    /// A full detach removes the route ledger; `--keep-vpp`, the routine
+    /// restart, keeps it for the start that follows.
+    #[test]
+    fn only_a_full_detach_removes_the_route_ledger() {
+        use packetframe_fast_path::fib::route_ledger;
+        assert!(super::fast_path_teardown(false).removes_route_ledger());
+        assert!(!super::fast_path_teardown(true).removes_route_ledger());
+
+        let dir = std::env::temp_dir().join(format!("pf-detach-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        route_ledger::write(&dir, b"a ledger").unwrap();
+        assert!(super::remove_route_ledger(&dir, Ok(())).is_ok());
+        assert!(!route_ledger::path_in(&dir).exists());
+        // Nothing there is not a failure, and an earlier failure survives.
+        assert!(super::remove_route_ledger(&dir, Ok(())).is_ok());
+        assert_eq!(
+            super::remove_route_ledger(&dir, Err("pins".into())),
+            Err("pins".into())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The fast-path half of `detach`, unchanged except for being callable.
@@ -2318,6 +2341,14 @@ fn detach_fast_path(
             );
         }
     }
+    // The route ledger the last clean stop preserved: gone on a full
+    // detach, kept by `--keep-vpp` for the start that follows it. A
+    // failure joins the result like the others.
+    let result = if teardown.removes_route_ledger() {
+        remove_route_ledger(state_dir, result)
+    } else {
+        result
+    };
     // `wan-egress` policy rules, found by their protocol tag in a fresh
     // dump: no state file is needed, and nothing without the tag can be
     // touched. Whatever the pin teardown's outcome, like the coalescing
@@ -2351,6 +2382,31 @@ fn detach_fast_path(
         }
     };
     result
+}
+
+/// Remove the fast-path route ledger, folding a failure into `result`.
+#[cfg(feature = "fast-path")]
+fn remove_route_ledger(state_dir: &Path, result: Result<(), String>) -> Result<(), String> {
+    use packetframe_fast_path::fib::route_ledger;
+    let existed = std::fs::symlink_metadata(route_ledger::path_in(state_dir)).is_ok();
+    match route_ledger::remove(state_dir) {
+        Ok(()) => {
+            if existed {
+                tracing::info!(
+                    "route ledger removed: the next start loads the route mirror cold from \
+                     the route source (`detach --keep-vpp` keeps it)"
+                );
+            }
+            result
+        }
+        Err(e) => {
+            let e = format!("route ledger removal: {e}");
+            Err(match result {
+                Ok(()) => e,
+                Err(prev) => format!("{prev}; AND {e}"),
+            })
+        }
+    }
 }
 
 /// Pins, tc filters and the registry: everything `detach_fast_path`
