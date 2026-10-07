@@ -10,9 +10,11 @@
 //!     allocating nexthop IDs and ECMP groups as needed.
 //!   - `PeerUp` / `PeerDown`: track which peer announced which
 //!     routes; withdraw everything on `PeerDown`.
-//!   - `Resync`: mark every mirrored route "not-seen-this-session";
-//!     live `Add` events clear the mark as they re-arrive.
-//!   - `InitiationComplete`: GC every still-unmarked route
+//!   - `Resync`: mark every route-source advertisement
+//!     "not-seen-this-session"; live `Add` events clear the mark as
+//!     they re-arrive. The resolver's `local_arp` routes are never
+//!     marked (see [`is_session_peer`]).
+//!   - `InitiationComplete`: GC every still-marked advertisement
 //!     (they were in the BPF maps from before the reconnect but
 //!     bird didn't re-announce → stale).
 //!
@@ -515,6 +517,27 @@ struct NexthopRecord {
     live: Option<(u32, [u8; 6], [u8; 6])>,
 }
 
+/// Whether `peer`'s advertisements belong to the route source's session
+/// rather than to the neighbour resolver, which injects the
+/// `local-prefix` host routes and the `fallback-default` 0/0 under
+/// [`PeerId::local_arp`].
+///
+/// The one answer for every caller that asks: Resync marking, and with
+/// it the GC, plus [`FibProgrammerHandle::has_session_routes`] and
+/// [`FibProgrammerHandle::session_families`]. Resync once marked the
+/// whole mirror. The resolver seeds its routes once and re-adds a host
+/// route only on a kernel neighbour update, so no session re-announced
+/// them, and every reconnect's GC deleted them: the fallback default in
+/// both tiers.
+///
+/// Sound only because route sources build their ids with
+/// [`PeerId::route_source`], which cannot produce a local-ARP id. Were a
+/// feed id hashed straight from sender-chosen fields, a sender could
+/// land one in that namespace and exempt its routes from the GC.
+fn is_session_peer(peer: PeerId) -> bool {
+    peer.as_local_arp_ifindex().is_none()
+}
+
 /// Whether a mirror record is a local-delivery host route, which stays
 /// off the second tier (the announce site in `recompute_fib_entry_inner`).
 ///
@@ -610,7 +633,8 @@ struct Advertisement {
     /// Resync; false when it was inherited from a prior session and
     /// hasn't been re-announced. `InitiationComplete` GCs
     /// advertisements whose flag is still false; the prefix's FIB
-    /// entry is then recomputed.
+    /// entry is then recomputed. Always true under a `local_arp` peer,
+    /// which belongs to no session ([`is_session_peer`]).
     seen_this_session: bool,
 }
 
@@ -1125,10 +1149,7 @@ impl FibProgrammer {
                 // finding). Anything owed a repair counts as session
                 // state until the repair lands.
                 let any = !self.recompute_owed.is_empty()
-                    || self
-                        .routes_by_peer
-                        .keys()
-                        .any(|p| p.as_local_arp_ifindex().is_none());
+                    || self.routes_by_peer.keys().any(|p| is_session_peer(*p));
                 let _ = reply.send(any);
             }
             Command::SessionFamilies { reply } => {
@@ -1136,7 +1157,7 @@ impl FibProgrammer {
                 // and it stops as soon as both answers are known.
                 let (mut v4, mut v6) = (false, false);
                 for (peer, keys) in &self.routes_by_peer {
-                    if peer.as_local_arp_ifindex().is_some() {
+                    if !is_session_peer(*peer) {
                         continue;
                     }
                     for (is_v4, _, _) in keys {
@@ -1300,7 +1321,7 @@ impl FibProgrammer {
     /// reached the mirror: the first one after a seed is the live session
     /// speaking.
     fn note_session_route(&mut self, peer: PeerId) {
-        if !self.seed_open || self.seed_stream_started || peer.as_local_arp_ifindex().is_some() {
+        if !self.seed_open || self.seed_stream_started || !is_session_peer(peer) {
             return;
         }
         self.seed_stream_started = true;
@@ -1318,7 +1339,7 @@ impl FibProgrammer {
 
     /// A route-source advertisement that was unseen is gone or now seen.
     fn note_unseen_cleared(&mut self, peer: PeerId, prior_unseen: bool) {
-        if !prior_unseen || peer.as_local_arp_ifindex().is_some() {
+        if !prior_unseen || !is_session_peer(peer) {
             return;
         }
         self.unseen_session = self.unseen_session.saturating_sub(1);
@@ -1340,14 +1361,14 @@ impl FibProgrammer {
     fn count_unseen_session(&self) -> u64 {
         let count = |recs: &mut dyn Iterator<Item = &RouteRecord>| -> u64 {
             recs.flat_map(|r| r.advertisements.iter())
-                .filter(|((p, _), a)| p.as_local_arp_ifindex().is_none() && !a.seen_this_session)
+                .filter(|((p, _), a)| is_session_peer(*p) && !a.seen_this_session)
                 .count() as u64
         };
         count(&mut self.routes_v4.values()) + count(&mut self.routes_v6.values())
     }
 
-    /// After a `Resync` marked everything unseen: the route source's
-    /// routes are unconfirmed from now — or from earlier, if a seed or a
+    /// After a `Resync` marked the route source's advertisements unseen:
+    /// they are unconfirmed from now — or from earlier, if a seed or a
     /// previous loss is still unreconciled.
     fn after_resync(&mut self) {
         self.unseen_session = self.count_unseen_session();
@@ -1412,9 +1433,7 @@ impl FibProgrammer {
         written_at_unix: u64,
     ) -> Result<EncodedLedger, String> {
         let started = Instant::now();
-        let session = |p: &PeerId, a: &Advertisement| {
-            p.as_local_arp_ifindex().is_none() && !a.nexthops.is_empty()
-        };
+        let session = |p: &PeerId, a: &Advertisement| is_session_peer(*p) && !a.nexthops.is_empty();
         let mut peers: Vec<PeerId> = Vec::new();
         let mut peer_set: HashSet<PeerId> = HashSet::new();
         let mut nexthops: Vec<IpAddr> = Vec::new();
@@ -2333,9 +2352,12 @@ impl FibProgrammer {
                 self.del_route(peer_id, prefix, path_id)
             }
             RouteEvent::Resync => {
-                self.mark_all_unseen();
+                let marked = self.mark_session_unseen();
                 self.after_resync();
-                info!("Resync: all advertisements marked not-seen-this-session");
+                info!(
+                    marked,
+                    "Resync: route-source advertisements marked not-seen-this-session"
+                );
                 Ok(())
             }
             RouteEvent::InitiationComplete => {
@@ -2432,24 +2454,35 @@ impl FibProgrammer {
         Ok(())
     }
 
-    /// Mark every advertisement as `seen_this_session = false`. Live
-    /// `Add` events clear the mark; `InitiationComplete` GCs what's
-    /// left.
-    fn mark_all_unseen(&mut self) {
-        for rec in self.routes_v4.values_mut() {
-            for adv in rec.advertisements.values_mut() {
-                adv.seen_this_session = false;
+    /// Mark every route-source advertisement `seen_this_session =
+    /// false` and return how many. Live `Add` events clear the mark;
+    /// `InitiationComplete` GCs what's left.
+    ///
+    /// Scoped by [`is_session_peer`], per advertisement rather than per
+    /// record: a 0/0 carrying both the fallback default and a BGP
+    /// default loses only the BGP path when the next session stops
+    /// announcing it. This is the only place an advertisement becomes
+    /// unseen, so it is also the GC's scope.
+    fn mark_session_unseen(&mut self) -> usize {
+        let mut marked = 0;
+        for rec in self
+            .routes_v4
+            .values_mut()
+            .chain(self.routes_v6.values_mut())
+        {
+            for ((peer, _), adv) in rec.advertisements.iter_mut() {
+                if is_session_peer(*peer) {
+                    adv.seen_this_session = false;
+                    marked += 1;
+                }
             }
         }
-        for rec in self.routes_v6.values_mut() {
-            for adv in rec.advertisements.values_mut() {
-                adv.seen_this_session = false;
-            }
-        }
+        marked
     }
 
     /// GC advertisements still marked `seen_this_session = false`
-    /// after an InitiationComplete. Returns the count of
+    /// after an InitiationComplete, which can only be route-source ones
+    /// (see [`Self::mark_session_unseen`]). Returns the count of
     /// advertisements (not prefixes) removed. Affected prefixes are
     /// recomputed; those whose every advertisement was unseen are
     /// torn down entirely.
@@ -2588,7 +2621,7 @@ impl FibProgrammer {
             }
             None => (0, 0),
         };
-        if unseen > 0 && peer_id.as_local_arp_ifindex().is_none() {
+        if unseen > 0 && is_session_peer(peer_id) {
             self.unseen_session = self.unseen_session.saturating_sub(unseen as u64);
             self.publish_unconfirmed();
         }

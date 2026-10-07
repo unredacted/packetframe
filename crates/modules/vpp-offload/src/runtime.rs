@@ -673,6 +673,10 @@ struct Core {
     /// while blind, which is the shape it exists to catch (review
     /// finding). Same rule as the null-drop gauge's absent-not-zero.
     drift_unreadable: Option<String>,
+    /// How long the latest finished drift scan took, in ms — whatever its
+    /// verdict and whichever scope it judged: the kernel paid for it
+    /// either way. `None` until one finishes.
+    drift_scan_ms: Option<u64>,
     steer_missing: usize,
     /// Rules still steering a port the config asks to leave unsteered,
     /// as of the last audit. Its own count because it points the other
@@ -1605,6 +1609,7 @@ impl Runtime {
                 drift_result_gen: None,
                 drift_pending: false,
                 drift_unreadable: None,
+                drift_scan_ms: None,
                 drift_scope_stale: None,
                 pending_drift_scope: None,
                 drift_v6: crate::drift::V6DriftState::default(),
@@ -1748,8 +1753,14 @@ impl Runtime {
 
     /// Install the exemption tripwire. Same wiring rule as the others.
     pub fn drift_watch(&self, w: Box<dyn crate::drift::DriftWatch + Send>) {
-        self.core.borrow_mut().drift_scanner =
-            Some(crate::drift::DriftScanner::spawn(w, DRIFT_SCAN_EVERY));
+        self.core.borrow_mut().drift_scanner = Some(crate::drift::DriftScanner::spawn(
+            w,
+            crate::drift::Pacing {
+                every: DRIFT_SCAN_EVERY,
+                settle: DRIFT_SETTLE,
+                max_defer: DRIFT_MAX_DEFER,
+            },
+        ));
     }
 
     /// Declare that the NIC holds rules INHERITED from a previous
@@ -1998,20 +2009,23 @@ impl Runtime {
             // that were in force when it started, and publishing that
             // as the new config's verdict is how a newly blackholed
             // path would read as covered (review finding).
-            let fresh = c.drift_scanner.as_ref().and_then(|s| {
+            let report = c.drift_scanner.as_ref().and_then(|s| {
                 let current = s.generation();
-                match s.take_result() {
-                    Some((gen, r)) if gen == current => Some(r),
-                    Some((gen, _)) => {
-                        tracing::debug!(
-                            scanned_under = gen,
-                            current,
-                            "discarding a drift result about a superseded scope"
-                        );
-                        None
-                    }
-                    None => None,
+                s.take_result().map(|r| (r, current))
+            });
+            if let Some((r, _)) = &report {
+                c.drift_scan_ms = Some(r.took.as_millis() as u64);
+            }
+            let fresh = report.and_then(|(r, current)| {
+                if r.generation == current {
+                    return Some(r.result);
                 }
+                tracing::debug!(
+                    scanned_under = r.generation,
+                    current,
+                    "discarding a drift result about a superseded scope"
+                );
+                None
             });
             // Whether a verdict about the CURRENT config exists at
             // all. Until one does — the first pass after attach, or
@@ -2145,6 +2159,7 @@ impl Runtime {
             drift_routes: c.drift_routes,
             drift_pending: c.drift_pending,
             drift_unreadable: c.drift_unreadable.clone(),
+            drift_scan_ms: c.drift_scan_ms,
             drift_scope_stale: c.drift_scope_stale.clone(),
             drift_v6: c.drift_v6.clone(),
             preserved_fib: c.seeded.is_some(),
@@ -2217,6 +2232,19 @@ const PLACEMENT_EVERY: Duration = Duration::from_secs(2);
 /// anyone touching packetframe, which is the whole argument for
 /// scanning on a clock rather than at config load.
 const DRIFT_SCAN_EVERY: Duration = Duration::from_secs(60);
+
+/// How long links must have been quiet before a drift scan starts — see
+/// [`crate::drift::Pacing`]. A judgement, not a measurement: one scan
+/// interval, and longer than the ~40 s the 2026-10-07 bridge toggle held
+/// the box. Routes a daemon reinstalls once sessions come back up can
+/// still be churning after it; the scan abandons itself only for a link
+/// change, so it can read through that.
+const DRIFT_SETTLE: Duration = Duration::from_secs(60);
+
+/// The longest a due drift scan waits for links to settle before it runs
+/// regardless: under a link that never stops flapping the tripwire still
+/// looks every five minutes rather than never.
+const DRIFT_MAX_DEFER: Duration = Duration::from_secs(300);
 
 /// What the completeness authority can currently say, for the health
 /// text.
@@ -2412,6 +2440,9 @@ pub struct RuntimeStatus {
     pub drift_pending: bool,
     /// Why the last drift scan could not read the kernel, if so.
     pub drift_unreadable: Option<String>,
+    /// How long the latest finished drift scan took, ms; `None` until one
+    /// finishes.
+    pub drift_scan_ms: Option<u64>,
     /// Why the scan cannot say which exemptions the NIC holds, if so.
     pub drift_scope_stale: Option<String>,
     /// The IPv6 half of the tripwire.
