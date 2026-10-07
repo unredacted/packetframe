@@ -10,8 +10,10 @@
 //!     allocating nexthop IDs and ECMP groups as needed.
 //!   - `PeerUp` / `PeerDown`: track which peer announced which
 //!     routes; withdraw everything on `PeerDown`.
-//!   - `Resync`: mark every mirrored route "not-seen-this-session";
-//!     live `Add` events clear the mark as they re-arrive.
+//!   - `Resync`: mark every route-source advertisement
+//!     "not-seen-this-session" (the resolver's local-arp routes are
+//!     no session's and stay put); live `Add` events clear the mark
+//!     as they re-arrive.
 //!   - `InitiationComplete`: GC every still-unmarked route
 //!     (they were in the BPF maps from before the reconnect but
 //!     bird didn't re-announce → stale).
@@ -468,6 +470,19 @@ struct NexthopRecord {
     live: Option<(u32, [u8; 6], [u8; 6])>,
 }
 
+/// Whether `peer`'s advertisements belong to a route-source session.
+///
+/// The neighbour resolver injects its `local-prefix` host routes and the
+/// `fallback-default` under [`PeerId::local_arp`] peers. It seeds them
+/// once and re-sends them only on neighbour events, never at a session
+/// boundary, so they live for the daemon's life. Every session question
+/// asks this one predicate: what `Resync` marks for the GC, what
+/// [`FibProgrammerHandle::has_session_routes`] counts, and which families
+/// [`FibProgrammerHandle::session_families`] reports.
+fn is_session_peer(peer: PeerId) -> bool {
+    peer.as_local_arp_ifindex().is_none()
+}
+
 /// Whether a mirror record is a local-delivery host route, which stays
 /// off the second tier (the announce site in `recompute_fib_entry_inner`).
 ///
@@ -563,7 +578,8 @@ struct Advertisement {
     /// Resync; false when it was inherited from a prior session and
     /// hasn't been re-announced. `InitiationComplete` GCs
     /// advertisements whose flag is still false; the prefix's FIB
-    /// entry is then recomputed.
+    /// entry is then recomputed. Always true for a local-arp peer,
+    /// which no session owns (see [`is_session_peer`]).
     seen_this_session: bool,
 }
 
@@ -991,10 +1007,7 @@ impl FibProgrammer {
                 // finding). Anything owed a repair counts as session
                 // state until the repair lands.
                 let any = !self.recompute_owed.is_empty()
-                    || self
-                        .routes_by_peer
-                        .keys()
-                        .any(|p| p.as_local_arp_ifindex().is_none());
+                    || self.routes_by_peer.keys().any(|p| is_session_peer(*p));
                 let _ = reply.send(any);
             }
             Command::SessionFamilies { reply } => {
@@ -1002,7 +1015,7 @@ impl FibProgrammer {
                 // and it stops as soon as both answers are known.
                 let (mut v4, mut v6) = (false, false);
                 for (peer, keys) in &self.routes_by_peer {
-                    if peer.as_local_arp_ifindex().is_some() {
+                    if !is_session_peer(*peer) {
                         continue;
                     }
                     for (is_v4, _, _) in keys {
@@ -1923,18 +1936,27 @@ impl FibProgrammer {
         Ok(())
     }
 
-    /// Mark every advertisement as `seen_this_session = false`. Live
-    /// `Add` events clear the mark; `InitiationComplete` GCs what's
+    /// Mark every session advertisement as `seen_this_session = false`.
+    /// Live `Add` events clear the mark; `InitiationComplete` GCs what's
     /// left.
+    ///
+    /// Local-arp advertisements stay marked seen (see
+    /// [`is_session_peer`]). Nothing re-announces them after a
+    /// reconnect, so marking them made every iBGP or BMP reconnect GC
+    /// the fallback /0 from both tiers until the next restart.
     fn mark_all_unseen(&mut self) {
         for rec in self.routes_v4.values_mut() {
-            for adv in rec.advertisements.values_mut() {
-                adv.seen_this_session = false;
+            for ((peer, _), adv) in rec.advertisements.iter_mut() {
+                if is_session_peer(*peer) {
+                    adv.seen_this_session = false;
+                }
             }
         }
         for rec in self.routes_v6.values_mut() {
-            for adv in rec.advertisements.values_mut() {
-                adv.seen_this_session = false;
+            for ((peer, _), adv) in rec.advertisements.iter_mut() {
+                if is_session_peer(*peer) {
+                    adv.seen_this_session = false;
+                }
             }
         }
     }
@@ -1944,6 +1966,10 @@ impl FibProgrammer {
     /// advertisements (not prefixes) removed. Affected prefixes are
     /// recomputed; those whose every advertisement was unseen are
     /// torn down entirely.
+    ///
+    /// Only [`Self::mark_all_unseen`] clears the flag, so the sweep
+    /// carries no peer filter of its own: what a session owns is
+    /// decided once, at the mark.
     fn gc_unseen(&mut self) -> Result<usize, ProgrammerError> {
         // Collect victims out-of-band so the borrow checker is happy
         // while we mutate during recompute.

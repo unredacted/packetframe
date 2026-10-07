@@ -2322,6 +2322,138 @@ fn session_families_ignore_local_prefix_routes() {
     });
 }
 
+/// A route-source reconnect garbage-collects only route-source routes.
+///
+/// `Resync` and `InitiationComplete` bracket a SESSION: whatever the
+/// previous one announced and the next one did not re-announce is
+/// stale. The resolver's `fallback-default` and `local-prefix` host
+/// routes live in the same mirror under `PeerId::local_arp` but belong
+/// to no session — seeded once at startup, never re-sent at a session
+/// boundary — so a sweep that took them withdrew the fallback /0 from
+/// both tiers at every iBGP or BMP reconnect until the next restart,
+/// and every host route until its neighbour's next RTM_NEWNEIGH.
+///
+/// The stale session route is the control: it proves the sweep still
+/// runs, so this cannot pass by not collecting at all.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_resync_leaves_local_arp_routes_alone() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let local_peer = PeerId::local_arp(33);
+    let session_peer = PeerId(0x8080);
+    let upstream = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+    let session_nh = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
+    let default = IpPrefix::V4 {
+        addr: [0, 0, 0, 0],
+        prefix_len: 0,
+    };
+    let host = IpPrefix::V4 {
+        addr: [192, 0, 2, 50],
+        prefix_len: 32,
+    };
+    let host6 = IpPrefix::V6 {
+        addr: v6("2001:db8::50"),
+        prefix_len: 128,
+    };
+    let live = IpPrefix::V4 {
+        addr: [203, 0, 113, 0],
+        prefix_len: 25,
+    };
+    let stale = IpPrefix::V4 {
+        addr: [203, 0, 113, 128],
+        prefix_len: 25,
+    };
+
+    let add = |peer_id: PeerId, prefix: IpPrefix, nh: IpAddr| RouteEvent::Add {
+        peer_id,
+        prefix,
+        nexthops: vec![nh],
+        path_id: None,
+        local_pref: None,
+    };
+
+    h.run(async {
+        for event in [
+            add(local_peer, default, upstream),
+            add(local_peer, host, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50))),
+            add(
+                local_peer,
+                host6,
+                IpAddr::V6("2001:db8::50".parse().expect("v6")),
+            ),
+            add(session_peer, live, session_nh),
+            add(session_peer, stale, session_nh),
+        ] {
+            h.handle.apply_route_event(event).await.expect("seed");
+        }
+    });
+    assert_eq!(
+        h.run(h.handle.mirror_counts()).expect("counts"),
+        (4, 1),
+        "seeded mirror"
+    );
+    let before_resync = sink.calls().len();
+
+    // The session drops and comes back with only `live`.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Resync)
+            .await
+            .expect("resync");
+        h.handle
+            .apply_route_event(add(session_peer, live, session_nh))
+            .await
+            .expect("re-announce");
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+            .expect("GC");
+    });
+
+    assert_eq!(
+        h.run(h.handle.mirror_counts()).expect("counts"),
+        (3, 1),
+        "the GC must take the stale session route and nothing the resolver owns"
+    );
+    let installed: std::collections::BTreeSet<(u32, [u8; 4])> = open_lpm_v4(&h.pins.path("FIB_V4"))
+        .keys()
+        .map(|k| k.expect("FIB_V4 key"))
+        .map(|k| (k.prefix_len(), k.data()))
+        .collect();
+    assert_eq!(
+        installed,
+        [
+            (0, [0, 0, 0, 0]),
+            (25, [203, 0, 113, 0]),
+            (32, [192, 0, 2, 50]),
+        ]
+        .into_iter()
+        .collect(),
+        "FIB_V4 must keep the fallback default and the host route"
+    );
+    assert!(
+        h.read_fib_v6(v6("2001:db8::50"), 128).is_some(),
+        "FIB_V6 must keep the local-prefix6 host route"
+    );
+
+    let calls = sink.calls();
+    assert!(
+        calls[..before_resync].contains(&SinkCall::Resolved(default, vec![upstream])),
+        "the fallback default reached the second tier: {calls:?}"
+    );
+    let after = &calls[before_resync..];
+    for local in [default, host, host6] {
+        assert!(
+            !after.contains(&SinkCall::Withdrawn(local)),
+            "a reconnect must not withdraw {local:?} from the second tier: {after:?}"
+        );
+    }
+    assert!(
+        after.contains(&SinkCall::Withdrawn(stale)),
+        "the stale session route must still be withdrawn: {after:?}"
+    );
+}
+
 /// Re-advertising an identical nexthop set announces nothing.
 ///
 /// Not an optimisation: under a peering flap the same prefix is
