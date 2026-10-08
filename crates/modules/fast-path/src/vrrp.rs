@@ -116,10 +116,16 @@ pub fn parse_instances(text: &str) -> Vec<VrrpInstance> {
     out
 }
 
+/// A word as keepalived reads it: quote characters removed, so
+/// `interface "eth1"` names `eth1`.
+fn unquote(word: &str) -> String {
+    word.replace('"', "")
+}
+
 fn open(stack: &[Frame], words: &[String]) -> Frame {
     match (stack.last(), words.first().map(String::as_str)) {
         (None, Some("vrrp_instance")) => Frame::Instance(VrrpInstance {
-            name: words.get(1).cloned().unwrap_or_default(),
+            name: words.get(1).map(|w| unquote(w)).unwrap_or_default(),
             interface: None,
             vip_devs: Vec::new(),
         }),
@@ -134,14 +140,14 @@ fn statement(stack: &mut [Frame], words: &[String]) {
     match stack {
         [.., Frame::Instance(inst)] => {
             if words.first().map(String::as_str) == Some("interface") {
-                inst.interface = words.get(1).cloned();
+                inst.interface = words.get(1).map(|w| unquote(w));
             }
         }
         [.., Frame::Instance(inst), Frame::Addresses] => inst.vip_devs.push(
             words
                 .windows(2)
                 .find(|w| w[0] == "dev")
-                .map(|w| w[1].clone()),
+                .map(|w| unquote(&w[1])),
         ),
         _ => {}
     }
@@ -320,6 +326,19 @@ vrrp_sync_group vrrpGroup {
         let insts = parse_instances(conf);
         assert_eq!(insts.len(), 1);
         assert_eq!(insts[0].dedicated_link(), Some("eth1"));
+    }
+
+    #[test]
+    fn quoted_names_match_unquoted() {
+        // keepalived strips quote characters, so these name eth1 and br0.
+        let conf = "vrrp_instance \"VI_1\" {\n  interface \"eth1\"\n  virtual_ipaddress {\n    192.0.2.1/24 dev \"br0\"\n  }\n}\n";
+        let insts = parse_instances(conf);
+        assert_eq!(insts[0].name, "VI_1");
+        assert_eq!(insts[0].vip_devs, vec![Some("br0".to_string())]);
+        assert_eq!(insts[0].dedicated_link(), Some("eth1"));
+
+        let on_link = "vrrp_instance VI_1 {\n  interface \"eth0\"\n  virtual_ipaddress {\n    192.0.2.1/24 dev eth0\n  }\n}\n";
+        assert_eq!(parse_instances(on_link)[0].dedicated_link(), None);
     }
 
     #[test]
