@@ -707,6 +707,12 @@ fn rx_placement_is_never_requested() {
             .collect::<Vec<_>>(),
         vec![("eth3", 7), ("eth2", 8), ("eth4", 9)]
     );
+    // Each port's VPP name, from the MAC readback: what the sampler's
+    // desired.conf names it by.
+    assert_eq!(
+        got.iter().map(|p| p.vpp_name.as_str()).collect::<Vec<_>>(),
+        vec!["octeon0/0", "octeon1/0", "octeon2/0"]
+    );
     let seen = fake.observed();
     assert!(
         !seen.iter().any(|s| s.contains("rx_placement")),

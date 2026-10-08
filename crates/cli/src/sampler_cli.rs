@@ -29,7 +29,7 @@ use packetframe_sampler_shm::coverage::{assess, Coverage, NoStatus, Observation}
 use packetframe_sampler_shm::desired::Desired;
 use packetframe_sampler_shm::follow::{self, Follower};
 use packetframe_sampler_shm::fs::{
-    usage, write_atomic, Lock, Opened, DEFAULT_DIR, DESIRED, DESIRED_LOCK, ENV_DIR,
+    clear_desired, usage, write_atomic, Lock, Opened, DEFAULT_DIR, DESIRED, DESIRED_LOCK, ENV_DIR,
 };
 use packetframe_sampler_shm::ring::{self, Counters, Drained, Sample};
 use packetframe_sampler_shm::status::{Interface, Status};
@@ -853,13 +853,15 @@ fn configure(
 }
 
 fn clear(dir: &Path) -> ExitCode {
-    let _lock = match take_desired_lock(dir) {
-        Ok(l) => l,
-        Err(code) => return code,
-    };
-    match std::fs::remove_file(dir.join(DESIRED)) {
-        Ok(()) => println!("desired.conf removed: the plugin stops sampling"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("no desired.conf"),
+    match clear_desired(dir) {
+        Ok(Some(true)) => println!("desired.conf removed: the plugin stops sampling"),
+        Ok(Some(false)) => println!("no desired.conf"),
+        Ok(None) => {
+            eprintln!(
+                "sampler: desired.lock is held: another writer (PacketFrame's flow export?) owns desired.conf"
+            );
+            return ExitCode::from(EXIT_STARTUP_ERROR);
+        }
         Err(e) => {
             eprintln!("sampler clear: {e}");
             return ExitCode::from(EXIT_RUNTIME_ERROR);

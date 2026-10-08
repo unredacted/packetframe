@@ -1,0 +1,104 @@
+name: VPP sampler plugin
+description: >-
+  Build the VPP sampler plugin and run it in a real VPP, leaving it at
+  crates/vpp-plugins/pf-sampler/target/release/libpf_sampler.so.
+
+# One definition for every workflow that ships or tests the plugin: CI's
+# `sampler plugin (arm64, VPP)` job, release.yml and hardware-artifacts.yml
+# all run exactly this, so a released plugin is one that passed the smoke
+# test in the run that built it.
+#
+# The plugin builds only against one VPP's headers, so it sits outside the
+# workspace and is built here: in the EFG's userland (Debian bullseye,
+# arm64), against the exact VPP release SOURCE.json names, its debs bound
+# to that release's SHA256SUMS. Then a real VPP runs it
+# (crates/vpp-plugins/pf-sampler/ci/smoke.sh): samples end to end through
+# the rings, no duplicate feature enable, a new epoch per VPP run, and VPP
+# starting with the plugin absent or refused.
+#
+# The caller runs it in a privileged debian:bullseye container on an arm64
+# runner (a tmpfs mount for the sampler directory, and VPP itself), after
+# actions/checkout. The container has no git at checkout time, so the
+# checkout is the REST download; nothing here needs a repository.
+runs:
+  using: composite
+  steps:
+    - name: System packages
+      shell: bash
+      # Bullseye left LTS on 2026-08-31; archive.debian.org is where every
+      # bullseye suite lives now.
+      run: |
+        printf '%s\n' \
+          'deb http://archive.debian.org/debian bullseye main' \
+          'deb http://archive.debian.org/debian bullseye-updates main' \
+          'deb http://archive.debian.org/debian-security bullseye-security main' \
+          > /etc/apt/sources.list
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          build-essential clang libclang-dev pkg-config curl ca-certificates git jq procps
+
+    - name: Install Rust (the toolchain rust-toolchain.toml pins)
+      shell: bash
+      # rustup reads rust-toolchain.toml itself: bullseye's Python predates
+      # the tomllib that .github/actions/rust-stable-pin uses.
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --profile minimal --default-toolchain none
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        "$HOME/.cargo/bin/rustup" toolchain install
+
+    - name: VPP from the release SOURCE.json names
+      shell: bash
+      run: |
+        set -eu
+        src=crates/modules/vpp-offload/vpp-api/SOURCE.json
+        repo=$(jq -r '.built_by' "$src" | cut -d@ -f1)
+        distro=$(jq -r '.distro' "$src" | sed 's/^debian-//')
+        tag="vpp-$(jq -r .vpp_ref "$src")-$(jq -r .platform "$src")-$distro-$(jq -r .arch "$src")"
+        dl=$(mktemp -d) && cd "$dl"
+        base="https://github.com/$repo/releases/download/$tag"
+        curl -fsSLO "$base/SHA256SUMS"
+        for p in vpp libvppinfra libvppinfra-dev vpp-dev vpp-plugin-core; do
+          curl -fsSLO "$base/$(awk -v p="$p" '$2 ~ "^" p "_" { print $2 }' SHA256SUMS)"
+        done
+        awk 'FNR == NR { have[$1]; next } $2 in have' <(ls *.deb) SHA256SUMS | sha256sum -c -
+        VPP_INSTALL_SKIP_SYSCTL=1 apt-get install -y --no-install-recommends ./*.deb
+        # The deb's boot-time hugepage sysctl (see vpp-unifi's README).
+        rm -f /etc/sysctl.d/80-vpp.conf
+        vpp --version
+
+    - uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+          crates/vpp-plugins/pf-sampler/target/
+        key: bullseye-arm64-sampler-plugin-${{ hashFiles('**/Cargo.lock', 'crates/modules/vpp-offload/vpp-api/SOURCE.json') }}
+        restore-keys: |
+          bullseye-arm64-sampler-plugin-
+
+    - name: Plugin fmt, clippy, build
+      shell: bash
+      working-directory: crates/vpp-plugins/pf-sampler
+      run: |
+        cargo fmt --check
+        cargo clippy --release --locked -- -D warnings
+        cargo build --release --locked
+        # The same plugin claiming another VPP, which VPP's loader must
+        # refuse while still starting.
+        PF_SAMPLER_VERSION_REQUIRED=00.00-never CARGO_TARGET_DIR=target/refused \
+          cargo build --release --locked
+
+    - name: Smoke tool
+      shell: bash
+      run: cargo build --release --locked -p packetframe-sampler-core --example sampler-smoke
+
+    - name: Plugin in a real VPP
+      shell: bash
+      run: |
+        bash crates/vpp-plugins/pf-sampler/ci/smoke.sh \
+          crates/vpp-plugins/pf-sampler/target/release/libpf_sampler.so \
+          crates/vpp-plugins/pf-sampler/target/refused/release/libpf_sampler.so \
+          target/release/examples/sampler-smoke

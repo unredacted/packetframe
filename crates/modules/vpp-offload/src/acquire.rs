@@ -68,6 +68,9 @@ pub struct SysPaths {
     /// record of THIS boot's resources from one a reboot has already
     /// released — see [`recorded_on_an_earlier_boot`].
     pub boot_id: Option<String>,
+    /// The VPP sampler's directory ([`crate::sampler`]), where its tmpfs
+    /// is mounted.
+    pub sampler_dir: PathBuf,
 }
 
 impl SysPaths {
@@ -94,9 +97,14 @@ impl SysPaths {
             hugetlbfs: PathBuf::from("/dev/hugepages"),
             state_dir: state_dir.into(),
             boot_id: crate::process::boot_id().ok(),
+            sampler_dir: PathBuf::from(SAMPLER_DIR),
         }
     }
 }
+
+/// The plugin's default directory, which VPP is spawned without
+/// overriding.
+pub const SAMPLER_DIR: &str = "/run/packetframe/vpp/sampler";
 
 /// Whether a state file describes resources from an EARLIER boot — and
 /// so describes nothing that still exists.
@@ -499,6 +507,16 @@ pub fn release(paths: &SysPaths, state: ResourceState) -> Result<(), String> {
                 Err(e) => errors.push(format!("restore {}: {e}", nr.display())),
             }
         }
+    }
+
+    // The sampler's tmpfs, if it is PacketFrame's. VPP is gone by now
+    // (every caller releases after the kill, or before any spawn), and a
+    // reader still mapping an epoch keeps only that memory, not the
+    // mount. Not one of `errors`, which keep the VF and hugepage record:
+    // its own record file stays when this fails, and `detach --all`
+    // processes it even once the state file is gone.
+    if let Err(e) = crate::sampler::release_recorded(&paths.sampler_dir, &paths.state_dir) {
+        tracing::warn!(error = %e, "the VPP sampler's tmpfs was not released; `packetframe detach --all` retries it");
     }
 
     if errors.is_empty() {
@@ -957,6 +975,7 @@ mod tests {
                 hugetlbfs,
                 state_dir: base.join("state"),
                 boot_id: Some(BOOT.into()),
+                sampler_dir: base.join("sampler"),
             };
             Self { base, paths }
         }

@@ -625,6 +625,10 @@ struct Core {
     /// second tier or a harness never set one; the small-table release
     /// is then simply off.
     feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
+    /// Where each attached process's ports are published for flow export
+    /// ([`packetframe_common::sampler_ports`]); `None` in harnesses that
+    /// never set one.
+    sampler_ports: Option<std::sync::Arc<packetframe_common::sampler_ports::VppSamplerPorts>>,
     /// Why the last drain failed, or `None` if the last one succeeded.
     ///
     /// Recorded here rather than left to the caller because the caller
@@ -1869,6 +1873,7 @@ impl Runtime {
             core: Rc::new(RefCell::new(Core {
                 completeness: None,
                 feed_session: None,
+                sampler_ports: None,
                 engine,
                 process: None,
                 source,
@@ -2051,6 +2056,15 @@ impl Runtime {
     /// leaves behind.
     pub fn feed_session(&self, handle: std::sync::Arc<packetframe_common::fib::FeedSession>) {
         self.core.borrow_mut().feed_session = Some(handle);
+    }
+
+    /// Publish each process's attached ports here, for flow export to
+    /// read VPP's samples by.
+    pub fn publish_sampler_ports(
+        &self,
+        handle: std::sync::Arc<packetframe_common::sampler_ports::VppSamplerPorts>,
+    ) {
+        self.core.borrow_mut().sampler_ports = Some(handle);
     }
 
     /// Install the kernel rx-mode kick. The attach wiring installs the
@@ -2841,6 +2855,34 @@ impl Core {
         }
     }
 
+    /// Publish which kernel port each of this process's interfaces is,
+    /// for flow export ([`packetframe_common::sampler_ports`]).
+    fn publish_ports_snapshot(&self) {
+        use packetframe_common::sampler_ports::{SampledPort, VppInstance, VppPortsSnapshot};
+        let (Some(h), Some(p)) = (&self.sampler_ports, &self.process) else {
+            return;
+        };
+        let ports = self
+            .engine
+            .attached_ports()
+            .iter()
+            .map(|a| SampledPort {
+                port: a.port.clone(),
+                ifindex: crate::sampler::kernel_ifindex(&a.port),
+                vpp_name: a.vpp_name.clone(),
+                sw_if_index: a.sw_if_index,
+            })
+            .collect();
+        h.publish(VppPortsSnapshot {
+            instance: VppInstance {
+                pid: p.pid(),
+                start_ticks: p.start_ticks(),
+                boot_id: crate::process::boot_id().ok(),
+            },
+            ports,
+        });
+    }
+
     /// The process is confirmed gone: invalidate everything learned
     /// from it. Indices are per-instance, the ledger describes a FIB
     /// that no longer exists, and the socket belongs to the dead
@@ -2849,6 +2891,10 @@ impl Core {
     /// instance (the engine clears its own copy for the same reason).
     fn process_gone(&mut self) {
         self.process = None;
+        // Its interface indices died with it.
+        if let Some(h) = &self.sampler_ports {
+            h.withdraw();
+        }
         self.attach_mode = crate::attach::AttachMode::Fresh;
         self.engine.on_process_gone();
         // Both described the dead instance's FIB.
@@ -4737,6 +4783,7 @@ impl Effects for EffectsView {
         // whole-record (see `note_persist`).
         let r = c.store.interfaces_attached(&indices);
         let _ = c.note_persist(r);
+        c.publish_ports_snapshot();
         // The kernel PF's half of the attach: the VF that just came up
         // disabled the AF's channel-default MCAM entries for the whole
         // LMAC, and only a PF-side rx-mode event re-enables them — the
@@ -6410,6 +6457,58 @@ mod tests {
         );
         // And only once.
         assert_eq!(obs.poll_exit(), None);
+    }
+
+    /// A process's attached ports are published for flow export with
+    /// its identity, and withdrawn the moment its exit is observed: its
+    /// interface indices mean nothing to the next one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sampler_ports_live_exactly_as_long_as_their_process() {
+        use packetframe_common::sampler_ports::VppSamplerPorts;
+        let rt = Runtime::new(
+            engine(),
+            Box::new(EmptySource),
+            Box::new(SteeringUnavailable),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/bin/true",
+            "/dev/null",
+        );
+        let ports = Arc::new(VppSamplerPorts::new());
+        rt.publish_sampler_ports(Arc::clone(&ports));
+        let (mut obs, mut fx) = rt.views();
+        fx.spawn().expect("spawn /bin/true");
+        {
+            let mut c = rt.core.borrow_mut();
+            c.engine
+                .set_attached_for_test(vec![crate::attach::AttachedPort {
+                    port: "lo".into(),
+                    dev_index: Some(0),
+                    sw_if_index: 1,
+                    vpp_name: "octeon0/0".into(),
+                    subifs: vec![],
+                }]);
+            c.publish_ports_snapshot();
+        }
+        let s = ports.current().expect("published");
+        assert_eq!(
+            s.instance.pid,
+            rt.core.borrow().process.as_ref().unwrap().pid()
+        );
+        assert_eq!(s.ports.len(), 1);
+        assert_eq!(
+            (s.ports[0].vpp_name.as_str(), s.ports[0].sw_if_index),
+            ("octeon0/0", 1)
+        );
+        assert_eq!(s.ports[0].ifindex, Some(1), "lo is ifindex 1");
+        for _ in 0..100 {
+            if obs.poll_exit().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ports.current().is_none(), "withdrawn with the process");
     }
 
     /// A steer into a mirror that is still loading is refused.

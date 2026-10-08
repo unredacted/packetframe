@@ -7,7 +7,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use packetframe_sampler_shm::fs::{
-    check_dir, create_epoch, ensure_dir, random_epoch, reclaim, DirError, EpochError,
+    check_dir, clear_desired, create_epoch, ensure_dir, is_mount_point, mount_tmpfs as mount,
+    random_epoch, reclaim, unmount, write_atomic, DirError, EpochError, DESIRED,
 };
 use packetframe_sampler_shm::layout::Layout;
 
@@ -75,4 +76,55 @@ fn a_default_size_tmpfs_is_refused() {
     assert!(matches!(check_dir(&d), Err(DirError::NotSizeLimited(_))));
     umount(&d);
     std::fs::remove_dir(&d).unwrap();
+}
+
+/// What PacketFrame mounts for the plugin: a directory `check_dir`
+/// accepts, with at least the budget asked for, gone again after
+/// `unmount` even while a file on it is open.
+#[test]
+#[ignore = "needs root to mount a tmpfs"]
+fn the_mount_packetframe_makes_is_one_the_plugin_accepts() {
+    let d = tempdir();
+    assert!(!is_mount_point(&d).unwrap());
+    assert!(
+        !is_mount_point(&d.join("absent")).unwrap(),
+        "nothing on a missing directory"
+    );
+    assert!(matches!(
+        check_dir(&d),
+        Err(DirError::NotTmpfs(_)) | Err(DirError::NotSizeLimited(_))
+    ));
+    let want = 5 * 1024 * 1024 + 123;
+    mount(&d, want).unwrap();
+    assert!(is_mount_point(&d).unwrap());
+    let size = check_dir(&d).unwrap();
+    assert!(size >= want && size < want + 64 * 1024, "{size}");
+
+    write_atomic(&d, DESIRED, b"x").unwrap();
+    assert_eq!(clear_desired(&d).unwrap(), Some(true));
+    assert_eq!(clear_desired(&d).unwrap(), Some(false));
+
+    let held = std::fs::File::create(d.join("held")).unwrap();
+    unmount(&d).unwrap();
+    assert!(!is_mount_point(&d).unwrap());
+    drop(held);
+    assert!(unmount(&d).is_err(), "nothing is mounted any more");
+    std::fs::remove_dir(&d).unwrap();
+}
+
+/// A writer holding `desired.lock` keeps `desired.conf`.
+#[test]
+fn a_held_lock_keeps_desired() {
+    let d = tempdir();
+    write_atomic(&d, DESIRED, b"x").unwrap();
+    let lock = packetframe_sampler_shm::fs::Lock::try_exclusive(
+        &d.join(packetframe_sampler_shm::fs::DESIRED_LOCK),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(clear_desired(&d).unwrap(), None);
+    assert!(d.join(DESIRED).exists());
+    drop(lock);
+    assert_eq!(clear_desired(&d).unwrap(), Some(true));
+    std::fs::remove_dir_all(&d).unwrap();
 }

@@ -138,6 +138,9 @@ pub struct AttachedPort {
     /// report a device index, and nothing downstream needs it).
     pub dev_index: Option<u32>,
     pub sw_if_index: u32,
+    /// VPP's name for the interface (`octeonN/P`): how `desired.conf`
+    /// names it to the sampler plugin.
+    pub vpp_name: String,
     /// `(vlan id, sw_if_index)` for every dot1q subinterface this
     /// port carries, created or adopted — in `vlans` declaration
     /// order. These are what `local-route` attached routes and the
@@ -336,7 +339,7 @@ pub fn attach_ports(
                 // running VPP, and this is the reconcile point. A MAC
                 // that silently reverted would punt every steered frame
                 // while every counter stayed healthy.
-                set_mac(t, p, idx, p.pf_mac)?;
+                let vpp_name = set_mac(t, p, idx, p.pf_mac)?;
                 set_accept_macs(t, p, idx, true)?;
                 set_promisc_on(t, p, idx)?;
                 set_unnumbered(t, p, idx, loop_idx)?;
@@ -345,6 +348,7 @@ pub fn attach_ports(
                     port: p.port.clone(),
                     dev_index: None,
                     sw_if_index: idx,
+                    vpp_name,
                     subifs,
                 });
                 continue;
@@ -391,7 +395,7 @@ pub fn attach_ports(
         // to the sink before it can forward is a port the FIB will
         // resolve routes onto while every packet dies at
         // `ip4-not-enabled`.
-        set_mac(t, p, sw_if_index, p.pf_mac)?;
+        let vpp_name = set_mac(t, p, sw_if_index, p.pf_mac)?;
         set_accept_macs(t, p, sw_if_index, false)?;
         set_promisc_on(t, p, sw_if_index)?;
         set_unnumbered(t, p, sw_if_index, loop_idx)?;
@@ -403,6 +407,7 @@ pub fn attach_ports(
             port: p.port.clone(),
             dev_index: Some(dev_index),
             sw_if_index,
+            vpp_name,
             subifs,
         });
     }
@@ -556,12 +561,14 @@ fn hex_mac(m: &[u8; 6]) -> String {
 /// implement it, and the failure mode is invisible — every packet
 /// punted, every counter healthy. `sw_interface_dump` reports
 /// `l2_address`, so the check costs one dump we already know how to do.
+/// Returns the interface's name from the readback, the one dump that
+/// sees a freshly created port.
 fn set_mac(
     t: &mut Transport,
     p: &PortAttach,
     sw_if_index: u32,
     mac: [u8; 6],
-) -> Result<(), AttachError> {
+) -> Result<String, AttachError> {
     let reply = t.request::<SwInterfaceSetMacAddress, SwInterfaceSetMacAddressReply>(
         SwInterfaceSetMacAddress {
             context: 0,
@@ -577,10 +584,10 @@ fn set_mac(
             detail: format!("mac {}", hex_mac(&mac)),
         });
     }
-    let got = interfaces(t)?
+    let (got, name) = interfaces(t)?
         .into_iter()
         .find(|i| i.sw_if_index == sw_if_index)
-        .map(|i| i.l2_address)
+        .map(|i| (i.l2_address, i.name))
         .ok_or_else(|| AttachError::StaleIndex {
             port: p.port.clone(),
             sw_if_index,
@@ -592,7 +599,7 @@ fn set_mac(
             got,
         });
     }
-    Ok(())
+    Ok(name)
 }
 
 /// The loopback a surviving VPP already has, if any.

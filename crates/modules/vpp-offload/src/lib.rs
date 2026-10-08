@@ -72,6 +72,7 @@ pub mod ntuple;
 pub mod process;
 pub mod resources;
 pub mod runtime;
+pub mod sampler;
 pub mod schedule;
 pub mod service;
 pub mod sink;
@@ -1135,6 +1136,10 @@ pub struct VppOffloadModule {
     /// loader wires it, which it does only when a route authority
     /// exists; see [`Self::set_completeness`].
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    /// Each VPP process's attached ports, for flow export to read VPP's
+    /// samples by. One for the module's life, so a holder sees every
+    /// attach: see [`Self::sampler_ports`].
+    sampler_ports: std::sync::Arc<packetframe_common::sampler_ports::VppSamplerPorts>,
     /// The feed's session-liveness handle, when the loader wired one;
     /// see [`Self::set_feed_session`].
     feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
@@ -1210,6 +1215,7 @@ impl VppOffloadModule {
         Self {
             allowlist: std::sync::Arc::new(SharedAllowlist::default()),
             completeness: None,
+            sampler_ports: Default::default(),
             feed_session: None,
             cfg: VppOffloadConfig::default(),
             state_dir: std::path::PathBuf::new(),
@@ -1265,6 +1271,14 @@ impl VppOffloadModule {
     /// that could make a snapshot stale.
     pub fn set_local_routes(&mut self, routes: Vec<LocalRoute>) {
         self.local_routes = routes;
+    }
+
+    /// Where this module publishes each VPP process's attached ports, for
+    /// flow export to interpret VPP's samples through.
+    pub fn sampler_ports(
+        &self,
+    ) -> std::sync::Arc<packetframe_common::sampler_ports::VppSamplerPorts> {
+        self.sampler_ports.clone()
     }
 
     /// Hand the module the route mirror's completeness handle.
@@ -1625,6 +1639,7 @@ impl Module for VppOffloadModule {
                 &allowlist,
                 self.completeness.clone(),
                 self.feed_session.clone(),
+                Some(self.sampler_ports.clone()),
                 &budget,
                 &self.local_routes,
             )
@@ -1961,7 +1976,16 @@ impl Module for VppOffloadModule {
             });
         }
         let alive = self.attached.as_ref().is_some_and(|a| a.service.is_alive());
-        Ok(report_from(self.published().as_ref(), alive))
+        let mut report = report_from(self.published().as_ref(), alive);
+        // Beside the overall state, never folded into it: forwarding does
+        // not depend on the sampler.
+        if let Some(a) = &self.attached {
+            report.subsystems.push(
+                a.sampler_dir
+                    .health(std::path::Path::new(acquire::SAMPLER_DIR)),
+            );
+        }
+        Ok(report)
     }
 }
 
@@ -2967,6 +2991,7 @@ mod tests {
             drift_accepts6: std::sync::Arc::new(drift::DriftAccepts6::new(
                 m.cfg.drift_accepts6.clone(),
             )),
+            sampler_dir: sampler::SamplerDir::Unavailable("not prepared in this test".into()),
         });
         m
     }

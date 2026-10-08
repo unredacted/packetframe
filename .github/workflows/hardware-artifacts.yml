@@ -27,6 +27,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/hardware-artifacts.yml'
+      - '.github/actions/sampler-plugin/**'
   workflow_dispatch:
     inputs:
       target:
@@ -142,9 +143,38 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  # The VPP sampler plugin for the arm64 glibc bundle and its .deb, built
+  # and smoke-tested by the action CI and release.yml use. From the same
+  # commit as the test binaries.
+  sampler-plugin:
+    name: sampler plugin (arm64, VPP)
+    if: (inputs.target || 'aarch64-unknown-linux-gnu') == 'aarch64-unknown-linux-gnu'
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:bullseye
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - uses: ./.github/actions/sampler-plugin
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sampler-plugin
+          path: crates/vpp-plugins/pf-sampler/target/release/libpf_sampler.so
+          retention-days: 14
+          if-no-files-found: error
+
   tests:
     name: test binaries (${{ inputs.target || 'aarch64-unknown-linux-gnu' }})
-    needs: bpf
+    needs: [bpf, sampler-plugin]
+    # Skipped for the other targets, which carry no plugin; failed is
+    # failed.
+    if: >-
+      !cancelled() && needs.bpf.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.sampler-plugin.result)
     runs-on: ubuntu-latest
     env:
       # Default target matches the production fleet: aarch64 UniFi OS,
@@ -438,6 +468,23 @@ jobs:
       #   - `<sha>` last, just before `_<arch>.deb`, so an operator can pick
       #     a bundle's package by commit with `*~hwtest.*.<sha>_*.deb` and
       #     read the exact commit out of `dpkg -l`.
+      # Where cargo-deb's `vpp-sampler` variant looks for it, and in the
+      # bundle for a router installing from the tarball.
+      - uses: actions/download-artifact@v8
+        if: env.TARGET == 'aarch64-unknown-linux-gnu'
+        with:
+          name: sampler-plugin
+          path: target/vpp-plugins
+
+      - name: Place the sampler plugin
+        if: env.TARGET == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          mv target/vpp-plugins/libpf_sampler.so target/vpp-plugins/pf_sampler_plugin.so
+          file target/vpp-plugins/pf_sampler_plugin.so | grep -q 'ELF 64-bit LSB shared object, ARM aarch64'
+          mkdir -p "dist/packetframe-hwtest-${TARGET}/vpp_plugins"
+          cp target/vpp-plugins/pf_sampler_plugin.so "dist/packetframe-hwtest-${TARGET}/vpp_plugins/"
+
       - name: Build .deb (gnu targets only)
         if: contains(inputs.target || 'aarch64-unknown-linux-gnu', '-gnu')
         run: |
@@ -450,9 +497,15 @@ jobs:
           # target/<triple>/release/packetframe. --no-strip: the release
           # profile strips, and the host's `strip` can't read a cross-built
           # arm64 ELF anyway.
+          # arm64 glibc is the package with the VPP sampler plugin.
+          VARIANT=()
+          if [ "${TARGET}" = aarch64-unknown-linux-gnu ]; then
+            VARIANT=(--variant vpp-sampler)
+          fi
           cargo deb --no-build --no-strip \
             --target "${TARGET}" \
             -p packetframe-cli \
+            "${VARIANT[@]}" \
             --deb-version "$(cat VERSION)~hwtest.${PF_RUN}.${PF_SHA:0:7}" \
             --output "dist/packetframe-hwtest-${TARGET}/"
           ls -la "dist/packetframe-hwtest-${TARGET}"/*.deb

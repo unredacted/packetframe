@@ -120,6 +120,9 @@ pub struct Attached {
     /// `reconfigure` to publish reloads into directly
     /// ([`crate::drift::DriftAccepts6`]).
     pub drift_accepts6: Arc<crate::drift::DriftAccepts6>,
+    /// The VPP sampler's directory as attach left it: the `sampler-dir`
+    /// row.
+    pub sampler_dir: crate::sampler::SamplerDir,
 }
 
 /// The MACs this member holds: its own PF address as **primary**, plus
@@ -524,6 +527,7 @@ pub fn bring_up(
     allowlist: &[packetframe_common::fib::IpPrefix],
     completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
     feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
+    sampler_ports: Option<Arc<packetframe_common::sampler_ports::VppSamplerPorts>>,
     budget: &McamBudget,
     local_routes: &[crate::LocalRoute],
 ) -> Result<Attached, String> {
@@ -833,6 +837,31 @@ pub fn bring_up(
         &cfg.restart_only(),
     )?;
 
+    // The VPP sampler's directory, before VPP can start. Never fatal
+    // (`crate::sampler`); a mount it makes is recorded before this
+    // returns, so the rollback below and every later release unmount it.
+    #[cfg(target_os = "linux")]
+    let sampler_dir = crate::sampler::prepare_recorded(
+        &paths.sys.sampler_dir,
+        startup_conf::thread_count(sizing.workers) as usize,
+        &paths.sys.state_dir,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let sampler_dir = crate::sampler::SamplerDir::Unavailable("Linux only".into());
+    match &sampler_dir {
+        crate::sampler::SamplerDir::Ready { bytes, owned, .. } => tracing::info!(
+            dir = %paths.sys.sampler_dir.display(),
+            kib = bytes >> 10,
+            owned,
+            "VPP sampler directory ready"
+        ),
+        crate::sampler::SamplerDir::Unavailable(why) => tracing::warn!(
+            dir = %paths.sys.sampler_dir.display(),
+            reason = %why,
+            "VPP sampler directory unavailable: VPP forwards as usual but cannot sample"
+        ),
+    }
+
     // From here, every failure releases. `?` would return holding VFs
     // and a hugepage reservation that only the state file knows about —
     // recoverable by `detach --all`, but an attach that leaves the box
@@ -884,6 +913,7 @@ pub fn bring_up(
         steering,
         completeness,
         feed_session,
+        sampler_ports,
         loopback,
         cfg.loopback_address6,
         &port_vlans,
@@ -893,6 +923,7 @@ pub fn bring_up(
         held_steering,
         cfg.families(),
         Arc::new(crate::drift::DriftAccepts6::new(cfg.drift_accepts6.clone())),
+        sampler_dir,
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -963,6 +994,7 @@ fn finish(
     steering: NtupleSteering,
     completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
     feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
+    sampler_ports: Option<Arc<packetframe_common::sampler_ports::VppSamplerPorts>>,
     loopback: packetframe_common::config::Ipv4Prefix,
     loopback6: Option<std::net::Ipv6Addr>,
     port_vlans: &[(String, Vec<u16>)],
@@ -972,6 +1004,7 @@ fn finish(
     held_steering: crate::SteeringInputs,
     families: FamilyPolicy,
     drift_accepts6: Arc<crate::drift::DriftAccepts6>,
+    sampler_dir: crate::sampler::SamplerDir,
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -1496,6 +1529,9 @@ fn finish(
         if let Some(handle) = feed_session {
             runtime.feed_session(handle);
         }
+        if let Some(handle) = sampler_ports {
+            runtime.publish_sampler_ports(handle);
+        }
         runtime.drift_accepts6(loop_accepts6);
         // The kernel rx-mode kick — the AllmultiKick doc in `runtime`
         // carries the w6/w8 evidence. Installed unconditionally on
@@ -1690,6 +1726,7 @@ fn finish(
         held_steering: Some(held_steering),
         control_plane,
         drift_accepts6,
+        sampler_dir,
     })
 }
 

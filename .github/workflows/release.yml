@@ -142,9 +142,31 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  # The VPP sampler plugin (flow export), for the arm64 package: built and
+  # run in a real VPP by the same action as CI's job, in the EFG's
+  # userland and against the VPP release SOURCE.json names.
+  sampler-plugin:
+    name: sampler plugin (arm64, VPP)
+    needs: version-gate
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:bullseye
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/sampler-plugin
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sampler-plugin
+          path: crates/vpp-plugins/pf-sampler/target/release/libpf_sampler.so
+          retention-days: 7
+          if-no-files-found: error
+
   build:
     name: build ${{ matrix.target }}
-    needs: bpf
+    needs: [bpf, sampler-plugin]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -238,6 +260,23 @@ jobs:
       - name: Build release
         run: cross build --release --workspace --target ${{ matrix.target }}
 
+      # Only arm64 glibc ships the plugin: it is built against the one VPP
+      # SOURCE.json names, which is the EFG's (bullseye, arm64), and the
+      # .deb is how a router gets it. Where cargo-deb's `vpp-sampler`
+      # variant looks for it.
+      - uses: actions/download-artifact@v8
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        with:
+          name: sampler-plugin
+          path: target/vpp-plugins
+
+      - name: Place the sampler plugin
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          mv target/vpp-plugins/libpf_sampler.so target/vpp-plugins/pf_sampler_plugin.so
+          file target/vpp-plugins/pf_sampler_plugin.so | grep -q 'ELF 64-bit LSB shared object, ARM aarch64'
+
       - name: Stage tarball contents
         run: |
           set -euo pipefail
@@ -255,6 +294,11 @@ jobs:
           # (hardware-artifacts.yml). The .deb installs the same set
           # under /usr/share/doc/packetframe/runbooks/.
           cp docs/runbooks/*.md "${STAGE}/docs/runbooks/"
+          # The VPP sampler plugin, for /usr/lib/packetframe/vpp_plugins/.
+          if [ "${{ matrix.target }}" = aarch64-unknown-linux-gnu ]; then
+            mkdir -p "${STAGE}/vpp_plugins"
+            cp target/vpp-plugins/pf_sampler_plugin.so "${STAGE}/vpp_plugins/"
+          fi
           ( cd dist && tar czf "${STEM}.tar.gz" "${STEM}" )
           ( cd dist && sha256sum "${STEM}.tar.gz" > "${STEM}.tar.gz.sha256" )
 
@@ -296,9 +340,15 @@ jobs:
           # --no-strip because the workspace release profile already
           # stripped, and the host's `strip` can't read a cross-built
           # arm64 ELF anyway.
+          # arm64 glibc is the package with the VPP sampler plugin.
+          VARIANT=()
+          if [ "${{ matrix.target }}" = aarch64-unknown-linux-gnu ]; then
+            VARIANT=(--variant vpp-sampler)
+          fi
           cargo deb --no-build --no-strip \
             --target "${{ matrix.target }}" \
             -p packetframe-cli \
+            "${VARIANT[@]}" \
             --deb-version "${DEB_VERSION}" \
             --output dist/
           # Append .deb hash to the per-target .sha256 so the publish

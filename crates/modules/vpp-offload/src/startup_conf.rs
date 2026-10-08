@@ -466,7 +466,15 @@ pub fn render(
     // linux-cp also deliberately ABSENT: it cannot pair kernel-owned
     // PFs (plan v3 correction). Routes and neighbors arrive over the
     // binary API from the RouteController's VppSink.
-    out.push_str("plugins {\n  plugin dpdk_plugin.so { disable }\n}\n");
+    //
+    // PacketFrame's own sampler plugin (flow export) is looked for beside
+    // VPP's: `add-path`, not `path`, which would drop VPP's own plugins.
+    // A missing directory is skipped and a plugin built for another VPP
+    // is refused by its version check; VPP starts the same either way.
+    out.push_str(&format!(
+        "plugins {{\n  plugin dpdk_plugin.so {{ disable }}\n  add-path {}\n}}\n",
+        crate::sampler::PLUGIN_DIR
+    ));
     out
 }
 
@@ -739,6 +747,10 @@ mod tests {
         assert!(
             conf.contains("plugin dpdk_plugin.so { disable }"),
             "dpdk_plugin must be disabled:\n{conf}"
+        );
+        assert!(
+            conf.contains("plugins {\n  plugin dpdk_plugin.so { disable }\n  add-path /usr/lib/packetframe/vpp_plugins\n}\n"),
+            "the sampler plugin's directory is added to VPP's, not put in its place:\n{conf}"
         );
         assert!(
             !conf.contains("dpdk {"),

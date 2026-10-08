@@ -28,6 +28,9 @@ case_() {
     local dir="$WORK/case"
     rm -rf "$dir" && mkdir -p "$dir"
     printf '%s\n' "$version" > "$dir/VERSION"
+    mkdir -p "$dir/crates/vpp-plugins/pf-sampler"
+    printf '[package]\nname = "pf-sampler"\nversion = "%s"\n\n[dependencies]\nx = { version = "9.9.9" }\n' \
+        "${STUB_PLUGIN_VERSION:-$STUB_CLI_VERSION}" > "$dir/crates/vpp-plugins/pf-sampler/Cargo.toml"
     printf '# Changelog\n\n%s\n\nBody line.\n\n## [0.0.1] - 2020-01-01\n\nOld.\n\n[0.5.0]: https://example.invalid\n' \
         "$heading" > "$dir/CHANGELOG.md"
     local got out
@@ -73,6 +76,8 @@ STUB_CLI_VERSION=0.5.0-rc1 case_ "rc tag, base section TBD"        fail 0.5.0-rc
 
 # A crate that hardcodes its own version.
 STUB_PROBE_VERSION=0.4.9 case_ "crate drift" fail 0.5.0 "## [0.5.0] - 2026-10-01" check v0.5.0
+# The VPP sampler plugin, outside the workspace, left behind.
+STUB_PLUGIN_VERSION=0.4.9 case_ "plugin drift" fail 0.5.0 "## [0.5.0] - 2026-10-01" check v0.5.0
 
 # Notes extraction.
 case_ "notes present"               ok   0.5.0 "## [0.5.0] - UNRELEASED"  notes 0.5.0

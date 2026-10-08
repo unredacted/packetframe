@@ -6,7 +6,10 @@
 //! - The consumer takes [`CONSUMER_LOCK`] with [`Lock::try_exclusive`] and
 //!   keeps it across epochs, then [`open_epoch`]s whatever `current` names.
 //! - PacketFrame writes `desired.conf` with [`write_atomic`] while holding
-//!   [`DESIRED_LOCK`].
+//!   [`DESIRED_LOCK`], and removes it with [`clear_desired`].
+//! - vpp-offload mounts the directory with [`mount_tmpfs`] before VPP
+//!   starts, when [`is_mount_point`] says nothing is there yet, and
+//!   [`unmount`]s its own mount after VPP is gone.
 //!
 //! The directory must be the root of its own tmpfs mount with an explicit
 //! `size=`: an unlinked epoch file stays allocated for as long as anyone
@@ -95,6 +98,14 @@ pub fn check_dir(dir: &Path) -> Result<u64, DirError> {
 /// its superblock options. tmpfs prints `size=` only when it is not the
 /// default (half of RAM), so its presence means someone chose a limit.
 fn size_limited_tmpfs_root(mountinfo: &str, dir: &Path) -> bool {
+    topmost_mount(mountinfo, dir).is_some_and(|(fstype, opts)| {
+        fstype == "tmpfs" && opts.split(',').any(|o| o.starts_with("size="))
+    })
+}
+
+/// The fstype and superblock options of the topmost mount at exactly
+/// `dir`, if anything is mounted there.
+fn topmost_mount<'a>(mountinfo: &'a str, dir: &Path) -> Option<(&'a str, &'a str)> {
     let want = dir.as_os_str().as_bytes();
     let mut found = None;
     for line in mountinfo.lines() {
@@ -111,9 +122,71 @@ fn size_limited_tmpfs_root(mountinfo: &str, dir: &Path) -> bool {
         let mut f = post.split(' ');
         let (fstype, _source, opts) = (f.next(), f.next(), f.next().unwrap_or(""));
         // Later lines are mounted over earlier ones at the same point.
-        found = Some(fstype == Some("tmpfs") && opts.split(',').any(|o| o.starts_with("size=")));
+        found = Some((fstype.unwrap_or(""), opts));
     }
-    found == Some(true)
+    found
+}
+
+/// Whether anything is mounted at exactly `dir`, as opposed to `dir`
+/// being a plain directory on its parent's filesystem.
+/// A `dir` that does not exist has nothing mounted on it.
+pub fn is_mount_point(dir: &Path) -> io::Result<bool> {
+    let real = match fs::canonicalize(dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    Ok(topmost_mount(&mountinfo, &real).is_some())
+}
+
+/// Mounts a tmpfs limited to `bytes` at `dir`, its root mode 0700: a
+/// directory [`check_dir`] accepts. Nothing on it is setuid, a device or
+/// executable.
+pub fn mount_tmpfs(dir: &Path, bytes: u64) -> io::Result<()> {
+    let target = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let opts = std::ffi::CString::new(format!("size={bytes},mode=0700")).unwrap();
+    // SAFETY: NUL-terminated strings that outlive the call.
+    let rc = unsafe {
+        libc::mount(
+            c"tmpfs".as_ptr(),
+            target.as_ptr(),
+            c"tmpfs".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            opts.as_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Detaches the mount at `dir`. Lazily: an epoch a reader still maps
+/// keeps its memory until the reader lets go.
+pub fn unmount(dir: &Path) -> io::Result<()> {
+    let target = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    // SAFETY: a NUL-terminated string that outlives the call.
+    if unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Removes `desired.conf` while holding [`DESIRED_LOCK`], so the plugin
+/// stops sampling. `Ok(None)` when another writer holds the lock, and
+/// otherwise whether there was a file to remove.
+pub fn clear_desired(dir: &Path) -> io::Result<Option<bool>> {
+    let Some(_lock) = Lock::try_exclusive(&dir.join(DESIRED_LOCK))? else {
+        return Ok(None);
+    };
+    match fs::remove_file(dir.join(DESIRED)) {
+        Ok(()) => Ok(Some(true)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Some(false)),
+        Err(e) => Err(e),
+    }
 }
 
 /// mountinfo escapes space, tab, newline and backslash as `\ooo`.

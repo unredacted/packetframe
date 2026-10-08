@@ -147,6 +147,9 @@ sha256sum -c SHA256SUMS --ignore-missing
 tar xzf "packetframe-v${VERSION}-${TARGET}.tar.gz"
 sudo install -m 0755 "packetframe-v${VERSION}-${TARGET}/packetframe" /usr/local/bin/
 sudo install -m 0644 -D "packetframe-v${VERSION}-${TARGET}/conf/example.conf" /etc/packetframe/example.conf
+# aarch64-unknown-linux-gnu only: the VPP sampler plugin, where vpp-offload's VPP looks for it
+[ ! -d "packetframe-v${VERSION}-${TARGET}/vpp_plugins" ] || sudo install -m 0644 -D \
+  "packetframe-v${VERSION}-${TARGET}/vpp_plugins/pf_sampler_plugin.so" /usr/lib/packetframe/vpp_plugins/pf_sampler_plugin.so
 ```
 
 When a release is signed, it also includes `SHA256SUMS.asc`. Check it with `gpg --verify SHA256SUMS.asc SHA256SUMS`.

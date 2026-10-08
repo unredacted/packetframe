@@ -76,6 +76,16 @@ notes_version() {
     fi
 }
 
+# Shipped crates outside the root workspace (the VPP sampler plugin
+# builds only against one VPP's headers; see the root Cargo.toml).
+OUTSIDE_WORKSPACE=(crates/vpp-plugins/pf-sampler/Cargo.toml)
+
+# The `[package]` version of a Cargo.toml.
+manifest_version() {
+    awk '/^\[/ { in_package = ($0 == "[package]") }
+         in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*/, ""); print; exit }' "$1"
+}
+
 cmd_check() {
     local tag="${1:-}"
     local file_version cargo_versions workspace_version
@@ -103,6 +113,16 @@ for p in m["packages"]:
     [ "$file_version" = "$workspace_version" ] ||
         die "VERSION says ${file_version} but the workspace Cargo version is ${workspace_version}"
 
+    # Crates outside the workspace that ship: cargo metadata cannot see
+    # them, so their manifests are read directly.
+    local m v
+    for m in "${OUTSIDE_WORKSPACE[@]}"; do
+        [ -f "$m" ] || die "${m} is missing"
+        v="$(manifest_version "$m")"
+        [ "$v" = "$workspace_version" ] ||
+            die "${m} says version ${v:-<none>} but the workspace is ${workspace_version}"
+    done
+
     local nv
     nv="$(notes_version "$file_version")"
     [ -n "$nv" ] || die "CHANGELOG.md has no '## [${file_version}]' section"
@@ -124,7 +144,7 @@ for p in m["packages"]:
         fi
     fi
 
-    echo "version ${file_version}: VERSION, Cargo workspace${tag:+, tag ${tag}} and CHANGELOG.md agree"
+    echo "version ${file_version}: VERSION, Cargo workspace and plugin${tag:+, tag ${tag}} and CHANGELOG.md agree"
 }
 
 cmd_notes() {
