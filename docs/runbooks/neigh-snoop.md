@@ -149,7 +149,8 @@ subscription feeds every bridge):
 - `netlink_resyncs_total{outcome=ok|failed}` — re-reads of links,
   addresses and neighbours after an overrun.
 - `netlink_resync_pending` — 1 while lost notifications are owed a
-  re-read; the neighbour mirror may be stale until it clears.
+  re-read, from the overrun until the re-read ends; the neighbour
+  mirror may be stale until it clears.
 
 Attribution notes:
 
@@ -159,6 +160,15 @@ Attribution notes:
   table dirty; the persist debounce (3 s) coalesces it.
 - `mac_conflict` climbing on one address is a participant with two
   routers on its port, or spoofing. Nothing is installed; look at who.
+- An install for an address the kernel mirror holds no row for is
+  written without `NLM_F_REPLACE`: the kernel creates the entry, or
+  fills one it holds unresolved (INCOMPLETE, FAILED), but keeps a valid
+  MAC it holds, a confirmed one included. The mirror can miss a live
+  entry (a neighbour dump taken during churn can skip one, and the
+  kernel does not flag it), and this is what keeps such a miss from
+  overwriting it. Such a write changes nothing and so counts
+  `unconfirmed`; the next sighting decides again on the row the
+  kernel's next notification or re-read brings.
 - `frames_outgoing_dropped_total` should be zero. Non-zero means the
   socket filter is not attached.
 - `recreated` link events during a provision or BGP upload are normal;
@@ -311,7 +321,8 @@ session has never been up from their side).
   re-seed applies the usual install rules to every learned address on
   that bridge: a confirmed (REACHABLE/DELAY/PROBE) MAC is never
   overridden, and a STALE row holding another MAC is replaced once it
-  is out of its 30 s holddown. The row
+  is out of its 30 s holddown. The row shows from the overrun until the
+  re-read ends, including while it runs, and
   clears on its own when the re-read lands; "the last re-read failed"
   names the dump that did not answer, and it is retried.
   `netlink_overruns_total` climbing steadily outside such events means

@@ -56,8 +56,8 @@ use crate::snapshot::{
     LinkEvent, LinkState, PersistOutcome, RsCoverageSnapshot, SeedOutcome, Snapshot,
 };
 use crate::table::{
-    admit, install_decision, Decision, FilterReject, KernelMirror, LearnedTable, MirrorEntry,
-    Observe, DEFAULT_HOLDDOWN,
+    admit, install_decision, Decision, FilterReject, InstallMode, KernelMirror, LearnedTable,
+    MirrorEntry, Observe, DEFAULT_HOLDDOWN,
 };
 
 pub type SharedSnapshot = Arc<RwLock<Snapshot>>;
@@ -189,6 +189,9 @@ struct InstallJob {
     ip: IpAddr,
     mac: [u8; 6],
     origin: Origin,
+    /// From the install decision taken at dispatch
+    /// ([`crate::table::InstallReason::mode`]).
+    mode: InstallMode,
 }
 
 struct PersistJob {
@@ -991,6 +994,10 @@ impl Engine {
                 "netlink notifications lost (receive buffer overrun); re-reading links, \
                  addresses and neighbours"
             );
+            // Say so now, not at the next housekeeping tick: a message
+            // storm can hold that off for as long as it lasts. Once per
+            // episode, so a burst of overruns costs one publish.
+            self.publish_snapshot(Instant::now());
         }
     }
 
@@ -1531,7 +1538,7 @@ impl Engine {
         };
         let kernel = self.mirror.get(ifindex, &ip);
         match install_decision(kernel, mac, last_install, now, DEFAULT_HOLDDOWN) {
-            Decision::Install(_) => {
+            Decision::Install(reason) => {
                 if b.queued.insert(ip) {
                     b.pending.push_back(InstallJob {
                         bridge_idx: bi,
@@ -1539,6 +1546,7 @@ impl Engine {
                         ip,
                         mac,
                         origin,
+                        mode: reason.mode(),
                     });
                 }
                 true
@@ -1586,7 +1594,10 @@ impl Engine {
                 };
                 let kernel = self.mirror.get(job.ifindex, &job.ip);
                 match install_decision(kernel, job.mac, last_install, now, DEFAULT_HOLDDOWN) {
-                    Decision::Install(_) => break Some(job),
+                    Decision::Install(reason) => {
+                        job.mode = reason.mode();
+                        break Some(job);
+                    }
                     Decision::Skip(reason) => {
                         b.counters.install(InstallOutcome::Skipped(reason));
                     }
@@ -1646,6 +1657,10 @@ impl Engine {
         // re-read before the expiry below calls it unconfirmed.
         if self.resync.due(Instant::now()) {
             self.resync.start(Instant::now());
+            // Published before the dumps, which can take several bounded
+            // waits: until the re-read ends, health and metrics say the
+            // mirror is owed one, not the last state before the loss.
+            self.publish_snapshot(Instant::now());
             match self.resync().await {
                 Ok(messages) => {
                     info!("netlink re-read complete; kernel mirror current");
@@ -1948,11 +1963,12 @@ async fn installer(
             ifindex,
             ip,
             mac,
+            mode,
             ..
         } = job;
         let result = requests
             .run("neighbour install", REQUEST_TIMEOUT, |h| async move {
-                netlink::install_stale(&h, ifindex, ip, mac).await
+                netlink::install_stale(&h, ifindex, ip, mac, mode).await
             })
             .await;
         match result {

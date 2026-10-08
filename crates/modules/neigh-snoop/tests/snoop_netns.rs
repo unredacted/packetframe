@@ -666,6 +666,81 @@ fn never_downgrades_or_overrides_confirmed_entries() {
     rig.stop();
 }
 
+/// (c5) An install decided on a row the mirror lacks cannot overwrite a
+/// MAC the kernel holds. The mirror can lack a live row with nothing to
+/// say so (a neighbour dump taken during churn can skip one, and the
+/// kernel never flags a neighbour dump `NLM_F_DUMP_INTR`), so such an
+/// install is written without `NLM_F_REPLACE`: a REACHABLE entry keeps
+/// its confirmed MAC. It must still fill an unresolved entry the mirror
+/// never heard of (an entry created FAILED or INCOMPLETE emits no
+/// notification), as `NLM_F_EXCL` would not, and create an absent one.
+/// An install over a row the mirror does hold replaces it, as before.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn an_install_on_a_missing_row_never_overrides_a_kernel_mac() {
+    use packetframe_neigh_snoop::netlink::install_stale;
+    use packetframe_neigh_snoop::table::InstallMode;
+    use std::net::IpAddr;
+
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let _ns_fd = enter_netns(&names.netns);
+    let ifindex = if_nametoindex(&names.veth_a);
+    let neigh = |ip: &str| neigh_line(&names.netns, &names.veth_a, ip).unwrap_or_default();
+    let set = |ip: &str, lladdr: Option<[u8; 6]>, nud: &str| {
+        let m = lladdr.map(mac_str);
+        let mut cmd = vec!["ip", "neigh", "replace", ip];
+        if let Some(m) = &m {
+            cmd.extend_from_slice(&["lladdr", m]);
+        }
+        cmd.extend_from_slice(&["dev", &names.veth_a, "nud", nud]);
+        ns_run(&names.netns, &cmd);
+    };
+    set("198.51.100.90", Some(MAC_X), "reachable");
+    set("198.51.100.91", None, "failed");
+    assert!(neigh("198.51.100.91").contains("FAILED"), "precondition");
+
+    // A current-thread runtime runs on this thread, inside the netns.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let (conn, handle, _) = rtnetlink::new_connection().expect("netlink connection");
+        tokio::spawn(conn);
+        let install = |n: u8, mode| install_stale(&handle, ifindex, IpAddr::V4(v4(n)), MAC_Y, mode);
+
+        // The kernel answers success and changes nothing.
+        assert_eq!(install(90, InstallMode::NoOverride).await, Ok(()));
+        let line = neigh("198.51.100.90");
+        assert!(
+            line.contains("REACHABLE") && line.contains(&mac_str(MAC_X)),
+            "a confirmed MAC the mirror missed must not be overwritten: {line}"
+        );
+
+        assert_eq!(install(91, InstallMode::NoOverride).await, Ok(()));
+        let line = neigh("198.51.100.91");
+        assert!(
+            line.contains("STALE") && line.contains(&mac_str(MAC_Y)),
+            "an unresolved entry the mirror missed is still filled: {line}"
+        );
+
+        assert_eq!(install(92, InstallMode::NoOverride).await, Ok(()));
+        let line = neigh("198.51.100.92");
+        assert!(
+            line.contains("STALE") && line.contains(&mac_str(MAC_Y)),
+            "an absent entry is created: {line}"
+        );
+
+        assert_eq!(install(90, InstallMode::Replace).await, Ok(()));
+        let line = neigh("198.51.100.90");
+        assert!(
+            line.contains("STALE") && line.contains(&mac_str(MAC_Y)),
+            "a row the mirror holds is replaced: {line}"
+        );
+    });
+}
+
 /// (c2) A FAILED entry is repaired from a solicitation. Uses NS on
 /// purpose: for ARP the kernel itself would update an existing FAILED
 /// entry from a third-party request and mask a regression here.

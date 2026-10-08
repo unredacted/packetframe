@@ -14,8 +14,10 @@ use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use futures::channel::mpsc::UnboundedReceiver;
-use futures::TryStreamExt;
-use netlink_packet_core::NetlinkMessage;
+use futures::{StreamExt, TryStreamExt};
+use netlink_packet_core::{
+    NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST,
+};
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
 use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
 use netlink_packet_route::neighbour::{
@@ -26,7 +28,7 @@ use rtnetlink::proto::Connection;
 use rtnetlink::sys::{AsyncSocket, SocketAddr, TokioSocket};
 use rtnetlink::Handle;
 
-use crate::table::{MirrorEntry, NudState};
+use crate::table::{InstallMode, MirrorEntry, NudState};
 
 /// What one RTM_NEWLINK tells us about a device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,24 +160,46 @@ pub async fn dump_neighs(handle: &Handle) -> Result<Vec<(u32, IpAddr, MirrorEntr
     Ok(out)
 }
 
-/// `RTM_NEWNEIGH` with `NLM_F_CREATE | NLM_F_REPLACE`, `NUD_STALE`,
-/// `NDA_DST` + `NDA_LLADDR`. rtnetlink's `add()` presets PERMANENT, so
-/// `.state(Stale)` must follow it; PERMANENT is never written.
+/// `RTM_NEWNEIGH` with `NUD_STALE`, `NDA_DST` + `NDA_LLADDR`, and
+/// `NLM_F_CREATE`, plus `NLM_F_REPLACE` for [`InstallMode::Replace`].
+/// Built here rather than with rtnetlink's `add()`, which sends
+/// `NLM_F_EXCL` whenever it does not send `NLM_F_REPLACE`: that would
+/// refuse to fill an unresolved entry the mirror never heard of.
 pub async fn install_stale(
     handle: &Handle,
     ifindex: u32,
     ip: IpAddr,
     mac: [u8; 6],
+    mode: InstallMode,
 ) -> Result<(), String> {
-    handle
-        .neighbours()
-        .add(ifindex, ip)
-        .link_layer_address(&mac)
-        .state(NeighbourState::Stale)
-        .replace()
-        .execute()
-        .await
-        .map_err(|e| e.to_string())
+    let mut msg = NeighbourMessage::default();
+    msg.header.ifindex = ifindex;
+    msg.header.state = NeighbourState::Stale;
+    let (family, dst) = match ip {
+        IpAddr::V4(a) => (AddressFamily::Inet, NeighbourAddress::Inet(a)),
+        IpAddr::V6(a) => (AddressFamily::Inet6, NeighbourAddress::Inet6(a)),
+    };
+    msg.header.family = family;
+    msg.attributes.push(NeighbourAttribute::Destination(dst));
+    msg.attributes
+        .push(NeighbourAttribute::LinkLayerAddress(mac.to_vec()));
+    let mut req = NetlinkMessage::from(RouteNetlinkMessage::NewNeighbour(msg));
+    req.header.flags = NLM_F_REQUEST
+        | NLM_F_ACK
+        | NLM_F_CREATE
+        | match mode {
+            InstallMode::Replace => NLM_F_REPLACE,
+            InstallMode::NoOverride => 0,
+        };
+    let mut replies = handle.clone().request(req).map_err(|e| e.to_string())?;
+    while let Some(reply) = replies.next().await {
+        if let NetlinkPayload::Error(e) = reply.payload {
+            if e.code.is_some() {
+                return Err(rtnetlink::Error::NetlinkError(e).to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub type StrictConnection = Connection<RouteNetlinkMessage, TokioSocket>;

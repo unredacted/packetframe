@@ -51,6 +51,8 @@
 //! re-reads the link table instead: every link that qualifies is queued
 //! for admission exactly as its `RTM_NEWLINK` would have been, and every
 //! ifindex the maps hold that the kernel no longer knows is evicted.
+//! The re-read reads on from a subscription opened just before its dump,
+//! so nothing queued before the loss is applied over it.
 //!
 //! The maps hold 64 links each. A link a map refuses with `E2BIG` (it
 //! is full) is warned about once and offered again only when an
@@ -68,12 +70,13 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use aya::maps::{xdp::DevMapHash, Array, HashMap as AyaHashMap, Map, MapData};
+use futures::channel::mpsc::UnboundedReceiver;
 use futures::{StreamExt, TryStreamExt};
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::link::{LinkAttribute, LinkLayerType, LinkMessage, State};
 use netlink_packet_route::RouteNetlinkMessage;
 use packetframe_common::config::ModuleDirective;
-use rtnetlink::sys::AsyncSocket;
+use rtnetlink::sys::{AsyncSocket, SocketAddr};
 use rtnetlink::{new_multicast_connection, MulticastGroup};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -677,6 +680,24 @@ fn resync_plan(links: &[LinkMessage], known: &HashSet<u32>) -> ResyncPlan {
     ResyncPlan { admit, gone }
 }
 
+/// The `RTNLGRP_LINK` notifications, as the watcher reads them.
+type Messages = UnboundedReceiver<(NetlinkMessage<RouteNetlinkMessage>, SocketAddr)>;
+
+/// A new `RTNLGRP_LINK` subscription with its receive buffer raised and
+/// its connection running.
+fn subscribe(rcvbuf: usize) -> Result<Messages, String> {
+    let (mut conn, _handle, messages) = new_multicast_connection(&[MulticastGroup::Link])
+        .map_err(|e| format!("RTNLGRP_LINK subscription failed: {e}"))?;
+    // Not fatal: the default buffer works, and an overrun is recovered
+    // from either way; a bigger one overruns less often.
+    match raise_rcvbuf(conn.socket_mut().socket_mut(), rcvbuf) {
+        Ok(granted) => debug!(granted, "redirect-target watcher: receive buffer"),
+        Err(e) => warn!(error = %e, "redirect-target watcher: could not raise the receive buffer"),
+    }
+    tokio::spawn(conn);
+    Ok(messages)
+}
+
 /// One `RTM_GETLINK` dump on a fresh connection, bounded. Abandoning a
 /// timed-out dump drops the connection with it, so nothing is left
 /// waiting on a reply that will not come.
@@ -696,8 +717,21 @@ async fn dump_links() -> Result<Vec<LinkMessage>, String> {
 
 /// Re-read the link table after lost notifications (see the module
 /// docs). Returns how many links qualify (each queued; admission skips
-/// what is already in) and how many were evicted.
-async fn resync(targets: &mut Targets, pending: &mut Pending) -> Result<(usize, usize), String> {
+/// what is already in), how many were evicted, and the subscription to
+/// read from now on.
+///
+/// That subscription is opened before the dump, so every change from
+/// the dump onwards is in it, and replaces the old one, which is dropped
+/// with whatever it still holds. That backlog predates the loss, so the
+/// dump already covers it, and applying it after the dump would undo
+/// the dump: an `RTM_DELLINK` queued before the loss would evict a link
+/// the dump just admitted at a reused ifindex.
+async fn resync(
+    targets: &mut Targets,
+    pending: &mut Pending,
+    rcvbuf: usize,
+) -> Result<(usize, usize, Messages), String> {
+    let fresh = subscribe(rcvbuf)?;
     let links = dump_links().await?;
     let known: HashSet<u32> = targets.in_devmap.union(&targets.in_tc).copied().collect();
     let plan = resync_plan(&links, &known);
@@ -720,7 +754,7 @@ async fn resync(targets: &mut Targets, pending: &mut Pending) -> Result<(usize, 
     if evicted > 0 {
         targets.offer_full(pending);
     }
-    Ok((plan.admit.len(), evicted))
+    Ok((plan.admit.len(), evicted, fresh))
 }
 
 /// The kernel dropped link notifications on the full buffer (netlink-
@@ -738,15 +772,25 @@ fn on_overrun(pending: &mut Pending, status: &Mutex<WatchStatus>) {
     }
 }
 
-async fn run_resync(targets: &mut Targets, pending: &mut Pending, status: &Mutex<WatchStatus>) {
+/// Run one re-read and record how it went. `Some` is the subscription
+/// that replaces the old one ([`resync`]); a failed re-read keeps the
+/// old one, and is owed again.
+async fn run_resync(
+    targets: &mut Targets,
+    pending: &mut Pending,
+    status: &Mutex<WatchStatus>,
+    rcvbuf: usize,
+) -> Option<Messages> {
     // This re-read covers every loss reported until now. One reported
-    // from here on arrives as another overrun, after it, and is owed a
-    // re-read of its own.
+    // from here on comes from the subscription it hands back, and is
+    // owed a re-read of its own.
     pending.resync = false;
-    let result = resync(targets, pending).await;
+    let result = resync(targets, pending, rcvbuf).await;
     let mut s = status.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut fresh = None;
     match result {
-        Ok((viable, evicted)) => {
+        Ok((viable, evicted, messages)) => {
+            fresh = Some(messages);
             pending.resync_not_before = None;
             info!(
                 viable,
@@ -765,6 +809,7 @@ async fn run_resync(targets: &mut Targets, pending: &mut Pending, status: &Mutex
         }
     }
     s.resync_pending = pending.resync || pending.recovering;
+    fresh
 }
 
 /// After a refresh: a completed re-read is a completed recovery once the
@@ -835,21 +880,13 @@ async fn run(
     // reconcile is replayed from the socket buffer afterwards instead
     // of being missed (same ordering argument as the resolver's FDB
     // seed).
-    let (mut conn, _handle, mut messages) = match new_multicast_connection(&[MulticastGroup::Link])
-    {
-        Ok(c) => c,
+    let mut messages = match subscribe(rcvbuf) {
+        Ok(m) => m,
         Err(e) => {
-            stopped(&status, format!("RTNLGRP_LINK subscription failed: {e}"));
+            stopped(&status, e);
             return;
         }
     };
-    // Not fatal: the default buffer works, and an overrun is recovered
-    // from either way; a bigger one overruns less often.
-    match raise_rcvbuf(conn.socket_mut().socket_mut(), rcvbuf) {
-        Ok(granted) => debug!(granted, "redirect-target watcher: receive buffer"),
-        Err(e) => warn!(error = %e, "redirect-target watcher: could not raise the receive buffer"),
-    }
-    tokio::spawn(conn);
 
     let mut targets = match Targets::open(&root, rx_ports) {
         Ok(t) => t,
@@ -898,13 +935,16 @@ async fn run(
                     // The one await here that can be long (a dump, up to
                     // its 30 s bound): `detach` joins this thread before it
                     // removes the pins, inside its budget.
-                    tokio::select! {
+                    let fresh = tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => {
                             debug!("redirect-target watcher shutdown during a re-read");
                             return;
                         }
-                        _ = run_resync(&mut targets, &mut pending, &status) => {}
+                        fresh = run_resync(&mut targets, &mut pending, &status, rcvbuf) => fresh,
+                    };
+                    if let Some(fresh) = fresh {
+                        messages = fresh;
                     }
                 }
                 let refreshed = refresh(&mut targets, &mut pending, &directives);

@@ -360,6 +360,36 @@ pub enum InstallReason {
     MacDiffers,
 }
 
+/// How an install is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    /// `NLM_F_CREATE` alone. The kernel creates an absent entry and fills
+    /// an unresolved one (INCOMPLETE, FAILED), but an existing entry
+    /// holding a valid MAC keeps it: without `NLM_F_REPLACE`, `neigh_add`
+    /// drops `NEIGH_UPDATE_F_OVERRIDE`, and `__neigh_update` then answers
+    /// a different MAC for a valid entry with success and no change.
+    NoOverride,
+    /// `NLM_F_CREATE | NLM_F_REPLACE`: over the entry the mirror holds.
+    Replace,
+}
+
+impl InstallReason {
+    /// "Absent" is the mirror's belief, and the mirror can be wrong with
+    /// nothing to say so: a neighbour dump taken during churn can skip a
+    /// live entry, and the kernel never marks a neighbour dump
+    /// `NLM_F_DUMP_INTR`, nor notifies an entry it creates unresolved. So
+    /// an absent install never overrides: if the kernel does hold a valid
+    /// MAC, a confirmed one included, it stays, while an unresolved entry
+    /// the mirror never heard of is still filled. The other reasons rest
+    /// on a row the mirror holds and must replace it.
+    pub fn mode(self) -> InstallMode {
+        match self {
+            Self::Absent => InstallMode::NoOverride,
+            Self::Unusable | Self::MacDiffers => InstallMode::Replace,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     /// The kernel already holds this MAC in a valid state; an ADMIN
@@ -525,6 +555,16 @@ mod tests {
     }
     fn m(state: NudState, mac: Option<[u8; 6]>) -> MirrorEntry {
         MirrorEntry { state, mac }
+    }
+
+    /// Only an install over a row the mirror holds may replace; one the
+    /// mirror believes absent must not, since a wrong "absent" would then
+    /// overwrite whatever the kernel holds.
+    #[test]
+    fn an_absent_install_never_overrides() {
+        assert_eq!(InstallReason::Absent.mode(), InstallMode::NoOverride);
+        assert_eq!(InstallReason::Unusable.mode(), InstallMode::Replace);
+        assert_eq!(InstallReason::MacDiffers.mode(), InstallMode::Replace);
     }
 
     #[test]

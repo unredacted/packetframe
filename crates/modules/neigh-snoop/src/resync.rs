@@ -26,6 +26,8 @@ pub struct Resync {
     /// Notifications were lost after the last re-read started (or no
     /// re-read has run yet).
     pending: bool,
+    /// A re-read is under way: what it covers is still owed until it ends.
+    running: bool,
     last_attempt: Option<Instant>,
     last_error: Option<String>,
 }
@@ -56,11 +58,13 @@ impl Resync {
     pub fn start(&mut self, now: Instant) {
         self.last_attempt = Some(now);
         self.pending = false;
+        self.running = true;
     }
 
     /// The re-read ended. A failed one leaves everything it was meant to
     /// cover still owed.
     pub fn finish(&mut self, result: Result<(), String>) {
+        self.running = false;
         match result {
             Ok(()) => {
                 self.outcomes[ResyncOutcome::Ok.index()] += 1;
@@ -74,11 +78,14 @@ impl Resync {
         }
     }
 
+    /// Owed means owed until a re-read *ends*: one still running has not
+    /// made the mirror current yet, so the snapshot published while it
+    /// runs must not read as recovered.
     pub fn snapshot(&self) -> NetlinkSnapshot {
         NetlinkSnapshot {
             overruns: self.overruns,
             resyncs: self.outcomes,
-            resync_pending: self.pending,
+            resync_pending: self.pending || self.running,
             last_error: self.last_error.clone(),
         }
     }
@@ -114,6 +121,9 @@ mod tests {
         r.overrun();
         r.start(t0);
         assert!(!r.due(t0 + RESYNC_MIN_INTERVAL), "nothing owed");
+        // Still owed while it runs: what is published meanwhile must not
+        // read as recovered.
+        assert!(r.snapshot().resync_pending, "owed until the re-read ends");
         r.finish(Ok(()));
         let s = r.snapshot();
         assert!(!s.resync_pending);

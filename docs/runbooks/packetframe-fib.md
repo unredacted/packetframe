@@ -1683,7 +1683,11 @@ from draining) and says so only once, as an overrun. None of them is
 resent, so the watcher re-reads the whole link table instead: every
 qualifying link is admitted as its notification would have admitted it,
 and every ifindex the maps hold that the kernel no longer knows is
-evicted.
+evicted. The re-read subscribes afresh before its dump and reads on from
+that subscription once it has been applied: what the old one still held
+predates the loss, and replayed after the dump it could undo it (a
+delete queued before the loss evicting a link the dump just admitted at
+a reused ifindex).
 
 Check:
 
