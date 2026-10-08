@@ -1155,24 +1155,13 @@ fn anyip_addr_from_cfg(cfg: &ModuleConfig<'_>) -> Option<std::net::Ipv4Addr> {
 /// in the state dir beside the pid file; flock is per-open-file, so
 /// dropping the returned handle releases it on every exit path.
 fn acquire_anyip_lock(state_dir: &Path) -> ModuleResult<std::fs::File> {
-    std::fs::create_dir_all(state_dir).map_err(|e| {
+    let path = state_dir.join(ANYIP_LOCK_NAME);
+    let f = open_anyip_lock(state_dir).map_err(|e| {
         ModuleError::other(
             MODULE_NAME,
-            format!("anyip lock: create {}: {e}", state_dir.display()),
+            format!("anyip lock: open {}: {e}", path.display()),
         )
     })?;
-    let path = state_dir.join("anyip.lock");
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(|e| {
-            ModuleError::other(
-                MODULE_NAME,
-                format!("anyip lock: open {}: {e}", path.display()),
-            )
-        })?;
     // SAFETY: valid fd from the just-opened File; flock has no other
     // preconditions.
     let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), libc::LOCK_EX) };
@@ -1184,6 +1173,47 @@ fn acquire_anyip_lock(state_dir: &Path) -> ModuleResult<std::fs::File> {
                 path.display(),
                 std::io::Error::last_os_error()
             ),
+        ));
+    }
+    Ok(f)
+}
+
+const ANYIP_LOCK_NAME: &str = "anyip.lock";
+
+/// Open `anyip.lock`, creating it 0600 when missing, relative to the
+/// same no-follow walk of `state_dir` the module's records are written
+/// through. This root daemon runs it, and `state-dir` may be writable by
+/// someone who is not. By pathname, `create_dir_all` and the open
+/// followed a symlink at any component, and at the name itself, so a
+/// planted link chose where root created a file and which file it
+/// locked, and the umask chose the modes of the directories it made.
+/// The walk makes those 0755, so this can be the first writer to make
+/// `state-dir` without leaving it group-writable for vpp-offload's
+/// state-file reader to refuse.
+///
+/// Opened `O_NONBLOCK` and kept only if it is a regular file, so a FIFO
+/// at the name is refused rather than waited on. `flock` blocks on
+/// `LOCK_EX` regardless of `O_NONBLOCK`, so the lock still waits for its
+/// holder. Read-only, because `flock` needs no write access.
+fn open_anyip_lock(state_dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let dir = packetframe_common::statefile::create_and_open_dir_no_follow(state_dir)?;
+    let name = std::ffi::CString::new(ANYIP_LOCK_NAME).expect("no NUL in the lock name");
+    let flags =
+        libc::O_CREAT | libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    // SAFETY: `dir` is an open directory descriptor and `name` a
+    // NUL-terminated string, both alive across the call.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600 as libc::c_uint) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by openat and is owned by nothing
+    // else.
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file; remove it",
         ));
     }
     Ok(f)
@@ -4453,5 +4483,208 @@ mod tests {
         // ...but a single readable family that alone exceeds the pool
         // still warns.
         assert!(gc_thresh3_capacity_warning(Some(65536), None, 8192).is_some());
+    }
+}
+
+/// The writers through which fast-path can be first to make `state-dir`,
+/// in attach order: the anyip lock, `tc-links.json`, and (in the loader,
+/// after attach) the pin registry.
+#[cfg(test)]
+mod state_dir_tests {
+    use super::{acquire_anyip_lock, ANYIP_LOCK_NAME};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pf-fp-state-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // Closed to group and others whatever the harness's umask, so
+        // what the writers make under it is judged on its own modes.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        d
+    }
+
+    /// A symlink at the lock's name, or at any component of `state-dir`,
+    /// fails the lock before anything is created where it points. By
+    /// pathname, the open created the link's target and locked it, and
+    /// `create_dir_all` followed an intermediate link.
+    #[test]
+    fn the_anyip_lock_refuses_a_symlink_anywhere_in_its_path() {
+        let base = scratch("lock-link");
+        let state = base.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let target = base.join("created-through-the-link");
+        std::os::unix::fs::symlink(&target, state.join(ANYIP_LOCK_NAME)).unwrap();
+        let err = acquire_anyip_lock(&state).expect_err("locked through the link");
+        assert!(err.to_string().contains(ANYIP_LOCK_NAME), "{err}");
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "the lock was created through the link"
+        );
+
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        for state_dir in [link.join("state"), link.join("a").join("b"), link.clone()] {
+            let err = acquire_anyip_lock(&state_dir).expect_err("locked through the link");
+            assert!(
+                err.to_string().contains("a symlink here is refused"),
+                "{}: {err}",
+                state_dir.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&real).unwrap().count(),
+            0,
+            "something was made through the link"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A FIFO at the lock's name is refused, not waited on. By pathname
+    /// the write open blocked until something opened the FIFO to read,
+    /// so whoever could plant one stopped every start at attach.
+    #[test]
+    fn the_anyip_lock_refuses_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let base = scratch("lock-fifo");
+        let fifo =
+            std::ffi::CString::new(base.join(ANYIP_LOCK_NAME).as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = mpsc::channel();
+        let dir = base.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(acquire_anyip_lock(&dir).map(drop));
+        });
+        let err = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the lock's open blocked on the FIFO")
+            .expect_err("a FIFO was taken as the lock");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The non-blocking open leaves the lock blocking: a second start
+    /// waits until the holder lets go, and the file is made 0600.
+    #[test]
+    fn the_anyip_lock_waits_for_its_holder() {
+        let base = scratch("lock-wait");
+        let held = acquire_anyip_lock(&base).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let dir = base.clone();
+        let waiter = std::thread::spawn(move || {
+            let _ = tx.send(acquire_anyip_lock(&dir).map(drop));
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the lock was taken, or refused, while held"
+        );
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("never taken after the holder let go")
+            .unwrap();
+        waiter.join().unwrap();
+        let mode = std::fs::metadata(base.join(ANYIP_LOCK_NAME))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o600);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Where the umask child creates; set only in the child's environment.
+    const UMASK_CHILD_BASE: &str = "PF_TEST_FP_UMASK_CHILD_BASE";
+
+    const UMASK_WRITERS: [&str; 3] = ["anyip-lock", "tc-links", "registry"];
+
+    fn umask_state_dir(base: &Path, writer: &str) -> PathBuf {
+        base.join(writer).join("a").join("b").join("state")
+    }
+
+    /// Each first creator makes a missing multi-level `state-dir`
+    /// closed to group and others under a 002 umask, so vpp-offload's
+    /// state-file reader, attaching after fast-path, takes the directory
+    /// as holding no state file rather than refusing it. Modules attach
+    /// in config order and the loader writes its own records (pid file,
+    /// identity) only after the last one, so fast-path's writers can be
+    /// the first to make `state-dir`; their `create_dir_all` made every
+    /// component 0775 under this umask.
+    ///
+    /// The umask is per process, and other tests here create directories
+    /// with default modes, so the writers run in a child: this test
+    /// binary re-run on [`umask_002_child_creates`] alone.
+    #[test]
+    fn a_missing_state_dir_is_made_closed_to_group_and_others_under_a_002_umask() {
+        use packetframe_common::statefile::read_owned_no_follow;
+        let base = scratch("umask");
+        let module = module_path!().split_once("::").unwrap().1;
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                &format!("{module}::umask_002_child_creates"),
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(UMASK_CHILD_BASE, &base)
+            .output()
+            .unwrap();
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{shown}");
+        assert!(
+            shown.contains("test result: ok. 1 passed;"),
+            "the child did not run its test: {shown}"
+        );
+
+        for writer in UMASK_WRITERS {
+            let state_dir = umask_state_dir(&base, writer);
+            let mut dir = base.clone();
+            for name in [writer, "a", "b", "state"] {
+                dir.push(name);
+                let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+                assert_eq!(mode & 0o022, 0, "{writer}: {} is {mode:04o}", dir.display());
+            }
+            let read = read_owned_no_follow(&state_dir.join("vpp-offload.json"), 1 << 20);
+            assert!(
+                matches!(read, Ok(None)),
+                "{writer}: the reader refused {}: {read:?}",
+                state_dir.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[ignore = "runs only as the child of a_missing_state_dir_is_made_closed_to_group_and_others_under_a_002_umask"]
+    fn umask_002_child_creates() {
+        let Some(base) = std::env::var_os(UMASK_CHILD_BASE) else {
+            return;
+        };
+        let base = PathBuf::from(base);
+        let prior = unsafe { libc::umask(0o002) };
+        let lock = acquire_anyip_lock(&umask_state_dir(&base, "anyip-lock")).map(drop);
+        let tc = crate::tc_links::save(
+            &umask_state_dir(&base, "tc-links"),
+            &crate::tc_links::TcLinksFile { links: Vec::new() },
+        );
+        let registry = crate::registry::save(
+            &umask_state_dir(&base, "registry"),
+            &crate::registry::RegistryFile {
+                module: "fast-path".into(),
+                attachments: Vec::new(),
+            },
+        );
+        unsafe { libc::umask(prior) };
+        lock.unwrap();
+        tc.unwrap();
+        registry.unwrap();
     }
 }
