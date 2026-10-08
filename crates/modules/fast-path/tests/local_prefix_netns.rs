@@ -241,9 +241,7 @@ fn collect_events_with(
         let (prog, log): (_, RouteEventLog) = recording_handle();
         let resolver = configure(resolver, prog);
 
-        let task = tokio::spawn(async move {
-            let _ = resolver.run().await;
-        });
+        let task = tokio::spawn(resolver.run());
 
         // Let the RTM_GETLINK / RTM_GETNEIGH dumps land and the
         // multicast socket bind before mutating neighbour state.

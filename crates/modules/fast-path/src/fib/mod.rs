@@ -35,6 +35,12 @@ pub mod local_nexthops;
 /// Linux's, behind a plain-`std::fs` fallback.
 pub mod route_ledger;
 
+/// Ungated for the same reason: the neighbour resolver's supervision
+/// decisions, its resync reconciliation and its health row are pure, so
+/// the rules that decide a restart are tested on the macOS dev loop. The
+/// resolver that acts on them is `netlink_neigh`, Linux-gated below.
+pub mod neigh_supervision;
+
 #[cfg(target_os = "linux")]
 pub mod anyip;
 #[cfg(target_os = "linux")]
