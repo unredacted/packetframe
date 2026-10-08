@@ -3307,7 +3307,8 @@ not the daemon's, or you cannot tell, handle it as the oversized file
 below.
 
 **"past the 16777216-byte bound".** A real file is a few KB, and the
-widest the module could write is ~12 MB, so this one was not written
+widest the module could write is ~12 MB (64 ports, the most a config
+may declare, each with a full rule table), so this one was not written
 by it whole (a sparse or corrupt file). Treat it as a torn file: check
 that nothing it could record is live (`pgrep -a vpp`, `ethtool -n
 <port>` for rules steering into a VF, `sriov_numvfs` under each

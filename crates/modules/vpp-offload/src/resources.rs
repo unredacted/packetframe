@@ -68,7 +68,8 @@ pub const STATE_FILE_NAME: &str = "vpp-offload.json";
 /// table: at most [`VPP_MAX_STEER_CAPACITY`] locations recorded and
 /// planned (also the most a table read enumerates). At the widest rule
 /// shape, with every number at its type's maximum, that is ~111 KB a
-/// port, so 64 ports (ten times the reference NIC's six) come to ~7.1 MB.
+/// port, so [`VPP_MAX_PORTS`] ports (64, the most a config may declare,
+/// ten times the reference NIC's six) come to ~7.1 MB.
 /// The attach-time config echo ([`ResourceState::restart_only`]) is
 /// bounded by the config file's own cap ([`MAX_CONFIG_FILE_SIZE`]); the
 /// widest the test below builds on top of those ports totals ~12.1 MB.
@@ -81,6 +82,7 @@ pub const STATE_FILE_NAME: &str = "vpp-offload.json";
 /// measures the widest file against it.
 ///
 /// [`VPP_MAX_STEER_CAPACITY`]: packetframe_common::config::VPP_MAX_STEER_CAPACITY
+/// [`VPP_MAX_PORTS`]: packetframe_common::config::VPP_MAX_PORTS
 /// [`MAX_CONFIG_FILE_SIZE`]: packetframe_common::config::MAX_CONFIG_FILE_SIZE
 pub const MAX_STATE_FILE_BYTES: u64 = 16 << 20;
 
@@ -1055,8 +1057,9 @@ mod tests {
     }
 
     /// The bound holds the widest file the module can write, measured on
-    /// what `save` writes and `load` reads back rather than restated: 64
-    /// ports, ten times the reference NIC's six, each with a rule table
+    /// what `save` writes and `load` reads back rather than restated:
+    /// every port a config may declare (`VPP_MAX_PORTS`, so raising the
+    /// cap without the bound fails here), each with a rule table
     /// at the `steer-capacity` ceiling recorded and planned at a widest
     /// rule shape, every number at its type's maximum. The config echo is
     /// rendered by `restart_only` itself from more `local-route6` lines,
@@ -1066,10 +1069,10 @@ mod tests {
     fn the_size_bound_holds_the_widest_state_the_module_writes() {
         use crate::steer::{L4Match, L4Proto, RuleAction, RuleMatch, RuleSet, Side, SteerRule};
         use packetframe_common::config::{
-            Ipv4Prefix, Ipv6Prefix, MAX_CONFIG_FILE_SIZE, VPP_MAX_STEER_CAPACITY,
+            Ipv4Prefix, Ipv6Prefix, MAX_CONFIG_FILE_SIZE, VPP_MAX_PORTS, VPP_MAX_STEER_CAPACITY,
         };
         use std::net::{Ipv4Addr, Ipv6Addr};
-        const PORTS: usize = 64;
+        const PORTS: usize = VPP_MAX_PORTS;
         // IFNAMSIZ less its NUL.
         let iface = |p: usize| format!("{p:x<15}");
         let shortest_line = "local-route6 ::/0 port a vlan 1\n".len() as u64;
