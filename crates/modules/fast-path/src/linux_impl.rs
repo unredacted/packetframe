@@ -3721,6 +3721,14 @@ pub fn route_ledger_status(state: &ActiveState) -> Option<crate::fib::route_ledg
     )
 }
 
+/// The neighbour resolver's status, for the health and metrics surfaces.
+/// `None` in kernel-fib mode, where no resolver runs.
+pub fn neigh_resolver_status(
+    state: &ActiveState,
+) -> Option<crate::fib::neigh_supervision::ResolverStatus> {
+    Some(state.route_controller.as_ref()?.neigh_resolver_status())
+}
+
 // Read current stats, aggregated across all CPUs.
 pub fn snapshot_stats(state: &ActiveState) -> ModuleResult<Vec<u64>> {
     use aya::maps::PerCpuArray;

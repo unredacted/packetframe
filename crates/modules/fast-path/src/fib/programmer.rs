@@ -233,6 +233,29 @@ impl FibProgrammerHandle {
         }
     }
 
+    /// Re-probe every nexthop that is not `Resolved` now, instead of when
+    /// its backoff says (up to
+    /// `REPROBE_MAX`, a minute away).
+    ///
+    /// The neighbour resolver sends this after it re-reads the kernel —
+    /// a resync after lost notifications, or a restarted resolver — when
+    /// the kernel may hold usable entries for nexthops this programmer
+    /// still has `Incomplete`: their re-probes hit the fresh cache and
+    /// resolve within a tick, and the ones the kernel has not resolved
+    /// get a solicitation now. Same `try_send` posture as
+    /// [`Self::set_nexthop_pin_nowait`]; `false` when the queue is full,
+    /// so the caller can re-send.
+    #[must_use]
+    pub fn reprobe_unresolved_now(&self) -> bool {
+        match self.tx.try_send(Command::ReprobeNow) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, "re-probe nudge not queued (command queue full); will retry");
+                false
+            }
+        }
+    }
+
     pub async fn register_nexthop(&self, ip: IpAddr) -> Result<NexthopId, ProgrammerError> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -363,24 +386,33 @@ impl FibProgrammerHandle {
 }
 
 /// Shared log of every [`RouteEvent`] a [`recording_handle`] observed,
-/// in dispatch order.
+/// in dispatch order, and how many re-probe nudges it was sent.
 #[doc(hidden)]
 #[derive(Clone, Default)]
-pub struct RouteEventLog(std::sync::Arc<std::sync::Mutex<Vec<RouteEvent>>>);
+pub struct RouteEventLog {
+    events: std::sync::Arc<std::sync::Mutex<Vec<RouteEvent>>>,
+    reprobe_nudges: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
 
 #[doc(hidden)]
 impl RouteEventLog {
     /// Snapshot the events recorded so far.
     pub fn events(&self) -> Vec<RouteEvent> {
-        self.0.lock().expect("RouteEventLog poisoned").clone()
+        self.events.lock().expect("RouteEventLog poisoned").clone()
     }
 
     pub fn len(&self) -> usize {
-        self.0.lock().expect("RouteEventLog poisoned").len()
+        self.events.lock().expect("RouteEventLog poisoned").len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// [`FibProgrammerHandle::reprobe_unresolved_now`] calls received.
+    pub fn reprobe_nudges(&self) -> u64 {
+        self.reprobe_nudges
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -406,7 +438,8 @@ pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
 /// authority's count.
 #[doc(hidden)]
 pub fn recording_handle_reporting(counts: (usize, usize)) -> (FibProgrammerHandle, RouteEventLog) {
-    spawn_recorder(counts, None)
+    let (tx, rx) = mpsc::channel::<Command>(256);
+    (FibProgrammerHandle { tx }, spawn_recorder(rx, counts, None))
 }
 
 /// Holds a [`gated_recording_handle`]'s applies until opened.
@@ -437,8 +470,32 @@ impl ApplyGate {
 pub(crate) fn gated_recording_handle() -> (FibProgrammerHandle, RouteEventLog, ApplyGate) {
     let (open, open_rx) = tokio::sync::watch::channel(false);
     let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let (handle, log) = spawn_recorder((0, 0), Some((open_rx, arrived.clone())));
-    (handle, log, ApplyGate { open, arrived })
+    let (tx, rx) = mpsc::channel::<Command>(256);
+    let log = spawn_recorder(rx, (0, 0), Some((open_rx, arrived.clone())));
+    (FibProgrammerHandle { tx }, log, ApplyGate { open, arrived })
+}
+
+/// A [`recording_handle`] whose commands nobody answers until
+/// [`HeldCommands::release`] — a programmer that is busy, as during a
+/// route-ledger seed or a full-table load. For the resolver test that a
+/// long wait on the programmer is not mistaken for a stuck resolver.
+#[doc(hidden)]
+pub fn held_handle() -> (FibProgrammerHandle, HeldCommands) {
+    let (tx, rx) = mpsc::channel::<Command>(256);
+    (FibProgrammerHandle { tx }, HeldCommands(rx))
+}
+
+/// See [`held_handle`].
+#[doc(hidden)]
+pub struct HeldCommands(mpsc::Receiver<Command>);
+
+#[doc(hidden)]
+impl HeldCommands {
+    /// Start answering, as [`recording_handle`] does, from the first
+    /// command held. Call inside a tokio runtime.
+    pub fn release(self) -> RouteEventLog {
+        spawn_recorder(self.0, (0, 0), None)
+    }
 }
 
 type RecorderGate = (
@@ -447,10 +504,10 @@ type RecorderGate = (
 );
 
 fn spawn_recorder(
+    mut rx: mpsc::Receiver<Command>,
     counts: (usize, usize),
     mut gate: Option<RecorderGate>,
-) -> (FibProgrammerHandle, RouteEventLog) {
-    let (tx, mut rx) = mpsc::channel::<Command>(256);
+) -> RouteEventLog {
     let log = RouteEventLog::default();
     let sink = log.clone();
     tokio::spawn(async move {
@@ -463,11 +520,15 @@ fn spawn_recorder(
                         // A dropped gate releases too: the test is over.
                         let _ = open.wait_for(|open| *open).await;
                     }
-                    sink.0
+                    sink.events
                         .lock()
                         .expect("RouteEventLog poisoned")
                         .push(event.clone());
                     let _ = reply.send(Ok(()));
+                }
+                Command::ReprobeNow => {
+                    sink.reprobe_nudges
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Command::RegisterNexthop { reply, .. } => {
                     let id = next_id;
@@ -494,7 +555,7 @@ fn spawn_recorder(
             }
         }
     });
-    (FibProgrammerHandle { tx }, log)
+    log
 }
 
 enum Command {
@@ -540,6 +601,9 @@ enum Command {
     /// write. Idempotent: repeats with an unchanged pin are absorbed
     /// by the stored-state comparison.
     SetNexthopPin { ip: IpAddr, pin: Option<(u32, u16)> },
+    /// Re-probe every unresolved nexthop now. Fire-and-forget. See
+    /// [`FibProgrammerHandle::reprobe_unresolved_now`].
+    ReprobeNow,
     /// Snapshot the mirror's route-source advertisements as a route
     /// ledger record. See [`FibProgrammerHandle::encode_ledger`].
     EncodeLedger {
@@ -1227,6 +1291,7 @@ impl FibProgrammer {
             }
             Command::SetCacheEnabled { on } => self.set_cache_enabled(on),
             Command::SetNexthopPin { ip, pin } => self.set_nexthop_pin(ip, pin),
+            Command::ReprobeNow => self.reprobe_now(),
             Command::EncodeLedger {
                 identity,
                 written_at_unix,
@@ -1881,6 +1946,32 @@ impl FibProgrammer {
             due: Instant::now() + REPROBE_INITIAL,
             attempts: 0,
         });
+    }
+
+    /// Make every pending re-probe due now
+    /// ([`FibProgrammerHandle::reprobe_unresolved_now`]). The next
+    /// `REPROBE_TICK` fires them, `REPROBE_BATCH` at a time.
+    ///
+    /// Only the next probe moves; the backoff keeps its count, so the one
+    /// after follows the schedule the nexthop had already earned. The
+    /// resolver may send this every few seconds through a sustained
+    /// overflow (once per resync), and restarting every backoff each time
+    /// would kick a dead neighbour every few seconds — a solicitation, a
+    /// pass through `rtnl_lock`, and more notifications into the very
+    /// socket that is overflowing. A live neighbour needs only the one
+    /// probe brought forward.
+    fn reprobe_now(&mut self) {
+        let now = Instant::now();
+        for r in self.reprobe.values_mut() {
+            r.due = now;
+        }
+        if !self.reprobe.is_empty() {
+            info!(
+                pending = self.reprobe.len(),
+                "the neighbour resolver re-read the kernel; re-probing every unresolved nexthop \
+                 now"
+            );
+        }
     }
 
     /// Issue `request_resolve` for every due re-probe (up to
