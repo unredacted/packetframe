@@ -1731,11 +1731,19 @@ loop waited for it forever, and nothing noticed. The daemon now:
   is then dropped with everything still queued on it. After an overflow
   the kernel goes on delivering what it queued *before* the drop, which
   is older than what it dropped; replayed after the dump, it would
-  re-learn deleted neighbours or withdraw live ones. A link or neighbour
-  the dump does not list is asked about individually before it is
-  withdrawn, because a dump can skip a live entry. One that cannot be
-  confirmed is left as it is and the resync is retried. The multicast
-  receive buffer is also raised to 16 MiB, which makes overruns rarer.
+  re-learn deleted neighbours or withdraw live ones. (A resync that
+  could not apply anything, for example because no request socket was
+  free, keeps the old subscription.)
+
+  What the dumps list is applied first. A link or neighbour the dump does
+  not list is then asked about individually before it is withdrawn,
+  because a dump can skip a live entry. A neighbour on a device that no
+  longer exists counts as gone, and when a device goes, any neighbours
+  the resolver still held on it go with it. Confirmations stop as soon as
+  the request socket is retired, and take at most 2 s per read. One that
+  is not made is left as it is and the resync is retried, so the loop
+  never sits behind a blocked socket. The multicast receive buffer is
+  also raised to 16 MiB, which makes overruns rarer.
 - **Reads back suppressed probes.** A nexthop behind an `ix-mode`
   interface is still never kicked, but its kernel entry is now read back
   (a unicast get, nothing on the fabric). An entry the snooper installed

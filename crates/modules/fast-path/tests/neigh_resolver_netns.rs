@@ -1355,3 +1355,173 @@ fn a_live_neighbour_a_dump_skipped_is_not_lost() {
         let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
     });
 }
+
+/// A device deleted while the resolver was not listening (stuck here, or
+/// an overrun) takes its neighbours with it, and their `RTM_DELNEIGH`s
+/// were lost too. The next read must announce them gone and leave
+/// nothing owed. Before the fix the view kept them: no dump listed them,
+/// and the single-entry get that was to confirm them answered `ENODEV`,
+/// read as "unknown" — a resync owed every 5 s, forever, surviving
+/// restarts.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn a_device_deleted_unheard_takes_its_neighbours_and_leaves_no_debt() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let netns = names.netns.clone();
+    let doomed = format!("{}x", names.veth_a);
+    let doomed_peer = format!("{}y", names.veth_a);
+    ns_run(
+        &netns,
+        &[
+            "ip",
+            "link",
+            "add",
+            &doomed,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            &doomed_peer,
+        ],
+    );
+    ns_run(&netns, &["ip", "link", "set", &doomed, "up"]);
+    ns_run(
+        &netns,
+        &["ip", "addr", "add", "203.0.113.254/24", "dev", &doomed],
+    );
+    let orphan: IpAddr = "203.0.113.9".parse().unwrap();
+    neigh_permanent(&netns, "203.0.113.9", "02:00:00:00:09:09", &doomed);
+    let _ns_fd = enter_netns(&names.netns);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async move {
+        let shutdown = CancellationToken::new();
+        let hang: IpAddr = "198.51.100.97".parse().unwrap();
+        let (resolver, mut events_rx, resolve) = NetlinkNeighborResolver::new(shutdown.clone());
+        let resolver = resolver
+            .with_supervision_timing(quick_timing(Duration::from_secs(3)))
+            .with_test_faults(TestFaults {
+                hang_on_resolve: Some(hang),
+                ..TestFaults::default()
+            });
+        let status = resolver.status();
+        let resolver_task = tokio::spawn(resolver.run());
+        await_status(&status, Duration::from_secs(5), "the first loop", |s| {
+            s.incarnation == 1
+                && s.phase == packetframe_fast_path::fib::neigh_supervision::Phase::Running
+        })
+        .await;
+
+        // Deaf, then the device goes: its notifications are lost with
+        // the stuck incarnation's subscription.
+        assert!(resolve.request_resolve(hang));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        ns_run(&netns, &["ip", "link", "del", &doomed]);
+
+        await_status(
+            &status,
+            Duration::from_secs(15),
+            "the replacement incarnation",
+            |s| {
+                s.incarnation == 2
+                    && s.phase == packetframe_fast_path::fib::neigh_supervision::Phase::Running
+            },
+        )
+        .await;
+        let events = collect_events(&mut events_rx, Duration::from_secs(2)).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, NeighEvent::Gone { ip, .. } if *ip == orphan)),
+            "a neighbour on a device deleted unheard must be announced gone: {events:?}"
+        );
+
+        // And nothing is owed: no resync retrying every 5 s for a
+        // neighbour no get can ever find.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let s = status.snapshot();
+        assert!(s.resync_owed.is_none(), "nothing may be owed: {s:?}");
+        assert_eq!(s.counters.resync_failures, 0, "{s:?}");
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
+    });
+}
+
+/// On an `ix-mode` interface the proactive kick is suppressed (its
+/// broadcast is dropped upstream), but a single-entry read of the
+/// kernel's entry is unicast to the kernel and puts nothing on the
+/// fabric. When the view missed an entry the kernel has — here its
+/// notification is dropped, as an overrun drops one — the resolve
+/// request must still find it. Before the fix a suppressed probe did
+/// nothing, and the nexthop waited for the kernel to next change that
+/// neighbour, which on an IX link may be never.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn a_suppressed_probe_reads_back_an_entry_the_view_missed() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let netns = names.netns.clone();
+    let veth_a = names.veth_a.clone();
+    let _ns_fd = enter_netns(&names.netns);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async move {
+        let shutdown = CancellationToken::new();
+        let missed: IpAddr = "198.51.100.77".parse().unwrap();
+        let (resolver, mut events_rx, resolve) = NetlinkNeighborResolver::new(shutdown.clone());
+        let resolver = resolver
+            .with_ix_interfaces(vec![veth_a.clone()])
+            .with_test_faults(TestFaults {
+                lose_notifications_for: vec![missed],
+                ..TestFaults::default()
+            });
+        let suppressed = resolver.ix_probe_suppressed_counter();
+        let status = resolver.status();
+        let resolver_task = tokio::spawn(resolver.run());
+        await_status(&status, Duration::from_secs(5), "the first loop", |s| {
+            s.phase == packetframe_fast_path::fib::neigh_supervision::Phase::Running
+        })
+        .await;
+
+        // The kernel learns it (the snooper's job on a real IX bridge);
+        // the view does not.
+        neigh_permanent(&netns, "198.51.100.77", "02:00:00:00:08:77", &veth_a);
+        let early = collect_events(&mut events_rx, Duration::from_millis(500)).await;
+        assert!(
+            !early
+                .iter()
+                .any(|e| matches!(e, NeighEvent::Learned { ip, .. } if *ip == missed)),
+            "the fixture must keep the view from hearing about it: {early:?}"
+        );
+
+        assert!(resolve.request_resolve(missed));
+        let missing = await_learned(
+            &mut events_rx,
+            [missed].into_iter().collect(),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            missing.is_empty(),
+            "a suppressed probe must still read the kernel's entry back"
+        );
+        assert_eq!(
+            suppressed.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "and it was suppressed, not kicked"
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
+    });
+}
