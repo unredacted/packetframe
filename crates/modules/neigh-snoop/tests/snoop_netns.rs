@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use packetframe_common::config::Config;
 use packetframe_neigh_snoop::cfg::SnoopConfig;
 use packetframe_neigh_snoop::engine::EngineHandle;
-use packetframe_neigh_snoop::snapshot::{InstallOutcome, Snapshot};
+use packetframe_neigh_snoop::snapshot::{InstallOutcome, ResyncOutcome, SeedOutcome, Snapshot};
 use packetframe_neigh_snoop::table::SkipReason;
 
 // --- netns plumbing ------------------------------------------------------
@@ -435,6 +435,12 @@ impl Rig {
     /// Enter the netns, start the engine (its runtime threads inherit
     /// the namespace from this thread), open the injector on veth B.
     fn start() -> Self {
+        Self::start_with(None)
+    }
+
+    /// [`Self::start`], with the engine's multicast receive buffer set to
+    /// `rcvbuf` bytes when given.
+    fn start_with(rcvbuf: Option<usize>) -> Self {
         let names = Names::new();
         let guard = NetnsGuard::setup(&names);
         let ns_fd = enter_netns(&names.netns);
@@ -447,7 +453,13 @@ impl Rig {
         let c = Config::parse(&s).unwrap();
         let cfg = SnoopConfig::from_directives(&c.modules[0].directives).unwrap();
         std::fs::create_dir_all(&names.persist).unwrap();
-        let engine = EngineHandle::start(cfg, names.persist.clone()).expect("engine start");
+        let engine = match rcvbuf {
+            None => EngineHandle::start(cfg, names.persist.clone()),
+            Some(bytes) => {
+                EngineHandle::start_with_multicast_rcvbuf(cfg, names.persist.clone(), bytes)
+            }
+        }
+        .expect("engine start");
         let b_ifindex = if_nametoindex(&names.veth_b);
         let injector = open_packet_socket(b_ifindex);
         Self {
@@ -654,6 +666,81 @@ fn never_downgrades_or_overrides_confirmed_entries() {
     rig.stop();
 }
 
+/// (c5) An install decided on a row the mirror lacks cannot overwrite a
+/// MAC the kernel holds. The mirror can lack a live row with nothing to
+/// say so (a neighbour dump taken during churn can skip one, and the
+/// kernel never flags a neighbour dump `NLM_F_DUMP_INTR`), so such an
+/// install is written without `NLM_F_REPLACE`: a REACHABLE entry keeps
+/// its confirmed MAC. It must still fill an unresolved entry the mirror
+/// never heard of (an entry created FAILED or INCOMPLETE emits no
+/// notification), as `NLM_F_EXCL` would not, and create an absent one.
+/// An install over a row the mirror does hold replaces it, as before.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn an_install_on_a_missing_row_never_overrides_a_kernel_mac() {
+    use packetframe_neigh_snoop::netlink::install_stale;
+    use packetframe_neigh_snoop::table::InstallMode;
+    use std::net::IpAddr;
+
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let _ns_fd = enter_netns(&names.netns);
+    let ifindex = if_nametoindex(&names.veth_a);
+    let neigh = |ip: &str| neigh_line(&names.netns, &names.veth_a, ip).unwrap_or_default();
+    let set = |ip: &str, lladdr: Option<[u8; 6]>, nud: &str| {
+        let m = lladdr.map(mac_str);
+        let mut cmd = vec!["ip", "neigh", "replace", ip];
+        if let Some(m) = &m {
+            cmd.extend_from_slice(&["lladdr", m]);
+        }
+        cmd.extend_from_slice(&["dev", &names.veth_a, "nud", nud]);
+        ns_run(&names.netns, &cmd);
+    };
+    set("198.51.100.90", Some(MAC_X), "reachable");
+    set("198.51.100.91", None, "failed");
+    assert!(neigh("198.51.100.91").contains("FAILED"), "precondition");
+
+    // A current-thread runtime runs on this thread, inside the netns.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let (conn, handle, _) = rtnetlink::new_connection().expect("netlink connection");
+        tokio::spawn(conn);
+        let install = |n: u8, mode| install_stale(&handle, ifindex, IpAddr::V4(v4(n)), MAC_Y, mode);
+
+        // The kernel answers success and changes nothing.
+        assert_eq!(install(90, InstallMode::NoOverride).await, Ok(()));
+        let line = neigh("198.51.100.90");
+        assert!(
+            line.contains("REACHABLE") && line.contains(&mac_str(MAC_X)),
+            "a confirmed MAC the mirror missed must not be overwritten: {line}"
+        );
+
+        assert_eq!(install(91, InstallMode::NoOverride).await, Ok(()));
+        let line = neigh("198.51.100.91");
+        assert!(
+            line.contains("STALE") && line.contains(&mac_str(MAC_Y)),
+            "an unresolved entry the mirror missed is still filled: {line}"
+        );
+
+        assert_eq!(install(92, InstallMode::NoOverride).await, Ok(()));
+        let line = neigh("198.51.100.92");
+        assert!(
+            line.contains("STALE") && line.contains(&mac_str(MAC_Y)),
+            "an absent entry is created: {line}"
+        );
+
+        assert_eq!(install(90, InstallMode::Replace).await, Ok(()));
+        let line = neigh("198.51.100.90");
+        assert!(
+            line.contains("STALE") && line.contains(&mac_str(MAC_Y)),
+            "a row the mirror holds is replaced: {line}"
+        );
+    });
+}
+
 /// (c2) A FAILED entry is repaired from a solicitation. Uses NS on
 /// purpose: for ARP the kernel itself would update an existing FAILED
 /// entry from a third-party request and mask a regression here.
@@ -777,6 +864,295 @@ fn emits_nothing() {
     assert_eq!(
         ours, 0,
         "the snooped interface emitted ARP/ND during a learn cycle"
+    );
+    rig.stop();
+}
+
+/// Notifications the kernel drops on a full receive buffer are made good
+/// by a re-read. The engine's multicast buffer is shrunk to the kernel's
+/// minimum (about one message), so one `ip neigh flush` — every delete in
+/// a single request, every `RTM_DELNEIGH` emitted back to back, the way a
+/// port bounce flushes a peering LAN — overruns it and most deletes are
+/// never heard. Without the re-read the mirror keeps those addresses as
+/// resolved for good and nothing puts them back in the kernel: coverage
+/// stays near full over an empty table, the gate keeps them as
+/// participants, and no frame arrives here to trigger a re-install. With
+/// it, the mirror learns they are gone and the bridge is re-seeded.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn neighbours_flushed_unheard_are_re_read_and_re_seeded() {
+    const N: u8 = 40;
+    let rig = Rig::start_with(Some(1));
+    let addr = |i: u8| v4(100 + i);
+    for i in 0..N {
+        let mac = [0x02, 0, 0, 0, 0x01, i];
+        rig.inject(&arp_request(mac, mac, addr(i), v4(200)));
+    }
+    // Echoes can overrun the shrunk buffer too; a re-read then confirms
+    // them, so allow for its pacing.
+    wait_for(
+        Duration::from_secs(15),
+        "every learned address resolved in the mirror",
+        || {
+            let s = rig.snapshot();
+            let c = s.bridges[0].participant_coverage;
+            (c.total == u64::from(N) && c.resolved == u64::from(N)).then(|| format!("{s:?}"))
+        },
+    );
+    let held = |table: &str| {
+        (0..N)
+            .filter(|i| {
+                table
+                    .lines()
+                    .any(|l| l.starts_with(&format!("{} ", addr(*i))))
+            })
+            .count()
+    };
+    assert_eq!(
+        held(&neigh_table(&rig.names.netns, &rig.names.veth_a)),
+        usize::from(N),
+        "every learned address installed"
+    );
+
+    let before = rig.snapshot();
+    ns_run(
+        &rig.names.netns,
+        &["ip", "neigh", "flush", "dev", &rig.names.veth_a],
+    );
+    assert_eq!(
+        held(&neigh_table(&rig.names.netns, &rig.names.veth_a)),
+        0,
+        "the flush emptied the kernel table"
+    );
+    // The premise: the burst overflowed the buffer. Without it this test
+    // would pass on the event path alone and prove nothing.
+    rig.wait_counter("an overrun reported for the flush", |s| {
+        s.netlink.overruns > before.netlink.overruns
+    });
+    // Re-reads are paced (`RESYNC_MIN_INTERVAL`), and one may have run
+    // just before for an overrun during the learning above. No frame is
+    // injected from here on: only the re-read can put entries back.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let restored = loop {
+        let n = held(&neigh_table(&rig.names.netns, &rig.names.veth_a));
+        if n == usize::from(N) || Instant::now() >= deadline {
+            break n;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let s = rig.snapshot();
+    assert_eq!(
+        restored,
+        usize::from(N),
+        "every flushed learned address re-seeded into the kernel: {:?}",
+        s.netlink
+    );
+    // Counted as seeds: restored by the re-seed, not by anything else.
+    // The snapshot trails by up to a housekeeping tick, and the re-seed's
+    // echoes can overrun the buffer as well, so the mirror catches up by
+    // its echoes or by the next re-read.
+    let seeded = |s: &Snapshot| s.bridges[0].counters.seeds[SeedOutcome::Requested.index()];
+    wait_for(
+        Duration::from_secs(15),
+        "the re-seed counted and the mirror agreeing with the restored table",
+        || {
+            let s = rig.snapshot();
+            let c = s.bridges[0].participant_coverage;
+            (seeded(&s) >= seeded(&before) + u64::from(N)
+                && !s.netlink.resync_pending
+                && c.total == u64::from(N)
+                && c.resolved == u64::from(N))
+            .then(|| format!("{s:?}"))
+        },
+    );
+    let s = rig.snapshot();
+    assert!(
+        s.netlink.resyncs[ResyncOutcome::Ok.index()]
+            > before.netlink.resyncs[ResyncOutcome::Ok.index()],
+        "{:?}",
+        s.netlink
+    );
+    let health = packetframe_neigh_snoop::health::health(&s);
+    assert!(
+        health.subsystems.iter().all(|r| r.name != "netlink"),
+        "no re-read owed once applied: {health:?}"
+    );
+    rig.stop();
+}
+
+/// `RTM_NEWNEIGH` setting each `(addr, mac)` STALE on `ifindex`, all in
+/// one `sendmsg`: the kernel applies them in one pass and emits every
+/// notification back to back, which a shrunk buffer cannot keep up with.
+/// (STALE because an entry created straight into FAILED or INCOMPLETE
+/// emits no notification at all.)
+fn neigh_stale_in_one_request(ifindex: u32, entries: &[(Ipv4Addr, [u8; 6])]) {
+    use netlink_packet_core::{NetlinkMessage, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST};
+    use netlink_packet_route::neighbour::{
+        NeighbourAddress, NeighbourAttribute, NeighbourMessage, NeighbourState,
+    };
+    use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+    use rtnetlink::sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
+
+    let mut sock = Socket::new(NETLINK_ROUTE).expect("netlink socket");
+    sock.bind_auto().expect("netlink bind");
+    sock.connect(&SocketAddr::new(0, 0))
+        .expect("netlink connect");
+    let mut buf = Vec::new();
+    for (seq, (a, mac)) in entries.iter().enumerate() {
+        let mut m = NeighbourMessage::default();
+        m.header.family = AddressFamily::Inet;
+        m.header.ifindex = ifindex;
+        m.header.state = NeighbourState::Stale;
+        m.attributes
+            .push(NeighbourAttribute::Destination(NeighbourAddress::Inet(*a)));
+        m.attributes
+            .push(NeighbourAttribute::LinkLayerAddress(mac.to_vec()));
+        let mut nl = NetlinkMessage::from(RouteNetlinkMessage::NewNeighbour(m));
+        nl.header.flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE;
+        nl.header.sequence_number = seq as u32 + 1;
+        nl.finalize();
+        let start = buf.len();
+        buf.resize(start + (nl.header.length as usize).next_multiple_of(4), 0);
+        nl.serialize(&mut buf[start..]);
+    }
+    let sent = sock.send(&buf, 0).expect("netlink send");
+    assert_eq!(sent, buf.len(), "one datagram, every request");
+}
+
+/// A neighbour row that appears unheard is acted on too. Every learned
+/// address is deleted with the engine listening (so the mirror holds no
+/// row for any of them), then one request puts them all back STALE with
+/// another MAC. Most of those notifications are lost to the shrunk
+/// buffer, so the re-read is the first the mirror hears of them: rows
+/// that *appeared*, none dropped or changed. They are repaired only if
+/// the re-read re-seeds on that; no frame arrives to repair them
+/// otherwise. A STALE entry holding another MAC is replaced only outside
+/// the 30 s holddown since our last install of it, so the test waits it
+/// out first.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn rows_that_appear_unheard_are_repaired() {
+    const N: u8 = 40;
+    let rig = Rig::start_with(Some(1));
+    let addr = |i: u8| v4(100 + i);
+    let mac = |i: u8| [0x02, 0, 0, 0, 0x02, i];
+    let other = |i: u8| [0x02, 0, 0, 0, 0x03, i];
+    for i in 0..N {
+        rig.inject(&arp_request(mac(i), mac(i), addr(i), v4(200)));
+    }
+    let all_resolved = |s: &Snapshot| {
+        let c = s.bridges[0].participant_coverage;
+        c.total == u64::from(N) && c.resolved == u64::from(N)
+    };
+    wait_for(
+        Duration::from_secs(15),
+        "every learned address resolved in the mirror",
+        || {
+            let s = rig.snapshot();
+            all_resolved(&s).then(|| format!("{s:?}"))
+        },
+    );
+    let held = || {
+        let table = neigh_table(&rig.names.netns, &rig.names.veth_a);
+        (0..N)
+            .filter(|i| {
+                table
+                    .lines()
+                    .any(|l| l.starts_with(&format!("{} ", addr(*i))))
+            })
+            .count()
+    };
+
+    // Delete them all, one request per address, paced, so that each
+    // RTM_DELNEIGH is heard and the mirror holds no row for any of them.
+    // The premise can still fail on the shrunk buffer: a lost delete is an
+    // overrun, and its re-read re-seeds every address. So a round counts
+    // only if it ends with no overrun, nothing owed and nothing held;
+    // otherwise wait for the re-seed and delete again.
+    let mut clean = false;
+    for _ in 0..3 {
+        let round = rig.snapshot().netlink.overruns;
+        for i in 0..N {
+            ns_run(
+                &rig.names.netns,
+                &[
+                    "ip",
+                    "neigh",
+                    "del",
+                    &addr(i).to_string(),
+                    "dev",
+                    &rig.names.veth_a,
+                ],
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Long enough for an overrun to be reported and published.
+        std::thread::sleep(Duration::from_secs(2));
+        let s = rig.snapshot();
+        if s.netlink.overruns == round
+            && !s.netlink.resync_pending
+            && s.bridges[0].participant_coverage.resolved == 0
+            && held() == 0
+        {
+            clean = true;
+            break;
+        }
+        wait_for(
+            Duration::from_secs(20),
+            "the re-seed after a lost delete",
+            || {
+                let s = rig.snapshot();
+                (all_resolved(&s) && !s.netlink.resync_pending && held() == usize::from(N))
+                    .then(|| format!("{s:?}"))
+            },
+        );
+    }
+    assert!(clean, "premise: a round of deletes was heard in full");
+
+    // Out of the holddown (`DEFAULT_HOLDDOWN`, 30 s from each install's
+    // dispatch): from the moment the install counters stop moving, which
+    // covers the learn's installs and any re-seed's.
+    let dispatched = |s: &Snapshot| {
+        let c = &s.bridges[0].counters;
+        c.installs[InstallOutcome::Requested.index()] + c.seeds[SeedOutcome::Requested.index()]
+    };
+    let mut last = dispatched(&rig.snapshot());
+    let mut still_since = Instant::now();
+    while still_since.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(500));
+        let now = dispatched(&rig.snapshot());
+        if now != last {
+            last = now;
+            still_since = Instant::now();
+        }
+    }
+    std::thread::sleep(Duration::from_secs(31));
+    let before = rig.snapshot();
+    assert!(!before.netlink.resync_pending, "{:?}", before.netlink);
+    assert_eq!(dispatched(&before), last, "no install since the wait began");
+
+    let a_ifindex = if_nametoindex(&rig.names.veth_a);
+    let entries: Vec<(Ipv4Addr, [u8; 6])> = (0..N).map(|i| (addr(i), other(i))).collect();
+    neigh_stale_in_one_request(a_ifindex, &entries);
+    // The premise: the burst overflowed the buffer, so some of the rows
+    // reach the mirror only through the re-read.
+    rig.wait_counter("an overrun reported for the burst", |s| {
+        s.netlink.overruns > before.netlink.overruns
+    });
+    wait_for(
+        Duration::from_secs(15),
+        "every learned address re-seeded STALE with its learned MAC",
+        || {
+            let table = neigh_table(&rig.names.netns, &rig.names.veth_a);
+            let repaired = (0..N).all(|i| {
+                table.lines().any(|l| {
+                    l.starts_with(&format!("{} ", addr(i)))
+                        && l.contains(&mac_str(mac(i)))
+                        && l.contains("STALE")
+                })
+            });
+            repaired.then_some(table)
+        },
     );
     rig.stop();
 }

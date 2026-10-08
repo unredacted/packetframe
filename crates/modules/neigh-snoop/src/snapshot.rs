@@ -336,6 +336,41 @@ pub struct RsCoverageSnapshot {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResyncOutcome {
+    /// Links, addresses and neighbours re-read and applied.
+    Ok,
+    /// A dump failed or went unanswered; retried.
+    Failed,
+}
+
+impl ResyncOutcome {
+    pub const COUNT: usize = 2;
+    pub const LABELS: [&'static str; Self::COUNT] = ["ok", "failed"];
+    pub fn index(self) -> usize {
+        match self {
+            Self::Ok => 0,
+            Self::Failed => 1,
+        }
+    }
+}
+
+/// The engine's multicast subscription (link, neighbour and address
+/// groups), engine-wide rather than per bridge: one socket feeds them all.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetlinkSnapshot {
+    /// Times the kernel reported notifications lost to a full receive
+    /// buffer (`ENOBUFS`). One report can stand for any number of them.
+    pub overruns: u64,
+    /// Re-reads of links, addresses and neighbours after an overrun.
+    pub resyncs: [u64; ResyncOutcome::COUNT],
+    /// Notifications were lost and no re-read has covered them yet: the
+    /// kernel neighbour mirror, own addresses and link state may be stale.
+    pub resync_pending: bool,
+    /// Why the last re-read failed; cleared by one that succeeds.
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Snapshot {
     pub bridges: Vec<IfaceSnapshot>,
@@ -343,6 +378,7 @@ pub struct Snapshot {
     pub gate: Option<GateSnapshot>,
     /// One per `route-server` peer, sorted by address.
     pub rs: Vec<RsCoverageSnapshot>,
+    pub netlink: NetlinkSnapshot,
 }
 
 #[cfg(test)]
@@ -363,6 +399,13 @@ mod tests {
         check(&PersistOutcome::LABELS);
         check(&LinkEvent::LABELS);
         check(&GateOutcome::LABELS);
+        check(&ResyncOutcome::LABELS);
+        for (i, o) in [ResyncOutcome::Ok, ResyncOutcome::Failed]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(o.index(), i);
+        }
         for (i, s) in [
             SkipReason::SameMac,
             SkipReason::Permanent,
