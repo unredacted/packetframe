@@ -963,15 +963,15 @@ fn release_steer_capacity(moved: &[(String, u32)], ctl: &dyn capacity::CapacityC
 /// How planning reads a port's rule table: with this module's own
 /// recorded rules counted as free ([`ntuple::rule_table_reclaiming`]).
 ///
-/// The ledger comes from the state file, which every steer persists, so
-/// the attach of an adopting restart and a reload of a running module
-/// read the same record. An unreadable or absent file reclaims nothing
-/// — planning then sees the raw table, as it always did, which can only
-/// refuse, never overwrite.
+/// `ledger` is the state file, which every steer persists, so the attach
+/// of an adopting restart and a reload of a running module read the same
+/// record. Without one nothing is reclaimed: planning then sees the raw
+/// table, which can only refuse, never overwrite. Attach refuses an
+/// unreadable file before it plans; a reload plans without it
+/// ([`live_reload_plan`]).
 fn planning_table(
-    state_dir: &std::path::Path,
+    ledger: Option<resources::ResourceState>,
 ) -> impl Fn(&str) -> Result<ntuple::RuleTable, String> {
-    let ledger = resources::ResourceState::load(state_dir).ok().flatten();
     move |iface: &str| {
         let Some(st) = &ledger else {
             return ntuple::rule_table(iface);
@@ -1175,15 +1175,30 @@ type ReloadPlanner = fn(
 ) -> Result<SteeringTarget, String>;
 
 /// The reload's plan, drawn from the NIC and the kernel as they are now.
+///
+/// A state file that cannot be read is planned around, not refused. A
+/// reload that turns one port off still re-plans the ports left on,
+/// and refusing it would block a rollback. Without the record, planning
+/// sees the module's own rules as occupied: it can refuse for budget,
+/// never overwrite. The warning names the file, so a budget refusal that
+/// follows is not read as the allowlist's fault.
 fn live_reload_plan(
     cfg: &VppOffloadConfig,
     allowlist: &[packetframe_common::fib::IpPrefix],
     state_dir: &std::path::Path,
 ) -> Result<SteeringTarget, String> {
+    let ledger = resources::ResourceState::load(state_dir).unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            "vpp-offload: state file unreadable; this reload plans steering without \
+             reclaiming the module's own recorded rules"
+        );
+        None
+    });
     steering_target(
         cfg,
         allowlist,
-        planning_table(state_dir),
+        planning_table(ledger),
         &topology::kernel_receive_macs,
         &topology::kernel_tagged_vlans,
     )
@@ -1571,6 +1586,16 @@ impl Module for VppOffloadModule {
                 ),
             ));
         }
+        // The state file, read before anything below touches a NIC, so
+        // that a file `ResourceState::load` refuses ends the attach here
+        // and under its own reason. `acquire` would refuse it anyway, but
+        // only after `steer-capacity` had resized the tables and planning
+        // had run without the record. On a steered adoption the module's
+        // own rules then read as occupied, and the attach could be
+        // refused for MCAM budget, blaming the allowlist instead of the
+        // file.
+        let recorded = resources::ResourceState::load(&self.state_dir)
+            .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         // Every member port on the one NIC this module drives, before
         // anything below touches a NIC: `steer-capacity` writes the
         // driver's devlink parameter, the budget query issues its ntuple
@@ -1590,7 +1615,7 @@ impl Module for VppOffloadModule {
         let resized = apply_steer_capacity(&self.cfg, &capacity::Live);
         let brought_up = steer::McamBudget::for_ifaces_with(
             ifaces_to_query(&self.cfg, &allowlist),
-            planning_table(&self.state_dir),
+            planning_table(recorded),
         )
         .and_then(|budget| {
             bringup::bring_up(
@@ -2459,6 +2484,66 @@ mod tests {
             std::fs::read_dir(&state).unwrap().count(),
             0,
             "nothing may be acquired or recorded before the gate"
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A state file attach cannot read ends the attach first, in the
+    /// file's own words: ahead of the NIC gate (whose refusal of a port
+    /// no host has would otherwise come first), so ahead of everything
+    /// that gate guards — `steer-capacity`, the budget read, the plan.
+    /// Planned without the record, a steered adoption's own rules read
+    /// as occupied and the refusal could blame the allowlist instead.
+    #[test]
+    fn attach_refuses_an_unreadable_state_file_before_touching_a_nic() {
+        use packetframe_common::config::{GlobalConfig, ModuleDirective, ModuleSection};
+        use packetframe_common::module::{Module as _, ModuleConfig};
+
+        let state = std::env::temp_dir().join(format!("pf-state-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let path = resources::ResourceState::path_in(&state);
+        resources::ResourceState::empty().save(&state).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(resources::MAX_STATE_FILE_BYTES + 1)
+            .unwrap();
+
+        let mut m = VppOffloadModule::new();
+        m.state_dir = state.clone();
+        m.set_route_source(Box::new(NoRoutes));
+        m.cfg = VppOffloadConfig::from_directives(&[ModuleDirective::VppPort {
+            iface: "pf-no-such-nic".into(),
+            cores: 1,
+            steer: true,
+            vlans: vec![],
+            vlans_all: false,
+            direction: None,
+            v6_divert: None,
+            line: 1,
+        }]);
+        let section = ModuleSection {
+            name: "vpp-offload".into(),
+            directives: Vec::new(),
+        };
+        let global = GlobalConfig::default();
+        let msg = m
+            .attach(&ModuleConfig::new(&section, &global))
+            .expect_err("an unreadable state file must refuse")
+            .to_string();
+        assert!(
+            msg.contains(&format!("refusing {}", path.display())) && msg.contains("-byte bound"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("pf-no-such-nic"),
+            "the NIC gate ran first: {msg}"
         );
         let _ = std::fs::remove_dir_all(&state);
     }
@@ -3883,8 +3968,15 @@ mod tests {
         second.ports[1].2 = true;
         steering_target(&second, &allow, ntuple::rule_table, &test_macs, &no_vlans)
             .expect_err("the raw tables leave 3 free slots");
-        let t2 = steering_target(&second, &allow, planning_table(&dir), &test_macs, &no_vlans)
-            .expect("eth4's own slots count as free");
+        let recorded = resources::ResourceState::load(&dir).unwrap();
+        let t2 = steering_target(
+            &second,
+            &allow,
+            planning_table(recorded),
+            &test_macs,
+            &no_vlans,
+        )
+        .expect("eth4's own slots count as free");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             t2.targets[0], t1.targets[0],

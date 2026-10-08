@@ -1857,6 +1857,17 @@ pub const MAX_CONFIG_FILE_SIZE: u64 = 1 << 20;
 /// NIC (2026-09-24), and far past any exemption list worth writing.
 pub const VPP_MAX_STEER_CAPACITY: u16 = 256;
 
+/// The most `port` lines a vpp-offload section may declare.
+///
+/// Far past any NIC the module drives (the reference OCTEON has six
+/// PFs). It is a cap rather than a guess because vpp-offload's state
+/// file is read only up to a bound sized for this many ports, each
+/// with a full rule table (`MAX_STATE_FILE_BYTES` in vpp-offload's
+/// `resources`, whose test builds the widest such file at this count).
+/// A config past it could have the daemon write a state file it would
+/// then refuse at the next attach and at `detach --all`.
+pub const VPP_MAX_PORTS: usize = 64;
+
 /// Maximum `interface` lines a guard section may declare. Mirrors the
 /// BPF `GUARD_CFG` map's capacity
 /// (`crates/modules/guard/bpf/src/maps.rs`, `GUARD_CFG_MAX_ENTRIES`):
@@ -2356,7 +2367,8 @@ impl Config {
     ///   member would blackhole those destinations in VPP);
     /// - steering requires `forwarding-mode packetframe-fib` (the full
     ///   table VPP mirrors comes from the PacketFrame FIB route pipeline);
-    /// - duplicate `port` lines for one interface are rejected;
+    /// - duplicate `port` lines for one interface are rejected, and so
+    ///   are more than [`VPP_MAX_PORTS`];
     /// - the IPv6 steering rules ([`Self::validate_vpp_v6_steering`]);
     /// - `drift-accept6` ([`Self::validate_vpp_drift_accepts6`]);
     /// - `local-route6` ([`Self::validate_vpp_local_routes6`]).
@@ -2380,6 +2392,16 @@ impl Config {
                     return Err(ConfigError::parse(
                         *line,
                         format!("duplicate `port {iface}` in module vpp-offload"),
+                    ));
+                }
+                if ports.len() == VPP_MAX_PORTS {
+                    return Err(ConfigError::parse(
+                        *line,
+                        format!(
+                            "module vpp-offload declares more than {VPP_MAX_PORTS} `port` \
+                             lines; its state file is read only up to a bound sized for that \
+                             many"
+                        ),
                     ));
                 }
                 // A `cores 0` port's queue is polled by the worker it
@@ -6936,6 +6958,34 @@ module vpp-offload
         // A different upstream on the same box is fine.
         let ok = cfg.replace("upstream 127.0.0.1", "upstream 192.0.2.1");
         Config::parse(&ok).unwrap().validate_fast_path().unwrap();
+    }
+
+    /// `VPP_MAX_PORTS` ports validate; one more is refused at its own
+    /// line, since vpp-offload's state-file read bound is sized for the
+    /// cap and nothing past it.
+    #[test]
+    fn vpp_offload_port_lines_are_capped() {
+        let header = "module fast-path\n  attach eth2 generic\n  allow-prefix 203.0.113.0/24\n\
+                      module vpp-offload\n  loopback-address 192.0.2.1/32\n  \
+                      require-table-complete off\n";
+        let config = |n: usize| {
+            let mut c = String::from(header);
+            for p in 0..n {
+                c.push_str(&format!("  port pf{p} cores 1 steer off\n"));
+            }
+            Config::parse(&c).unwrap()
+        };
+        config(VPP_MAX_PORTS).validate_vpp_offload().unwrap();
+        let err = config(VPP_MAX_PORTS + 1)
+            .validate_vpp_offload()
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains(&format!("more than {VPP_MAX_PORTS} `port` lines")),
+            "{err}"
+        );
+        // The port line past the cap is the one named.
+        let past = header.lines().count() + VPP_MAX_PORTS + 1;
+        assert!(format!("{err}").contains(&format!("line {past}")), "{err}");
     }
 
     /// `require-table-complete on` + `integrity-authority none` is a

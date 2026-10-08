@@ -2138,15 +2138,25 @@ fn vpp_detach(all: bool, config_has_vpp: bool, keep_vpp: bool) -> VppDetach {
 mod keep_vpp_tests {
     use super::*;
 
+    /// A fresh state directory, its mode pinned rather than left to the
+    /// umask: on Linux the state file's reader refuses a `state-dir`
+    /// group or others can write, whether or not the file is in it.
+    fn state_dir(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
     /// `detach --all` removes the IPv6 hand-back path even when there is
     /// no state file left: the daemon's teardown releases the VFs (and the
     /// record) even if the veth would not go, and names this command as the
     /// remedy. A failure says what to remove by hand.
     #[test]
     fn detach_removes_the_handback_path_without_a_state_file() {
-        let dir = std::env::temp_dir().join(format!("pf-detach-hb-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = state_dir("pf-detach-hb");
         let mut called = false;
         detach_vpp_offload_with(&dir, || {
             called = true;
@@ -2215,9 +2225,7 @@ mod keep_vpp_tests {
     /// the section, or an attach-time field it changed.
     #[test]
     fn keep_vpp_refuses_what_the_next_start_could_not_adopt() {
-        let dir = std::env::temp_dir().join(format!("pf-keep-vpp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = state_dir("pf-keep-vpp");
 
         let steered = conf(" vlans 88,1337", true);
         let e = keep_vpp_preflight(Some(&steered), &dir).unwrap_err();
@@ -2237,6 +2245,51 @@ mod keep_vpp_tests {
 
         let e = keep_vpp_preflight(None, &dir).unwrap_err();
         assert!(e.contains("--config"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A state file the reader refuses is not "no record" to either
+    /// door. `detach --all` stops before the hand-back teardown it runs
+    /// when nothing is recorded, and `--keep-vpp` refuses under the
+    /// file's reason instead of saying there is nothing to keep. A sparse
+    /// file past the bound stands in for the refusals every platform
+    /// makes; on Linux, so does a `state-dir` others can write with no
+    /// file in it, which such an account could have emptied.
+    #[test]
+    fn a_refused_state_file_is_not_read_as_absent() {
+        use packetframe_vpp_offload::resources::{ResourceState, MAX_STATE_FILE_BYTES};
+        let dir = state_dir("pf-refused-state");
+        let steered = conf("", true);
+        record(&dir, &steered);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(ResourceState::path_in(&dir))
+            .unwrap()
+            .set_len(MAX_STATE_FILE_BYTES + 1)
+            .unwrap();
+        let both_refuse = |what: &str| {
+            let mut handback = false;
+            let e = detach_vpp_offload_with(&dir, || {
+                handback = true;
+                Ok(())
+            })
+            .expect_err(what);
+            assert!(e.starts_with("vpp state: refusing "), "{what}: {e}");
+            assert!(!handback, "{what}: detach took the no-record path");
+            let e = keep_vpp_preflight(Some(&steered), &dir).unwrap_err();
+            assert!(e.starts_with("vpp state: refusing "), "{what}: {e}");
+            e
+        };
+        assert!(both_refuse("past the bound").contains("-byte bound"));
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::remove_file(ResourceState::path_in(&dir)).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+            let e = both_refuse("an emptied untrusted state-dir");
+            assert!(e.contains("writable by group or others"), "{e}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
