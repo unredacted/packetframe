@@ -2527,6 +2527,9 @@ impl crate::runtime::Steering for NtupleSteering {
 
     fn missing_from_nic(&self) -> Result<crate::runtime::SteeringAudit, String> {
         let mut missing = Vec::new();
+        // Ledger locations on a steered port whose rule the NIC no longer
+        // holds intact (`SteeringAudit::gone`).
+        let mut gone = Vec::new();
         let mut read_errors: Vec<String> = Vec::new();
         // Which planned rule each interface has already accounted for.
         // ONE-TO-ONE: a planned rule satisfies at most one location.
@@ -2677,6 +2680,8 @@ impl crate::runtime::Steering for NtupleSteering {
                                     "a location this ledger names holds a rule that is \
                                      neither this target's nor the last one's"
                                 );
+                                // Somebody else's rule: ours is gone.
+                                gone.push((iface.clone(), *loc));
                             } else {
                                 occupied
                                     .entry(iface.as_str())
@@ -2693,6 +2698,7 @@ impl crate::runtime::Steering for NtupleSteering {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if member.is_some() {
                         empty.entry(iface.as_str()).or_default().push(*loc);
+                        gone.push((iface.clone(), *loc));
                     }
                 }
                 // A read that failed says nothing about THIS rule, but
@@ -2766,11 +2772,13 @@ impl crate::runtime::Steering for NtupleSteering {
                 if let Some(k) = damaged {
                     let (loc, _) = occupants.remove(k);
                     missing.push((iface.clone(), loc));
+                    gone.push((iface.clone(), loc));
                 } else if let Some(loc) = slots.pop() {
                     // An empty ledger slot says it plainly: something
                     // was installed here and is gone. No identity to
                     // check — an empty slot has no contents — so this
-                    // stays a positional pairing.
+                    // stays a positional pairing. (Already in `gone`,
+                    // from the read.)
                     missing.push((iface.clone(), loc));
                 } else if unread > 0 {
                     // Explained by a read that failed: not established,
@@ -2781,7 +2789,8 @@ impl crate::runtime::Steering for NtupleSteering {
                     // was never installed — the shape a restart
                     // produces when the allowlist GREW while the daemon
                     // was down. Named by its planned slot, the only
-                    // location it has.
+                    // location it has — and NOT `gone`: that slot can be
+                    // one a rule still installed occupies.
                     missing.push((iface.clone(), rule.location));
                 }
             }
@@ -2810,6 +2819,7 @@ impl crate::runtime::Steering for NtupleSteering {
         // whenever this is `Some`.
         Ok(crate::runtime::SteeringAudit {
             missing,
+            gone,
             stray,
             unreadable: (!read_errors.is_empty()).then(|| read_errors.join("; ")),
             keeps_observed,
@@ -2857,6 +2867,14 @@ impl crate::runtime::Steering for NtupleSteering {
     /// something else in.
     fn installed_plan(&self) -> Vec<(String, u32, RuleSet)> {
         self.installed_as.clone().unwrap_or_default()
+    }
+
+    /// `targets`, the effective target: what [`Self::steer`] installs,
+    /// with the IPv6 half already withheld while the hand-back path is
+    /// not ready — so a v6 diversion that would not go in does not count
+    /// as one being added.
+    fn target_plan(&self) -> Vec<(String, u32, RuleSet)> {
+        self.targets.clone()
     }
 
     fn retarget(&mut self, targets: Vec<(String, u32, RuleSet)>) {
@@ -3910,6 +3928,66 @@ mod tests {
              alarming on them would cry wolf on every successful unsteer"
         );
         assert_eq!(a.missing, Vec::new(), "and eth0 is still untouched");
+    }
+
+    /// `gone` names only ledger locations whose rule the readback found
+    /// emptied or damaged — never the planned slot of a rule that was
+    /// never installed. A re-plan reclaims our own slots, so the new
+    /// prefix's planned slot here is one the old prefix's rule still
+    /// occupies; named "gone", it made the first-steer hold read that
+    /// installed rule as absent and hold a reconcile that only removes
+    /// (review finding, PR #333).
+    #[test]
+    fn only_rules_the_nic_lost_are_gone_never_a_planned_slot() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let (old, new) = ([198, 51, 100, 0], [192, 0, 2, 0]);
+        let one = plan_for(&[old]);
+        let mut s = steering(vec![("eth0".into(), 0)], one.clone());
+        s.steer().expect("installs the old prefix");
+        let installed = s.installed();
+
+        let grown = plan_for(&[new, old]);
+        let added: Vec<u32> = grown
+            .rules
+            .iter()
+            .filter(|r| !one.rules.iter().any(|o| o.shape == r.shape))
+            .map(|r| r.location)
+            .collect();
+        assert!(
+            added.iter().any(|l| installed.iter().any(|(_, i)| i == l)),
+            "the premise: the new prefix is planned onto a slot the old rule holds \
+             ({added:?} against {installed:?})"
+        );
+        s.retarget(uniform(vec![("eth0".into(), 0)], grown));
+        let a = s.missing_from_nic().expect("read the NIC");
+        assert!(!a.missing.is_empty(), "the new prefix is not installed");
+        assert_eq!(a.gone, Vec::new(), "and nothing installed has gone");
+
+        // Back to the old target, then lose one rule and damage another
+        // behind the module's back: those two ARE gone — the damaged one
+        // disowned against the plan this process installed.
+        s.retarget(uniform(vec![("eth0".into(), 0)], one.clone()));
+        let (emptied, damaged) = (installed[0].1, installed[1].1);
+        sys::remove_behind_back("eth0", emptied);
+        sys::narrow_behind_back("eth0", damaged);
+        let mut want = vec![emptied, damaged];
+        want.sort_unstable();
+        let gone_of = |a: &crate::runtime::SteeringAudit| {
+            let mut gone: Vec<u32> = a.gone.iter().map(|(_, l)| *l).collect();
+            gone.sort_unstable();
+            gone
+        };
+        let a = s.missing_from_nic().expect("read the NIC");
+        assert_eq!(gone_of(&a), want, "{a:?}");
+        assert_eq!(a.missing.len(), 2, "{a:?}");
+
+        // And adopted, with no installed plan to disown against: the
+        // narrowed rule pairs as a damaged copy, gone all the same.
+        let mut adopted = steering(vec![("eth0".into(), 0)], one);
+        adopted.adopt_installed(installed);
+        let a = adopted.missing_from_nic().expect("read the NIC");
+        assert_eq!(gone_of(&a), want, "{a:?}");
     }
 
     /// A prefix dropped from the allowlist leaves SURPLUS, not absence.

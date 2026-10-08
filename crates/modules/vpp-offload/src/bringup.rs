@@ -1128,13 +1128,27 @@ fn finish(
     // first save drops it from the file too.
     //
     // Every refusal is logged and falls back to the dump path; none fails
-    // the attach. Only the identity legs are checked here, where the
-    // adopted process and the state file are in hand. VPP's own route
-    // counts are compared in `start_resync`, which has the API.
+    // the attach. Only the file's provenance and size and the identity
+    // legs are checked here, where the adopted process and the state file
+    // are in hand. VPP's own route counts are compared in `start_resync`,
+    // which has the API.
+    //
+    // The size bound is the widest record this run's engine could write
+    // — the same capacities it is built with below — which is the
+    // writer's too: `acquire` refuses an adoption unless the VPP was
+    // started under this `expected-routes`, `v6` and ports.
+    let capacity = startup_conf::route_capacity(sizing);
+    // The IPv6 pool: the allowance the segments were grown for under
+    // `v6 on`, never touched under `v6 off` (the drainer admits no v6).
+    let capacity_v6 = startup_conf::route_capacity_v6(sizing);
     let mut state = state;
     let ledger_token = state.ledger_token.take();
     let preserved = crate::ledger_record::consume_for_adoption(
         &paths.sys.state_dir,
+        crate::ledger_record::max_ledger_bytes(
+            capacity.saturating_add(capacity_v6),
+            recorded.len(),
+        ),
         adopted.as_ref().map(|p| crate::ledger_record::Adoptee {
             pid: p.pid(),
             start_ticks: p.start_ticks(),
@@ -1328,10 +1342,6 @@ fn finish(
         state.steer_plans.clone(),
     );
 
-    let capacity = startup_conf::route_capacity(sizing);
-    // The IPv6 pool: the allowance the segments were grown for under
-    // `v6 on`, never touched under `v6 off` (the drainer admits no v6).
-    let capacity_v6 = startup_conf::route_capacity_v6(sizing);
     let api_socket_path = paths.api_socket.clone();
     let startup_conf_path = paths.startup_conf.clone();
     let vpp_binary = vpp_binary.to_path_buf();

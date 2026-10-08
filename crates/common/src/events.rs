@@ -121,6 +121,10 @@ pub mod kind {
     pub const STEERING_DOWN: &str = "steering_down";
     pub const STEERING_RESTORED: &str = "steering_restored";
     pub const STEER_FAILED: &str = "steer_failed";
+    /// A steer that would divert more traffic onto VPP was held by the
+    /// first-steer hold — not attempted, nothing changed (`reason`,
+    /// `steered`).
+    pub const STEER_HELD: &str = "steer_held";
     pub const UNSTEER_FAILED: &str = "unsteer_failed";
     pub const VERIFY_PASSED: &str = "verify_passed";
     pub const VERIFY_FAILED: &str = "verify_failed";
@@ -158,6 +162,10 @@ pub mod kind {
     /// The route source's first completed initial dump after a seed
     /// garbage-collected what it did not re-advertise.
     pub const ROUTE_LEDGER_RECONCILED: &str = "route_ledger_reconciled";
+    /// The neighbour resolver exited or stopped making progress and the
+    /// supervisor restarted it (`cause`: `stalled`, `failed`,
+    /// `returned`; `detail` the reason).
+    pub const NEIGH_RESOLVER_RESTARTED: &str = "neigh_resolver_restarted";
 
     // --- the event log itself (module `event-log`) ---
     pub const EVENTS_DROPPED: &str = "events_dropped";
