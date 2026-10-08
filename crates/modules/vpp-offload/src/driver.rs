@@ -215,13 +215,12 @@ pub trait Observe {
     /// blackholes exactly the prefixes that are missing, and a steered
     /// miss is dropped rather than falling through to the eBPF tier.
     ///
-    /// And one thing that is not a gate at all but disqualifies the
-    /// moment just as thoroughly: a source backlog. Neither gate can
-    /// see changes the engine has not pulled yet — the ledger has not
-    /// classified them and the mirror already counts them — so the
-    /// implementation owes that check too. The driver's own
-    /// `Drain::Idle` proof does not cover it either; see
-    /// `Driver::poll_steer_retry`.
+    /// And the first-steer hold, which neither table gate can see: VPP
+    /// still behind the route mirror — changes the engine has not pulled
+    /// yet, which the ledger has not classified and the mirror already
+    /// counts — and a verify that does not vouch for the table now
+    /// installed. The driver's own `Drain::Idle` proof covers neither;
+    /// see `Driver::poll_steer_retry`.
     fn steer_permitted(&mut self) -> bool;
 
     /// Whether VPP's FIB holds no installed routes right now. Read every
@@ -271,14 +270,16 @@ pub trait Observe {
         crate::supervisor::CONVERGENCE_BUDGET
     }
 
-    /// Re-run a verdict the table has outgrown, if it is due
-    /// ([`crate::verify::ReverifySchedule`]). Called only from a converged
-    /// state (`Ready`/`Steered`), on a tick whose drain proved the engine
-    /// idle, with VPP answering — the same proofs a steer retry needs, and
-    /// the reason no delta can land between a probe's sample and its
-    /// answer. Produces no event: the verdict it refreshes decides nothing.
-    /// The default does nothing, which is every harness that does not
-    /// exercise it.
+    /// Re-run a stale verdict — one that failed only on what the table
+    /// has since outgrown, or one taken against too little of the table
+    /// now installed — if it is due ([`crate::verify::ReverifySchedule`]).
+    /// Called only from a converged state (`Ready`/`Steered`), on a tick
+    /// whose drain proved the engine idle, with VPP answering — the same
+    /// proofs a steer retry needs, and the reason no delta can land
+    /// between a probe's sample and its answer. Produces no event: the
+    /// re-run decides nothing itself, and a first steer held on the old
+    /// verdict reads the new one on its next retry. The default does
+    /// nothing, which is every harness that does not exercise it.
     fn poll_reverify(&mut self, _now: Instant) {}
 }
 

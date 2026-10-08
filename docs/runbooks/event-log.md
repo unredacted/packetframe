@@ -94,7 +94,7 @@ Kinds are stable: scripts and alerts may key on them.
 | `steering_restored` | An adopted VPP took the traffic back while the fallback was not ready | `detail` |
 | `steer_failed` | A steer or restore-steer failed; repeats of the same failure are recorded once. With `rules_remain: true` the rollback left rules in the NIC and traffic matching them is still on VPP | `action`, `reason`, `rules_remain` |
 | `unsteer_failed` | Steering could not be removed; the VF is withheld | `reason` |
-| `verify_passed` / `verify_failed` / `verify_incomplete` | A verify finished | `outcome`, `seeded`, `may_steer`; a re-run of a stale incomplete verdict carries `outcome` and `rerun: true` instead, and decides nothing |
+| `verify_passed` / `verify_failed` / `verify_incomplete` | A verify finished | `outcome`, `seeded`, `may_steer`; a re-run of a stale verdict (one that failed only on what the table outgrew, or one the table has outgrown) carries `outcome`, `rerun: true` and `cause` instead, and decides nothing itself |
 | `unresolvable_routes` | The set of named unresolvable routes changed (at most once a minute) | `ipv4`, `ipv6` (`<prefix> via <nexthop> [dev <device>] (<why>)`, `; `-separated, then `+K more`); `detail: none` once the set empties |
 | `adoption_path` | How a start took over VPP's FIB | `path` (`preserved-ledger`, `readback`, `readback-deferred`, `fresh`), `routes` |
 | `preserved_ledger_rejected` | The preserved route ledger was not used | `stage`, `reason` |

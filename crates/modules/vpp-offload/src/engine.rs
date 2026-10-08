@@ -453,11 +453,16 @@ impl Verdict {
     ///
     /// All of those ride `VerifyIncomplete`: reach `Ready`, keep the
     /// want, do NOT steer. Steering stays refused by the LIVE gates —
-    /// `steer_permitted` re-reads the authority verdict, the source
-    /// backlog and `blocks_first_steer` on every retry, none of which
-    /// consult this verdict's snapshot — so recovery is the retry loop
-    /// noticing conditions changed, not a verdict going stale in
-    /// either direction.
+    /// `steer_permitted` re-reads the authority verdict, how far VPP is
+    /// behind the mirror and `blocks_first_steer` on every retry, none of
+    /// which consult this verdict's failure reasons — so recovery is the
+    /// retry loop noticing conditions changed, not a verdict going stale
+    /// in either direction. What the retry does read off the verdict is
+    /// only what no live count can say: whether its probes found a
+    /// mismatch, and whether it was drawn from enough of the table now
+    /// installed to vouch for it (`verify::unvouched`). A verdict taken
+    /// before the feed landed fails the second, and is re-run
+    /// (`verify::ReverifySchedule`) before the first steer is admitted.
     ///
     /// A dark member that is IDLE — no installed route can egress it,
     /// which is the normal state of a dark port, since the BGP session
@@ -2469,6 +2474,21 @@ impl ConvergenceEngine {
 
     pub fn last_verify(&self) -> Option<&VerifyOutcome> {
         self.last_verify.as_ref()
+    }
+
+    /// For in-crate unit tests of the steer gates, which have no VPP to
+    /// verify against: record a passing verdict over the ledger as it
+    /// stands NOW — the standard sample, or all of a smaller table — as a
+    /// clean verify of it would. A test that grows the ledger afterwards
+    /// has outgrown it, exactly as the real thing would.
+    #[cfg(test)]
+    pub(crate) fn verified_for_test(&mut self) {
+        let table = self.ledger.counts().installed;
+        self.last_verify = Some(VerifyOutcome {
+            sampled: (table as usize).min(DEFAULT_SAMPLE),
+            table,
+            ..Default::default()
+        });
     }
 
     pub fn is_connected(&self) -> bool {
@@ -4780,6 +4800,7 @@ mod tests {
         );
         e.last_verify = Some(crate::verify::VerifyOutcome {
             sampled: 4,
+            table: 4,
             mismatches: vec![],
             unresolvable: 0,
             unresolvable_named: vec![],

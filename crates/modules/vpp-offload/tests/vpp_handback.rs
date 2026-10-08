@@ -1199,6 +1199,19 @@ fn runtime_inheriting(
     )
 }
 
+/// A first steer follows a verify of the table it steers into — the
+/// first-steer hold refuses one with no verdict — so these tests run one
+/// before they steer, over the (empty) table attach leaves. Its verdict
+/// event is the convergence's business, not theirs, and is discarded.
+fn verified(rt: &Runtime, fx: &mut impl packetframe_vpp_offload::executor::Effects) {
+    fx.start_verify().expect("verify");
+    assert!(
+        rt.status().last_verify.is_some(),
+        "the premise: a verdict exists"
+    );
+    let _ = rt.take_pending();
+}
+
 /// The steer chokepoint services the path first: by the time `steer`
 /// runs, every router-owned /128 is in VPP and the steering has been told
 /// the v6 half may go in — even straight after a device attach, which
@@ -1215,6 +1228,7 @@ fn at_the_steer_the_128s_are_in_before_the_v6_half_is_permitted() {
     assert!(obs.api_ready());
     fx.attach_devices().expect("attach");
     assert!(held(&fake).is_empty(), "none at attach");
+    verified(&rt, &mut fx);
     fx.steer().expect("steer");
     assert_eq!(*seen.lock().unwrap(), vec![(true, owned().len(), true)]);
     let st = rt.status().handback.expect("wanted");
@@ -1242,6 +1256,7 @@ fn a_broken_path_holds_back_only_the_v6_half() {
     assert!(obs.api_ready());
     fx.attach_devices()
         .expect("a refused hand-back does not fail the attach");
+    verified(&rt, &mut fx);
     assert_eq!(fx.steer(), Ok(SteerOutcome::Steered));
     assert_eq!(*seen.lock().unwrap(), vec![(false, 0, false)]);
     let st = rt.status().handback.expect("wanted");
@@ -1269,6 +1284,7 @@ fn a_path_becoming_ready_under_installed_rules_queues_a_reconcile() {
     let (mut obs, mut fx) = rt.views();
     assert!(obs.api_ready());
     fx.attach_devices().expect("attach");
+    verified(&rt, &mut fx);
     fx.steer().expect("steer");
     rt.set_steered(true);
     assert!(rt.take_pending().is_empty());
