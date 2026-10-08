@@ -1453,11 +1453,17 @@ fn apply_steering(
     // exist only in this Tick — the same reason the main loop keeps its
     // injected outcomes. Here they are also the operator's answer.
     let failures = fmt_failures(&tick.outcome);
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures.join("; "))
+    if !failures.is_empty() {
+        return Err(failures.join("; "));
     }
+    // A HELD steer is no failure — nothing changed, and the state says so
+    // — but it is not in effect either, and "reconfigure answered OK" must
+    // never mean that: the canary ladder reads this answer as "the step
+    // happened" (`SteerOutcome::Held`).
+    if !tick.outcome.held.is_empty() {
+        return Err(tick.outcome.held.join("; "));
+    }
+    Ok(())
 }
 
 fn run_loop(
@@ -1541,62 +1547,24 @@ fn run_loop(
         // check said Degraded and Prometheus said Healthy, about the same
         // instant, during exactly the failure the patch existed to
         // surface. One condition, one place: `StatusSnapshot`.
-        let mut snap = StatusSnapshot::observe_parts(
-            driver.supervisor(),
-            rs.counts,
-            rs.pending_ops,
-            rs.parked_ops,
-            driver.api_health(now),
-            fib,
-            rs.resync_deferred,
-            rs.fresh_hold,
-            rs.preserved_fib,
-            rs.authority,
-            rs.port_links,
-            rs.store_error.clone(),
-            rs.drain_error.clone(),
-            rs.source_backlog,
-            rs.steer_configured_ports > 0,
-            crate::status::SteerAudit {
-                missing: rs.steer_missing,
-                stray: rs.steer_stray,
-                unreadable: rs.steer_audit_error.clone(),
-                v6_divert: rs.steer_v6_divert.clone(),
-                v6_only: rs.steer_v6_only,
-                handback: rs.handback.clone(),
-                icmp6_source: rs.icmp6_source,
-            },
-            rs.shadowed_routes,
-            rs.kernel_delivered_routes,
-            rs.null_drops,
-            rs.neighbours_unplaced,
-            rs.neighbour_moves,
-            rs.neighbours_flooded,
-            rs.fdb_unreadable,
-            rs.drift_uncovered,
-            rs.drift_routes,
-            rs.drift_pending,
-            rs.drift_unreadable,
-            rs.drift_scope_stale,
-            rs.drift_v6,
-        );
-        snap.neighbour_counters = rs.neighbour_counters;
-        snap.kernel_path = rs.kernel_path;
-        snap.drift_scan_ms = rs.drift_scan_ms;
-        snap.unresolvable_named = rs.unresolvable_named;
-        snap.unresolvable_named_v6 = rs.unresolvable_named_v6;
+        //
+        // `Published` carries these two as well, so they are taken before
+        // the snapshot consumes the rest of `rs`.
+        let (api_error, store_error) = (rs.api_error.clone(), rs.store_error.clone());
+        let snap =
+            StatusSnapshot::from_runtime(driver.supervisor(), rs, driver.api_health(now), fib);
         let report = snap.report();
         let episode_over = snap.failure_episode_over();
         let published = Published {
             report,
             metrics: crate::status::render_metrics(&snap, module),
             state: driver.state(),
-            api_error: rs.api_error,
+            api_error,
             terminal: terminal.clone(),
             teardown_failures: teardown_failures.to_vec(),
             resources_leaked,
             last_failures: last_failures.to_vec(),
-            store_error: rs.store_error,
+            store_error,
             resend: ResendVerdict::observe(driver.state(), driver.supervisor().steer_intended()),
         };
         *shared.latest.lock().expect("status lock") = Some(published);

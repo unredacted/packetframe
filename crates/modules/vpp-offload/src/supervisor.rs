@@ -407,6 +407,21 @@ pub enum Event {
     SteerFailed {
         rules_remain: bool,
     },
+    /// The first-steer hold kept a steer that would divert more traffic
+    /// onto VPP from the NIC (`runtime::SteerOutcome::Held`).
+    ///
+    /// NOT a failure, and the difference is the state: nothing was
+    /// attempted, so nothing rolled back and nothing moved. A port in
+    /// `Steered` stays there with its traffic on VPP — reported as
+    /// `SteerFailed` it went to `Ready`, the steered-state gauge dropped,
+    /// and the journal said traffic was on the eBPF tier while it was not
+    /// (review finding, PR #333). One held from `Ready` stays in `Ready`,
+    /// `steered` untouched: a convergence's re-assert over a steered
+    /// adoption waits there for its acknowledgement, as every re-assert
+    /// does. The want is kept, and the addition is remembered as held so
+    /// the retry re-attempts it from `Steered` too
+    /// ([`Supervisor::steer_retry_pending`]).
+    SteerHeld,
     /// MCAM rules are confirmed removed.
     ///
     /// Steering is only believed *down* on this acknowledgement, for
@@ -614,6 +629,12 @@ pub struct Supervisor {
     /// steering is unambiguously wanted. A field whose name mis-describes
     /// its contents is how the next bug gets written.
     steer_wanted: bool,
+    /// A steer that would divert more was held ([`Event::SteerHeld`]) and
+    /// has not landed since. What lets the retry act from `Steered`, where
+    /// nothing is otherwise outstanding. Cleared by any steer outcome that
+    /// is not another hold, and by an operator's `steer off`; only read
+    /// in `Steered`, which is entered only through `Event::Steered`.
+    addition_held: bool,
     /// Whether a resync or verify task is still running.
     ///
     /// A field for the same reason `steered` is one: derived from the
@@ -657,6 +678,7 @@ impl Supervisor {
             failures: 0,
             steered: false,
             steer_wanted: false,
+            addition_held: false,
             converging: false,
             undead: false,
             interrupted: None,
@@ -701,8 +723,20 @@ impl Supervisor {
     /// **Not** [`Self::steer_intended`], which is the health surface's
     /// question and answers yes for a port that is steering perfectly
     /// well. This one is only true where something is missing.
+    ///
+    /// And from `Steered` while an addition is held ([`Event::SteerHeld`]):
+    /// the rules in the NIC are the old target's, and the new one waits.
     pub fn steer_retry_pending(&self) -> bool {
-        matches!(self.state, State::Ready) && self.steer_wanted
+        self.steer_wanted
+            && (matches!(self.state, State::Ready)
+                || (matches!(self.state, State::Steered) && self.addition_held))
+    }
+
+    /// Whether a steering change that diverts more is held over ports
+    /// already steered — the health surface's question, answered by the
+    /// field the retry acts on.
+    pub fn addition_held(&self) -> bool {
+        self.steered && self.addition_held && matches!(self.state, State::Ready | State::Steered)
     }
 
     pub fn failures(&self) -> u32 {
@@ -974,6 +1008,13 @@ impl Supervisor {
                 self.state = State::Steered;
                 self.steered = true;
                 self.steer_wanted = true;
+                self.addition_held = false;
+                vec![]
+            }
+            // A reconcile of a port already steered landed — the held
+            // addition included, if one was waiting.
+            (State::Steered, Event::Steered) => {
+                self.addition_held = false;
                 vec![]
             }
 
@@ -1030,6 +1071,16 @@ impl Supervisor {
                 self.steer_wanted = true;
                 vec![]
             }
+            // The steer was held before the NIC: nothing moved, so neither
+            // does the state — `Steered` stays `Steered` over traffic still
+            // on VPP, and `Ready` stays `Ready` with `steered` as it was.
+            // The want is kept, and the addition marked held so the retry
+            // acts from `Steered` as it does from `Ready`.
+            (Ready | State::Steered, SteerHeld) => {
+                self.steer_wanted = true;
+                self.addition_held = true;
+                vec![]
+            }
             // The same lever, re-pulled by the module rather than by a
             // human, once whatever refused it has cleared.
             //
@@ -1051,6 +1102,13 @@ impl Supervisor {
             // `steered == true` and the want set — and that is a steer
             // that did not fully happen, so it wants the same retry.
             (Ready, SteerUnblocked) if self.steer_wanted => vec![Action::Steer],
+            // ...and from `Steered` only for an addition the hold kept back
+            // (`SteerHeld`): the rules in place are the old target's, so
+            // there is something to retry; without one, `Steered` has
+            // nothing outstanding, as above.
+            (State::Steered, SteerUnblocked) if self.steer_wanted && self.addition_held => {
+                vec![Action::Steer]
+            }
             // The module takes steering down itself: an empty FIB drops
             // what the eBPF tier would forward. Shaped like
             // `SteerFailed` — the WANT is kept and the state returns to
@@ -1067,6 +1125,7 @@ impl Supervisor {
             // started it (review finding). The driver paces that repeat.
             (State::Steered | Ready, TableEmptied) => {
                 self.steer_wanted = true;
+                self.addition_held = false;
                 self.state = Ready;
                 if self.steered {
                     vec![Action::Unsteer]
@@ -1081,6 +1140,7 @@ impl Supervisor {
             // a refused removal keeps the VF withheld.
             (Ready | State::Steered, UnsteerRequested) => {
                 self.steer_wanted = false;
+                self.addition_held = false;
                 self.state = Ready;
                 if self.steered {
                     vec![Action::Unsteer]
@@ -1109,6 +1169,7 @@ impl Supervisor {
             // the VF withheld and keep every later teardown trying.
             (Syncing | AdoptedResyncing | Verifying, UnsteerRequested) => {
                 self.steer_wanted = false;
+                self.addition_held = false;
                 if self.steered {
                     vec![Action::Unsteer]
                 } else {
@@ -1171,6 +1232,7 @@ impl Supervisor {
             (Ready | State::Steered, SteerFailed { rules_remain }) => {
                 self.steer_wanted = true;
                 self.steered = rules_remain;
+                self.addition_held = false;
                 self.state = Ready;
                 vec![]
             }
@@ -1200,6 +1262,7 @@ impl Supervisor {
             (_, NothingToSteer) => {
                 self.steered = false;
                 self.steer_wanted = false;
+                self.addition_held = false;
                 vec![]
             }
             // Traffic is still diverted. `steered` stays true so the
@@ -1249,6 +1312,8 @@ impl Supervisor {
     /// steered packet is going to a VF nothing is servicing.
     fn fail(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
+        // A held addition belongs to the process going away.
+        self.addition_held = false;
         // Unsteer FIRST and unconditionally on the current fact, not on
         // the lifecycle state: until the MCAM rules are gone, every
         // steered packet is going to a VF nothing is servicing.
@@ -1358,6 +1423,43 @@ mod tests {
         s.on(Event::Steered);
         assert_eq!(s.state(), State::Steered);
         s
+    }
+
+    /// A held steer is not a failure (review finding, PR #333): from
+    /// `Steered` the state stays `Steered` with traffic on VPP, the
+    /// addition is remembered so the retry re-pulls the lever
+    /// from `Steered`, and every way out of steering still behaves as
+    /// it does for a port that is simply steered.
+    #[test]
+    fn a_held_addition_stays_steered_and_is_retried() {
+        let mut s = running_and_steered();
+        assert!(!s.steer_retry_pending(), "steered with nothing held");
+        assert_eq!(s.on(Event::SteerHeld), vec![]);
+        assert_eq!(s.state(), State::Steered, "nothing moved");
+        assert!(s.is_steered() && s.addition_held());
+        assert!(s.steer_retry_pending());
+        assert_eq!(s.on(Event::SteerUnblocked), vec![Action::Steer]);
+        assert_eq!(s.on(Event::Steered), vec![]);
+        assert!(!s.addition_held() && !s.steer_retry_pending(), "landed");
+        assert_eq!(s.on(Event::SteerUnblocked), vec![], "nothing outstanding");
+
+        // `steer off` over a held addition takes the rules down and forgets it.
+        s.on(Event::SteerHeld);
+        assert_eq!(s.on(Event::UnsteerRequested), vec![Action::Unsteer]);
+        assert!(!s.addition_held() && !s.steer_retry_pending());
+
+        // An emptied table unsteers a held box like any steered one.
+        let mut s = running_and_steered();
+        s.on(Event::SteerHeld);
+        assert_eq!(s.on(Event::TableEmptied), vec![Action::Unsteer]);
+        assert!(!s.addition_held());
+
+        // A death unsteers first, held or not.
+        let mut s = running_and_steered();
+        s.on(Event::SteerHeld);
+        let actions = s.on(Event::ProcessExited { status: Some(139) });
+        assert_eq!(actions[0], Action::Unsteer, "unsteer must come first");
+        assert!(!s.addition_held());
     }
 
     #[test]
