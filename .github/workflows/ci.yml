@@ -178,6 +178,9 @@ jobs:
           sudo -E $(which cargo) test -p packetframe-sampler-shm --tests -- --ignored --nocapture
           sudo -E $(which cargo) test -p packetframe-sampler-core --tests -- --ignored --nocapture
           sudo -E $(which cargo) test -p packetframe-vpp-offload --test drift_netns -- --ignored --nocapture
+          # The sampler's tmpfs for real: mounted, marked, recorded, reused
+          # across a restart, released, and a crowded foreign mount refused.
+          sudo -E $(which cargo) test -p packetframe-vpp-offload --lib -- --ignored --exact sampler::tests::the_live_mount_round_trips --nocapture
 
   sampler-shm-arm64:
     name: sampler-shm (arm64)

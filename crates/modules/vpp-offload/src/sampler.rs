@@ -48,7 +48,13 @@ pub const MOUNT_RECORD: &str = "vpp-sampler-mount";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SamplerDir {
     /// Usable: a tmpfs of `bytes`, PacketFrame's own mount or not.
-    Ready { bytes: u64, owned: bool },
+    /// `stale`: why a `desired.conf` no flow export owns is still there,
+    /// when attach could not remove it, so the plugin may be sampling.
+    Ready {
+        bytes: u64,
+        owned: bool,
+        stale: Option<String>,
+    },
     /// Not usable, and why.
     Unavailable(String),
 }
@@ -58,9 +64,12 @@ impl SamplerDir {
     /// into the module's overall health: forwarding does not depend on it.
     pub fn health(&self, dir: &Path) -> SubsystemHealth {
         let (state, message) = match self {
-            Self::Ready { bytes, owned } => (
-                HealthState::Healthy,
-                format!(
+            Self::Ready {
+                bytes,
+                owned,
+                stale,
+            } => {
+                let ready = format!(
                     "{}: tmpfs of {} KiB, {}",
                     dir.display(),
                     bytes >> 10,
@@ -69,8 +78,18 @@ impl SamplerDir {
                     } else {
                         "an existing mount"
                     }
-                ),
-            ),
+                );
+                match stale {
+                    None => (HealthState::Healthy, ready),
+                    Some(why) => (
+                        HealthState::Degraded,
+                        format!(
+                            "{ready}; a desired.conf no flow export owns is still there ({why}), \
+                             so VPP may be sampling: `packetframe sampler clear` removes it"
+                        ),
+                    ),
+                }
+            }
             Self::Unavailable(why) => (
                 HealthState::Degraded,
                 format!("unavailable, so VPP cannot sample (forwarding is unaffected): {why}"),
@@ -188,6 +207,7 @@ pub(crate) fn prepare(
                 SamplerDir::Ready {
                     bytes: total,
                     owned: ours.is_some(),
+                    stale: None,
                 },
                 ours,
             )
@@ -214,6 +234,7 @@ pub(crate) fn prepare(
                     SamplerDir::Ready {
                         bytes: total,
                         owned: true,
+                        stale: None,
                     },
                     Some(fresh),
                 ),
@@ -352,22 +373,21 @@ pub(crate) fn prepare_recorded(dir: &Path, threads: usize, state_dir: &Path) -> 
             Err(e) => tracing::warn!(error = %e, "could not remove a stale sampler mount record"),
         }
     }
-    if matches!(outcome, SamplerDir::Ready { .. }) {
-        match packetframe_sampler_shm::fs::clear_desired(dir) {
-            Ok(Some(true)) => tracing::info!(
-                dir = %dir.display(),
-                "removed a desired.conf no flow export owns: the VPP sampler stays off"
-            ),
-            Ok(Some(false)) => {}
-            Ok(None) => tracing::warn!(
-                dir = %dir.display(),
-                "desired.lock is held by another writer; its desired.conf is left in place"
-            ),
-            Err(e) => tracing::warn!(
-                dir = %dir.display(),
-                error = %e,
-                "could not remove a stale desired.conf"
-            ),
+    if let SamplerDir::Ready { stale, .. } = &mut outcome {
+        *stale = match packetframe_sampler_shm::fs::clear_desired(dir) {
+            Ok(Some(true)) => {
+                tracing::info!(
+                    dir = %dir.display(),
+                    "removed a desired.conf no flow export owns: the VPP sampler stays off"
+                );
+                None
+            }
+            Ok(Some(false)) => None,
+            Ok(None) => Some("desired.lock is held by another writer".into()),
+            Err(e) => Some(format!("removing it failed: {e}")),
+        };
+        if let Some(why) = stale {
+            tracing::warn!(dir = %dir.display(), reason = %why, "a stale desired.conf is left in place; the VPP sampler may be sampling");
         }
     }
     outcome
@@ -554,7 +574,8 @@ mod tests {
             out,
             SamplerDir::Ready {
                 bytes: 1000,
-                owned: true
+                owned: true,
+                stale: None
             }
         );
         assert_eq!(ours, Some(7));
@@ -570,7 +591,8 @@ mod tests {
             (
                 SamplerDir::Ready {
                     bytes: 1000,
-                    owned: true
+                    owned: true,
+                    stale: None
                 },
                 Some(7)
             )
@@ -583,7 +605,8 @@ mod tests {
             (
                 SamplerDir::Ready {
                     bytes: 4000,
-                    owned: false
+                    owned: false,
+                    stale: None
                 },
                 None
             )
@@ -753,10 +776,37 @@ mod tests {
         assert!(
             Live.check(&d).unwrap() >= packetframe_sampler_core::driver::dir_budget(2).unwrap()
         );
+        // A daemon restart: reused as ours. A desired.conf another writer
+        // holds the lock on stays, and the row says so.
+        packetframe_sampler_shm::fs::write_atomic(&d, packetframe_sampler_shm::fs::DESIRED, b"x")
+            .unwrap();
+        let held = packetframe_sampler_shm::fs::Lock::try_exclusive(
+            &d.join(packetframe_sampler_shm::fs::DESIRED_LOCK),
+        )
+        .unwrap()
+        .unwrap();
+        let out = prepare_recorded(&d, 2, &st);
+        assert!(
+            matches!(
+                out,
+                SamplerDir::Ready {
+                    owned: true,
+                    stale: Some(_),
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        drop(held);
         assert!(matches!(
             prepare_recorded(&d, 2, &st),
-            SamplerDir::Ready { owned: true, .. }
+            SamplerDir::Ready {
+                owned: true,
+                stale: None,
+                ..
+            }
         ));
+        assert!(!d.join(packetframe_sampler_shm::fs::DESIRED).exists());
         assert_eq!(read_record(&st), Some(token), "the same mount, still ours");
         release_recorded(&d, &st).unwrap();
         assert!(!Live.is_mount_point(&d).unwrap());
@@ -781,6 +831,7 @@ mod tests {
         let ok = SamplerDir::Ready {
             bytes: 18 << 20,
             owned: true,
+            stale: None,
         }
         .health(dir());
         assert_eq!(ok.state, HealthState::Healthy);
@@ -791,5 +842,19 @@ mod tests {
         let bad = SamplerDir::Unavailable("why".into()).health(dir());
         assert_eq!(bad.state, HealthState::Degraded);
         assert!(bad.message.unwrap().ends_with("why"));
+        // Ready, but a desired.conf attach could not remove: the plugin may
+        // be sampling with nobody owning it.
+        let stale = SamplerDir::Ready {
+            bytes: 18 << 20,
+            owned: true,
+            stale: Some("desired.lock is held by another writer".into()),
+        }
+        .health(dir());
+        assert_eq!(stale.state, HealthState::Degraded);
+        let m = stale.message.unwrap();
+        assert!(
+            m.contains("held by another writer") && m.contains("packetframe sampler clear"),
+            "{m}"
+        );
     }
 }

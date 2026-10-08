@@ -849,7 +849,7 @@ pub fn bring_up(
     #[cfg(not(target_os = "linux"))]
     let sampler_dir = crate::sampler::SamplerDir::Unavailable("Linux only".into());
     match &sampler_dir {
-        crate::sampler::SamplerDir::Ready { bytes, owned } => tracing::info!(
+        crate::sampler::SamplerDir::Ready { bytes, owned, .. } => tracing::info!(
             dir = %paths.sys.sampler_dir.display(),
             kib = bytes >> 10,
             owned,
