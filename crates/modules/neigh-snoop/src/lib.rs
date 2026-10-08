@@ -42,6 +42,7 @@ pub mod health;
 pub mod metrics;
 pub mod persist;
 pub mod probe_linux;
+pub mod resync;
 pub mod rs_coverage;
 pub mod snapshot;
 pub mod table;

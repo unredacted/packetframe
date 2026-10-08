@@ -1,12 +1,17 @@
 //! rtnetlink helpers for the engine: dumps of links, addresses and
 //! neighbours; the STALE installer; message decoders shared by the
 //! dump and multicast paths (so both agree on what a neighbour means);
-//! and the strict-check connection the coverage dump needs.
+//! the strict-check connection the coverage dump needs; the bounded,
+//! self-replacing request connection every task issues requests on;
+//! and the multicast subscription's receive buffer.
 
 #![cfg(target_os = "linux")]
 
+use std::future::Future;
 use std::io;
 use std::net::IpAddr;
+use std::os::fd::AsRawFd;
+use std::time::Duration;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::TryStreamExt;
@@ -187,6 +192,145 @@ pub fn new_strict_connection() -> io::Result<(StrictConnection, Handle, Messages
         .socket_mut()
         .set_netlink_get_strict_chk(true)?;
     Ok((conn, handle, msgs))
+}
+
+/// How long one request (a dump, or a write and its ACK) may go
+/// unanswered before it is taken to be lost.
+///
+/// Replies normally arrive in microseconds. A request that needs RTNL
+/// queues behind whoever holds it, and a port bounce that flushes a full
+/// routing table holds it for seconds while the softirq load of the same
+/// event delays the reader — so the bound sits well above that. A reply
+/// the kernel could not allocate (a write's ACK, or a dump's next chunk)
+/// never arrives at all, and netlink-proto waits for it forever.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A request that went unanswered, told apart from one the kernel
+/// refused: a write that timed out may still have landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    Failed(String),
+    TimedOut(String),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(e) | Self::TimedOut(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<RequestError> for String {
+    fn from(e: RequestError) -> Self {
+        e.to_string()
+    }
+}
+
+/// A unicast rtnetlink connection owned by one task, every request on it
+/// bounded.
+///
+/// A request that times out is not merely slow: netlink-proto keeps it
+/// pending for good, and a dump abandoned half-way keeps running on the
+/// socket, so the kernel refuses the next dump on it with `EBUSY`. The
+/// connection is therefore replaced after a timeout — which is also why
+/// each task owns its own: replacing one must never strand a request
+/// another task is still waiting on.
+pub struct Requests {
+    handle: Handle,
+    strict: bool,
+}
+
+impl Requests {
+    /// A plain connection, spawned on the current runtime.
+    pub fn new() -> io::Result<Self> {
+        Self::open(false)
+    }
+
+    /// With `NETLINK_GET_STRICT_CHK`, see [`new_strict_connection`].
+    pub fn new_strict() -> io::Result<Self> {
+        Self::open(true)
+    }
+
+    fn open(strict: bool) -> io::Result<Self> {
+        let (conn, handle, _) = if strict {
+            new_strict_connection()?
+        } else {
+            rtnetlink::new_connection()?
+        };
+        tokio::spawn(conn);
+        Ok(Self { handle, strict })
+    }
+
+    /// Issue `request` on this connection, bounded by `bound`. On a
+    /// timeout the connection is replaced before returning.
+    pub async fn run<T, F, Fut>(
+        &mut self,
+        what: &str,
+        bound: Duration,
+        request: F,
+    ) -> Result<T, RequestError>
+    where
+        F: FnOnce(Handle) -> Fut,
+        Fut: Future<Output = Result<T, String>>,
+    {
+        match tokio::time::timeout(bound, request(self.handle.clone())).await {
+            Ok(result) => result.map_err(RequestError::Failed),
+            Err(_) => {
+                let replaced = match Self::open(self.strict) {
+                    Ok(fresh) => {
+                        *self = fresh;
+                        "connection replaced".to_string()
+                    }
+                    Err(e) => format!("could not replace the connection: {e}"),
+                };
+                Err(RequestError::TimedOut(format!(
+                    "{what}: no reply within {}s; {replaced}",
+                    bound.as_secs()
+                )))
+            }
+        }
+    }
+}
+
+/// What the multicast subscription asks for as its receive buffer.
+///
+/// The neighbour group carries every neighbour change on the box, and a
+/// port bounce flushes thousands of rows inside one syscall, faster than
+/// any reader drains them; the default buffer (about 200 KiB) overflowed
+/// on exactly that on 2026-10-07. This holds thousands of messages more.
+/// It makes an overrun rarer, not impossible — the re-dump on overrun is
+/// what makes one harmless.
+pub const MULTICAST_RCVBUF: usize = 4 << 20;
+
+/// Ask for `bytes` of receive buffer on `socket` and return what the
+/// kernel granted (it doubles the request to cover its own bookkeeping).
+/// `SO_RCVBUFFORCE` needs CAP_NET_ADMIN, which the daemon has; without it
+/// `SO_RCVBUF` is still worth asking, capped at `net.core.rmem_max`.
+pub fn raise_rcvbuf(socket: &rtnetlink::sys::Socket, bytes: usize) -> io::Result<usize> {
+    let want = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX / 2);
+    let set = |opt: libc::c_int| {
+        // SAFETY: `want` is a c_int of exactly the passed length, and
+        // `socket` owns the fd for the call.
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                opt,
+                std::ptr::addr_of!(want).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+    if set(libc::SO_RCVBUFFORCE).is_err() {
+        set(libc::SO_RCVBUF)?;
+    }
+    socket.get_rx_buf_sz()
 }
 
 #[cfg(test)]

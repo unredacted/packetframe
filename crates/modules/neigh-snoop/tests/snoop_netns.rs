@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use packetframe_common::config::Config;
 use packetframe_neigh_snoop::cfg::SnoopConfig;
 use packetframe_neigh_snoop::engine::EngineHandle;
-use packetframe_neigh_snoop::snapshot::{InstallOutcome, Snapshot};
+use packetframe_neigh_snoop::snapshot::{InstallOutcome, ResyncOutcome, SeedOutcome, Snapshot};
 use packetframe_neigh_snoop::table::SkipReason;
 
 // --- netns plumbing ------------------------------------------------------
@@ -435,6 +435,12 @@ impl Rig {
     /// Enter the netns, start the engine (its runtime threads inherit
     /// the namespace from this thread), open the injector on veth B.
     fn start() -> Self {
+        Self::start_with(None)
+    }
+
+    /// [`Self::start`], with the engine's multicast receive buffer set to
+    /// `rcvbuf` bytes when given.
+    fn start_with(rcvbuf: Option<usize>) -> Self {
         let names = Names::new();
         let guard = NetnsGuard::setup(&names);
         let ns_fd = enter_netns(&names.netns);
@@ -447,7 +453,13 @@ impl Rig {
         let c = Config::parse(&s).unwrap();
         let cfg = SnoopConfig::from_directives(&c.modules[0].directives).unwrap();
         std::fs::create_dir_all(&names.persist).unwrap();
-        let engine = EngineHandle::start(cfg, names.persist.clone()).expect("engine start");
+        let engine = match rcvbuf {
+            None => EngineHandle::start(cfg, names.persist.clone()),
+            Some(bytes) => {
+                EngineHandle::start_with_multicast_rcvbuf(cfg, names.persist.clone(), bytes)
+            }
+        }
+        .expect("engine start");
         let b_ifindex = if_nametoindex(&names.veth_b);
         let injector = open_packet_socket(b_ifindex);
         Self {
@@ -777,6 +789,118 @@ fn emits_nothing() {
     assert_eq!(
         ours, 0,
         "the snooped interface emitted ARP/ND during a learn cycle"
+    );
+    rig.stop();
+}
+
+/// Notifications the kernel drops on a full receive buffer are made good
+/// by a re-read. The engine's multicast buffer is shrunk to the kernel's
+/// minimum (about one message), so one `ip neigh flush` — every delete in
+/// a single request, every `RTM_DELNEIGH` emitted back to back, the way a
+/// port bounce flushes a peering LAN — overruns it and most deletes are
+/// never heard. Without the re-read the mirror keeps those addresses as
+/// resolved for good and nothing puts them back in the kernel: coverage
+/// stays near full over an empty table, the gate keeps them as
+/// participants, and no frame arrives here to trigger a re-install. With
+/// it, the mirror learns they are gone and the bridge is re-seeded.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn neighbours_flushed_unheard_are_re_read_and_re_seeded() {
+    const N: u8 = 40;
+    let rig = Rig::start_with(Some(1));
+    let addr = |i: u8| v4(100 + i);
+    for i in 0..N {
+        let mac = [0x02, 0, 0, 0, 0x01, i];
+        rig.inject(&arp_request(mac, mac, addr(i), v4(200)));
+    }
+    // Echoes can overrun the shrunk buffer too; a re-read then confirms
+    // them, so allow for its pacing.
+    wait_for(
+        Duration::from_secs(15),
+        "every learned address resolved in the mirror",
+        || {
+            let s = rig.snapshot();
+            let c = s.bridges[0].participant_coverage;
+            (c.total == u64::from(N) && c.resolved == u64::from(N)).then(|| format!("{s:?}"))
+        },
+    );
+    let held = |table: &str| {
+        (0..N)
+            .filter(|i| {
+                table
+                    .lines()
+                    .any(|l| l.starts_with(&format!("{} ", addr(*i))))
+            })
+            .count()
+    };
+    assert_eq!(
+        held(&neigh_table(&rig.names.netns, &rig.names.veth_a)),
+        usize::from(N),
+        "every learned address installed"
+    );
+
+    let before = rig.snapshot();
+    ns_run(
+        &rig.names.netns,
+        &["ip", "neigh", "flush", "dev", &rig.names.veth_a],
+    );
+    assert_eq!(
+        held(&neigh_table(&rig.names.netns, &rig.names.veth_a)),
+        0,
+        "the flush emptied the kernel table"
+    );
+    // The premise: the burst overflowed the buffer. Without it this test
+    // would pass on the event path alone and prove nothing.
+    rig.wait_counter("an overrun reported for the flush", |s| {
+        s.netlink.overruns > before.netlink.overruns
+    });
+    // Re-reads are paced (`RESYNC_MIN_INTERVAL`), and one may have run
+    // just before for an overrun during the learning above. No frame is
+    // injected from here on: only the re-read can put entries back.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let restored = loop {
+        let n = held(&neigh_table(&rig.names.netns, &rig.names.veth_a));
+        if n == usize::from(N) || Instant::now() >= deadline {
+            break n;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let s = rig.snapshot();
+    assert_eq!(
+        restored,
+        usize::from(N),
+        "every flushed learned address re-seeded into the kernel: {:?}",
+        s.netlink
+    );
+    // Counted as seeds: restored by the re-seed, not by anything else.
+    // The snapshot trails by up to a housekeeping tick, and the re-seed's
+    // echoes can overrun the buffer as well, so the mirror catches up by
+    // its echoes or by the next re-read.
+    let seeded = |s: &Snapshot| s.bridges[0].counters.seeds[SeedOutcome::Requested.index()];
+    wait_for(
+        Duration::from_secs(15),
+        "the re-seed counted and the mirror agreeing with the restored table",
+        || {
+            let s = rig.snapshot();
+            let c = s.bridges[0].participant_coverage;
+            (seeded(&s) >= seeded(&before) + u64::from(N)
+                && !s.netlink.resync_pending
+                && c.total == u64::from(N)
+                && c.resolved == u64::from(N))
+            .then(|| format!("{s:?}"))
+        },
+    );
+    let s = rig.snapshot();
+    assert!(
+        s.netlink.resyncs[ResyncOutcome::Ok.index()]
+            > before.netlink.resyncs[ResyncOutcome::Ok.index()],
+        "{:?}",
+        s.netlink
+    );
+    let health = packetframe_neigh_snoop::health::health(&s);
+    assert!(
+        health.subsystems.iter().all(|r| r.name != "netlink"),
+        "no re-read owed once applied: {health:?}"
     );
     rig.stop();
 }

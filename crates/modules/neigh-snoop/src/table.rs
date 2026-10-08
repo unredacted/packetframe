@@ -265,6 +265,20 @@ impl MirrorEntry {
     }
 }
 
+/// What [`KernelMirror::replace_ifindex`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MirrorDelta {
+    pub removed: usize,
+    pub added: usize,
+    pub changed: usize,
+}
+
+impl MirrorDelta {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Mirror of the kernel neighbour table for the tracked bridges only.
 #[derive(Debug, Clone, Default)]
 pub struct KernelMirror {
@@ -289,6 +303,35 @@ impl KernelMirror {
         let before = self.entries.len();
         self.entries.retain(|(i, _), _| *i != ifindex);
         before - self.entries.len()
+    }
+
+    /// Make the rows for `ifindex` exactly `rows`, a fresh dump of it:
+    /// what a re-read after lost notifications establishes. Unlike
+    /// [`Self::upsert`], a row the dump does not hold is dropped — a lost
+    /// `RTM_DELNEIGH` is the case this exists for. Returns how many rows
+    /// were dropped, added and changed.
+    pub fn replace_ifindex(
+        &mut self,
+        ifindex: u32,
+        rows: impl IntoIterator<Item = (IpAddr, MirrorEntry)>,
+    ) -> MirrorDelta {
+        let fresh: HashMap<IpAddr, MirrorEntry> = rows.into_iter().collect();
+        let mut delta = MirrorDelta::default();
+        self.entries.retain(|(i, ip), _| {
+            let keep = *i != ifindex || fresh.contains_key(ip);
+            if !keep {
+                delta.removed += 1;
+            }
+            keep
+        });
+        for (ip, e) in fresh {
+            match self.entries.insert((ifindex, ip), e) {
+                None => delta.added += 1,
+                Some(old) if old != e => delta.changed += 1,
+                Some(_) => {}
+            }
+        }
+        delta
     }
 
     pub fn iter_ifindex(&self, ifindex: u32) -> impl Iterator<Item = (&IpAddr, &MirrorEntry)> {
@@ -725,6 +768,54 @@ mod tests {
         assert_eq!(m.purge_ifindex(3), 2);
         assert_eq!(m.len(), 1);
         assert!(m.get(4, &ip(1)).is_some());
+    }
+
+    /// A re-read after lost notifications: the device's rows become the
+    /// dump's, so an entry whose `RTM_DELNEIGH` was lost stops counting as
+    /// resolved, and other devices are left alone.
+    #[test]
+    fn mirror_replace_drops_what_the_dump_no_longer_holds() {
+        let stale_a = MirrorEntry {
+            state: NudState::Stale,
+            mac: Some(A),
+        };
+        let mut m = KernelMirror::default();
+        m.upsert(3, ip(1), stale_a);
+        m.upsert(3, ip(2), stale_a);
+        m.upsert(3, ip(3), stale_a);
+        m.upsert(4, ip(1), stale_a);
+
+        let reachable_b = MirrorEntry {
+            state: NudState::Reachable,
+            mac: Some(B),
+        };
+        // The kernel flushed .1, moved .2 to another MAC, kept .3, and
+        // learned .9; none of it was heard.
+        let delta = m.replace_ifindex(
+            3,
+            [(ip(2), reachable_b), (ip(3), stale_a), (ip(9), stale_a)],
+        );
+        assert_eq!(
+            delta,
+            MirrorDelta {
+                removed: 1,
+                added: 1,
+                changed: 1
+            }
+        );
+        assert!(m.get(3, &ip(1)).is_none(), "the lost delete is applied");
+        assert_eq!(m.get(3, &ip(2)), Some(&reachable_b));
+        assert_eq!(m.get(3, &ip(3)), Some(&stale_a));
+        assert_eq!(m.get(3, &ip(9)), Some(&stale_a));
+        assert_eq!(m.get(4, &ip(1)), Some(&stale_a), "other devices untouched");
+
+        assert_eq!(
+            m.replace_ifindex(3, []).removed,
+            3,
+            "an empty dump empties it"
+        );
+        assert_eq!(m.iter_ifindex(3).count(), 0);
+        assert!(m.replace_ifindex(4, [(ip(1), stale_a)]).is_empty());
     }
 
     /// A customer VLAN behind a vpp-offload `local-route6`, frame to

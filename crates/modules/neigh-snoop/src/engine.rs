@@ -6,9 +6,10 @@
 //!   the paced installer feed, housekeeping, reconfiguration;
 //! - one **capture** pump per bridge with a bound socket
 //!   ([`crate::capture::pump`]);
-//! - the **installer**: one unicast rtnetlink handle, one write per job,
-//!   errors reported back — success is *not* reported, the kernel's
-//!   `RTM_NEWNEIGH` echo on the multicast group is the confirmation;
+//! - the **installer**: its own unicast rtnetlink connection, one write
+//!   per job, errors reported back — success is *not* reported, the
+//!   kernel's `RTM_NEWNEIGH` echo on the multicast group is the
+//!   confirmation;
 //! - the **persister**: write-then-rename on the blocking pool;
 //! - the **coverage** sampler on its own strict-check connection;
 //! - the FRR **gate** reconciler and the **route-server** dumps, which
@@ -16,6 +17,11 @@
 //!
 //! Every counter that claims an effect is recorded when the effect is
 //! *observed* (the echo, the persist result), not when it is requested.
+//!
+//! Every netlink request is bounded ([`netlink::REQUEST_TIMEOUT`]) on a
+//! connection its task owns and replaces after a timeout, and the
+//! multicast subscription's lost notifications (an overrun) are made
+//! good by re-reading what they feed ([`Engine::resync`]).
 
 #![cfg(target_os = "linux")]
 
@@ -29,7 +35,8 @@ use std::time::{Duration, Instant, SystemTime};
 use futures::StreamExt;
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::RouteNetlinkMessage;
-use rtnetlink::{new_connection, new_multicast_connection, Handle, MulticastGroup};
+use rtnetlink::sys::AsyncSocket;
+use rtnetlink::{new_multicast_connection, MulticastGroup};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -42,16 +49,17 @@ use crate::cfg::{BridgeCfg, GateCfg, HotConfig, SnoopConfig};
 use crate::coverage::{self, CoverageSample};
 use crate::frame::{self, Reject};
 use crate::frr_gate::{self, GateInput, RealVtysh, Vtysh};
-use crate::netlink::{self, LinkInfo, Messages};
+use crate::netlink::{self, LinkInfo, Messages, RequestError, Requests, REQUEST_TIMEOUT};
 use crate::persist::{self, LoadOutcome};
+use crate::resync::Resync;
 use crate::rs_coverage;
 use crate::snapshot::{
     Counters, Coverage, CoverageState, GateSnapshot, IfaceSnapshot, InstallOutcome, LearnOutcome,
     LinkEvent, LinkState, PersistOutcome, RsCoverageSnapshot, SeedOutcome, Snapshot,
 };
 use crate::table::{
-    admit, install_decision, Decision, FilterReject, KernelMirror, LearnedTable, Observe,
-    DEFAULT_HOLDDOWN,
+    admit, install_decision, Decision, FilterReject, KernelMirror, LearnedTable, MirrorEntry,
+    Observe, DEFAULT_HOLDDOWN,
 };
 
 pub type SharedSnapshot = Arc<RwLock<Snapshot>>;
@@ -71,6 +79,13 @@ const UNRESOLVED_SAMPLE_MAX: usize = 32;
 const LOG_BUDGET: u64 = 20;
 /// `Module::detach` must *return* within 1 s; joins get this much.
 const SHUTDOWN_JOIN: Duration = Duration::from_millis(700);
+/// One route-coverage sample: a nexthop-object dump and two route dumps
+/// filtered to one bridge. Filtered or not, the kernel walks the whole
+/// table, and on an IX bridge the routes it returns run to hundreds of
+/// thousands, so a sample legitimately takes far longer than one small
+/// request ([`REQUEST_TIMEOUT`]). The bound only keeps a lost reply from
+/// ending sampling for good.
+const COVERAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// `sll_pkttype` for frames we sent.
 const PACKET_OUTGOING: u8 = 4;
 
@@ -259,6 +274,15 @@ impl IfaceState {
             self.dirty_since = Some(now);
         }
     }
+
+    /// The kernel was seen holding the MAC an in-flight install wrote:
+    /// by its echo, or by a re-read that found it.
+    fn confirmed(&mut self, origin: Origin) {
+        match origin {
+            Origin::Seed => self.counters.seed(SeedOutcome::Confirmed),
+            Origin::Learn | Origin::Derived => self.counters.install(InstallOutcome::Confirmed),
+        }
+    }
 }
 
 struct Engine {
@@ -268,7 +292,11 @@ struct Engine {
     gate_cfg: Option<GateCfg>,
     bridges: Vec<IfaceState>,
     mirror: KernelMirror,
-    unicast: Handle,
+    /// The engine loop's own request connection: dumps only (the
+    /// installer and the coverage sampler each own theirs).
+    requests: Requests,
+    /// Lost multicast notifications and the re-reads that make them good.
+    resync: Resync,
     frame_tx: mpsc::Sender<EngineMsg>,
     install_tx: mpsc::Sender<InstallJob>,
     persist_tx: mpsc::Sender<PersistJob>,
@@ -297,6 +325,18 @@ impl EngineHandle {
     /// netlink or socket failure is an attach error, not a log line),
     /// then spawn the pumps and the loop.
     pub fn start(config: SnoopConfig, persist_dir: PathBuf) -> Result<Self, String> {
+        Self::start_with_multicast_rcvbuf(config, persist_dir, netlink::MULTICAST_RCVBUF)
+    }
+
+    /// [`Self::start`] with the multicast subscription's receive buffer
+    /// chosen by the caller. For tests, which shrink it to force an
+    /// overrun on demand.
+    #[doc(hidden)]
+    pub fn start_with_multicast_rcvbuf(
+        config: SnoopConfig,
+        persist_dir: PathBuf,
+        multicast_rcvbuf: usize,
+    ) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -316,7 +356,7 @@ impl EngineHandle {
         let (gate_tx, gate_rx) = watch::channel(GateInput::default());
         let (rs_tx, rs_rx) = watch::channel(RsInput::default());
 
-        let (engine, messages) = runtime.block_on(Engine::init(
+        let (engine, messages, install_requests) = runtime.block_on(Engine::init(
             config,
             persist_dir,
             snapshot.clone(),
@@ -329,8 +369,8 @@ impl EngineHandle {
                 rs_tx,
             },
             cancel.clone(),
+            multicast_rcvbuf,
         ))?;
-        let unicast = engine.unicast.clone();
         let turn = Arc::new(tokio::sync::Mutex::new(()));
         // The gate takes its turn per reconcile, not per call (see
         // `gate_task`), so its runner is the bare one.
@@ -340,7 +380,7 @@ impl EngineHandle {
             turn: turn.clone(),
         });
         let tasks = vec![
-            runtime.spawn(installer(unicast, install_rx, ctl_tx.clone())),
+            runtime.spawn(installer(install_requests, install_rx, ctl_tx.clone())),
             runtime.spawn(persister(persist_rx, ctl_tx.clone())),
             runtime.spawn(coverage_task(cov_rx, ctl_tx.clone(), cancel.clone())),
             runtime.spawn(frr_gate::gate_task(
@@ -434,13 +474,16 @@ struct Pumps {
 }
 
 impl Engine {
+    /// Also returns the installer's request connection, opened here so
+    /// that failing to open it fails attach like every other socket.
     async fn init(
         config: SnoopConfig,
         persist_dir: PathBuf,
         snapshot: SharedSnapshot,
         pumps: Pumps,
         cancel: CancellationToken,
-    ) -> Result<(Self, Messages), String> {
+        multicast_rcvbuf: usize,
+    ) -> Result<(Self, Messages, Requests), String> {
         let Pumps {
             frame_tx,
             install_tx,
@@ -512,12 +555,18 @@ impl Engine {
             MulticastGroup::Ipv4Ifaddr,
             MulticastGroup::Ipv6Ifaddr,
         ];
-        let (mconn, _mhandle, messages) = new_multicast_connection(&groups)
+        let (mut mconn, _mhandle, messages) = new_multicast_connection(&groups)
             .map_err(|e| format!("netlink multicast subscription: {e}"))?;
+        // Not fatal: the default buffer still works, and an overrun is
+        // recovered from either way; a bigger one just overruns less.
+        match netlink::raise_rcvbuf(mconn.socket_mut().socket_mut(), multicast_rcvbuf) {
+            Ok(granted) => debug!(granted, "netlink multicast receive buffer"),
+            Err(e) => warn!(error = %e, "could not raise the netlink multicast receive buffer"),
+        }
         tokio::spawn(mconn);
-        let (uconn, unicast, _) =
-            new_connection().map_err(|e| format!("netlink unicast connection: {e}"))?;
-        tokio::spawn(uconn);
+        let requests = Requests::new().map_err(|e| format!("netlink unicast connection: {e}"))?;
+        let install_requests =
+            Requests::new().map_err(|e| format!("netlink unicast connection (installer): {e}"))?;
 
         let mut engine = Engine {
             persist_dir,
@@ -526,7 +575,8 @@ impl Engine {
             gate_cfg: config.gate.clone(),
             bridges,
             mirror: KernelMirror::default(),
-            unicast,
+            requests,
+            resync: Resync::default(),
             frame_tx,
             install_tx,
             persist_tx,
@@ -542,7 +592,7 @@ impl Engine {
         };
 
         // 3. Links: which configured bridges exist, their MACs, state.
-        let links = netlink::dump_links(&engine.unicast).await?;
+        let links = engine.dump_links().await?;
         let mut present: Vec<(usize, LinkInfo)> = Vec::new();
         for l in links {
             if let Some(name) = &l.name {
@@ -585,7 +635,7 @@ impl Engine {
         engine.publish_coverage_params();
         engine.publish_gate_input();
         engine.publish_snapshot(now);
-        Ok((engine, messages))
+        Ok((engine, messages, install_requests))
     }
 
     /// The resolved participant set for the gate (addresses on up
@@ -650,14 +700,133 @@ impl Engine {
         if tracked.is_empty() {
             return Ok(());
         }
-        for (ifindex, ip) in netlink::dump_addrs(&self.unicast).await? {
+        for (ifindex, ip) in self.dump_addrs().await? {
             if let Some(&bi) = tracked.get(&ifindex) {
                 self.bridges[bi].own_addrs.insert(ip);
             }
         }
-        for (ifindex, ip, entry) in netlink::dump_neighs(&self.unicast).await? {
+        for (ifindex, ip, entry) in self.dump_neighs().await? {
             if tracked.contains_key(&ifindex) {
                 self.mirror.upsert(ifindex, ip, entry);
+            }
+        }
+        Ok(())
+    }
+
+    async fn dump_links(&mut self) -> Result<Vec<LinkInfo>, RequestError> {
+        self.requests
+            .run("link dump", REQUEST_TIMEOUT, |h| async move {
+                netlink::dump_links(&h).await
+            })
+            .await
+    }
+
+    async fn dump_addrs(&mut self) -> Result<Vec<(u32, IpAddr)>, RequestError> {
+        self.requests
+            .run("address dump", REQUEST_TIMEOUT, |h| async move {
+                netlink::dump_addrs(&h).await
+            })
+            .await
+    }
+
+    async fn dump_neighs(&mut self) -> Result<Vec<(u32, IpAddr, MirrorEntry)>, RequestError> {
+        self.requests
+            .run("neighbour dump", REQUEST_TIMEOUT, |h| async move {
+                netlink::dump_neighs(&h).await
+            })
+            .await
+    }
+
+    /// Re-read everything the multicast groups feed, after the kernel
+    /// reported notifications lost: which configured bridges exist and
+    /// in what state (by name, as the events are read), then each
+    /// tracked bridge's own addresses and neighbour rows, *replacing*
+    /// what is held — the lost message may have been a delete. The link
+    /// pass goes through the handlers the events use, so a bridge
+    /// recreated, brought up or deleted while nobody was listening gets
+    /// what the event would have given it (capture moved, kernel state
+    /// refreshed, re-seed).
+    ///
+    /// An install whose echo was lost is confirmed here when the dump
+    /// shows our MAC in a usable state; one the dump does not show stays
+    /// in flight, for its echo or its confirmation window, as before.
+    ///
+    /// A bridge whose rows the kernel dropped or changed unheard is
+    /// re-seeded, as a bring-up would be: a bounce whose down *and* up
+    /// were both lost flushed its neighbours with no event left to say
+    /// so, and on a fabric that drops our broadcasts nothing else puts
+    /// them back until each participant happens to speak again.
+    async fn resync(&mut self) -> Result<(), String> {
+        let links = self.dump_links().await?;
+        for bi in 0..self.bridges.len() {
+            let name = self.bridges[bi].cfg.name.clone();
+            match links
+                .iter()
+                .find(|l| l.name.as_deref() == Some(name.as_str()))
+            {
+                Some(l) => self.on_link(l.clone()).await,
+                None => {
+                    if let Some(ifindex) = self.bridges[bi].ifindex {
+                        self.on_link_gone(ifindex);
+                    }
+                }
+            }
+        }
+        let tracked: Vec<(usize, u32)> = self
+            .bridges
+            .iter()
+            .enumerate()
+            .filter_map(|(bi, b)| b.ifindex.map(|ifi| (bi, ifi)))
+            .collect();
+        if tracked.is_empty() {
+            return Ok(());
+        }
+        let addrs = self.dump_addrs().await?;
+        let neighs = self.dump_neighs().await?;
+        for (bi, ifindex) in tracked {
+            self.bridges[bi].own_addrs = addrs
+                .iter()
+                .filter(|(i, _)| *i == ifindex)
+                .map(|(_, ip)| *ip)
+                .collect();
+            let delta = self.mirror.replace_ifindex(
+                ifindex,
+                neighs
+                    .iter()
+                    .filter(|(i, _, _)| *i == ifindex)
+                    .map(|(_, ip, e)| (*ip, *e)),
+            );
+            // Only a usable entry holding our MAC confirms: an install
+            // still queued can find the kernel holding that MAC in FAILED,
+            // the very state it was sent to repair.
+            let b = &mut self.bridges[bi];
+            let heard: Vec<IpAddr> = b
+                .in_flight
+                .iter()
+                .filter(|(ip, p)| {
+                    self.mirror
+                        .get(ifindex, ip)
+                        .is_some_and(|e| e.resolves() && e.mac == Some(p.mac))
+                })
+                .map(|(ip, _)| *ip)
+                .collect();
+            for ip in &heard {
+                if let Some(p) = b.in_flight.remove(ip) {
+                    b.confirmed(p.origin);
+                }
+            }
+            if !delta.is_empty() || !heard.is_empty() {
+                info!(
+                    bridge = %b.cfg.name,
+                    removed = delta.removed,
+                    added = delta.added,
+                    changed = delta.changed,
+                    confirmed = heard.len(),
+                    "neighbour mirror re-read after lost notifications"
+                );
+            }
+            if b.up && (delta.removed > 0 || delta.changed > 0) {
+                self.seed(bi, Instant::now());
             }
         }
         Ok(())
@@ -756,7 +925,21 @@ impl Engine {
                 }
             }
             NetlinkPayload::Error(e) => warn!(?e, "netlink error on the multicast socket"),
+            NetlinkPayload::Overrun(_) => self.on_overrun(),
             _ => {}
+        }
+    }
+
+    /// The receive buffer overflowed and the kernel dropped notifications
+    /// (netlink-proto's rendering of ENOBUFS). Which ones is unknowable
+    /// and none is resent, so a re-read is owed; housekeeping runs it,
+    /// which coalesces a burst of these into one.
+    fn on_overrun(&mut self) {
+        if self.resync.overrun() {
+            warn!(
+                "netlink notifications lost (receive buffer overrun); re-reading links, \
+                 addresses and neighbours"
+            );
         }
     }
 
@@ -959,7 +1142,7 @@ impl Engine {
         );
     }
 
-    fn on_neigh(&mut self, ifindex: u32, ip: IpAddr, entry: Option<crate::table::MirrorEntry>) {
+    fn on_neigh(&mut self, ifindex: u32, ip: IpAddr, entry: Option<MirrorEntry>) {
         let Some(bi) = self.bridges.iter().position(|b| b.ifindex == Some(ifindex)) else {
             return;
         };
@@ -972,12 +1155,7 @@ impl Engine {
                 let b = &mut self.bridges[bi];
                 if let Some(p) = b.in_flight.remove(&ip) {
                     match e.mac {
-                        Some(m) if m == p.mac => match p.origin {
-                            Origin::Seed => b.counters.seed(SeedOutcome::Confirmed),
-                            Origin::Learn | Origin::Derived => {
-                                b.counters.install(InstallOutcome::Confirmed)
-                            }
-                        },
+                        Some(m) if m == p.mac => b.confirmed(p.origin),
                         Some(_) => b.counters.install(InstallOutcome::Overridden),
                         // An echo without a link-layer address: not ours;
                         // keep waiting for the real one.
@@ -1410,6 +1588,17 @@ impl Engine {
     // --- housekeeping ----------------------------------------------------
 
     async fn housekeeping(&mut self) {
+        // First, so an install whose echo was lost is confirmed from the
+        // re-read before the expiry below calls it unconfirmed.
+        if self.resync.due(Instant::now()) {
+            self.resync.start(Instant::now());
+            let result = self.resync().await;
+            match &result {
+                Ok(()) => info!("netlink re-read complete; kernel mirror current"),
+                Err(e) => warn!(error = %e, "netlink re-read failed; retrying"),
+            }
+            self.resync.finish(result);
+        }
         let now = Instant::now();
         self.ticks += 1;
         for bi in 0..self.bridges.len() {
@@ -1448,7 +1637,7 @@ impl Engine {
             .iter()
             .any(|b| b.up && b.capture.is_some() && !b.promisc_confirmed)
         {
-            if let Ok(links) = netlink::dump_links(&self.unicast).await {
+            if let Ok(links) = self.dump_links().await {
                 for l in links {
                     if let Some(b) = self
                         .bridges
@@ -1609,7 +1798,12 @@ impl Engine {
             .collect();
         rs.sort_by_key(|r| r.rs);
         if let Ok(mut s) = self.snapshot.write() {
-            *s = Snapshot { bridges, gate, rs };
+            *s = Snapshot {
+                bridges,
+                gate,
+                rs,
+                netlink: self.resync.snapshot(),
+            };
         }
     }
 
@@ -1677,18 +1871,42 @@ async fn run_pump(
         .await;
 }
 
+/// One write per job on the installer's own connection. A refused write
+/// is reported as failed. A write that went unanswered is NOT: it may
+/// have landed with only its ACK lost, so it stays in flight and its
+/// echo, or the confirmation window, decides — and the connection behind
+/// it has been replaced, so the next job does not queue behind a reply
+/// that will never come.
 async fn installer(
-    handle: Handle,
+    mut requests: Requests,
     mut rx: mpsc::Receiver<InstallJob>,
     ctl: mpsc::UnboundedSender<EngineMsg>,
 ) {
     while let Some(job) = rx.recv().await {
-        if let Err(e) = netlink::install_stale(&handle, job.ifindex, job.ip, job.mac).await {
-            let _ = ctl.send(EngineMsg::InstallFailed {
-                bridge_idx: job.bridge_idx,
-                ip: job.ip,
-                error: e,
-            });
+        let InstallJob {
+            bridge_idx,
+            ifindex,
+            ip,
+            mac,
+            ..
+        } = job;
+        let result = requests
+            .run("neighbour install", REQUEST_TIMEOUT, |h| async move {
+                netlink::install_stale(&h, ifindex, ip, mac).await
+            })
+            .await;
+        match result {
+            Ok(()) => {}
+            Err(RequestError::Failed(error)) => {
+                let _ = ctl.send(EngineMsg::InstallFailed {
+                    bridge_idx,
+                    ip,
+                    error,
+                });
+            }
+            Err(RequestError::TimedOut(e)) => {
+                warn!(%ip, error = %e, "neighbour install unanswered; its echo decides");
+            }
         }
     }
 }
@@ -1716,11 +1934,8 @@ async fn coverage_task(
     // Strict check is what makes the RTA_OIF filter real. Without it
     // the dump is the whole table, so refuse to sample rather than
     // dump a million routes every tick.
-    let strict = match netlink::new_strict_connection() {
-        Ok((conn, handle, _)) => {
-            tokio::spawn(conn);
-            Ok(handle)
-        }
+    let mut strict = match Requests::new_strict() {
+        Ok(requests) => Ok(requests),
         Err(e) => {
             warn!(error = %e, "strict-check netlink unavailable; route coverage disabled");
             Err(format!("strict-check netlink unavailable: {e}"))
@@ -1739,8 +1954,15 @@ async fn coverage_task(
             }
         }
         for (bi, ifindex) in p.bridges {
-            let result = match &strict {
-                Ok(h) => coverage::sample(h, ifindex).await,
+            let result = match &mut strict {
+                Ok(requests) => requests
+                    .run(
+                        "route coverage sample",
+                        COVERAGE_SAMPLE_TIMEOUT,
+                        |h| async move { coverage::sample(&h, ifindex).await },
+                    )
+                    .await
+                    .map_err(String::from),
                 Err(e) => Err(e.clone()),
             };
             if ctl

@@ -140,6 +140,17 @@ All labelled `module="neigh-snoop",iface="<bridge>"`:
   `route_nexthops{state}` (absent until the first sample),
   `nexthop_objects`, `coverage_dump_ms`, `coverage_age_seconds`.
 
+Engine-wide, labelled `module="neigh-snoop"` only (one netlink
+subscription feeds every bridge):
+
+- `netlink_overruns_total` — times the kernel reported link, neighbour
+  or address notifications lost to a full receive buffer. One report
+  stands for any number of lost messages.
+- `netlink_resyncs_total{outcome=ok|failed}` — re-reads of links,
+  addresses and neighbours after an overrun.
+- `netlink_resync_pending` — 1 while lost notifications are owed a
+  re-read; the neighbour mirror may be stale until it clears.
+
 Attribution notes:
 
 - **`confirmed`, not `requested`, is the install count.** Requested is
@@ -242,6 +253,11 @@ session has never been up from their side).
   and must trend to zero; `ip neigh show dev <br>` must show no
   `INCOMPLETE` or `FAILED` next-hop of an installed route after a few
   minutes.
+- **T8 lost notifications.** During T5 (or any port bounce), if
+  `netlink_overruns_total` moves, `netlink_resyncs_total{outcome="ok"}`
+  must follow within seconds and the `netlink` row must clear; then
+  `participant_addresses{state="resolved"}` must agree with what
+  `ip neigh show dev <br>` holds for learned addresses.
 
 ## Triage by symptom
 
@@ -281,6 +297,24 @@ session has never been up from their side).
   bgpd, not a coverage problem. `FRR says: Inbound soft reconfiguration
   not enabled` means the IX session lacks `soft-reconfiguration
   inbound`.
+- **`netlink` row Degraded "netlink notifications lost (N overruns)"**:
+  the kernel dropped link/neighbour/address notifications on the
+  engine's subscription — a port bounce flushing a peering LAN's
+  neighbours in one burst does it. Until the re-read that follows
+  (paced to one every 5 s), the neighbour mirror can hold flushed
+  entries as resolved: coverage reads too high, the gate keeps them as
+  participants, and a re-seed skips them. The re-read replaces the
+  mirror's rows and re-seeds a bridge whose neighbours vanished or
+  changed unheard (`seed_total{outcome="requested"}` moves), since a
+  bounce whose down and up were both lost leaves no other trigger. The
+  row clears on its own when the re-read lands; "the last re-read
+  failed" names the dump that did not answer, and it is retried.
+  `netlink_overruns_total` climbing steadily outside such events means
+  the engine cannot keep up at all.
+- **`install_total{outcome="unconfirmed"}` with a WARN
+  `neighbour install unanswered`**: the kernel never answered the write
+  (30 s); it may still have landed, so it is counted only by whether
+  its echo arrives. The installer moves to a fresh connection.
 - **`evictions` non-zero**: raise `table-max`.
 - **Persisted table ignored at start ("file is for bridge …")**: a
   JSON file was copied between bridges; delete it.
@@ -399,6 +433,14 @@ reaches new hosts, alongside `vppctl show errors | grep -i glean`.
   refreshes produces one write per window.
 - Installs are paced round-robin across bridges, so a boot-time seed on
   one bridge cannot starve live learns on another.
+- Netlink: one multicast subscription (link, neighbour, IPv4 and IPv6
+  address groups, with a 4 MiB receive buffer) feeds the engine; the
+  engine's dumps, the installer's writes and the coverage sampler's
+  dumps each go on a unicast connection of their own. Every request is
+  bounded (30 s; a coverage sample 120 s), and a connection whose
+  request went unanswered is replaced, because netlink-proto would
+  otherwise wait on that reply forever and the kernel refuses a new
+  dump on a socket with one still running.
 - For IPv4 the kernel itself updates an *existing* neighbour entry from
   any ARP packet whose sender it already knows (one-second lock time),
   even a third-party request. The snooper's never-override rule
