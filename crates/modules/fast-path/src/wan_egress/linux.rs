@@ -20,8 +20,10 @@ use tracing::{info, warn};
 
 use super::{
     desired_rules, diff, plan_layout, removal_stage, Condition, Layout, ObservedRule, OwnedRule,
-    PlanError, RepairLimiter, RuleAction, Status, WanEgressSpec, MAIN_TABLE, RECONCILE_INTERVAL,
+    PlanError, RepairLimiter, RuleAction, Status, WanEgressSpec, LOCAL_TABLE, MAIN_TABLE,
+    RECONCILE_INTERVAL,
 };
+use crate::netlink_bounds::NETLINK_EXCHANGE_TIMEOUT;
 use crate::{MODULE_NAME, PACKETFRAME_RT_PROTOCOL};
 
 /// How long after a rule event the pass runs. Folds a provisioning
@@ -37,6 +39,26 @@ pub enum WanEgressError {
     Request(#[from] rtnetlink::Error),
     #[error("removed {removed} rules, then stopped: {first}")]
     Incomplete { removed: usize, first: String },
+    #[error(
+        "no netlink reply within {}s; abandoned where it stood",
+        .0.as_secs()
+    )]
+    TimedOut(Duration),
+}
+
+/// A whole pass under [`NETLINK_EXCHANGE_TIMEOUT`]. A pass that never
+/// returns holds the pass lock for good: the periodic pass stops and a
+/// SIGHUP's reconcile waits on the lock forever. Abandoning one is safe
+/// for the reason stopping at a failed write is: writes go out one at a
+/// time in stage order, each awaited before the next, so a pass cut
+/// short leaves an ordered prefix of them (the one in flight landed or
+/// not), and the next pass, which starts from a fresh dump, does the rest.
+async fn bounded<T>(
+    pass: impl std::future::Future<Output = Result<T, WanEgressError>>,
+) -> Result<T, WanEgressError> {
+    tokio::time::timeout(NETLINK_EXCHANGE_TIMEOUT, pass)
+        .await
+        .unwrap_or(Err(WanEgressError::TimedOut(NETLINK_EXCHANGE_TIMEOUT)))
 }
 
 type StrictConnection =
@@ -135,7 +157,11 @@ fn message_for(rule: &OwnedRule) -> RuleMessage {
         m.attributes.push(RuleAttribute::Source(IpAddr::V4(p.addr)));
     }
     match rule {
-        OwnedRule::Anchor { .. } => m.header.action = NlAction::Nop,
+        OwnedRule::Anchor { .. } => {
+            m.header.action = NlAction::ToTable;
+            m.header.table = LOCAL_TABLE as u8;
+            m.attributes.push(RuleAttribute::Table(LOCAL_TABLE));
+        }
         OwnedRule::Keep { src, dst, .. } => {
             m.header.action = NlAction::ToTable;
             m.header.table = MAIN_TABLE as u8;
@@ -157,6 +183,7 @@ fn message_for(rule: &OwnedRule) -> RuleMessage {
 fn describe(r: &ObservedRule) -> String {
     match r.as_owned() {
         Some(o) => o.to_string(),
+        None if r.is_legacy_anchor() => format!("{}: from all nop (legacy anchor)", r.priority),
         None => format!("{}: {:?} (unrecognised owned rule)", r.priority, r.action),
     }
 }
@@ -229,8 +256,12 @@ impl PassReport {
 }
 
 /// One reconcile: dump, plan, diff, write the difference. A converged
-/// kernel gets a dump and nothing else.
+/// kernel gets a dump and nothing else. Bounded ([`bounded`]).
 pub async fn reconcile_once(spec: &WanEgressSpec) -> Result<PassReport, WanEgressError> {
+    bounded(reconcile_unbounded(spec)).await
+}
+
+async fn reconcile_unbounded(spec: &WanEgressSpec) -> Result<PassReport, WanEgressError> {
     let (conn, handle) = strict_connection()?;
     tokio::spawn(conn);
     let (raw, observed) = dump(&handle).await?;
@@ -324,8 +355,12 @@ async fn remove_staged(
 /// left pointing at nothing or live without its keep rules (a stage
 /// with a failure ends the removal; see [`remove_staged`]). Foreign
 /// rules are structurally out of reach: the delete echoes an owned
-/// rule, protocol and all.
+/// rule, protocol and all. Bounded ([`bounded`]).
 pub async fn remove_all_owned() -> Result<usize, WanEgressError> {
+    bounded(remove_all_owned_unbounded()).await
+}
+
+async fn remove_all_owned_unbounded() -> Result<usize, WanEgressError> {
     let (conn, handle) = strict_connection()?;
     tokio::spawn(conn);
     let (raw, observed) = dump(&handle).await?;
@@ -398,8 +433,12 @@ async fn retire_pass(shared: &Shared, memory: &mut PassMemory) -> Result<usize, 
             warn!(error = %e, "wan-egress: rule removal incomplete; retrying every pass");
         }
     }
+    // Retired is an observation (the removal finished): none remain. A
+    // removal that stopped leaves an unknown number.
+    let present = matches!(condition, Condition::Retired).then_some(0);
     *status = Status {
         condition,
+        present,
         last_converged: status.last_converged,
         ..Status::default()
     };
@@ -429,7 +468,11 @@ async fn run_pass(shared: &Shared) {
     };
     match reconcile_once(&spec).await {
         Err(e) => {
-            next.condition = Condition::Failing(format!("cannot read policy rules: {e}"));
+            next.condition = Condition::Failing(match e {
+                // Abandoned anywhere in the pass, the dump included.
+                WanEgressError::TimedOut(_) => e.to_string(),
+                _ => format!("cannot read policy rules: {e}"),
+            });
             next.desired = prev.desired;
             next.layout = prev.layout;
         }
@@ -441,7 +484,7 @@ async fn run_pass(shared: &Shared) {
                 info!(rule = %r, "wan-egress: rule removed");
             }
             next.desired = report.desired;
-            next.present = report.present;
+            next.present = Some(report.present);
             match report.layout {
                 Err(why) => next.condition = Condition::Refused(why),
                 Ok(layout) => {
@@ -479,7 +522,7 @@ async fn run_pass(shared: &Shared) {
     if next.condition != prev.condition {
         match &next.condition {
             Condition::Converged => info!(
-                rules = next.present,
+                rules = ?next.present,
                 layout = ?next.layout,
                 "wan-egress: policy rules in place"
             ),
@@ -532,6 +575,9 @@ async fn watch(shared: Arc<Shared>, token: CancellationToken) {
                     None => std::future::pending().await,
                 }
             } => match ev {
+                // Any message, the overrun marker for lost events
+                // included: what it said does not matter, because a pass
+                // re-reads every rule.
                 Some(_) => {
                     due.get_or_insert_with(|| tokio::time::Instant::now() + EVENT_DEBOUNCE);
                 }
@@ -704,6 +750,52 @@ mod tests {
             assert!(seen.owned, "{rule}: protocol tag lost");
             assert_eq!(seen.as_owned(), Some(rule));
         }
+    }
+
+    /// UniFi's udapi-server aborts at start on any rule with neither a
+    /// table nor a goto, so nothing we write may be one.
+    #[test]
+    fn every_written_rule_names_a_table_or_a_goto() {
+        for rule in [
+            OwnedRule::Anchor { priority: 32001 },
+            OwnedRule::Keep {
+                priority: 31998,
+                src: p("198.18.0.0/24"),
+                dst: p("10.0.0.0/8"),
+            },
+            OwnedRule::Goto {
+                priority: 31999,
+                src: p("198.18.0.0/24"),
+                target: 32001,
+            },
+        ] {
+            let m = message_for(&rule);
+            let names_table = m.header.action == NlAction::ToTable
+                && m.attributes
+                    .iter()
+                    .any(|a| matches!(a, RuleAttribute::Table(t) if *t != 0));
+            let names_goto = m.header.action == NlAction::Goto
+                && m.attributes
+                    .iter()
+                    .any(|a| matches!(a, RuleAttribute::Goto(_)));
+            assert!(names_table || names_goto, "{rule}: {m:?}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_nop_anchor_observes_as_one() {
+        let mut m = RuleMessage::default();
+        m.header.family = AddressFamily::Inet;
+        m.header.action = NlAction::Nop;
+        m.attributes = vec![
+            RuleAttribute::Priority(32001),
+            RuleAttribute::Protocol(RouteProtocol::Other(PACKETFRAME_RT_PROTOCOL)),
+            RuleAttribute::SuppressPrefixLen(u32::MAX),
+        ];
+        let o = observe(&m).unwrap();
+        assert!(o.is_legacy_anchor(), "{o:?}");
+        assert_eq!(o.as_owned(), None, "replaced, not adopted");
+        assert_eq!(describe(&o), "32001: from all nop (legacy anchor)");
     }
 
     #[test]

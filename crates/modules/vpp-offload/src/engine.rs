@@ -70,13 +70,19 @@ use crate::vpp_api::{Transport, TransportError};
 /// that nexthop.
 pub const IP_NEIGHBOR_STATIC: u8 = 1;
 
-/// How long to wait for the handshake on a connect attempt.
+/// How long one connect attempt may take, end to end: the socket's
+/// connect and the handshake together (`Transport::connect` holds the
+/// whole call to it).
 ///
 /// Short on purpose: `api_ready` is polled from the supervision loop and
 /// a long blocking connect would stall the tick that also services the
 /// pidfd and the wedge ping. A timeout here just means the next tick
 /// tries again; the *overall* patience for a slow start is
 /// `API_STARTUP_BUDGET`, which is the loop's business, not this call's.
+///
+/// Inside the steady wedge budget, which is what keeps the published
+/// bound: a probe that has to reconnect first blocks no longer than one
+/// that does not.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Socket timeout for requests after the handshake: **exactly the
@@ -241,6 +247,33 @@ pub trait RouteSource {
     /// inherited a default and silently dropped work.
     fn requeue_via(&self, _nexthops: &[IpAddr]) {}
 
+    /// Drop every queued ROUTE delta, because a resync walk is about to
+    /// read the whole mirror and supersedes them.
+    ///
+    /// [`ConvergenceEngine::begin_resync`] calls this immediately before
+    /// its walk. Everything queued until then describes a state the walk
+    /// reads — an updated prefix holds its latest nexthops in the mirror —
+    /// or one the diff derives: a withdrawn prefix is absent from the
+    /// mirror, and the diff withdraws whatever the ledger knows and the
+    /// walk does not see. Left queued, those deltas came back through
+    /// `apply_changes` on the ticks after the diff and re-sent every
+    /// route the diff had just classified unchanged, as a replace, which
+    /// is the whole table when the mirror filled while a deferral held
+    /// the drain (a ledger seed, or a full reload): ~1.35M route ops VPP
+    /// already held, and a first-steer gate that waits for them (review
+    /// finding, PR #324).
+    ///
+    /// Deltas written AFTER this call stay queued, including those for
+    /// prefixes the walk reads after they change: the walk is not a
+    /// coherent snapshot, and a change landing behind its cursor is caught
+    /// only as a delta. Neighbour deltas are kept — a handful, and
+    /// `apply_neighbour` skips one VPP already holds.
+    ///
+    /// A default no-op, because only the live feed queues anything. The
+    /// delegating `Arc<RouteFeed>` forwards it explicitly and a test pins
+    /// that, as for [`Self::requeue_via`].
+    fn discard_route_deltas(&self) {}
+
     /// How many changes are queued but not yet handed over.
     ///
     /// Reported so a source that is filling faster than the engine drains
@@ -249,6 +282,36 @@ pub trait RouteSource {
     /// the static sources, which never queue anything.
     fn backlog(&self) -> u64 {
         0
+    }
+
+    /// [`Self::backlog`] split into ROUTE and NEIGHBOUR changes — a next
+    /// hop resolved, lost, or moved to another MAC or device — read as
+    /// ONE snapshot.
+    ///
+    /// Counted apart because a neighbour change is not churn-sized. A
+    /// route delta moves one prefix; a neighbour delta moves the
+    /// adjacency of every route through that next hop, and verify cannot
+    /// see a stale one (it checks that a probed route has paths on owned
+    /// interfaces, not where the adjacency points). The first-steer hold
+    /// therefore tolerates a little route churn at the source and no
+    /// neighbour work at all (`Runtime`'s caught-up test).
+    ///
+    /// One snapshot, because the feed takes neighbour reports on another
+    /// thread: read as two counts under two locks, a neighbour change
+    /// landing between the reads was counted in the total and not in the
+    /// neighbours, and so passed as an allowed route delta — a steer
+    /// admitted ahead of the adjacency it moved (review finding,
+    /// PR #333).
+    ///
+    /// Default: all of [`Self::backlog`] is route work, true of every
+    /// source that queues no neighbour changes. The live feed answers
+    /// under its one lock, and the delegating `Arc<RouteFeed>` forwards
+    /// it explicitly, as it must every defaulted method.
+    fn backlog_split(&self) -> SourceBacklog {
+        SourceBacklog {
+            routes: self.backlog(),
+            neighbours: 0,
+        }
     }
 
     /// How many routes the source currently holds.
@@ -297,6 +360,16 @@ pub type RouteChange = (IpPrefix, Option<Vec<IpAddr>>);
 /// One neighbour change: the nexthop, and its (egress device, MAC) —
 /// or `None` if it is no longer resolved.
 pub type NeighbourChange = (IpAddr, Option<(String, [u8; 6])>);
+
+/// What a route source still holds for VPP, by kind
+/// ([`RouteSource::backlog_split`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SourceBacklog {
+    /// Route changes: prefixes announced, changed or withdrawn.
+    pub routes: u64,
+    /// Neighbour changes: next hops resolved, lost or moved.
+    pub neighbours: u64,
+}
 
 /// What changed at the source since it was last asked.
 ///
@@ -420,11 +493,16 @@ impl Verdict {
     ///
     /// All of those ride `VerifyIncomplete`: reach `Ready`, keep the
     /// want, do NOT steer. Steering stays refused by the LIVE gates —
-    /// `steer_permitted` re-reads the authority verdict, the source
-    /// backlog and `blocks_first_steer` on every retry, none of which
-    /// consult this verdict's snapshot — so recovery is the retry loop
-    /// noticing conditions changed, not a verdict going stale in
-    /// either direction.
+    /// `steer_permitted` re-reads the authority verdict, how far VPP is
+    /// behind the mirror and `blocks_first_steer` on every retry, none of
+    /// which consult this verdict's failure reasons — so recovery is the
+    /// retry loop noticing conditions changed, not a verdict going stale
+    /// in either direction. What the retry does read off the verdict is
+    /// only what no live count can say: whether its probes found a
+    /// mismatch, and whether it was drawn from enough of the table now
+    /// installed to vouch for it (`verify::unvouched`). A verdict taken
+    /// before the feed landed fails the second, and is re-run
+    /// (`verify::ReverifySchedule`) before the first steer is admitted.
     ///
     /// A dark member that is IDLE — no installed route can egress it,
     /// which is the normal state of a dark port, since the BGP session
@@ -663,6 +741,12 @@ impl From<AttachError> for EngineError {
 pub struct ConvergenceEngine {
     api_socket: std::path::PathBuf,
     transport: Option<Transport>,
+    /// Time spent blocked on VPP's API socket by connections already
+    /// dropped, and by connect attempts. See [`Self::api_wait`].
+    api_waited: Duration,
+    /// Frames VPP sent on connections already dropped. See
+    /// [`Self::api_answers`].
+    api_answered: u64,
 
     ports: Vec<PortAttach>,
     /// Locally terminated prefixes VPP delivers itself: an attached
@@ -867,6 +951,18 @@ pub struct ConvergenceEngine {
 
     phase: Option<Phase>,
     last_verify: Option<VerifyOutcome>,
+    /// A verify of THIS ledger found VPP disagreeing with it, in either
+    /// family ([`VerifyOutcome::any_mismatch`]) — sticky until the ledger
+    /// is rebuilt from VPP or from scratch (`begin_resync`,
+    /// `discard_ledger`, `on_process_gone`).
+    ///
+    /// Not read off `last_verify`, which a re-run replaces: an IPv6-only
+    /// mismatch does not stop an outgrown IPv4 verdict being re-run, and
+    /// a fresh v6 sample can miss the prefix the last one caught — after
+    /// which the disproved ledger would be preserved and seeded again,
+    /// and the diff would skip exactly the route VPP has wrong (review
+    /// finding, PR #333). [`Self::ledger_disproved`].
+    disproved: bool,
     /// The most recent FRESH dead-member scan, from whenever the steer
     /// gate last ran one.
     ///
@@ -945,6 +1041,8 @@ impl ConvergenceEngine {
         Self {
             api_socket: api_socket.into(),
             transport: None,
+            api_waited: Duration::ZERO,
+            api_answered: 0,
             ports,
             local_routes: Vec::new(),
             attached_at: std::collections::HashMap::new(),
@@ -990,6 +1088,7 @@ impl ConvergenceEngine {
             api_incompatible: false,
             phase: None,
             last_verify: None,
+            disproved: false,
             last_dead_scan: None,
             #[cfg(test)]
             test_dead_members: None,
@@ -2430,6 +2529,35 @@ impl ConvergenceEngine {
         self.last_verify.as_ref()
     }
 
+    /// Whether any verify since the ledger was last rebuilt found VPP
+    /// disagreeing with it, in either family — what a stop must not
+    /// preserve (`Runtime::preserve`).
+    pub fn ledger_disproved(&self) -> bool {
+        self.disproved
+    }
+
+    /// For in-crate unit tests: record `outcome` as a verify pass would.
+    #[cfg(test)]
+    pub(crate) fn record_verdict_for_test(&mut self, outcome: VerifyOutcome) {
+        self.disproved |= outcome.any_mismatch();
+        self.last_verify = Some(outcome);
+    }
+
+    /// For in-crate unit tests of the steer gates, which have no VPP to
+    /// verify against: record a passing verdict over the ledger as it
+    /// stands NOW — the standard sample, or all of a smaller table — as a
+    /// clean verify of it would. A test that grows the ledger afterwards
+    /// has outgrown it, exactly as the real thing would.
+    #[cfg(test)]
+    pub(crate) fn verified_for_test(&mut self) {
+        let table = self.ledger.counts().installed;
+        self.last_verify = Some(VerifyOutcome {
+            sampled: (table as usize).min(DEFAULT_SAMPLE),
+            table,
+            ..Default::default()
+        });
+    }
+
     pub fn is_connected(&self) -> bool {
         self.transport.is_some()
     }
@@ -2537,8 +2665,41 @@ impl ConvergenceEngine {
         if let Some(t) = self.transport.as_mut() {
             // A socket that will not take a timeout is not one to keep.
             if t.set_timeout(d).is_err() {
-                self.transport = None;
+                self.drop_transport();
             }
+        }
+    }
+
+    /// Wall time spent blocked on VPP's binary-API socket, ever: every
+    /// request and reply on every connection this engine has held, and
+    /// every connect attempt. Monotonic.
+    ///
+    /// The supervision loop subtracts it from the gap between two of its
+    /// passes to learn how long it was away for reasons of its OWN — a
+    /// kernel call waiting on `rtnl_lock`, a starved host — as opposed
+    /// to VPP keeping it waiting. Only the first kind excuses silence;
+    /// see `liveness::WedgeDetector::on_loop_gap`.
+    pub fn api_wait(&self) -> Duration {
+        self.api_waited
+            + self
+                .transport
+                .as_ref()
+                .map_or(Duration::ZERO, Transport::waited)
+    }
+
+    /// Frames VPP has answered with, ever, across every connection this
+    /// engine has held. Monotonic. The wedge detector counts any increase
+    /// as proof of life; see `Transport::answers`.
+    pub fn api_answers(&self) -> u64 {
+        self.api_answered + self.transport.as_ref().map_or(0, Transport::answers)
+    }
+
+    /// Drop the connection, keeping what it waited and answered on the
+    /// books.
+    fn drop_transport(&mut self) {
+        if let Some(t) = self.transport.take() {
+            self.api_waited += t.waited();
+            self.api_answered += t.answers();
         }
     }
 
@@ -2551,7 +2712,18 @@ impl ConvergenceEngine {
         if self.transport.is_some() {
             return true;
         }
-        match Transport::connect(&self.api_socket, HANDSHAKE_TIMEOUT) {
+        let started = std::time::Instant::now();
+        let connected = Transport::connect(&self.api_socket, HANDSHAKE_TIMEOUT);
+        // A connect is time spent waiting on VPP whatever its outcome: a
+        // backlog VPP is not accepting from, a handshake it does not
+        // answer. ALL of it is charged, up to the connect's own deadline,
+        // which bounds the whole call (`Transport::connect`). Charging
+        // less is the dangerous direction: the rest would read as the
+        // loop's own stall and could excuse the very silence a hung VPP
+        // is showing (review finding, PR #322). Past the deadline is only
+        // this thread not being scheduled, the host's time.
+        self.api_waited += started.elapsed().min(HANDSHAKE_TIMEOUT);
+        match connected {
             Ok(mut t) => {
                 // Re-arm off the handshake value. It is deliberately short
                 // so a failed connect costs the loop one tick, but
@@ -2603,7 +2775,7 @@ impl ConvergenceEngine {
     /// may be desynchronised — a half-read reply would corrupt every
     /// subsequent context match.
     pub fn disconnect(&mut self) {
-        self.transport = None;
+        self.drop_transport();
     }
 
     fn transport(&mut self) -> Result<&mut Transport, EngineError> {
@@ -3733,6 +3905,9 @@ impl ConvergenceEngine {
 
     pub fn begin_resync(&mut self, src: &dyn RouteSource) -> ResyncPlan {
         self.phase = Some(Phase::Resync);
+        // The ledger is rebuilt from here, so no verify has disproved the
+        // one it becomes (`disproved`).
+        self.disproved = false;
 
         // Rebuild, not merge. An insert-only refresh leaves a nexthop the
         // source has stopped reporting mapped to its last known device,
@@ -3783,6 +3958,10 @@ impl ConvergenceEngine {
         self.fib_match_spent = Duration::ZERO;
         self.fib_match_halted = None;
         let families = self.drainer.families();
+        // Immediately before the walk, never earlier: what is queued now
+        // is what the walk supersedes, and anything written from here on
+        // stays a delta. See `RouteSource::discard_route_deltas`.
+        src.discard_route_deltas();
         src.for_each_route(&mut |prefix, nexthops| {
             // A family VPP does not carry never enters the diff — the
             // route-side twin of the neighbour filter
@@ -4018,6 +4197,7 @@ impl ConvergenceEngine {
                 if let Some(v6) = outcome.v6.as_mut() {
                     v6.unresolvable_named = self.unresolvable_named(true);
                 }
+                self.disproved |= outcome.any_mismatch();
                 self.last_verify = Some(outcome.clone());
                 // The pass dumped the interfaces too, and that is now the
                 // newest link observation: `latest_dead` prefers the cache,
@@ -4198,6 +4378,7 @@ impl ConvergenceEngine {
         self.ledger = RouteLedger::new(self.ledger_capacity());
         self.phase = None;
         self.last_verify = None;
+        self.disproved = false;
         self.last_dead_scan = None;
     }
 
@@ -4213,6 +4394,9 @@ impl ConvergenceEngine {
     /// Owed work in the pending map stays owed.
     pub fn discard_ledger(&mut self) {
         self.ledger = RouteLedger::new(self.ledger_capacity());
+        // What the dump reads in is VPP's own FIB, which no verify of the
+        // discarded ledger says anything about (`disproved`).
+        self.disproved = false;
     }
 
     /// Seed an EMPTY ledger from a preserved record: every entry
@@ -4539,6 +4723,48 @@ mod tests {
         }
     }
 
+    /// A ledger a verify disproved — in either family — stays disproved
+    /// whatever verdict replaces that one, until the ledger is rebuilt:
+    /// a resync, a discard ahead of the dump, or a VPP gone (review
+    /// finding, PR #333). Cleared by
+    /// neither, a process that had once seen a mismatch would never
+    /// preserve a ledger again, and every restart would pay for the dump.
+    #[test]
+    fn a_disproved_ledger_stays_disproved_until_it_is_rebuilt() {
+        use crate::verify::{FamilyVerify, Mismatch, VerifyOutcome};
+        let mismatch = VerifyOutcome {
+            v6: Some(FamilyVerify {
+                mismatches: vec![Mismatch::NoPaths {
+                    prefix: IpPrefix::V6 {
+                        addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        prefix_len: 32,
+                    },
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut e = engine();
+        assert!(!e.ledger_disproved());
+        e.record_verdict_for_test(mismatch.clone());
+        e.record_verdict_for_test(VerifyOutcome::default());
+        assert!(
+            e.ledger_disproved(),
+            "a clean verdict after it is no rebuild"
+        );
+        e.begin_resync(&mirror(5));
+        assert!(!e.ledger_disproved(), "a resync rebuilds the ledger");
+        e.record_verdict_for_test(mismatch.clone());
+        e.discard_ledger();
+        assert!(
+            !e.ledger_disproved(),
+            "a discarded ledger is read from VPP again"
+        );
+        e.record_verdict_for_test(mismatch);
+        e.on_process_gone();
+        assert!(!e.ledger_disproved(), "and so is a VPP that is gone");
+    }
+
     #[test]
     fn a_resync_queues_every_route_from_the_source() {
         let mut e = engine();
@@ -4703,6 +4929,7 @@ mod tests {
         );
         e.last_verify = Some(crate::verify::VerifyOutcome {
             sampled: 4,
+            table: 4,
             mismatches: vec![],
             unresolvable: 0,
             unresolvable_named: vec![],
@@ -4852,6 +5079,15 @@ mod tests {
             e.recorded_indices.is_empty(),
             "recorded indices belong to the dead instance"
         );
+    }
+
+    /// `HANDSHAKE_TIMEOUT` bounds a whole connect, and a probe that has
+    /// to reconnect first must block no longer than a ping, or the
+    /// published bound stretches by the difference on every reconnecting
+    /// probe.
+    #[test]
+    fn a_reconnect_fits_inside_the_steady_wedge_budget() {
+        assert!(HANDSHAKE_TIMEOUT <= crate::liveness::PING_BUDGET);
     }
 
     /// The socket deadline must equal the budget in force — not the

@@ -765,6 +765,14 @@ pub struct ActiveState {
     /// the SIGHUP reconcile. `detach` removes its rules; a drop (the
     /// preserve-attach exit) leaves them for the next start to adopt.
     pub wan_egress: Option<crate::wan_egress::WanEgress>,
+    /// The `route-ledger` directive in force. Refreshed by every SIGHUP
+    /// reconcile, because its write half runs at the preserving stop and
+    /// should honour the config in force then; its read half ran at this
+    /// start, from the config this start read.
+    pub route_ledger: packetframe_common::config::RouteLedgerSpec,
+    /// What this start did with the route ledger, and the seed's
+    /// progress since — shared with the control plane that applies it.
+    pub ledger_status: crate::fib::route_ledger::SharedLedgerStatus,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
@@ -841,6 +849,8 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         ));
     }
 
+    crate::vrrp::check_attach_set(cfg)?;
+
     // Refuse startup when pins from a prior invocation survive.
     // SPEC.md §8.5 "exit without detach" leaves pins in bpffs after
     // SIGTERM; they are not adopted, so the operator must run
@@ -888,7 +898,203 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         route_source_spec: route_source_spec_from_cfg(cfg),
         coalesce: coalesce_spec_from_cfg(cfg),
         wan_egress: None,
+        route_ledger: route_ledger_spec_from_cfg(cfg),
+        ledger_status: crate::fib::route_ledger::shared_status(),
     })
+}
+
+/// The `route-ledger` directive; absent ⇒ on, 30 minutes.
+pub(crate) fn route_ledger_spec_from_cfg(
+    cfg: &ModuleConfig<'_>,
+) -> packetframe_common::config::RouteLedgerSpec {
+    cfg.section
+        .directives
+        .iter()
+        .find_map(|d| match d {
+            ModuleDirective::RouteLedger { spec, .. } => Some(*spec),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The start's half of the route ledger: consume whatever `state-dir`
+/// holds, judge it against this config, say what happened (journal,
+/// event log, status), and hand back the seed if there is one.
+///
+/// Runs in every forwarding mode, so a start that will not use a ledger
+/// still consumes one: a kernel-fib run must not leave a table that goes
+/// stale under it for a later packetframe-fib start to find.
+fn take_route_ledger(
+    state: &ActiveState,
+    cfg: &ModuleConfig<'_>,
+) -> Option<crate::fib::route_ledger::RouteLedger> {
+    use crate::fib::route_ledger::{consume, Consumed, Expectations, StartReport};
+    use packetframe_common::events::{kind, Event};
+
+    let spec = state.route_ledger;
+    let forwarding_mode = forwarding_mode_from_cfg(cfg);
+    let identity = state
+        .route_source_spec
+        .as_ref()
+        .map(|s| s.ledger_identity());
+    // A BGP listener files every route under one peer id; a record
+    // naming any other cannot be reconciled by it.
+    let single_peer = match &state.route_source_spec {
+        Some(packetframe_common::config::RouteSourceSpec::Bgp {
+            addr,
+            port,
+            peer_as,
+            ..
+        }) => format!("{addr}:{port}")
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|listen| crate::fib::route_source_bgp::session_peer_id(listen, *peer_as)),
+        _ => None,
+    };
+    let exp = Expectations {
+        spec,
+        forwarding_mode,
+        identity: identity.as_deref(),
+        single_peer,
+        now_unix: crate::fib::route_ledger::now_unix(),
+    };
+    let outcome = consume(&state.state_dir, &exp);
+    let mut status = state.ledger_status.lock().expect("ledger status lock");
+    match outcome {
+        Consumed::Quiet => {
+            debug!("no route ledger to consider (route-ledger off, or not packetframe-fib)");
+            status.start = if spec.enabled {
+                // Compare mode runs the control plane, so the row shows;
+                // say why it never seeds rather than "not checked".
+                StartReport::Refused {
+                    code: "forwarding-mode",
+                    detail: crate::fib::route_ledger::Refusal::ForwardingMode(forwarding_mode)
+                        .describe(),
+                }
+            } else {
+                StartReport::Off
+            };
+            None
+        }
+        Consumed::Refused(r) => {
+            let detail = r.describe();
+            if r.is_warning() {
+                warn!(reason = r.code(), detail = %detail, "route ledger not used; the route mirror loads cold from the route source");
+            } else {
+                info!(reason = r.code(), detail = %detail, "route ledger not used; the route mirror loads cold from the route source");
+            }
+            let ev = if r.is_warning() {
+                Event::warn(MODULE_NAME, kind::ROUTE_LEDGER_REFUSED)
+            } else {
+                Event::info(MODULE_NAME, kind::ROUTE_LEDGER_REFUSED)
+            };
+            ev.field("reason", r.code()).detail(detail.clone()).emit();
+            status.start = if matches!(r, crate::fib::route_ledger::Refusal::Disabled) {
+                StartReport::Off
+            } else {
+                StartReport::Refused {
+                    code: r.code(),
+                    detail,
+                }
+            };
+            None
+        }
+        Consumed::Seed(ledger) => {
+            let age = exp.now_unix.saturating_sub(ledger.meta.written_at_unix);
+            info!(
+                prefixes_v4 = ledger.counts.v4.prefixes,
+                prefixes_v6 = ledger.counts.v6.prefixes,
+                advertisements = ledger.counts.advertisements(),
+                written_ago_secs = age,
+                writer_version = %ledger.meta.writer_version,
+                bytes = ledger.encoded_len(),
+                "route ledger accepted (consumed: the file is gone); seeding the route mirror \
+                 before the route source connects"
+            );
+            status.start = StartReport::Seeded;
+            // Present from here, so a completeness check that lands while
+            // the seed is still going in sees one and does not attest it.
+            status.seed = Some(crate::fib::route_ledger::SeedReport {
+                writer_version: ledger.meta.writer_version.clone(),
+                written_at_unix: ledger.meta.written_at_unix,
+                confirmed_at_unix: ledger.meta.confirmed_at_unix,
+                counts: ledger.counts,
+                applied_at: None,
+                apply_took: None,
+                failed: 0,
+                unconfirmed: ledger.counts.advertisements(),
+                stream_started_at: None,
+                reconciled: None,
+            });
+            Some(ledger)
+        }
+    }
+}
+
+/// The preserving stop's half of the route ledger: snapshot the mirror
+/// into `state-dir` for the next start, when the directive and the mode
+/// call for one. Bounded by the route ledger's own budget; never fails
+/// the exit.
+pub fn exit_preserving(state: &ActiveState) {
+    use packetframe_common::events::{kind, Event};
+
+    let Some(ctrl) = state.route_controller.as_ref() else {
+        return;
+    };
+    if !state.route_ledger.enabled {
+        info!("route ledger not preserved: `route-ledger off`");
+        return;
+    }
+    if state.route_source_spec.is_none() {
+        info!("route ledger not preserved: no `route-source`, so no start could match one");
+        return;
+    }
+    match ctrl.preserve_route_ledger(&state.state_dir) {
+        crate::fib::controller::Preserved::Written {
+            counts,
+            bytes,
+            confirmed_at_unix,
+            written_at_unix,
+            encode,
+            write,
+        } => {
+            let unconfirmed_secs = written_at_unix.saturating_sub(confirmed_at_unix);
+            info!(
+                prefixes_v4 = counts.v4.prefixes,
+                prefixes_v6 = counts.v6.prefixes,
+                advertisements = counts.advertisements(),
+                bytes,
+                encode_ms = encode.as_millis() as u64,
+                write_ms = write.as_millis() as u64,
+                unconfirmed_for_secs = unconfirmed_secs,
+                "preserved the route mirror as the route ledger: the next start seeds from it \
+                 instead of waiting for the route source's full replay"
+            );
+            let mut ev = Event::info(MODULE_NAME, kind::ROUTE_LEDGER_PRESERVED)
+                .field("preserved", true)
+                .field("routes_v4", u64::from(counts.v4.prefixes))
+                .field("routes_v6", u64::from(counts.v6.prefixes))
+                .field("advertisements", counts.advertisements())
+                .field("bytes", bytes as u64)
+                .field("encode_ms", encode.as_millis() as u64)
+                .field("write_ms", write.as_millis() as u64);
+            if unconfirmed_secs > 0 {
+                ev = ev.field("unconfirmed_for_secs", unconfirmed_secs);
+            }
+            ev.emit();
+        }
+        crate::fib::controller::Preserved::NotWritten(reason) => {
+            warn!(
+                reason = %reason,
+                "the route mirror was not preserved; the next start loads it cold from the \
+                 route source"
+            );
+            Event::warn(MODULE_NAME, kind::ROUTE_LEDGER_PRESERVED)
+                .field("preserved", false)
+                .field("reason", reason)
+                .emit();
+        }
+    }
 }
 
 /// The `coalesce` directive, if any (the parser refuses a second one).
@@ -951,24 +1157,13 @@ fn anyip_addr_from_cfg(cfg: &ModuleConfig<'_>) -> Option<std::net::Ipv4Addr> {
 /// in the state dir beside the pid file; flock is per-open-file, so
 /// dropping the returned handle releases it on every exit path.
 fn acquire_anyip_lock(state_dir: &Path) -> ModuleResult<std::fs::File> {
-    std::fs::create_dir_all(state_dir).map_err(|e| {
+    let path = state_dir.join(ANYIP_LOCK_NAME);
+    let f = open_anyip_lock(state_dir).map_err(|e| {
         ModuleError::other(
             MODULE_NAME,
-            format!("anyip lock: create {}: {e}", state_dir.display()),
+            format!("anyip lock: open {}: {e}", path.display()),
         )
     })?;
-    let path = state_dir.join("anyip.lock");
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(|e| {
-            ModuleError::other(
-                MODULE_NAME,
-                format!("anyip lock: open {}: {e}", path.display()),
-            )
-        })?;
     // SAFETY: valid fd from the just-opened File; flock has no other
     // preconditions.
     let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), libc::LOCK_EX) };
@@ -980,6 +1175,47 @@ fn acquire_anyip_lock(state_dir: &Path) -> ModuleResult<std::fs::File> {
                 path.display(),
                 std::io::Error::last_os_error()
             ),
+        ));
+    }
+    Ok(f)
+}
+
+const ANYIP_LOCK_NAME: &str = "anyip.lock";
+
+/// Open `anyip.lock`, creating it 0600 when missing, relative to the
+/// same no-follow walk of `state_dir` the module's records are written
+/// through. This root daemon runs it, and `state-dir` may be writable by
+/// someone who is not. By pathname, `create_dir_all` and the open
+/// followed a symlink at any component, and at the name itself, so a
+/// planted link chose where root created a file and which file it
+/// locked, and the umask chose the modes of the directories it made.
+/// The walk makes those 0755, so this can be the first writer to make
+/// `state-dir` without leaving it group-writable for vpp-offload's
+/// state-file reader to refuse.
+///
+/// Opened `O_NONBLOCK` and kept only if it is a regular file, so a FIFO
+/// at the name is refused rather than waited on. `flock` blocks on
+/// `LOCK_EX` regardless of `O_NONBLOCK`, so the lock still waits for its
+/// holder. Read-only, because `flock` needs no write access.
+fn open_anyip_lock(state_dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let dir = packetframe_common::statefile::create_and_open_dir_no_follow(state_dir)?;
+    let name = std::ffi::CString::new(ANYIP_LOCK_NAME).expect("no NUL in the lock name");
+    let flags =
+        libc::O_CREAT | libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    // SAFETY: `dir` is an open directory descriptor and `name` a
+    // NUL-terminated string, both alive across the call.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600 as libc::c_uint) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by openat and is owned by nothing
+    // else.
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file; remove it",
         ));
     }
     Ok(f)
@@ -1888,12 +2124,21 @@ pub fn attach(
         xdp_ports(state),
     ) {
         Ok(w) => state.redirect_watch = Some(w),
-        Err(e) => warn!(
-            error = %e,
-            "redirect-target watcher thread could not be spawned; REDIRECT_DEVMAP refreshes \
-             only on SIGHUP"
-        ),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "redirect-target watcher thread could not be spawned; REDIRECT_DEVMAP refreshes \
+                 only on SIGHUP"
+            );
+            state.redirect_watch = Some(crate::redirect_watch::RedirectTargetWatcher::not_started(
+                format!("thread could not be spawned: {e}"),
+            ));
+        }
     }
+
+    // The route ledger a clean stop left, consumed in every mode (see
+    // `take_route_ledger`) and seeded only under packetframe-fib.
+    let ledger_seed = take_route_ledger(state, cfg);
 
     // Start Option F's RouteController if the operator asked for the
     // PacketFrame FIB path. Uses `MapData::from_pin` internally, so it
@@ -2084,6 +2329,14 @@ pub fn attach(
             crate::fib::controller::SecondTierSignals {
                 completeness,
                 feed_session,
+            },
+            crate::fib::controller::LedgerWiring {
+                seed: ledger_seed,
+                status: state.ledger_status.clone(),
+                identity: state
+                    .route_source_spec
+                    .as_ref()
+                    .map(|s| s.ledger_identity()),
             },
         )
         .map_err(|e| {
@@ -3490,6 +3743,29 @@ pub fn integrity_posture(state: &ActiveState) -> Option<crate::fib::integrity::I
     state.route_controller.as_ref()?.integrity_posture()
 }
 
+/// The route ledger's status, for the health and metrics surfaces.
+/// `None` in kernel-fib mode: no mirror, so no ledger to report on (a
+/// ledger such a start found was refused by name in the journal and the
+/// event log, which is where that belongs).
+pub fn route_ledger_status(state: &ActiveState) -> Option<crate::fib::route_ledger::LedgerStatus> {
+    state.route_controller.as_ref()?;
+    Some(
+        state
+            .ledger_status
+            .lock()
+            .expect("ledger status lock")
+            .clone(),
+    )
+}
+
+/// The neighbour resolver's status, for the health and metrics surfaces.
+/// `None` in kernel-fib mode, where no resolver runs.
+pub fn neigh_resolver_status(
+    state: &ActiveState,
+) -> Option<crate::fib::neigh_supervision::ResolverStatus> {
+    Some(state.route_controller.as_ref()?.neigh_resolver_status())
+}
+
 // Read current stats, aggregated across all CPUs.
 pub fn snapshot_stats(state: &ActiveState) -> ModuleResult<Vec<u64>> {
     use aya::maps::PerCpuArray;
@@ -4080,6 +4356,8 @@ mod tests {
             route_source_spec: None,
             coalesce: None,
             wan_egress: None,
+            route_ledger: packetframe_common::config::RouteLedgerSpec::default(),
+            ledger_status: crate::fib::route_ledger::shared_status(),
         };
 
         let bridge_idx = if_nametoindex(BRIDGE).unwrap();
@@ -4220,5 +4498,208 @@ mod tests {
         // ...but a single readable family that alone exceeds the pool
         // still warns.
         assert!(gc_thresh3_capacity_warning(Some(65536), None, 8192).is_some());
+    }
+}
+
+/// The writers through which fast-path can be first to make `state-dir`,
+/// in attach order: the anyip lock, `tc-links.json`, and (in the loader,
+/// after attach) the pin registry.
+#[cfg(test)]
+mod state_dir_tests {
+    use super::{acquire_anyip_lock, ANYIP_LOCK_NAME};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pf-fp-state-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // Closed to group and others whatever the harness's umask, so
+        // what the writers make under it is judged on its own modes.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        d
+    }
+
+    /// A symlink at the lock's name, or at any component of `state-dir`,
+    /// fails the lock before anything is created where it points. By
+    /// pathname, the open created the link's target and locked it, and
+    /// `create_dir_all` followed an intermediate link.
+    #[test]
+    fn the_anyip_lock_refuses_a_symlink_anywhere_in_its_path() {
+        let base = scratch("lock-link");
+        let state = base.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let target = base.join("created-through-the-link");
+        std::os::unix::fs::symlink(&target, state.join(ANYIP_LOCK_NAME)).unwrap();
+        let err = acquire_anyip_lock(&state).expect_err("locked through the link");
+        assert!(err.to_string().contains(ANYIP_LOCK_NAME), "{err}");
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "the lock was created through the link"
+        );
+
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        for state_dir in [link.join("state"), link.join("a").join("b"), link.clone()] {
+            let err = acquire_anyip_lock(&state_dir).expect_err("locked through the link");
+            assert!(
+                err.to_string().contains("a symlink here is refused"),
+                "{}: {err}",
+                state_dir.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&real).unwrap().count(),
+            0,
+            "something was made through the link"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A FIFO at the lock's name is refused, not waited on. By pathname
+    /// the write open blocked until something opened the FIFO to read,
+    /// so whoever could plant one stopped every start at attach.
+    #[test]
+    fn the_anyip_lock_refuses_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let base = scratch("lock-fifo");
+        let fifo =
+            std::ffi::CString::new(base.join(ANYIP_LOCK_NAME).as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = mpsc::channel();
+        let dir = base.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(acquire_anyip_lock(&dir).map(drop));
+        });
+        let err = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the lock's open blocked on the FIFO")
+            .expect_err("a FIFO was taken as the lock");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The non-blocking open leaves the lock blocking: a second start
+    /// waits until the holder lets go, and the file is made 0600.
+    #[test]
+    fn the_anyip_lock_waits_for_its_holder() {
+        let base = scratch("lock-wait");
+        let held = acquire_anyip_lock(&base).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let dir = base.clone();
+        let waiter = std::thread::spawn(move || {
+            let _ = tx.send(acquire_anyip_lock(&dir).map(drop));
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the lock was taken, or refused, while held"
+        );
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("never taken after the holder let go")
+            .unwrap();
+        waiter.join().unwrap();
+        let mode = std::fs::metadata(base.join(ANYIP_LOCK_NAME))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o600);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Where the umask child creates; set only in the child's environment.
+    const UMASK_CHILD_BASE: &str = "PF_TEST_FP_UMASK_CHILD_BASE";
+
+    const UMASK_WRITERS: [&str; 3] = ["anyip-lock", "tc-links", "registry"];
+
+    fn umask_state_dir(base: &Path, writer: &str) -> PathBuf {
+        base.join(writer).join("a").join("b").join("state")
+    }
+
+    /// Each first creator makes a missing multi-level `state-dir`
+    /// closed to group and others under a 002 umask, so vpp-offload's
+    /// state-file reader, attaching after fast-path, takes the directory
+    /// as holding no state file rather than refusing it. Modules attach
+    /// in config order and the loader writes its own records (pid file,
+    /// identity) only after the last one, so fast-path's writers can be
+    /// the first to make `state-dir`; their `create_dir_all` made every
+    /// component 0775 under this umask.
+    ///
+    /// The umask is per process, and other tests here create directories
+    /// with default modes, so the writers run in a child: this test
+    /// binary re-run on [`umask_002_child_creates`] alone.
+    #[test]
+    fn a_missing_state_dir_is_made_closed_to_group_and_others_under_a_002_umask() {
+        use packetframe_common::statefile::read_owned_no_follow;
+        let base = scratch("umask");
+        let module = module_path!().split_once("::").unwrap().1;
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                &format!("{module}::umask_002_child_creates"),
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(UMASK_CHILD_BASE, &base)
+            .output()
+            .unwrap();
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{shown}");
+        assert!(
+            shown.contains("test result: ok. 1 passed;"),
+            "the child did not run its test: {shown}"
+        );
+
+        for writer in UMASK_WRITERS {
+            let state_dir = umask_state_dir(&base, writer);
+            let mut dir = base.clone();
+            for name in [writer, "a", "b", "state"] {
+                dir.push(name);
+                let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+                assert_eq!(mode & 0o022, 0, "{writer}: {} is {mode:04o}", dir.display());
+            }
+            let read = read_owned_no_follow(&state_dir.join("vpp-offload.json"), 1 << 20);
+            assert!(
+                matches!(read, Ok(None)),
+                "{writer}: the reader refused {}: {read:?}",
+                state_dir.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[ignore = "runs only as the child of a_missing_state_dir_is_made_closed_to_group_and_others_under_a_002_umask"]
+    fn umask_002_child_creates() {
+        let Some(base) = std::env::var_os(UMASK_CHILD_BASE) else {
+            return;
+        };
+        let base = PathBuf::from(base);
+        let prior = unsafe { libc::umask(0o002) };
+        let lock = acquire_anyip_lock(&umask_state_dir(&base, "anyip-lock")).map(drop);
+        let tc = crate::tc_links::save(
+            &umask_state_dir(&base, "tc-links"),
+            &crate::tc_links::TcLinksFile { links: Vec::new() },
+        );
+        let registry = crate::registry::save(
+            &umask_state_dir(&base, "registry"),
+            &crate::registry::RegistryFile {
+                module: "fast-path".into(),
+                attachments: Vec::new(),
+            },
+        );
+        unsafe { libc::umask(prior) };
+        lock.unwrap();
+        tc.unwrap();
+        registry.unwrap();
     }
 }

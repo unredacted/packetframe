@@ -121,6 +121,10 @@ pub mod kind {
     pub const STEERING_DOWN: &str = "steering_down";
     pub const STEERING_RESTORED: &str = "steering_restored";
     pub const STEER_FAILED: &str = "steer_failed";
+    /// A steer that would divert more traffic onto VPP was held by the
+    /// first-steer hold — not attempted, nothing changed (`reason`,
+    /// `steered`).
+    pub const STEER_HELD: &str = "steer_held";
     pub const UNSTEER_FAILED: &str = "unsteer_failed";
     pub const VERIFY_PASSED: &str = "verify_passed";
     pub const VERIFY_FAILED: &str = "verify_failed";
@@ -134,11 +138,34 @@ pub mod kind {
     /// The set of named unresolvable routes changed (rate-limited at the
     /// source); `detail` "none" once it empties.
     pub const UNRESOLVABLE_ROUTES: &str = "unresolvable_routes";
+    /// A port's driver declined an RSS-action keep rule, so its keeps
+    /// deliver to PF queue 0 (`port`, `detail` the driver's answer). Once
+    /// per port per process.
+    pub const KEEP_QUEUE0_FALLBACK: &str = "keep_queue0_fallback";
+    /// A steered port's kernel path started or stopped dropping frames
+    /// (`port`, `drops_per_second`, `queue0_share`, `dropping`).
+    /// Rate-limited at the source.
+    pub const KERNEL_PATH_DROPPING: &str = "kernel_path_dropping";
 
     // --- fast-path ---
     /// `wan-egress` put back policy rules that had disappeared from the
     /// kernel under an unchanged config. Rate-limited at the source.
     pub const WAN_EGRESS_REPAIRED: &str = "wan_egress_repaired";
+    /// A clean stop preserved (or failed to preserve) the route mirror
+    /// as the fast-path route ledger.
+    pub const ROUTE_LEDGER_PRESERVED: &str = "route_ledger_preserved";
+    /// A start seeded the route mirror from the route ledger.
+    pub const ROUTE_LEDGER_SEEDED: &str = "route_ledger_seeded";
+    /// A start found no usable route ledger; `reason` says why
+    /// (`missing` included), and the mirror loads cold.
+    pub const ROUTE_LEDGER_REFUSED: &str = "route_ledger_refused";
+    /// The route source's first completed initial dump after a seed
+    /// garbage-collected what it did not re-advertise.
+    pub const ROUTE_LEDGER_RECONCILED: &str = "route_ledger_reconciled";
+    /// The neighbour resolver exited or stopped making progress and the
+    /// supervisor restarted it (`cause`: `stalled`, `failed`,
+    /// `returned`; `detail` the reason).
+    pub const NEIGH_RESOLVER_RESTARTED: &str = "neigh_resolver_restarted";
 
     // --- the event log itself (module `event-log`) ---
     pub const EVENTS_DROPPED: &str = "events_dropped";

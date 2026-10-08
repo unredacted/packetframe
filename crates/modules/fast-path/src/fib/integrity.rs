@@ -95,6 +95,13 @@ pub struct IntegrityChecker {
     /// `None` when nothing is consuming it, which is every
     /// single-module deployment.
     completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
+    /// The route ledger's status: a seeded mirror is not attested until
+    /// the route source has started streaming to this daemon. See
+    /// [`crate::fib::route_ledger::LedgerStatus::attestation_blocker`].
+    ledger_status: Option<crate::fib::route_ledger::SharedLedgerStatus>,
+    /// The last check withheld its report because of the seed: the next
+    /// one runs the moment the stream starts, not an interval later.
+    seed_blocked_last: bool,
 }
 
 impl IntegrityChecker {
@@ -110,7 +117,19 @@ impl IntegrityChecker {
             prog,
             shutdown,
             completeness: None,
+            ledger_status: None,
+            seed_blocked_last: false,
         }
+    }
+
+    /// Consult the route ledger's status before republishing — see the
+    /// field.
+    pub fn with_ledger_status(
+        mut self,
+        status: crate::fib::route_ledger::SharedLedgerStatus,
+    ) -> Self {
+        self.ledger_status = Some(status);
+        self
     }
 
     /// Publish each comparison to the second forwarding tier as well.
@@ -128,26 +147,33 @@ impl IntegrityChecker {
     /// Main loop. Sleeps `config.interval`, runs one check, repeats.
     /// Each tick is independent, a failure writes `last_error` into
     /// the snapshot and continues.
-    pub async fn run(self) {
+    pub async fn run(mut self) {
         info!(
             interval_secs = self.config.interval.as_secs(),
             birdc = %self.config.birdc_path.display(),
             "IntegrityChecker started"
         );
         loop {
+            // A seeded mirror is worth checking the moment the route
+            // source starts streaming — that is when the seed becomes
+            // attestable — rather than an interval after start.
+            let early = crate::fib::route_ledger::early_check_due(
+                self.ledger_status.as_ref(),
+                self.seed_blocked_last,
+            );
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
                     info!("IntegrityChecker shutdown");
                     return;
                 }
-                _ = tokio::time::sleep(self.config.interval) => {
-                    self.run_check().await;
-                }
+                _ = tokio::time::sleep(self.config.interval) => {}
+                _ = crate::fib::route_ledger::stream_started(self.ledger_status.clone()), if early => {}
             }
+            self.run_check().await;
         }
     }
 
-    async fn run_check(&self) {
+    async fn run_check(&mut self) {
         // THE PAIR, CONCURRENTLY. These two numbers are the whole
         // content of the report the steering gate acts on, and the gap
         // between them is the report's error bar: whatever the mirror
@@ -286,7 +312,23 @@ impl IntegrityChecker {
                 packetframe_prefixes: pf,
                 drift,
             });
-            if let Some(handle) = self.completeness.as_ref() {
+            // Recorded for the operator either way, but withheld from the
+            // second tier while a seed has heard nothing from the route
+            // source: the counts agree by construction then, and say
+            // nothing about whether anything will ever update the table.
+            // `birdc` has no revocation channel, so withholding IS the
+            // refusal — the gate reads no report as no permission.
+            let blocker = crate::fib::route_ledger::blocker(self.ledger_status.as_ref());
+            if let Some(why) = &blocker {
+                if !self.seed_blocked_last {
+                    info!(
+                        reason = %why,
+                        "integrity check: comparison not published to the steering gate"
+                    );
+                }
+            }
+            self.seed_blocked_last = blocker.is_some();
+            if let (Some(handle), None) = (self.completeness.as_ref(), blocker) {
                 handle.publish(packetframe_common::fib::CompletenessReport {
                     authority_routes: bird as u64,
                     mirror_routes: pf as u64,

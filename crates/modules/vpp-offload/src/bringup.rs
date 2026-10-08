@@ -1161,13 +1161,27 @@ fn finish(
     // first save drops it from the file too.
     //
     // Every refusal is logged and falls back to the dump path; none fails
-    // the attach. Only the identity legs are checked here, where the
-    // adopted process and the state file are in hand. VPP's own route
-    // counts are compared in `start_resync`, which has the API.
+    // the attach. Only the file's provenance and size and the identity
+    // legs are checked here, where the adopted process and the state file
+    // are in hand. VPP's own route counts are compared in `start_resync`,
+    // which has the API.
+    //
+    // The size bound is the widest record this run's engine could write
+    // — the same capacities it is built with below — which is the
+    // writer's too: `acquire` refuses an adoption unless the VPP was
+    // started under this `expected-routes`, `v6` and ports.
+    let capacity = startup_conf::route_capacity(sizing);
+    // The IPv6 pool: the allowance the segments were grown for under
+    // `v6 on`, never touched under `v6 off` (the drainer admits no v6).
+    let capacity_v6 = startup_conf::route_capacity_v6(sizing);
     let mut state = state;
     let ledger_token = state.ledger_token.take();
     let preserved = crate::ledger_record::consume_for_adoption(
         &paths.sys.state_dir,
+        crate::ledger_record::max_ledger_bytes(
+            capacity.saturating_add(capacity_v6),
+            recorded.len(),
+        ),
         adopted.as_ref().map(|p| crate::ledger_record::Adoptee {
             pid: p.pid(),
             start_ticks: p.start_ticks(),
@@ -1361,10 +1375,6 @@ fn finish(
         state.steer_plans.clone(),
     );
 
-    let capacity = startup_conf::route_capacity(sizing);
-    // The IPv6 pool: the allowance the segments were grown for under
-    // `v6 on`, never touched under `v6 off` (the drainer admits no v6).
-    let capacity_v6 = startup_conf::route_capacity_v6(sizing);
     let api_socket_path = paths.api_socket.clone();
     let startup_conf_path = paths.startup_conf.clone();
     let vpp_binary = vpp_binary.to_path_buf();
@@ -1406,6 +1416,23 @@ fn finish(
         .max(1500);
     let handback_wanted = crate::handback::plans_divert_v6(&held_steering.targets);
     let loop_accepts6 = drift_accepts6.clone();
+    // The kernel path's host side ([`crate::kernel_path::LiveKernelPath`]),
+    // built on the loop thread from these: where the IRQs and counters
+    // live, every CPU VPP is on (derived AND observed — the same set the
+    // attach-time IRQ moves vacated), and the control-plane CPUs, which a
+    // queue-0 placement takes only after every other eligible CPU
+    // (`cores::plan_queue0_irqs`).
+    let kernel_path_inputs = (
+        paths.sys.sysfs_net.clone(),
+        paths.proc_irq.clone(),
+        paths.sysfs_cpu.clone(),
+        paths.sys.state_dir.clone(),
+        vacate.clone(),
+        control_plane
+            .as_ref()
+            .map(|cp| cp.cpus.clone())
+            .unwrap_or_default(),
+    );
     let factory: LoopFactory = Box::new(move || {
         // What VPP can egress, for the exemption tripwire: the member
         // ports, the kernel bridges `local-route` and `local-route6`
@@ -1513,6 +1540,20 @@ fn finish(
         // log is itself the diagnostic.
         #[cfg(target_os = "linux")]
         runtime.rx_mode_kick(Box::new(crate::runtime::AllmultiKick));
+        // The kernel path exempt traffic takes: queue-0 IRQ placement
+        // while a port's keeps pin to queue 0, and the counters the
+        // `kernel-path` row reports. Loads the previous daemon's
+        // placement record, so a `--keep-vpp` restart restores the
+        // ORIGINAL affinity on its eventual teardown.
+        #[cfg(target_os = "linux")]
+        {
+            let (net, irq, cpu, state, vpp, avoid) = kernel_path_inputs;
+            runtime.kernel_path(Box::new(crate::kernel_path::LiveKernelPath::new(
+                net, irq, cpu, state, vpp, avoid,
+            )));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = kernel_path_inputs;
         // The exemption tripwire, installed whenever this box could
         // steer at all — the hole it names opens the instant a port
         // does, so an operator wants it BEFORE the canary rather than
@@ -1523,6 +1564,16 @@ fn finish(
             port_vlans: drift_port_vlans,
             trunk_ports: drift_trunks,
             scope: drift_scope,
+            // Without it the scan still runs, on the clock alone — what
+            // a monitoring scan can afford to lose, unlike its findings.
+            links: crate::drift::KernelLinkWatch::open()
+                .map_err(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "cannot watch link state; drift scans will not wait out link churn"
+                    )
+                })
+                .ok(),
         }));
         // Rules from a previous process are adopted below, and the
         // config on disk may have been edited while the daemon was

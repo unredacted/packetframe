@@ -23,12 +23,14 @@ pub mod coalesce;
 pub mod fib;
 pub mod metrics;
 pub mod pin;
+pub mod redirect_watch_status;
 pub mod registry;
 pub mod rx_macs;
 pub mod sample;
 pub mod sample_rings;
 pub mod softnet;
 pub mod tc_links;
+pub mod vrrp;
 pub mod wan_egress;
 
 /// The protocol number that tags kernel routing objects as
@@ -51,6 +53,9 @@ pub mod reconcile;
 
 #[cfg(target_os = "linux")]
 pub mod redirect_watch;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod netlink_bounds;
 
 #[cfg(target_os = "linux")]
 pub use linux_impl::{
@@ -284,6 +289,17 @@ impl Module for FastPathModule {
         self.breaker_tripped = true;
     }
 
+    /// The preserving exit: leave the route mirror for the next start as
+    /// the route ledger ([`fib::route_ledger`]). Bounded, and never fails
+    /// the exit — a ledger that cannot be written is a cold reload next
+    /// time, which is what every start used to be.
+    #[cfg(target_os = "linux")]
+    fn exit_preserving(&mut self) {
+        if let Some(state) = self.state.as_ref() {
+            linux_impl::exit_preserving(state);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn detach(&mut self) -> ModuleResult<()> {
         if let Some(mut state) = self.state.take() {
@@ -302,14 +318,32 @@ impl Module for FastPathModule {
         Ok(())
     }
 
-    /// Only the `wan-egress` gauges come through here: they live in
-    /// the daemon's memory, not in a pinned map. Everything else the
-    /// cli's MetricsExporter (`crates/cli/src/metrics.rs`) reads from
+    /// Only the gauges that live in the daemon's memory rather than in a
+    /// pinned map come through here: `wan-egress`, the route ledger, the
+    /// neighbour resolver and the redirect-target watcher. Everything else
+    /// the cli's MetricsExporter (`crates/cli/src/metrics.rs`) reads from
     /// the pins directly on its 15 s cadence.
     #[cfg(target_os = "linux")]
     fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
         if let Some(w) = self.state.as_ref().and_then(|s| s.wan_egress.as_ref()) {
             w.status().render_metrics(out.out);
+        }
+        if let Some(w) = self.state.as_ref().and_then(|s| s.redirect_watch.as_ref()) {
+            w.status().render_metrics(out.out);
+        }
+        if let Some(l) = self
+            .state
+            .as_ref()
+            .and_then(linux_impl::route_ledger_status)
+        {
+            l.render_metrics(out.out);
+        }
+        if let Some(n) = self
+            .state
+            .as_ref()
+            .and_then(linux_impl::neigh_resolver_status)
+        {
+            n.render_metrics(std::time::Instant::now(), out.out);
         }
         Ok(())
     }
@@ -325,9 +359,9 @@ impl Module for FastPathModule {
     /// computed every 300 s and discarded — `packetframe status` had
     /// nothing to say about whether the mirror matches bird, and the
     /// second tier's steering gate acts on exactly that comparison.
-    /// BmpStation and NeighborResolver freshness are the obvious next
-    /// rows; neither publishes anything readable yet, and a row that
-    /// reported "fine" from an unread source would be worse than none.
+    /// BmpStation freshness is the obvious next row; it publishes
+    /// nothing readable yet, and a row that reported "fine" from an
+    /// unread source would be worse than none.
     ///
     /// The row is absent only when nothing is checking (kernel-fib
     /// mode, or a control plane with no route source). Whenever a
@@ -338,6 +372,23 @@ impl Module for FastPathModule {
     /// A second row, `wan-egress`, whenever that directive is in force
     /// (in any forwarding mode): the policy rules in place, or why
     /// they are not.
+    ///
+    /// A third, `route-ledger`, whenever the PacketFrame FIB control
+    /// plane runs: seeded from a ledger (and how far the route source's
+    /// replay has confirmed it), or why this start loaded cold.
+    ///
+    /// A fourth, `neigh-resolver`, whenever the control plane runs: the
+    /// NeighborResolver's progress, restarts, overruns and resyncs. It
+    /// is the freshness row the paragraph above deferred until the
+    /// resolver published something readable, and it is always present
+    /// rather than only when failing because its `last_success_age` is
+    /// the point: on 2026-10-07 the resolver hung for over 13 minutes
+    /// with every nexthop's traffic on the kernel path while this module
+    /// read healthy.
+    ///
+    /// A fifth, `redirect-watch`, whenever attached (in any forwarding
+    /// mode): whether the redirect maps still follow the link table, or
+    /// why not.
     #[cfg(target_os = "linux")]
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
         let mut subsystems: Vec<_> = self
@@ -349,6 +400,26 @@ impl Module for FastPathModule {
             .collect();
         if let Some(w) = self.state.as_ref().and_then(|s| s.wan_egress.as_ref()) {
             subsystems.push(w.status().subsystem_health(std::time::Instant::now()));
+        }
+        // `route-ledger`, whenever the PacketFrame FIB control plane runs:
+        // what this start did with the ledger, and how the seed is doing.
+        if let Some(l) = self
+            .state
+            .as_ref()
+            .and_then(linux_impl::route_ledger_status)
+        {
+            subsystems
+                .push(l.subsystem_health(fib::route_ledger::now_unix(), std::time::Instant::now()));
+        }
+        if let Some(n) = self
+            .state
+            .as_ref()
+            .and_then(linux_impl::neigh_resolver_status)
+        {
+            subsystems.push(n.subsystem_health(std::time::Instant::now()));
+        }
+        if let Some(w) = self.state.as_ref().and_then(|s| s.redirect_watch.as_ref()) {
+            subsystems.push(w.status().subsystem_health());
         }
         // `worse_of` rather than a hand-rolled escalation: a module that
         // reports Healthy over a Degraded subsystem disagrees with its

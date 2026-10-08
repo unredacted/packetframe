@@ -46,6 +46,15 @@
 //! removal asks "will this keep steering into the VF we are about to
 //! release", and the second question has to be answered `yes` for
 //! rules the first would disown.
+//!
+//! ## Keeps come in two forms
+//!
+//! A keep (exemption) delivers to the PF either spread by RSS or pinned
+//! to PF queue 0 ([`KeepForm`]). RSS is tried first, per port, and the
+//! driver's answer decides ([`install`]). Every ownership question —
+//! audit, slot reuse, removal — accepts BOTH forms ([`forms_of`]): a
+//! queue-0 keep an older daemon left is this module's to account for
+//! and to remove, and missing that is how keeps once survived teardown.
 
 use crate::runtime::SteerOutcome;
 use crate::steer::{L4Match, L4Proto, RuleMatch, RuleSet, Side, SteerRule};
@@ -79,6 +88,84 @@ const FLOW_EXT: u32 = 0x8000_0000;
 /// The three bits a `flow_type` can carry beside its base type
 /// (`FLOW_EXT | FLOW_MAC_EXT | FLOW_RSS`), masked off to recover it.
 const FLOW_FLAGS: u32 = 0xE000_0000;
+
+/// `FLOW_RSS`, or'd into `flow_type`: the rule's action is an RSS
+/// context (`ethtool_rxnfc.rss_context`) rather than one queue, and
+/// `ring_cookie`'s queue field becomes an offset into the queue RSS
+/// picks. The otx2 driver turns it into `NIX_RX_ACTIONOP_RSS` on the
+/// context's group (`otx2_add_flow_msg`) and masks it off before
+/// building the match (`otx2_prepare_flow_request`), which is why it is
+/// one of [`FLOW_FLAGS`].
+///
+/// How a [`KeepForm::Rss`] keep spreads the kernel's share of a steered
+/// port across the PF's queues instead of pinning it to queue 0.
+const FLOW_RSS: u32 = 0x2000_0000;
+
+/// The RSS context a [`KeepForm::Rss`] keep names: 0, the PF's default
+/// context — the one carrying every frame no rule matches — so exempt
+/// traffic lands exactly as it would on an unsteered port. A lab probe
+/// on the production firmware (2026-10-07) inserted `context 0 action 0`
+/// on this driver and read it back with `FLOW_RSS` and context 0
+/// intact, so no dedicated context is created.
+const KEEP_RSS_CONTEXT: u32 = 0;
+
+/// How a [`crate::steer::RuleAction::Keep`] rule hands its traffic to
+/// the kernel.
+///
+/// The exemptions began as a few of the router's own /32s carrying
+/// control-plane traffic, where one queue was an accepted cost. They
+/// grew into bulk traffic — WAN /31s (every NAT'd flow's return path),
+/// whole LAN subnets, IX LANs, a CGNAT /10 — and every port's queue-0
+/// IRQ sits on CPU 0 by default, so all of it converged on ONE core. On
+/// a production gateway (2026-10-07) that core sat at 99% softirq while
+/// the others idled, the PF dropped thousands of frames a second, a
+/// directly connected next hop lost 30% of pings at 618 ms, and transit
+/// BGP sessions fell on hold-timer expiry. [`Self::Rss`] is the fix;
+/// [`Self::Queue0`] is the fallback where the driver will not take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepForm {
+    /// `FLOW_RSS` on [`KEEP_RSS_CONTEXT`]: spread across the PF's queues
+    /// the way unsteered traffic is.
+    Rss,
+    /// `ring_cookie` 0, no RSS: every frame onto PF queue 0 — the only
+    /// form builds before 0.6.0 installed, and the fallback for a port
+    /// whose driver refuses or silently drops the RSS action.
+    Queue0,
+}
+
+impl KeepForm {
+    /// The word `packetframe status` and the metrics use.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rss => "rss",
+            Self::Queue0 => "queue0",
+        }
+    }
+}
+
+/// What a port's driver did with the first [`KeepForm::Rss`] keep this
+/// process inserted on it, and therefore the form its keeps take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeepVerdict {
+    pub form: KeepForm,
+    /// Why the port fell back to [`KeepForm::Queue0`]: what the driver
+    /// answered. `None` for [`KeepForm::Rss`].
+    pub why: Option<String>,
+}
+
+/// One port with keep rules in the ledger, and the form they were
+/// installed in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeepPort {
+    pub iface: String,
+    /// `None` when no steer in this process has installed them — they
+    /// were inherited from a previous daemon and may be either form
+    /// until the next steer rewrites them (which migrates a queue-0 keep
+    /// to RSS wherever the driver takes it). The steering audit reports
+    /// which form the NIC actually holds
+    /// ([`crate::runtime::SteeringAudit::keeps_observed`]).
+    pub verdict: Option<KeepVerdict>,
+}
 
 /// `TCP_V6_FLOW`: `ethtool_tcpip6_spec`, matched here on a port only.
 const TCP_V6_FLOW: u32 = 0x05;
@@ -161,11 +248,14 @@ pub fn rule_table_reclaiming(
         // The VF field, not the whole cookie: a rule into another queue
         // of our VF is still ours, as `remove_all` already judges it.
         let diverts_to_us =
-            ring_cookie_vf(got.ring_cookie) == ring_cookie_vf(ring_cookie(vf_index));
+            ring_cookie_vf(got.fs.ring_cookie) == ring_cookie_vf(ring_cookie(vf_index));
+        // Either keep form: a queue-0 keep an older daemon installed is
+        // reclaimed like an RSS one, so the re-plan lands on its slot
+        // and the steer rewrites it in place.
         let planned_here = recorded_plan.is_some_and(|plan| {
             plan.rules
                 .iter()
-                .any(|r| r.location == loc && audit_matches(&flow_spec(r, vf_index), &got))
+                .any(|r| r.location == loc && held_form(r, vf_index, loc, &got).is_some())
         });
         if diverts_to_us || planned_here {
             ours.push(loc);
@@ -268,7 +358,44 @@ struct Rxnfc {
     flow_type: u32,
     data: u64,
     fs: RxFlowSpec,
+    /// `union { rule_cnt; rss_context; }` in the uapi: the rule count
+    /// for the enumeration commands, and for `SRXCLSRLINS` /
+    /// `GRXCLSRULE` the RSS context of a `FLOW_RSS` rule — written on
+    /// insert, returned on readback (`otx2_get_flow` copies the flow's
+    /// `rss_ctx_id` here). One field because it is one storage slot;
+    /// [`Held::rss_context`] is the name the readback gives it.
     rule_cnt: u32,
+}
+
+const _: () = assert!(core::mem::offset_of!(Rxnfc, rule_cnt) == 184);
+
+/// One rule as `ETHTOOL_GRXCLSRULE` returns it: the flow spec, plus the
+/// RSS context that rides OUTSIDE it, in [`Rxnfc::rule_cnt`].
+///
+/// The context matters only under `FLOW_RSS` — a queue-0 keep's union
+/// slot is meaningless — and every comparison here reads it only then
+/// ([`context_ok`]). Carried beside the spec rather than folded into it
+/// because the spec is the uapi struct and has nowhere to put it.
+#[derive(Clone, Copy, Default)]
+struct Held {
+    fs: RxFlowSpec,
+    rss_context: u32,
+}
+
+impl Held {
+    fn of(req: &Rxnfc) -> Self {
+        Self {
+            fs: req.fs,
+            rss_context: req.rule_cnt,
+        }
+    }
+}
+
+/// The RSS half of a readback comparison: a rule asked for under
+/// `FLOW_RSS` must come back on [`KEEP_RSS_CONTEXT`]. Whether `FLOW_RSS`
+/// itself survived is `flow_type`'s comparison, which is whole.
+fn context_ok(asked: &RxFlowSpec, got: &Held) -> bool {
+    asked.flow_type & FLOW_RSS == 0 || got.rss_context == KEEP_RSS_CONTEXT
 }
 
 impl Default for FlowUnion {
@@ -389,10 +516,22 @@ pub fn mask_for(prefix_len: u8) -> u32 {
 ///   n`: `TCP_V6_FLOW`/`UDP_V6_FLOW`, the port under 0xFFFF, nothing
 ///   else — no address, since every v6 address field is what the AF
 ///   rejects with 710.
-fn flow_spec(rule: &SteerRule, vf_index: u32) -> RxFlowSpec {
+///
+/// ## The keep's two forms
+///
+/// `form` decides a [`crate::steer::RuleAction::Keep`]'s action and
+/// nothing else; a diversion ignores it. Both forms carry `ring_cookie`
+/// 0 — no VF bits, so the PF; queue field 0. [`KeepForm::Queue0`] stops
+/// there, which the driver encodes as `NIX_RX_ACTIONOP_UCAST` toward PF
+/// queue 0. [`KeepForm::Rss`] adds `FLOW_RSS` to `flow_type` and names
+/// [`KEEP_RSS_CONTEXT`] in the request's `rss_context` (see [`insert`]),
+/// which the driver encodes as `NIX_RX_ACTIONOP_RSS` on the default
+/// context's group — the queue 0 in the cookie becoming an offset of 0
+/// into whichever queue the hash picks. The stored form of the CLI's
+/// `context 0 action 0`.
+fn flow_spec_as(rule: &SteerRule, vf_index: u32, form: KeepForm) -> RxFlowSpec {
     let mut fs = RxFlowSpec {
-        // Divert → the VF's cookie. Keep → 0, which the driver encodes
-        // as NIX_RX_ACTIONOP_UCAST toward PF queue 0 — the kernel path.
+        // Divert → the VF's cookie. Keep → 0: the PF, the kernel path.
         // The exemption rules' whole job is that second arm; see
         // `RuleAction::Keep` for the measured traffic it rescues.
         ring_cookie: match rule.action {
@@ -402,6 +541,7 @@ fn flow_spec(rule: &SteerRule, vf_index: u32) -> RxFlowSpec {
         location: rule.location,
         ..RxFlowSpec::default()
     };
+    let rss = rule.action == crate::steer::RuleAction::Keep && form == KeepForm::Rss;
     match rule.shape {
         RuleMatch::V4 {
             prefix,
@@ -479,7 +619,62 @@ fn flow_spec(rule: &SteerRule, vf_index: u32) -> RxFlowSpec {
             fs.m_u.hdata[off..off + 2].copy_from_slice(&[0xff; 2]);
         }
     }
+    if rss {
+        fs.flow_type |= FLOW_RSS;
+    }
     fs
+}
+
+/// [`flow_spec_as`] in the queue-0 form — what every fixture written
+/// before the RSS keep describes, and the encoding a diversion has in
+/// either form.
+#[cfg(test)]
+fn flow_spec(rule: &SteerRule, vf_index: u32) -> RxFlowSpec {
+    flow_spec_as(rule, vf_index, KeepForm::Queue0)
+}
+
+/// The forms this module can have installed `rule` in: both for a keep
+/// — RSS, and the queue-0 form every earlier build installed and the
+/// fallback still does — and one for a diversion, whose encoding does
+/// not depend on the form.
+///
+/// Every OWNERSHIP question asks all of them. A keep a previous daemon
+/// installed at queue 0 is ours whatever this process would install
+/// today, and reading it as a stranger's is the bug this module already
+/// paid for once (keeps surviving teardown): an adopted ledger's queue-0
+/// keeps would be disowned, dropped from the ledger, and left in the
+/// MCAM pinning traffic to one core forever.
+fn forms_of(rule: &SteerRule) -> &'static [KeepForm] {
+    match rule.action {
+        crate::steer::RuleAction::Keep => &[KeepForm::Rss, KeepForm::Queue0],
+        crate::steer::RuleAction::Divert => &[KeepForm::Rss],
+    }
+}
+
+/// Which form of `rule`, stamped at `loc`, the NIC holds — under the
+/// audit's strict comparison ([`audit_matches`]) plus the RSS context.
+/// `None` when it holds none of them. For a diversion the form is
+/// meaningless; only `Some` versus `None` is.
+fn held_form(rule: &SteerRule, vf_index: u32, loc: u32, got: &Held) -> Option<KeepForm> {
+    forms_of(rule).iter().copied().find(|&form| {
+        let asked = RxFlowSpec {
+            location: loc,
+            ..flow_spec_as(rule, vf_index, form)
+        };
+        audit_matches(&asked, &got.fs) && context_ok(&asked, got)
+    })
+}
+
+/// [`held_form`] under the LOOSE comparison ([`matches`]): the same
+/// rule identity, possibly narrowed. The audit's "damaged copy" test.
+fn resembles(rule: &SteerRule, vf_index: u32, loc: u32, got: &Held) -> bool {
+    forms_of(rule).iter().any(|&form| {
+        let asked = RxFlowSpec {
+            location: loc,
+            ..flow_spec_as(rule, vf_index, form)
+        };
+        matches(&asked, &got.fs)
+    })
 }
 
 /// Whether a rule read back from the NIC is still ours in the sense the
@@ -793,6 +988,19 @@ pub(crate) mod sys {
 
     pub(crate) struct FakeNic {
         rules: HashMap<(String, u32), super::RxFlowSpec>,
+        /// The RSS context each stored rule carries — the
+        /// `rule_cnt`/`rss_context` union slot, which lives outside the
+        /// flow spec, so it is kept beside it the way the driver keeps
+        /// `rss_ctx_id` beside its copy of the spec.
+        contexts: HashMap<(String, u32), u32>,
+        /// Interfaces whose driver refuses an RSS-action rule outright
+        /// with `EINVAL` — what a driver without RSS-context support
+        /// answers.
+        rss_refused: Vec<String>,
+        /// Interfaces whose driver accepts an RSS-action rule and stores
+        /// it WITHOUT `FLOW_RSS` — the silent drop only the readback can
+        /// see, which leaves the rule delivering to queue 0.
+        rss_stripped: Vec<String>,
         /// Locations whose delete must fail, modelling the rule that
         /// will not come out — the case the release rules turn on.
         undeletable: Vec<u32>,
@@ -819,6 +1027,9 @@ pub(crate) mod sys {
         fn default() -> Self {
             Self {
                 rules: HashMap::new(),
+                contexts: HashMap::new(),
+                rss_refused: Vec::new(),
+                rss_stripped: Vec::new(),
                 undeletable: Vec::new(),
                 uninsertable: Vec::new(),
                 garbled: Vec::new(),
@@ -877,6 +1088,47 @@ pub(crate) mod sys {
         NIC.with(|n| n.borrow_mut().table_size = size);
     }
 
+    /// Make `iface`'s driver refuse RSS-action rules with `EINVAL`.
+    pub(crate) fn refuse_rss(iface: &str) {
+        NIC.with(|n| n.borrow_mut().rss_refused.push(iface.to_string()));
+    }
+
+    /// Make `iface`'s driver store RSS-action rules with `FLOW_RSS`
+    /// cleared — accepted, and quietly a queue-0 rule.
+    pub(super) fn strip_rss(iface: &str) {
+        NIC.with(|n| n.borrow_mut().rss_stripped.push(iface.to_string()));
+    }
+
+    /// Store `spec` at its location as an out-of-band writer — or an
+    /// older daemon — would have, with no RSS context.
+    pub(super) fn plant(iface: &str, spec: super::RxFlowSpec) {
+        NIC.with(|n| {
+            let mut nic = n.borrow_mut();
+            let key = (iface.to_string(), spec.location);
+            nic.contexts.remove(&key);
+            nic.rules.insert(key, spec);
+        });
+    }
+
+    /// Change the RSS context the rule at `(iface, loc)` reads back with.
+    pub(super) fn set_context_behind_back(iface: &str, loc: u32, ctx: u32) {
+        NIC.with(|n| {
+            n.borrow_mut()
+                .contexts
+                .insert((iface.to_string(), loc), ctx);
+        });
+    }
+
+    /// The stored flow type at `(iface, loc)`, flag bits included.
+    pub(super) fn flow_type_at(iface: &str, loc: u32) -> Option<u32> {
+        NIC.with(|n| {
+            n.borrow()
+                .rules
+                .get(&(iface.to_string(), loc))
+                .map(|fs| fs.flow_type)
+        })
+    }
+
     /// The fake's answer to `GRXCLSRLALL`.
     ///
     /// Note what this cannot stand in for: the real one reads a size the
@@ -916,6 +1168,10 @@ pub(crate) mod sys {
             if let Some(src) = nic.rules.get(&(iface.to_string(), from)).copied() {
                 let mut copy = src;
                 copy.location = to;
+                match nic.contexts.get(&(iface.to_string(), from)).copied() {
+                    Some(ctx) => nic.contexts.insert((iface.to_string(), to), ctx),
+                    None => nic.contexts.remove(&(iface.to_string(), to)),
+                };
                 nic.rules.insert((iface.to_string(), to), copy);
             }
         });
@@ -963,6 +1219,7 @@ pub(crate) mod sys {
                 ring_cookie: cookie,
                 ..super::RxFlowSpec::default()
             };
+            nic.contexts.remove(&(iface.to_string(), loc));
             nic.rules.insert((iface.to_string(), loc), foreign);
         });
     }
@@ -1011,6 +1268,10 @@ pub(crate) mod sys {
                     if nic.uninsertable.contains(&req.fs.location) {
                         return Err(std::io::Error::other("ENOSPC: no free MCAM entry"));
                     }
+                    let rss = req.fs.flow_type & super::FLOW_RSS != 0;
+                    if rss && nic.rss_refused.iter().any(|i| i == iface) {
+                        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                    }
                     // A real insert at an occupied slot replaces it,
                     // which is what makes re-asserting cheap.
                     let mut stored = req.fs;
@@ -1019,6 +1280,16 @@ pub(crate) mod sys {
                         // for every shape, and one that leaves a keep's
                         // VF field at 0 — unattributable by cookie.
                         stored.ring_cookie ^= 7;
+                    }
+                    let mut ctx = req.rule_cnt;
+                    if rss && nic.rss_stripped.iter().any(|i| i == iface) {
+                        stored.flow_type &= !super::FLOW_RSS;
+                        ctx = 0;
+                    }
+                    if stored.flow_type & super::FLOW_RSS != 0 {
+                        nic.contexts.insert(key.clone(), ctx);
+                    } else {
+                        nic.contexts.remove(&key);
                     }
                     nic.rules.insert(key, stored);
                     Ok(())
@@ -1029,6 +1300,9 @@ pub(crate) mod sys {
                 ETHTOOL_GRXCLSRULE => match nic.rules.get(&key) {
                     Some(stored) => {
                         req.fs = *stored;
+                        // `otx2_get_flow` writes the union slot on every
+                        // readback; 0 for a rule that never named one.
+                        req.rule_cnt = nic.contexts.get(&key).copied().unwrap_or(0);
                         Ok(())
                     }
                     // `NotFound`, not a bare string: ENOENT is how the
@@ -1045,6 +1319,7 @@ pub(crate) mod sys {
                     if nic.undeletable.contains(&req.fs.location) {
                         return Err(std::io::Error::other("EBUSY: rule is pinned"));
                     }
+                    nic.contexts.remove(&key);
                     match nic.rules.remove(&key) {
                         Some(_) => Ok(()),
                         None => Err(std::io::Error::new(
@@ -1069,21 +1344,55 @@ struct InsertError {
     /// rollback must remove it, since no ledger entry would otherwise
     /// ever name it.
     landed: bool,
+    /// The failure was the driver declining the RSS action of a
+    /// [`KeepForm::Rss`] keep — refusing it, or storing it without
+    /// `FLOW_RSS` or on another context — and nothing else about the
+    /// rule. The caller retries the queue-0 form at the same location
+    /// on the strength of this, so it is set ONLY where the RSS action
+    /// is provably the difference: a refusal of the RSS form with the
+    /// errno a driver gives for an action it does not support, or a
+    /// readback that matches the rule in every field but that action.
+    rss_declined: Option<String>,
+}
+
+/// Errnos that mean "this driver does not do that action": `EINVAL`
+/// (the otx2 family validates the action against what it supports) and
+/// `EOPNOTSUPP`. Anything else — `ENOSPC`, `EBUSY`, `EIO` — says nothing
+/// about RSS and must fail the insert as it always has.
+fn declines_an_action(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+    )
 }
 
 /// Install one rule and confirm the NIC holds what was asked for.
-fn insert(iface: &str, rule: &SteerRule, vf_index: u32) -> Result<(), InsertError> {
-    let asked = flow_spec(rule, vf_index);
+///
+/// `form` decides a keep's action ([`flow_spec_as`]); under
+/// [`KeepForm::Rss`] the request also names [`KEEP_RSS_CONTEXT`], and
+/// the readback must return both the `FLOW_RSS` flag and that context
+/// — a driver that echoes the spec but dropped either would deliver to
+/// queue 0 while the ledger said otherwise.
+fn insert(iface: &str, rule: &SteerRule, vf_index: u32, form: KeepForm) -> Result<(), InsertError> {
+    let asked = flow_spec_as(rule, vf_index, form);
+    let rss = asked.flow_type & FLOW_RSS != 0;
     let mut req = Rxnfc {
         cmd: ETHTOOL_SRXCLSRLINS,
         fs: asked,
+        rule_cnt: if rss { KEEP_RSS_CONTEXT } else { 0 },
         ..Rxnfc::default()
     };
     sys::ethtool(iface, &mut req).map_err(|e| InsertError {
         msg: format!("inserting ntuple rule at loc {}: {e}", rule.location),
         landed: false,
+        rss_declined: (rss && declines_an_action(&e))
+            .then(|| format!("the driver refused an RSS-action rule ({e})")),
     })?;
-    let landed = |msg: String| InsertError { msg, landed: true };
+    let landed = |msg: String| InsertError {
+        msg,
+        landed: true,
+        rss_declined: None,
+    };
 
     // Read back, always. See the module docs: a wrong field offset
     // installs cleanly and matches the wrong traffic.
@@ -1101,7 +1410,33 @@ fn insert(iface: &str, rule: &SteerRule, vf_index: u32) -> Result<(), InsertErro
             rule.location
         ))
     })?;
-    if !matches(&asked, &check.fs) {
+    let got = Held::of(&check);
+    if rss && !(matches(&asked, &got.fs) && context_ok(&asked, &got)) {
+        // Every field but the action: the driver took the rule and
+        // dropped the RSS half — the flag (what it stored then delivers
+        // to queue 0), or the context (some other context's queues).
+        let queue0 = flow_spec_as(rule, vf_index, KeepForm::Queue0);
+        let stripped = matches(&queue0, &got.fs);
+        let rehomed = matches(&asked, &got.fs) && !context_ok(&asked, &got);
+        if stripped || rehomed {
+            let why = if stripped {
+                "the driver accepted an RSS-action rule and read it back without FLOW_RSS"
+                    .to_string()
+            } else {
+                format!(
+                    "the driver accepted an RSS-action rule on context {KEEP_RSS_CONTEXT} and \
+                     read it back on context {}",
+                    got.rss_context
+                )
+            };
+            return Err(InsertError {
+                msg: format!("ntuple rule at loc {}: {why}", rule.location),
+                landed: true,
+                rss_declined: Some(why),
+            });
+        }
+    }
+    if !matches(&asked, &got.fs) {
         return Err(landed(format!(
             "ntuple rule at loc {} is not what was asked for — the NIC reports flow_type {:#x}, \
              cookie {:#x}; expected {:#x}, {:#x}. Refusing to steer traffic into a rule whose \
@@ -1116,13 +1451,102 @@ fn insert(iface: &str, rule: &SteerRule, vf_index: u32) -> Result<(), InsertErro
     Ok(())
 }
 
+/// [`insert`], choosing a keep's form from the port's verdict — and
+/// deciding the verdict, the first time a keep is installed there.
+///
+/// The capability check is the insert itself. [`KeepForm::Rss`] is
+/// tried while the port has no verdict or an RSS one; if the driver
+/// declines the RSS action ([`InsertError::rss_declined`] — refused with
+/// `EINVAL`/`EOPNOTSUPP`, or read back without the flag or on another
+/// context) the same rule is installed at the same location in the
+/// queue-0 form, which replaces whatever the RSS attempt left there, and
+/// the port is recorded as [`KeepForm::Queue0`] with the driver's answer
+/// as the reason. A fallback whose own insert fails records nothing:
+/// then the RSS action was not demonstrably the problem, and the error
+/// travels out as an ordinary failed insert (with `landed` set if either
+/// write reached the NIC, so the rollback removes it).
+///
+/// An RSS verdict can still turn into a queue-0 one later in the same
+/// process if the driver starts declining — the keeps already installed
+/// on RSS stay as they are (the driver took them) and the next steer
+/// rewrites them all in the queue-0 form.
+fn install(
+    verdicts: &mut Vec<(String, KeepVerdict)>,
+    iface: &str,
+    rule: &SteerRule,
+    vf_index: u32,
+) -> Result<(), InsertError> {
+    if rule.action != crate::steer::RuleAction::Keep {
+        return insert(iface, rule, vf_index, KeepForm::Rss);
+    }
+    let decided = verdicts
+        .iter()
+        .find(|(i, _)| i == iface)
+        .map(|(_, v)| v.form);
+    if decided == Some(KeepForm::Queue0) {
+        return insert(iface, rule, vf_index, KeepForm::Queue0);
+    }
+    let declined = match insert(iface, rule, vf_index, KeepForm::Rss) {
+        Ok(()) => {
+            if decided.is_none() {
+                tracing::info!(
+                    iface,
+                    "keep rules on this port spread over RSS (default context): the driver \
+                     accepted an RSS-action rule and read it back intact"
+                );
+                verdicts.push((
+                    iface.to_string(),
+                    KeepVerdict {
+                        form: KeepForm::Rss,
+                        why: None,
+                    },
+                ));
+            }
+            return Ok(());
+        }
+        Err(e) => match e.rss_declined {
+            Some(why) => (why, e.landed),
+            None => return Err(e),
+        },
+    };
+    let (why, rss_landed) = declined;
+    if let Err(mut e) = insert(iface, rule, vf_index, KeepForm::Queue0) {
+        e.landed |= rss_landed;
+        e.msg = format!("{} (after the RSS form was declined: {why})", e.msg);
+        return Err(e);
+    }
+    tracing::warn!(
+        iface,
+        reason = %why,
+        "keep rules on this port fall back to PF queue 0: every exempt frame on it is \
+         handled by the one CPU that queue's IRQ is on. The queue-0 IRQ is placed on a \
+         CPU of its own while this holds (`packetframe status`, row kernel-path)"
+    );
+    packetframe_common::events::Event::warn(
+        crate::MODULE_NAME,
+        packetframe_common::events::kind::KEEP_QUEUE0_FALLBACK,
+    )
+    .field("port", iface)
+    .detail(&why)
+    .emit();
+    verdicts.retain(|(i, _)| i != iface);
+    verdicts.push((
+        iface.to_string(),
+        KeepVerdict {
+            form: KeepForm::Queue0,
+            why: Some(why),
+        },
+    ));
+    Ok(())
+}
+
 /// Read back whatever the NIC holds at `location`.
 ///
 /// `Ok(None)` is ENOENT — the driver's answer for a location holding
 /// nothing. Every other error is returned: a read that failed says
 /// nothing about what is there, and the callers must not read it as
 /// "empty".
-fn read_rule(iface: &str, location: u32) -> Result<Option<RxFlowSpec>, String> {
+fn read_rule(iface: &str, location: u32) -> Result<Option<Held>, String> {
     let mut req = Rxnfc {
         cmd: ETHTOOL_GRXCLSRULE,
         fs: RxFlowSpec {
@@ -1132,7 +1556,7 @@ fn read_rule(iface: &str, location: u32) -> Result<Option<RxFlowSpec>, String> {
         ..Rxnfc::default()
     };
     match sys::ethtool(iface, &mut req) {
-        Ok(()) => Ok(Some(req.fs)),
+        Ok(()) => Ok(Some(Held::of(&req))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("reading ntuple rule at loc {location}: {e}")),
     }
@@ -1295,6 +1719,17 @@ pub struct NtupleSteering {
     /// Whether the hand-back path is ready ([`crate::runtime::Steering::set_v6_ready`]).
     /// Starts false: withheld until the runtime says otherwise.
     v6_ready: bool,
+    /// Per port, the form its keeps take: what the driver did with the
+    /// first [`KeepForm::Rss`] keep this process inserted there.
+    ///
+    /// A runtime capability check, not a config fact: whether the
+    /// vendor driver accepts AND keeps an RSS-action rule is decided by
+    /// asking it ([`install`]), and a port it refuses falls back to the
+    /// queue-0 form alone — the other ports keep RSS. Decided once per
+    /// port per process: the driver does not change under a running
+    /// daemon, and re-probing on every re-assert would repeat a refused
+    /// insert, its log line and its event each time.
+    keep_verdicts: Vec<(String, KeepVerdict)>,
 }
 
 impl NtupleSteering {
@@ -1313,6 +1748,7 @@ impl NtupleSteering {
             installed_as: None,
             families: crate::fib_sync::FamilyPolicy::V4Only,
             v6_ready: false,
+            keep_verdicts: Vec::new(),
         }
     }
 
@@ -1424,7 +1860,7 @@ impl NtupleSteering {
             return Ok(Occupant::Absent);
         };
         match self.vf_for(iface) {
-            Some(vf) if ring_cookie_vf(got.ring_cookie) == ring_cookie_vf(ring_cookie(vf)) => {
+            Some(vf) if ring_cookie_vf(got.fs.ring_cookie) == ring_cookie_vf(ring_cookie(vf)) => {
                 Ok(Occupant::IntoOurVf)
             }
             // A cookie whose VF field is zero is a kernel-delivery rule
@@ -1438,15 +1874,19 @@ impl NtupleSteering {
             // by rules nothing would ever remove (caught by
             // `exemptions_install_with_cookie_zero_and_clear_on_unsteer`
             // the day the exemptions were written).
+            //
+            // In EITHER form ([`held_form`]): a teardown in a process
+            // that would install RSS keeps still owns the queue-0 keeps
+            // an older daemon left, and the reverse.
             Some(vf)
-                if ring_cookie_vf(got.ring_cookie) == 0
+                if ring_cookie_vf(got.fs.ring_cookie) == 0
                     && self
                         .planned_keep_at(iface, loc)
-                        .is_some_and(|rule| audit_matches(&flow_spec(&rule, vf), &got)) =>
+                        .is_some_and(|rule| held_form(&rule, vf, loc, &got).is_some()) =>
             {
                 Ok(Occupant::IntoOurVf)
             }
-            Some(_) => Ok(Occupant::Elsewhere(got.ring_cookie)),
+            Some(_) => Ok(Occupant::Elsewhere(got.fs.ring_cookie)),
             None => Ok(Occupant::Unattributable),
         }
     }
@@ -1772,7 +2212,7 @@ impl NtupleSteering {
         &self,
         iface: &str,
         loc: u32,
-        got: &RxFlowSpec,
+        got: &Held,
         consumed: &mut std::collections::HashMap<String, Vec<bool>>,
     ) -> bool {
         let Some(installed_as) = &self.installed_as else {
@@ -1785,16 +2225,11 @@ impl NtupleSteering {
         let taken = consumed
             .entry(iface.to_string())
             .or_insert_with(|| vec![false; plan.rules.len()]);
-        let found = plan.rules.iter().enumerate().position(|(i, r)| {
-            !taken[i]
-                && audit_matches(
-                    &RxFlowSpec {
-                        location: loc,
-                        ..flow_spec(r, vf)
-                    },
-                    got,
-                )
-        });
+        let found = plan
+            .rules
+            .iter()
+            .enumerate()
+            .position(|(i, r)| !taken[i] && held_form(r, vf, loc, got).is_some());
         match found {
             Some(i) => {
                 taken[i] = true;
@@ -1970,7 +2405,9 @@ impl crate::runtime::Steering for NtupleSteering {
         let mut written: Vec<(String, u32)> = Vec::new();
         for (iface, vf_index, plan) in &self.targets {
             for rule in &plan.rules {
-                if let Err(InsertError { msg: e, landed }) = insert(iface, rule, *vf_index) {
+                if let Err(InsertError { msg: e, landed, .. }) =
+                    install(&mut self.keep_verdicts, iface, rule, *vf_index)
+                {
                     // All-or-nothing. A partially steered port divides
                     // traffic between the tiers along a line nobody chose,
                     // so back out what landed before reporting the failure
@@ -2090,6 +2527,9 @@ impl crate::runtime::Steering for NtupleSteering {
 
     fn missing_from_nic(&self) -> Result<crate::runtime::SteeringAudit, String> {
         let mut missing = Vec::new();
+        // Ledger locations on a steered port whose rule the NIC no longer
+        // holds intact (`SteeringAudit::gone`).
+        let mut gone = Vec::new();
         let mut read_errors: Vec<String> = Vec::new();
         // Which planned rule each interface has already accounted for.
         // ONE-TO-ONE: a planned rule satisfies at most one location.
@@ -2111,7 +2551,7 @@ impl crate::runtime::Steering for NtupleSteering {
         // this target wants go", and what is left over once every
         // homeless rule has an answer is surplus.
         let mut empty: std::collections::HashMap<&str, Vec<u32>> = std::collections::HashMap::new();
-        let mut occupied: std::collections::HashMap<&str, Vec<(u32, RxFlowSpec)>> =
+        let mut occupied: std::collections::HashMap<&str, Vec<(u32, Held)>> =
             std::collections::HashMap::new();
         let mut unreadable: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
@@ -2129,6 +2569,10 @@ impl crate::runtime::Steering for NtupleSteering {
         // `consumed` above and for the same reason.
         let mut installed_consumed: std::collections::HashMap<String, Vec<bool>> =
             std::collections::HashMap::new();
+        // The form each present keep was read back in, one entry per
+        // keep — the observation `packetframe status` reports, as
+        // opposed to the form this process meant to install.
+        let mut keeps_observed: Vec<(String, KeepForm)> = Vec::new();
 
         for (iface, loc) in &self.installed {
             // `None` = the current target does not steer this port.
@@ -2167,7 +2611,8 @@ impl crate::runtime::Steering for NtupleSteering {
                 // "occupied" rather than claiming the traffic is ours:
                 // silence is the worse error on the rollback path.
                 Ok(()) if member.is_none() => {
-                    if self.install_disowns(iface, *loc, &check.fs, &mut installed_consumed) {
+                    if self.install_disowns(iface, *loc, &Held::of(&check), &mut installed_consumed)
+                    {
                         tracing::debug!(
                             iface,
                             loc,
@@ -2188,18 +2633,27 @@ impl crate::runtime::Steering for NtupleSteering {
                     // `location`, and on an adopted start the planner
                     // chose different slots by construction, so an
                     // unstamped expectation can never match.
-                    let found = plan.rules.iter().enumerate().position(|(i, r)| {
-                        !taken[i]
-                            && audit_matches(
-                                &RxFlowSpec {
-                                    location: *loc,
-                                    ..flow_spec(r, vf)
-                                },
-                                &check.fs,
-                            )
+                    //
+                    // A keep in EITHER form is ours and present: the
+                    // form is a delivery choice, not a different match,
+                    // and a queue-0 keep inherited from an older daemon
+                    // is not missing — it is migrated by the next steer.
+                    // Which form the NIC holds is reported instead
+                    // (`keeps_observed`), so status says so.
+                    let got = Held::of(&check);
+                    let found = plan.rules.iter().enumerate().find_map(|(i, r)| {
+                        if taken[i] {
+                            return None;
+                        }
+                        held_form(r, vf, *loc, &got).map(|form| (i, r.action, form))
                     });
                     match found {
-                        Some(i) => taken[i] = true,
+                        Some((i, action, form)) => {
+                            taken[i] = true;
+                            if action == crate::steer::RuleAction::Keep {
+                                keeps_observed.push((iface.clone(), form));
+                            }
+                        }
                         // Occupied by something this target does not
                         // ask for. WHICH complaint that is cannot be
                         // decided here: if a planned rule is left
@@ -2219,19 +2673,20 @@ impl crate::runtime::Steering for NtupleSteering {
                         // outright, in which case it is not ours at
                         // all and neither complaint applies.
                         None => {
-                            if self.install_disowns(iface, *loc, &check.fs, &mut installed_consumed)
-                            {
+                            if self.install_disowns(iface, *loc, &got, &mut installed_consumed) {
                                 tracing::debug!(
                                     iface,
                                     loc,
                                     "a location this ledger names holds a rule that is \
                                      neither this target's nor the last one's"
                                 );
+                                // Somebody else's rule: ours is gone.
+                                gone.push((iface.clone(), *loc));
                             } else {
                                 occupied
                                     .entry(iface.as_str())
                                     .or_default()
-                                    .push((*loc, check.fs));
+                                    .push((*loc, got));
                             }
                         }
                     }
@@ -2243,6 +2698,7 @@ impl crate::runtime::Steering for NtupleSteering {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if member.is_some() {
                         empty.entry(iface.as_str()).or_default().push(*loc);
+                        gone.push((iface.clone(), *loc));
                     }
                 }
                 // A read that failed says nothing about THIS rule, but
@@ -2310,23 +2766,19 @@ impl crate::runtime::Steering for NtupleSteering {
                 // traffic the allowlist no longer covers — two
                 // independent facts, one of them silently consumed by
                 // the other (review finding).
-                let damaged = occupants.iter().position(|(loc, got)| {
-                    matches(
-                        &RxFlowSpec {
-                            location: *loc,
-                            ..flow_spec(rule, *vf)
-                        },
-                        got,
-                    )
-                });
+                let damaged = occupants
+                    .iter()
+                    .position(|(loc, got)| resembles(rule, *vf, *loc, got));
                 if let Some(k) = damaged {
                     let (loc, _) = occupants.remove(k);
                     missing.push((iface.clone(), loc));
+                    gone.push((iface.clone(), loc));
                 } else if let Some(loc) = slots.pop() {
                     // An empty ledger slot says it plainly: something
                     // was installed here and is gone. No identity to
                     // check — an empty slot has no contents — so this
-                    // stays a positional pairing.
+                    // stays a positional pairing. (Already in `gone`,
+                    // from the read.)
                     missing.push((iface.clone(), loc));
                 } else if unread > 0 {
                     // Explained by a read that failed: not established,
@@ -2337,7 +2789,8 @@ impl crate::runtime::Steering for NtupleSteering {
                     // was never installed — the shape a restart
                     // produces when the allowlist GREW while the daemon
                     // was down. Named by its planned slot, the only
-                    // location it has.
+                    // location it has — and NOT `gone`: that slot can be
+                    // one a rule still installed occupies.
                     missing.push((iface.clone(), rule.location));
                 }
             }
@@ -2366,13 +2819,42 @@ impl crate::runtime::Steering for NtupleSteering {
         // whenever this is `Some`.
         Ok(crate::runtime::SteeringAudit {
             missing,
+            gone,
             stray,
             unreadable: (!read_errors.is_empty()).then(|| read_errors.join("; ")),
+            keeps_observed,
         })
     }
 
     fn installed(&self) -> Vec<(String, u32)> {
         self.installed.clone()
+    }
+
+    /// Ports with keep rules in the ledger, from the last successful
+    /// install's plan, each with the form this process installed them
+    /// in — `None` where no steer in this process has (an adopted
+    /// ledger before its first re-steer).
+    fn keep_forms(&self) -> Vec<KeepPort> {
+        let Some(plans) = &self.installed_as else {
+            return Vec::new();
+        };
+        plans
+            .iter()
+            .filter(|(iface, _, plan)| {
+                plan.rules.iter().any(|r| {
+                    r.action == crate::steer::RuleAction::Keep
+                        && self.installed.contains(&(iface.clone(), r.location))
+                })
+            })
+            .map(|(iface, _, _)| KeepPort {
+                iface: iface.clone(),
+                verdict: self
+                    .keep_verdicts
+                    .iter()
+                    .find(|(i, _)| i == iface)
+                    .map(|(_, v)| v.clone()),
+            })
+            .collect()
     }
 
     /// `installed_as` verbatim, including its absence.
@@ -2385,6 +2867,14 @@ impl crate::runtime::Steering for NtupleSteering {
     /// something else in.
     fn installed_plan(&self) -> Vec<(String, u32, RuleSet)> {
         self.installed_as.clone().unwrap_or_default()
+    }
+
+    /// `targets`, the effective target: what [`Self::steer`] installs,
+    /// with the IPv6 half already withheld while the hand-back path is
+    /// not ready — so a v6 diversion that would not go in does not count
+    /// as one being added.
+    fn target_plan(&self) -> Vec<(String, u32, RuleSet)> {
+        self.targets.clone()
     }
 
     fn retarget(&mut self, targets: Vec<(String, u32, RuleSet)>) {
@@ -3438,6 +3928,66 @@ mod tests {
              alarming on them would cry wolf on every successful unsteer"
         );
         assert_eq!(a.missing, Vec::new(), "and eth0 is still untouched");
+    }
+
+    /// `gone` names only ledger locations whose rule the readback found
+    /// emptied or damaged — never the planned slot of a rule that was
+    /// never installed. A re-plan reclaims our own slots, so the new
+    /// prefix's planned slot here is one the old prefix's rule still
+    /// occupies; named "gone", it made the first-steer hold read that
+    /// installed rule as absent and hold a reconcile that only removes
+    /// (review finding, PR #333).
+    #[test]
+    fn only_rules_the_nic_lost_are_gone_never_a_planned_slot() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let (old, new) = ([198, 51, 100, 0], [192, 0, 2, 0]);
+        let one = plan_for(&[old]);
+        let mut s = steering(vec![("eth0".into(), 0)], one.clone());
+        s.steer().expect("installs the old prefix");
+        let installed = s.installed();
+
+        let grown = plan_for(&[new, old]);
+        let added: Vec<u32> = grown
+            .rules
+            .iter()
+            .filter(|r| !one.rules.iter().any(|o| o.shape == r.shape))
+            .map(|r| r.location)
+            .collect();
+        assert!(
+            added.iter().any(|l| installed.iter().any(|(_, i)| i == l)),
+            "the premise: the new prefix is planned onto a slot the old rule holds \
+             ({added:?} against {installed:?})"
+        );
+        s.retarget(uniform(vec![("eth0".into(), 0)], grown));
+        let a = s.missing_from_nic().expect("read the NIC");
+        assert!(!a.missing.is_empty(), "the new prefix is not installed");
+        assert_eq!(a.gone, Vec::new(), "and nothing installed has gone");
+
+        // Back to the old target, then lose one rule and damage another
+        // behind the module's back: those two ARE gone — the damaged one
+        // disowned against the plan this process installed.
+        s.retarget(uniform(vec![("eth0".into(), 0)], one.clone()));
+        let (emptied, damaged) = (installed[0].1, installed[1].1);
+        sys::remove_behind_back("eth0", emptied);
+        sys::narrow_behind_back("eth0", damaged);
+        let mut want = vec![emptied, damaged];
+        want.sort_unstable();
+        let gone_of = |a: &crate::runtime::SteeringAudit| {
+            let mut gone: Vec<u32> = a.gone.iter().map(|(_, l)| *l).collect();
+            gone.sort_unstable();
+            gone
+        };
+        let a = s.missing_from_nic().expect("read the NIC");
+        assert_eq!(gone_of(&a), want, "{a:?}");
+        assert_eq!(a.missing.len(), 2, "{a:?}");
+
+        // And adopted, with no installed plan to disown against: the
+        // narrowed rule pairs as a damaged copy, gone all the same.
+        let mut adopted = steering(vec![("eth0".into(), 0)], one);
+        adopted.adopt_installed(installed);
+        let a = adopted.missing_from_nic().expect("read the NIC");
+        assert_eq!(gone_of(&a), want, "{a:?}");
     }
 
     /// A prefix dropped from the allowlist leaves SURPLUS, not absence.
@@ -5288,5 +5838,398 @@ mod tests {
              intended but not in place` with an empty config and nothing left to do"
         );
         assert_eq!(sup.state(), State::Ready, "membership without steering");
+    }
+
+    // --- RSS keeps -------------------------------------------------------
+
+    fn keep_v4(addr: [u8; 4], len: u8, loc: u32) -> SteerRule {
+        SteerRule::v4(
+            Ipv4Addr::from(addr),
+            len,
+            Side::Dst,
+            loc,
+            crate::steer::RuleAction::Keep,
+            None,
+        )
+    }
+
+    /// The RSS keep, byte for byte, is the stored form of the rule the
+    /// lab probe inserted on the production firmware (2026-10-07) and
+    /// read back with `RSS Context ID: 0`:
+    /// `ethtool -N <port> flow-type ip4 dst-ip 192.0.2.1 context 0 action
+    /// 0 loc 15`. `FLOW_RSS` (0x2000_0000) in `flow_type`, the match
+    /// identical to the queue-0 keep's, `ring_cookie` 0, and context 0 in
+    /// the `rule_cnt`/`rss_context` union at byte 184 of the request.
+    #[test]
+    fn the_rss_keep_is_the_probed_context_0_rule() {
+        let rule = keep_v4([192, 0, 2, 1], 32, 15);
+        let rss = flow_spec_as(&rule, 0, KeepForm::Rss);
+        let q0 = flow_spec_as(&rule, 0, KeepForm::Queue0);
+        let (w, w0) = (wire(&rss), wire(&q0));
+        assert_eq!(
+            &w[0..4],
+            &0x2000_000du32.to_ne_bytes(),
+            "IP_USER_FLOW | FLOW_RSS"
+        );
+        assert_eq!(
+            &w0[0..4],
+            &0x0000_000du32.to_ne_bytes(),
+            "IP_USER_FLOW alone"
+        );
+        assert_eq!(
+            &w[4..],
+            &w0[4..],
+            "everything but the flag is the queue-0 keep"
+        );
+        assert_eq!(&w[4 + 4..4 + 8], &[192, 0, 2, 1], "ip4dst");
+        assert_eq!(&w[76 + 4..76 + 8], &[0xff; 4], "ip4dst mask: every bit");
+        assert_eq!(&w[76..76 + 4], &[0; 4], "no src");
+        assert_eq!(&w[76 + 8..128], &[0u8; 44][..], "no tos, proto or l4 bytes");
+        assert_eq!(
+            &w[152..160],
+            &[0; 8],
+            "ring_cookie 0: the PF, queue offset 0"
+        );
+        assert_eq!(&w[160..164], &15u32.to_ne_bytes(), "loc 15");
+
+        // The request carries the context outside the spec.
+        assert_eq!(core::mem::offset_of!(Rxnfc, rule_cnt), 184);
+        sys::reset();
+        install(&mut Vec::new(), "eth0", &rule, 0).unwrap_or_else(|e| panic!("{}", e.msg));
+        let got = read_rule("eth0", 15).expect("read").expect("present");
+        assert_eq!(got.fs.flow_type, IP_USER_FLOW | FLOW_RSS);
+        assert_eq!(got.rss_context, KEEP_RSS_CONTEXT);
+
+        // A diversion does not change with the form.
+        let divert = SteerRule {
+            action: crate::steer::RuleAction::Divert,
+            ..rule
+        };
+        assert_eq!(
+            wire(&flow_spec_as(&divert, 0, KeepForm::Rss)),
+            wire(&flow_spec_as(&divert, 0, KeepForm::Queue0))
+        );
+        assert_eq!(
+            flow_spec_as(&divert, 0, KeepForm::Rss).flow_type & FLOW_RSS,
+            0
+        );
+    }
+
+    /// The v6 keeps take the flag the same way and nothing else moves.
+    #[test]
+    fn a_v6_keep_takes_flow_rss_and_keeps_its_l4_match() {
+        for m in [
+            L4Match::Proto(17),
+            L4Match::Port {
+                proto: L4Proto::Tcp,
+                side: Side::Dst,
+                port: 179,
+            },
+        ] {
+            let rule = v6_keep(m, 2);
+            let rss = flow_spec_as(&rule, 0, KeepForm::Rss);
+            let q0 = flow_spec_as(&rule, 0, KeepForm::Queue0);
+            assert_eq!(rss.flow_type, q0.flow_type | FLOW_RSS, "{m:?}");
+            assert_eq!(wire(&rss)[4..], wire(&q0)[4..], "{m:?}");
+        }
+    }
+
+    /// What the NIC returns decides ownership in either form, and the
+    /// audit's comparison holds an RSS keep to its flag AND its context.
+    #[test]
+    fn readback_recognises_both_forms_and_holds_rss_to_its_context() {
+        let rule = keep_v4([198, 51, 100, 0], 24, 3);
+        let held = |form, ctx| Held {
+            fs: flow_spec_as(&rule, 0, form),
+            rss_context: ctx,
+        };
+        assert_eq!(
+            held_form(&rule, 0, 3, &held(KeepForm::Rss, 0)),
+            Some(KeepForm::Rss)
+        );
+        assert_eq!(
+            held_form(&rule, 0, 3, &held(KeepForm::Queue0, 0)),
+            Some(KeepForm::Queue0),
+            "a queue-0 keep is still ours: an older daemon installed it"
+        );
+        assert_eq!(
+            held_form(&rule, 0, 3, &held(KeepForm::Rss, 4)),
+            None,
+            "an RSS keep on another context spreads over other queues: not ours"
+        );
+        assert!(
+            resembles(&rule, 0, 3, &held(KeepForm::Rss, 4)),
+            "but the same rule"
+        );
+        let asked = flow_spec_as(&rule, 0, KeepForm::Rss);
+        assert!(
+            !matches(&asked, &held(KeepForm::Queue0, 0).fs),
+            "the insert readback refuses a keep that lost FLOW_RSS"
+        );
+        assert!(!context_ok(&asked, &held(KeepForm::Rss, 4)));
+        assert!(
+            context_ok(
+                &flow_spec_as(&rule, 0, KeepForm::Queue0),
+                &held(KeepForm::Queue0, 9)
+            ),
+            "a queue-0 keep's union slot means nothing"
+        );
+    }
+
+    fn keeps_and_diverts(ports: &[&str]) -> NtupleSteering {
+        let plan = plan_with_keeps(&[[198, 51, 100, 0]]);
+        let members: Vec<(String, u32)> = ports.iter().map(|p| (p.to_string(), 0)).collect();
+        steering(members, plan)
+    }
+
+    fn keep_locs(s: &NtupleSteering, iface: &str) -> Vec<u32> {
+        use crate::runtime::Steering as _;
+        s.installed_plan()
+            .iter()
+            .filter(|(i, _, _)| i == iface)
+            .flat_map(|(_, _, p)| p.rules.iter())
+            .filter(|r| r.action == crate::steer::RuleAction::Keep)
+            .map(|r| r.location)
+            .collect()
+    }
+
+    /// The capability check is per port: a driver that REFUSES the RSS
+    /// action costs that port its spread and no other. Its keeps land in
+    /// the queue-0 form at the same slots, the verdict names the
+    /// driver's answer, the audit reads everything back clean in the
+    /// form actually installed, and the keeps still sit above every
+    /// diversion.
+    #[test]
+    fn a_port_whose_driver_refuses_rss_falls_back_alone() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        sys::refuse_rss("eth0");
+        let mut s = keeps_and_diverts(&["eth0", "eth1"]);
+        s.steer().expect("the fallback is a steer, not a failure");
+
+        let forms = s.keep_forms();
+        let verdict = |i: &str| {
+            forms
+                .iter()
+                .find(|p| p.iface == i)
+                .and_then(|p| p.verdict.clone())
+                .unwrap_or_else(|| panic!("{i} has keeps: {forms:?}"))
+        };
+        assert_eq!(verdict("eth0").form, KeepForm::Queue0);
+        assert!(
+            verdict("eth0").why.unwrap().contains("refused"),
+            "the reason is the driver's answer"
+        );
+        assert_eq!(
+            verdict("eth1"),
+            KeepVerdict {
+                form: KeepForm::Rss,
+                why: None
+            }
+        );
+        for loc in keep_locs(&s, "eth0") {
+            assert_eq!(sys::flow_type_at("eth0", loc).unwrap() & FLOW_RSS, 0);
+        }
+        for loc in keep_locs(&s, "eth1") {
+            assert_ne!(sys::flow_type_at("eth1", loc).unwrap() & FLOW_RSS, 0);
+        }
+
+        let a = s.missing_from_nic().expect("audit");
+        assert!(a.missing.is_empty() && a.stray.is_empty(), "{a:?}");
+        let n = keep_locs(&s, "eth0").len();
+        assert!(n > 0);
+        let count = |i: &str, f| {
+            a.keeps_observed
+                .iter()
+                .filter(|(p, form)| p == i && *form == f)
+                .count()
+        };
+        assert_eq!(count("eth0", KeepForm::Queue0), n);
+        assert_eq!(count("eth1", KeepForm::Rss), n);
+
+        // Keeps above every diversion (lower location = higher priority),
+        // whatever their form.
+        let plan = &s.installed_plan()[0].2;
+        let max_keep = keep_locs(&s, "eth0").into_iter().max().unwrap();
+        let min_divert = plan
+            .rules
+            .iter()
+            .filter(|r| r.action == crate::steer::RuleAction::Divert)
+            .map(|r| r.location)
+            .min()
+            .unwrap();
+        assert!(max_keep < min_divert);
+
+        s.unsteer().expect("both forms come out");
+        assert!(sys::rules().is_empty(), "{:?}", sys::rules_with_cookies());
+    }
+
+    /// The silent version: the driver takes the RSS rule and stores it
+    /// WITHOUT the flag. Only the readback sees it, and it is a fallback,
+    /// not a refused steer: the rule is rewritten in the queue-0 form
+    /// the NIC was quietly holding anyway, and the port says so.
+    #[test]
+    fn a_driver_that_silently_drops_rss_falls_back_too() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        sys::strip_rss("eth0");
+        let mut s = keeps_and_diverts(&["eth0"]);
+        s.steer().expect("steers");
+        let v = s.keep_forms()[0].verdict.clone().expect("decided");
+        assert_eq!(v.form, KeepForm::Queue0);
+        assert!(v.why.unwrap().contains("without FLOW_RSS"));
+        assert!(s.missing_from_nic().expect("audit").missing.is_empty());
+
+        // Decided once per port: a re-assert installs queue-0 straight
+        // away rather than re-probing.
+        s.steer().expect("re-asserts");
+        assert_eq!(
+            s.keep_forms()[0].verdict.as_ref().unwrap().form,
+            KeepForm::Queue0
+        );
+    }
+
+    /// The fallback is taken only where the RSS action is provably the
+    /// problem. Here the queue-0 retry fails as well (the NIC stores
+    /// something else at the slot), so nothing is decided, the steer
+    /// fails whole, and the rollback leaves the NIC empty.
+    #[test]
+    fn a_fallback_that_also_fails_decides_nothing_and_rolls_back() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        sys::refuse_rss("eth0");
+        let mut s = keeps_and_diverts(&["eth0"]);
+        let plan = s.configured[0].2.clone();
+        let first_keep = plan
+            .rules
+            .iter()
+            .find(|r| r.action == crate::steer::RuleAction::Keep)
+            .expect("keeps")
+            .location;
+        sys::garble_insert(&[first_keep]);
+        let e = s.steer().expect_err("both forms failed");
+        assert!(e.contains("after the RSS form was declined"), "{e}");
+        assert!(s.keep_forms().is_empty(), "no install, no verdict");
+        assert!(s.keep_verdicts.is_empty());
+        assert!(sys::rules().is_empty(), "{:?}", sys::rules_with_cookies());
+    }
+
+    /// An ordinary insert failure on an RSS keep (a full table) is not a
+    /// capability answer and must not flip the port to queue 0.
+    #[test]
+    fn a_full_table_is_not_mistaken_for_a_refused_rss_action() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = keeps_and_diverts(&["eth0"]);
+        let first_keep = s.configured[0]
+            .2
+            .rules
+            .iter()
+            .find(|r| r.action == crate::steer::RuleAction::Keep)
+            .unwrap()
+            .location;
+        sys::wedge_insert(&[first_keep]);
+        s.steer().expect_err("ENOSPC fails the steer");
+        assert!(s.keep_verdicts.is_empty(), "{:?}", s.keep_verdicts);
+    }
+
+    /// An RSS keep moved to another context behind our back delivers to
+    /// that context's queues — not what was asked for, so drift.
+    #[test]
+    fn an_rss_keep_moved_to_another_context_is_reported_missing() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let mut s = keeps_and_diverts(&["eth0"]);
+        s.steer().expect("steers");
+        let loc = keep_locs(&s, "eth0")[0];
+        sys::set_context_behind_back("eth0", loc, 3);
+        assert_eq!(audit(&s), vec![("eth0".to_string(), loc)]);
+        s.steer().expect("the reconcile rewrites it");
+        assert!(audit(&s).is_empty());
+    }
+
+    /// The upgrade path. A daemon from before 0.6.0 left QUEUE-0 keeps,
+    /// and the state file names their slots and plan. The new process
+    /// owns them in every sense that matters — the audit reads them as
+    /// present (and says which form), planning reclaims their slots,
+    /// the first steer rewrites them in place as RSS keeps with no
+    /// duplicate and no orphan, and a teardown in yet another process
+    /// removes them. Nothing is left in the MCAM pinning traffic to
+    /// queue 0.
+    #[test]
+    fn queue0_keeps_from_an_older_daemon_are_ours_and_migrate() {
+        use crate::runtime::Steering as _;
+        sys::reset();
+        let plan = plan_with_keeps(&[[198, 51, 100, 0]]);
+        // The older daemon's install: every rule, keeps in the queue-0
+        // form (`flow_spec` is that encoding).
+        for r in &plan.rules {
+            sys::plant("eth0", flow_spec(r, 0));
+        }
+        let recorded: Vec<(String, u32)> = plan
+            .rules
+            .iter()
+            .map(|r| ("eth0".to_string(), r.location))
+            .collect();
+        let keeps = plan
+            .rules
+            .iter()
+            .filter(|r| r.action == crate::steer::RuleAction::Keep)
+            .count();
+        assert!(keeps > 0);
+
+        let mut s = steering(vec![("eth0".into(), 0)], plan.clone());
+        s.adopt_record(recorded.clone(), vec![("eth0".into(), 0, plan.clone())]);
+        assert_eq!(
+            s.keep_forms(),
+            vec![KeepPort {
+                iface: "eth0".into(),
+                verdict: None
+            }],
+            "inherited: the form is unknown until this process installs"
+        );
+        let a = s.missing_from_nic().expect("audit");
+        assert!(a.missing.is_empty() && a.stray.is_empty(), "{a:?}");
+        assert_eq!(a.keeps_observed.len(), keeps);
+        assert!(a.keeps_observed.iter().all(|(_, f)| *f == KeepForm::Queue0));
+
+        let locs: Vec<u32> = recorded.iter().map(|(_, l)| *l).collect();
+        let table = rule_table_reclaiming("eth0", 0, &locs, Some(&plan)).expect("table");
+        assert!(
+            table.occupied.is_empty(),
+            "queue-0 keeps reclaimed: {:?}",
+            table.occupied
+        );
+
+        s.steer().expect("migrates");
+        assert_eq!(
+            sys::rules().len(),
+            plan.rules.len(),
+            "rewritten in place, no duplicates"
+        );
+        for loc in keep_locs(&s, "eth0") {
+            assert_ne!(
+                sys::flow_type_at("eth0", loc).unwrap() & FLOW_RSS,
+                0,
+                "loc {loc}"
+            );
+        }
+        let a = s.missing_from_nic().expect("audit");
+        assert!(a.keeps_observed.iter().all(|(_, f)| *f == KeepForm::Rss));
+
+        // And a queue-0 keep the migration has not reached yet comes out
+        // of a teardown in another process, by the recorded plan.
+        sys::reset();
+        for r in &plan.rules {
+            sys::plant("eth0", flow_spec(r, 0));
+        }
+        let mut cli = NtupleSteering::new(vec![("eth0".into(), 0)], Vec::new());
+        cli.adopt_record(recorded, vec![("eth0".into(), 0, plan)]);
+        cli.unsteer().expect("unsteer");
+        assert!(
+            sys::rules().is_empty(),
+            "an inherited queue-0 keep left behind pins its traffic to one core forever: {:?}",
+            sys::rules_with_cookies()
+        );
     }
 }

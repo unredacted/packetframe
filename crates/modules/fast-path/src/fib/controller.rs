@@ -32,10 +32,12 @@ use crate::fib::integrity::{
     shared_snapshot, IntegrityChecker, IntegrityConfig, IntegrityPosture, SharedSnapshot,
     DEFAULT_INTERVAL,
 };
+use crate::fib::neigh_supervision::{ResolverStatus, SharedResolverStatus};
 use crate::fib::netlink_neigh::{
     FallbackDefaultSpec, LocalPrefixSpec, NeighborResolveHandle, NetlinkNeighborResolver,
 };
 use crate::fib::programmer::{FibProgrammer, FibProgrammerHandle, ProgrammerError};
+use crate::fib::route_ledger::{RouteLedger, SharedLedgerStatus};
 use crate::fib::route_source_bgp::{BgpListener, BgpListenerConfig};
 use crate::fib::route_source_bmp::BmpStation;
 use packetframe_common::config::IntegrityAuthoritySpec;
@@ -68,6 +70,7 @@ fn spawn_authority(
     snapshot: &SharedSnapshot,
     prog: &FibProgrammerHandle,
     completeness: &Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
+    ledger_status: &SharedLedgerStatus,
     shutdown: &CancellationToken,
     runtime: &Runtime,
     tasks: &mut Vec<JoinHandle<()>>,
@@ -79,8 +82,12 @@ fn spawn_authority(
             if let Some(p) = path {
                 icfg.birdc_path = p.clone();
             }
+            // Both authorities read the ledger status: a seeded mirror
+            // agrees with the route source's count before any session has
+            // spoken to this daemon, and must not be attested on that.
             let mut checker =
-                IntegrityChecker::new(icfg, snapshot.clone(), prog.clone(), shutdown.clone());
+                IntegrityChecker::new(icfg, snapshot.clone(), prog.clone(), shutdown.clone())
+                    .with_ledger_status(ledger_status.clone());
             // The second tier's steering gate reads what this
             // publishes; see `TableCompleteness`.
             if let Some(h) = completeness.clone() {
@@ -116,7 +123,8 @@ fn spawn_authority(
                 peer,
             );
             let mut checker =
-                FrrAuthorityChecker::new(cfg, snapshot.clone(), prog.clone(), shutdown.clone());
+                FrrAuthorityChecker::new(cfg, snapshot.clone(), prog.clone(), shutdown.clone())
+                    .with_ledger_status(ledger_status.clone());
             if let Some(h) = completeness.clone() {
                 checker = checker.with_completeness(h);
             }
@@ -229,6 +237,43 @@ pub struct RouteController {
     /// the BGP listener; removed during `shutdown()` so the route's
     /// lifetime never exceeds the daemon's.
     anyip_addr: Option<Ipv4Addr>,
+    /// The route ledger's status, shared with the programmer and the
+    /// authorities; read by the health and metrics surfaces.
+    ledger_status: SharedLedgerStatus,
+    /// The configured route source's ledger identity, which a preserving
+    /// stop writes into the ledger. `None` with no route source: there is
+    /// nothing a ledger could be matched against.
+    ledger_identity: Option<String>,
+    /// What the neighbour resolver publishes about itself; read by the
+    /// `neigh-resolver` health row and the metrics.
+    neigh_status: SharedResolverStatus,
+}
+
+/// The route ledger, for [`RouteController::start`]: the seed a start
+/// accepted, and where its status is reported.
+pub struct LedgerWiring {
+    /// Seed the mirror from this before serving any route event.
+    pub seed: Option<RouteLedger>,
+    pub status: SharedLedgerStatus,
+    /// See [`RouteController::preserve_route_ledger`].
+    pub identity: Option<String>,
+}
+
+/// What a preserving stop did with the ledger, for the caller's log and
+/// event.
+#[derive(Debug)]
+pub enum Preserved {
+    Written {
+        counts: crate::fib::route_ledger::LedgerCounts,
+        bytes: usize,
+        /// Routes in it that no live session had re-confirmed by the stop
+        /// carry an older confirmation time than the write.
+        confirmed_at_unix: u64,
+        written_at_unix: u64,
+        encode: Duration,
+        write: Duration,
+    },
+    NotWritten(String),
 }
 
 /// The external route feed and the authority the integrity checker
@@ -291,7 +336,13 @@ impl RouteController {
         fdb_pin_chains: std::collections::HashMap<u32, (u32, u16)>,
         route_sink: Option<std::sync::Arc<dyn packetframe_common::fib::ResolvedRouteSink>>,
         signals: SecondTierSignals,
+        ledger: LedgerWiring,
     ) -> Result<Self, ControllerError> {
+        let LedgerWiring {
+            seed,
+            status: ledger_status,
+            identity: ledger_identity,
+        } = ledger;
         let RouteFeed {
             source: route_source,
             integrity_authority,
@@ -353,6 +404,22 @@ impl RouteController {
             programmer.set_route_sink(sink);
             info!("second-tier route sink registered with the FibProgrammer");
         }
+        // The seed, likewise before the programmer runs: it is applied
+        // ahead of every route event, so the route source spawned below
+        // can connect at once — its UPDATEs queue behind the seed rather
+        // than racing it. After the sink, so the second tier hears every
+        // seeded route like any other install.
+        programmer.set_ledger_status(ledger_status.clone());
+        if let Some(seed) = seed {
+            programmer.set_seed(seed);
+            // Told to the second tier before the route source can
+            // connect, through the handle its gates already read: the
+            // mirror is not a table loading from empty. Cleared by the
+            // route source's first GC (`mark_reconciled`).
+            if let Some(h) = &feed_session {
+                h.mark_mirror_seeded();
+            }
+        }
 
         // v0.2.1: enable the connected fast-path when the operator
         // declared at least one `local-prefix`. The resolver gets the
@@ -389,14 +456,16 @@ impl RouteController {
             resolver.with_ix_interfaces(ix_interfaces)
         };
 
-        let resolver_task = runtime.spawn(async move {
-            if let Err(e) = resolver.run().await {
-                // Non-fatal: the controller stays up and the programmer
-                // keeps draining commands. Operators notice via the
-                // Phase 3.5 health report / metrics.
-                warn!(error = %e, "NeighborResolver task exited with error");
-            }
-        });
+        // Every resync and every restarted incarnation tells the
+        // programmer to re-probe what it holds unresolved: the kernel may
+        // have resolved it while the resolver was not listening.
+        let resolver = resolver.with_reprobe_target(prog_handle.clone());
+        let neigh_status = resolver.status();
+        // `run` supervises: it restarts an incarnation that exits or
+        // stops making progress, and returns only at shutdown. Before
+        // 2026-10-07 this spawned one incarnation and logged a single
+        // WARN if it ended — and nothing at all if it hung.
+        let resolver_task = runtime.spawn(resolver.run());
         let programmer_task = runtime.spawn(async move { programmer.run().await });
 
         let mut tasks = vec![resolver_task, programmer_task];
@@ -431,6 +500,7 @@ impl RouteController {
                     &snapshot,
                     &prog_handle,
                     &completeness,
+                    &ledger_status,
                     &shutdown_token,
                     &runtime,
                     &mut tasks,
@@ -514,6 +584,7 @@ impl RouteController {
                     &snapshot,
                     &prog_handle,
                     &completeness,
+                    &ledger_status,
                     &shutdown_token,
                     &runtime,
                     &mut tasks,
@@ -609,6 +680,13 @@ impl RouteController {
                     let shut = shutdown_token.clone();
                     tasks.push(runtime.spawn(async move {
                         let mut tick = tokio::time::interval(ANYIP_RECONCILE_INTERVAL);
+                        // One reconcile is a netlink round trip that can
+                        // wait on `rtnl_lock` for longer than the interval.
+                        // After one that ran late, the next is due a full
+                        // interval on, not at once: the default `Burst`
+                        // would replay every missed tick back to back,
+                        // into the same contended lock.
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
                             tokio::select! {
                                 _ = shut.cancelled() => return,
@@ -670,7 +748,93 @@ impl RouteController {
                 packetframe_common::config::IntegrityAuthoritySpec::None
             ),
             anyip_addr: anyip_installed,
+            ledger_status,
+            ledger_identity,
+            neigh_status,
         })
+    }
+
+    /// The route ledger's status, for the health and metrics surfaces.
+    pub fn ledger_status(&self) -> &SharedLedgerStatus {
+        &self.ledger_status
+    }
+
+    /// The neighbour resolver's status, for the health and metrics
+    /// surfaces. A snapshot: one read, so the row and the gauges agree.
+    pub fn neigh_resolver_status(&self) -> ResolverStatus {
+        self.neigh_status.snapshot()
+    }
+
+    /// Write the mirror's route-source advertisements to `state_dir` as
+    /// the route ledger, for the next start to seed from.
+    ///
+    /// Only on the preserving exit (`Module::exit_preserving`), before the
+    /// controller is dropped. The programmer snapshots the mirror on its
+    /// own task, so the record is one consistent moment. The snapshot and
+    /// the write (temp file, fsync, rename) share one deadline,
+    /// [`crate::fib::route_ledger::PRESERVE_BUDGET`] from the call: this
+    /// is the loader's signal thread, and neither a wedged programmer nor
+    /// a wedged filesystem may hold the exit past it. Past it nothing is
+    /// renamed into place ([`crate::fib::route_ledger::write_within`]) and
+    /// the next start loads cold, which is what every start did before; a
+    /// stop that dies mid-write likewise leaves no record rather than half
+    /// of one.
+    pub fn preserve_route_ledger(&self, state_dir: &Path) -> Preserved {
+        use crate::fib::route_ledger::{now_unix, write_within, PRESERVE_BUDGET};
+        let Some(identity) = self.ledger_identity.clone() else {
+            return Preserved::NotWritten(
+                "no route source is configured, so no start could ever match a ledger".into(),
+            );
+        };
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Preserved::NotWritten("the control plane has already shut down".into());
+        };
+        let prog = self.prog_handle.clone();
+        let written_at_unix = now_unix();
+        let started = Instant::now();
+        let deadline = started + PRESERVE_BUDGET;
+        let encoded = runtime.block_on(async move {
+            tokio::time::timeout(
+                PRESERVE_BUDGET,
+                prog.encode_ledger(identity, written_at_unix),
+            )
+            .await
+        });
+        let encoded = match encoded {
+            Err(_) => {
+                return Preserved::NotWritten(format!(
+                    "the programmer did not snapshot the mirror within {} s",
+                    PRESERVE_BUDGET.as_secs()
+                ))
+            }
+            Ok(Err(why)) => return Preserved::NotWritten(why),
+            Ok(Ok(e)) => e,
+        };
+        let encode = started.elapsed();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Preserved::NotWritten(format!(
+                "the snapshot used the whole {} s budget, leaving none for the write",
+                PRESERVE_BUDGET.as_secs()
+            ));
+        }
+        let (counts, bytes, confirmed_at_unix) = (
+            encoded.counts,
+            encoded.bytes.len(),
+            encoded.confirmed_at_unix,
+        );
+        let started = Instant::now();
+        if let Err(e) = write_within(state_dir, encoded.bytes, remaining) {
+            return Preserved::NotWritten(e);
+        }
+        Preserved::Written {
+            counts,
+            bytes,
+            confirmed_at_unix,
+            written_at_unix,
+            encode,
+            write: started.elapsed(),
+        }
     }
 
     /// The last integrity check, for the module's health surface.

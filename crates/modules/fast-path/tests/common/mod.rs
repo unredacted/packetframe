@@ -684,7 +684,7 @@ impl Harness {
     /// bytes). The kernel may have mutated the packet (L2 rewrite, TTL
     /// decrement) on XDP_REDIRECT; the output buffer reflects that.
     pub fn run(&self, packet: &[u8]) -> (u32, Vec<u8>) {
-        let (retval, _duration, out) = test_run_xdp_repeat(self.fast_path_fd(), packet, 1);
+        let (retval, _duration, out) = self.test_run_fast_path(packet, 1);
         (retval, out)
     }
 
@@ -739,8 +739,19 @@ impl Harness {
     /// measure the `PassLowTtl` path instead. Each new syscall starts
     /// from the pristine `packet` again.
     pub fn run_timed(&self, packet: &[u8], repeat: u32) -> (u32, u32) {
-        let (retval, duration, _out) = test_run_xdp_repeat(self.fast_path_fd(), packet, repeat);
+        let (retval, duration, _out) = self.test_run_fast_path(packet, repeat);
         (retval, duration)
+    }
+
+    /// TEST_RUN `fast_path`, one XDP run at a time per process: see
+    /// [`XDP_DISPATCHER`].
+    fn test_run_fast_path(&self, packet: &[u8], repeat: u32) -> (u32, u32, Vec<u8>) {
+        // A failed run panics holding the guard; the lock guards no data,
+        // so the poison must not fail every later test too.
+        let _alone = XDP_DISPATCHER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        test_run_xdp_repeat(self.fast_path_fd(), packet, repeat)
     }
 
     fn fast_path_fd(&self) -> i32 {
@@ -922,6 +933,18 @@ struct TestRunAttr {
 }
 
 const BPF_PROG_TEST_RUN: u32 = 10;
+
+/// Held across every XDP TEST_RUN in the process (all of them go through
+/// `Harness::test_run_fast_path`). On 5.15 each one adds its program to
+/// the kernel's XDP dispatcher before running and removes it after,
+/// live-patching `bpf_dispatcher_xdp_func` both times (5.16+ patches
+/// only for `repeat > 1`), and before 6.2 no update waits for a CPU
+/// still running through the dispatcher. Parallel test threads thus
+/// patched it under each other: the 5.15 qemu guest oopsed on the `int3`
+/// at its patch site, in a thread mid-TEST_RUN. One run at a time leaves
+/// no CPU inside it while another patches. x86 only (arm64 builds no
+/// dispatcher image); tc's TEST_RUN never touches it.
+static XDP_DISPATCHER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Returns `(retval, duration_ns, data_out)`. `duration_ns` is the
 /// kernel's mean nanoseconds per iteration across `repeat` runs.

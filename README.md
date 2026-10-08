@@ -183,7 +183,7 @@ module fast-path
   circuit-breaker drop-ratio 0.01 of matched window 5s threshold 5
 ```
 
-- `attach` names each interface. `auto` tries native XDP and falls back to generic, and picks generic on drivers with known native-mode bugs (see [XDP modes and drivers](#xdp-modes-and-drivers)).
+- `attach` names each interface. `auto` tries native XDP and falls back to generic, and picks generic on drivers with known native-mode bugs (see [XDP modes and drivers](#xdp-modes-and-drivers)). Allowlisted traffic arriving on an attached interface is forwarded without passing through netfilter, so attach only interfaces that carry traffic you mean to forward. PacketFrame refuses to attach keepalived's dedicated VRRP link: a `vrrp_instance`'s interface that carries none of the instance's virtual addresses, directly or through a VLAN or bridge over it.
 - `dry-run on` counts matches but always returns `XDP_PASS`, so the kernel keeps forwarding everything.
 - `circuit-breaker` detaches the fast path when unreachable plus FIB-error drops exceed 1% of matched packets for five consecutive 5-second samples.
 

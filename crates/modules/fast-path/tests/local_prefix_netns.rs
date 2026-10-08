@@ -14,6 +14,10 @@
 //! CAP_NET_ADMIN + CAP_SYS_ADMIN and assert on exactly the events the
 //! resolver emits.
 //!
+//! The `fallback-default` 0.0.0.0/0 is covered here too: the resolver
+//! injects it through the same handle under the same per-iface
+//! `local_arp` peer, so its lifecycle is tied to the same link events.
+//!
 //! Setup utilities are copied from `tests/netns.rs` /
 //! `neigh_resolver_netns.rs` rather than shared, per the convention
 //! documented there: each `tests/*.rs` is its own crate and cannot
@@ -23,7 +27,7 @@
 
 use std::ffi::CString;
 use std::fs::File;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::Command;
 use std::time::Duration;
@@ -31,8 +35,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, RouteEvent};
-use packetframe_fast_path::fib::netlink_neigh::{LocalPrefixSpec, NetlinkNeighborResolver};
-use packetframe_fast_path::fib::programmer::{recording_handle, RouteEventLog};
+use packetframe_fast_path::fib::netlink_neigh::{
+    FallbackDefaultSpec, LocalPrefixSpec, NetlinkNeighborResolver,
+};
+use packetframe_fast_path::fib::programmer::{
+    recording_handle, FibProgrammerHandle, RouteEventLog,
+};
 
 // --- Test setup utilities (copied from tests/netns.rs) -----------------
 
@@ -40,6 +48,9 @@ struct Names {
     netns: String,
     veth_a: String,
     veth_b: String,
+    /// Not created by `NetnsGuard::setup`; the `fallback-default` tests
+    /// create and delete it themselves.
+    fallback: String,
 }
 
 static NAMES_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
@@ -53,6 +64,7 @@ impl Names {
             netns: format!("pfln{suffix}"),
             veth_a: format!("pfla{suffix}"),
             veth_b: format!("pflb{suffix}"),
+            fallback: format!("pflf{suffix}"),
         }
     }
 }
@@ -207,6 +219,16 @@ fn collect_events(
     specs: Vec<LocalPrefixSpec>,
     body: impl FnOnce(&str),
 ) -> (Vec<RouteEvent>, Vec<NeighEvent>) {
+    collect_events_with(netns, |r, prog| r.with_local_prefixes(specs, prog), body)
+}
+
+/// [`collect_events`] with the resolver's configuration left to the
+/// caller, for tests that need more than `with_local_prefixes`.
+fn collect_events_with(
+    netns: &str,
+    configure: impl FnOnce(NetlinkNeighborResolver, FibProgrammerHandle) -> NetlinkNeighborResolver,
+    body: impl FnOnce(&str),
+) -> (Vec<RouteEvent>, Vec<NeighEvent>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -217,11 +239,9 @@ fn collect_events(
         let (resolver, mut events_rx, _resolve_handle) =
             NetlinkNeighborResolver::new(shutdown.clone());
         let (prog, log): (_, RouteEventLog) = recording_handle();
-        let resolver = resolver.with_local_prefixes(specs, prog);
+        let resolver = configure(resolver, prog);
 
-        let task = tokio::spawn(async move {
-            let _ = resolver.run().await;
-        });
+        let task = tokio::spawn(resolver.run());
 
         // Let the RTM_GETLINK / RTM_GETNEIGH dumps land and the
         // multicast socket bind before mutating neighbour state.
@@ -752,4 +772,180 @@ fn local_prefix6_registers_a_snooped_stale_global() {
         )),
         "the STALE entry must resolve the host with the snooped MAC; got {neigh_events:?}"
     );
+}
+
+// --- fallback-default --------------------------------------------------
+
+const FALLBACK_NEXTHOP: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 1);
+
+fn iface_exists(name: &str) -> bool {
+    let c = CString::new(name).expect("iface name with NUL");
+    unsafe { libc::if_nametoindex(c.as_ptr()) != 0 }
+}
+
+/// The iface the tests point `fallback-default` at. A fixed `02:` MAC
+/// rather than the kernel's random one.
+fn add_dummy(netns: &str, name: &str) {
+    ns_run(
+        netns,
+        &[
+            "ip",
+            "link",
+            "add",
+            name,
+            "address",
+            "02:00:00:00:fd:01",
+            "type",
+            "dummy",
+        ],
+    );
+}
+
+fn is_v4_default(prefix: &IpPrefix) -> bool {
+    prefix_to_ip(prefix) == (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+}
+
+/// The `0.0.0.0/0` advertisements a programmer would hold after
+/// `events`, as `(peer, nexthops)`. Replayed rather than searched for:
+/// an `Add` that a later `PeerDown` for its peer withdrew is not a
+/// default the FIB holds, and that (seed `Add`, `PeerDown`, nothing
+/// after) is exactly the log a lost default leaves.
+fn defaults_held(events: &[RouteEvent]) -> Vec<(PeerId, Vec<IpAddr>)> {
+    let mut held: Vec<(PeerId, Vec<IpAddr>)> = Vec::new();
+    for e in events {
+        match e {
+            RouteEvent::Add {
+                peer_id,
+                prefix,
+                nexthops,
+                ..
+            } if is_v4_default(prefix) => {
+                held.retain(|(p, _)| p != peer_id);
+                held.push((*peer_id, nexthops.clone()));
+            }
+            RouteEvent::Del {
+                peer_id, prefix, ..
+            } if is_v4_default(prefix) => held.retain(|(p, _)| p != peer_id),
+            RouteEvent::PeerDown { peer_id } => held.retain(|(p, _)| p != peer_id),
+            _ => {}
+        }
+    }
+    held
+}
+
+/// The `fallback-default` iface does not exist when the resolver
+/// starts, so the startup seed cannot inject the /0. The iface's
+/// `RTM_NEWLINK` must, or the default is missing for the daemon's life.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn fallback_default_injected_when_its_iface_appears_after_startup() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let _nsfd = enter_netns(&names.netns);
+    assert!(
+        !iface_exists(&names.fallback),
+        "precondition: {} must be absent at startup",
+        names.fallback
+    );
+
+    let spec = FallbackDefaultSpec {
+        iface: names.fallback.clone(),
+        nexthop: FALLBACK_NEXTHOP,
+    };
+    let (events, _) = collect_events_with(
+        &names.netns,
+        |r, prog| r.with_fallback_default(spec, prog),
+        |ns| add_dummy(ns, &names.fallback),
+    );
+    let ifindex = if_nametoindex(&names.fallback);
+
+    assert_eq!(
+        defaults_held(&events),
+        vec![(
+            PeerId::local_arp(ifindex),
+            vec![IpAddr::V4(FALLBACK_NEXTHOP)]
+        )],
+        "the iface's RTM_NEWLINK must inject the /0 under its peer; got {events:?}"
+    );
+}
+
+/// The `fallback-default` iface is deleted and recreated under the same
+/// name, as when the platform rebuilds a link (a new ifindex). The
+/// `RTM_DELLINK` `PeerDown` withdraws the /0 with the rest of the
+/// iface's `local_arp` peer; the recreated iface's `RTM_NEWLINK` must
+/// put it back under the new peer, or the eBPF FIB and the route sink
+/// lose the default until restart.
+fn fallback_default_survives_iface_recreate(local_prefix_too: bool) {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let _nsfd = enter_netns(&names.netns);
+    add_dummy(&names.netns, &names.fallback);
+    let old_ifindex = if_nametoindex(&names.fallback);
+
+    let spec_fd = FallbackDefaultSpec {
+        iface: names.fallback.clone(),
+        nexthop: FALLBACK_NEXTHOP,
+    };
+    let local = vec![spec("192.0.2.0", 24, &names.fallback)];
+    let (events, _) = collect_events_with(
+        &names.netns,
+        // Builder order as in `controller.rs`.
+        |r, prog| {
+            let r = if local_prefix_too {
+                r.with_local_prefixes(local, prog.clone())
+            } else {
+                r
+            };
+            r.with_fallback_default(spec_fd, prog)
+        },
+        |ns| {
+            ns_run(ns, &["ip", "link", "del", &names.fallback]);
+            add_dummy(ns, &names.fallback);
+        },
+    );
+    let new_ifindex = if_nametoindex(&names.fallback);
+
+    // Both halves of the premise, or this run never exercised the
+    // re-injection: the seed installed the /0, and the deletion
+    // withdrew it.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            RouteEvent::Add { peer_id, prefix, .. }
+                if *peer_id == PeerId::local_arp(old_ifindex) && is_v4_default(prefix)
+        )),
+        "the startup seed must inject the /0 under local_arp({old_ifindex}); got {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            RouteEvent::PeerDown { peer_id } if *peer_id == PeerId::local_arp(old_ifindex)
+        )),
+        "RTM_DELLINK must withdraw local_arp({old_ifindex}); got {events:?}"
+    );
+    assert_eq!(
+        defaults_held(&events),
+        vec![(
+            PeerId::local_arp(new_ifindex),
+            vec![IpAddr::V4(FALLBACK_NEXTHOP)]
+        )],
+        "the recreated iface's RTM_NEWLINK must re-inject the /0 after the \
+         PeerDown, under local_arp({new_ifindex}); got {events:?}"
+    );
+}
+
+/// The production shape: a `local-prefix` on the same iface, which is
+/// what made `RTM_DELLINK` emit the `PeerDown` in the first place.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn fallback_default_reinjected_after_iface_recreate_with_local_prefix() {
+    fallback_default_survives_iface_recreate(true);
+}
+
+/// `fallback-default` alone: the /0 follows its iface the same way, so
+/// the stale peer's copy is withdrawn rather than left beside the new.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn fallback_default_reinjected_after_iface_recreate_alone() {
+    fallback_default_survives_iface_recreate(false);
 }

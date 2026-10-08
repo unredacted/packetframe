@@ -85,6 +85,7 @@ running badly.
 - [Everyday inspection commands](#everyday-inspection-commands)
 - [The canary ladder](#the-canary-ladder)
 - [Rollback](#rollback)
+- [The first-steer hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table)
 - [The adopted-reconciliation release gate](#the-adopted-reconciliation-release-gate-what-it-needs-and-when-it-refuses)
 - [What a keep-vpp restart costs now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)
 - [Rung 0 for IPv6: `v6 on`](#rung-0-for-ipv6-v6-on)
@@ -93,6 +94,7 @@ running badly.
 - [Triage by symptom](#triage-by-symptom)
 - [Numbers: measured vs published-on-faith](#numbers-measured-vs-published-on-faith)
 - [Install and upgrade on the router](#install-and-upgrade-on-the-router)
+- [The kernel path for exempt traffic](#the-kernel-path-for-exempt-traffic)
 - [IRQ affinity before attach](#irq-affinity-before-attach)
 - [Constraints worth knowing before you debug](#constraints-worth-knowing-before-you-debug)
 
@@ -225,7 +227,7 @@ module health (pid 12345, 3s old):
   vpp-offload: healthy
     vpp-process    healthy
     api-ping       healthy (last ok 0s ago)
-    fib-synced     healthy — 1053360 routes installed, verified on 64 probes (last ok 41s ago)
+    fib-synced     healthy — 1053360 routes installed; last verified on 64 probes against 1053360 routes (last ok 41s ago)
     steering       healthy
     ports          healthy
 ```
@@ -241,7 +243,7 @@ whenever their feature is: `fib-v6` under `v6 on`, and `v6-handback`
 while the hand-back path is wanted or built — so the reference router,
 steered for both families, shows seven.
 
-Two of the five rows are worth understanding rather than glancing at.
+Three of the five rows are worth understanding rather than glancing at.
 
 **`module health: STALE`** means the daemon that wrote the snapshot is
 gone. The report below it is history. The dataplane may well still be
@@ -258,7 +260,22 @@ down by trouble and not yet restored. From `Ready` that line also names
 the module's own retry — a refused steer is re-attempted at most every
 30 s once nothing is refusing it — so it is worth reading twice before
 reaching for `reconfigure`: if it is still there a minute later, the
-refusal is still standing and the reason is what to chase.
+refusal is still standing and the reason is what to chase. When it goes
+on `Held now because …`, the reason is the [first-steer
+hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table)
+and carries its own numbers; the staging line `awaiting an operator
+lever move` says the same thing ahead of the lever (`A lever move now
+would be held …`).
+
+**`fib-synced healthy — N routes installed; last verified on 64 probes
+against M routes`** names the table the last verify drew its probes
+from. Read M against N. Within about 10% of each other, the verdict
+covers the table. When it does not — a verify taken before the table
+loaded — the row reads `DEGRADED — N routes installed, but the last
+verify ran on P probes against M routes …`, a first steer is held, and
+verify re-runs on its own once VPP has caught up. On 2026-10-07 this row
+read `healthy — 666382 routes installed; last verified on 1 probes` and
+a lever move was admitted on it.
 
 And the overall verdict is deliberately **not** the maximum of the
 subsystems. Health tracks whether packets are forwarded correctly, not
@@ -289,10 +306,13 @@ current value without a mapping table:
 | `packetframe_vpp_exempt_drift` | `> 0` — a kernel path VPP cannot take has no `steer-exempt`; steered traffic for it is (or will be) blackholed. ALSO alarm on `absent()` while attached: the gauge is omitted, never zeroed, when the scan cannot read the kernel |
 | `packetframe_vpp_exempt_drift_v6` | `> 0` — an IPv6 kernel path VPP cannot take while a port carries `v6-divert`; diverted v6 for it is (or will be) blackholed. Present ONLY while some port carries `v6-divert` under `v6 on`, so alarm on `absent()` only on boxes configured that way: it is omitted, never zeroed, when the v6 scan cannot read. Counts only findings no `drift-accept6` covers |
 | `packetframe_vpp_exempt_drift_v6_accepted` | not an alarm — v6 findings a `drift-accept6` covers (still blackholed if diverted). Present exactly when the series above is; a step up means a new route appeared under an accepted prefix |
+| `packetframe_vpp_drift_scan_ms` | informational — wall time of the latest drift scan; absent until one finishes. A sustained rise means the kernel's tables grew or its routing lock is contended. See [The exemption tripwire](#the-exemption-tripwire-exempt-drift) |
 | `packetframe_vpp_neighbours_unplaced` | `> 0` — a bridge neighbour the kernel FDB has not placed behind any member port; routes through it are unresolvable |
 | `packetframe_vpp_neighbour_moves` | a step — spanning tree moved neighbours between trunks and VPP followed; worth correlating with switch events |
+| `packetframe_vpp_kernel_path_dropping{port}` | `1` — a steered port's PF is dropping exempt traffic in the kernel's receive (`packetframe_vpp_kernel_rx_drops_per_second` at 100/s or more). See [the kernel path for exempt traffic](#the-kernel-path-for-exempt-traffic) |
+| `packetframe_vpp_keep_rss{port}` | `0` is not an alarm by itself — that port's driver declined RSS keeps, so its exempt traffic lands on PF queue 0 (`packetframe_vpp_queue0_irq_cpu` says where that queue's IRQ was placed). Watch `packetframe_vpp_kernel_rx_fps{queue="0"}` against `{queue="all"}` on it |
 | `packetframe_vpp_undead` | `1` — a killed VPP survived and blocks the restart |
-| `packetframe_vpp_api_silent_seconds` | approaching the wedge budget (1.5 s steered) |
+| `packetframe_vpp_api_silent_seconds` | approaching the wedge budget (1.5 s steered). It can pass the budget without a teardown just after the supervision loop itself stalled, because that time is not counted ([why](#a-teardown-with-causewedged)) |
 | `packetframe_vpp_glean_sent{family}` / `packetframe_vpp_glean_throttled{family}` | informational, never a health input — cumulative; watch the RATE. See [Glean and ARP counters](#glean-and-arp-counters) for normal vs a scan |
 | `packetframe_vpp_arp_replies_sent` | informational — a step on a box whose `loopback-address` nobody should be asking for |
 
@@ -540,14 +560,17 @@ exits 2. A fast-path edit alongside a withdrawn vpp-offload change is
 live; re-running the same config re-applies every module, which
 changes nothing for the ones that already landed.
 
-Not in effect is not the same as forgotten. A steer refused by either
-gate — the completeness verdict, or a FIB still holding withheld,
-unresolvable or in-flight routes — leaves the *ask* recorded, and the
-module re-attempts it on its own once the refusal clears, at most every
-30 s. The refusal message says so when that is what will happen. What
-it never does is report success for something that has not taken
-effect, which is the property this rung depends on: read the answer,
-then confirm with `ethtool -n` before moving to the next rung.
+Not in effect is not the same as forgotten. A steer refused by any
+gate — the completeness verdict, a FIB still holding withheld,
+unresolvable or in-flight routes, or the [first-steer
+hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table)
+(VPP still behind the route mirror, or a verify that does not cover the
+table) — leaves the *ask* recorded, and the module re-attempts it on its
+own once the refusal clears, at most every 30 s. The refusal message
+says so when that is what will happen. What it never does is report
+success for something that has not taken effect, which is the property
+this rung depends on: read the answer, then confirm with `ethtool -n`
+before moving to the next rung.
 
 Then watch actual traffic, not counters: PMTUD in particular. A DF
 packet larger than the MTU through a steered path must come back as a
@@ -636,7 +659,11 @@ the MCAM budget does not block it. The budget check
 only applies when rules are about to be installed, because `unsteer`
 removes what the ledger names and never consults the plan. An allowlist
 growing past the budget is a plausible route to wanting exactly this
-rollback, and it must not be the thing that prevents it.
+rollback, and it must not be the thing that prevents it. The same goes
+for the [first-steer
+hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table):
+it judges steers that put traffic ONTO VPP, and a `steer off` takes it
+off, whatever VPP's backlog or the age of its verify.
 
 If you need the whole vector gone:
 
@@ -650,7 +677,10 @@ unbinds the VFs and restores hugepages. If it refuses, read the message:
 a rule the NIC would not delete leaves traffic diverted at a VF the
 teardown is about to unbind, so it stops rather than blackholing. The
 state file names exactly which rules remain; clear them by hand
-(`ethtool -N <iface> delete <loc>`) and re-run.
+(`ethtool -N <iface> delete <loc>`) and re-run. A state file it cannot
+vouch for (another account could have written it, or it is past the
+size bound) is refused before anything is touched; see
+[Attach or `detach` refuses](#attach-or-detach-refuses-refusing-vpp-offloadjson-).
 
 It reads each recorded location back before deleting it, and a location
 the NIC will not describe counts as a refusal — the same message, and
@@ -690,6 +720,208 @@ ethtool -N eth5 delete <loc>
 Only reachable on the first teardown after upgrading a **steered** box.
 Once a steer has run under a build that writes `steer_plans`, the record
 is complete.
+
+## The first-steer hold: VPP caught up, and a verify that covers the table
+
+**The incident (2026-10-07).** After an outage the daemon was restarted
+with `detach --keep-vpp`. The VPP it adopted had never been steered, and
+its FIB held almost nothing: the previous daemon's VPP had been
+mid-sync. Twenty seconds in, `packetframe status` read `fib-synced
+healthy — 20424 routes installed; last verified on 1 probes`. Nine
+minutes later, with the completeness authority attesting the mirror and
+VPP still installing the reload (`666382 routes installed`), the lever
+was moved and steering came up at once. VPP finished filling about ten
+minutes after that, at 1,095,605 IPv4 routes. Until then, steered
+traffic for every prefix VPP did not hold yet followed a less specific
+VPP route or was dropped.
+
+Two things let it through:
+
+- **The verify covered one route.** An unsteered adoption defers its
+  diff only behind half the adopted table and a quiet source ([the
+  unsteered diff](#the-unsteered-diff-and-a-seeded-mirror)). Half of an
+  almost empty FIB is one route, and a feed that has not connected yet
+  is perfectly quiet, so the diff ran against a mirror holding next to
+  nothing and verify sampled what was installed: one route. The verdict
+  was right about the table it saw, and nothing looked again once the
+  table loaded.
+- **The lever never asked whether VPP had caught up.** The module's own
+  retry has always refused while the route source holds changes VPP has
+  not received. The lever went through the FIB gate (withheld,
+  unresolvable and in-flight, all zero between drains) and the
+  completeness gate (the authority against the *mirror*, which was
+  full), and neither can see a backlog at the source.
+
+**What a steer that diverts more traffic onto VPP needs now** (which
+steers those are is below), on top of the completeness, FIB and link
+gates:
+
+1. **VPP has caught up with the route mirror.** The route changes the
+   route source still holds plus what the engine has pulled and not sent
+   are no more than a quiet source produces in a second — 64 on a small
+   table, about 1,300 on a full one — the source holds **no** neighbour
+   change at all, and the last attempt to apply updates landed. Not zero
+   route changes, because a live feed always has a few in flight between
+   two drains; a reload is orders of magnitude past it (its last few
+   hundred pass, and reach VPP within a drain or two). Zero neighbour
+   changes, because one moves the adjacency of every route through that
+   next hop, and verify cannot see a stale adjacency. A neighbour report
+   that changes nothing is not a change: the kernel reports every NUD
+   transition of a next hop (`REACHABLE` → `STALE` → `DELAY` →
+   `REACHABLE`), and one carrying the MAC and device VPP already has is
+   not queued, so a BGP peer cycling its neighbour state does not hold
+   the lever. A moved MAC, a moved device or a loss still is a change.
+2. **A verify vouches for the table being steered.** The last verify
+   drew the standard 64 probes (or every route, on a table smaller than
+   that) from a table at least 90% the size of the IPv4 table installed
+   now, and found no mismatch. Ordinary churn stays well inside that —
+   a full table grows about 10% a year — so the verdict a convergence
+   takes still covers any lever move a canary ladder makes.
+
+**Which steers it judges: any that diverts more traffic onto VPP.** The
+first steer (nothing in the NIC yet), and equally a change to ports
+already steered that adds a port, a prefix, a direction, a receive MAC
+or a `v6-divert`, or widens a prefix — the canary ladder's second rung
+moved during a reload diverts into the same behind-and-unverified VPP
+the first would have. So does removing or narrowing a `steer-exempt` or
+a `steer-keep6` on a port that goes on diverting: those rules take their
+matches back to the kernel, and dropping one puts that traffic onto VPP.
+It is judged by coverage, not by identical rules: a prefix narrowed
+inside one already diverted, or an exemption widened, adds nothing and
+is not held; a match only several installed rules cover between them
+counts as new. So does re-asserting rules the last NIC readback found
+wiped or altered (a provisioning push), since they divert nothing until
+they are back, and rules a failed reconcile rolled out of the NIC, which
+count as not installed even though the last steer that landed planned
+them. The change is judged against what the NIC is doing now, after the
+[hand-back path](#the-hand-back-path) has set the IPv6 gate, so a
+`v6-divert` whose path turns ready inside the same steer is judged with
+the rest.
+The operator's lever, the module's own retry and a convergence
+re-steering a remembered want all pass through it. A change that
+diverts the same or less is never held (refusing it would leave the
+previous rules installed), and `steer off` never is.
+
+Rules in the NIC with no recorded plan — a state file from before plans
+were kept, or what a failed first steer's rollback could not delete —
+are judged by the one identity the record keeps, port and MCAM location:
+a diversion at a location those rules hold is taken as already there,
+one anywhere else as new. Turning a port off is still a removal there,
+and a retry of the first steer those rules are left from is not held for
+them. A location cannot say more, so in that state a removed exemption
+reads as a removal and a slot re-planned to a different rule as
+unchanged, until the next steer that lands records a plan.
+
+A held addition changes nothing in the NIC: the ports already steered
+keep exactly the rules they have and go on forwarding — including any
+rule the same change would have removed. A removal that cannot wait
+for the hold goes on its own: apply it in a change that adds nothing.
+
+**A hold is not a failure.** Nothing was attempted, so nothing rolled
+back and nothing moved: a port already steered keeps its rules and its
+traffic on VPP (`packetframe_vpp_steered` stays `1`), and the journal
+and event log record a `steer_held` event — never `steer_failed`, which
+would say traffic is on the eBPF tier while it is still on VPP. A
+change held over a box in `steered` leaves it in `steered`. The one
+exception is the re-assert a convergence makes over a steered
+adoption: that runs from `ready`, as every re-assert does until it
+lands, so if it is held (rare — rules with no recorded plan, a changed
+receive MAC, rules a readback found wiped) `packetframe_vpp_state` reads
+`ready` while `packetframe_vpp_steered` reads `1` and traffic is on
+VPP, until the retry lands it; the `steering` row names the hold either
+way. `packetframe reconfigure` still answers with the hold's words
+rather than OK, so a canary ladder does not read a held rung as taken.
+The module's retry re-attempts the held change from `steered` as it
+does from `ready`, and over rules a steer landed it skips the
+first-steer FIB gate (unresolvable, withheld, unexempted kernel-delivered
+or still-installing routes), as the lever does for a port already
+steered. A `steer off`, an emptied table or a VPP death in the meantime
+unsteers exactly as it would without one.
+
+**When it refuses**, the want is remembered, as for every other gate,
+and what clears it depends on the half that refused:
+
+- *VPP behind*: nothing to do. The drain catches up on its own, and the
+  steer lands on the next retry, at most 30 s later.
+- *The verdict outgrown*: verify [re-runs on its
+  own](#the-re-run-a-stale-verdict) about ten seconds after VPP has caught
+  up on routes and the table holds no unresolvable route — however
+  recently it last re-ran, unless that re-run could not reach VPP — and
+  the retry steers on the new verdict. Nobody moves the lever again.
+- *A mismatch*: the last verify found VPP disagreeing with the ledger.
+  Waiting does not clear that, a mismatch is never re-run (a fresh sample
+  can miss what this one caught), and the remembered want will not steer
+  by itself. Restart the daemon — `systemctl restart packetframe`, or
+  the `detach --keep-vpp` sequence: the stopping daemon will not preserve
+  a route ledger a verify has disproved, so the next start reads VPP's
+  FIB instead of seeding the disagreement back in, and its resync corrects
+  what VPP holds before it verifies. A port that was never steered starts
+  that adoption with no want, so move its lever again afterwards. On a
+  box already steered, that start is the [read-back
+  path](#the-adopted-reconciliation-release-gate-what-it-needs-and-when-it-refuses):
+  it stays steered until the eBPF tier has loaded, then takes traffic off
+  VPP to dump, diff and verify the FIB — about three minutes unsteered on
+  a full table — and steers again, so pick the window. Or
+  replace VPP outright: `systemctl stop packetframe && packetframe detach
+  --all && systemctl start packetframe` (a cold attach). A mismatch is
+  not a transient of churn: verify runs only with nothing in flight, on
+  the thread that would apply any update, so no update can land between
+  a probe's sample and VPP's answer.
+
+  An IPv6 mismatch (`fib-v6`) does not hold an IPv4 steer — IPv4
+  steering is judged on the IPv4 verdict, as everywhere — but it does
+  disprove the ledger: the stopping daemon will not preserve a ledger
+  that ANY verify since it was last rebuilt found wrong in either
+  family, even after a later re-run's fresh sample came back clean, so
+  the same restart corrects it.
+
+**What you see.** `packetframe reconfigure` answers with the hold's own
+numbers:
+
+```
+refusing to steer: VPP has not caught up with the route mirror: B change(s) still at
+the route source and P queued for VPP, where caught up is at most A; and the last
+verify ran on 1 probe(s) against 1 routes and N are installed now, so it vouches for
+less than 90% of the table being steered; verify re-runs on its own 10s after VPP
+has caught up and the table is clean. ...
+```
+
+and `packetframe status` carries the same on two rows:
+
+```
+fib-synced   DEGRADED — N routes installed, but the last verify ran on 1 probes against
+             1 routes, so it vouches for less than 90% of this table and a first steer
+             waits for one that does. Verify re-runs on its own once VPP has caught up
+             with the route mirror (B change(s) still at the route source, P queued for
+             VPP) and the table holds no unresolvable route
+steering     DEGRADED — steering intended but not in place — ... Held now because VPP
+             has not caught up with the route mirror: ...
+```
+
+With ports already steered, the steering row instead reads `DEGRADED —
+a steering change that diverts more traffic onto VPP is held because ….
+The rules already installed stay as they are and keep forwarding; …`
+— the state stays `steered`, or `ready` for a convergence's held
+re-assert — and on a mismatch every one of these
+lines says that waiting does not clear it. Each held attempt is a
+`steer_held` event in the event log, with the reason and whether rules
+were already steering.
+
+Before the lever moves, the staging line says it in advance:
+`configured "steer on", awaiting an operator lever move; ... A lever move
+now would be held, and steer on its own once nothing holds it, because
+…`. That is the line to read before moving it.
+
+`packetframe_vpp_source_backlog` is the number to watch fall. Once VPP
+has caught up, expect a `verify_passed` event with `rerun: true` and a
+`cause` naming the outgrown table within about ten seconds (the re-run's
+debounce), then `steering_up`.
+
+**What it does not do.** It does not hold the convergence: an adoption
+over a small FIB still reaches `Ready` on a verify of whatever was
+installed — the hold only stops that verdict admitting a steer, and the
+re-run replaces it. And it judges size, not turnover: a table withdrawn
+and re-announced to the same size since the verify reads as covered.
 
 ## The adopted-reconciliation release gate: what it needs, and when it refuses
 
@@ -750,6 +982,76 @@ release: check the feed session actually started (`BGP client
 connected` + at least one UPDATE in the log), then check the mirror
 count against the floor in the health text.
 
+### The unsteered diff and a seeded mirror
+
+Everything above is the STEERED stages' release. An UNSTEERED adoption
+— its dump already ran, harmlessly, because nothing is on VPP — defers
+only its diff, behind the floor (half the adopted table) and the same
+stream-quiet rule: a reannouncement holds it loud until the stream
+ends. That still applies to every mirror that loaded from empty.
+
+When the fast-path seeded the mirror from its [route
+ledger](packetframe-fib.md#restarts-the-route-ledger), the diff has a
+second door, and it does not wait for the replay to go quiet. It opens
+when **all** of these hold:
+
+- the mirror holds a seed no route-source GC has reconciled yet (the
+  fast-path marks the feed session when it hands the seed over);
+- the feed session is up, and it is still the FIRST session of this
+  process — the route source is streaming now and has not dropped and
+  reconnected since;
+- the completeness authority's current word is yes: its last report
+  permits steering and its count is within 1% of the mirror as it is now
+  (the fast-path authorities never attest a seed before the route
+  source's first route, so in the first session this also proves the
+  report was taken while that stream was live);
+- the floor.
+
+**A reconnect shuts this door for good.** After it, a cached yes may
+predate the new stream, and a newer one proves no more than it does
+for the steered stages after a flap (above): counts over a mirror
+being re-announced stay aligned whether or not the new stream has
+caught up. The replay then has to go quiet, as for any mirror; the
+first GC would end the seed anyway.
+
+Whichever door opens, the resync walk drops the route deltas the feed
+queued before it (the seed queued one per route) — the walk reads every
+route's current state and the diff derives the withdrawals — so VPP is
+sent only what differs from what it holds, not the seeded table again.
+Changes written after the walk began stay queued and follow as
+ordinary updates.
+
+Why that is safe where quiet is not needed: the diff withdraws from VPP
+whatever the mirror lacks, so the danger is a mirror still filling from
+empty — "~all withdrawals". A seed is the previous process's whole
+table, present before the route source connected, and the authority's
+agreement rules out a seed that is substantially short of what the
+source has now. What the seed has that the source dropped leaves VPP
+when the route source's GC withdraws it; what changed reaches VPP as the
+replay re-advertises it — the same as on the eBPF tier, which forwards
+on the same seed. VPP carries no traffic at this stage either way. With
+`require-table-complete off` there is no authority to vouch for the
+seed, and only the quiet door exists.
+
+The journal says which door opened: `the route mirror was seeded from
+the fast-path route ledger, the route source is streaming and the
+completeness authority agrees with it: running the adopted resync diff
+now ...`. Verify follows, and then the port is `Ready`. **It does not
+steer on its own**: an adoption that was unsteered keeps the canary rule,
+so the first steer is still a `steer` flag you move — after `Ready`; a
+move while still converging is refused as before.
+
+**A small adopted FIB releases almost at once.** The floor is half of
+what the dump found, so a VPP adopted nearly empty — one the previous
+daemon left mid-sync — releases its diff on its first quiet moment,
+which a feed that has not connected yet provides. The verify that
+follows samples the few routes installed by then, and the table arrives
+afterwards as ordinary updates. Nothing here waits for it; the
+[first-steer
+hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table)
+is what keeps that verdict from admitting a lever move over the loaded
+table (2026-10-07).
+
 ## What a keep-vpp restart costs now: the preserved route ledger
 
 **The incident this answers (primary, 2026-09-26, ~1.09M v4 routes).**
@@ -787,8 +1089,10 @@ VPP's route ledger was not preserved; the next adoption reads VPP's FIB instead 
 
 It is only written for a ledger this daemon can vouch for: the
 supervisor `Ready`/`Steered` (or a previous ledger-seeded adoption still
-waiting on the feed, untouched), nothing awaiting VPP's acknowledgement,
-and VPP's summary readable. A stop during a dump-path deferral, a crash,
+waiting on the feed, untouched), no verify re-run having found VPP
+disagreeing with it (see [the first-steer
+hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table)),
+nothing awaiting VPP's acknowledgement, and VPP's summary readable. A stop during a dump-path deferral, a crash,
 a `kill -9`, or anything that is not a clean preserving exit writes
 nothing — and "nothing" is simply the dump path below. So does a bare
 drop of the supervision service: it cannot tell a process exit from an
@@ -808,19 +1112,24 @@ reached the preserve step (`preserved` true or false, with the reason
 when false), `adoption_path` at the start (`path=preserved-ledger`, or
 `readback` / `readback-deferred` for the dump path — this one records
 the fallback whatever happened at the stop), and
-`preserved_ledger_rejected` with the stage and reason when a record was
-found but not used.
+`preserved_ledger_rejected` when a record was found but not used: its
+`stage` names the check that refused it (the table below), its `reason`
+says why.
 
 **The start that finds it** adopts WITHOUT reading VPP's FIB and without
 unsteering, in this order:
 
 1. At bring-up, before anything touches VPP, the record is read and
    **removed** — whether or not it is used, so it is consumed once. It
-   must name the adopted process (pid + start ticks + boot id), carry the
-   token `vpp-offload.json` holds (any other adopter rewrites that file on
-   its attach, and an older build drops the field, so a record that
-   outlived a downgrade or a second adopter cannot match), and list the
-   same interfaces.
+   is read at all only if its ownership and modes, and those of
+   `state-dir` and its ancestors, show no other account could have
+   written it, and only if it is no larger than the widest record this
+   run's route capacity could encode to — both judged on the open file
+   before a byte of it is read. It must name the adopted process (pid +
+   start ticks + boot id), carry the token `vpp-offload.json` holds (any
+   other adopter rewrites that file on its attach, and an older build
+   drops the field, so a record that outlived a downgrade or a second
+   adopter cannot match), and list the same interfaces.
 2. At `StartResync`, VPP's per-length route counts must equal the
    recorded ones — anything that added or removed a route since (a
    `vppctl` edit, a stray client) shows up here. Then the engine's ledger
@@ -835,6 +1144,19 @@ unsteering, in this order:
    holds through exactly the paths it resolves to now is not sent.
 4. Verify runs its 64 probes with the **paths compared** too, still
    steered. Pass → `Ready` → the usual re-assert steer.
+
+**The fast-path tier has its own ledger now.** The same clean stop
+leaves the route mirror for the next start (see [the route
+ledger](packetframe-fib.md#restarts-the-route-ledger)), so the mirror is
+at full size seconds after the start instead of after the route
+source's replay: the release floor is met at once, and the
+completeness authority attests the seeded mirror at the route source's
+first route. The diff described here still waits for the replay to go
+quiet — "quiet" counts every streamed element — so a steered adoption
+behaves as before. What changes is an UNSTEERED VPP: a fresh one's
+convergence hold releases on that first attested check, and an adopted
+one's diff takes the seeded-mirror door ([the unsteered diff and a
+seeded mirror](#the-unsteered-diff-and-a-seeded-mirror)).
 
 What you see: `fib-synced DEGRADED — resync deferred ... the adopted FIB
 keeps forwarding untouched` while the feed reloads (on the primary the
@@ -854,17 +1176,30 @@ unsteered.
 
 **Every fallback is today's dump path, never a failed attach.** Each is
 logged with its reason (`preserved route ledger not used: ...` /
-`this adoption reads VPP's FIB instead`):
+`this adoption reads VPP's FIB instead`, the journal line carrying the
+`stage` too) and recorded as `preserved_ledger_rejected` with that
+`stage`:
 
-| Why | When it is caught |
-|---|---|
-| No record (unclean stop, crash, first start after upgrading, stop mid-convergence) | bring-up |
-| Record names a different pid / start time / boot | bring-up |
-| Token missing or different (another daemon adopted since, or a downgrade rewrote the state file) | bring-up |
-| Corrupt, truncated, planted symlink, or another format version | bring-up (the file is still removed) |
-| Interfaces differ from the state file's, or a recorded path egresses an interface this attach does not own | bring-up / seed |
-| VPP's route counts differ from the recorded ones, or the summary cannot be read | `StartResync`, and again when the deferred diff is released |
-| **Verify disagrees** (a prefix absent, or held through other paths) | the seeded verify |
+| Why | When it is caught | `stage` |
+|---|---|---|
+| No record (unclean stop, crash, first start after upgrading, stop mid-convergence, or a stop after a verify re-run found VPP disagreeing with the ledger) | bring-up | none: `adoption_path` records the dump path |
+| **Another account could have written it.** The file is not owned by the daemon's uid or is group- or world-writable, or so is `state-dir`, or an ancestor directory is owned by someone other than root or is writable by group or others without the sticky bit (so another account could rename `state-dir` away), or it is not a regular file. Its routes are what the adoption believes VPP holds, so a file another account could have written is never trusted, whatever its checksum says. Fix the state-dir's ownership and modes (`chown root:root`, `chmod 755` or tighter); fast-path's route ledger refuses the same directory for the same reason | bring-up (removed unread) | `untrusted` |
+| **Larger than this run's bound**: the widest record its route capacity (both families' high-water marks) could encode to, every route charged a path set of its own. About 500 MB at the default `expected-routes` with `v6 on`; a real one is ~10 bytes a route, ~11 MB at 1.09M | bring-up (removed unread) | `too-large` |
+| Unreadable, or a planted symlink | bring-up (the file is still removed) | `unreadable` |
+| Corrupt or truncated | bring-up (the file is still removed) | `corrupt` |
+| Another format version | bring-up (the file is still removed) | `format-version` |
+| Read but not removable, so it cannot be consumed once — remove it by hand | bring-up | `unremovable` |
+| Record names a different pid / start time / boot | bring-up | `process` |
+| Token missing or different (another daemon adopted since, or a downgrade rewrote the state file) | bring-up | `token` |
+| Interfaces differ from the state file's | bring-up | `interfaces` |
+| A recorded path egresses an interface this attach does not own | seed | `seed` |
+| VPP's route counts differ from the recorded ones, or the summary cannot be read | `StartResync`, and again when the deferred diff is released | `fingerprint`, then `fingerprint-moved` |
+| **Verify disagrees** (a prefix absent, or held through other paths) | the seeded verify | `verify` |
+
+A record found while nothing is being adopted (the VPP it describes
+died before this start) is discarded with an info line and no event:
+`adoption_path` says `fresh`. `vpp-offload` has no status row for any of
+these; the journal and the event log are where they show.
 
 The last one is `PreservedLedgerRejected`, deliberately not
 `VerifyFailed`: it disproves the RECORD, not VPP, so it is not a
@@ -980,7 +1315,7 @@ correctness verified, while every v6 packet still rides the eBPF tier.
 
 ```sh
 packetframe status
-#   fib-synced   healthy   N routes installed; last verified on 64 probes   <- IPv4, as before
+#   fib-synced   healthy   N routes installed; last verified on 64 probes against N routes   <- IPv4, as before
 #   fib-v6       healthy   M IPv6 routes loaded in VPP, not steered
 #   steering     ...       (IPv6 routes are loaded in VPP by `v6 on`, but no IPv6 is steered ...)
 
@@ -990,8 +1325,9 @@ grep packetframe_vpp_family_routes /var/lib/node_exporter/textfile/packetframe.p
 #   ..._family_routes{module="vpp-offload",family="ipv6",state="withheld"} 0
 
 journalctl -u packetframe | grep 'verify PASS'
-#   verify PASS: 64/64 probes matched, unresolvable=0, withheld=0; IPv6 (loaded,
-#   not steered — cannot fail the pass): 64/64 probes matched, unresolvable=0, withheld=0
+#   verify PASS: 64/64 probes matched against N routes, unresolvable=0, withheld=0;
+#   IPv6 (loaded, not steered — cannot fail the pass): 64/64 probes matched against
+#   M routes, unresolvable=0, withheld=0
 
 vppctl -s /run/packetframe/vpp/api.sock.cli show ip6 interface          # every member/subif/BVI: link-local only, no global address
 vppctl -s /run/packetframe/vpp/api.sock.cli show ip6 fib summary        # the v6 table, ~the fib-v6 installed count
@@ -1506,7 +1842,7 @@ and the sets that produce it are edited by routing daemons — bird
 announces a remote host route and the hole re-opens with nobody
 touching packetframe. So it is watched on a clock rather than
 validated once: every 60 s the module dumps the kernel's IPv4 routes
-across all tables and reports any path VPP cannot take that no
+from every table a policy rule selects and reports any path VPP cannot take that no
 `steer-exempt` covers — and, while a port diverts IPv6, the kernel's
 IPv6 routes too ([IPv6 findings](#ipv6-findings-exempt-drift-v6)
 below).
@@ -1530,6 +1866,28 @@ cannot be cancelled and a monitoring scan holds none of the resources
 a detach must release. A `detach` that reported "resources may still
 be held" while only a scan remained would be a false alarm about the
 one thing that alarm must stay trustworthy for.
+
+**It stays out of the way of link churn.** Every chunk of a route dump
+is served under the kernel's routing lock (`rtnl_mutex` on 5.15), the
+same lock every route and link change needs, and the worst moment to
+take thousands of them is right after a link changes state, while the
+kernel and the routing daemon flush and reinstall the routes through
+it. So the scan watches link up/down transitions (`RTNLGRP_LINK`; not
+promiscuity or allmulti toggles): a scan that falls due within 60 s of
+one waits until links have been quiet for 60 s, and a scan a transition
+catches mid-dump is abandoned and rerun once they settle. Neither
+publishes anything, so the last verdict stands meanwhile. The wait is
+capped at five minutes from when the scan fell due: under a link that
+never stops flapping, the scan runs anyway, to the end. Each case logs
+at info: `holding the drift scan until links settle`, `abandoned the
+drift scan until links settle`, `running the drift scan anyway`, each
+naming the link.
+
+`packetframe_vpp_drift_scan_ms` is how long the latest scan took, rule
+and route dumps of both families, whatever it concluded: how long it
+contended with route and link changes. At debug level each scan also
+logs what it read per family (`drift scan read the kernel's routes`:
+routes read, routes kept, ms, and the tables dumped).
 
 `packetframe_vpp_exempt_drift` carries the count; **alarm on `> 0`,
 and on `absent()` while the module is attached** — the gauge is
@@ -1618,9 +1976,9 @@ so a row that persists means the read itself needs looking at.
 rule carries table id 0 and resolves to a VRF's table per packet, so
 the enumeration cannot be complete — filtering by the tables that ARE
 named would drop every VRF route and report clean while steered
-traffic blackholed. A host with one gets no table filtering at all
-(the behaviour before the filter existed), and so does a rule dump
-that fails or comes back empty.
+traffic blackholed. A host with one gets every table dumped and
+judged (the behaviour before the filter existed), and so does a rule
+dump that fails or comes back empty.
 
 Everything the scan judges against is hot: `steer-exempt`, the
 allowlist, and both direction knobs are rebuilt on `packetframe
@@ -2001,9 +2359,11 @@ Four consequences to decide on before listing a VLAN:
 
 ### The keeps
 
-Kernel-delivery rules (`ring_cookie` 0, PF queue 0) at **lower
-locations than every diversion** — lower location is higher priority on
-this NIC — so they are matched first:
+Kernel-delivery rules (`ring_cookie` 0 — the PF; spread over its queues
+by RSS, or on PF queue 0 where the driver declines RSS, see [the kernel
+path for exempt traffic](#the-kernel-path-for-exempt-traffic)) at
+**lower locations than every diversion** — lower location is higher
+priority on this NIC — so they are matched first:
 
 | Keep | Why |
 | --- | --- |
@@ -2027,11 +2387,10 @@ they apply port-wide and also keep DNS and BGP toward **external**
 hosts on the eBPF tier. That is intended: correct, and a
 small slice. Two costs to know: they occupy MCAM slots only while some
 port diverts v6 (a port with `steer-keep6` lines and no `v6-divert`
-plans none), and everything they match lands on PF queue 0 rather than
-RSS — all of the port's DNS and BGP, every VLAN. If queue 0's softirq
-core shows it, per-VLAN keeps are the remedy (`tcp6 dst-port N vlan
-<vid> m 0xf000` inserts on this kernel too); they are not built yet
-because they multiply slots by the VLAN count.
+plans none), and on a port whose driver declines RSS keeps everything
+they match lands on PF queue 0 — all of the port's DNS and BGP, every
+VLAN. Where the driver takes RSS (the production firmware does) they
+spread like any other kernel traffic.
 
 ### Budget
 
@@ -2157,8 +2516,9 @@ checked against — that restart may take the dump path.
 # The rules the NIC holds. The diversions read "TCP over IPv6" / "UDP
 # over IPv6" with no ports, the router MAC as the destination MAC and
 # the VLAN, "Action: Direct to VF 0 queue 0"; the keeps "TCP over IPv6"
-# / "UDP over IPv6" with a port and no MAC, "Action: Direct to queue 0"
-# — four built-ins (TCP 53, UDP 53, TCP dst 179, TCP src 179) plus
+# / "UDP over IPv6" with a port and no MAC, "RSS Context ID: 0" (absent
+# on a port whose driver declined RSS keeps) and "Action: Direct to
+# queue 0" — four built-ins (TCP 53, UDP 53, TCP dst 179, TCP src 179) plus
 # yours. No rule may read "Flow Type: Raw Ethernet" or name an L4
 # protocol number. Every keep's location must be LOWER than every
 # diversion's. Masks print complemented (ethtool shows ignored bits), as
@@ -2755,8 +3115,9 @@ automatically — this reconfigure is the re-assert.
 
 ### A verified FIB is not a complete one
 
-`fib-synced healthy — N routes installed; verified on 64 probes` means
-the probes matched the mirror. It does **not** mean the table is whole.
+`fib-synced healthy — N routes installed; last verified on 64 probes
+against M routes` means the probes matched what was installed when they
+were drawn — M routes. It does **not** mean the table is whole.
 
 Measured 2026-08-11 on a cold bring-up: `healthy` at **11.4 s with
 110,724 routes** — about 10% of the table — with 64 probes passing,
@@ -2767,7 +3128,17 @@ That is safe on its own, because a first attach never steers itself:
 `steer on` in the config is a staging state until an operator moves the
 lever. The exposure is the operator who moves it early.
 
-**`require-table-complete on` is what closes it**, and it is not
+Two gates close it, for two different gaps. The verdict's own gap — M
+is what the probes were drawn from, and the table may since have grown
+past it — is the [first-steer
+hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table):
+once N outgrows M by more than ~11% the row turns `DEGRADED`, a first
+steer is held, and verify re-runs over the table as it is once VPP has
+caught up. That gate needs no authority. The mirror's gap — the table
+the route source has delivered may itself be short of the real one — is
+the completeness gate:
+
+**`require-table-complete on` closes the mirror's gap**, and it is not
 optional on a box with a completeness authority (bird's `birdc`, or
 `integrity-authority frr`):
 
@@ -2779,9 +3150,10 @@ module vpp-offload
 With it, `steer` refuses while the authority does not attest the mirror,
 reports why, and re-attempts itself — at most every 30 s — once the
 mirror converges, so an early lever-move costs a wait rather than a lost
-offload. Without it there is no gate at all — the refusal path is
-compiled out — and the canary ladder is the only thing between an early
-lever-move and traffic diverted into a 10%-loaded FIB. (The retry
+offload. Without it there is no completeness gate at all — the refusal
+path is compiled out — and an early lever-move is held only until VPP
+holds what the MIRROR holds and a verify covers that: a mirror that is
+itself 10% loaded passes both. (The retry
 itself does not depend on the gate — a steer the NIC refused is
 re-attempted either way — but with no verdict to wait on, an early
 lever-move steers into whatever is loaded at that instant.) `off` is
@@ -2968,6 +3340,60 @@ The complete evidence chain for the vendor report — the asymmetry,
 the reproduction, the w5–w10 forensics index — lives in
 `docs/vendor/rvu-af-channel-default-mcam.md`.
 
+### A steer is refused with "VPP has not caught up with the route mirror" or "the last verify ran on N probe(s) against M routes"
+
+The [first-steer
+hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table),
+on a first steer or on a change that adds a port, prefix or direction to
+ports already steered, or drops an exemption from one (those keep their
+rules and their traffic on VPP meanwhile). The want is
+remembered and, except after a mismatch, the steer lands on its own once
+the hold clears; `packetframe reconfigure` re-asks at once but cannot
+clear it faster. The same reason is on the `steering` row (`Held now
+because …`, or `a steering change that diverts more traffic onto VPP is
+held because …`).
+
+- **"VPP has not caught up with the route mirror: B change(s) still at
+  the route source and P queued for VPP"** — VPP is installing a reload
+  the mirror already holds. Watch `packetframe_vpp_source_backlog` fall
+  (or `packetframe status`, whose `fib-synced` row prints both numbers).
+  If it does not fall, the drain is not keeping up or is failing: a
+  `route-feed` row and `packetframe_vpp_drain_failing 1` say which. A
+  trailing **"and K neighbour change(s), where caught up is none"** is a
+  next hop resolved, lost or moved that VPP has not taken yet; it clears
+  with the next drain that lands. A next hop merely cycling its NUD
+  state with the same MAC is not counted here, and neighbour changes
+  never hold the verify re-run, only the steer.
+- **"the last attempt to apply route updates to VPP failed"** — the same,
+  with the drain failing; see [`route-feed
+  DEGRADED`](#route-feed-degraded--packetframe_vpp_drain_failing-1).
+- **"the last verify ran on P probe(s) against M routes and N are
+  installed now"** — the verdict was taken before the table loaded.
+  Verify re-runs on its own about 10 s after VPP has caught up on routes
+  and the table holds no unresolvable route, however recently it last
+  re-ran; the event log records it as `verify_passed` with `rerun: true`
+  and the `cause`, and the steer follows on the next retry. If it never
+  re-runs, the table is not clean: `fib-synced` names the unresolvable
+  routes. A journal warning `verify re-run could not reach VPP` means the
+  re-run itself failed; the next one waits the usual 5 minutes
+  (`retry_in_secs`) rather than retrying every 10 s against a VPP that is
+  not answering.
+- **"the last verify found VPP disagreeing with the route ledger"** —
+  waiting does not clear it, it is never re-run, and the remembered want
+  will not steer by itself. `fib-synced` reads UNHEALTHY with the verify
+  summary. Restart the daemon (`systemctl restart packetframe`, or the
+  `detach --keep-vpp` sequence): the stop will not preserve the
+  disproved ledger, so the next start reads VPP's FIB and its resync
+  corrects it before verifying. A port that was never steered then needs
+  its lever moved again. On a box already steered that start is the
+  read-back path: steered until the eBPF tier has loaded, then about
+  three minutes unsteered on a full table while it dumps, diffs and
+  verifies the FIB, then steered again — pick the window. Or replace
+  VPP: `systemctl stop packetframe && packetframe detach --all &&
+  systemctl start packetframe`.
+- **"no verify has completed against this VPP"** — should not be
+  reachable from `Ready`; capture `packetframe status` and the journal.
+
 ### A steer is refused with "the route mirror holds N of M routes"
 
 The completeness gate. The routing daemon's initial dump has not
@@ -3131,6 +3557,87 @@ build, the remedy is the full sequence:
 systemctl stop packetframe && packetframe detach --all && systemctl start packetframe
 ```
 
+### Attach or `detach` refuses: "refusing …/vpp-offload.json: …"
+
+`vpp-offload.json` decides what this root daemon acts on. It names the
+VPP process an attach adopts and a teardown may SIGKILL, the VFs it
+unbinds, the hugepage reservation it hands back and the MCAM rules it
+deletes. It also holds the token the
+[preserved route ledger](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)
+must match. So it is read only when no other account could have
+written it or put it in place, and only up to 16 MiB. Both are judged
+on the open file, before a byte of it is read:
+
+- the file is a regular file owned by the daemon's uid (root) and not
+  writable by group or others;
+- so is `state-dir`, the directory holding it;
+- every directory above `state-dir` is owned by root and is either not
+  writable by group or others or sticky (as `/tmp` is), so nobody else
+  can rename `state-dir` away and put another in its place;
+- no component of the path is a symlink.
+
+**A refusal is never read as "no file".** Attaching fresh over
+resources the file records would acquire them twice, so the attach
+fails instead. `packetframe detach --all` refuses too (it acts on
+nothing it cannot vouch for), and so does the `--keep-vpp` preflight.
+The directory is judged even when the file is absent: an account that
+can write `state-dir` can delete the record. A **reload** is not
+refused, because a reload that turns one port off still re-plans the
+others and must stay a rollback lever. It plans without the record
+and logs `state file unreadable; this reload plans steering without
+reclaiming the module's own recorded rules`. A steer it plans can then
+be refused for MCAM budget, because the module's own rules read as
+occupied; that refusal comes from the file, not the allowlist.
+
+The message names the check that failed. See what the path holds (the
+default `state-dir` shown):
+
+```bash
+stat -c '%U:%G %a %F %n' / /var /var/lib /var/lib/packetframe /var/lib/packetframe/state /var/lib/packetframe/state/vpp-offload.json
+```
+
+If the file is there, check it is the daemon's before trusting it
+again: its `vpp_pid` is the running VPP, and its `vf_pci` addresses are
+the VFs bound to `vfio-pci`.
+
+```bash
+jq '{vpp_pid, ports: [.ports[] | {iface, vf_pci}], steer_rules}' /var/lib/packetframe/state/vpp-offload.json
+```
+
+```bash
+pgrep -a vpp
+```
+
+```bash
+ls -l /sys/class/net/eth4/device/virtfn0 /sys/bus/pci/drivers/vfio-pci/
+```
+
+Then make it and `state-dir` root-owned and closed to group and
+others, and retry:
+
+```bash
+chown root:root /var/lib/packetframe/state /var/lib/packetframe/state/vpp-offload.json
+```
+
+```bash
+chmod 755 /var/lib/packetframe/state && chmod 600 /var/lib/packetframe/state/vpp-offload.json
+```
+
+A directory above `state-dir` that the message names gets the same
+`chown root:root` and `chmod go-w`. A symlinked `state-dir` cannot be
+made acceptable: point `state-dir` at the real path. If the record is
+not the daemon's, or you cannot tell, handle it as the oversized file
+below.
+
+**"past the 16777216-byte bound".** A real file is a few KB, and the
+widest the module could write is ~12 MB (64 ports, the most a config
+may declare, each with a full rule table), so this one was not written
+by it whole (a sparse or corrupt file). Treat it as a torn file: check
+that nothing it could record is live (`pgrep -a vpp`, `ethtool -n
+<port>` for rules steering into a VF, `sriov_numvfs` under each
+port's `device/` for VFs), release by hand whatever is, then remove
+the file.
+
 ### VPP is gone after `systemctl stop`, but its steering rules are not
 
 On builds whose unit has `KillMode=mixed`, every stop kills VPP. Look
@@ -3193,9 +3700,94 @@ carrying the check, attach refuses this shape before it can start.
 
 A socket timeout (`Resource temporarily unavailable`) or `binary API is
 not connected` during attach, resync or verify no longer restarts
-anything on current builds. The next section covers it. If a loop
+anything on current builds. The section after next covers it. If a loop
 like that still shows `event=ConvergenceFailed`, the step was
 *refused*, and the error text says by what.
+
+### A teardown with `cause=Wedged`
+
+The wedge detector decided VPP had stopped answering its binary API:
+silent past the budget, which is **1.5 s while steered** and 10 s for an
+unsteered convergence. Silent means it answered *nothing*: no ping, and
+no reply to anything else the module sent, such as a route batch or a
+verify probe. A VPP that keeps answering a long route burst is busy,
+not wedged, however late a ping queued behind that burst comes back.
+On a steered gateway a teardown is expensive. Traffic
+returns to the eBPF tier, and the fresh VPP is not steered again until
+its table has reloaded and verified. The journal line just before the
+teardown gives the evidence, and the `vpp_teardown` event carries the
+same fields:
+
+```
+WARN VPP's binary API stayed silent past the wedge budget; calling it wedged. ... silent_ms=2004 counted_ms=2004 budget_ms=1500 steered=true unanswered_probes=2 last_probe_error="socket I/O: Resource temporarily unavailable (os error 11)" vpp_wait_ms=1998 loop_gap_ms=48 stalls_excused=0
+```
+
+How to read it:
+
+- **`vpp_wait_ms` close to `counted_ms`.** VPP kept the loop waiting.
+  The thread that answers the API is VPP's main thread, which is not
+  the thread that forwards. The workers may have been forwarding
+  throughout, and this detector cannot see them. Look on VPP's side for
+  what held the main thread (`/var/log/packetframe/vpp.log`,
+  `vppctl show log`). The module's own work is the first suspect. Each
+  next hop that loses and regains resolution costs a neighbour delete
+  and a neighbour add, and in VPP each of those walks every route that
+  resolves through the adjacency, on the main thread and under the
+  worker barrier. A bridge next hop that comes back also re-sends every
+  route through it. Look for `nexthop lost resolution` and `nexthop
+  re-resolved` in the journal around the time, and for
+  `packetframe_vpp_pending_ops` climbing. A plugin following the
+  kernel's routing table is not a candidate: VPP's `linux_cp` and
+  `linux_nl` plugins ship disabled by default and are not loaded on the
+  reference build (`vppctl show plugins`).
+- **`last_probe_error`.** `Resource temporarily unavailable` means a
+  request hit its socket deadline. `reconnect refused: …` means VPP's
+  socket would not take a connection or finish the handshake within
+  500 ms. `did not accept the connection` means VPP stopped draining
+  its socket's backlog.
+- **`loop_gap_ms` large and `vpp_wait_ms` small.** The supervision loop
+  itself was away: blocked in the kernel, or not scheduled. Such a
+  stall is excused (below), so a wedge with this shape had VPP silent
+  for a full budget after the loop came back as well.
+  `stalls_excused` counts the stalls in that silence.
+
+**A stall of the loop is not VPP's silence.** The loop that pings VPP
+also makes kernel calls that wait on `rtnl_lock`: the steering audit's
+ethtool ioctls and the hand-back path's netlink reads. When the kernel
+holds that lock, the loop sends no pings. On a production gateway, a
+bridge going down with a full table appears to have held it for about
+40 s. Those 40 s used to count as VPP's silence, so one unanswered
+probe after the loop resumed was enough to tear down a steered VPP.
+Now a pass that arrives more than the budget after the previous one
+restarts the measurement. Time spent waiting on VPP's own
+socket does not count toward the gap. The journal says when this
+happens:
+
+```
+WARN the supervision loop was away longer than the wedge budget, and not waiting on VPP — a stall of this host or of PacketFrame itself. ... loop_gap_ms=40112 budget_ms=1500 steered=true silent_ms=40112
+```
+
+From there VPP is called wedged only if it stays silent for the full
+budget across fresh probes. For a VPP that really hung, that is at
+most 2 s after the loop resumes: the usual bound, measured from the
+resume. A broken connection is not counted as silence either. If
+something else dropped the socket in the meantime, such as the
+error-counter read in the status publish, the probe reconnects
+first. A socket the drain loses on the same pass is reconnected at the
+start of the next pass, one ping interval into the budget. Two limits
+stop this from hiding a dead VPP:
+
+- Time the loop spends blocked on VPP's socket is never excused. A
+  hung VPP holds every probe for the full deadline, and that wait is
+  the evidence. A reconnect counts the same way. It gives up after
+  500 ms, the socket's own connect included, so a VPP that stopped
+  accepting connections cannot park the loop inside one.
+- Once VPP has missed more probes than the budget tolerates as jitter
+  (two, while steered), a later stall no longer erases them. The
+  journal then says `VPP had already left more probes unanswered than
+  jitter explains`.
+
+A VPP that exits is caught by its pidfd whatever the loop is doing.
 
 ### `binary API lost; VPP is not torn down for this` during a convergence
 
@@ -3241,7 +3833,9 @@ drained until the attach completes.
 - the process exits (pidfd);
 - VPP stays silent past the wedge budget: **1.5 s while steered**,
   which is the published bound and applies to a steered adoptee
-  exactly as before, or 10 s for an unsteered convergence;
+  exactly as before, or 10 s for an unsteered convergence. It is
+  measured while the supervision loop is running; see [A teardown with
+  `cause=Wedged`](#a-teardown-with-causewedged);
 - the convergence deadline runs out — 120 s on a small table, scaled
   up to 600 s on a big one (see [What a keep-vpp restart costs
   now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)).
@@ -3465,7 +4059,7 @@ reason, and prints the verdict's age and the live table beside it:
 
 ```
 fib-synced   DEGRADED — verify INCOMPLETE — steering refused, no
-  restart: 0/0 probes matched, unresolvable=0, withheld=0 (verify ran
+  restart: 0/0 probes matched against 0 routes, unresolvable=0, withheld=0 (verify ran
   1847s ago and re-runs on its own once the table holds no unresolvable
   route and no unexempted kernel-delivered prefix; the table now holds
   69155 installed, 0 withheld, 0 unresolvable)
@@ -3473,19 +4067,27 @@ fib-synced   DEGRADED — verify INCOMPLETE — steering refused, no
 
 A verdict that failed only on unresolvable routes, unexempted
 kernel-delivered prefixes or an empty sample is **re-run once the table
-is clean** (see [the re-run](#the-one-re-run-a-stale-incomplete-verdict)),
-so this line no longer outlives its cause by more than a few seconds. One
-that failed for any other reason (a dark member carrying routes) says
-`does not re-run in steady state` instead.
+is clean** (see [the re-run](#the-re-run-a-stale-verdict)), so this line
+no longer outlives its cause by more than a few seconds. So is one the
+table has outgrown, whatever it failed on — the line then says `the
+table has outgrown it, so it re-runs on its own …`. One that failed for
+any other reason (a dark member carrying routes) over a table it still
+covers says `does not re-run in steady state` instead.
 
 Read the parenthesis first. Verification is a convergence-time gate, and
-**the live steering gates never consult this verdict** — they re-read
-the route counts, the source backlog and the authority on every retry.
-So a box whose first verify ran before its feed landed recovers and
-steers on its own, with this line still quoting the empty-mirror window.
-A large installed count next to `0/0 probes matched` is that recovery,
-not a contradiction. On the lab rig (2026-09-21) the row paged as
-UNHEALTHY while 69,155 routes forwarded; it does not any more.
+the live steering gates do not take **what this verdict failed on** from
+it — they re-read the route counts, the source backlog and the authority
+on every retry. What a first steer does read off it is what no live
+count can say: whether its probes found a mismatch, and whether it was
+drawn from enough of the table to vouch for it ([the first-steer
+hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table)).
+A verify that ran before the feed landed was drawn from almost nothing,
+so a box in this state now re-runs it once the table is in and VPP has
+caught up, and steers on the new verdict. Before 2026-10-07 it steered
+on its own with this line still quoting the empty-mirror window — the
+same gap that, with a one-route verdict that had *passed*, let a lever
+through. On the lab rig (2026-09-21) the row paged as UNHEALTHY while
+69,155 routes forwarded; it does not any more.
 
 If the counts in the parenthesis are *also* bad — nonzero
 `unresolvable`, or an installed count that never grows — the condition
@@ -3912,7 +4514,8 @@ gauge green.
 daemon it legitimately reads hours. Measured: `last ok 18966s ago` after
 a 5 h uptime.
 
-Verify runs on first attach and after every resync, then not again. A
+Verify runs on first attach and after every resync, then not again
+except through the one re-run below. A
 periodic verify would have to sample the ledger and probe VPP while
 deltas are in flight, and a withdrawal landing between sample and probe
 reads as a mismatch — which is why delta draining is excluded during
@@ -3920,38 +4523,76 @@ reads as a mismatch — which is why delta draining is excluded during
 surface as drain errors and a rising outstanding count instead.
 
 What this means when you are reading a dashboard: a green `fib-synced`
-says the FIB was verified *at some point*, not that it is being watched.
-Nothing here would notice VPP's FIB drifting for a reason other than this
-module's own deltas.
+says the FIB was verified *at some point*, against the table it names
+(`against M routes`) — not that it is being watched. Nothing here would
+notice VPP's FIB drifting for a reason other than this module's own
+deltas.
 
 The same applies to a NON-green one, and it bites harder, because the
 condition usually clears while the verdict does not. Every `fib-synced`
 line that is not `healthy` therefore carries its own age; compare that
 against the counts printed beside it before acting on the verdict.
 
-#### The one re-run: a stale incomplete verdict
+#### The re-run: a stale verdict
 
-One verdict is re-run. A verify that failed **only** because the table
-held unresolvable routes, kernel-delivered prefixes without a
-`steer-exempt`, or nothing at all is re-run once, after the table has
-held none of those for 10 s, and at most once every 5 minutes. A verdict
-with a probe mismatch or an in-use dark member is never re-run, since a
-clean table does not clear either.
+One mechanism re-runs verify, for a verdict the live counts can show is
+stale in one of two ways:
+
+- **Incomplete, and the table has since outgrown why.** A verify that
+  failed **only** because the table held unresolvable routes,
+  kernel-delivered prefixes without a `steer-exempt`, or nothing at all.
+- **Outgrown.** One drawn from less than 90% of the IPv4 table
+  installed now — taken before the table loaded, or before it grew by
+  about a ninth — that found no mismatch. This is the verdict the
+  [first-steer
+  hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table)
+  will not admit a steer on.
+
+Either is re-run once, after the table has held no unresolvable route
+and no unexempted kernel-delivered prefix, and VPP has stayed caught up
+with the route mirror, for 10 s. An incomplete one is re-run at most once
+every 5 minutes; an outgrown one is not rate-limited, because it cannot
+recur without the table growing again — a re-run in a lull part-way
+through a reload must not hold a steer for five minutes once the rest has
+landed. The exception is a re-run that could not reach VPP: it replaced
+nothing, so the next one waits the 5 minutes whatever made it due,
+instead of a warning and a reconnect every 10 s. A re-run verdict covers the table it ran against in full, so it
+is outgrown again only after another ~11% of growth: on a steady box that
+is about once a year, which is what keeps this from being a heartbeat.
+
+A verdict with a probe **mismatch** is never re-run, however much the
+table grows: a fresh sample can miss the prefixes it caught, and a pass
+over it would release the steer it holds with nothing rebuilt. Nor is
+one with an in-use dark member over a table it still covers, since
+neither a clean table nor time clears it.
 
 The re-run happens only in `Ready` or `Steered`, on a tick whose drain
 proved nothing is pending, with VPP answering its last ping. It also
-needs no source backlog, nothing in flight, the last drain to have
-landed, and no deferral, fresh hold or unverified preserved ledger. No
-delta can land between a probe's sample and its answer, which is the
-race that keeps verification out of steady state otherwise.
+needs VPP caught up with the mirror on routes (the route half of the
+first-steer hold's test: no more route changes at the source than a
+quiet second's churn, and the last drain landed), nothing in flight, and
+no deferral, fresh hold or unverified preserved ledger. Neighbour
+changes still queued do not hold it: a probe checks a route's paths, not
+where an adjacency leads, so it cannot see them either way, and none can
+land mid-pass — they hold the steer instead. No delta can land between a probe's sample
+and its answer — the drain and the probes share one thread — which is
+the race that keeps verification out of steady state otherwise. The few
+changes a live feed queues behind the last drain race nothing; requiring
+none starved the debounce on a full-table feed.
 
-**It refreshes the verdict and decides nothing.** No supervisor event
-comes of it: steering stays with the live gates, which never read the
-verdict, and a first attach is still never steered on its own. Only what
-`fib-synced` reports changes. The re-run is logged as an ordinary
-`verify_passed` / `verify_incomplete` / `verify_failed` event with
-`rerun: true`. A `verify_failed` re-run tears nothing down. It reports
-VPP disagreeing with the ledger, and a daemon restart rebuilds the FIB.
+**It refreshes the verdict and decides nothing itself.** No supervisor
+event comes of it, and a first attach is still never steered on its own.
+What changes is what `fib-synced` reports — and what a held first steer
+reads on its next retry, which is how an outgrown verdict stops holding
+it. The re-run is logged as an ordinary `verify_passed` /
+`verify_incomplete` / `verify_failed` event with `rerun: true` and a
+`cause`. A `verify_failed` re-run tears nothing down. It reports VPP
+disagreeing with the ledger; steering already in place is left alone, no
+steer that diverts more is admitted on it, the stop that ends this
+daemon will not preserve the ledger it disproved, and a restart therefore
+re-reads and corrects the FIB (see [the first-steer
+hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table)
+for the commands).
 
 **Failed, and shaping the design:**
 
@@ -4175,6 +4816,173 @@ new packetframe release is answered by the `generated.rs` diff during
 the re-vendor. The full compatibility model and bump procedure:
 `crates/modules/vpp-offload/vpp-api/README.md`.
 
+## The kernel path for exempt traffic
+
+Steering diverts allowlisted traffic to VPP. Everything a **keep** rule
+matches stays on the kernel: the router's own traffic, the built-in
+exemptions, every `steer-exempt` prefix and, on a v6-diverting port,
+the v6 keeps. Keeps sit above every diversion in the MCAM and hand
+their frames to the PF, where the kernel receives them like any
+unsteered frame.
+
+That is not control-plane trickle on a real box. Exemptions grow into
+bulk traffic: the WAN /31s (the return path of every NAT'd flow), whole
+LAN subnets, the IX LANs, another site's /24, a CGNAT /10. **Which PF
+queue a keep delivers to is therefore a capacity decision**, and one
+queue is one CPU: its IRQ, and the softirq that drains it, run on one
+core.
+
+### What happened on 2026-10-07
+
+Until 0.6.0 every keep delivered to **PF queue 0** (`ring_cookie` 0, no
+RSS). Every port's queue-0 IRQ defaults to cpu0. On a production gateway
+(18 CPUs, 18 queues per port, queue N's IRQ on CPU N), about three
+minutes after a lever move that steered, cpu0 sat at 99% softirq and 0%
+idle while the other non-VPP CPUs were 50-76% idle. Queue 0 took ~5.8k,
+~5.2k and ~6.0k frames/s on three ports, two of them dropping ~3.9k and
+~1.6k frames/s (`rx_drops`). A ping to the directly connected transit
+next hop lost 30% at 618 ms; transit BGP sessions fell on hold-timer
+expiry; the platform's WAN monitor flapped the uplink, and every flap
+emptied conntrack, loading cpu0 further. The same config had run steered
+for a week without visible trouble: a latent capacity limit with no
+warning. Moving the queue-0 IRQs of the three busy ports to CPUs of
+their own fixed it within seconds: 0% loss, 0.15 ms RTT, 0 drops/s,
+cpu0 74% idle.
+
+### RSS keeps, and the queue-0 fallback
+
+Since 0.6.0 a keep is an **RSS rule on the PF's default context**
+(`FLOW_RSS`, context 0; the CLI's `context 0 action 0`): its frames are
+hashed across the PF's queues exactly as unsteered traffic is. Whether
+the vendor driver takes that is checked at run time, per port, by the
+first keep the daemon installs there. It inserts the RSS form and reads
+it back:
+
+- accepted, and read back with `FLOW_RSS` and context 0: the port's
+  keeps spread over RSS (log line `keep rules on this port spread over
+  RSS`);
+- refused (`EINVAL`/`EOPNOTSUPP`), or accepted but read back **without**
+  the flag or on another context: the same rule is installed in the
+  queue-0 form at the same slot, and that port's keeps stay on queue 0
+  for the life of the daemon. It says so three ways: a `warn` line
+  (`keep rules on this port fall back to PF queue 0`), a
+  `keep_queue0_fallback` event naming the driver's answer, and the
+  `kernel-path` status row. Other ports are unaffected.
+
+A lab probe on the production firmware (driver `rvu-nicpf`, vendor
+5.15) accepted `context 0 action 0` and read it back with `RSS Context
+ID: 0`. That proves acceptance and readback only: a driver can echo the
+stored spec without programming the action. The proof that frames
+actually spread is the per-queue counters below, on a port carrying
+many flows.
+
+Keeps from an older daemon are queue-0 keeps. They are recognised as
+this module's in either form (audit, slot reuse, teardown), the status
+row counts them (`keeps inherited from a previous daemon (… on queue
+0)`), and the next steer rewrites them in place as RSS keeps. An
+adopted restart steers again at the end of its resync; `packetframe
+reconfigure` does it sooner.
+
+### Queue-0 IRQ placement, while keeps pin to queue 0
+
+On a port whose keeps fell back to queue 0, the daemon moves that
+port's queue-0 IRQ (the vector named `<port>-rxtx-0`) to **a CPU of its
+own**: never one of VPP's cores (main and workers), never an isolated
+CPU, never cpu0. Every eligible CPU takes one port's queue 0 before any
+takes a second; the published control-plane CPUs (where they exist —
+on a box where every CPU takes NIC interrupts there are none) are used
+after the others but before any sharing; ties go to the CPU with the
+fewest NIC queue IRQs. The prior affinity is
+written to `<state-dir>/vpp-queue0-irqs.json` **before** the move, and
+put back when the port's keeps stop needing it: a steer that leaves the
+port on RSS or unsteered, the module's teardown, or `packetframe
+detach`. A record from another boot is dropped unrestored (the reboot
+reset the IRQs), and so is one whose IRQ no longer holds the CPU the
+daemon wrote: something else moved it since, and its value is kept.
+`--keep-vpp` restarts leave the placement and the record in place, and
+the next daemon restores the original prior on its teardown. With no
+CPU to move to, the port is reported `queue-0 IRQ NOT moved (no CPU
+outside VPP's cores …)` and nothing is written. A placement counts only
+once `effective_affinity_list` says the IRQ fires there: a kernel that
+takes the mask and keeps delivering elsewhere (a kernel-managed or
+driver-pinned vector) is reported `queue-0 IRQ NOT moved (cpu N was
+written to its mask but the kernel still delivers it on M)`, retried on
+every steer, and its mask is still put back on teardown. A write the
+kernel refuses leaves the record exactly as it was.
+
+The otx2 PF re-applies its own affinity hint whenever it re-opens a
+port (ring resize, link bounce, provisioning push), which puts queue 0
+back on cpu0. The row shows where the IRQ is delivered now; the next
+steer places it again.
+
+**Does a daemon restart undo a manual placement?** No, unless you
+picked one of VPP's cores. The attach-time pass (`crates/modules/
+vpp-offload/src/bringup.rs`, the `cores::clear_irqs_off` call before
+VPP starts, and again after adopting a VPP observed on other cores)
+moves only member IRQs whose effective affinity is on a VPP core; a
+queue-0 IRQ moved by hand to any other CPU is left alone. What does
+undo it is a port re-open (above), and a reboot.
+
+### How to check
+
+```bash
+# The keeps: "RSS Context ID: 0" on an RSS keep, absent on a queue-0
+# one; "Action: Direct to queue 0" on both (for an RSS rule the queue is
+# an offset into the one the hash picks). Keeps sit at lower locations
+# than every diversion ("Direct to VF 0 ...").
+ethtool -n <port>
+
+# Where each queue's IRQ fires, and how often. "<port>-rxtx-0" is queue 0.
+grep '<port>-rxtx-' /proc/interrupts
+cat /proc/irq/<irq>/effective_affinity_list
+
+# Per-queue receive and the port's drops. Twice, ten seconds apart:
+# with RSS keeps `rxq0: frames` grows at roughly the others' rate; with
+# queue-0 keeps carrying the bulk it outgrows all of them together.
+# `rx_drops` should not move at all on a steered port.
+ethtool -S <port> | grep -E 'rxq[0-9]+: frames|rx_drops'
+
+# Which core is drowning: softirq per CPU.
+mpstat -P ALL 1 5   # or: top, then 1
+```
+
+`packetframe status` carries a `kernel-path` row while any port has
+rules installed: per port, the keep form (and the driver's answer on a
+fallback), the queue-0 IRQ placement, and receive, queue-0 and drop
+rates sampled every 10 s from the same counters. It is **Degraded**,
+port named, when a port drops 100 frames/s or more — with the remedy for
+the form its keeps are in. The `kernel_path_dropping` event records the
+start (at most once per port every ten minutes while it lasts) and the
+end. Gauges: `packetframe_vpp_keep_rss`, `packetframe_vpp_keeps_observed`,
+`packetframe_vpp_queue0_irq_cpu`, `packetframe_vpp_kernel_rx_frames`,
+`packetframe_vpp_kernel_rx_drops`, `packetframe_vpp_kernel_rx_fps`,
+`packetframe_vpp_kernel_rx_drops_per_second` and
+`packetframe_vpp_kernel_path_dropping`.
+
+### Emergency lever: move the IRQ by hand
+
+If a core is saturated and exempt traffic is dropping, do not wait for a
+release. Move the hot queue's IRQ to an idle CPU that is not one of
+VPP's (the attach log names VPP's cores: `vpp-offload attached`,
+`main_core`, `workers`) and not isolated:
+
+```bash
+grep '<port>-rxtx-0' /proc/interrupts          # first column is the IRQ
+echo <cpu> > /proc/irq/<irq>/smp_affinity_list
+cat /proc/irq/<irq>/effective_affinity_list    # must now read <cpu>
+```
+
+One port per CPU. It takes effect immediately and lasts until the port
+is re-opened or the box reboots. On the incident box it took loss from
+30% to 0 within seconds.
+
+### Downgrading below 0.6.0
+
+An older daemon reads an RSS keep as somebody else's rule: its teardown
+would leave the keeps in the MCAM and its planner would route around
+their slots. Run **this** release's `packetframe detach --all` before
+installing an older one.
+
 ## IRQ affinity before attach
 
 VPP workers are poll-mode: each one owns its CPU at 100% duty cycle
@@ -4214,7 +5022,9 @@ apply by hand. On UniFi a hand-written affinity is gone at the next
 reboot, provision cycle or ring resize, so the refusal fired after
 every one of them. The moves are not undone on detach: putting an IRQ
 back on a CPU VPP no longer uses would only re-create the conflict for
-the next attach. With a config that
+the next attach. (The queue-0 placement for keeps that pin to queue 0
+is different, and is restored: see [the kernel path for exempt
+traffic](#the-kernel-path-for-exempt-traffic).) With a config that
 declares the module, the no-CPU-left failure is `required`: it makes
 the summary read "vpp-offload attach BLOCKED" (exit non-zero) rather
 than PASS. Effective, not

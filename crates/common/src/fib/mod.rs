@@ -84,9 +84,14 @@ pub enum RouteEvent {
     /// collect entries left over from a prior session.
     InitiationComplete,
     /// The RouteSource reconnected after a disconnect. Programmer
-    /// should stale-and-reconcile: mark all entries "not-yet-seen",
-    /// clear the mark as `Add` events arrive, and GC anything still
-    /// marked at the next `InitiationComplete`.
+    /// should stale-and-reconcile: mark the RouteSource's entries
+    /// "not-yet-seen", clear the mark as `Add` events arrive, and GC
+    /// anything still marked at the next `InitiationComplete`.
+    ///
+    /// Entries under a [`PeerId::local_arp`] peer are not the
+    /// RouteSource's and are never marked. The neighbour resolver
+    /// injects them and no session re-announces them, so marking them
+    /// made every reconnect delete them.
     Resync,
 }
 
@@ -97,17 +102,28 @@ pub enum RouteEvent {
 /// so that a `PeerDown` from one feed never tears down routes another
 /// feed installed.
 ///
-/// **`local_arp(ifindex)`** (v0.2.1) carves out a deterministic
-/// sub-range for the v0.2.1 connected fast-path feature
-/// ([`crate::config::ModuleDirective::LocalPrefix`]): the high bit of
-/// the 64-bit space is set, the next 31 bits are zeroed, and the low
-/// 32 bits hold the kernel ifindex. RouteSource-derived hashes
-/// effectively never produce values with both halves of this layout
-/// (the high bit set + 31 zero bits + a small u32-shaped low half),
-/// so collision with a hash-allocated PeerId is mathematically
-/// negligible. `is_local_arp` recovers the per-iface scope so the
-/// programmer can withdraw a single iface's worth of /32s on
-/// `RTM_DELLINK`.
+/// Two namespaces, one constructor each:
+///
+/// - **`local_arp(ifindex)`** (v0.2.1) is the neighbour resolver's, for
+///   the connected fast-path feature
+///   ([`crate::config::ModuleDirective::LocalPrefix`]) and
+///   `fallback-default`: the high bit of the 64-bit space is set, the
+///   next 31 bits are zeroed, and the low 32 bits hold the kernel
+///   ifindex. `as_local_arp_ifindex` recovers the per-iface scope so the
+///   programmer can withdraw a single iface's worth of /32s on
+///   `RTM_DELLINK`.
+/// - **`route_source(key)`** is every route feed's, and never sets the
+///   high bit, so no feed id can be a local-ARP one. Every RouteSource
+///   must build its ids with it.
+///
+/// The separation has to hold by construction. Feed ids are hashes of
+/// fields the feed's sender chooses (a BMP peer distinguisher, a BGP
+/// ASN), and `DefaultHasher` uses fixed keys, so a sender can search
+/// offline for a key whose hash lands in the local-ARP layout. The
+/// programmer exempts that namespace from the reconnect GC, so a
+/// route under such an id would outlive the session that sent it
+/// (security review finding).
+///
 /// `Ord` / `PartialOrd` are derived (lexicographic on the wrapped
 /// `u64`) so `PeerId` can key a `BTreeMap` / `BTreeSet`. The
 /// FibProgrammer uses `BTreeMap<(PeerId, Option<u32>), _>` for its
@@ -118,7 +134,8 @@ pub struct PeerId(pub u64);
 
 impl PeerId {
     /// High-bit marker that distinguishes [`PeerId::local_arp`] values
-    /// from RouteSource-derived hashes. See the type-level docs.
+    /// from [`PeerId::route_source`] ones, which never set it. See the
+    /// type-level docs.
     const LOCAL_ARP_MARKER: u64 = 1u64 << 63;
 
     /// The 31 bits between the marker and the ifindex, which
@@ -140,6 +157,23 @@ impl PeerId {
     /// behind that iface.
     pub fn local_arp(ifindex: u32) -> Self {
         Self(Self::LOCAL_ARP_MARKER | (ifindex as u64))
+    }
+
+    /// A route feed's PeerId for the peer identified by `key`. Stable
+    /// across reconnects and process runs for the same key, and never
+    /// in the local-ARP namespace, whatever the key; see the type-level
+    /// docs for why that must not rest on the hash.
+    pub fn route_source(key: &impl std::hash::Hash) -> Self {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        Self::from_route_source_hash(h.finish())
+    }
+
+    /// Clearing the marker is enough: [`Self::as_local_arp_ifindex`]
+    /// requires it set. 63 bits stay for telling feed peers apart.
+    fn from_route_source_hash(hash: u64) -> Self {
+        Self(hash & !Self::LOCAL_ARP_MARKER)
     }
 
     /// `Some(ifindex)` when this PeerId came from
@@ -631,6 +665,10 @@ pub struct FeedLiveness {
     /// The stale-route GC has completed for THIS epoch. See
     /// [`FeedSession::mark_reconciled`].
     pub reconciled: bool,
+    /// The mirror was seeded from the fast-path route ledger and no
+    /// stale-route GC has run since. See
+    /// [`FeedSession::mark_mirror_seeded`].
+    pub mirror_seeded: bool,
 }
 
 impl FeedSession {
@@ -648,8 +686,17 @@ impl FeedSession {
     /// transition, set only by [`FeedSession::mark_reconciled`].
     const RECONCILED_BIT: u64 = 1 << 1;
 
-    /// The epoch occupies the remaining 62 bits.
-    const EPOCH_SHIFT: u32 = 2;
+    /// Bit 2 of `state`: the mirror holds a seed from the fast-path
+    /// route ledger that no GC has reconciled yet. Unlike
+    /// [`Self::RECONCILED_BIT`] it is a fact about the MIRROR, not an
+    /// epoch: a reconnect does not clear it (the seed's unconfirmed routes
+    /// are still there), the first GC does (it removed every seeded route
+    /// the source did not re-advertise). In the same word so a consumer
+    /// reads it with the liveness it is judged alongside.
+    const MIRROR_SEEDED_BIT: u64 = 1 << 2;
+
+    /// The epoch occupies the remaining 61 bits.
+    const EPOCH_SHIFT: u32 = 3;
 
     pub fn new() -> Self {
         Self::default()
@@ -681,11 +728,27 @@ impl FeedSession {
                 }
                 Some(
                     (epoch << Self::EPOCH_SHIFT)
+                        | (cur & Self::MIRROR_SEEDED_BIT)
                         | if reconciled { Self::RECONCILED_BIT } else { 0 }
                         | u64::from(up),
                 )
             },
         );
+    }
+
+    /// The mirror was seeded from the fast-path route ledger: it holds
+    /// the previous process's whole table, every route unconfirmed until
+    /// the route source re-advertises it. Set once, by the control plane,
+    /// before the route source can connect; cleared by the first
+    /// [`Self::mark_reconciled`].
+    ///
+    /// What it lets a consumer conclude, and what it does not: the
+    /// mirror is NOT a table still loading from empty — a diff against it
+    /// is not "~all withdrawals" — but neither is it current. Pair it with
+    /// the completeness authority's word before acting on it.
+    pub fn mark_mirror_seeded(&self) {
+        self.state
+            .fetch_or(Self::MIRROR_SEEDED_BIT, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// The session owner reports that the stale-route GC has completed
@@ -704,9 +767,15 @@ impl FeedSession {
     /// sole writer of this word and its raise and its GC completion are
     /// sequential within one task; nothing can clear the epoch between
     /// the GC and this call.
+    ///
+    /// The same GC is what reconciles a ledger seed, so this also clears
+    /// [`Self::MIRROR_SEEDED_BIT`].
     pub fn mark_reconciled(&self) {
-        self.state
-            .fetch_or(Self::RECONCILED_BIT, std::sync::atomic::Ordering::AcqRel);
+        let _ = self.state.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| Some((cur | Self::RECONCILED_BIT) & !Self::MIRROR_SEEDED_BIT),
+        );
     }
 
     /// Liveness, epoch and reconciliation as one observation. Prefer
@@ -716,6 +785,7 @@ impl FeedSession {
         FeedLiveness {
             up: s & Self::UP_BIT != 0,
             reconciled: s & Self::RECONCILED_BIT != 0,
+            mirror_seeded: s & Self::MIRROR_SEEDED_BIT != 0,
             epoch: s >> Self::EPOCH_SHIFT,
         }
     }
@@ -786,6 +856,45 @@ mod peer_id_tests {
                 "bit {bit} is reserved; a value carrying it is not a local-ARP id"
             );
         }
+    }
+
+    /// A feed id is never a local-ARP id, even when the sender has found
+    /// a key whose hash IS one. The inputs here are exactly those
+    /// hashes: every value the local-ARP constructor can produce at its
+    /// edges, plus the marker alone and all bits set.
+    #[test]
+    fn a_route_source_hash_never_lands_in_the_local_arp_namespace() {
+        let crafted = [
+            PeerId::local_arp(0).0,
+            PeerId::local_arp(1).0,
+            PeerId::local_arp(33).0,
+            PeerId::local_arp(u32::MAX).0,
+            1u64 << 63,
+            u64::MAX,
+        ];
+        for hash in crafted {
+            let pid = PeerId::from_route_source_hash(hash);
+            assert_eq!(
+                pid.as_local_arp_ifindex(),
+                None,
+                "hash {hash:#018x} became local-ARP id {pid:?}"
+            );
+            // Only the marker goes: the rest still tells peers apart.
+            assert_eq!(pid.0, hash & !(1u64 << 63));
+        }
+    }
+
+    #[test]
+    fn route_source_ids_are_stable_per_key_and_distinct_across_keys() {
+        let key = |asn: u32| ("192.0.2.1".parse::<IpAddr>().unwrap(), asn);
+        assert_eq!(
+            PeerId::route_source(&key(64512)),
+            PeerId::route_source(&key(64512))
+        );
+        assert_ne!(
+            PeerId::route_source(&key(64512)),
+            PeerId::route_source(&key(64513))
+        );
     }
 
     #[test]
@@ -1074,6 +1183,7 @@ mod tests {
             up,
             epoch,
             reconciled,
+            mirror_seeded: false,
         };
         let s = FeedSession::new();
         assert_eq!(s.liveness(), l(false, 0, false));
@@ -1126,6 +1236,41 @@ mod tests {
         s.mark_reconciled();
         assert!(s.liveness().reconciled);
         assert_eq!(s.liveness().epoch, 2, "reconciling does not move the epoch");
+    }
+
+    /// A ledger seed is a fact about the mirror, not about an epoch: it
+    /// outlives a reconnect (the seed's unconfirmed routes are still
+    /// there) and ends at the first GC (which removed them) — and it
+    /// shares the word without disturbing what else the word carries.
+    #[test]
+    fn a_mirror_seed_lasts_until_the_first_gc() {
+        let s = FeedSession::new();
+        s.mark_mirror_seeded();
+        let seen = s.liveness();
+        assert!(
+            seen.mirror_seeded && !seen.up && seen.epoch == 0,
+            "{seen:?}"
+        );
+        s.set_up(true);
+        s.set_up(false);
+        s.set_up(true);
+        let seen = s.liveness();
+        assert!(
+            seen.mirror_seeded && seen.up && seen.epoch == 2 && !seen.reconciled,
+            "a reconnect is not a reconciliation of the seed: {seen:?}"
+        );
+        s.mark_reconciled();
+        let seen = s.liveness();
+        assert!(
+            !seen.mirror_seeded && seen.reconciled && seen.up && seen.epoch == 2,
+            "{seen:?}"
+        );
+        s.set_up(false);
+        s.set_up(true);
+        assert!(
+            !s.liveness().mirror_seeded,
+            "nothing re-seeds a mirror mid-process"
+        );
     }
 
     #[test]

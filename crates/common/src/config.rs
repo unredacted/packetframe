@@ -568,6 +568,19 @@ pub enum ModuleDirective {
     /// Only meaningful under `forwarding-mode packetframe-fib`; parsed and
     /// inert otherwise (warned at apply time). SIGHUP-reconcilable.
     FibCache(bool),
+    /// `route-ledger on|off [max-age <seconds>]` — the fast-path route
+    /// ledger: a clean stop preserves the route mirror's route-source
+    /// advertisements in `<state-dir>/fast-path-route-ledger.bin`, and
+    /// the next start seeds the mirror from it before the route source
+    /// connects. Default on, `max-age` [`ROUTE_LEDGER_DEFAULT_MAX_AGE_SECS`].
+    /// Only meaningful under `forwarding-mode packetframe-fib`; the
+    /// start that finds a ledger under any other mode consumes and
+    /// refuses it by name. SIGHUP-applicable: the stop reads the setting
+    /// in force when it runs. See `docs/runbooks/packetframe-fib.md`.
+    RouteLedger {
+        spec: RouteLedgerSpec,
+        line: usize,
+    },
     /// `coalesce [rx-usecs <n>] [rx-frames <n>] [tx-usecs <n>]
     /// [tx-frames <n>]` — NIC interrupt coalescing applied to every
     /// interface this module attaches (never to one it does not), via
@@ -1161,6 +1174,115 @@ pub enum RouteSourceSpec {
     },
 }
 
+impl RouteSourceSpec {
+    /// The route source a fast-path route ledger was written for, as
+    /// the ledger records it and the next start compares it.
+    ///
+    /// Only the fields that decide WHICH table arrives and under which
+    /// peer it is keyed: the mode, the listen endpoint, the ASNs and the
+    /// peer pin for BGP (the listener's peer id hashes the listen address
+    /// and the peer AS), the Loc-RIB requirement for BMP — and the
+    /// `peer-from` ACL wherever no peer pin names the one speaker that
+    /// may supply the table. Without a pin the ACL is what decides that:
+    /// two routers in one AS behind one listen address file their tables
+    /// under the same BGP peer id, so an ACL moved from one to the other
+    /// across a restart must not accept the first router's ledger for the
+    /// second. BMP has no pin, so its ACL is always identity. `router-id`,
+    /// `anyip` and `allow-remote` change how the session is announced or
+    /// bound, not whose routes arrive, so editing them keeps a ledger
+    /// usable; so does the ACL under a BGP peer pin, which already names
+    /// the speaker. A loopback listen has no ACL and renders none.
+    ///
+    /// Rendered from the parsed values rather than the text, so
+    /// `192.0.2.1` and `192.000.002.001` are one identity, and the ACL
+    /// sorted, deduplicated and with host bits cleared, so the order it
+    /// was written in and `192.0.2.7/24` for `192.0.2.0/24` (the same
+    /// match) do not change it.
+    pub fn ledger_identity(&self) -> String {
+        fn addr(raw: &str) -> String {
+            raw.parse::<IpAddr>()
+                .map_or_else(|_| raw.to_string(), |a| a.to_string())
+        }
+        fn acl(peer_from: &[ipnet::IpNet]) -> String {
+            let mut nets: Vec<ipnet::IpNet> = peer_from.iter().map(|n| n.trunc()).collect();
+            nets.sort();
+            nets.dedup();
+            if nets.is_empty() {
+                return String::new();
+            }
+            let nets: Vec<String> = nets.iter().map(ToString::to_string).collect();
+            format!(" peer-from {}", nets.join(","))
+        }
+        match self {
+            RouteSourceSpec::Bgp {
+                addr: a,
+                port,
+                local_as,
+                peer_as,
+                peer_ip,
+                peer_from,
+                ..
+            } => format!(
+                "bgp listen {} port {port} local-as {local_as} peer-as {peer_as} peer-ip {}{}",
+                addr(a),
+                peer_ip.map_or_else(|| "any".to_string(), |p| p.to_string()),
+                if peer_ip.is_some() {
+                    String::new()
+                } else {
+                    acl(peer_from)
+                }
+            ),
+            RouteSourceSpec::Bmp {
+                addr: a,
+                port,
+                require_loc_rib,
+                peer_from,
+                ..
+            } => format!(
+                "bmp listen {} port {port} require-loc-rib {}{}",
+                addr(a),
+                if *require_loc_rib { "on" } else { "off" },
+                acl(peer_from)
+            ),
+        }
+    }
+}
+
+/// Default for `route-ledger ... max-age`: 30 minutes.
+///
+/// A routine `stop`/`detach --keep-vpp`/`start` takes a minute or two
+/// and a reboot of the reference gateway about five, so this is several
+/// times either. Past it the seed is refused: every minute the router
+/// was down is a minute of churn the seed forwards on until the route
+/// source re-advertises it, and half an hour is where that stops being
+/// a small fraction of the table (tens of changes a second on a full
+/// table). Conservative on purpose: a refused ledger costs the cold
+/// reload the daemon always paid, never a wrong route.
+pub const ROUTE_LEDGER_DEFAULT_MAX_AGE_SECS: u64 = 1800;
+
+/// Allowed range for `route-ledger ... max-age`. One minute up, because
+/// a smaller bound refuses the restart the ledger exists for; one day
+/// down, because a ledger older than that describes a table nobody
+/// should forward on, even as a seed.
+pub const ROUTE_LEDGER_MAX_AGE_SECS: std::ops::RangeInclusive<u64> = 60..=86_400;
+
+/// `route-ledger on|off [max-age <seconds>]`, resolved. Absent ⇒
+/// [`RouteLedgerSpec::default`]: on, 30 minutes.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct RouteLedgerSpec {
+    pub enabled: bool,
+    pub max_age_secs: u64,
+}
+
+impl Default for RouteLedgerSpec {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_age_secs: ROUTE_LEDGER_DEFAULT_MAX_AGE_SECS,
+        }
+    }
+}
+
 /// One `fib-*-max-entries` directive. Parsed but not runtime-applied
 /// see the doc on [`ModuleDirective::FibSize`].
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -1735,6 +1857,17 @@ pub const MAX_CONFIG_FILE_SIZE: u64 = 1 << 20;
 /// NIC (2026-09-24), and far past any exemption list worth writing.
 pub const VPP_MAX_STEER_CAPACITY: u16 = 256;
 
+/// The most `port` lines a vpp-offload section may declare.
+///
+/// Far past any NIC the module drives (the reference OCTEON has six
+/// PFs). It is a cap rather than a guess because vpp-offload's state
+/// file is read only up to a bound sized for this many ports, each
+/// with a full rule table (`MAX_STATE_FILE_BYTES` in vpp-offload's
+/// `resources`, whose test builds the widest such file at this count).
+/// A config past it could have the daemon write a state file it would
+/// then refuse at the next attach and at `detach --all`.
+pub const VPP_MAX_PORTS: usize = 64;
+
 /// Maximum `interface` lines a guard section may declare. Mirrors the
 /// BPF `GUARD_CFG` map's capacity
 /// (`crates/modules/guard/bpf/src/maps.rs`, `GUARD_CFG_MAX_ENTRIES`):
@@ -2234,7 +2367,8 @@ impl Config {
     ///   member would blackhole those destinations in VPP);
     /// - steering requires `forwarding-mode packetframe-fib` (the full
     ///   table VPP mirrors comes from the PacketFrame FIB route pipeline);
-    /// - duplicate `port` lines for one interface are rejected;
+    /// - duplicate `port` lines for one interface are rejected, and so
+    ///   are more than [`VPP_MAX_PORTS`];
     /// - the IPv6 steering rules ([`Self::validate_vpp_v6_steering`]);
     /// - `drift-accept6` ([`Self::validate_vpp_drift_accepts6`]);
     /// - `local-route6` ([`Self::validate_vpp_local_routes6`]).
@@ -2258,6 +2392,16 @@ impl Config {
                     return Err(ConfigError::parse(
                         *line,
                         format!("duplicate `port {iface}` in module vpp-offload"),
+                    ));
+                }
+                if ports.len() == VPP_MAX_PORTS {
+                    return Err(ConfigError::parse(
+                        *line,
+                        format!(
+                            "module vpp-offload declares more than {VPP_MAX_PORTS} `port` \
+                             lines; its state file is read only up to a bound sized for that \
+                             many"
+                        ),
                     ));
                 }
                 // A `cores 0` port's queue is polled by the worker it
@@ -3277,6 +3421,19 @@ fn parse(input: &str) -> Result<Config, ConfigError> {
                             ));
                         }
                     }
+                    // Two lines would make "is the ledger on" depend
+                    // on which one a reader finds first.
+                    if matches!(d, ModuleDirective::RouteLedger { .. }) {
+                        if let Some(prev) = modules[i].directives.iter().find_map(|e| match e {
+                            ModuleDirective::RouteLedger { line, .. } => Some(*line),
+                            _ => None,
+                        }) {
+                            return Err(ConfigError::parse(
+                                line,
+                                format!("duplicate `route-ledger` (first on line {prev})"),
+                            ));
+                        }
+                    }
                     // One rule set per section: a second line would
                     // raise the question of whether its keep list
                     // applies to the first line's sources, and the
@@ -3970,6 +4127,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             };
             Ok(ModuleDirective::FibCache(on))
         }
+        "route-ledger" => parse_route_ledger(line, rest),
         "coalesce" => parse_coalesce(line, rest),
         "bridge-resolve" => parse_single_arg(line, rest, "bridge-resolve", |t| {
             let v: ToggleAutoOnOff = t.parse().map_err(|e: String| e)?;
@@ -4846,6 +5004,79 @@ pub const COALESCE_MAX_FRAMES: u32 = 32_768;
 
 /// `coalesce <key> <n> [<key> <n>...]`: keyword/value pairs in any
 /// order, each key at most once, at least one pair.
+/// `route-ledger on|off [max-age <seconds>]`.
+///
+/// `max-age` with `off` is refused rather than ignored: it reads as a
+/// setting that does something, and an operator who wrote it meant the
+/// ledger to be on.
+fn parse_route_ledger<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    const USAGE: &str = "form: `route-ledger on|off [max-age <seconds>]`";
+    let toggle = rest.next().ok_or_else(|| {
+        ConfigError::parse(line, format!("route-ledger requires on|off ({USAGE})"))
+    })?;
+    let enabled = match toggle {
+        "on" => true,
+        "off" => false,
+        other => {
+            return Err(ConfigError::parse(
+                line,
+                format!("route-ledger expects on|off, got `{other}` ({USAGE})"),
+            ))
+        }
+    };
+    let mut spec = RouteLedgerSpec {
+        enabled,
+        ..RouteLedgerSpec::default()
+    };
+    let mut max_age_seen = false;
+    while let Some(key) = rest.next() {
+        if key != "max-age" {
+            return Err(ConfigError::parse(
+                line,
+                format!("route-ledger: unknown parameter `{key}` ({USAGE})"),
+            ));
+        }
+        if max_age_seen {
+            return Err(ConfigError::parse(
+                line,
+                "route-ledger: `max-age` given twice",
+            ));
+        }
+        max_age_seen = true;
+        if !enabled {
+            return Err(ConfigError::parse(
+                line,
+                "route-ledger off takes no `max-age`: with the ledger off nothing is \
+                 written or read, so the bound would do nothing",
+            ));
+        }
+        let tok = rest.next().ok_or_else(|| {
+            ConfigError::parse(line, "route-ledger: `max-age` requires a number of seconds")
+        })?;
+        let secs: u64 = tok.parse().map_err(|_| {
+            ConfigError::parse(
+                line,
+                format!("route-ledger: `max-age` expects whole seconds, got `{tok}`"),
+            )
+        })?;
+        if !ROUTE_LEDGER_MAX_AGE_SECS.contains(&secs) {
+            return Err(ConfigError::parse(
+                line,
+                format!(
+                    "route-ledger: `max-age {secs}` out of range [{}, {}] seconds",
+                    ROUTE_LEDGER_MAX_AGE_SECS.start(),
+                    ROUTE_LEDGER_MAX_AGE_SECS.end()
+                ),
+            ));
+        }
+        spec.max_age_secs = secs;
+    }
+    Ok(ModuleDirective::RouteLedger { spec, line })
+}
+
 fn parse_coalesce<'a>(
     line: usize,
     mut rest: impl Iterator<Item = &'a str>,
@@ -6031,6 +6262,206 @@ module fast-path
         assert!(Config::parse("module fast-path\n  fib-cache on off\n").is_err());
     }
 
+    fn route_ledger_of(body: &str) -> Result<RouteLedgerSpec, String> {
+        let s = format!("module fast-path\n  {body}\n");
+        let c = Config::parse(&s).map_err(|e| e.to_string())?;
+        match &c.modules[0].directives[0] {
+            ModuleDirective::RouteLedger { spec, line } => {
+                assert_eq!(*line, 2);
+                Ok(*spec)
+            }
+            other => panic!("expected RouteLedger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_ledger_parses_with_defaults() {
+        assert_eq!(
+            route_ledger_of("route-ledger on").unwrap(),
+            RouteLedgerSpec {
+                enabled: true,
+                max_age_secs: ROUTE_LEDGER_DEFAULT_MAX_AGE_SECS
+            }
+        );
+        assert_eq!(
+            route_ledger_of("route-ledger on max-age 600").unwrap(),
+            RouteLedgerSpec {
+                enabled: true,
+                max_age_secs: 600
+            }
+        );
+        let off = route_ledger_of("route-ledger off").unwrap();
+        assert!(!off.enabled);
+        // Absent is on, 30 minutes: the default is what an operator who
+        // never heard of the directive gets.
+        assert_eq!(
+            RouteLedgerSpec::default(),
+            RouteLedgerSpec {
+                enabled: true,
+                max_age_secs: 1800
+            }
+        );
+    }
+
+    #[test]
+    fn route_ledger_bounds_are_inclusive() {
+        let lo = *ROUTE_LEDGER_MAX_AGE_SECS.start();
+        let hi = *ROUTE_LEDGER_MAX_AGE_SECS.end();
+        assert_eq!(
+            route_ledger_of(&format!("route-ledger on max-age {lo}"))
+                .unwrap()
+                .max_age_secs,
+            lo
+        );
+        assert_eq!(
+            route_ledger_of(&format!("route-ledger on max-age {hi}"))
+                .unwrap()
+                .max_age_secs,
+            hi
+        );
+        for bad in [lo - 1, hi + 1] {
+            let e = route_ledger_of(&format!("route-ledger on max-age {bad}")).unwrap_err();
+            assert!(e.contains("out of range"), "{e}");
+        }
+    }
+
+    #[test]
+    fn route_ledger_refuses_malformed_lines() {
+        for (body, want) in [
+            ("route-ledger", "requires on|off"),
+            ("route-ledger auto", "expects on|off"),
+            ("route-ledger on max-age", "requires a number"),
+            ("route-ledger on max-age 30m", "whole seconds"),
+            ("route-ledger on max-age -5", "whole seconds"),
+            ("route-ledger on max-age 600 max-age 700", "given twice"),
+            ("route-ledger on ttl 600", "unknown parameter"),
+            ("route-ledger off max-age 600", "takes no `max-age`"),
+        ] {
+            let e = route_ledger_of(body).unwrap_err();
+            assert!(e.contains(want), "{body}: {e}");
+        }
+        let e = Config::parse("module fast-path\n  route-ledger on\n  route-ledger off\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("duplicate `route-ledger` (first on line 2)"),
+            "{e}"
+        );
+    }
+
+    /// The identity is what the ledger is matched on, so it must change
+    /// with what changes the table or its keying, and must not change
+    /// with what does not.
+    #[test]
+    fn route_source_ledger_identity_tracks_only_the_table() {
+        let identity = |line: &str| {
+            let c = Config::parse(&format!("module fast-path\n  {line}\n")).unwrap();
+            match &c.modules[0].directives[0] {
+                ModuleDirective::RouteSource(s) => s.ledger_identity(),
+                other => panic!("expected RouteSource, got {other:?}"),
+            }
+        };
+        let base = identity("route-source bgp 127.0.0.1:1179 local-as 65000 peer-as 65000");
+        assert_eq!(
+            base,
+            "bgp listen 127.0.0.1 port 1179 local-as 65000 peer-as 65000 peer-ip any"
+        );
+        // Not identity: how the session announces itself.
+        assert_eq!(
+            identity(
+                "route-source bgp 127.0.0.1:1179 local-as 65000 peer-as 65000 \
+                 router-id 192.0.2.9"
+            ),
+            base
+        );
+        // Identity: the endpoint, the ASNs.
+        for other in [
+            "route-source bgp 127.0.0.1:1180 local-as 65000 peer-as 65000",
+            "route-source bgp 127.0.0.2:1179 local-as 65000 peer-as 65000",
+            "route-source bgp 127.0.0.1:1179 local-as 65000 peer-as 65001",
+            "route-source bgp 127.0.0.1:1179 local-as 65001 peer-as 65000",
+            "route-source bmp 127.0.0.1:1179",
+        ] {
+            assert_ne!(identity(other), base, "{other}");
+        }
+        // On a remote listen with no peer pin, the ACL decides which
+        // speaker supplies the table, so it is identity: moving it from
+        // one router to another in the same AS (same listener, same peer
+        // id) must not accept the first router's ledger.
+        let remote = identity(
+            "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
+             peer-from 192.0.2.0/24",
+        );
+        assert_eq!(
+            remote,
+            "bgp listen 192.0.2.1 port 179 local-as 65000 peer-as 65000 peer-ip any \
+             peer-from 192.0.2.0/24"
+        );
+        assert_ne!(
+            identity(
+                "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
+                 peer-from 198.51.100.0/24"
+            ),
+            remote
+        );
+        // Normalised: host bits, order and repeats are not identity, and
+        // neither is `anyip`.
+        assert_eq!(
+            identity(
+                "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
+                 peer-from 192.0.2.77/24 anyip"
+            ),
+            remote
+        );
+        let two = identity(
+            "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
+             peer-from 198.51.100.0/24 peer-from 192.0.2.0/24",
+        );
+        assert_eq!(
+            identity(
+                "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
+                 peer-from 192.0.2.0/24 peer-from 198.51.100.0/24 peer-from 192.0.2.0/24"
+            ),
+            two
+        );
+        assert_ne!(two, remote);
+        // A peer pin names the speaker itself, so under one the ACL is
+        // not identity; the pin is.
+        let pinned = identity(
+            "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
+             peer-from 192.0.2.0/24 peer-ip 192.0.2.2",
+        );
+        assert_ne!(pinned, remote);
+        assert!(pinned.ends_with("peer-ip 192.0.2.2"), "{pinned}");
+        assert_eq!(
+            identity(
+                "route-source bgp 192.0.2.1:179 local-as 65000 peer-as 65000 allow-remote \
+                 peer-from 192.0.2.0/25 peer-ip 192.0.2.2"
+            ),
+            pinned
+        );
+        assert_eq!(
+            identity("route-source bmp 127.0.0.1:6543 require-loc-rib"),
+            "bmp listen 127.0.0.1 port 6543 require-loc-rib on"
+        );
+        // BMP has no pin: its ACL is always identity.
+        let bmp = identity(
+            "route-source bmp 192.0.2.1:6543 require-loc-rib allow-remote \
+             peer-from 192.0.2.0/24",
+        );
+        assert_eq!(
+            bmp,
+            "bmp listen 192.0.2.1 port 6543 require-loc-rib on peer-from 192.0.2.0/24"
+        );
+        assert_ne!(
+            identity(
+                "route-source bmp 192.0.2.1:6543 require-loc-rib allow-remote \
+                 peer-from 198.51.100.0/24"
+            ),
+            bmp
+        );
+    }
+
     fn coalesce_of(body: &str) -> Result<crate::ethtool::CoalesceSpec, String> {
         let s = format!("module fast-path\n  {body}\n");
         let c = Config::parse(&s).map_err(|e| e.to_string())?;
@@ -6527,6 +6958,34 @@ module vpp-offload
         // A different upstream on the same box is fine.
         let ok = cfg.replace("upstream 127.0.0.1", "upstream 192.0.2.1");
         Config::parse(&ok).unwrap().validate_fast_path().unwrap();
+    }
+
+    /// `VPP_MAX_PORTS` ports validate; one more is refused at its own
+    /// line, since vpp-offload's state-file read bound is sized for the
+    /// cap and nothing past it.
+    #[test]
+    fn vpp_offload_port_lines_are_capped() {
+        let header = "module fast-path\n  attach eth2 generic\n  allow-prefix 203.0.113.0/24\n\
+                      module vpp-offload\n  loopback-address 192.0.2.1/32\n  \
+                      require-table-complete off\n";
+        let config = |n: usize| {
+            let mut c = String::from(header);
+            for p in 0..n {
+                c.push_str(&format!("  port pf{p} cores 1 steer off\n"));
+            }
+            Config::parse(&c).unwrap()
+        };
+        config(VPP_MAX_PORTS).validate_vpp_offload().unwrap();
+        let err = config(VPP_MAX_PORTS + 1)
+            .validate_vpp_offload()
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains(&format!("more than {VPP_MAX_PORTS} `port` lines")),
+            "{err}"
+        );
+        // The port line past the cap is the one named.
+        let past = header.lines().count() + VPP_MAX_PORTS + 1;
+        assert!(format!("{err}").contains(&format!("line {past}")), "{err}");
     }
 
     /// `require-table-complete on` + `integrity-authority none` is a

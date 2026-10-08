@@ -43,8 +43,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -322,6 +320,23 @@ impl BmpStation {
             auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
             "BMP station listening"
         );
+        // The station's own start is a stream boundary too, and the
+        // mirror is asked here for the same reason it is at the others:
+        // a route ledger may have seeded it with the previous process's
+        // routes (or an earlier station instance on this retry loop left
+        // its stream's), and a first frame must not raise over floor
+        // credit no stream of this station earned. An empty mirror —
+        // every start without a seed — answers false, as before.
+        let stale = self.mirror_holds_state().await;
+        self.stale_state_possible
+            .store(stale, std::sync::atomic::Ordering::Relaxed);
+        if stale {
+            info!(
+                "BMP station: the route mirror already holds route-source routes (a ledger \
+                 seed, or an earlier stream); the feed raises after this stream's \
+                 InitiationComplete GC rather than on its first frame"
+            );
+        }
 
         // Optional stall monitor. Fires a warning log when no ROUTE
         // MONITORING frame arrives for `STALL_THRESHOLD` *and* the
@@ -386,9 +401,11 @@ impl BmpStation {
                             self.lower_session();
                             // Resync contract: any prior-session mirrored
                             // state is now potentially stale. Programmer
-                            // flips seen_this_session=false on all routes;
-                            // the next Add storm clears marks; unmarked
-                            // entries get GC'd on InitiationComplete.
+                            // flips seen_this_session=false on every
+                            // route-source advertisement (never the
+                            // resolver's local_arp routes); the next Add
+                            // storm clears marks; still-marked entries
+                            // get GC'd on InitiationComplete.
                             if let Err(e) = self
                                 .prog_handle
                                 .apply_route_event(RouteEvent::Resync)
@@ -1009,12 +1026,12 @@ async fn reader_task(
 /// `peer_ip + peer_distinguisher + peer_type` together uniquely
 /// identify one peer, two BGP sessions to the same peer IP that
 /// differ in RD or peer-type hash to distinct IDs.
+///
+/// Through [`PeerId::route_source`], never a raw hash: the sender picks
+/// the distinguisher, so a raw hash could be steered into the
+/// resolver's local-ARP namespace, which the reconnect GC exempts.
 fn peer_id_from_header(pph: &BmpPerPeerHeader) -> PeerId {
-    let mut hasher = DefaultHasher::new();
-    pph.peer_ip.hash(&mut hasher);
-    pph.peer_distinguisher.hash(&mut hasher);
-    (pph.peer_type as u8).hash(&mut hasher);
-    PeerId(hasher.finish())
+    PeerId::route_source(&(pph.peer_ip, pph.peer_distinguisher, pph.peer_type as u8))
 }
 
 fn network_prefix_to_ip_prefix(np: &NetworkPrefix) -> Option<IpPrefix> {

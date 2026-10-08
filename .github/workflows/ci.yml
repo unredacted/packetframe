@@ -177,6 +177,7 @@ jobs:
           sudo -E $(which cargo) test -p packetframe-probe --tests -- --ignored --nocapture
           sudo -E $(which cargo) test -p packetframe-sampler-shm --tests -- --ignored --nocapture
           sudo -E $(which cargo) test -p packetframe-sampler-core --tests -- --ignored --nocapture
+          sudo -E $(which cargo) test -p packetframe-vpp-offload --test drift_netns -- --ignored --nocapture
 
   sampler-shm-arm64:
     name: sampler-shm (arm64)

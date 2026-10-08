@@ -165,7 +165,11 @@ All of it is documented inline in
 appear only when they fail, and the drift rows (`fdb`, `exempt-drift`,
 `exempt-drift-v6`) only with findings. `v6 on` adds `fib-v6`, and IPv6
 diversion adds `v6-handback` (plus `icmp6-source` while no
-`loopback-address6` is set). Overall health tracks whether packets are
+`loopback-address6` is set). While any port has steering rules
+installed, `kernel-path` reports the kernel path its exempt (keep)
+traffic takes: whether the keeps spread over RSS or pin to PF queue 0,
+where queue 0's IRQ is, and the receive and drop rates; it is
+`Degraded` when that path drops. Overall health tracks whether packets are
 being forwarded correctly. A crash-looping VPP with nothing steered is
 `Degraded`, because the eBPF path is carrying the traffic, while a
 steered VPP that cannot forward is `Unhealthy`.

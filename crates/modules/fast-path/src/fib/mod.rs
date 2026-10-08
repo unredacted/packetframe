@@ -29,6 +29,18 @@ pub mod frr;
 /// it is Linux's.
 pub mod local_nexthops;
 
+/// Ungated for the same reason: the route ledger's format, its checks
+/// and its status rendering are pure, so the refusal reasons are tested
+/// on the macOS dev loop. Only the state-dir primitives under it are
+/// Linux's, behind a plain-`std::fs` fallback.
+pub mod route_ledger;
+
+/// Ungated for the same reason: the neighbour resolver's supervision
+/// decisions, its resync reconciliation and its health row are pure, so
+/// the rules that decide a restart are tested on the macOS dev loop. The
+/// resolver that acts on them is `netlink_neigh`, Linux-gated below.
+pub mod neigh_supervision;
+
 #[cfg(target_os = "linux")]
 pub mod anyip;
 #[cfg(target_os = "linux")]

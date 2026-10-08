@@ -55,6 +55,156 @@ use crate::vpp_api::{Transport, TransportError};
 /// is a sample, not a proof, and the module docs say so.
 pub const DEFAULT_SAMPLE: usize = 64;
 
+/// The least share of the IPv4 table installed NOW, in percent, that a
+/// verify must have been taken against to vouch for it at a first steer
+/// ([`covers`]).
+///
+/// A verify probes [`DEFAULT_SAMPLE`] routes drawn from what was
+/// installed when it ran. Routes installed afterwards were never
+/// candidates, and on the path that matters they did not even arrive
+/// the same way: the 2026-10-07 restart verified an adopted VPP on ONE
+/// probe against a one-route table, then the full-table reload reached
+/// VPP as steady-state deltas, and a lever moved nine minutes later was
+/// admitted on that verdict with VPP holding ~60% of the table. 90%
+/// bounds how much of the table being steered can postdate its verdict
+/// to a tenth.
+///
+/// Why not tighter: ordinary churn has to fit inside it, or every lever
+/// move costs a re-verify. Net growth of a full table is ~10% a YEAR,
+/// and day-to-day churn moves the count by a fraction of a percent, so a
+/// verdict taken at convergence still covers the table at any lever
+/// move a canary ladder makes. Why it cannot loop: the remedy is the
+/// re-run ([`ReverifySchedule`]), which takes the verdict against the
+/// table as it is, back at 100%; it is outgrown again only after the
+/// table grows by another ~11%. Shrinkage is not judged — what is
+/// installed now is mostly what the sample was drawn from — and that
+/// is also the limit of a count: a table that turned over at constant
+/// size reads as covered.
+pub const VERIFY_COVERS_PERCENT: u64 = 90;
+
+/// Whether a verify of `sampled` probes against a `table`-route table
+/// vouches for the `installed` routes there are now — THE coverage rule,
+/// the one the first-steer gate, the re-run and the `fib-synced` row all
+/// ask, so none of them can answer it differently.
+///
+/// Two halves:
+/// - **The probes**: the standard sample, or the whole table when the
+///   table was smaller than that. A pass of fewer probes than its own
+///   table allowed did not look at what it claims to have looked at.
+/// - **The table**: at least [`VERIFY_COVERS_PERCENT`] of `installed`.
+///
+/// On a full-table box the first half cannot be met by a short pass and
+/// the second cannot be met by a small table, so a one-probe verdict
+/// vouches only for a box with about one route.
+pub fn covers(sampled: usize, table: u64, installed: u64) -> bool {
+    let probed = sampled as u64 >= table.min(DEFAULT_SAMPLE as u64);
+    let large_enough = table.saturating_mul(100) >= installed.saturating_mul(VERIFY_COVERS_PERCENT);
+    probed && large_enough
+}
+
+/// What clears a mismatch a verify found. One wording for every surface
+/// that names it — the steer refusal, the `fib-synced` row and the
+/// re-run's log line.
+///
+/// A restart that keeps VPP does, because the stopping daemon will not
+/// preserve a route ledger a verify has disproved (`Runtime::preserve`):
+/// the next start has no record to trust, reads VPP's FIB, and its resync
+/// diff corrects what VPP holds against the mirror before it verifies.
+/// Preserved, the ledger would be seeded instead, VPP's per-length counts
+/// would match it, and the diff would skip exactly the prefixes VPP has
+/// wrong. Replacing VPP clears it as well, at the cost of a cold attach.
+///
+/// The want does not survive for a port that was never steered: an
+/// unsteered adoption starts with none, so its lever has to move again.
+/// And on a box already steered, reading the FIB is the read-back path,
+/// which may only run against a VPP carrying no traffic: the start stays
+/// steered until the eBPF tier has loaded, then unsteers for the dump, the
+/// diff and the verify — about three minutes unsteered on a full table —
+/// and steers again. Saying so is what lets an operator pick the window.
+pub const MISMATCH_REMEDY: &str = "restart the daemon (`systemctl restart packetframe`, or the \
+     `detach --keep-vpp` sequence): the stop will not preserve a route ledger a verify has \
+     disproved, so the next start reads VPP's FIB and its resync corrects what VPP holds. A port \
+     that was never steered needs its lever moved again afterwards. On a box already steered \
+     that start is the read-back path: it stays steered until the eBPF tier has loaded, then \
+     takes traffic off VPP to read, diff and verify the FIB — about three minutes unsteered on a \
+     full table — and steers again, so pick the window. Replacing VPP also clears it: stop the \
+     daemon, run `packetframe detach --all`, start it";
+
+/// Why the last verify does not vouch for the IPv4 table installed now,
+/// as a first steer needs it to — [`unvouched`] decides it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unvouched {
+    /// No verify has completed against this VPP.
+    NoVerdict,
+    /// The last verify found VPP disagreeing with the ledger. Not
+    /// outgrown by waiting, and never re-run away: a new sample can miss
+    /// the prefix this one caught. [`MISMATCH_REMEDY`] clears it.
+    ///
+    /// Not a transient of churn. Verify runs only when nothing is in
+    /// flight — at the end of a convergence, which drains nothing while
+    /// verifying, or as a re-run on a tick whose drain went idle — and
+    /// the drain and the probes share one thread, so no update can land
+    /// between a probe's sample and VPP's answer. A mismatch is VPP's
+    /// FIB, not the moment.
+    Mismatch,
+    /// The last verify was taken against a table [`covers`] says is too
+    /// small for the one installed now.
+    Outgrown {
+        sampled: usize,
+        table: u64,
+        installed: u64,
+    },
+}
+
+impl std::fmt::Display for Unvouched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unvouched::NoVerdict => write!(f, "no verify has completed against this VPP"),
+            Unvouched::Mismatch => write!(
+                f,
+                "the last verify found VPP disagreeing with the route ledger, which waiting \
+                 and re-verifying do not clear — {MISMATCH_REMEDY}"
+            ),
+            Unvouched::Outgrown {
+                sampled,
+                table,
+                installed,
+            } => write!(
+                f,
+                "the last verify ran on {sampled} probe(s) against {table} routes and {installed} \
+                 are installed now, so it vouches for less than {VERIFY_COVERS_PERCENT}% of the \
+                 table being steered"
+            ),
+        }
+    }
+}
+
+/// What the last verify leaves unvouched for a first steer into the
+/// `installed` IPv4 routes there are now, or `None` when it vouches for
+/// them.
+///
+/// Deliberately NOT a pass/fail test. A verdict that failed only on
+/// conditions the live table can be seen to outgrow — unresolvable
+/// routes, an unexempted kernel-delivered prefix, a dark member — is
+/// judged on those conditions as they stand NOW, by the gates that read
+/// them live (`SinkCounts::blocks_first_steer`, the steer's fresh link
+/// scan); re-reading them off a recording would hold a steer for a
+/// reason that has since cleared. What a recording CAN say, and nothing
+/// live can, is what the probes saw and how much of the table they were
+/// drawn from: a mismatch, and coverage.
+pub fn unvouched(verdict: Option<&VerifyOutcome>, installed: u64) -> Option<Unvouched> {
+    match verdict {
+        None => Some(Unvouched::NoVerdict),
+        Some(v) if v.restart_worthy() => Some(Unvouched::Mismatch),
+        Some(v) if !v.covers(installed) => Some(Unvouched::Outgrown {
+            sampled: v.sampled,
+            table: v.table,
+            installed,
+        }),
+        Some(_) => None,
+    }
+}
+
 /// Why a sampled prefix failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mismatch {
@@ -106,6 +256,13 @@ pub struct DeadInterface {
 #[derive(Debug, Clone, Default)]
 pub struct VerifyOutcome {
     pub sampled: usize,
+    /// How many IPv4 routes the ledger held installed when the probes
+    /// were drawn — the population the sample speaks for, and the only
+    /// one. A route installed after the pass was never a candidate, so
+    /// a verdict vouches for the table it was taken against and not for
+    /// whatever has arrived since; [`Self::covers`] is where that is
+    /// judged against the table installed now.
+    pub table: u64,
     pub mismatches: Vec<Mismatch>,
     /// Routes the mapping could not resolve to a VPP-owned device.
     /// Steady state on the reference fleet is exactly 0, which is what
@@ -142,6 +299,8 @@ pub struct FamilyVerify {
     /// ~250k-route family is not left to the few probes its share of a
     /// mixed pool would draw.
     pub sampled: usize,
+    /// See [`VerifyOutcome::table`]; this family's.
+    pub table: u64,
     pub mismatches: Vec<Mismatch>,
     pub unresolvable: u64,
     /// See [`VerifyOutcome::unresolvable_named`].
@@ -223,6 +382,12 @@ impl VerifyOutcome {
         !self.mismatches.is_empty()
     }
 
+    /// Whether this verdict vouches for the `installed` IPv4 routes there
+    /// are now — [`covers`], over this pass's own sample and table.
+    pub fn covers(&self, installed: u64) -> bool {
+        covers(self.sampled, self.table, installed)
+    }
+
     /// Whether ANY probe, of any family, disagreed with the ledger.
     ///
     /// The test a preserved-ledger seed is judged by, which is wider than
@@ -274,7 +439,7 @@ impl VerifyOutcome {
     /// `Verdict::event`).
     pub fn summary(&self) -> String {
         let mut s = format!(
-            "verify {}: {}/{} probes matched, unresolvable={}{}, withheld={}",
+            "verify {}: {}/{} probes matched against {} routes, unresolvable={}{}, withheld={}",
             if self.passed() {
                 "PASS"
             } else if self.fib_correct() {
@@ -286,6 +451,7 @@ impl VerifyOutcome {
             },
             self.sampled.saturating_sub(self.mismatches.len()),
             self.sampled,
+            self.table,
             self.unresolvable,
             named_in_parens(&self.unresolvable_named),
             self.withheld
@@ -301,10 +467,11 @@ impl VerifyOutcome {
         }
         if let Some(v6) = &self.v6 {
             s.push_str(&format!(
-                "; IPv6 (loaded, not steered — cannot fail the pass): {}/{} probes matched, \
-                 unresolvable={}{}, withheld={}",
+                "; IPv6 (loaded, not steered — cannot fail the pass): {}/{} probes matched \
+                 against {} routes, unresolvable={}{}, withheld={}",
                 v6.sampled.saturating_sub(v6.mismatches.len()),
                 v6.sampled,
+                v6.table,
                 v6.unresolvable,
                 named_in_parens(&v6.unresolvable_named),
                 v6.withheld
@@ -484,6 +651,10 @@ pub fn verify_paths(
 
     let mut out = VerifyOutcome {
         sampled: v4_probes,
+        // The pool itself, which is `counts.installed`: both are the
+        // ledger's IPv4 routes in `Installed`, so the coverage check
+        // compares like with like.
+        table: v4_pool.len() as u64,
         unresolvable: counts.unresolvable,
         withheld: counts.withheld,
         ..Default::default()
@@ -495,6 +666,7 @@ pub fn verify_paths(
         let v6_probes = sample(&v6_pool, sample_size, seed.rotate_left(32) ^ 0x6666);
         out.v6 = Some(FamilyVerify {
             sampled: v6_probes.len(),
+            table: v6_pool.len() as u64,
             unresolvable: v6c.unresolvable,
             withheld: v6c.withheld,
             ..Default::default()
@@ -590,28 +762,61 @@ fn named_in_parens(names: &[String]) -> String {
 /// against how long an operator watches a Degraded row.
 pub const REVERIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The least time between two re-runs. A verify probes VPP with
-/// [`DEFAULT_SAMPLE`] requests on the supervision loop; this keeps a
-/// table that keeps getting dirty and clean again from turning a
-/// convergence-time gate into a heartbeat.
+/// The least time between two re-runs of an INCOMPLETE verdict
+/// ([`Stale::Incomplete`]). A verify probes VPP with [`DEFAULT_SAMPLE`]
+/// requests on the supervision loop; this keeps a table that keeps
+/// getting dirty and clean again from turning a convergence-time gate
+/// into a heartbeat.
+///
+/// An outgrown verdict ([`Stale::Outgrown`]) does not wait it out. It
+/// cannot recur without the table growing by another ~11% past the
+/// verdict the re-run takes, so it needs no rate limit to stay off the
+/// heartbeat — and a first steer is waiting on it: a re-run taken during
+/// a lull part-way through a reload left the steer held for most of this
+/// interval after VPP had caught up (review finding, PR #333).
 pub const REVERIFY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// When a verdict that failed only because the table was not yet clean
-/// ([`VerifyOutcome::awaits_clean_table`]) is re-run, once the table is.
+/// Why a standing verdict is due a re-run ([`ReverifySchedule`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stale {
+    /// It failed only on what the table can outgrow
+    /// ([`VerifyOutcome::awaits_clean_table`]).
+    Incomplete,
+    /// It no longer covers the table ([`VerifyOutcome::covers`]), and
+    /// found no mismatch. Wins over `Incomplete` when both hold: it is the
+    /// one a held first steer waits on.
+    Outgrown,
+}
+
+/// When a verdict known to be stale is re-run, once the table it is stale
+/// against is clean and VPP has caught up with the route mirror.
 ///
 /// Verification stays a convergence-time gate — `status::FibSync` gives
 /// the reasons a periodic verify is a design change — and this does not
-/// make it a heartbeat. It re-runs the ONE verdict known to be stale in
-/// a way the live counts can show: the table held unresolvable routes,
-/// kernel-delivered prefixes without an exemption, or nothing at all,
-/// and now holds none of those. One re-run per clearing, debounced by
-/// [`REVERIFY_DEBOUNCE`] and at most once per [`REVERIFY_MIN_INTERVAL`].
+/// make it a heartbeat. It re-runs only a verdict the live counts can
+/// show is stale, in one of two ways:
 ///
-/// **It refreshes the verdict and nothing else.** No supervisor event
-/// comes of it: steering is decided by the live gates
-/// (`Runtime::fib_fit_to_steer`, the completeness verdict, the backlog),
-/// which never consulted the verdict, and a first attach still never
-/// steers on its own. What changes is what `fib-synced` reports.
+/// - it failed only because the table was not yet clean
+///   ([`VerifyOutcome::awaits_clean_table`]): the table held
+///   unresolvable routes, kernel-delivered prefixes without an
+///   exemption, or nothing at all, and now holds none of those;
+/// - the table has outgrown it ([`VerifyOutcome::covers`]): it was
+///   taken against too small a share of what is installed now to vouch
+///   for it, which is what a first steer needs from it — unless it found
+///   a MISMATCH, which no new sample may overwrite
+///   ([`Unvouched::Mismatch`]).
+///
+/// One re-run per clearing, debounced by [`REVERIFY_DEBOUNCE`] and at
+/// most once per [`REVERIFY_MIN_INTERVAL`]. A re-run verdict covers the
+/// table it ran against in full, so the second trigger cannot fire again
+/// until the table grows by another ~11% (see [`VERIFY_COVERS_PERCENT`]).
+///
+/// **It refreshes the verdict and decides nothing.** No supervisor event
+/// comes of it, and a first attach still never steers on its own. A
+/// steer the operator already asked for, held because the verdict did
+/// not cover the table (`Runtime`'s first-steer hold), is admitted by
+/// the ordinary steer retry once the refreshed verdict does — the retry
+/// re-reads the verdict, the re-run only replaces it.
 ///
 /// Pure bookkeeping over the caller's clock, so the policy is testable
 /// without a VPP; the runtime owns the conditions and the verify.
@@ -622,32 +827,56 @@ pub struct ReverifySchedule {
     clean_since: Option<std::time::Instant>,
     /// When the last re-run was granted.
     last_run: Option<std::time::Instant>,
+    /// The last granted re-run could not reach VPP ([`Self::failed`]).
+    /// An outgrown verdict skips [`REVERIFY_MIN_INTERVAL`] because each
+    /// run replaces it; one that failed replaced nothing, and without the
+    /// interval it would be retried every debounce — a warning and a
+    /// reconnect each time, each able to hold the loop for a socket
+    /// deadline — for as long as VPP would not answer (review finding,
+    /// PR #333).
+    last_failed: bool,
 }
 
 impl ReverifySchedule {
-    /// Whether to re-run verify now. `stale` is "the standing verdict
-    /// [`VerifyOutcome::awaits_clean_table`]", `clean` is the caller's
-    /// reading that the live table no longer holds what failed it and
-    /// the moment is quiet enough to probe. A `true` is spent: the caller
-    /// runs verify, and the schedule starts over.
-    pub fn poll(&mut self, now: std::time::Instant, stale: bool, clean: bool) -> bool {
-        if !(stale && clean) {
+    /// Whether to re-run verify now. `stale` is why the standing verdict
+    /// is due one, if it is; `clean` is the caller's reading that the live
+    /// table no longer holds what failed it and the moment is quiet enough
+    /// to probe. Both triggers wait out [`REVERIFY_DEBOUNCE`]; only
+    /// [`Stale::Incomplete`] waits out [`REVERIFY_MIN_INTERVAL`]. A `true`
+    /// is spent: the caller runs verify, and the schedule starts over.
+    pub fn poll(&mut self, now: std::time::Instant, stale: Option<Stale>, clean: bool) -> bool {
+        let Some(stale) = stale.filter(|_| clean) else {
             self.clean_since = None;
             return false;
-        }
+        };
         let since = *self.clean_since.get_or_insert(now);
         if now.duration_since(since) < REVERIFY_DEBOUNCE {
             return false;
         }
-        if self
-            .last_run
-            .is_some_and(|t| now.duration_since(t) < REVERIFY_MIN_INTERVAL)
+        if (stale == Stale::Incomplete || self.last_failed)
+            && self
+                .last_run
+                .is_some_and(|t| now.duration_since(t) < REVERIFY_MIN_INTERVAL)
         {
             return false;
         }
         self.last_run = Some(now);
+        self.last_failed = false;
         self.clean_since = None;
         true
+    }
+
+    /// The re-run [`Self::poll`] just granted could not reach VPP, so the
+    /// verdict stands: the next one waits out [`REVERIFY_MIN_INTERVAL`],
+    /// whatever made it due.
+    pub fn failed(&mut self) {
+        self.last_failed = true;
+    }
+
+    /// When the last re-run was granted, for the runtime's tests.
+    #[cfg(test)]
+    pub(crate) fn last_run(&self) -> Option<std::time::Instant> {
+        self.last_run
     }
 }
 
@@ -807,6 +1036,101 @@ mod tests {
         assert!(!dark.awaits_clean_table(), "nor is a cable");
     }
 
+    /// The 2026-10-07 verdict, and what it may vouch for: one probe
+    /// against a one-route table vouches for a one-route table and for
+    /// nothing a reload grows it into — at 60% loaded or at 100%.
+    #[test]
+    fn a_one_probe_verdict_vouches_for_nothing_a_reload_grows() {
+        let incident = VerifyOutcome {
+            sampled: 1,
+            table: 1,
+            ..Default::default()
+        };
+        assert!(incident.passed(), "{}", incident.summary());
+        assert!(incident.covers(1), "it does vouch for the table it saw");
+        for installed in [2, 666_382, 1_095_605] {
+            assert!(
+                !incident.covers(installed),
+                "one probe of one route cannot vouch for {installed}"
+            );
+            assert_eq!(
+                unvouched(Some(&incident), installed),
+                Some(Unvouched::Outgrown {
+                    sampled: 1,
+                    table: 1,
+                    installed
+                })
+            );
+        }
+        // The text an operator reads names both numbers.
+        let why = unvouched(Some(&incident), 666_382).unwrap().to_string();
+        assert!(why.contains("1 probe(s) against 1 routes"), "{why}");
+        assert!(why.contains("666382 are installed now"), "{why}");
+        assert!(
+            incident
+                .summary()
+                .contains("1/1 probes matched against 1 routes"),
+            "{}",
+            incident.summary()
+        );
+    }
+
+    /// The probe half: a pass that drew fewer probes than its own table
+    /// allowed does not vouch for that table, however large; one that
+    /// drew the whole of a table smaller than the standard sample does.
+    #[test]
+    fn coverage_needs_the_standard_sample_or_the_whole_table() {
+        assert!(!covers(1, 1_000_000, 1_000_000));
+        assert!(!covers(DEFAULT_SAMPLE - 1, 1_000_000, 1_000_000));
+        assert!(covers(DEFAULT_SAMPLE, 1_000_000, 1_000_000));
+        assert!(covers(10, 10, 10), "exhaustive over a small table");
+        assert!(!covers(9, 10, 10));
+    }
+
+    /// The table half, at the threshold: ordinary growth since the verdict
+    /// stays covered, growth past ~11% does not, and shrinkage is never
+    /// judged.
+    #[test]
+    fn coverage_tolerates_churn_and_refuses_a_table_that_outgrew_it() {
+        let verified = 1_000_000;
+        // A year of DFZ growth is ~10%; a few percent is any lever move.
+        assert!(covers(DEFAULT_SAMPLE, verified, 1_030_000));
+        assert!(covers(DEFAULT_SAMPLE, verified, 1_111_111));
+        assert!(!covers(DEFAULT_SAMPLE, verified, 1_111_112));
+        assert!(!covers(DEFAULT_SAMPLE, verified, 2_000_000));
+        assert!(covers(DEFAULT_SAMPLE, verified, 500_000), "shrink");
+        assert!(covers(DEFAULT_SAMPLE, verified, 0));
+    }
+
+    /// What a recording may and may not decide. A mismatch is the probes'
+    /// own finding and stands until a restart; a verdict that failed only
+    /// on conditions the live table outgrows (unresolvable routes here)
+    /// is NOT unvouched — those are judged live — provided it covers the
+    /// table; and no verdict at all vouches for nothing.
+    #[test]
+    fn only_coverage_and_mismatches_are_read_off_the_recording() {
+        assert_eq!(unvouched(None, 5), Some(Unvouched::NoVerdict));
+        let wrong = VerifyOutcome {
+            sampled: 64,
+            table: 1_000,
+            mismatches: vec![Mismatch::NoPaths { prefix: v4(0, 0) }],
+            ..Default::default()
+        };
+        assert_eq!(unvouched(Some(&wrong), 1_000), Some(Unvouched::Mismatch));
+        let holed = VerifyOutcome {
+            sampled: 64,
+            table: 1_000,
+            unresolvable: 3,
+            ..Default::default()
+        };
+        assert!(!holed.passed());
+        assert_eq!(unvouched(Some(&holed), 1_000), None);
+        assert!(matches!(
+            unvouched(Some(&holed), 2_000),
+            Some(Unvouched::Outgrown { .. })
+        ));
+    }
+
     /// One re-run per clearing: only once the table has stayed clean for
     /// the debounce, never twice inside the minimum interval, and the
     /// debounce starts over whenever the table gets dirty again.
@@ -815,23 +1139,67 @@ mod tests {
         let t0 = std::time::Instant::now();
         let at = |s: u64| t0 + std::time::Duration::from_secs(s);
         let mut r = ReverifySchedule::default();
+        let stale = Some(Stale::Incomplete);
         // A stale verdict over a dirty table: nothing.
-        assert!(!r.poll(at(0), true, false));
+        assert!(!r.poll(at(0), stale, false));
         // Clean from t=1: not before the debounce has run.
-        assert!(!r.poll(at(1), true, true));
-        assert!(!r.poll(at(5), true, true));
+        assert!(!r.poll(at(1), stale, true));
+        assert!(!r.poll(at(5), stale, true));
         // Dirty again at t=8 resets it.
-        assert!(!r.poll(at(8), true, false));
-        assert!(!r.poll(at(9), true, true));
-        assert!(!r.poll(at(18), true, true));
-        assert!(r.poll(at(19), true, true), "clean for the debounce: fire");
+        assert!(!r.poll(at(8), stale, false));
+        assert!(!r.poll(at(9), stale, true));
+        assert!(!r.poll(at(18), stale, true));
+        assert!(r.poll(at(19), stale, true), "clean for the debounce: fire");
         // Spent: a verdict that is still stale (the re-run did not clear
         // it) waits out the interval, however clean the table reads.
-        assert!(!r.poll(at(30), true, true));
-        assert!(!r.poll(at(19 + 299), true, true));
-        assert!(r.poll(at(19 + 300), true, true), "the interval has run");
+        assert!(!r.poll(at(30), stale, true));
+        assert!(!r.poll(at(19 + 299), stale, true));
+        assert!(r.poll(at(19 + 300), stale, true), "the interval has run");
         // A verdict that is no longer stale asks for nothing.
-        assert!(!r.poll(at(10_000), false, true));
-        assert!(!r.poll(at(10_100), false, true));
+        assert!(!r.poll(at(10_000), None, true));
+        assert!(!r.poll(at(10_100), None, true));
+    }
+
+    /// An outgrown verdict waits out the debounce and not the minimum
+    /// interval: a re-run a moment ago (taken in a lull part-way through
+    /// a reload) does not hold a steer for five minutes once the table
+    /// has outgrown THAT verdict and VPP has caught up.
+    #[test]
+    fn an_outgrown_verdict_is_not_rate_limited_by_an_earlier_re_run() {
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        let mut r = ReverifySchedule::default();
+        assert!(!r.poll(at(0), Some(Stale::Outgrown), true));
+        assert!(r.poll(at(10), Some(Stale::Outgrown), true), "debounced");
+        // Twenty seconds later the table has outgrown the new verdict too.
+        assert!(!r.poll(at(30), Some(Stale::Outgrown), true));
+        assert!(
+            r.poll(at(40), Some(Stale::Outgrown), true),
+            "the debounce again, and no five-minute wait"
+        );
+        // An incomplete one still waits the interval out.
+        assert!(!r.poll(at(41), Some(Stale::Incomplete), true));
+        assert!(!r.poll(at(60), Some(Stale::Incomplete), true));
+    }
+
+    /// A re-run that could not reach VPP replaced nothing, so an outgrown
+    /// verdict loses its exemption until one gets through: no retry every
+    /// debounce while VPP will not answer.
+    #[test]
+    fn a_failed_re_run_backs_off_even_for_an_outgrown_verdict() {
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        let mut r = ReverifySchedule::default();
+        let out = Some(Stale::Outgrown);
+        assert!(!r.poll(at(0), out, true));
+        assert!(r.poll(at(10), out, true));
+        r.failed();
+        assert!(!r.poll(at(11), out, true));
+        assert!(!r.poll(at(30), out, true), "not one debounce later");
+        assert!(!r.poll(at(10 + 299), out, true));
+        assert!(r.poll(at(10 + 300), out, true), "after the interval");
+        // That one got through: the exemption is back.
+        assert!(!r.poll(at(311), out, true));
+        assert!(r.poll(at(321), out, true));
     }
 }

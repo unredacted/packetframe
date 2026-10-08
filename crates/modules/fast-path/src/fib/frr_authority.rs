@@ -203,6 +203,17 @@ pub struct FrrAuthorityChecker {
     /// When the running check's reads must be done by. Set at the start
     /// of each check; every `vtysh` call goes through [`Self::ask`].
     deadline: tokio::time::Instant,
+    /// The route ledger's status. A mirror seeded from the ledger agrees
+    /// with FRR's count before any session has spoken to this daemon;
+    /// until the route source's first route arrives, a check disqualifies
+    /// it rather than attest a table nothing may ever update. See
+    /// [`crate::fib::route_ledger::LedgerStatus::attestation_blocker`].
+    ledger_status: Option<crate::fib::route_ledger::SharedLedgerStatus>,
+    /// The last check found the seed standing in the way of attestation:
+    /// the next one runs the moment the stream starts, because the
+    /// revocation is sticky and an interval of it would hold a second
+    /// tier's first steer for nothing.
+    seed_blocked_last: bool,
 }
 
 impl FrrAuthorityChecker {
@@ -238,7 +249,18 @@ impl FrrAuthorityChecker {
             announced_revocation: None,
             check_budget: CHECK_BUDGET,
             deadline: tokio::time::Instant::now(),
+            ledger_status: None,
+            seed_blocked_last: false,
         }
+    }
+
+    /// Consult the route ledger's status — see the field.
+    pub fn with_ledger_status(
+        mut self,
+        status: crate::fib::route_ledger::SharedLedgerStatus,
+    ) -> Self {
+        self.ledger_status = Some(status);
+        self
     }
 
     /// Publish each observation to the second forwarding tier as well.
@@ -268,12 +290,22 @@ impl FrrAuthorityChecker {
                     "FRR authority: check unreadable, retrying before the interval"
                 );
             }
+            // A seeded mirror's first attestable moment is the route
+            // source's first route, and a second tier may be holding its
+            // first steer for it: check then, not an interval after start.
+            let early = crate::fib::route_ledger::early_check_due(
+                self.ledger_status.as_ref(),
+                self.seed_blocked_last,
+            );
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     info!("FrrAuthorityChecker shutdown");
                     return;
                 }
                 _ = tokio::time::sleep(delay) => {}
+                _ = crate::fib::route_ledger::stream_started(self.ledger_status.clone()), if early => {
+                    debug!("FRR authority: the route source started streaming after a ledger seed; checking now");
+                }
             }
             // The check races shutdown too. With a 30 s subprocess
             // budget a check can outlast the controller's drain window
@@ -335,6 +367,20 @@ impl FrrAuthorityChecker {
                 if !matches!(eligibility, Eligibility::Revoked(_)) {
                     eligibility = Eligibility::Revoked(r);
                 }
+            }
+        }
+        // A seed no session has spoken to: positive evidence, like the
+        // composition check above, and needing no subprocess. Read AFTER
+        // the counts, which queue behind the seed, so a seed still being
+        // applied is seen as one. Same precedence: an existing revocation
+        // is as true and stays the one reported.
+        let seed_blocker = crate::fib::route_ledger::blocker(self.ledger_status.as_ref());
+        self.seed_blocked_last = seed_blocker.is_some();
+        if let Some(why) = seed_blocker {
+            if !matches!(eligibility, Eligibility::Revoked(_)) {
+                eligibility = Eligibility::Revoked(
+                    packetframe_common::fib::Revocation::UpstreamNotReady(why),
+                );
             }
         }
 
@@ -1048,5 +1094,83 @@ mod tests {
         assert!(
             2 * max_interval + 2 * CHECK_BUDGET <= packetframe_common::fib::STEER_MAX_REPORT_AGE
         );
+    }
+
+    /// A mirror seeded from the route ledger agrees with FRR's count
+    /// before any session has spoken to this daemon. Until the route
+    /// source's first route arrives, a check disqualifies it by name —
+    /// counts or no counts — and asks for the next check the moment the
+    /// stream starts. Once it has started, a clean check with agreeing
+    /// counts attests it like any mirror.
+    #[tokio::test]
+    async fn a_seed_no_session_has_spoken_to_is_not_attested() {
+        use crate::fib::route_ledger::{
+            early_check_due, shared_status, LedgerCounts, SeedReport, StartReport,
+        };
+        let vtysh = Arc::new(Scripted::default());
+        // FRR reports 10 IPv4 prefixes; so does the seeded mirror.
+        let (prog, _log) = crate::fib::programmer::recording_handle_reporting((10, 0));
+        let handle = Arc::new(TableCompleteness::new());
+        let status = shared_status();
+        {
+            let mut st = status.lock().unwrap();
+            st.start = StartReport::Seeded;
+            st.seed = Some(SeedReport {
+                writer_version: "test".into(),
+                written_at_unix: 1_790_000_000,
+                confirmed_at_unix: 1_790_000_000,
+                counts: LedgerCounts::default(),
+                applied_at: Some(std::time::Instant::now()),
+                apply_took: None,
+                failed: 0,
+                unconfirmed: 10,
+                stream_started_at: None,
+                reconciled: None,
+            });
+        }
+        let mut checker = FrrAuthorityChecker::with_vtysh(
+            config(),
+            vtysh,
+            shared_snapshot(),
+            prog,
+            CancellationToken::new(),
+        )
+        .with_completeness(handle.clone())
+        .with_ledger_status(status.clone());
+        assert!(
+            early_check_due(Some(&status), checker.seed_blocked_last),
+            "a seed waiting for its stream is worth checking the moment it starts"
+        );
+
+        assert!(checker.run_check().await, "a disqualification is readable");
+        match handle.latest_verdict().1 {
+            packetframe_common::fib::Completeness::Ineligible(
+                packetframe_common::fib::Revocation::UpstreamNotReady(why),
+            ) => assert!(why.contains("seeded from the route ledger"), "{why}"),
+            other => panic!("agreeing counts must not attest a silent seed: {other:?}"),
+        }
+        assert!(checker.seed_blocked_last);
+
+        // The route source speaks.
+        status
+            .lock()
+            .unwrap()
+            .seed
+            .as_mut()
+            .unwrap()
+            .stream_started_at = Some(std::time::Instant::now());
+        assert!(
+            early_check_due(Some(&status), checker.seed_blocked_last),
+            "the blocked check is re-run as soon as the stream has started"
+        );
+        assert!(checker.run_check().await);
+        assert!(
+            handle.verdict().permits_steering(),
+            "a clean check with agreeing counts attests the seeded mirror once the stream \
+             has started: {:?}",
+            handle.verdict()
+        );
+        assert!(!checker.seed_blocked_last);
+        assert!(!early_check_due(Some(&status), checker.seed_blocked_last));
     }
 }

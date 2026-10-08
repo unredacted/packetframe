@@ -235,20 +235,18 @@ fn vtysh_sync(path: &Path, commands: &[&str]) -> Result<String, String> {
 }
 
 /// Writable now, creatable at load, or neither. An existing
-/// non-directory is "neither": `create_dir_all` at load cannot replace
-/// it, so feasibility must not promise it will.
+/// non-directory is "neither": the load cannot replace it, so
+/// feasibility must not promise it will. An existing directory is
+/// probed by the load's own [`crate::persist::ensure_dir_writable`],
+/// which also refuses a symlink anywhere in the path, as the load will.
 #[cfg(target_os = "linux")]
 fn persist_dir_state(dir: &Path) -> Result<String, String> {
     if dir.exists() && !dir.is_dir() {
         return Err(format!("{} exists but is not a directory", dir.display()));
     }
     if dir.is_dir() {
-        let probe = dir.join(format!(".feasibility-{}", std::process::id()));
-        return match std::fs::write(&probe, b"") {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&probe);
-                Ok(format!("{} exists and is writable", dir.display()))
-            }
+        return match crate::persist::ensure_dir_writable(dir) {
+            Ok(()) => Ok(format!("{} exists and is writable", dir.display())),
             Err(e) => Err(format!("{} exists but is not writable: {e}", dir.display())),
         };
     }
@@ -290,5 +288,32 @@ mod tests {
         assert!(names.contains(&"neigh-snoop.iface.definitely-absent0"));
         assert!(names.contains(&"neigh-snoop.persist-dir"));
         assert!(caps.iter().all(|c| !c.required));
+    }
+
+    /// Feasibility judges an existing persist directory with the load's
+    /// own probe: a symlink in the path fails it, as the load will, and
+    /// a writable directory passes and is left as it was. The pathname
+    /// probe wrote through the link and reported it writable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persist_dir_state_refuses_a_symlink_as_the_load_does() {
+        let base = std::env::temp_dir().join(format!("pf-snoop-probe-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = super::persist_dir_state(&link).expect_err("probed through the link");
+        assert!(err.contains("a symlink here is refused"), "{err}");
+
+        let msg = super::persist_dir_state(&real).expect("a writable directory");
+        assert!(msg.contains("exists and is writable"), "{msg}");
+        assert_eq!(
+            std::fs::read_dir(&real).unwrap().count(),
+            0,
+            "the probe was left behind"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -2138,15 +2138,25 @@ fn vpp_detach(all: bool, config_has_vpp: bool, keep_vpp: bool) -> VppDetach {
 mod keep_vpp_tests {
     use super::*;
 
+    /// A fresh state directory, its mode pinned rather than left to the
+    /// umask: on Linux the state file's reader refuses a `state-dir`
+    /// group or others can write, whether or not the file is in it.
+    fn state_dir(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
     /// `detach --all` removes the IPv6 hand-back path even when there is
     /// no state file left: the daemon's teardown releases the VFs (and the
     /// record) even if the veth would not go, and names this command as the
     /// remedy. A failure says what to remove by hand.
     #[test]
     fn detach_removes_the_handback_path_without_a_state_file() {
-        let dir = std::env::temp_dir().join(format!("pf-detach-hb-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = state_dir("pf-detach-hb");
         let mut called = false;
         detach_vpp_offload_with(&dir, || {
             called = true;
@@ -2215,9 +2225,7 @@ mod keep_vpp_tests {
     /// the section, or an attach-time field it changed.
     #[test]
     fn keep_vpp_refuses_what_the_next_start_could_not_adopt() {
-        let dir = std::env::temp_dir().join(format!("pf-keep-vpp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = state_dir("pf-keep-vpp");
 
         let steered = conf(" vlans 88,1337", true);
         let e = keep_vpp_preflight(Some(&steered), &dir).unwrap_err();
@@ -2237,6 +2245,51 @@ mod keep_vpp_tests {
 
         let e = keep_vpp_preflight(None, &dir).unwrap_err();
         assert!(e.contains("--config"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A state file the reader refuses is not "no record" to either
+    /// door. `detach --all` stops before the hand-back teardown it runs
+    /// when nothing is recorded, and `--keep-vpp` refuses under the
+    /// file's reason instead of saying there is nothing to keep. A sparse
+    /// file past the bound stands in for the refusals every platform
+    /// makes; on Linux, so does a `state-dir` others can write with no
+    /// file in it, which such an account could have emptied.
+    #[test]
+    fn a_refused_state_file_is_not_read_as_absent() {
+        use packetframe_vpp_offload::resources::{ResourceState, MAX_STATE_FILE_BYTES};
+        let dir = state_dir("pf-refused-state");
+        let steered = conf("", true);
+        record(&dir, &steered);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(ResourceState::path_in(&dir))
+            .unwrap()
+            .set_len(MAX_STATE_FILE_BYTES + 1)
+            .unwrap();
+        let both_refuse = |what: &str| {
+            let mut handback = false;
+            let e = detach_vpp_offload_with(&dir, || {
+                handback = true;
+                Ok(())
+            })
+            .expect_err(what);
+            assert!(e.starts_with("vpp state: refusing "), "{what}: {e}");
+            assert!(!handback, "{what}: detach took the no-record path");
+            let e = keep_vpp_preflight(Some(&steered), &dir).unwrap_err();
+            assert!(e.starts_with("vpp state: refusing "), "{what}: {e}");
+            e
+        };
+        assert!(both_refuse("past the bound").contains("-byte bound"));
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::remove_file(ResourceState::path_in(&dir)).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+            let e = both_refuse("an emptied untrusted state-dir");
+            assert!(e.contains("writable by group or others"), "{e}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -2285,6 +2338,29 @@ mod fast_path_teardown_tests {
         assert!(super::fast_path_teardown(false).removes_wan_egress_rules());
         assert!(!super::fast_path_teardown(true).removes_wan_egress_rules());
     }
+
+    /// A full detach removes the route ledger; `--keep-vpp`, the routine
+    /// restart, keeps it for the start that follows.
+    #[test]
+    fn only_a_full_detach_removes_the_route_ledger() {
+        use packetframe_fast_path::fib::route_ledger;
+        assert!(super::fast_path_teardown(false).removes_route_ledger());
+        assert!(!super::fast_path_teardown(true).removes_route_ledger());
+
+        let dir = std::env::temp_dir().join(format!("pf-detach-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        route_ledger::write(&dir, b"a ledger").unwrap();
+        assert!(super::remove_route_ledger(&dir, Ok(())).is_ok());
+        assert!(!route_ledger::path_in(&dir).exists());
+        // Nothing there is not a failure, and an earlier failure survives.
+        assert!(super::remove_route_ledger(&dir, Ok(())).is_ok());
+        assert_eq!(
+            super::remove_route_ledger(&dir, Err("pins".into())),
+            Err("pins".into())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The fast-path half of `detach`, unchanged except for being callable.
@@ -2318,6 +2394,14 @@ fn detach_fast_path(
             );
         }
     }
+    // The route ledger the last clean stop preserved: gone on a full
+    // detach, kept by `--keep-vpp` for the start that follows it. A
+    // failure joins the result like the others.
+    let result = if teardown.removes_route_ledger() {
+        remove_route_ledger(state_dir, result)
+    } else {
+        result
+    };
     // `wan-egress` policy rules, found by their protocol tag in a fresh
     // dump: no state file is needed, and nothing without the tag can be
     // touched. Whatever the pin teardown's outcome, like the coalescing
@@ -2351,6 +2435,31 @@ fn detach_fast_path(
         }
     };
     result
+}
+
+/// Remove the fast-path route ledger, folding a failure into `result`.
+#[cfg(feature = "fast-path")]
+fn remove_route_ledger(state_dir: &Path, result: Result<(), String>) -> Result<(), String> {
+    use packetframe_fast_path::fib::route_ledger;
+    let existed = std::fs::symlink_metadata(route_ledger::path_in(state_dir)).is_ok();
+    match route_ledger::remove(state_dir) {
+        Ok(()) => {
+            if existed {
+                tracing::info!(
+                    "route ledger removed: the next start loads the route mirror cold from \
+                     the route source (`detach --keep-vpp` keeps it)"
+                );
+            }
+            result
+        }
+        Err(e) => {
+            let e = format!("route ledger removal: {e}");
+            Err(match result {
+                Ok(()) => e,
+                Err(prev) => format!("{prev}; AND {e}"),
+            })
+        }
+    }
 }
 
 /// Pins, tc filters and the registry: everything `detach_fast_path`
@@ -2453,6 +2562,20 @@ fn handback_leftover(e: String) -> String {
     )
 }
 
+/// Put back every queue-0 IRQ affinity the daemon placed while a port's
+/// keep rules pinned to queue 0 (`packetframe_vpp_offload::kernel_path`).
+/// A leftover is reported, never a reason to refuse the rest of the
+/// teardown: an IRQ on a CPU of its own forwards correctly.
+#[cfg(feature = "vpp-offload")]
+fn restore_queue0_irqs(state_dir: &Path) {
+    use packetframe_vpp_offload::kernel_path::{current_boot_id, restore_recorded};
+    match restore_recorded(state_dir, Path::new("/proc/irq"), &current_boot_id()) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(restored = n, "vpp-offload: queue-0 IRQ affinities restored"),
+        Err(e) => tracing::warn!(error = %e, "vpp-offload: queue-0 IRQ affinities left placed"),
+    }
+}
+
 /// [`detach_vpp_offload`] with the hand-back teardown as a seam.
 #[cfg(feature = "vpp-offload")]
 fn detach_vpp_offload_with(
@@ -2472,6 +2595,8 @@ fn detach_vpp_offload_with(
         // record (a teardown that released the VFs and could not remove
         // the veth), and this command is the remedy the daemon names for
         // exactly that. No VPP to kill first: there is no record of one.
+        // A queue-0 IRQ placement whose restore failed outlives it too.
+        restore_queue0_irqs(state_dir);
         return teardown_handback().map_err(handback_leftover);
     };
 
@@ -2554,6 +2679,9 @@ fn detach_vpp_offload_with(
         }
         tracing::info!("vpp-offload: MCAM steering rules removed");
     }
+    // No keep rule is left to pin traffic to queue 0, so any queue-0 IRQ
+    // the daemon placed for one goes back to what it was.
+    restore_queue0_irqs(state_dir);
 
     // Kill the recorded VPP first, if it is still the process we recorded.
     //
