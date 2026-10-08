@@ -53,7 +53,12 @@ pub trait SampleSource {
     /// Make the rings hold a few ticks of samples at `rate`. Their size
     /// is also what bounds one tick's work: a drain takes what they hold,
     /// and a burst beyond it is lost in them, which coverage reports.
-    fn ensure_capacity(&mut self, rate: u32) -> Result<(), String>;
+    ///
+    /// Rings being replaced leave the map first and are drained into
+    /// `left`, so no sample is lost uncounted: each is either in `left` or
+    /// a failed output the program counts. `left` is filled even when this
+    /// fails.
+    fn ensure_capacity(&mut self, rate: u32, left: &mut Leftover) -> Result<(), String>;
     /// Hand every sample event published since the last drain to `f`;
     /// return the samples the rings reported lost.
     fn drain(&mut self, f: &mut dyn FnMut(&[u8])) -> u64;
@@ -61,6 +66,24 @@ pub trait SampleSource {
     /// (STATS `sample_emit_failed`), when it can be read.
     fn emit_failed(&mut self) -> Option<u64>;
 }
+
+/// What replacing the rings left: the events the old ones held, and the
+/// samples they reported lost.
+#[derive(Debug, Default)]
+pub struct Leftover {
+    pub events: Vec<Vec<u8>>,
+    pub lost: u64,
+}
+
+/// A reload for the worker to apply, and where it answers whether it did.
+pub struct Reload {
+    pub cfg: FlowExportConfig,
+    pub done: std::sync::mpsc::Sender<Result<(), String>>,
+}
+
+/// How long `reconfigure` waits for the worker to answer a reload: ten of
+/// its ticks.
+pub const RELOAD_WAIT: Duration = Duration::from_secs(1);
 
 /// The ports fast-path has attached, and what each counted.
 pub trait Ports {
@@ -124,7 +147,7 @@ pub struct Shared {
     pub epoch: Instant,
     pub heartbeat_ms: Arc<AtomicU64>,
     pub published: Arc<Mutex<Published>>,
-    pub reload: Arc<Mutex<Option<FlowExportConfig>>>,
+    pub reload: Arc<Mutex<Option<Reload>>>,
 }
 
 impl Shared {
@@ -141,6 +164,34 @@ impl Shared {
     pub fn heartbeat_age(&self, now: Instant) -> Duration {
         let at = Duration::from_millis(self.heartbeat_ms.load(Ordering::Relaxed));
         now.saturating_duration_since(self.epoch).saturating_sub(at)
+    }
+
+    /// Hand the worker a reload and wait for it to say whether it applied
+    /// it, so a SIGHUP is reported applied only once it is. A worker that
+    /// does not answer in time never sees it: the reload is withdrawn.
+    pub fn request_reload(&self, cfg: FlowExportConfig, wait: Duration) -> Result<(), String> {
+        let (done, answer) = std::sync::mpsc::channel();
+        *self.reload.lock().unwrap_or_else(|e| e.into_inner()) = Some(Reload { cfg, done });
+        match answer.recv_timeout(wait) {
+            Ok(r) => r,
+            Err(_) => {
+                let withdrawn = self
+                    .reload
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .is_some();
+                Err(if withdrawn {
+                    format!(
+                        "the export worker did not take the reload within {} ms: is it \
+                         running? (the `worker` row says)",
+                        wait.as_millis()
+                    )
+                } else {
+                    "the export worker took the reload but did not answer in time".into()
+                })
+            }
+        }
     }
 
     pub fn snapshot(&self) -> Published {
@@ -178,6 +229,8 @@ pub struct Worker<S, P, T> {
     last_emit_failed: Option<u64>,
     /// Loss not yet carried by a sample, for the next one's `drops`.
     pending_drops: u32,
+    /// What the last ring replacement left, for the next tick to export.
+    leftover: Leftover,
     p: Published,
 }
 
@@ -192,7 +245,7 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
         shared: Shared,
         now: Instant,
     ) -> Result<Self, String> {
-        source.ensure_capacity(cfg.rate)?;
+        source.ensure_capacity(cfg.rate, &mut Leftover::default())?;
         source.configure(SampleCfg::new(cfg.rate, cfg.header_bytes, 1))?;
         let collectors = cfg
             .collectors
@@ -215,6 +268,7 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
             window_lost: 0,
             last_emit_failed: None,
             pending_drops: 0,
+            leftover: Leftover::default(),
             p: Published::default(),
         })
     }
@@ -226,8 +280,8 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(new) = reload {
-            self.apply(new);
+        if let Some(Reload { cfg, done }) = reload {
+            let _ = done.send(self.apply(now, cfg));
         }
         if now >= self.next_ports {
             self.refresh_ports(now);
@@ -260,17 +314,37 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
         ))
     }
 
-    fn apply(&mut self, new: FlowExportConfig) {
+    /// Apply a reload, or none of it: on a failure the sampler, the
+    /// collectors and what is published stay as they were, so the same
+    /// reload retried is tried again rather than taken as applied.
+    fn apply(&mut self, now: Instant, new: FlowExportConfig) -> Result<(), String> {
         if (new.rate, new.header_bytes) != (self.cfg.rate, self.cfg.header_bytes) {
-            self.generation += 1;
-            let r = self.source.ensure_capacity(new.rate).and_then(|()| {
-                self.source
-                    .configure(SampleCfg::new(new.rate, new.header_bytes, self.generation))
-            });
-            self.p.source_error = r.err();
+            let generation = self.generation + 1;
+            let r = self
+                .source
+                .ensure_capacity(new.rate, &mut self.leftover)
+                .and_then(|()| {
+                    self.source
+                        .configure(SampleCfg::new(new.rate, new.header_bytes, generation))
+                });
+            if let Err(e) = r {
+                let e = format!(
+                    "a reload to 1:{} with {} header bytes could not be applied: {e}",
+                    new.rate, new.header_bytes
+                );
+                self.p.source_error = Some(e.clone());
+                return Err(e);
+            }
+            // The window so far was drawn at the old rate: judge it at that
+            // rate, and start the next at the new one.
+            self.judge(now);
+            self.next_window = now + WINDOW;
+            self.generation = generation;
+            self.p.source_error = None;
         }
         self.collectors = reconcile(std::mem::take(&mut self.collectors), &new.collectors);
         self.cfg = new;
+        Ok(())
     }
 
     fn refresh_ports(&mut self, now: Instant) {
@@ -307,52 +381,28 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
 
     fn take_samples(&mut self) -> Vec<Ready> {
         let mut ready = Vec::new();
+        let left = std::mem::take(&mut self.leftover);
         let (sources, p, pending) = (&mut self.sources, &mut self.p, &mut self.pending_drops);
-        let ring_lost = self.source.drain(&mut |event| {
-            let s = match sample::parse(event) {
-                Ok(s) => s,
-                Err(_) => {
-                    p.undecodable_total += 1;
-                    return;
-                }
-            };
-            let Some(src) = sources.get_mut(&s.ingress_ifindex) else {
-                p.unmapped_total += 1;
-                return;
-            };
-            src.sequence = src.sequence.wrapping_add(1);
-            src.drops = src.drops.wrapping_add(std::mem::take(pending));
-            src.window_samples += 1;
-            src.samples += 1;
-            p.samples_total += 1;
-            let (header, frame_length) = wire_frame(&s);
-            ready.push(Ready {
-                sequence: src.sequence,
-                source_if: s.ingress_ifindex,
-                rate: s.rate,
-                pool: src.pool.total() as u32,
-                drops: src.drops,
-                output_if: match s.disposition {
-                    Disposition::Redirect => s.egress_ifindex,
-                    _ => 0,
-                },
-                frame_length,
-                header,
-            });
-        });
+        for e in &left.events {
+            ingest(e, sources, p, pending, &mut ready);
+        }
+        let ring_lost = left.lost
+            + self
+                .source
+                .drain(&mut |e| ingest(e, sources, p, pending, &mut ready));
         self.p.ring_lost_total += ring_lost;
         // The programs' own count covers both a full ring and a CPU with
         // none; the rings' count is a full ring only, and the same
-        // samples. One or the other, never both.
+        // samples. One or the other, never both. A tick it cannot be read
+        // ends its baseline: the next reading starts a new one rather than
+        // counting the gap's losses a second time.
         let emit_failed = self.source.emit_failed();
         let lost = match (emit_failed, self.last_emit_failed) {
             (Some(now), Some(before)) => now.saturating_sub(before),
             (Some(_), None) => 0,
             (None, _) => ring_lost,
         };
-        if emit_failed.is_some() {
-            self.last_emit_failed = emit_failed;
-        }
+        self.last_emit_failed = emit_failed;
         self.window_lost += lost;
         self.p.lost_total += lost;
         self.pending_drops = self.pending_drops.wrapping_add(lost as u32);
@@ -405,7 +455,7 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
                 datagrams: c.datagrams,
                 send_errors: c.send_errors,
                 budget_drops: c.budget_drops,
-                failing: c.failing(now).map(str::to_owned),
+                failing: c.failing(now),
             })
             .collect();
         *self
@@ -414,6 +464,47 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = self.p.clone();
     }
+}
+
+/// One sample event: its port's sequence, drops and window, and the
+/// sample as sFlow will carry it.
+fn ingest(
+    event: &[u8],
+    sources: &mut BTreeMap<u32, Source>,
+    p: &mut Published,
+    pending: &mut u32,
+    ready: &mut Vec<Ready>,
+) {
+    let s = match sample::parse(event) {
+        Ok(s) => s,
+        Err(_) => {
+            p.undecodable_total += 1;
+            return;
+        }
+    };
+    let Some(src) = sources.get_mut(&s.ingress_ifindex) else {
+        p.unmapped_total += 1;
+        return;
+    };
+    src.sequence = src.sequence.wrapping_add(1);
+    src.drops = src.drops.wrapping_add(std::mem::take(pending));
+    src.window_samples += 1;
+    src.samples += 1;
+    p.samples_total += 1;
+    let (header, frame_length) = wire_frame(&s);
+    ready.push(Ready {
+        sequence: src.sequence,
+        source_if: s.ingress_ifindex,
+        rate: s.rate,
+        pool: src.pool.total() as u32,
+        drops: src.drops,
+        output_if: match s.disposition {
+            Disposition::Redirect => s.egress_ifindex,
+            _ => 0,
+        },
+        frame_length,
+        header,
+    });
 }
 
 #[cfg(test)]
@@ -433,6 +524,10 @@ mod tests {
         ring_lost: Rc<RefCell<u64>>,
         emit_failed: Rc<RefCell<Option<u64>>>,
         refuse: bool,
+        /// The next ring replacement fails.
+        capacity_fails: Rc<RefCell<bool>>,
+        /// What the replaced rings held.
+        held: Rc<RefCell<Vec<Vec<u8>>>>,
     }
 
     impl SampleSource for FakeSource {
@@ -443,7 +538,11 @@ mod tests {
             self.cfgs.borrow_mut().push(cfg);
             Ok(())
         }
-        fn ensure_capacity(&mut self, _: u32) -> Result<(), String> {
+        fn ensure_capacity(&mut self, _: u32, left: &mut Leftover) -> Result<(), String> {
+            left.events.append(&mut self.held.borrow_mut());
+            if *self.capacity_fails.borrow() {
+                return Err("perf rings: ENOMEM".into());
+            }
             Ok(())
         }
         fn drain(&mut self, f: &mut dyn FnMut(&[u8])) -> u64 {
@@ -549,6 +648,8 @@ mod tests {
                 ring_lost: src.ring_lost.clone(),
                 emit_failed: src.emit_failed.clone(),
                 refuse: false,
+                capacity_fails: src.capacity_fails.clone(),
+                held: src.held.clone(),
             },
             FakePorts {
                 list: ports.list.clone(),
@@ -567,6 +668,15 @@ mod tests {
             shared,
             t0,
         }
+    }
+
+    fn reload(
+        shared: &Shared,
+        c: FlowExportConfig,
+    ) -> std::sync::mpsc::Receiver<Result<(), String>> {
+        let (done, answer) = std::sync::mpsc::channel();
+        *shared.reload.lock().unwrap() = Some(Reload { cfg: c, done });
+        answer
     }
 
     fn word(d: &[u8], at: usize) -> u32 {
@@ -614,8 +724,9 @@ mod tests {
     fn a_rate_change_is_a_new_generation_and_keeps_the_collectors() {
         let mut r = rig(1000);
         r.w.tick(r.t0);
-        *r.shared.reload.lock().unwrap() = Some(cfg(4000));
+        let answer = reload(&r.shared, cfg(4000));
         r.w.tick(r.t0 + TICK);
+        assert_eq!(answer.try_recv().unwrap(), Ok(()));
         assert_eq!(
             r.src.cfgs.borrow().last(),
             Some(&SampleCfg::new(4000, 64, 2))
@@ -625,7 +736,7 @@ mod tests {
         // A collector-only change is no new generation.
         let mut c = cfg(4000);
         c.collectors[0].addr = "198.51.100.11:6343".parse().unwrap();
-        *r.shared.reload.lock().unwrap() = Some(c);
+        let _ = reload(&r.shared, c);
         r.w.tick(r.t0 + 2 * TICK);
         assert_eq!(r.src.cfgs.borrow().len(), 2);
         assert_eq!(r.shared.snapshot().collectors[0].addr.port(), 6343);
@@ -653,6 +764,94 @@ mod tests {
         r.w.tick(r.t0 + WINDOW + TICK);
         let d = &r.net.sent.borrow()[0].1;
         assert_eq!(word(d, 28 + 24), 5, "drops");
+    }
+
+    #[test]
+    fn a_reload_that_cannot_be_applied_changes_nothing_and_is_tried_again() {
+        let mut r = rig(1000);
+        r.w.tick(r.t0);
+        *r.src.capacity_fails.borrow_mut() = true;
+        let answer = reload(&r.shared, cfg(100));
+        r.w.tick(r.t0 + TICK);
+        let e = answer.try_recv().unwrap().unwrap_err();
+        assert!(e.contains("1:100") && e.contains("ENOMEM"), "{e}");
+        let p = r.shared.snapshot();
+        assert_eq!(
+            (p.rate, p.generation),
+            (1000, 1),
+            "still what the kernel has"
+        );
+        assert!(p.source_error.is_some());
+        assert_eq!(r.src.cfgs.borrow().len(), 1, "SAMPLE_CFG untouched");
+        // The same reload again, now that it can be applied: not mistaken
+        // for the configuration already in place.
+        *r.src.capacity_fails.borrow_mut() = false;
+        let answer = reload(&r.shared, cfg(100));
+        r.w.tick(r.t0 + 2 * TICK);
+        assert_eq!(answer.try_recv().unwrap(), Ok(()));
+        let p = r.shared.snapshot();
+        assert_eq!((p.rate, p.generation), (100, 2));
+        assert!(p.source_error.is_none());
+    }
+
+    #[test]
+    fn samples_left_in_replaced_rings_are_exported() {
+        let mut r = rig(1000);
+        r.w.tick(r.t0);
+        r.src.held.borrow_mut().push(event(3, 0, 0, 1000, 1));
+        let _ = reload(&r.shared, cfg(100));
+        r.w.tick(r.t0 + TICK);
+        assert_eq!(r.shared.snapshot().samples_total, 1);
+        assert_eq!(r.net.sent.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_rate_change_judges_the_window_so_far_at_the_old_rate() {
+        let mut r = rig(1_000_000);
+        r.w.tick(r.t0);
+        let t = r.t0 + crate::coverage::STARTUP_GRACE + Duration::from_secs(1);
+        r.w.tick(t);
+        assert_eq!(r.shared.snapshot().ports[0].state, State::Covered);
+        // 30 000 packets, no sample: nothing at 1:1000000, but silent at
+        // 1:100.
+        r.ports.rx.borrow_mut().insert(3, 31_000);
+        r.w.tick(t + PORTS_EVERY);
+        let answer = reload(&r.shared, cfg(100));
+        r.w.tick(t + PORTS_EVERY + TICK);
+        assert_eq!(answer.try_recv().unwrap(), Ok(()));
+        assert_eq!(r.shared.snapshot().ports[0].state, State::Covered);
+        // The next window starts at the reload and holds none of them.
+        r.w.tick(t + PORTS_EVERY + TICK + WINDOW);
+        assert_eq!(r.shared.snapshot().ports[0].state, State::Covered);
+    }
+
+    #[test]
+    fn an_unreadable_loss_counter_starts_a_new_baseline() {
+        let mut r = rig(1000);
+        *r.src.emit_failed.borrow_mut() = Some(10);
+        r.w.tick(r.t0);
+        // Unreadable for a tick: the rings' count stands in.
+        *r.src.emit_failed.borrow_mut() = None;
+        *r.src.ring_lost.borrow_mut() = 3;
+        r.w.tick(r.t0 + TICK);
+        // Readable again, having counted those 3 and 7 before: a new
+        // baseline, not 10 more.
+        *r.src.emit_failed.borrow_mut() = Some(20);
+        r.w.tick(r.t0 + 2 * TICK);
+        assert_eq!(r.shared.snapshot().lost_total, 3);
+        *r.src.emit_failed.borrow_mut() = Some(21);
+        r.w.tick(r.t0 + 3 * TICK);
+        assert_eq!(r.shared.snapshot().lost_total, 4);
+    }
+
+    #[test]
+    fn a_reload_no_worker_takes_is_withdrawn() {
+        let shared = Shared::new(Instant::now());
+        let e = shared
+            .request_reload(cfg(2000), Duration::from_millis(20))
+            .unwrap_err();
+        assert!(e.contains("did not take the reload"), "{e}");
+        assert!(shared.reload.lock().unwrap().is_none());
     }
 
     #[test]

@@ -12,6 +12,21 @@ use crate::worker::{Hook, Published};
 /// exported, and every port is uncovered.
 pub const STALL_AFTER: Duration = Duration::from_secs(1);
 
+/// A Prometheus label value: backslash, double quote and newline escaped,
+/// as the text format requires.
+fn escape(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for ch in v.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn row(name: impl Into<String>, state: HealthState, message: String) -> SubsystemHealth {
     SubsystemHealth {
         name: name.into(),
@@ -37,10 +52,15 @@ pub fn health(p: &Published, heartbeat_age: Duration) -> HealthReport {
     }
 
     rows.push(match &p.source_error {
+        // A failed reload changed nothing: the sampler runs as before, and
+        // the ports' rows say whether that still covers them.
         Some(e) => row(
             "sampling",
-            HealthState::Unhealthy,
-            format!("the sampler's configuration could not be applied: {e}"),
+            HealthState::Degraded,
+            format!(
+                "{e}; 1:{}, {} header bytes, generation {} stays applied",
+                p.rate, p.header_bytes, p.generation
+            ),
         ),
         None if p.over_budget => row(
             "sampling",
@@ -105,7 +125,7 @@ pub fn health(p: &Published, heartbeat_age: Duration) -> HealthReport {
             Some(why) => row(
                 format!("collector {}", c.name),
                 HealthState::Degraded,
-                format!("sflow to {} ({kind}): sends failing: {why}", c.addr),
+                format!("sflow to {} ({kind}): {why}", c.addr),
             ),
             None => row(
                 format!("collector {}", c.name),
@@ -171,7 +191,7 @@ pub fn metrics(p: &Published, out: &mut String) {
     let per_collector = |f: fn(&crate::worker::CollectorReport) -> u64| {
         p.collectors
             .iter()
-            .map(|c| (format!("{{collector=\"{}\"}}", c.name), f(c)))
+            .map(|c| (format!("{{collector=\"{}\"}}", escape(&c.name)), f(c)))
             .collect::<Vec<_>>()
     };
     counter(
@@ -198,7 +218,7 @@ pub fn metrics(p: &Published, out: &mut String) {
         let _ = writeln!(
             out,
             "packetframe_flow_export_coverage{{iface=\"{}\",path=\"{}\"}} {}",
-            r.name,
+            escape(&r.name),
             r.hook.name(),
             r.state.level()
         );
@@ -312,6 +332,46 @@ mod tests {
             .find(|r| r.name == "collector fnm")
             .unwrap();
         assert_eq!(c.state, HealthState::Degraded);
+    }
+
+    #[test]
+    fn a_reload_that_failed_degrades_and_names_what_stays() {
+        let mut p = published();
+        p.source_error =
+            Some("a reload to 1:100 with 128 header bytes could not be applied: no".into());
+        let h = health(&p, Duration::ZERO);
+        let s = h.subsystems.iter().find(|r| r.name == "sampling").unwrap();
+        assert_eq!(s.state, HealthState::Degraded);
+        assert!(
+            s.message
+                .as_deref()
+                .unwrap()
+                .contains("1:1000, 128 header bytes, generation 1 stays"),
+            "{:?}",
+            s.message
+        );
+    }
+
+    #[test]
+    fn label_values_are_escaped() {
+        let mut p = published();
+        p.ports[0].name = "a\\b\"c\nd".into();
+        p.collectors[0].name = "f\"nm".into();
+        let mut out = String::new();
+        metrics(&p, &mut out);
+        assert!(
+            out.contains("coverage{iface=\"a\\\\b\\\"c\\nd\",path=\"xdp\"} 3"),
+            "{out}"
+        );
+        assert!(
+            out.contains("datagrams_total{collector=\"f\\\"nm\"} 3"),
+            "{out}"
+        );
+        assert_eq!(out.lines().count(), {
+            let mut plain = String::new();
+            metrics(&published(), &mut plain);
+            plain.lines().count()
+        });
     }
 
     #[test]

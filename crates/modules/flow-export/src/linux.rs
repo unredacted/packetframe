@@ -17,7 +17,7 @@ use packetframe_fast_path::sample_rings::SampleRings;
 use packetframe_fast_path::{pin, registry};
 
 use crate::cfg::FlowExportConfig;
-use crate::worker::{Hook, Port, Ports, SampleSource, Shared, Worker, TICK};
+use crate::worker::{Hook, Leftover, Port, Ports, SampleSource, Shared, Worker, TICK};
 use crate::THREAD_NAME;
 
 /// The busiest a single CPU forwards, for sizing its ring.
@@ -55,6 +55,10 @@ struct LiveSource {
     cfg: Array<MapData, SampleCfg>,
     samples: MapData,
     rings: Option<SampleRings>,
+    /// Rings a reload replaced, and when: drained with the new ones for a
+    /// tick more, for a program that found them in the map just before
+    /// they left it.
+    retired: Option<(Instant, SampleRings)>,
     pages: usize,
     cpus: Vec<u32>,
     bpffs_root: PathBuf,
@@ -75,6 +79,7 @@ impl LiveSource {
             cfg: open_cfg(bpffs_root)?,
             samples,
             rings: None,
+            retired: None,
             pages: 0,
             cpus,
             bpffs_root: bpffs_root.to_owned(),
@@ -90,27 +95,59 @@ impl SampleSource for LiveSource {
             .map_err(|e| format!("SAMPLE_CFG: {e}"))
     }
 
-    fn ensure_capacity(&mut self, rate: u32) -> Result<(), String> {
+    fn ensure_capacity(&mut self, rate: u32, left: &mut Leftover) -> Result<(), String> {
         let want = pages_for(rate);
         if self.rings.is_some() && self.pages >= want {
             return Ok(());
         }
-        // The old rings leave the map before the new ones go in; samples
-        // in between fail to output and are counted.
-        self.rings = None;
-        self.rings = Some(
-            SampleRings::open(self.samples.fd().as_fd(), &self.cpus, want)
-                .map_err(|e| format!("perf rings ({want} pages per CPU): {e}"))?,
-        );
-        self.pages = want;
-        Ok(())
+        // Out of the map first: from then on a sample is either in the old
+        // rings, drained here, or a failed output the program counts.
+        if let Some((_, mut older)) = self.retired.take() {
+            left.lost += older.drain(|_, e| left.events.push(e.to_vec()));
+        }
+        if let Some(mut old) = self.rings.take() {
+            old.uninstall();
+            left.lost += old.drain(|_, e| left.events.push(e.to_vec()));
+            self.retired = Some((Instant::now(), old));
+        }
+        let fd = self.samples.fd().as_fd();
+        match SampleRings::open(fd, &self.cpus, want) {
+            Ok(r) => {
+                self.rings = Some(r);
+                self.pages = want;
+                Ok(())
+            }
+            Err(e) => {
+                let e = format!("perf rings ({want} pages per CPU): {e}");
+                // Rings of the size that worked, so export carries on at
+                // the rate the kernel still has.
+                if self.pages > 0 {
+                    match SampleRings::open(fd, &self.cpus, self.pages) {
+                        Ok(r) => self.rings = Some(r),
+                        Err(again) => {
+                            return Err(format!(
+                                "{e}; and the old ones could not be put back: {again}"
+                            ))
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     fn drain(&mut self, f: &mut dyn FnMut(&[u8])) -> u64 {
-        match &mut self.rings {
-            Some(r) => r.drain(|_, e| f(e)),
-            None => 0,
+        let mut lost = 0;
+        if let Some((at, old)) = &mut self.retired {
+            lost += old.drain(|_, e| f(e));
+            if at.elapsed() >= TICK {
+                self.retired = None;
+            }
         }
+        if let Some(r) = &mut self.rings {
+            lost += r.drain(|_, e| f(e));
+        }
+        lost
     }
 
     fn emit_failed(&mut self) -> Option<u64> {
@@ -126,8 +163,13 @@ struct LivePorts {
 
 impl Ports for LivePorts {
     fn ports(&mut self) -> Result<Vec<Port>, String> {
+        // fast-path saves it at its attach, before this module's: gone now
+        // is an inventory lost, not a fast-path with no ports.
         let Some(reg) = registry::load(&self.state_dir).map_err(|e| e.to_string())? else {
-            return Ok(Vec::new());
+            return Err(format!(
+                "fast-path's attachment registry is missing from {}",
+                self.state_dir.display()
+            ));
         };
         Ok(reg
             .attachments
@@ -216,10 +258,6 @@ impl Running {
             thread: Some(thread),
             bpffs_root: bpffs_root.to_owned(),
         })
-    }
-
-    pub fn reload(&self, cfg: FlowExportConfig) {
-        *self.shared.reload.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
     }
 
     /// Stop the worker, within the second a module's detach has, and the

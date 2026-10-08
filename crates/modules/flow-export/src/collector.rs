@@ -14,7 +14,8 @@ use crate::cfg::Collector;
 /// for 1:1000 on every port at once, and a bound on what a burst costs.
 pub const SEND_BUDGET: usize = 512;
 
-/// A send error this recent makes a collector read as failing.
+/// A send error or a budget drop this recent makes a collector read as
+/// failing.
 pub const FAILING_FOR: Duration = Duration::from_secs(10);
 
 /// The socket, behind a trait for the tests to fail it.
@@ -37,6 +38,9 @@ pub struct CollectorState {
     pub budget_drops: u64,
     pub last_error: Option<(Instant, String)>,
     pub last_ok: Option<Instant>,
+    /// When the budget last dropped datagrams: samples lost on the way
+    /// out, which a send after it does not undo.
+    pub last_budget_drop: Option<Instant>,
 }
 
 impl CollectorState {
@@ -48,16 +52,23 @@ impl CollectorState {
             budget_drops: 0,
             last_error: None,
             last_ok: None,
+            last_budget_drop: None,
         }
     }
 
-    /// The last [`FAILING_FOR`]'s most recent send error, if no send
-    /// has succeeded since.
-    pub fn failing(&self, now: Instant) -> Option<&str> {
-        let (at, why) = self.last_error.as_ref()?;
-        let recent = now.saturating_duration_since(*at) < FAILING_FOR;
-        let recovered = self.last_ok.is_some_and(|ok| ok > *at);
-        (recent && !recovered).then_some(why.as_str())
+    /// Why the collector reads as failing: a send error in the last
+    /// [`FAILING_FOR`] with no send succeeding since, or datagrams the
+    /// budget dropped in it.
+    pub fn failing(&self, now: Instant) -> Option<String> {
+        let recent = |at: Instant| now.saturating_duration_since(at) < FAILING_FOR;
+        if let Some((at, why)) = &self.last_error {
+            if recent(*at) && !self.last_ok.is_some_and(|ok| ok > *at) {
+                return Some(format!("sends failing: {why}"));
+            }
+        }
+        self.last_budget_drop
+            .filter(|at| recent(*at))
+            .map(|_| "datagrams dropped: the per-tick send budget was spent".to_owned())
     }
 }
 
@@ -72,6 +83,7 @@ pub fn send_all(
         for (i, d) in datagrams.iter().enumerate() {
             if i >= SEND_BUDGET {
                 c.budget_drops += (datagrams.len() - i) as u64;
+                c.last_budget_drop = Some(now);
                 break;
             }
             match t.send_to(d, c.cfg.addr) {
@@ -105,6 +117,8 @@ mod tests {
     use super::*;
     use packetframe_common::config::CollectorKind;
     use std::cell::RefCell;
+
+    const TICK_LATER: Duration = Duration::from_millis(100);
 
     struct Fake {
         fail_to: Option<SocketAddr>,
@@ -156,9 +170,16 @@ mod tests {
             sent: RefCell::new(Vec::new()),
         };
         let burst = vec![vec![0u8; 1]; SEND_BUDGET + 7];
-        send_all(&t, &mut cs, &burst, Instant::now());
+        let now = Instant::now();
+        send_all(&t, &mut cs, &burst, now);
         assert_eq!(cs[0].datagrams, SEND_BUDGET as u64);
         assert_eq!(cs[0].budget_drops, 7);
+        // Samples lost on the way out: failing, though every send it made
+        // succeeded, until the drops are old news.
+        assert!(cs[0].failing(now).unwrap().contains("budget"));
+        send_all(&t, &mut cs, &[vec![0u8; 1]], now + TICK_LATER);
+        assert!(cs[0].failing(now + TICK_LATER).is_some());
+        assert!(cs[0].failing(now + FAILING_FOR).is_none());
     }
 
     #[test]

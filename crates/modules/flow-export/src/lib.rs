@@ -96,9 +96,13 @@ impl Module for FlowExportModule {
             old.restart_only_delta(&new)
                 .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         }
+        // Applied by the worker and kept only once it says so: on a failure
+        // nothing changed, and the loader reports the reload as failed.
         #[cfg(target_os = "linux")]
         if let Some(r) = &self.running {
-            r.reload(new.clone());
+            r.shared
+                .request_reload(new.clone(), worker::RELOAD_WAIT)
+                .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         }
         self.cfg = Some(new);
         Ok(())

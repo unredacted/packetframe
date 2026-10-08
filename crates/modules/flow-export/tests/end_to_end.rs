@@ -362,3 +362,101 @@ fn a_source_address_the_host_lacks_fails_the_attach() {
         "the sampler was never turned on"
     );
 }
+
+/// fast-path's counter `name`, summed across CPUs.
+fn stat(s: &Scratch, name: &str) -> u64 {
+    let at = packetframe_fast_path::metrics::COUNTER_NAMES
+        .iter()
+        .position(|n| *n == name)
+        .unwrap();
+    packetframe_fast_path::stats_from_pin(&s.root).unwrap()[at]
+}
+
+/// A reload is applied by the time `reconfigure` returns, and one that
+/// needs larger rings swaps them without losing what the old ones held:
+/// every sample the program selected reaches the collector, at the rate
+/// it was drawn at.
+#[test]
+#[ignore = "needs root: CAP_BPF and bpffs"]
+fn a_reload_to_a_denser_rate_swaps_the_rings_and_loses_nothing() {
+    if !FAST_PATH_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("reload");
+    let bpf = fast_path(&s);
+    register_lo(&s);
+    let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+    collector
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let conf = |rate: u32| {
+        Config::parse(&format!(
+            "module fast-path\n  attach lo generic\nmodule flow-export\n  source-address 127.0.0.1\n  \
+             sample-rate {rate}\n  header-bytes 64\n  collector t sflow {}\n",
+            collector.local_addr().unwrap()
+        ))
+        .unwrap()
+    };
+    let section = |c: &Config| {
+        c.modules
+            .iter()
+            .find(|m| m.name == "flow-export")
+            .unwrap()
+            .clone()
+    };
+    let sparse = conf(1000);
+    let sparse_section = section(&sparse);
+    let mc = ModuleConfig::new(&sparse_section, &sparse.global);
+    let mut m = FlowExportModule::new();
+    m.load(
+        &mc,
+        &LoaderCtx {
+            bpffs_root: &s.root,
+            state_dir: &s.state,
+        },
+    )
+    .unwrap();
+    m.attach(&mc).expect("attach");
+
+    // ~50 samples at 1:1000, most still in the rings when the reload
+    // replaces them.
+    let pkt = frame();
+    test_run(&bpf, &pkt, 50_000);
+    let dense = conf(100);
+    let dense_section = section(&dense);
+    m.reconfigure(&ModuleConfig::new(&dense_section, &dense.global))
+        .expect("reload");
+    assert_eq!(
+        sample_cfg(&s),
+        SampleCfg::new(100, 64, 2),
+        "applied when reconfigure returned"
+    );
+    test_run(&bpf, &pkt, 5_000);
+
+    let selected = stat(&s, "sample_selected");
+    let mut by_rate = std::collections::BTreeMap::<u32, u64>::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut buf = [0u8; 2048];
+    while Instant::now() < deadline && by_rate.values().sum::<u64>() < selected {
+        let Ok(n) = collector.recv(&mut buf) else {
+            continue;
+        };
+        let d = &buf[..n];
+        let mut f = 28;
+        for _ in 0..word(d, 24) {
+            *by_rate.entry(word(d, f + 16)).or_default() += 1;
+            f += 8 + word(d, f + 4) as usize;
+        }
+    }
+    assert_eq!(stat(&s, "sample_emit_failed"), 0, "no swap in flight");
+    assert_eq!(
+        by_rate.values().sum::<u64>(),
+        selected,
+        "every selected sample exported: {by_rate:?}"
+    );
+    assert!(
+        by_rate.contains_key(&1000) && by_rate.contains_key(&100),
+        "{by_rate:?}"
+    );
+    m.detach().unwrap();
+}
