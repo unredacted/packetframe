@@ -38,7 +38,6 @@
 //! pinning pages; release sweeps them.
 
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -391,46 +390,49 @@ impl ResourceState {
     /// Persist via write-then-rename so a crash mid-write can never
     /// produce a torn file that a later adopt trusts.
     ///
-    /// The temp file is opened `O_NOFOLLOW | O_EXCL`, never with a
-    /// plain create. `state-dir` is operator-configurable, and if it
-    /// ever sits somewhere another user can prepare (`/tmp/...`), a
-    /// pre-planted `vpp-offload.json.tmp` symlink would otherwise have
-    /// this daemon truncate the link's target with root privileges.
-    /// `O_EXCL` also means a stale temp file is an explicit error we
-    /// clean up and retry once, rather than silently reused.
+    /// Through [`write_state_file`], the walk the pid file, the route
+    /// ledgers and this module's other records use: `state-dir` is opened
+    /// one component at a time without following a symlink, a missing
+    /// component is made 0755 less the umask (so never group- or
+    /// world-writable), and the 0600 temp file is created
+    /// `O_EXCL|O_NOFOLLOW` and renamed within the walked directory. A
+    /// symlink anywhere on the way fails the save rather than choosing
+    /// where this root daemon writes, and so does anything at the temp
+    /// name but a stale regular file, which is replaced once. By pathname
+    /// (`create_dir_all`, then an open and a rename by path), an
+    /// intermediate symlink redirected the write, and a 002 umask left a
+    /// fresh `state-dir` group-writable for [`Self::load`] to refuse at
+    /// the next attach.
+    ///
+    /// `state-dir` may not exist yet. On a first run it is made by
+    /// whichever writer reaches it first: the event log's writer thread
+    /// (at the default `event-log` path), a module earlier in config
+    /// order (fast-path's anyip lock and `tc-links.json` during its
+    /// attach, then the loader's pin-registry save after it; neigh-snoop's
+    /// load, probing the default `persist-dir`), or this save. The
+    /// loader's pid file is written only after every module has attached.
+    /// The walk makes the directory when it is still missing.
     pub fn save(&self, state_dir: &Path) -> Result<(), String> {
-        // The loader only creates state-dir when it saves the pin
-        // registry AFTER attach, so on a first run — or a config where
-        // vpp-offload attaches before any module that writes there —
-        // the directory may not exist yet.
-        fs::create_dir_all(state_dir)
-            .map_err(|e| format!("create {}: {e}", state_dir.display()))?;
         let path = Self::path_in(state_dir);
-        let tmp = path.with_extension("json.tmp");
         let body = serde_json::to_string_pretty(self).expect("state serializes");
-
-        let mut f = match open_tmp_nofollow(&tmp) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Stale temp from a crashed write (or a planted file).
-                // Remove and retry exactly once; a second failure is a
-                // real error worth surfacing.
-                fs::remove_file(&tmp)
-                    .map_err(|e| format!("remove stale {}: {e}", tmp.display()))?;
-                open_tmp_nofollow(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?
+        write_state_file(&path, body.as_bytes()).map_err(|e| {
+            // Only the temp file's create can collide.
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "write {}: {e}: {}.tmp is in the way and is not a stale file this daemon \
+                     replaces; remove it",
+                    path.display(),
+                    path.display()
+                )
+            } else {
+                format!("write {}: {e}", path.display())
             }
-            Err(e) => return Err(format!("create {}: {e}", tmp.display())),
-        };
-        f.write_all(body.as_bytes())
-            .and_then(|()| f.sync_all())
-            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, &path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
-        Ok(())
+        })
     }
 
     pub fn remove(state_dir: &Path) -> Result<(), String> {
         let path = Self::path_in(state_dir);
-        match fs::remove_file(&path) {
+        match remove_state_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(format!("remove {}: {e}", path.display())),
@@ -532,6 +534,34 @@ fn read_state_file(path: &Path) -> Result<Option<Vec<u8>>, ReadFailure> {
     Ok(Some(buf))
 }
 
+// The state-dir primitives are Linux-only (they are `openat` walks); the
+// dev-laptop build gets plain `std::fs`, as the ledger record beside this
+// file does. Nothing privileged runs off Linux.
+#[cfg(target_os = "linux")]
+fn write_state_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    packetframe_common::statefile::write_atomic(path, contents)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_state_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_state_file(path: &Path) -> std::io::Result<()> {
+    packetframe_common::statefile::remove_state_record(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_state_file(path: &Path) -> std::io::Result<()> {
+    fs::remove_file(path)
+}
+
 // --- sysfs primitives, base-path-injected for tests ---------------------
 
 /// Read + trim a small sysfs/procfs file.
@@ -539,20 +569,6 @@ fn read_trim(path: &Path) -> Result<String, String> {
     fs::read_to_string(path)
         .map(|s| s.trim().to_string())
         .map_err(|e| format!("read {}: {e}", path.display()))
-}
-
-/// Open the state temp file refusing symlinks and refusing to
-/// clobber an existing file. See [`ResourceState::save`].
-fn open_tmp_nofollow(tmp: &Path) -> std::io::Result<fs::File> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true); // create_new == O_EXCL|O_CREAT
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(libc::O_NOFOLLOW);
-        opts.mode(0o600);
-    }
-    opts.open(tmp)
 }
 
 fn write_str(path: &Path, value: &str) -> Result<(), String> {
@@ -1604,6 +1620,15 @@ mod tests {
         }
     }
 
+    /// `save` makes a missing `state-dir`, and never writes through a
+    /// symlink planted at the temp name. Nor does it remove one: the
+    /// write replaces only a stale regular file there, so the save fails
+    /// naming the link, which stays put with its target untouched, and
+    /// the record already in place is not replaced. With the link gone,
+    /// the next save goes through.
+    ///
+    /// The symlink half is Linux-only: the dev-laptop `write_state_file`
+    /// is plain `std::fs`.
     #[test]
     fn state_save_creates_dir_and_refuses_symlinked_tmp() {
         let base = tmpdir();
@@ -1613,24 +1638,146 @@ mod tests {
         st.save(&state_dir).unwrap();
         assert_eq!(ResourceState::load(&state_dir).unwrap().unwrap(), st);
 
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
-            // A pre-planted symlink at the temp path must never be
-            // followed: the victim file stays untouched.
             let victim = base.join("victim");
             fs::write(&victim, b"do not clobber").unwrap();
             let tmp = ResourceState::path_in(&state_dir).with_extension("json.tmp");
-            let _ = fs::remove_file(&tmp);
             std::os::unix::fs::symlink(&victim, &tmp).unwrap();
-            // The stale-file retry removes the symlink itself (not its
-            // target) and writes a real file in its place.
-            st.save(&state_dir).unwrap();
+
+            let err = recorded()
+                .save(&state_dir)
+                .expect_err("a symlink at the temp name");
+            assert!(
+                err.contains(&format!("{} is in the way", tmp.display())),
+                "{err}"
+            );
             assert_eq!(
                 fs::read_to_string(&victim).unwrap(),
                 "do not clobber",
                 "symlink target was written through"
             );
+            assert!(
+                fs::symlink_metadata(&tmp).unwrap().file_type().is_symlink(),
+                "the link is left for the operator, not removed"
+            );
+            assert_eq!(
+                ResourceState::load(&state_dir).unwrap().unwrap(),
+                st,
+                "the record in place was replaced"
+            );
+
+            fs::remove_file(&tmp).unwrap();
+            recorded().save(&state_dir).unwrap();
+            assert_eq!(ResourceState::load(&state_dir).unwrap(), Some(recorded()));
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "do not clobber");
         }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A symlink at any component of `state-dir` fails `save` before
+    /// anything is made or written where it points, and `remove` deletes
+    /// nothing through one. By pathname, `create_dir_all` and the rename
+    /// followed an intermediate link, so whoever could plant it chose
+    /// where this root daemon wrote its record (and `remove_file`
+    /// followed one too). The reader refuses such a path; the writer now
+    /// does as well.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn save_and_remove_refuse_a_symlink_in_the_state_dir_path() {
+        let base = tmpdir();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        for state_dir in [link.join("state"), link.join("a").join("b"), link.clone()] {
+            let Err(err) = recorded().save(&state_dir) else {
+                panic!("saved through the link at {}", state_dir.display());
+            };
+            assert!(
+                err.contains("a symlink here is refused"),
+                "{}: {err}",
+                state_dir.display()
+            );
+        }
+        assert_eq!(
+            fs::read_dir(&real).unwrap().count(),
+            0,
+            "something was made or written through the link"
+        );
+
+        recorded().save(&real).unwrap();
+        let err = ResourceState::remove(&link).expect_err("remove through the link");
+        assert!(err.contains("a symlink here is refused"), "{err}");
+        assert!(
+            ResourceState::path_in(&real).exists(),
+            "the record was deleted through the link"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Where the umask child saves; set only in the child's environment.
+    #[cfg(target_os = "linux")]
+    const UMASK_CHILD_STATE_DIR: &str = "PF_TEST_VPP_UMASK_CHILD_STATE_DIR";
+
+    /// A missing multi-level `state-dir` is made closed to group and
+    /// others under a 002 umask, so the reader takes the record `save`
+    /// just wrote. `create_dir_all` made each component 0775 under that
+    /// umask, and the reader then refused the directory at the next
+    /// attach and at `detach --all`.
+    ///
+    /// The umask is per process, and other tests here create directories
+    /// with default modes for the reader to judge, so the save runs in a
+    /// child: this test binary re-run on [`umask_002_child_saves`] alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_missing_state_dir_is_made_closed_to_group_and_others_under_a_002_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tmpdir();
+        let state_dir = base.join("a").join("b").join("state");
+        let module = module_path!().split_once("::").unwrap().1;
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                &format!("{module}::umask_002_child_saves"),
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(UMASK_CHILD_STATE_DIR, &state_dir)
+            .output()
+            .unwrap();
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{shown}");
+        assert!(
+            shown.contains("test result: ok. 1 passed;"),
+            "the child did not run its test: {shown}"
+        );
+
+        for dir in [base.join("a"), base.join("a").join("b"), state_dir.clone()] {
+            let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode & 0o022, 0, "{} is {mode:04o}", dir.display());
+        }
+        assert_eq!(ResourceState::load(&state_dir).unwrap(), Some(recorded()));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "runs only as the child of a_missing_state_dir_is_made_closed_to_group_and_others_under_a_002_umask"]
+    fn umask_002_child_saves() {
+        let Some(dir) = std::env::var_os(UMASK_CHILD_STATE_DIR) else {
+            return;
+        };
+        let prior = unsafe { libc::umask(0o002) };
+        let saved = recorded().save(Path::new(&dir));
+        unsafe { libc::umask(prior) };
+        saved.unwrap();
     }
 
     #[test]

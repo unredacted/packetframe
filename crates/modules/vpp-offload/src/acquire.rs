@@ -1270,10 +1270,9 @@ mod tests {
         // Break SAVE specifically, in a way that also fails under the
         // qemu jobs (which run as root, so permission tricks pass
         // there): a DIRECTORY squatting on the temp-file path collides
-        // with save's O_EXCL create, and its remove-stale retry cannot
-        // remove_file a directory — root or not. Load still sees no
-        // state file, so the fresh path runs and only persistence
-        // breaks.
+        // with save's O_EXCL create, and the retry replaces only a stale
+        // regular file — root or not. Load still sees no state file, so
+        // the fresh path runs and only persistence breaks.
         fs::create_dir_all(f.paths.state_dir.join("vpp-offload.json.tmp")).unwrap();
 
         let err = acquire(&f.paths, &two_ports(), 8, ROUTES, &RestartOnly::new()).unwrap_err();
