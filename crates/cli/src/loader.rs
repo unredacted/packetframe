@@ -2173,6 +2173,30 @@ mod keep_vpp_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// With no state file left, `detach --all` still processes the
+    /// sampler's mount record, kept for a teardown that released everything
+    /// but the tmpfs. Nothing carrying its marker is mounted here (no
+    /// marker for this token exists anywhere), so it unmounts nothing and
+    /// drops the record.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detach_processes_the_sampler_mount_record_without_a_state_file() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let dir = state_dir("pf-detach-sampler");
+        let rec = dir.join(packetframe_vpp_offload::sampler::MOUNT_RECORD);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&rec)
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"00000000000000a7\n").unwrap();
+        drop(f);
+        detach_vpp_offload_with(&dir, || Ok(())).expect("nothing to unmount");
+        assert!(!rec.exists(), "the record is processed and dropped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `--keep-vpp` wins over both `--all` and a config that declares the
     /// module — it exists for exactly the restart where both are true.
     #[test]
@@ -2576,6 +2600,15 @@ fn restore_queue0_irqs(state_dir: &Path) {
     }
 }
 
+/// Unmount the VPP sampler's tmpfs if PacketFrame's record and marker say
+/// it is PacketFrame's (`packetframe_vpp_offload::sampler`).
+#[cfg(feature = "vpp-offload")]
+fn release_sampler_mount(state_dir: &Path) -> Result<(), String> {
+    use packetframe_vpp_offload::{acquire::SAMPLER_DIR, sampler::release_recorded};
+    release_recorded(Path::new(SAMPLER_DIR), state_dir)
+        .map_err(|e| format!("vpp-offload: the sampler's tmpfs: {e}"))
+}
+
 /// [`detach_vpp_offload`] with the hand-back teardown as a seam.
 #[cfg(feature = "vpp-offload")]
 fn detach_vpp_offload_with(
@@ -2597,7 +2630,11 @@ fn detach_vpp_offload_with(
         // exactly that. No VPP to kill first: there is no record of one.
         // A queue-0 IRQ placement whose restore failed outlives it too.
         restore_queue0_irqs(state_dir);
-        return teardown_handback().map_err(handback_leftover);
+        // So can the sampler's tmpfs, when a teardown released everything
+        // else but could not unmount it: its record is its own file, kept
+        // for exactly this.
+        let sampler = release_sampler_mount(state_dir);
+        return teardown_handback().map_err(handback_leftover).and(sampler);
     };
 
     // Recorded MCAM rules mean traffic is DIVERTED to a VF this function is

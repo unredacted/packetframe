@@ -129,8 +129,13 @@ fn topmost_mount<'a>(mountinfo: &'a str, dir: &Path) -> Option<(&'a str, &'a str
 
 /// Whether anything is mounted at exactly `dir`, as opposed to `dir`
 /// being a plain directory on its parent's filesystem.
+/// A `dir` that does not exist has nothing mounted on it.
 pub fn is_mount_point(dir: &Path) -> io::Result<bool> {
-    let real = fs::canonicalize(dir)?;
+    let real = match fs::canonicalize(dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
     Ok(topmost_mount(&mountinfo, &real).is_some())
 }

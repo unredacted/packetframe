@@ -86,6 +86,10 @@ fn a_default_size_tmpfs_is_refused() {
 fn the_mount_packetframe_makes_is_one_the_plugin_accepts() {
     let d = tempdir();
     assert!(!is_mount_point(&d).unwrap());
+    assert!(
+        !is_mount_point(&d.join("absent")).unwrap(),
+        "nothing on a missing directory"
+    );
     assert!(matches!(
         check_dir(&d),
         Err(DirError::NotTmpfs(_)) | Err(DirError::NotSizeLimited(_))

@@ -512,9 +512,9 @@ pub fn release(paths: &SysPaths, state: ResourceState) -> Result<(), String> {
     // The sampler's tmpfs, if it is PacketFrame's. VPP is gone by now
     // (every caller releases after the kill, or before any spawn), and a
     // reader still mapping an epoch keeps only that memory, not the
-    // mount. Not one of `errors`: its record is its own file, which stays
-    // when this fails, so a later release retries it whatever happens to
-    // this one.
+    // mount. Not one of `errors`, which keep the VF and hugepage record:
+    // its own record file stays when this fails, and `detach --all`
+    // processes it even once the state file is gone.
     if let Err(e) = crate::sampler::release_recorded(&paths.sampler_dir, &paths.state_dir) {
         tracing::warn!(error = %e, "the VPP sampler's tmpfs was not released; `packetframe detach --all` retries it");
     }

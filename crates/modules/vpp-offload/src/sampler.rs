@@ -124,8 +124,10 @@ pub(crate) fn prepare(
     fresh: u64,
 ) -> (SamplerDir, Option<u64>) {
     let shown = dir.display();
+    // Unknown, as for the mount table below: the record stands, so a mount
+    // of ours that is still there is still released.
     if let Err(e) = ops.ensure_dir(dir) {
-        return (SamplerDir::Unavailable(format!("{shown}: {e}")), None);
+        return (SamplerDir::Unavailable(format!("{shown}: {e}")), recorded);
     }
     match ops.is_mount_point(dir) {
         // Unknown: the record stands as it is.
@@ -373,13 +375,13 @@ pub(crate) fn prepare_recorded(dir: &Path, threads: usize, state_dir: &Path) -> 
 
 /// Release PacketFrame's sampler mount ([`release`]), after VPP is gone.
 #[cfg(target_os = "linux")]
-pub(crate) fn release_recorded(dir: &Path, state_dir: &Path) -> Result<(), String> {
+pub fn release_recorded(dir: &Path, state_dir: &Path) -> Result<(), String> {
     release(&Live, dir, state_dir)
 }
 
 /// No mounts off Linux, so nothing to release.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn release_recorded(_dir: &Path, _state_dir: &Path) -> Result<(), String> {
+pub fn release_recorded(_dir: &Path, _state_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -455,6 +457,7 @@ mod tests {
         /// `None`: a plain directory. Else the mount: its size (or why the
         /// plugin would refuse it), its other files' bytes, its markers.
         mounted: RefCell<Option<Mount>>,
+        refuse_dir: bool,
         refuse_mount: bool,
         refuse_marker: bool,
         mounts: RefCell<Vec<u64>>,
@@ -482,6 +485,9 @@ mod tests {
 
     impl DirOps for Fake {
         fn ensure_dir(&self, _: &Path) -> io::Result<()> {
+            if self.refuse_dir {
+                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            }
             Ok(())
         }
         fn is_mount_point(&self, _: &Path) -> io::Result<bool> {
@@ -622,6 +628,17 @@ mod tests {
             prepare(&f, dir(), NEED, Some(7), 8).0,
             SamplerDir::Ready { owned: true, .. }
         ));
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_checked_keeps_the_record() {
+        let f = Fake {
+            refuse_dir: true,
+            ..Fake::with(Ok(1000), 0, vec![7])
+        };
+        let (out, ours) = prepare(&f, dir(), NEED, Some(7), 8);
+        assert!(matches!(out, SamplerDir::Unavailable(_)));
+        assert_eq!(ours, Some(7), "unknown is not gone");
     }
 
     #[test]

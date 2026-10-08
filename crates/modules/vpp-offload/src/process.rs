@@ -89,6 +89,25 @@ mod imp {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
+
+    /// VPP's command line and environment.
+    pub(super) fn command(binary: &Path, conf: &Path) -> Command {
+        let mut cmd = Command::new(binary);
+        cmd.arg("-c")
+            .arg(conf)
+            // The sampler plugin follows `PF_SAMPLER_DIR` when it is set.
+            // An inherited one would point it at a directory nothing
+            // prepared; without it, the plugin uses its default, which is
+            // the one vpp-offload mounts (`crate::sampler`).
+            .env_remove(packetframe_sampler_shm::fs::ENV_DIR)
+            // VPP's own `log` stanza owns its output. Inheriting our
+            // stdout would interleave dataplane chatter into
+            // packetframe's structured log.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    }
     use std::time::{Duration, Instant};
 
     /// How long to wait for a process to die after SIGKILL before
@@ -180,15 +199,7 @@ mod imp {
         /// would signal "exited" immediately and the supervisor would
         /// restart-loop a perfectly healthy VPP.
         pub fn spawn(binary: &Path, conf: &Path) -> io::Result<Self> {
-            let mut cmd = Command::new(binary);
-            cmd.arg("-c")
-                .arg(conf)
-                // VPP's own `log` stanza owns its output. Inheriting
-                // our stdout would interleave dataplane chatter into
-                // packetframe's structured log.
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+            let mut cmd = command(binary, conf);
             // This runs on the supervision thread, which may be placed
             // on the control-plane CPUs; VPP must start from the
             // daemon's unplaced mask instead (`placement::unplaced` has
@@ -534,6 +545,25 @@ pub fn terminate_or_leak(p: &mut VppProcess, grace: Duration) -> Disposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VPP never inherits a sampler directory: the plugin must use the
+    /// default, the one vpp-offload mounts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vpp_is_spawned_without_a_sampler_directory_override() {
+        let cmd = imp::command(Path::new("/usr/bin/vpp"), Path::new("/run/vpp.conf"));
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == packetframe_sampler_shm::fs::ENV_DIR && v.is_none()),
+            "{:?}",
+            cmd.get_envs().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            crate::acquire::SAMPLER_DIR,
+            packetframe_sampler_shm::fs::DEFAULT_DIR,
+            "vpp-offload mounts where the plugin looks by default"
+        );
+    }
 
     /// The ordinary shape.
     #[test]
