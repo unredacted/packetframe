@@ -59,6 +59,7 @@ shipped; that work is part of 0.5.0.
     - The dumps are taken on a fresh subscription, and the overflowed socket is dropped with everything still queued on it. What it still held is older than what was lost, and replaying it after the dump would undo the dump. If nothing was applied, the old subscription is kept.
     - What the dumps list is applied first.
     - An entry missing from a dump is confirmed gone with a single-entry get before it is withdrawn, because a dump can skip a live entry. A neighbour on a device that no longer exists counts as gone, and a device's deletion takes any neighbours still held on it.
+    - Each outcome is announced as the lost notification would have been. A neighbour now `FAILED` is announced `Failed` and keeps its local-prefix route. A neighbour that moved to another interface also loses its entry on the old one, which withdraws the host route it had there.
     - Confirmations stop once the request socket is retired and are capped at 2 s per read; the rest are owed to the next resync.
     - The receive buffer is raised to 16 MiB.
   - A probe suppressed on an `ix-mode` interface still reads the kernel's entry back. This is a unicast get, so nothing goes onto the fabric.

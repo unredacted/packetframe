@@ -293,8 +293,9 @@ pub type NeighView = HashMap<IpAddr, (u32, [u8; 6])>;
 pub struct NeighDelta {
     /// Usable entries that are new, or moved device, or changed MAC.
     pub learned: Vec<(IpAddr, u32, [u8; 6])>,
-    /// Entries in the view that the dump no longer holds as usable, with
-    /// the device the view had them on.
+    /// `(address, device)` pairs the view holds that the dump no longer
+    /// lists as usable: the address missing altogether, or listed only on
+    /// other devices (a move, which also appears in `learned`).
     pub lost: Vec<(IpAddr, u32)>,
 }
 
@@ -302,8 +303,9 @@ pub struct NeighDelta {
 /// view. The view is keyed by address while the kernel keys `(device,
 /// address)`, so an address the dump holds on several devices keeps the
 /// one the view already has, if the dump still has it there; otherwise
-/// the last one in dump order wins, which is what a fresh seed does.
-/// Output is sorted by address so the announcements are deterministic.
+/// the last one in dump order wins, which is what a fresh seed does, and
+/// the device the view had is reported lost. Output is sorted by address
+/// so the announcements are deterministic.
 pub fn reconcile_neighbours(view: &NeighView, dump: &[(IpAddr, u32, [u8; 6])]) -> NeighDelta {
     let mut by_ip: HashMap<IpAddr, Vec<(u32, [u8; 6])>> = HashMap::new();
     for &(ip, ifindex, mac) in dump {
@@ -317,7 +319,16 @@ pub fn reconcile_neighbours(view: &NeighView, dump: &[(IpAddr, u32, [u8; 6])]) -
                 match entries.iter().rev().find(|(i, _)| *i == cached_if) {
                     Some(&(_, mac)) if mac == cached_mac => continue,
                     Some(&e) => e,
-                    None => last,
+                    None => {
+                        // A move: the address is listed, but not on the
+                        // device the view holds it on. That entry is
+                        // missing like any other, and is lost on its own —
+                        // as its RTM_DELNEIGH would have, withdrawing what
+                        // was announced for it there — besides the new
+                        // device being learned.
+                        delta.lost.push((*ip, cached_if));
+                        last
+                    }
                 }
             }
             None => last,
@@ -938,12 +949,15 @@ mod tests {
         let dump = vec![(ip(1), 10, M1), (ip(1), 20, M2)];
         assert_eq!(reconcile_neighbours(&view, &dump), NeighDelta::default());
 
-        // Off the viewed device but still on another: that is a move,
-        // announced as a Learned on the device that remains, not a loss.
+        // Off the viewed device but still on another: a move. The device
+        // that remains is learned, and the viewed one is lost in its own
+        // right — whatever was announced for the address there (a
+        // local-prefix host route on that interface) must be withdrawn,
+        // as that device's RTM_DELNEIGH would have done.
         let dump = vec![(ip(1), 20, M2)];
         let d = reconcile_neighbours(&view, &dump);
         assert_eq!(d.learned, vec![(ip(1), 20, M2)]);
-        assert!(d.lost.is_empty());
+        assert_eq!(d.lost, vec![(ip(1), 10)]);
     }
 
     #[test]

@@ -546,6 +546,15 @@ impl ReadFailure {
     }
 }
 
+/// A neighbour as a single-entry get finds it.
+#[derive(Debug)]
+enum NeighbourNow {
+    /// Usable: `(ifindex, mac)`.
+    Usable(u32, [u8; 6]),
+    /// Held `NUD_FAILED` on this ifindex.
+    Failed(u32),
+}
+
 /// What a single-entry get says about an entry a dump did not list.
 enum Still<T> {
     Gone,
@@ -1769,12 +1778,19 @@ impl NetlinkNeighborResolver {
             }
             match self.confirm_neighbour(handle, ip, ifindex).await {
                 Still::Gone => self.lose(ip, ifindex).await,
-                Still::Present((now_if, mac)) => {
+                Still::Present(NeighbourNow::Usable(now_if, mac)) => {
                     // Skipped by the dump. Announced only if it differs
                     // from what the view already holds.
                     if self.neigh_cache.get(&ip) != Some(&(now_if, mac)) {
                         self.learn(ip, now_if, mac).await;
                     }
+                }
+                // The dump leaves NUD_FAILED entries out; the kernel still
+                // holds this one, failed. Announced as its notification
+                // would have been: `Failed`, not `Gone` — the nexthop is
+                // written Failed and its local-prefix route stays.
+                Still::Present(NeighbourNow::Failed(on)) => {
+                    self.fail(ip, on, "kernel marked NUD_FAILED".into()).await;
                 }
                 Still::Unknown(e) => unconfirmed.add(e),
             }
@@ -1809,17 +1825,19 @@ impl NetlinkNeighborResolver {
     /// device itself no longer exists, so neither can a neighbour on it;
     /// `neigh_get` answers that for an index the platform deleted (a
     /// recreated bridge), and reading it as "unknown" would owe a resync
-    /// that can never be paid. So is an entry the kernel still holds in a
-    /// state with no usable MAC: the dump left it out for that, exactly as
-    /// the multicast path would. A kernel without single-entry gets
-    /// (before 5.1, `EOPNOTSUPP`) cannot be asked, and there the dump's
-    /// word is all there is.
+    /// that can never be paid. An entry the kernel holds `NUD_FAILED` is
+    /// reported as such ([`NeighbourNow::Failed`]), since the dump leaves
+    /// those out as unusable but a notification would have announced it
+    /// `Failed`, not lost; one in another state with no MAC (incomplete,
+    /// none) is gone, as nothing usable is there. A kernel without
+    /// single-entry gets (before 5.1, `EOPNOTSUPP`) cannot be asked, and
+    /// there the dump's word is all there is.
     async fn confirm_neighbour(
         &mut self,
         handle: &Handle,
         ip: IpAddr,
         ifindex: u32,
-    ) -> Still<(u32, [u8; 6])> {
+    ) -> Still<NeighbourNow> {
         let mut h = handle.clone();
         let mut replies = match h.request(neigh_get_request(ip, ifindex)) {
             Ok(r) => r,
@@ -1845,8 +1863,13 @@ impl NetlinkNeighborResolver {
                 Still::Unknown(format!("{ip}: timed out"))
             }
             Ok(Some(Ok(n))) => match parse_neighbour_add(&n, [0; 6]) {
-                Some(NeighEvent::Learned { ifindex, mac, .. }) => Still::Present((ifindex, mac)),
-                _ => Still::Gone,
+                Some(NeighEvent::Learned { ifindex, mac, .. }) => {
+                    Still::Present(NeighbourNow::Usable(ifindex, mac))
+                }
+                Some(NeighEvent::Failed { ifindex, .. }) => {
+                    Still::Present(NeighbourNow::Failed(ifindex))
+                }
+                Some(NeighEvent::Gone { .. }) | None => Still::Gone,
             },
             Ok(Some(Err(code)))
                 if code == -libc::ENOENT || code == -libc::ENODEV || code == -libc::EOPNOTSUPP =>

@@ -1525,3 +1525,216 @@ fn a_suppressed_probe_reads_back_an_entry_the_view_missed() {
         let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
     });
 }
+
+/// A resolver with a `local-prefix` on `iface`, recording its routes,
+/// that hangs (and is then restarted) on a resolve request for `hang`:
+/// how the reconcile tests below change the kernel behind its back.
+fn local_prefix_resolver(
+    shutdown: &CancellationToken,
+    iface: &str,
+    hang: IpAddr,
+) -> (
+    NetlinkNeighborResolver,
+    mpsc::Receiver<NeighEvent>,
+    packetframe_fast_path::fib::netlink_neigh::NeighborResolveHandle,
+    RouteEventLog,
+) {
+    let (prog, log) = recording_handle();
+    let (resolver, events, resolve) = NetlinkNeighborResolver::new(shutdown.clone());
+    let resolver = resolver
+        .with_local_prefixes(
+            vec![LocalPrefixSpec {
+                addr: "198.51.100.0".parse().unwrap(),
+                prefix_len: 24,
+                iface: iface.to_string(),
+                arp_scavenge: false,
+            }],
+            prog,
+        )
+        .with_supervision_timing(quick_timing(Duration::from_secs(3)))
+        .with_test_faults(TestFaults {
+            hang_on_resolve: Some(hang),
+            ..TestFaults::default()
+        });
+    (resolver, events, resolve, log)
+}
+
+fn host_route(last: u8) -> IpPrefix {
+    IpPrefix::V4 {
+        addr: [198, 51, 100, last],
+        prefix_len: 32,
+    }
+}
+
+/// Stall the first incarnation, run `change` while it is deaf, and wait
+/// for the replacement to be running: the replacement reconciles against
+/// a kernel whose notifications for `change` were lost.
+async fn change_while_deaf(
+    status: &SharedResolverStatus,
+    resolve: &packetframe_fast_path::fib::netlink_neigh::NeighborResolveHandle,
+    hang: IpAddr,
+    change: impl FnOnce(),
+) {
+    await_status(status, Duration::from_secs(5), "the first loop", |s| {
+        s.incarnation == 1
+            && s.phase == packetframe_fast_path::fib::neigh_supervision::Phase::Running
+    })
+    .await;
+    assert!(resolve.request_resolve(hang));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    change();
+    await_status(
+        status,
+        Duration::from_secs(15),
+        "the replacement incarnation",
+        |s| {
+            s.incarnation == 2
+                && s.phase == packetframe_fast_path::fib::neigh_supervision::Phase::Running
+        },
+    )
+    .await;
+}
+
+/// A neighbour that moved to another interface while the resolver was
+/// deaf: deleted on the `local-prefix` interface, re-learned on one
+/// outside it. The multicast path withdraws the old host route on the old
+/// device's `RTM_DELNEIGH`; the reconcile must too, or the stale /32 keeps
+/// fast-pathing traffic for the host to the interface it left.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn a_neighbour_that_moved_unheard_withdraws_its_old_local_prefix_route() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let netns = names.netns.clone();
+    let (veth_a, veth_b) = (names.veth_a.clone(), names.veth_b.clone());
+    neigh_permanent(&netns, "198.51.100.40", "02:00:00:00:0a:40", &veth_a);
+    let _ns_fd = enter_netns(&names.netns);
+    let moved: IpAddr = "198.51.100.40".parse().unwrap();
+    let to_ifindex = if_nametoindex(&veth_b);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async move {
+        let shutdown = CancellationToken::new();
+        let hang: IpAddr = "198.51.100.96".parse().unwrap();
+        let (resolver, mut events_rx, resolve, log) =
+            local_prefix_resolver(&shutdown, &veth_a, hang);
+        let status = resolver.status();
+        let resolver_task = tokio::spawn(resolver.run());
+        change_while_deaf(&status, &resolve, hang, || {
+            ns_run(
+                &netns,
+                &["ip", "neigh", "del", "198.51.100.40", "dev", &veth_a],
+            );
+            neigh_permanent(&netns, "198.51.100.40", "02:00:00:00:0a:41", &veth_b);
+        })
+        .await;
+        let events = collect_events(&mut events_rx, Duration::from_secs(2)).await;
+
+        assert!(
+            log.events()
+                .iter()
+                .any(|e| matches!(e, RouteEvent::Add { prefix, .. } if *prefix == host_route(40))),
+            "the fixture must have installed the host route on the local-prefix interface"
+        );
+        assert!(
+            log.events()
+                .iter()
+                .any(|e| matches!(e, RouteEvent::Del { prefix, .. } if *prefix == host_route(40))),
+            "the host route on the interface it left must be withdrawn: {:?}",
+            log.events()
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                NeighEvent::Learned { ip, ifindex, .. } if *ip == moved && *ifindex == to_ifindex
+            )),
+            "and the neighbour is learned where it is now: {events:?}"
+        );
+        assert!(
+            status.snapshot().resync_owed.is_none(),
+            "{:?}",
+            status.snapshot()
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
+    });
+}
+
+/// A neighbour the kernel declared `NUD_FAILED` while the resolver was
+/// deaf. The dump leaves failed entries out, so the reconcile asks about
+/// it; the kernel still holds it, failed. It must be announced as its
+/// notification would have been — `Failed`, which writes the nexthop
+/// Failed and keeps its local-prefix route — not `Gone`, which withdraws
+/// the route and writes it Incomplete.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn a_neighbour_that_failed_unheard_is_announced_failed_and_keeps_its_route() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let netns = names.netns.clone();
+    let veth_a = names.veth_a.clone();
+    neigh_permanent(&netns, "198.51.100.41", "02:00:00:00:0b:41", &veth_a);
+    let _ns_fd = enter_netns(&names.netns);
+    let failed: IpAddr = "198.51.100.41".parse().unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async move {
+        let shutdown = CancellationToken::new();
+        let hang: IpAddr = "198.51.100.95".parse().unwrap();
+        let (resolver, mut events_rx, resolve, log) =
+            local_prefix_resolver(&shutdown, &veth_a, hang);
+        let status = resolver.status();
+        let resolver_task = tokio::spawn(resolver.run());
+        change_while_deaf(&status, &resolve, hang, || {
+            ns_run(
+                &netns,
+                &[
+                    "ip",
+                    "neigh",
+                    "replace",
+                    "198.51.100.41",
+                    "dev",
+                    &veth_a,
+                    "nud",
+                    "failed",
+                ],
+            );
+        })
+        .await;
+        let events = collect_events(&mut events_rx, Duration::from_secs(2)).await;
+        let about: Vec<&NeighEvent> = events.iter().filter(|e| event_ip(e) == failed).collect();
+
+        assert!(
+            about.iter().any(|e| matches!(e, NeighEvent::Failed { .. })),
+            "a neighbour that failed unheard must be announced Failed: {about:?}"
+        );
+        assert!(
+            !about.iter().any(|e| matches!(e, NeighEvent::Gone { .. })),
+            "not Gone: {about:?}"
+        );
+        assert!(
+            !log.events()
+                .iter()
+                .any(|e| matches!(e, RouteEvent::Del { prefix, .. } if *prefix == host_route(41))),
+            "a failed neighbour keeps its local-prefix route, as on the multicast path: {:?}",
+            log.events()
+        );
+        assert!(
+            status.snapshot().resync_owed.is_none(),
+            "{:?}",
+            status.snapshot()
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
+    });
+}

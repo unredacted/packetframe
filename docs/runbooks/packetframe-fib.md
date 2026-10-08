@@ -1737,9 +1737,18 @@ loop waited for it forever, and nothing noticed. The daemon now:
 
   What the dumps list is applied first. A link or neighbour the dump does
   not list is then asked about individually before it is withdrawn,
-  because a dump can skip a live entry. A neighbour on a device that no
-  longer exists counts as gone, and when a device goes, any neighbours
-  the resolver still held on it go with it. Confirmations stop as soon as
+  because a dump can skip a live entry. Each outcome is announced as its
+  notification would have been:
+  - A neighbour the kernel now holds `FAILED` (dumps leave those out) is
+    announced `Failed`, not lost, and keeps its local-prefix route.
+  - A neighbour that moved to another interface is learned there, and
+    its entry on the old one is lost, which withdraws the local-prefix
+    host route it had there.
+  - A neighbour on a device that no longer exists counts as gone, and
+    when a device goes, any neighbours the resolver still held on it go
+    with it.
+
+  Confirmations stop as soon as
   the request socket is retired, and take at most 2 s per read. One that
   is not made is left as it is and the resync is retried, so the loop
   never sits behind a blocked socket. The multicast receive buffer is
