@@ -654,7 +654,10 @@ unbinds the VFs and restores hugepages. If it refuses, read the message:
 a rule the NIC would not delete leaves traffic diverted at a VF the
 teardown is about to unbind, so it stops rather than blackholing. The
 state file names exactly which rules remain; clear them by hand
-(`ethtool -N <iface> delete <loc>`) and re-run.
+(`ethtool -N <iface> delete <loc>`) and re-run. A state file it cannot
+vouch for (another account could have written it, or it is past the
+size bound) is refused before anything is touched; see
+[Attach or `detach` refuses](#attach-or-detach-refuses-refusing-vpp-offloadjson-).
 
 It reads each recorded location back before deleting it, and a location
 the NIC will not describe counts as a refusal — the same message, and
@@ -3230,6 +3233,86 @@ build, the remedy is the full sequence:
 ```bash
 systemctl stop packetframe && packetframe detach --all && systemctl start packetframe
 ```
+
+### Attach or `detach` refuses: "refusing …/vpp-offload.json: …"
+
+`vpp-offload.json` decides what this root daemon acts on. It names the
+VPP process an attach adopts and a teardown may SIGKILL, the VFs it
+unbinds, the hugepage reservation it hands back and the MCAM rules it
+deletes. It also holds the token the
+[preserved route ledger](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)
+must match. So it is read only when no other account could have
+written it or put it in place, and only up to 16 MiB. Both are judged
+on the open file, before a byte of it is read:
+
+- the file is a regular file owned by the daemon's uid (root) and not
+  writable by group or others;
+- so is `state-dir`, the directory holding it;
+- every directory above `state-dir` is owned by root and is either not
+  writable by group or others or sticky (as `/tmp` is), so nobody else
+  can rename `state-dir` away and put another in its place;
+- no component of the path is a symlink.
+
+**A refusal is never read as "no file".** Attaching fresh over
+resources the file records would acquire them twice, so the attach
+fails instead. `packetframe detach --all` refuses too (it acts on
+nothing it cannot vouch for), and so does the `--keep-vpp` preflight.
+The directory is judged even when the file is absent: an account that
+can write `state-dir` can delete the record. A **reload** is not
+refused, because a reload that turns one port off still re-plans the
+others and must stay a rollback lever. It plans without the record
+and logs `state file unreadable; this reload plans steering without
+reclaiming the module's own recorded rules`. A steer it plans can then
+be refused for MCAM budget, because the module's own rules read as
+occupied; that refusal comes from the file, not the allowlist.
+
+The message names the check that failed. See what the path holds (the
+default `state-dir` shown):
+
+```bash
+stat -c '%U:%G %a %F %n' / /var /var/lib /var/lib/packetframe /var/lib/packetframe/state /var/lib/packetframe/state/vpp-offload.json
+```
+
+If the file is there, check it is the daemon's before trusting it
+again: its `vpp_pid` is the running VPP, and its `vf_pci` addresses are
+the VFs bound to `vfio-pci`.
+
+```bash
+jq '{vpp_pid, ports: [.ports[] | {iface, vf_pci}], steer_rules}' /var/lib/packetframe/state/vpp-offload.json
+```
+
+```bash
+pgrep -a vpp
+```
+
+```bash
+ls -l /sys/class/net/eth4/device/virtfn0 /sys/bus/pci/drivers/vfio-pci/
+```
+
+Then make it and `state-dir` root-owned and closed to group and
+others, and retry:
+
+```bash
+chown root:root /var/lib/packetframe/state /var/lib/packetframe/state/vpp-offload.json
+```
+
+```bash
+chmod 755 /var/lib/packetframe/state && chmod 600 /var/lib/packetframe/state/vpp-offload.json
+```
+
+A directory above `state-dir` that the message names gets the same
+`chown root:root` and `chmod go-w`. A symlinked `state-dir` cannot be
+made acceptable: point `state-dir` at the real path. If the record is
+not the daemon's, or you cannot tell, handle it as the oversized file
+below.
+
+**"past the 16777216-byte bound".** A real file is a few KB, and the
+widest the module could write is ~12 MB, so this one was not written
+by it whole (a sparse or corrupt file). Treat it as a torn file: check
+that nothing it could record is live (`pgrep -a vpp`, `ethtool -n
+<port>` for rules steering into a VF, `sriov_numvfs` under each
+port's `device/` for VFs), release by hand whatever is, then remove
+the file.
 
 ### VPP is gone after `systemctl stop`, but its steering rules are not
 
