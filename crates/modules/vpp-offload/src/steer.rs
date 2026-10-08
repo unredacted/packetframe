@@ -946,29 +946,47 @@ impl RuleSet {
 /// Every one of those is new traffic routed by VPP's whole FIB: a
 /// diversion selects flows by source or by frame, and VPP then looks up
 /// each one's destination, so a newly diverted flow meets every route VPP
-/// lacks however small the allowlist change that diverted it. What does
-/// NOT add is removal (a port, prefix or direction dropped), a `Keep`
-/// added (that takes traffic back to the kernel), and a rule moved to
-/// another slot or another VF index — slots are the planner's, and the
+/// lacks however small the allowlist change that diverted it.
+///
+/// So is a `Keep` REMOVED from a port that goes on diverting: keeps sit
+/// at higher MCAM priority and take their matches back to the kernel, so
+/// dropping a `steer-exempt` or a `steer-keep6` from a steered port puts
+/// that traffic onto VPP as surely as a new diversion would (review
+/// finding, PR #333). On a port the target no longer diverts at all, its
+/// keeps go with its diversions, which is a removal.
+///
+/// What does NOT add is removal (a port, prefix or direction dropped), a
+/// `Keep` added (that takes traffic back to the kernel), and a rule moved
+/// to another slot or another VF index — slots are the planner's, and the
 /// VF is VPP either way.
 pub fn adds_diversion(
     target: &[(String, u32, RuleSet)],
     installed: &[(String, u32, RuleSet)],
 ) -> bool {
-    target.iter().any(|(port, _, plan)| {
-        plan.rules
+    let rules_on = |plans: &[(String, u32, RuleSet)], port: &str, action: RuleAction| {
+        plans
             .iter()
-            .filter(|r| r.action == RuleAction::Divert)
-            .any(|r| {
-                !installed.iter().any(|(p, _, have)| {
-                    p == port
-                        && have
-                            .rules
-                            .iter()
-                            .any(|h| h.action == RuleAction::Divert && h.shape == r.shape)
-                })
-            })
-    })
+            .filter(|(p, _, _)| p == port)
+            .flat_map(|(_, _, set)| set.rules.iter())
+            .filter(|r| r.action == action)
+            .map(|r| r.shape)
+            .collect::<Vec<RuleMatch>>()
+    };
+    let new_divert = target.iter().any(|(port, _, _)| {
+        let have = rules_on(installed, port, RuleAction::Divert);
+        rules_on(target, port, RuleAction::Divert)
+            .iter()
+            .any(|shape| !have.contains(shape))
+    });
+    let lost_keep = installed.iter().any(|(port, _, _)| {
+        let still_diverting = !rules_on(target, port, RuleAction::Divert).is_empty();
+        let keeps = rules_on(target, port, RuleAction::Keep);
+        still_diverting
+            && rules_on(installed, port, RuleAction::Keep)
+                .iter()
+                .any(|shape| !keeps.contains(shape))
+    });
+    new_divert || lost_keep
 }
 
 #[cfg(test)]
@@ -1022,10 +1040,16 @@ mod tests {
             addr: Ipv4Addr::new(192, 0, 2, 1),
             prefix_len: 32,
         }];
-        assert!(!adds_diversion(
-            &one("eth4", plan(&[a], &exempt, src)),
-            &installed
-        ));
+        let exempted = one("eth4", plan(&[a], &exempt, src));
+        assert!(!adds_diversion(&exempted, &installed));
+        // ...and dropping that exemption from a port still diverting puts
+        // its traffic back onto VPP: an addition. Dropping the port with
+        // it is a removal.
+        assert!(
+            adds_diversion(&installed, &exempted),
+            "an exemption removed"
+        );
+        assert!(!adds_diversion(&[], &exempted), "the whole port removed");
         // The same diversion on another slot is not a new one.
         let mut moved = installed.clone();
         for r in &mut moved[0].2.rules {

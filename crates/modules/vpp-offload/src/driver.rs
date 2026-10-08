@@ -1309,9 +1309,7 @@ impl Driver {
                 }
                 let o = execute(&actions, fx);
                 next.extend(o.events.clone());
-                outcome.events.extend(o.events);
-                outcome.failures.extend(o.failures);
-                outcome.resources_leaked |= o.resources_leaked;
+                outcome.absorb(o);
             }
             queue = next;
         }

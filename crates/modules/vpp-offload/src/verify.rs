@@ -116,11 +116,19 @@ pub fn covers(sampled: usize, table: u64, installed: u64) -> bool {
 ///
 /// The want does not survive for a port that was never steered: an
 /// unsteered adoption starts with none, so its lever has to move again.
+/// And on a box already steered, reading the FIB is the read-back path,
+/// which may only run against a VPP carrying no traffic: the start stays
+/// steered until the eBPF tier has loaded, then unsteers for the dump, the
+/// diff and the verify — about three minutes unsteered on a full table —
+/// and steers again. Saying so is what lets an operator pick the window.
 pub const MISMATCH_REMEDY: &str = "restart the daemon (`systemctl restart packetframe`, or the \
      `detach --keep-vpp` sequence): the stop will not preserve a route ledger a verify has \
      disproved, so the next start reads VPP's FIB and its resync corrects what VPP holds. A port \
-     that was never steered needs its lever moved again afterwards. Replacing VPP also clears \
-     it: stop the daemon, run `packetframe detach --all`, start it";
+     that was never steered needs its lever moved again afterwards. On a box already steered \
+     that start is the read-back path: it stays steered until the eBPF tier has loaded, then \
+     takes traffic off VPP to read, diff and verify the FIB — about three minutes unsteered on a \
+     full table — and steers again, so pick the window. Replacing VPP also clears it: stop the \
+     daemon, run `packetframe detach --all`, start it";
 
 /// Why the last verify does not vouch for the IPv4 table installed now,
 /// as a first steer needs it to — [`unvouched`] decides it.
@@ -819,6 +827,14 @@ pub struct ReverifySchedule {
     clean_since: Option<std::time::Instant>,
     /// When the last re-run was granted.
     last_run: Option<std::time::Instant>,
+    /// The last granted re-run could not reach VPP ([`Self::failed`]).
+    /// An outgrown verdict skips [`REVERIFY_MIN_INTERVAL`] because each
+    /// run replaces it; one that failed replaced nothing, and without the
+    /// interval it would be retried every debounce — a warning and a
+    /// reconnect each time, each able to hold the loop for a socket
+    /// deadline — for as long as VPP would not answer (review finding,
+    /// PR #333).
+    last_failed: bool,
 }
 
 impl ReverifySchedule {
@@ -837,7 +853,7 @@ impl ReverifySchedule {
         if now.duration_since(since) < REVERIFY_DEBOUNCE {
             return false;
         }
-        if stale == Stale::Incomplete
+        if (stale == Stale::Incomplete || self.last_failed)
             && self
                 .last_run
                 .is_some_and(|t| now.duration_since(t) < REVERIFY_MIN_INTERVAL)
@@ -845,8 +861,22 @@ impl ReverifySchedule {
             return false;
         }
         self.last_run = Some(now);
+        self.last_failed = false;
         self.clean_since = None;
         true
+    }
+
+    /// The re-run [`Self::poll`] just granted could not reach VPP, so the
+    /// verdict stands: the next one waits out [`REVERIFY_MIN_INTERVAL`],
+    /// whatever made it due.
+    pub fn failed(&mut self) {
+        self.last_failed = true;
+    }
+
+    /// When the last re-run was granted, for the runtime's tests.
+    #[cfg(test)]
+    pub(crate) fn last_run(&self) -> Option<std::time::Instant> {
+        self.last_run
     }
 }
 
@@ -1150,5 +1180,26 @@ mod tests {
         // An incomplete one still waits the interval out.
         assert!(!r.poll(at(41), Some(Stale::Incomplete), true));
         assert!(!r.poll(at(60), Some(Stale::Incomplete), true));
+    }
+
+    /// A re-run that could not reach VPP replaced nothing, so an outgrown
+    /// verdict loses its exemption until one gets through: no retry every
+    /// debounce while VPP will not answer.
+    #[test]
+    fn a_failed_re_run_backs_off_even_for_an_outgrown_verdict() {
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        let mut r = ReverifySchedule::default();
+        let out = Some(Stale::Outgrown);
+        assert!(!r.poll(at(0), out, true));
+        assert!(r.poll(at(10), out, true));
+        r.failed();
+        assert!(!r.poll(at(11), out, true));
+        assert!(!r.poll(at(30), out, true), "not one debounce later");
+        assert!(!r.poll(at(10 + 299), out, true));
+        assert!(r.poll(at(10 + 300), out, true), "after the interval");
+        // That one got through: the exemption is back.
+        assert!(!r.poll(at(311), out, true));
+        assert!(r.poll(at(321), out, true));
     }
 }

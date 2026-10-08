@@ -146,6 +146,12 @@ pub struct Outcome {
     pub events: Vec<Event>,
     /// Actions that failed, with the reason, for status and logs.
     pub failures: Vec<(Action, String)>,
+    /// Steers the first-steer hold kept from the NIC, in its own words
+    /// ([`crate::runtime::SteerOutcome::Held`]). Not failures — nothing
+    /// was attempted and nothing changed — but not in effect either, so
+    /// the caller that asked (an operator's `reconfigure`) is answered
+    /// with them as a refusal.
+    pub held: Vec<String>,
     /// Resources were NOT released because teardown did not fully
     /// succeed.
     ///
@@ -160,6 +166,24 @@ pub struct Outcome {
 impl Outcome {
     pub fn ok(&self) -> bool {
         self.failures.is_empty() && !self.resources_leaked
+    }
+
+    /// Fold a later batch's outcome into this one — every field, by a
+    /// destructure with no `..`, so a field added later is a compile error
+    /// here rather than something dropped between a batch and its tick.
+    /// The field-by-field copy this replaced did exactly that to `held`,
+    /// and a held lever answered `reconfigure` with OK.
+    pub fn absorb(&mut self, other: Outcome) {
+        let Outcome {
+            events,
+            failures,
+            held,
+            resources_leaked,
+        } = other;
+        self.events.extend(events);
+        self.failures.extend(failures);
+        self.held.extend(held);
+        self.resources_leaked |= resources_leaked;
     }
 }
 
@@ -187,6 +211,35 @@ fn steering_event(ev: events::Event, key: &str) {
 
 fn steer_failed(action: &str, why: &str, rules_remain: bool) {
     steering_event(steer_failed_event(action, why, rules_remain), why);
+}
+
+/// A steer the first-steer hold kept from the NIC: journal, event log
+/// and the outcome's `held` list, then [`Event::SteerHeld`]. Its own
+/// event, never `steer_failed`: nothing was attempted and nothing rolled
+/// back, and where traffic is did not change — a steered port's stays on
+/// VPP, an unsteered port's on the eBPF tier — which a failure record
+/// would misstate (review finding, PR #333). Repeats of one hold are
+/// recorded once, like failures.
+fn steer_held(held: &mut Vec<String>, why: String, steered: bool) -> Event {
+    tracing::info!(
+        reason = %why,
+        steered,
+        "steer held: nothing changed in the NIC; the reason says what clears it"
+    );
+    steering_event(
+        events::Event::info(crate::MODULE_NAME, kind::STEER_HELD)
+            .field("reason", why.clone())
+            .field("steered", steered)
+            .detail(if steered {
+                "a steering change that diverts more traffic onto VPP is held; the rules \
+                 already installed are untouched and keep forwarding"
+            } else {
+                "a first steer is held; traffic stays on the eBPF tier"
+            }),
+        &why,
+    );
+    held.push(why);
+    Event::SteerHeld
 }
 
 /// The `steer_failed` record. What it says about where traffic is
@@ -338,6 +391,11 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                     );
                     Event::NothingToSteer
                 }
+                // `restore_steer` is ungated, so this is not reached;
+                // matched the way `steer`'s is so it could not be dropped.
+                Ok(SteerOutcome::Held(why)) => {
+                    steer_held(&mut out.held, why, fx.steering_in_place())
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -395,6 +453,10 @@ pub fn execute(actions: &[Action], fx: &mut dyn Effects) -> Outcome {
                         "",
                     );
                     Event::NothingToSteer
+                }
+                // Held, not failed: nothing reached the NIC.
+                Ok(SteerOutcome::Held(why)) => {
+                    steer_held(&mut out.held, why, fx.steering_in_place())
                 }
                 Err(e) => {
                     tracing::warn!(

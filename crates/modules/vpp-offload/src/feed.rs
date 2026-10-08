@@ -235,6 +235,19 @@ impl ResolvedRouteSink for RouteFeed {
         if g.disconnected {
             return;
         }
+        // A report of what the mirror already holds, with nothing queued
+        // for that next hop, changes nothing and is not queued or counted.
+        // The kernel reports every NUD transition (REACHABLE → STALE →
+        // DELAY → REACHABLE, same MAC) as a resolution, and each one queued
+        // read as a neighbour change waiting for VPP — which the
+        // first-steer hold allows none of — so a BGP peer cycling its
+        // neighbour state refused levers for nothing (review finding,
+        // PR #333). Anything queued for the next hop (a loss, another MAC)
+        // still has this newer word written over it, and a changed MAC or
+        // device is queued as before.
+        if g.neighbours.get(&nh) == Some(&(mac, ifindex)) && !g.neigh_pending.contains_key(&nh) {
+            return;
+        }
         g.seq += 1;
         g.neighbours.insert(nh, (mac, ifindex));
         g.neigh_pending.insert(nh, Some((mac, ifindex)));
@@ -884,6 +897,38 @@ mod tests {
         assert_eq!((src.backlog(), src.neighbour_backlog()), (3, 1));
         let _ = f.drain_changes(64);
         assert_eq!((src.backlog(), src.neighbour_backlog()), (0, 0));
+    }
+
+    /// A NUD transition that changes nothing — the same MAC on the same
+    /// device, reported again — is not a neighbour change: not queued,
+    /// not counted as activity. A changed MAC, a loss, and a re-resolve
+    /// over a queued loss all still are.
+    #[test]
+    fn a_same_mac_report_is_not_a_neighbour_change() {
+        let f = RouteFeed::new();
+        let (m1, m2) = ([2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2]);
+        f.neighbour_resolved(nh(1), m1, 7);
+        assert_eq!(f.neighbour_backlog(), 1, "a first resolution is one");
+        let _ = f.drain_changes(64);
+        let seq = f.change_seq();
+        for _ in 0..5 {
+            f.neighbour_resolved(nh(1), m1, 7);
+        }
+        assert_eq!(f.neighbour_backlog(), 0, "REACHABLE/STALE/DELAY, same MAC");
+        assert_eq!(f.change_seq(), seq, "and no source activity");
+        f.neighbour_resolved(nh(1), m2, 7);
+        assert_eq!(f.neighbour_backlog(), 1, "a moved MAC is a change");
+        let _ = f.drain_changes(64);
+        f.neighbour_resolved(nh(1), m2, 8);
+        assert_eq!(f.neighbour_backlog(), 1, "so is a moved device");
+        let _ = f.drain_changes(64);
+        f.neighbour_resolved(nh(1), m2, some_real_ifindex());
+        let _ = f.drain_changes(64);
+        f.neighbour_lost(nh(1));
+        f.neighbour_resolved(nh(1), m2, some_real_ifindex());
+        let got = f.drain_changes(64).neighbours;
+        assert_eq!(got.len(), 1, "a re-resolve over a queued loss is queued");
+        assert!(got[0].1.is_some(), "and is the newer word: {got:?}");
     }
 
     /// A neighbour whose link is gone is skipped, not reported with a

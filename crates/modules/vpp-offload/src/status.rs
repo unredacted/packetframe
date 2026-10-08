@@ -439,6 +439,10 @@ pub struct StatusSnapshot {
     /// what the gate is waiting for. Not an `observe_parts` argument;
     /// [`Self::from_runtime`] sets it, as it does `neighbour_counters`.
     pub steer_hold: Option<crate::runtime::SteerHold>,
+    /// A steering change that diverts more is held over ports already
+    /// steered — the supervisor's own record ([`Supervisor::addition_held`]),
+    /// the one its retry acts on.
+    pub steer_addition_held: bool,
     /// Mirror prefixes a `local-route` is currently suppressing —
     /// routes the mirror carries that VPP deliberately does not,
     /// because local delivery owns their footprint. Informational, not
@@ -699,6 +703,7 @@ impl StatusSnapshot {
             drain_error,
             source_backlog,
             steer_hold: None,
+            steer_addition_held: sup.addition_held(),
             shadowed_routes,
             kernel_delivered_routes,
             unresolvable_named: Vec::new(),
@@ -800,13 +805,11 @@ impl StatusSnapshot {
     }
 
     /// The first-steer hold standing over a change to ports ALREADY
-    /// steered: rules in the NIC, the supervisor in `Ready` with the want
-    /// kept — where a refused reconcile settles — and the hold answering
-    /// for a target that diverts more than is installed. `Steered` is the
-    /// normal resting state and carries no outstanding change. One reading
-    /// for the steering row and `nominal`.
+    /// steered: the supervisor recorded the addition as held
+    /// (`Event::SteerHeld`, state left `Steered`), and the hold still
+    /// answers for it. One reading for the steering row and `nominal`.
     fn held_addition(&self) -> Option<&crate::runtime::SteerHold> {
-        (self.steered && self.steer_intended && matches!(self.state, State::Ready))
+        self.steer_addition_held
             .then_some(self.steer_hold.as_ref())
             .flatten()
     }
@@ -3780,6 +3783,7 @@ mod tests {
                             snap.steer_stray = stray;
                             snap.steer_audit_unreadable = unreadable.clone();
                             snap.steer_hold = hold;
+                            snap.steer_addition_held = snap.steered && snap.steer_hold.is_some();
 
                             for sub in snap.report().subsystems {
                                 let Some(msg) = sub.message else { continue };
@@ -3940,6 +3944,7 @@ mod tests {
                             snap.steer_stray = stray;
                             snap.steer_audit_unreadable = unreadable.clone();
                             snap.steer_hold = hold;
+                            snap.steer_addition_held = snap.steered && snap.steer_hold.is_some();
 
                             for sub in snap.report().subsystems {
                                 let Some(msg) = sub.message else { continue };

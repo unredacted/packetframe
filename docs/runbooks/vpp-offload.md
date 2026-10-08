@@ -762,7 +762,12 @@ gates:
    two drains; a reload is orders of magnitude past it (its last few
    hundred pass, and reach VPP within a drain or two). Zero neighbour
    changes, because one moves the adjacency of every route through that
-   next hop, and verify cannot see a stale adjacency.
+   next hop, and verify cannot see a stale adjacency. A neighbour report
+   that changes nothing is not a change: the kernel reports every NUD
+   transition of a next hop (`REACHABLE` → `STALE` → `DELAY` →
+   `REACHABLE`), and one carrying the MAC and device VPP already has is
+   not queued, so a BGP peer cycling its neighbour state does not hold
+   the lever. A moved MAC, a moved device or a loss still is a change.
 2. **A verify vouches for the table being steered.** The last verify
    drew the standard 64 probes (or every route, on a table smaller than
    that) from a table at least 90% the size of the IPv4 table installed
@@ -775,15 +780,44 @@ first steer (nothing in the NIC yet), and equally a change to ports
 already steered that adds a port, a prefix, a direction, a receive MAC
 or a `v6-divert` — the canary ladder's second rung moved during a reload
 diverts into the same behind-and-unverified VPP the first would have.
+So does removing a `steer-exempt` or a `steer-keep6` from a port that
+goes on diverting: those rules take their matches back to the kernel,
+and dropping one puts that traffic onto VPP. So does re-asserting rules
+the last NIC readback found wiped or altered (a provisioning push), since
+they divert nothing until they are back. The change is judged against
+what the NIC is doing now, after the [hand-back
+path](#the-hand-back-path) has set the IPv6 gate, so a `v6-divert` whose
+path turns ready inside the same steer is judged with the rest.
 The operator's lever, the module's own retry and a convergence
 re-steering a remembered want all pass through it. A change that
 diverts the same or less is never held (refusing it would leave the
 previous rules installed), and `steer off` never is.
 
+Rules in the NIC with no recorded plan — a state file from before plans
+were kept, or what a failed first steer's rollback could not delete —
+are judged by the one identity the record keeps, port and MCAM location:
+a diversion at a location those rules hold is taken as already there,
+one anywhere else as new. Turning a port off is still a removal there,
+and a retry of the first steer those rules are left from is not held for
+them. A location cannot say more, so in that state a removed exemption
+reads as a removal and a slot re-planned to a different rule as
+unchanged, until the next steer that lands records a plan.
+
 A held addition changes nothing in the NIC: the ports already steered
 keep exactly the rules they have and go on forwarding — including any
 rule the same change would have removed. A removal that cannot wait
 for the hold goes on its own: apply it in a change that adds nothing.
+
+**A hold is not a failure.** Nothing was attempted, so nothing rolled
+back and nothing moved: a box already steered stays in `steered`
+(`packetframe_vpp_state{state="steered"}` and `packetframe_vpp_steered`
+do not change), and the journal and event log record a `steer_held` event —
+never `steer_failed`, which would say traffic is on the eBPF tier while
+it is still on VPP. `packetframe reconfigure` still answers with the
+hold's words rather than OK, so a canary ladder does not read a held
+rung as taken. The module's retry re-attempts the held change from
+`steered` as it does from `ready`; a `steer off`, an emptied table or a
+VPP death in the meantime unsteers exactly as it would without one.
 
 **When it refuses**, the want is remembered, as for every other gate,
 and what clears it depends on the half that refused:
@@ -792,9 +826,9 @@ and what clears it depends on the half that refused:
   steer lands on the next retry, at most 30 s later.
 - *The verdict outgrown*: verify [re-runs on its
   own](#the-re-run-a-stale-verdict) about ten seconds after VPP has caught
-  up and the table holds no unresolvable route — however recently it last
-  re-ran — and the retry steers on the new verdict. Nobody moves the
-  lever again.
+  up on routes and the table holds no unresolvable route — however
+  recently it last re-ran, unless that re-run could not reach VPP — and
+  the retry steers on the new verdict. Nobody moves the lever again.
 - *A mismatch*: the last verify found VPP disagreeing with the ledger.
   Waiting does not clear that, a mismatch is never re-run (a fresh sample
   can miss what this one caught), and the remembered want will not steer
@@ -803,7 +837,12 @@ and what clears it depends on the half that refused:
   a route ledger a verify has disproved, so the next start reads VPP's
   FIB instead of seeding the disagreement back in, and its resync corrects
   what VPP holds before it verifies. A port that was never steered starts
-  that adoption with no want, so move its lever again afterwards. Or
+  that adoption with no want, so move its lever again afterwards. On a
+  box already steered, that start is the [read-back
+  path](#the-adopted-reconciliation-release-gate-what-it-needs-and-when-it-refuses):
+  it stays steered until the eBPF tier has loaded, then takes traffic off
+  VPP to dump, diff and verify the FIB — about three minutes unsteered on
+  a full table — and steers again, so pick the window. Or
   replace VPP outright: `systemctl stop packetframe && packetframe detach
   --all && systemctl start packetframe` (a cold attach). A mismatch is
   not a transient of churn: verify runs only with nothing in flight, on
@@ -835,9 +874,11 @@ steering     DEGRADED — steering intended but not in place — ... Held now be
 
 With ports already steered, the steering row instead reads `DEGRADED —
 a steering change that diverts more traffic onto VPP is held because ….
-The rules already installed stay as they are and keep forwarding; …` —
-and on a mismatch every one of these lines says that waiting does not
-clear it.
+The rules already installed stay as they are and keep forwarding; …`
+while the state stays `steered` — and on a mismatch every one of these
+lines says that waiting does not clear it. Each held attempt is a
+`steer_held` event in the event log, with the reason and whether rules
+were already steering.
 
 Before the lever moves, the staging line says it in advance:
 `configured "steer on", awaiting an operator lever move; ... A lever move
@@ -3259,7 +3300,8 @@ the reproduction, the w5–w10 forensics index — lives in
 The [first-steer
 hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table),
 on a first steer or on a change that adds a port, prefix or direction to
-ports already steered (those keep their rules meanwhile). The want is
+ports already steered, or drops an exemption from one (those keep their
+rules meanwhile, and stay `steered`). The want is
 remembered and, except after a mismatch, the steer lands on its own once
 the hold clears; `packetframe reconfigure` re-asks at once but cannot
 clear it faster. The same reason is on the `steering` row (`Held now
@@ -3274,17 +3316,23 @@ held because …`).
   `route-feed` row and `packetframe_vpp_drain_failing 1` say which. A
   trailing **"and K neighbour change(s), where caught up is none"** is a
   next hop resolved, lost or moved that VPP has not taken yet; it clears
-  with the next drain that lands.
+  with the next drain that lands. A next hop merely cycling its NUD
+  state with the same MAC is not counted here, and neighbour changes
+  never hold the verify re-run, only the steer.
 - **"the last attempt to apply route updates to VPP failed"** — the same,
   with the drain failing; see [`route-feed
   DEGRADED`](#route-feed-degraded--packetframe_vpp_drain_failing-1).
 - **"the last verify ran on P probe(s) against M routes and N are
   installed now"** — the verdict was taken before the table loaded.
-  Verify re-runs on its own about 10 s after VPP has caught up and the
-  table holds no unresolvable route, however recently it last re-ran; the
-  event log records it as `verify_passed` with `rerun: true` and the
-  `cause`, and the steer follows on the next retry. If it never re-runs,
-  the table is not clean: `fib-synced` names the unresolvable routes.
+  Verify re-runs on its own about 10 s after VPP has caught up on routes
+  and the table holds no unresolvable route, however recently it last
+  re-ran; the event log records it as `verify_passed` with `rerun: true`
+  and the `cause`, and the steer follows on the next retry. If it never
+  re-runs, the table is not clean: `fib-synced` names the unresolvable
+  routes. A journal warning `verify re-run could not reach VPP` means the
+  re-run itself failed; the next one waits the usual 5 minutes
+  (`retry_in_secs`) rather than retrying every 10 s against a VPP that is
+  not answering.
 - **"the last verify found VPP disagreeing with the route ledger"** —
   waiting does not clear it, it is never re-run, and the remembered want
   will not steer by itself. `fib-synced` reads UNHEALTHY with the verify
@@ -3292,8 +3340,12 @@ held because …`).
   `detach --keep-vpp` sequence): the stop will not preserve the
   disproved ledger, so the next start reads VPP's FIB and its resync
   corrects it before verifying. A port that was never steered then needs
-  its lever moved again. Or replace VPP: `systemctl stop packetframe &&
-  packetframe detach --all && systemctl start packetframe`.
+  its lever moved again. On a box already steered that start is the
+  read-back path: steered until the eBPF tier has loaded, then about
+  three minutes unsteered on a full table while it dumps, diffs and
+  verifies the FIB, then steered again — pick the window. Or replace
+  VPP: `systemctl stop packetframe && packetframe detach --all &&
+  systemctl start packetframe`.
 - **"no verify has completed against this VPP"** — should not be
   reachable from `Ready`; capture `packetframe status` and the journal.
 
@@ -4376,7 +4428,9 @@ with the route mirror, for 10 s. An incomplete one is re-run at most once
 every 5 minutes; an outgrown one is not rate-limited, because it cannot
 recur without the table growing again — a re-run in a lull part-way
 through a reload must not hold a steer for five minutes once the rest has
-landed. A re-run verdict covers the table it ran against in full, so it
+landed. The exception is a re-run that could not reach VPP: it replaced
+nothing, so the next one waits the 5 minutes whatever made it due,
+instead of a warning and a reconnect every 10 s. A re-run verdict covers the table it ran against in full, so it
 is outgrown again only after another ~11% of growth: on a steady box that
 is about once a year, which is what keeps this from being a heartbeat.
 
@@ -4388,10 +4442,13 @@ neither a clean table nor time clears it.
 
 The re-run happens only in `Ready` or `Steered`, on a tick whose drain
 proved nothing is pending, with VPP answering its last ping. It also
-needs VPP caught up with the mirror (the same test as the first-steer
-hold: no more route changes at the source than a quiet second's churn,
-no neighbour change, and the last drain landed), nothing in flight, and no deferral, fresh hold or
-unverified preserved ledger. No delta can land between a probe's sample
+needs VPP caught up with the mirror on routes (the route half of the
+first-steer hold's test: no more route changes at the source than a
+quiet second's churn, and the last drain landed), nothing in flight, and
+no deferral, fresh hold or unverified preserved ledger. Neighbour
+changes still queued do not hold it: a probe checks a route's paths, not
+where an adjacency leads, so it cannot see them either way, and none can
+land mid-pass — they hold the steer instead. No delta can land between a probe's sample
 and its answer — the drain and the probes share one thread — which is
 the race that keeps verification out of steady state otherwise. The few
 changes a live feed queues behind the last drain race nothing; requiring

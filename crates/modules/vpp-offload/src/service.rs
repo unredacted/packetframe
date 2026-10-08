@@ -1453,11 +1453,17 @@ fn apply_steering(
     // exist only in this Tick — the same reason the main loop keeps its
     // injected outcomes. Here they are also the operator's answer.
     let failures = fmt_failures(&tick.outcome);
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures.join("; "))
+    if !failures.is_empty() {
+        return Err(failures.join("; "));
     }
+    // A HELD steer is no failure — nothing changed, and the state says so
+    // — but it is not in effect either, and "reconfigure answered OK" must
+    // never mean that: the canary ladder reads this answer as "the step
+    // happened" (`SteerOutcome::Held`).
+    if !tick.outcome.held.is_empty() {
+        return Err(tick.outcome.held.join("; "));
+    }
+    Ok(())
 }
 
 fn run_loop(

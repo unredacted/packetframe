@@ -1232,7 +1232,7 @@ fn at_the_steer_the_128s_are_in_before_the_v6_half_is_permitted() {
     fx.attach_devices().expect("attach");
     assert!(held(&fake).is_empty(), "none at attach");
     verified(&rt, &mut fx);
-    fx.steer().expect("steer");
+    assert_eq!(fx.steer(), Ok(SteerOutcome::Steered));
     assert_eq!(*seen.lock().unwrap(), vec![(true, owned().len(), true)]);
     let st = rt.status().handback.expect("wanted");
     assert!(st.ready, "{st:?}");
@@ -1288,7 +1288,7 @@ fn a_path_becoming_ready_under_installed_rules_queues_a_reconcile() {
     assert!(obs.api_ready());
     fx.attach_devices().expect("attach");
     verified(&rt, &mut fx);
-    fx.steer().expect("steer");
+    assert_eq!(fx.steer(), Ok(SteerOutcome::Steered));
     rt.set_steered(true);
     assert!(rt.take_pending().is_empty());
     assert!(held(&fake).is_empty(), "not wanted, not built");
@@ -1320,4 +1320,146 @@ fn a_path_becoming_ready_under_installed_rules_queues_a_reconcile() {
     // Settled: another tick asks for nothing more.
     obs.drain_batch(std::time::Instant::now()).expect("drain");
     assert!(rt.take_pending().is_empty());
+}
+
+/// The first-steer hold judges the target AFTER the steer has serviced
+/// the hand-back path and set the v6 gate (review finding, PR #333). A
+/// port already diverting IPv4 whose path turns ready inside this very
+/// steer now has a v6 diversion in its target — new traffic onto VPP —
+/// and with VPP behind the mirror that addition is held, not installed.
+#[test]
+fn a_v6_diversion_the_gate_opens_inside_the_steer_is_judged_by_the_hold() {
+    use packetframe_common::config::VppSteerDirection;
+    use packetframe_vpp_offload::driver::Observe as _;
+    use packetframe_vpp_offload::executor::Effects as _;
+    use packetframe_vpp_offload::steer::{McamBudget, RuleSet, V6Steering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The table, with a reload's worth still queued for VPP.
+    struct Behind(Mirror);
+    impl RouteSource for Behind {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            self.0.for_each_route(visit)
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            self.0.for_each_neighbour(visit)
+        }
+        fn requeue(&self, changes: SourceChanges) {
+            self.0.requeue(changes)
+        }
+        fn backlog(&self) -> u64 {
+            10_000
+        }
+        fn route_count(&self) -> u64 {
+            self.0.route_count()
+        }
+        fn change_seq(&self) -> u64 {
+            self.0.change_seq()
+        }
+    }
+    /// IPv4 installed on eth4; the target adds the v6 diversion once the
+    /// gate says the path is ready, as `NtupleSteering` does.
+    struct V6Probe {
+        ready: bool,
+        v4: RuleSet,
+        both: RuleSet,
+        steers: Arc<AtomicUsize>,
+    }
+    impl packetframe_vpp_offload::runtime::Steering for V6Probe {
+        fn set_v6_ready(&mut self, ready: bool) {
+            self.ready = ready;
+        }
+        fn steer(&mut self) -> Result<SteerOutcome, String> {
+            self.steers.fetch_add(1, Ordering::SeqCst);
+            Ok(SteerOutcome::Steered)
+        }
+        fn unsteer(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn missing_from_nic(
+            &self,
+        ) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
+            Ok(packetframe_vpp_offload::runtime::SteeringAudit::clean())
+        }
+        fn installed(&self) -> Vec<(String, u32)> {
+            self.v4
+                .locations()
+                .into_iter()
+                .map(|l| ("eth4".to_string(), l))
+                .collect()
+        }
+        fn installed_plan(&self) -> Vec<(String, u32, RuleSet)> {
+            vec![("eth4".into(), 0, self.v4.clone())]
+        }
+        fn target_plan(&self) -> Vec<(String, u32, RuleSet)> {
+            let set = if self.ready { &self.both } else { &self.v4 };
+            vec![("eth4".into(), 0, set.clone())]
+        }
+        fn retarget(&mut self, _targets: Vec<(String, u32, RuleSet)>) {}
+        fn configured_ports(&self) -> usize {
+            1
+        }
+    }
+
+    let allow = [IpPrefix::V4 {
+        addr: [198, 51, 100, 0],
+        prefix_len: 24,
+    }];
+    let mac = [[0x02, 0, 0, 0, 0, 1]];
+    let v4 = RuleSet::plan(
+        &allow,
+        &[],
+        McamBudget::default(),
+        VppSteerDirection::Src,
+        &mac,
+    )
+    .expect("fits");
+    let both = RuleSet::plan_with_v6(
+        &allow,
+        &[],
+        McamBudget::default(),
+        VppSteerDirection::Src,
+        &mac,
+        &V6Steering {
+            vlans: vec![Some(100)],
+            keeps: vec![],
+        },
+    )
+    .expect("fits");
+    let fake = Fake::start_behaving("hb-hold-v6", behaviour());
+    let host = host();
+    let steers = Arc::new(AtomicUsize::new(0));
+    let rt = Runtime::new(
+        engine(&fake, &host),
+        Box::new(Behind(Mirror(2))),
+        Box::new(V6Probe {
+            ready: false,
+            v4,
+            both,
+            steers: steers.clone(),
+        }),
+        Box::new(NullStore),
+        Box::new(NoResources),
+        "/nonexistent/vpp",
+        "/nonexistent/startup.conf",
+    );
+    let (mut obs, mut fx) = rt.views();
+    assert!(obs.api_ready());
+    fx.attach_devices().expect("attach");
+    verified(&rt, &mut fx);
+    match fx.steer() {
+        Ok(SteerOutcome::Held(why)) => {
+            assert!(why.contains("VPP has not caught up"), "{why}")
+        }
+        other => panic!("the v6 addition must be held: {other:?}"),
+    }
+    assert_eq!(
+        steers.load(Ordering::SeqCst),
+        0,
+        "nothing reached the NIC — the v6 diversion included"
+    );
+    assert!(
+        rt.status().handback.expect("wanted").ready,
+        "the premise: the path turned ready inside this steer"
+    );
 }

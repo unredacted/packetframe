@@ -4822,6 +4822,16 @@ mod first_steer_hold {
         StatusSnapshot::from_runtime(d.supervisor(), rs, d.api_health(now), fib).report()
     }
 
+    /// The Prometheus textfile this loop would publish now.
+    pub fn metrics(d: &Driver, rt: &Runtime, now: Instant) -> String {
+        let rs = rt.status();
+        let fib = rs.last_verify.as_ref().map_or(FibSync::NeverVerified, |v| {
+            FibSync::from_outcome(v, Duration::ZERO)
+        });
+        let snap = StatusSnapshot::from_runtime(d.supervisor(), rs, d.api_health(now), fib);
+        packetframe_vpp_offload::status::render_metrics(&snap, "vpp-offload")
+    }
+
     pub fn row(r: &HealthReport, name: &str) -> (HealthState, String) {
         let s = r
             .subsystems
@@ -4862,17 +4872,19 @@ mod first_steer_hold {
     }
 
     /// The operator's lever, as `apply_steering` delivers it once its own
-    /// checks pass: the request, and the answer `reconfigure` prints.
+    /// checks pass: the request, and the answer `reconfigure` prints —
+    /// failures, or else what the hold kept back, as `apply_steering`
+    /// answers it.
     pub fn lever(d: &mut Driver, rt: &Runtime, now: Instant) -> String {
         let (_, mut fx) = rt.views();
         let t = d.inject(now, Event::SteerRequested, &mut fx);
         rt.set_steered(d.supervisor().is_steered());
-        t.outcome
-            .failures
-            .iter()
-            .map(|(_, why)| why.clone())
-            .collect::<Vec<_>>()
-            .join("; ")
+        let failures: Vec<String> = t.outcome.failures.iter().map(|(_, w)| w.clone()).collect();
+        if failures.is_empty() {
+            t.outcome.held.join("; ")
+        } else {
+            failures.join("; ")
+        }
     }
 
     pub fn handshake(rt: &Runtime) {
@@ -5187,14 +5199,15 @@ fn a_lever_moved_on_a_one_probe_verdict_waits_for_vpp_and_a_verify_of_the_table(
         )
     );
 
-    // Another reload puts a hold back up, and the operator rolls back:
+    // Another reload leaves VPP far behind, and the operator rolls back:
     // `steer off` is never held.
     reload.allow.store(0, Ordering::SeqCst);
     reload.announce(table(TABLE + 200)[TABLE..].iter().copied());
     let (now, _, _) = run_for(&mut d, &rt, now, Duration::from_secs(5));
-    assert!(
-        rt.status().steer_hold.is_some(),
-        "the premise: a hold stands"
+    assert_eq!(
+        rt.status().source_backlog,
+        200,
+        "the premise: VPP is behind the mirror"
     );
     {
         let (_, mut fx) = rt.views();
@@ -5413,6 +5426,14 @@ fn the_next_canary_port_waits_for_a_reload_the_first_was_steered_before() {
         "the NIC untouched"
     );
     assert!(d.supervisor().is_steered(), "eth4 still diverting");
+    // A hold is not a failure: nothing moved, so the state does not, and
+    // the steered-state gauge an operator alarms on stays where it was.
+    assert_eq!(d.state(), State::Steered);
+    let m = first_steer_hold::metrics(&d, &rt, now);
+    assert!(
+        m.contains("packetframe_vpp_state{module=\"vpp-offload\",state=\"steered\"} 1"),
+        "{m}"
+    );
     let r = first_steer_hold::report(&d, &rt, now);
     let (state, steering) = row(&r, "steering");
     assert_eq!(state, HealthState::Degraded, "{steering}");
@@ -5729,10 +5750,14 @@ fn a_convergence_re_steer_waits_for_vpp_to_catch_up() {
         rt.status().counts
     );
     assert!(
-        events
+        events.contains(&Event::SteerHeld),
+        "the re-steer was asked for and held: {events:?}"
+    );
+    assert!(
+        !events
             .iter()
             .any(|e| matches!(e, Event::SteerFailed { .. })),
-        "the re-steer was asked for and refused: {events:?}"
+        "a hold is not a failure: {events:?}"
     );
     assert_eq!(
         log.lock().unwrap().as_slice(),
@@ -5752,4 +5777,188 @@ fn a_convergence_re_steer_waits_for_vpp_to_catch_up() {
     assert!(events.contains(&Event::SteerUnblocked), "{events:?}");
     assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
     assert_eq!(d.state(), State::Steered);
+}
+
+/// Neighbour reports arriving while the loop runs, through the feed the
+/// loader really boxes.
+mod nud {
+    use super::*;
+    use packetframe_common::fib::ResolvedRouteSink as _;
+    use packetframe_vpp_offload::engine::SourceChanges;
+    use packetframe_vpp_offload::feed::RouteFeed;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// The live feed, with `nh` reported again after every drain — the
+    /// kernel's NUD transitions for a BGP peer (REACHABLE → STALE → DELAY
+    /// → REACHABLE), arriving while a tick runs. `macs` cycles: one MAC is
+    /// the same report again and again, two is a real change every time.
+    pub struct Nud {
+        pub feed: Arc<RouteFeed>,
+        pub ifindex: u32,
+        pub macs: Vec<[u8; 6]>,
+        n: AtomicUsize,
+    }
+
+    impl Nud {
+        pub fn new(feed: Arc<RouteFeed>, ifindex: u32, macs: Vec<[u8; 6]>) -> Self {
+            Self {
+                feed,
+                ifindex,
+                macs,
+                n: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl RouteSource for Nud {
+        fn drain_changes(&self, max: usize) -> SourceChanges {
+            let c = self.feed.drain_changes(max);
+            let i = self.n.fetch_add(1, Ordering::SeqCst);
+            self.feed.neighbour_resolved(
+                fake_vpp::nh(),
+                self.macs[i % self.macs.len()],
+                self.ifindex,
+            );
+            c
+        }
+        fn requeue(&self, changes: SourceChanges) {
+            self.feed.requeue(changes)
+        }
+        fn requeue_via(&self, nexthops: &[IpAddr]) {
+            self.feed.requeue_via(nexthops)
+        }
+        fn discard_route_deltas(&self) {
+            self.feed.discard_route_deltas()
+        }
+        fn backlog(&self) -> u64 {
+            self.feed.backlog()
+        }
+        fn neighbour_backlog(&self) -> u64 {
+            self.feed.neighbour_backlog()
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            self.feed.for_each_route(visit)
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            self.feed.for_each_neighbour(visit)
+        }
+        fn route_count(&self) -> u64 {
+            self.feed.route_count()
+        }
+        fn change_seq(&self) -> u64 {
+            self.feed.change_seq()
+        }
+    }
+
+    /// A converged runtime over `table` routes via `nh`, the port named
+    /// after a real local interface (the feed resolves a neighbour's
+    /// device through `if_indextoname`), and the table then grown past its
+    /// verdict.
+    pub fn grown(
+        name: &str,
+        macs: Vec<[u8; 6]>,
+    ) -> (Fake, Arc<RouteFeed>, steered::Log, Runtime, Driver, Instant) {
+        let (ifindex, dev) = local_interface();
+        let fake = Fake::start_behaving(
+            name,
+            fake_vpp::Behaviour {
+                track_routes: true,
+                ..Default::default()
+            },
+        );
+        let feed = Arc::new(RouteFeed::new());
+        feed.neighbour_resolved(fake_vpp::nh(), MAC, ifindex);
+        let pool = first_steer_hold::table(400);
+        for p in &pool[..300] {
+            feed.route_resolved(*p, &[fake_vpp::nh()]);
+        }
+        let log: steered::Log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ConvergenceEngine::new(
+            &fake.path,
+            vec![PortAttach {
+                port: dev.clone(),
+                pci_addr: "0002:07:00.1".into(),
+                port_id: 0,
+                num_rx_queues: 1,
+                pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                accept_macs: vec![],
+                mtu: None,
+                vlans: vec![],
+            }],
+            vec![dev],
+            1_000_000,
+            FamilyPolicy::V4Only,
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            },
+        );
+        let rt = Runtime::new(
+            engine,
+            Box::new(Nud::new(feed.clone(), ifindex, macs)),
+            Box::new(steered::RecordingSteering {
+                rules: Vec::new(),
+                log: log.clone(),
+            }),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        let mut d = Driver::new();
+        let t0 = Instant::now();
+        first_steer_hold::handshake(&rt);
+        {
+            let (_, mut fx) = rt.views();
+            d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+        }
+        let (now, _) = steered::run_paced(&mut d, &rt, t0, 2_000, |d| d.state() == State::Ready);
+        let v = rt.status().last_verify.expect("a verdict");
+        assert_eq!((v.sampled, v.table), (64, 300), "{}", v.summary());
+        for p in &pool[300..] {
+            feed.route_resolved(*p, &[fake_vpp::nh()]);
+        }
+        (fake, feed, log, rt, d, now)
+    }
+}
+
+/// A BGP peer's next hop cycling REACHABLE → STALE → DELAY → REACHABLE
+/// with the same MAC reports a "resolution" at every step (review finding,
+/// PR #333). None of them changes anything, so none is a neighbour change
+/// VPP is behind on: the outgrown verdict is re-run within its window, and
+/// a lever moved between two reports is admitted.
+#[test]
+fn same_mac_neighbour_reports_neither_hold_the_lever_nor_starve_the_re_run() {
+    use first_steer_hold::*;
+    let (_fake, _feed, log, rt, mut d, now) = nud::grown("first-steer-nud-same", vec![MAC]);
+    let (now, _, reruns) = run_for(&mut d, &rt, now, Duration::from_secs(30));
+    assert_eq!(reruns.len(), 1, "re-run within the window");
+    assert_eq!(reruns[0].1.table, 400);
+    assert_eq!(rt.status().source_backlog, 0, "no report was queued");
+    let answer = lever(&mut d, &rt, now);
+    assert!(answer.is_empty(), "{answer}");
+    assert_eq!(log.lock().unwrap().as_slice(), &["steer"]);
+    assert_eq!(d.state(), State::Steered);
+}
+
+/// A next hop whose MAC really does change on every tick is a neighbour
+/// change each time, and a steer waits for VPP to take it — but the verify
+/// re-run does not: it checks routes' paths, not where adjacencies lead,
+/// and a change still queued cannot land mid-pass. So the outgrown verdict
+/// is re-run anyway, and the lever, moved with one queued, says so.
+#[test]
+fn queued_neighbour_changes_hold_the_lever_and_not_the_re_run() {
+    use first_steer_hold::*;
+    let moved = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    let (_fake, _feed, log, rt, mut d, now) =
+        nud::grown("first-steer-nud-moving", vec![MAC, moved]);
+    let (now, _, reruns) = run_for(&mut d, &rt, now, Duration::from_secs(30));
+    assert_eq!(reruns.len(), 1, "the re-run is not starved");
+    let answer = lever(&mut d, &rt, now);
+    assert!(
+        answer.contains("and 1 neighbour change(s), where caught up is none"),
+        "{answer}"
+    );
+    assert!(log.lock().unwrap().is_empty());
 }
