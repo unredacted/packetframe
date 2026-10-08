@@ -198,7 +198,17 @@ pub fn awaiting_summary<'a>(
 /// pre-existing behaviour, noisy but never wrong about traffic.
 #[cfg(target_os = "linux")]
 pub fn kernel_local_addrs() -> HashSet<IpAddr> {
-    let mut out = HashSet::new();
+    kernel_addrs_by_iface()
+        .into_iter()
+        .map(|(_, addr)| addr)
+        .collect()
+}
+
+/// Every address the kernel holds with the interface holding it, from
+/// `getifaddrs`, both families. Empty on a failed read.
+#[cfg(target_os = "linux")]
+pub fn kernel_addrs_by_iface() -> Vec<(String, IpAddr)> {
+    let mut out = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates the list; freed below on every path
     // that saw a zero return.
@@ -212,14 +222,14 @@ pub fn kernel_local_addrs() -> HashSet<IpAddr> {
         if !ifa.ifa_addr.is_null() {
             // SAFETY: non-null; the family decides the layout read below.
             let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
-            if family == libc::AF_INET {
+            let addr = if family == libc::AF_INET {
                 // SAFETY: AF_INET guarantees sockaddr_in layout.
                 let raw = unsafe {
                     (*(ifa.ifa_addr as *const libc::sockaddr_in))
                         .sin_addr
                         .s_addr
                 };
-                out.insert(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(raw))));
+                Some(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(raw))))
             } else if family == libc::AF_INET6 {
                 // SAFETY: AF_INET6 guarantees sockaddr_in6 layout.
                 let raw = unsafe {
@@ -227,7 +237,16 @@ pub fn kernel_local_addrs() -> HashSet<IpAddr> {
                         .sin6_addr
                         .s6_addr
                 };
-                out.insert(IpAddr::V6(std::net::Ipv6Addr::from(raw)));
+                Some(IpAddr::V6(std::net::Ipv6Addr::from(raw)))
+            } else {
+                None
+            };
+            if let Some(addr) = addr {
+                // SAFETY: getifaddrs gives every entry a NUL-terminated name.
+                let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((name, addr));
             }
         }
         cur = ifa.ifa_next;

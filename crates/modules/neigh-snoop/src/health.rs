@@ -1,6 +1,8 @@
 //! Health rows derived from a [`Snapshot`]. Portable.
 //!
-//! Rows: `snoop:<bridge>` per configured bridge, `coverage`, `peers`.
+//! Rows: `snoop:<bridge>` per configured bridge, `coverage`, `peers`;
+//! `frr-gate` and `rs-coverage` when configured; `netlink` only while
+//! lost notifications are owed a re-read.
 //! Overall is the worst row, never cheerier than any subsystem.
 
 use packetframe_common::module::{HealthReport, HealthState, SubsystemHealth};
@@ -255,6 +257,25 @@ pub fn health(s: &Snapshot) -> HealthReport {
         subsystems.push(row("rs-coverage".into(), state, parts.join("; "), None));
     }
 
+    // Only while lost notifications are owed a re-read: until then the
+    // kernel mirror every install decision, coverage figure and gate
+    // participant is computed from may be wrong. The history stays in
+    // the metrics.
+    if s.netlink.resync_pending {
+        let mut message = format!(
+            "netlink notifications lost ({} overruns); the neighbour mirror may be stale until \
+             links, addresses and neighbours are re-read",
+            s.netlink.overruns
+        );
+        if let Some(e) = &s.netlink.last_error {
+            message.push_str(&format!(
+                "; the last re-read failed (retrying every {}s): {e}",
+                crate::resync::RESYNC_MIN_INTERVAL.as_secs()
+            ));
+        }
+        subsystems.push(row("netlink".into(), HealthState::Degraded, message, None));
+    }
+
     let overall = subsystems
         .iter()
         .fold(HealthState::Healthy, |acc, r| acc.worse_of(r.state));
@@ -308,7 +329,7 @@ mod tests {
                 permitted_v6: 1,
                 ..Default::default()
             }),
-            rs: vec![],
+            ..Default::default()
         };
         let r = health(&snap);
         assert_eq!(state_of(&r, "frr-gate").state, HealthState::Healthy);
@@ -530,5 +551,40 @@ mod tests {
         let m = p.message.as_deref().unwrap();
         assert!(m.starts_with("12 of 14 never heard: br0:192.0.2.1"), "{m}");
         assert!(m.ends_with("+2 more"), "{m}");
+    }
+
+    /// Lost notifications that no re-read has covered make the module
+    /// Degraded, whatever the other rows say: every one of them is
+    /// computed from the mirror that may now be wrong. Once covered, the
+    /// row goes and the overruns stay in the metrics only.
+    #[test]
+    fn lost_notifications_degrade_until_re_read() {
+        use crate::snapshot::NetlinkSnapshot;
+        let mut snap = Snapshot {
+            bridges: vec![up("br0")],
+            netlink: NetlinkSnapshot {
+                overruns: 3,
+                resync_pending: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let r = health(&snap);
+        assert_eq!(r.overall, HealthState::Degraded);
+        let n = state_of(&r, "netlink");
+        assert_eq!(n.state, HealthState::Degraded);
+        assert!(n.message.as_deref().unwrap().contains("3 overruns"));
+
+        snap.netlink.last_error = Some("neighbour dump: no reply within 30s".into());
+        let r = health(&snap);
+        let m = state_of(&r, "netlink").message.clone().unwrap();
+        assert!(m.contains("the last re-read failed"), "{m}");
+        assert!(m.contains("no reply within 30s"), "{m}");
+
+        snap.netlink.resync_pending = false;
+        snap.netlink.last_error = None;
+        let r = health(&snap);
+        assert_eq!(r.overall, HealthState::Healthy);
+        assert!(r.subsystems.iter().all(|s| s.name != "netlink"));
     }
 }

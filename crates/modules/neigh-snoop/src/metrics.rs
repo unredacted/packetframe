@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use crate::frame::{Reject, Source};
 use crate::snapshot::{
     Counters, CoverageState, GateOutcome, InstallOutcome, LearnOutcome, LinkEvent, LinkState,
-    PersistOutcome, SeedOutcome, Snapshot,
+    PersistOutcome, ResyncOutcome, SeedOutcome, Snapshot,
 };
 use crate::table::FilterReject;
 
@@ -464,6 +464,43 @@ pub fn render_textfile(snapshot: &Snapshot, out: &mut String) {
             );
         }
     }
+
+    // Engine-wide: one subscription feeds every bridge.
+    let n = &snapshot.netlink;
+    family(
+        out,
+        "netlink_overruns_total",
+        "counter",
+        "times the kernel reported link/neighbour/address notifications lost to a full receive buffer",
+    );
+    let _ = writeln!(
+        out,
+        "{NS}_netlink_overruns_total{{module=\"neigh-snoop\"}} {}",
+        n.overruns
+    );
+    family(
+        out,
+        "netlink_resyncs_total",
+        "counter",
+        "re-reads of links, addresses and neighbours after lost notifications, by outcome",
+    );
+    for (label, v) in ResyncOutcome::LABELS.iter().zip(n.resyncs.iter()) {
+        let _ = writeln!(
+            out,
+            "{NS}_netlink_resyncs_total{{module=\"neigh-snoop\",outcome=\"{label}\"}} {v}"
+        );
+    }
+    family(
+        out,
+        "netlink_resync_pending",
+        "gauge",
+        "1 while lost notifications are owed a re-read (the neighbour mirror may be stale)",
+    );
+    let _ = writeln!(
+        out,
+        "{NS}_netlink_resync_pending{{module=\"neigh-snoop\"}} {}",
+        u8::from(n.resync_pending)
+    );
 }
 
 #[cfg(test)]
@@ -505,6 +542,12 @@ mod tests {
     #[test]
     fn every_counter_renders_exactly_once() {
         let counters = dense_counters();
+        // Engine-wide counters, distinct from every per-bridge value.
+        let netlink = crate::snapshot::NetlinkSnapshot {
+            overruns: 1_000,
+            resyncs: [1_001, 1_002],
+            ..Default::default()
+        };
         let snap = Snapshot {
             bridges: vec![IfaceSnapshot {
                 name: "br0".into(),
@@ -513,6 +556,7 @@ mod tests {
                 counters: counters.clone(),
                 ..Default::default()
             }],
+            netlink,
             ..Default::default()
         };
         let mut out = String::new();
@@ -524,6 +568,7 @@ mod tests {
             expected_counter_series += f.labels.len();
         }
         expected_counter_series += SCALAR_COUNTERS.len();
+        expected_counter_series += 1 + ResyncOutcome::COUNT;
         let counter_lines = out
             .lines()
             .filter(|l| l.starts_with(NS) && l.contains("_total{"))
@@ -555,6 +600,14 @@ mod tests {
         );
         // Pending coverage renders no route_nexthops series.
         assert!(!out.contains("route_nexthops{"));
+        assert!(out.contains(
+            "packetframe_neigh_snoop_netlink_overruns_total{module=\"neigh-snoop\"} 1000"
+        ));
+        assert!(out.contains(
+            "packetframe_neigh_snoop_netlink_resyncs_total{module=\"neigh-snoop\",outcome=\"failed\"} 1002"
+        ));
+        assert!(out
+            .contains("packetframe_neigh_snoop_netlink_resync_pending{module=\"neigh-snoop\"} 0"));
     }
 
     #[test]
@@ -614,6 +667,7 @@ mod tests {
                 age_secs: 0,
                 error: None,
             }],
+            ..Default::default()
         };
         let mut out = String::new();
         render_textfile(&snap, &mut out);

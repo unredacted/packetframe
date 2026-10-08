@@ -201,6 +201,11 @@ pub enum FibSync {
         /// How long ago the passing verify finished.
         age: Duration,
         sampled: usize,
+        /// The IPv4 routes installed when it ran — what its probes were
+        /// drawn from ([`VerifyOutcome::table`]). The row prints it beside
+        /// the live count, and judges the two with
+        /// [`crate::verify::covers`], the rule the first steer is held on.
+        table: u64,
     },
     /// A verify that finished, found the FIB unfit to take traffic, and
     /// named a condition a teardown cannot change: the source has not
@@ -215,18 +220,27 @@ pub enum FibSync {
     /// [`VerifyOutcome::restart_worthy`].
     ///
     /// **This is the variant that goes stale.** Verification is a
-    /// convergence-time gate, and the live steering gates never consult
-    /// this snapshot (`Verdict::event` spells out why), so a box
-    /// recovers and steers while this verdict still describes the
-    /// window before its feed landed. Anything rendering it must say
-    /// how old it is — and whether it will be looked at again: `reruns`
-    /// is [`VerifyOutcome::awaits_clean_table`], the verdicts
+    /// convergence-time gate, and the live steering gates judge the
+    /// conditions it failed on as they stand now rather than off this
+    /// snapshot (`Verdict::event` spells out why), so this verdict can
+    /// still describe the window before the feed landed after the table
+    /// has recovered. What the first steer does read off it — coverage,
+    /// and a mismatch ([`crate::verify::unvouched`]) — has a verdict
+    /// taken before the feed landed re-run before a steer is admitted.
+    /// Anything rendering it must say how old it is — and whether it
+    /// will be looked at again: `reruns` is
+    /// [`VerifyOutcome::awaits_clean_table`], the verdicts
     /// [`crate::verify::ReverifySchedule`] re-runs once the table is
     /// clean.
     Unfit {
         age: Duration,
         summary: String,
         reruns: bool,
+        /// The pass's probe count and the table they were drawn from, as
+        /// on [`Self::Verified`]: a verdict the table has outgrown is
+        /// re-run too, whatever it failed on.
+        sampled: usize,
+        table: u64,
     },
     /// VPP answered a probe and disagreed with the ledger. The one
     /// verify outcome a restart remedies.
@@ -243,6 +257,7 @@ impl FibSync {
             Self::Verified {
                 age,
                 sampled: outcome.sampled,
+                table: outcome.table,
             }
         } else if outcome.restart_worthy() {
             Self::Failed {
@@ -254,6 +269,8 @@ impl FibSync {
                 age,
                 summary: outcome.summary(),
                 reruns: outcome.awaits_clean_table(),
+                sampled: outcome.sampled,
+                table: outcome.table,
             }
         }
     }
@@ -416,6 +433,16 @@ pub struct StatusSnapshot {
     /// engine is not draining, a backlog there means VPP is not
     /// accepting.
     pub source_backlog: u64,
+    /// Why a first steer would be held right now, as the steer and its
+    /// retry decide it ([`crate::runtime::RuntimeStatus::steer_hold`]) —
+    /// carried, never recomputed here, so the steering row says exactly
+    /// what the gate is waiting for. Not an `observe_parts` argument;
+    /// [`Self::from_runtime`] sets it, as it does `neighbour_counters`.
+    pub steer_hold: Option<crate::runtime::SteerHold>,
+    /// A steering change that diverts more is held over ports already
+    /// steered — the supervisor's own record ([`Supervisor::addition_held`]),
+    /// the one its retry acts on.
+    pub steer_addition_held: bool,
     /// Mirror prefixes a `local-route` is currently suppressing —
     /// routes the mirror carries that VPP deliberately does not,
     /// because local delivery owns their footprint. Informational, not
@@ -675,6 +702,8 @@ impl StatusSnapshot {
             store_error,
             drain_error,
             source_backlog,
+            steer_hold: None,
+            steer_addition_held: sup.addition_held(),
             shadowed_routes,
             kernel_delivered_routes,
             unresolvable_named: Vec::new(),
@@ -694,6 +723,95 @@ impl StatusSnapshot {
             drift_scan_ms: None,
             drift_v6,
         }
+    }
+
+    /// The snapshot the supervision service publishes: every field from
+    /// the supervisor and ONE [`crate::runtime::RuntimeStatus`], plus the
+    /// two the runtime cannot know — API health, which the driver's
+    /// detector owns, and the verdict, which the service keeps across the
+    /// teardown that would erase the engine's copy.
+    ///
+    /// One constructor so that a test driving the loop by hand renders
+    /// exactly what `packetframe status` would, rather than a hand-picked
+    /// subset of it.
+    pub fn from_runtime(
+        sup: &Supervisor,
+        rs: crate::runtime::RuntimeStatus,
+        api: ApiHealth,
+        fib: FibSync,
+    ) -> Self {
+        let mut snap = Self::observe_parts(
+            sup,
+            rs.counts,
+            rs.pending_ops,
+            rs.parked_ops,
+            api,
+            fib,
+            rs.resync_deferred,
+            rs.fresh_hold,
+            rs.preserved_fib,
+            rs.authority,
+            rs.port_links,
+            rs.store_error,
+            rs.drain_error,
+            rs.source_backlog,
+            rs.steer_configured_ports > 0,
+            SteerAudit {
+                missing: rs.steer_missing,
+                stray: rs.steer_stray,
+                unreadable: rs.steer_audit_error,
+                v6_divert: rs.steer_v6_divert,
+                v6_only: rs.steer_v6_only,
+                handback: rs.handback,
+                icmp6_source: rs.icmp6_source,
+            },
+            rs.shadowed_routes,
+            rs.kernel_delivered_routes,
+            rs.null_drops,
+            rs.neighbours_unplaced,
+            rs.neighbour_moves,
+            rs.neighbours_flooded,
+            rs.fdb_unreadable,
+            rs.drift_uncovered,
+            rs.drift_routes,
+            rs.drift_pending,
+            rs.drift_unreadable,
+            rs.drift_scope_stale,
+            rs.drift_v6,
+        );
+        snap.steer_hold = rs.steer_hold;
+        snap.neighbour_counters = rs.neighbour_counters;
+        snap.kernel_path = rs.kernel_path;
+        snap.drift_scan_ms = rs.drift_scan_ms;
+        snap.unresolvable_named = rs.unresolvable_named;
+        snap.unresolvable_named_v6 = rs.unresolvable_named_v6;
+        snap
+    }
+
+    /// `Some((sampled, table))` when the verdict the `fib-synced` row
+    /// reports was taken against too little of the IPv4 table installed
+    /// now to vouch for it — [`crate::verify::covers`], the rule the
+    /// first steer is held on and the verify re-run fires on, asked of
+    /// the same numbers. One reading for the row and for `nominal`, so
+    /// overall health cannot outrank the row.
+    fn verify_outgrown(&self) -> Option<(usize, u64)> {
+        let (sampled, table) = match &self.fib {
+            FibSync::Verified { sampled, table, .. } | FibSync::Unfit { sampled, table, .. } => {
+                (*sampled, *table)
+            }
+            FibSync::NeverVerified | FibSync::Failed { .. } => return None,
+        };
+        (!crate::verify::covers(sampled, table, self.counts.installed)).then_some((sampled, table))
+    }
+
+    /// The first-steer hold standing over a change to ports ALREADY
+    /// steered: the supervisor recorded the addition as held
+    /// (`Event::SteerHeld`, state left where it was), and the hold still
+    /// answers for it. One reading for the steering row and `nominal`.
+    fn held_addition(&self) -> Option<&crate::runtime::SteerHold> {
+        self.steer_addition_held
+            .then_some(self.steer_hold.as_ref())
+            .flatten()
     }
 
     /// Ports that cannot forward.
@@ -722,12 +840,14 @@ impl StatusSnapshot {
         // as bird takes to reload.
         //
         // `Unfit` asks the LIVE counts instead of the verdict, because
-        // that verdict is the one that outlives its condition. Verify
-        // does not re-run in steady state and the steering gate reads
-        // current counts, so a box whose first verify sampled an empty
-        // mirror goes on to steer correctly with that verdict still
-        // standing — and treating it as a blackhole paged for a
-        // dataplane forwarding 69k routes (rig, 2026-09-21). What would
+        // that verdict is the one that outlives its condition. The
+        // steering gates judge what it failed on from current counts, so
+        // a box can be steered correctly with one still standing — an
+        // unresolvable route that resolved, a steer made before the
+        // re-run's debounce ran out — and treating that as a blackhole
+        // paged for a dataplane forwarding 69k routes (rig, 2026-09-21;
+        // then the verdict was an empty sample, which the first-steer
+        // hold now has re-run before it admits a steer). What would
         // make it a real blackhole now is a hole in the table or no
         // table at all, and both of those are readable right here.
         // `withheld` deliberately does not count: withholding is the
@@ -959,6 +1079,10 @@ impl StatusSnapshot {
         // Arrived: verified and either steered or deliberately staged.
         matches!(self.state, State::Ready | State::Steered)
             && self.fib.verified()
+            // ...over the table that is there now, not a fraction of it:
+            // the `fib-synced` row says Degraded for a verdict the table
+            // has outgrown, from the same reading.
+            && self.verify_outgrown().is_none()
             && matches!(self.api, ApiHealth::Answering { .. })
             && self.failures == 0
             // A complete table. Withheld and unresolvable are real
@@ -987,6 +1111,9 @@ impl StatusSnapshot {
             && self.dead_ports().is_empty()
             // Steering wanted but absent: a broken rollout, not staging.
             && (self.steered || !self.steer_intended)
+            // ...or partly absent: an addition held over ports already
+            // steered, which the steering row says Degraded for.
+            && self.held_addition().is_none()
             // Convergence is fine and the interfaces work, but the next
             // daemon restart will refuse adoption and cycle a VPP that
             // was forwarding. Nominal has to mean "and it will survive a
@@ -1661,12 +1788,13 @@ impl StatusSnapshot {
             //
             // The age and the LIVE counts ride along because this is the
             // verdict that outlives its condition: verification is a
-            // convergence-time gate, the steering retry reads current
-            // counts and not this snapshot, so a box whose first verify
-            // ran before its feed landed goes on to steer with this
-            // still the last word. Reading `INCOMPLETE ... sampled=0`
-            // against 69k installed routes and no way to tell which is
-            // current is the shape this row is answering for.
+            // convergence-time gate, and the steering gates judge what it
+            // failed on from current counts, not from this snapshot.
+            // Reading `INCOMPLETE ... sampled=0` against 69k installed
+            // routes and no way to tell which is current is the shape
+            // this row is answering for. (A verdict that old is also one
+            // the table has outgrown, so it is re-run before a first
+            // steer is admitted — and the row says so.)
             // Same escalation as the `Verified` arm: steered into an
             // empty table is the fault now, whatever the stale verdict
             // says, and the row must agree with `overall` (review
@@ -1684,11 +1812,18 @@ impl StatusSnapshot {
                 summary,
                 age,
                 reruns,
+                ..
             } => {
                 let c = self.counts;
+                // Both re-run triggers, as `verify::ReverifySchedule` has
+                // them: one that failed only on what the table outgrows,
+                // and one the table has outgrown, whatever it failed on.
                 let when = if *reruns {
                     "re-runs on its own once the table holds no unresolvable route and no \
                      unexempted kernel-delivered prefix"
+                } else if self.verify_outgrown().is_some() {
+                    "the table has outgrown it, so it re-runs on its own once VPP has caught \
+                     up with the route mirror and the table holds no unresolvable route"
                 } else {
                     "does not re-run in steady state"
                 };
@@ -1706,11 +1841,29 @@ impl StatusSnapshot {
                     )),
                 )
             }
+            // From `Ready` or `Steered` this is a re-run's verdict — a
+            // convergence's tears the process down and is expired with it
+            // — and nothing will tear down for it, so the row names what
+            // it holds and what clears it. It is not re-run: a new sample
+            // can miss the prefix this one caught (`Unvouched::Mismatch`).
+            FibSync::Failed { summary, age }
+                if matches!(self.state, State::Ready | State::Steered) =>
+            {
+                (
+                    HealthState::Unhealthy,
+                    Some(format!(
+                        "{summary} (verify ran {}s ago). No steer that diverts more traffic \
+                         onto VPP is admitted on it, and it is not re-run; {}",
+                        age.as_secs(),
+                        crate::verify::MISMATCH_REMEDY
+                    )),
+                )
+            }
             FibSync::Failed { summary, age } => (
                 HealthState::Unhealthy,
                 Some(format!("{summary} (verify ran {}s ago)", age.as_secs())),
             ),
-            FibSync::Verified { sampled, .. } => {
+            FibSync::Verified { sampled, table, .. } => {
                 let c = self.counts;
                 if c.installed == 0 && self.steered {
                     // Transient by construction: the driver takes
@@ -1746,22 +1899,53 @@ impl StatusSnapshot {
                     (
                         HealthState::Degraded,
                         Some(format!(
-                            "verified on {sampled} probes; {} withheld (at capacity), \
-                             {} unresolvable (mapping){}{}",
+                            "verified on {sampled} probes against {table} routes; {} withheld \
+                             (at capacity), {} unresolvable (mapping){}{}",
                             c.withheld,
                             c.unresolvable,
                             named(&self.unresolvable_named),
                             self.kernel_delivered_note(),
                         )),
                     )
+                } else if self.verify_outgrown().is_some() {
+                    // A pass, but over a table the one installed now has
+                    // outgrown: the probes were drawn from what was there
+                    // when it ran, and nothing since has been sampled. The
+                    // 2026-10-07 restart read `healthy — 666382 routes
+                    // installed; last verified on 1 probes` here, and a
+                    // lever move was admitted on it. Degraded, because the
+                    // FIB being reported on has not been verified, and
+                    // that is what a first steer waits for; it clears
+                    // itself through the re-run. The backlog rides along
+                    // because "VPP has caught up" is the re-run's
+                    // precondition, and it is the number an operator can
+                    // watch fall.
+                    (
+                        HealthState::Degraded,
+                        Some(format!(
+                            "{} routes installed, but the last verify ran on {sampled} probes \
+                             against {table} routes, so it vouches for less than {}% of this \
+                             table and a first steer waits for one that does. Verify re-runs \
+                             on its own once VPP has caught up with the route mirror ({} \
+                             change(s) still at the route source, {} queued for VPP) and the \
+                             table holds no unresolvable route",
+                            c.installed,
+                            crate::verify::VERIFY_COVERS_PERCENT,
+                            self.source_backlog,
+                            self.pending_ops,
+                        )),
+                    )
                 } else {
                     // "verified AT" rather than "verified", because
                     // nothing re-runs verification in steady state and
-                    // this line is read hours later. See `FibSync`.
+                    // this line is read hours later. See `FibSync`. The
+                    // table it ran against rides along so its coverage of
+                    // the table now can be read at a glance.
                     (
                         HealthState::Healthy,
                         Some(format!(
-                            "{} routes installed; last verified on {sampled} probes",
+                            "{} routes installed; last verified on {sampled} probes against \
+                             {table} routes",
                             c.installed
                         )),
                     )
@@ -2067,9 +2251,10 @@ impl StatusSnapshot {
                 "a convergence re-applies steering only if it verifies clean — one that \
                  ends with routes withheld or unresolvable parks in the staging state and \
                  emits no steer at all, and a steer that IS emitted can still be refused \
-                 by the completeness gate. Both settle in the staging state with the want \
-                 remembered, and from there the module re-attempts the steer by itself \
-                 once both gates permit. {tail}"
+                 by the completeness gate or held until VPP has caught up with the route \
+                 mirror. Each settles in the staging state with the want remembered, and \
+                 from there the module re-attempts the steer by itself once nothing \
+                 refuses it. {tail}"
             )
         };
         // Stray rules do NOT share that remedy, and sharing it was a
@@ -2138,6 +2323,22 @@ impl StatusSnapshot {
                 )
             });
         }
+        // Last, so the readback clause's "the count(s) above" still means
+        // the audit's counts. A held addition on ports already steered —
+        // the canary ladder's next rung during a reload — is steering
+        // asked for and not in place, which the arms below would print as
+        // plain `steered`.
+        if let Some(h) = self.held_addition() {
+            clauses.push(format!(
+                "a steering change that diverts more traffic onto VPP is held because {h}. \
+                 The rules already installed stay as they are and keep forwarding; {}",
+                if h.clears_itself() {
+                    "the change lands on its own once nothing holds it"
+                } else {
+                    "waiting does not clear this, so the change waits until it is cleared"
+                }
+            ));
+        }
         let message = (!clauses.is_empty()).then(|| clauses.join(". "));
         if let Some(message) = message {
             return SubsystemHealth {
@@ -2205,6 +2406,13 @@ impl StatusSnapshot {
             // schedule — and predicting a paced retry that is not
             // running is exactly how the lines in this file have gone
             // wrong before.
+            //
+            // From `Ready` the row also names the first-steer hold when one
+            // stands, because that is the refusal the retry is waiting out
+            // and the one whose cause changes while the operator watches
+            // (VPP catching up with the mirror, the verify re-run). Carried
+            // from the runtime, never re-derived: it is the accessor the
+            // steer and the retry refuse on (`Core::steer_hold`).
             (false, true) => (
                 HealthState::Degraded,
                 Some(if matches!(self.state, State::Ready) {
@@ -2212,8 +2420,19 @@ impl StatusSnapshot {
                         "steering intended but not in place — traffic is on the eBPF tier. \
                          The module re-attempts it on its own, at most every {}s, once \
                          nothing is refusing it; `packetframe reconfigure` asks immediately \
-                         and reports the reason if it is refused again",
-                        crate::driver::STEER_RETRY_EVERY.as_secs()
+                         and reports the reason if it is refused again{}",
+                        crate::driver::STEER_RETRY_EVERY.as_secs(),
+                        self.steer_hold
+                            .as_ref()
+                            .map(|h| format!(
+                                ". Held now because {h}{}",
+                                if h.clears_itself() {
+                                    ""
+                                } else {
+                                    " — waiting does not clear this, so it will not steer by itself"
+                                }
+                            ))
+                            .unwrap_or_default()
                     )
                 } else {
                     "steering intended but not in place — traffic is on the eBPF tier".to_string()
@@ -2228,6 +2447,13 @@ impl StatusSnapshot {
             // rollout. Both are Healthy — waiting for a lever is not a
             // fault — but "I asked for this" and "the machine is waiting
             // for me" must not print the same line.
+            //
+            // When a lever move made now would be held, the row says so
+            // and why — the 2026-10-07 lever was moved on this line while
+            // VPP was ~430k routes behind and its verify covered one
+            // route, and nothing here said either. Still Healthy: waiting
+            // for a lever is not a fault, and the `fib-synced` row is
+            // where an outgrown verdict degrades.
             (false, false) if self.steer_configured => (
                 HealthState::Healthy,
                 // The continuations are load-bearing: without the
@@ -2237,13 +2463,23 @@ impl StatusSnapshot {
                 // unnoticed because the guard test rendered only the
                 // arms an already-steering port reaches; it covers
                 // these now.
-                Some(
+                Some(format!(
                     "configured `steer on`, awaiting an operator lever move; traffic is on \
                      the eBPF tier. A first attach never steers by itself — set the port \
                      `steer off`, `packetframe reconfigure`, then back to `steer on` and \
-                     reconfigure again (canary ladder, docs/runbooks/vpp-offload.md)"
-                        .into(),
-                ),
+                     reconfigure again (canary ladder, docs/runbooks/vpp-offload.md){}",
+                    self.steer_hold
+                        .as_ref()
+                        .map(|h| if h.clears_itself() {
+                            format!(
+                                ". A lever move now would be held, and steer on its own once \
+                                 nothing holds it, because {h}"
+                            )
+                        } else {
+                            format!(". A lever move now would be held, because {h}")
+                        })
+                        .unwrap_or_default()
+                )),
             ),
             (false, false) => (
                 HealthState::Healthy,
@@ -3172,10 +3408,15 @@ mod tests {
         }]
     }
 
+    /// A passing verdict that covers every table these tests install —
+    /// taken against more routes than any of them holds, so coverage is
+    /// never what they are about. The tests that are about it build their
+    /// own (`an_outgrown_verdict_degrades_the_row_and_overall`).
     fn verified(secs: u64) -> FibSync {
         FibSync::Verified {
             age: Duration::from_secs(secs),
             sampled: 64,
+            table: 1_000_000,
         }
     }
 
@@ -3215,6 +3456,56 @@ mod tests {
     /// in the awaiting-a-lever line under two class guards.
     fn steering_postures() -> [(bool, bool); 4] {
         [(true, true), (false, true), (false, false), (true, false)]
+    }
+
+    /// Every first-steer hold shape, beside the verdict that goes with it,
+    /// for the text guards: the hold rides into the steering row and an
+    /// outgrown verdict changes the `fib-synced` row, so a matrix without
+    /// them renders neither.
+    fn hold_postures() -> Vec<(Option<crate::runtime::SteerHold>, FibSync)> {
+        use crate::runtime::{Behind, SteerHold};
+        use crate::verify::Unvouched;
+        // A neighbour change with the failing posture's drain, so both
+        // wordings of the neighbour count render.
+        let behind = |failing| Behind {
+            backlog: 149,
+            neighbours: if failing { 0 } else { 2 },
+            pending: 3,
+            allowance: 64,
+            failing,
+        };
+        vec![
+            (None, verified(3)),
+            (
+                Some(SteerHold {
+                    behind: Some(behind(false)),
+                    unvouched: Some(Unvouched::Outgrown {
+                        sampled: 1,
+                        table: 1,
+                        installed: 10,
+                    }),
+                }),
+                FibSync::Verified {
+                    age: Duration::from_secs(3),
+                    sampled: 1,
+                    table: 1,
+                },
+            ),
+            (
+                Some(SteerHold {
+                    behind: Some(behind(true)),
+                    unvouched: Some(Unvouched::Mismatch),
+                }),
+                verified(3),
+            ),
+            (
+                Some(SteerHold {
+                    behind: None,
+                    unvouched: Some(Unvouched::NoVerdict),
+                }),
+                verified(3),
+            ),
+        ]
     }
 
     fn snap_of(
@@ -3428,6 +3719,10 @@ mod tests {
         const ALLOWED: &[&str] = &[
             "packetframe reconfigure",
             "packetframe detach --all",
+            // The mismatch remedy (`verify::MISMATCH_REMEDY`), rendered
+            // through the first-steer hold.
+            "systemctl restart packetframe",
+            "detach --keep-vpp",
             "ethtool -n <iface>",
             "ethtool -N <iface> delete <loc>",
             "steer",
@@ -3470,42 +3765,46 @@ mod tests {
                         (0, 0, Some("EIO: readback failed".to_string())),
                         (0, 0, None),
                     ] {
-                        let led = ledger_with(10, 0, 0);
-                        let mut snap = snap_of(
-                            &steered_supervisor(),
-                            &led,
-                            ApiHealth::Answering {
-                                silent_for: Duration::from_millis(200),
-                            },
-                            verified(3),
-                            ports_up(),
-                        );
-                        snap.state = state;
-                        snap.steer_configured = steer_configured;
-                        (snap.steered, snap.steer_intended) = steering;
-                        snap.steer_missing = missing;
-                        snap.steer_stray = stray;
-                        snap.steer_audit_unreadable = unreadable.clone();
+                        for (hold, fib) in hold_postures() {
+                            let led = ledger_with(10, 0, 0);
+                            let mut snap = snap_of(
+                                &steered_supervisor(),
+                                &led,
+                                ApiHealth::Answering {
+                                    silent_for: Duration::from_millis(200),
+                                },
+                                fib,
+                                ports_up(),
+                            );
+                            snap.state = state;
+                            snap.steer_configured = steer_configured;
+                            (snap.steered, snap.steer_intended) = steering;
+                            snap.steer_missing = missing;
+                            snap.steer_stray = stray;
+                            snap.steer_audit_unreadable = unreadable.clone();
+                            snap.steer_hold = hold;
+                            snap.steer_addition_held = snap.steered && snap.steer_hold.is_some();
 
-                        for sub in snap.report().subsystems {
-                            let Some(msg) = sub.message else { continue };
-                            let mut rest = msg.as_str();
-                            while let Some(open) = rest.find('`') {
-                                rest = &rest[open + 1..];
-                                let Some(close) = rest.find('`') else { break };
-                                let span = &rest[..close];
-                                rest = &rest[close + 1..];
-                                if !seen.iter().any(|s| s == span) {
-                                    seen.push(span.to_string());
-                                }
-                                assert!(
-                                    ALLOWED.contains(&span),
-                                    "{} in {state:?} prints `{span}`, which is not a \
+                            for sub in snap.report().subsystems {
+                                let Some(msg) = sub.message else { continue };
+                                let mut rest = msg.as_str();
+                                while let Some(open) = rest.find('`') {
+                                    rest = &rest[open + 1..];
+                                    let Some(close) = rest.find('`') else { break };
+                                    let span = &rest[..close];
+                                    rest = &rest[close + 1..];
+                                    if !seen.iter().any(|s| s == span) {
+                                        seen.push(span.to_string());
+                                    }
+                                    assert!(
+                                        ALLOWED.contains(&span),
+                                        "{} in {state:?} prints `{span}`, which is not a \
                                      command this module means to emit. Either it is \
                                      mangled — the way `ethtool -n reconfigure` was — or \
                                      it is new and belongs in ALLOWED. Full line: {msg}",
-                                    sub.name
-                                );
+                                        sub.name
+                                    );
+                                }
                             }
                         }
                     }
@@ -3627,32 +3926,36 @@ mod tests {
                         (0, 0, Some("EIO: readback failed".to_string())),
                         (0, 0, None),
                     ] {
-                        let led = ledger_with(10, 0, 0);
-                        let mut snap = snap_of(
-                            &steered_supervisor(),
-                            &led,
-                            ApiHealth::Answering {
-                                silent_for: Duration::from_millis(200),
-                            },
-                            verified(3),
-                            ports_up(),
-                        );
-                        snap.state = state;
-                        snap.steer_configured = steer_configured;
-                        (snap.steered, snap.steer_intended) = steering;
-                        snap.steer_missing = missing;
-                        snap.steer_stray = stray;
-                        snap.steer_audit_unreadable = unreadable.clone();
+                        for (hold, fib) in hold_postures() {
+                            let led = ledger_with(10, 0, 0);
+                            let mut snap = snap_of(
+                                &steered_supervisor(),
+                                &led,
+                                ApiHealth::Answering {
+                                    silent_for: Duration::from_millis(200),
+                                },
+                                fib,
+                                ports_up(),
+                            );
+                            snap.state = state;
+                            snap.steer_configured = steer_configured;
+                            (snap.steered, snap.steer_intended) = steering;
+                            snap.steer_missing = missing;
+                            snap.steer_stray = stray;
+                            snap.steer_audit_unreadable = unreadable.clone();
+                            snap.steer_hold = hold;
+                            snap.steer_addition_held = snap.steered && snap.steer_hold.is_some();
 
-                        for sub in snap.report().subsystems {
-                            let Some(msg) = sub.message else { continue };
-                            assert!(
-                                !msg.contains("   "),
-                                "{} in {state:?} renders a whitespace run — a line an \
+                            for sub in snap.report().subsystems {
+                                let Some(msg) = sub.message else { continue };
+                                assert!(
+                                    !msg.contains("   "),
+                                    "{} in {state:?} renders a whitespace run — a line an \
                                  operator reads at 3am, mangled by a source-formatting \
                                  artefact: {msg:?}",
-                                sub.name
-                            );
+                                    sub.name
+                                );
+                            }
                         }
                     }
                 }
@@ -3883,6 +4186,79 @@ mod tests {
         assert!(r.subsystems.iter().all(|x| x.state == HealthState::Healthy));
     }
 
+    /// A verdict the table has outgrown degrades the `fib-synced` row and
+    /// overall with it, naming both tables — and only degrades: on a
+    /// steered box it is growth since the verify, not a blackhole, and it
+    /// must not page. One that still covers the table is healthy and says
+    /// what it covered; an incomplete one the table has outgrown says it
+    /// will be re-run, where before it said it would not.
+    #[test]
+    fn an_outgrown_verdict_degrades_the_row_and_overall() {
+        let led = ledger_with(5_000, 0, 0);
+        let api = ApiHealth::Answering {
+            silent_for: Duration::ZERO,
+        };
+        let fib_row = |s: &StatusSnapshot| {
+            s.report()
+                .subsystems
+                .into_iter()
+                .find(|x| x.name == SUBSYS_FIB)
+                .map(|x| (x.state, x.message.unwrap_or_default()))
+                .unwrap()
+        };
+        let pass = |table| FibSync::Verified {
+            age: Duration::from_secs(30),
+            sampled: 64,
+            table,
+        };
+
+        for sup in [ready_supervisor(), steered_supervisor()] {
+            let s = snap_of(&sup, &led, api, pass(1_000), ports_up());
+            let (state, msg) = fib_row(&s);
+            assert_eq!(state, HealthState::Degraded, "{msg}");
+            assert!(
+                msg.contains(
+                    "5000 routes installed, but the last verify ran on 64 probes against \
+                     1000 routes"
+                ),
+                "{msg}"
+            );
+            assert_eq!(s.report().overall, HealthState::Degraded, "{msg}");
+        }
+
+        // Within the threshold: healthy, and the row says what it covered.
+        let s = snap_of(&ready_supervisor(), &led, api, pass(4_600), ports_up());
+        assert_eq!(
+            fib_row(&s),
+            (
+                HealthState::Healthy,
+                "5000 routes installed; last verified on 64 probes against 4600 routes".into()
+            )
+        );
+        assert_eq!(s.report().overall, HealthState::Healthy);
+
+        // Incomplete for a reason that does not re-run it, but outgrown.
+        let s = snap_of(
+            &ready_supervisor(),
+            &led,
+            api,
+            FibSync::Unfit {
+                age: Duration::from_secs(30),
+                summary: "verify FIB OK, IN-USE MEMBER(S) DARK".into(),
+                reruns: false,
+                sampled: 64,
+                table: 1_000,
+            },
+            ports_up(),
+        );
+        let (_, msg) = fib_row(&s);
+        assert!(
+            msg.contains("the table has outgrown it, so it re-runs on its own"),
+            "{msg}"
+        );
+        assert!(!msg.contains("does not re-run"), "{msg}");
+    }
+
     /// A verify that passed does not make a later empty table healthy.
     ///
     /// The rig (2026-09-24): FRR's nexthop went away, all 7,830 routes
@@ -3995,6 +4371,8 @@ mod tests {
             age: Duration::from_secs(1847),
             summary: VerifyOutcome::default().summary(),
             reruns: true,
+            sampled: 0,
+            table: 0,
         };
         let r = snap_of(
             &steered_supervisor(),
@@ -4029,6 +4407,8 @@ mod tests {
             age: Duration::from_secs(1847),
             summary: VerifyOutcome::default().summary(),
             reruns: true,
+            sampled: 0,
+            table: 0,
         };
         let s = snap_of(
             &steered_supervisor(),
@@ -4114,6 +4494,8 @@ mod tests {
             age: Duration::from_secs(1847),
             summary: VerifyOutcome::default().summary(),
             reruns: true,
+            sampled: 0,
+            table: 0,
         };
         let s = snap_of(
             &steered_supervisor(),
@@ -4151,6 +4533,8 @@ mod tests {
                     age: Duration::from_secs(30),
                     summary: VerifyOutcome::default().summary(),
                     reruns: true,
+                    sampled: 0,
+                    table: 0,
                 },
                 ports_up(),
             );
@@ -4179,6 +4563,8 @@ mod tests {
                 age: Duration::from_secs(30),
                 summary: VerifyOutcome::default().summary(),
                 reruns: true,
+                sampled: 0,
+                table: 0,
             },
             ports_up(),
         );
@@ -6624,6 +7010,10 @@ mod tests {
                     age: Duration::from_secs(30),
                     summary: "verify INCOMPLETE".into(),
                     reruns,
+                    // Covering the table, so `reruns` alone decides
+                    // whether it is looked at again.
+                    sampled: 64,
+                    table: 5_000,
                 },
                 ports_up(),
             );
@@ -6660,6 +7050,7 @@ mod tests {
             FibSync::Verified {
                 age: Duration::from_secs(30),
                 sampled: 64,
+                table: 5_000,
             },
             ports_up(),
         );

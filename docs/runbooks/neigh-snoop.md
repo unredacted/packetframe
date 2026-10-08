@@ -140,6 +140,18 @@ All labelled `module="neigh-snoop",iface="<bridge>"`:
   `route_nexthops{state}` (absent until the first sample),
   `nexthop_objects`, `coverage_dump_ms`, `coverage_age_seconds`.
 
+Engine-wide, labelled `module="neigh-snoop"` only (one netlink
+subscription feeds every bridge):
+
+- `netlink_overruns_total` — times the kernel reported link, neighbour
+  or address notifications lost to a full receive buffer. One report
+  stands for any number of lost messages.
+- `netlink_resyncs_total{outcome=ok|failed}` — re-reads of links,
+  addresses and neighbours after an overrun.
+- `netlink_resync_pending` — 1 while lost notifications are owed a
+  re-read, from the overrun until the re-read ends; the neighbour
+  mirror may be stale until it clears.
+
 Attribution notes:
 
 - **`confirmed`, not `requested`, is the install count.** Requested is
@@ -148,6 +160,15 @@ Attribution notes:
   table dirty; the persist debounce (3 s) coalesces it.
 - `mac_conflict` climbing on one address is a participant with two
   routers on its port, or spoofing. Nothing is installed; look at who.
+- An install for an address the kernel mirror holds no row for is
+  written without `NLM_F_REPLACE`: the kernel creates the entry, or
+  fills one it holds unresolved (INCOMPLETE, FAILED), but keeps a valid
+  MAC it holds, a confirmed one included. The mirror can miss a live
+  entry (a neighbour dump taken during churn can skip one, and the
+  kernel does not flag it), and this is what keeps such a miss from
+  overwriting it. Such a write changes nothing and so counts
+  `unconfirmed`; the next sighting decides again on the row the
+  kernel's next notification or re-read brings.
 - `frames_outgoing_dropped_total` should be zero. Non-zero means the
   socket filter is not attached.
 - `recreated` link events during a provision or BGP upload are normal;
@@ -242,6 +263,11 @@ session has never been up from their side).
   and must trend to zero; `ip neigh show dev <br>` must show no
   `INCOMPLETE` or `FAILED` next-hop of an installed route after a few
   minutes.
+- **T8 lost notifications.** During T5 (or any port bounce), if
+  `netlink_overruns_total` moves, `netlink_resyncs_total{outcome="ok"}`
+  must follow within seconds and the `netlink` row must clear; then
+  `participant_addresses{state="resolved"}` must agree with what
+  `ip neigh show dev <br>` holds for learned addresses.
 
 ## Triage by symptom
 
@@ -281,6 +307,32 @@ session has never been up from their side).
   bgpd, not a coverage problem. `FRR says: Inbound soft reconfiguration
   not enabled` means the IX session lacks `soft-reconfiguration
   inbound`.
+- **`netlink` row Degraded "netlink notifications lost (N overruns)"**:
+  the kernel dropped link/neighbour/address notifications on the
+  engine's subscription — a port bounce flushing a peering LAN's
+  neighbours in one burst does it. Until the re-read that follows
+  (paced to one every 5 s), the neighbour mirror can hold flushed
+  entries as resolved: coverage reads too high, the gate keeps them as
+  participants, and a re-seed skips them. The re-read replaces the
+  mirror's rows and re-seeds a bridge any of whose neighbour rows
+  vanished, changed or appeared unheard (`seed_total{outcome="requested"}`
+  moves), since a bounce whose down and up were both lost, or an entry
+  the kernel failed while nobody listened, leaves no other trigger. The
+  re-seed applies the usual install rules to every learned address on
+  that bridge: a confirmed (REACHABLE/DELAY/PROBE) MAC is never
+  overridden, and a STALE row holding another MAC is replaced once it
+  is out of its 30 s holddown. The row shows from the overrun until the
+  re-read ends, including while it runs, and
+  clears on its own when the re-read lands; "the last re-read failed"
+  names the dump that did not answer, and it is retried.
+  `netlink_overruns_total` climbing steadily outside such events means
+  the engine cannot keep up at all.
+- **WARN `neighbour install unanswered`**: the kernel never answered the
+  write within 30 s. It may still have landed, so it is not counted as
+  failed: by then its 5 s confirmation window has long closed, and it
+  counted `install_total{outcome="confirmed"}` if its echo arrived in
+  that window and `unconfirmed` if not. The installer moves to a fresh
+  connection.
 - **`evictions` non-zero**: raise `table-max`.
 - **Persisted table ignored at start ("file is for bridge …")**: a
   JSON file was copied between bridges; delete it.
@@ -399,6 +451,23 @@ reaches new hosts, alongside `vppctl show errors | grep -i glean`.
   refreshes produces one write per window.
 - Installs are paced round-robin across bridges, so a boot-time seed on
   one bridge cannot starve live learns on another.
+- Netlink: one multicast subscription (link, neighbour, IPv4 and IPv6
+  address groups, with a 4 MiB receive buffer) feeds the engine; the
+  engine's dumps, the installer's writes and the coverage sampler's
+  dumps each go on a unicast connection of their own. Every request is
+  bounded (30 s; a coverage sample 120 s), and a connection whose
+  request did not end in a clean reply (unanswered, refused, or cut off)
+  is not used again, because netlink-proto would otherwise wait on a lost
+  reply forever and the kernel refuses every later dump on a socket with
+  one still running.
+- A re-read after lost notifications opens a fresh subscription before
+  its dumps and replaces the old one with it once they are applied:
+  after an overflow the kernel still delivers what it had queued before
+  the loss, and replayed after the dumps those older messages would undo
+  them. Because a dump taken during churn can skip a live entry, a
+  bridge missing from the link dump is treated as gone only if its name
+  no longer resolves, and a neighbour row leaves the mirror only if two
+  consecutive dumps both lack it.
 - For IPv4 the kernel itself updates an *existing* neighbour entry from
   any ARP packet whose sender it already knows (one-second lock time),
   even a third-party request. The snooper's never-override rule

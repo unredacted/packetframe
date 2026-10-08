@@ -939,6 +939,14 @@ mod tests {
             }
             let hugetlbfs = base.join("dev-hugepages");
             fs::create_dir_all(&hugetlbfs).unwrap();
+            // Pinned, not left to the umask: the preserved ledger's reader
+            // refuses a state-dir under an ancestor group or others can
+            // write.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+            }
             let paths = SysPaths {
                 sysfs_net: net,
                 vlan_config: base.join("proc-net-vlan-config"),
@@ -1836,7 +1844,8 @@ mod tests {
             start_ticks: 987,
             boot_id: "abcd",
         };
-        let rec = consume_for_adoption(&f.paths.state_dir, Some(me), token, &recorded)
+        let bound = crate::ledger_record::max_ledger_bytes(ROUTES, recorded.len());
+        let rec = consume_for_adoption(&f.paths.state_dir, bound, Some(me), token, &recorded)
             .expect("the matching adoption takes the record");
         assert_eq!(rec.body, body);
 

@@ -82,6 +82,13 @@ Indicators that the PacketFrame FIB path is working:
   and not regaining it — see the triage entry below.
 - `packetframe status` shows `nexthops (incomplete)` and `nexthops
   (failed)` at or near zero once the table has converged.
+- The fast-path `neigh-resolver` row is healthy and its `last ok` age is a
+  few seconds; an idle resolver still makes progress every second.
+  `restarts 0` is the norm. Overruns, each matched by a resync, are not
+  faults: they are notifications the kernel dropped and the resolver
+  recovered. See the triage entry
+  [nexthops stuck `incomplete` while the kernel neighbour is
+  REACHABLE](#symptom-nexthops-stuck-incomplete-while-the-kernel-neighbour-is-reachable).
 - `pass_not_for_us` holds steady as a share of matched traffic. It
   counts allowlisted frames whose destination MAC is not one the router
   receives on at the ingress port: host-to-host frames the kernel is
@@ -381,8 +388,13 @@ birdc enable bmp1
 packetframe emits `RouteEvent::Resync` on disconnect and receives
 the fresh dump on reconnect. Routes the new session does not
 re-announce are GC'd at `InitiationComplete`, which fires after 5 s of
-post-first-update quiescence. A session that drops before then GCs
-nothing; the next session's `InitiationComplete` does.
+post-first-update quiescence. On the iBGP feed the listener's socket
+reader judges it: 5 s with no UPDATE read and nothing left unread on
+the socket (KEEPALIVEs do not count either way), and the event is
+applied behind every UPDATE read before it. A slow programmer
+therefore neither fires it early (ahead of a backlog, mid-reload) nor
+late. A session that drops before then GCs nothing; the next
+session's `InitiationComplete` does.
 
 The GC covers the feed's routes only. The `fallback-default` 0/0 and
 the `local-prefix` host routes come from the neighbour resolver, not
@@ -423,6 +435,12 @@ Alongside the existing counter family, the textfile exporter emits:
 - `packetframe_nexthops_max`: configured NEXTHOPS capacity.
 - `packetframe_ecmp_groups_active`, `packetframe_ecmp_groups_max`.
 - `packetframe_fib_default_hash_mode`: 3/4/5-tuple.
+- `packetframe_fib_neigh_resolver_*`: the neighbour resolver's overruns,
+  resyncs, request timeouts and restarts (counters), whether a resolver
+  loop is running, its progress age, and how long it has been waiting on
+  the programmer (gauges). See the triage entry
+  [nexthops stuck `incomplete` while the kernel neighbour is
+  REACHABLE](#symptom-nexthops-stuck-incomplete-while-the-kernel-neighbour-is-reachable).
 
 Example alerts:
 
@@ -434,6 +452,15 @@ sum(packetframe_nexthops{state=~"resolved|incomplete|failed|stale"})
 
 # Nexthops whose traffic is on the kernel path.
 sum(packetframe_nexthops{state=~"incomplete|failed"}) > 0
+
+# The neighbour resolver is stuck, or not running at all. A wait on the
+# programmer also stops its progress, and is not its fault.
+(packetframe_fib_neigh_resolver_progress_age_seconds > 30
+  and packetframe_fib_neigh_resolver_programmer_wait_seconds == 0)
+  or packetframe_fib_neigh_resolver_running == 0
+
+# The daemon had to restart its neighbour resolver.
+increase(packetframe_fib_neigh_resolver_restarts_total[1h]) > 0
 
 # Unexpected forwarding-mode transition.
 changes(packetframe_fib_forwarding_mode{mode="packetframe-fib"}[5m]) > 0
@@ -957,6 +984,8 @@ in force:
 | degraded, `priorities ... below main are taken` | Fewer than two free priorities within 100 of `main`; nothing written or changed | `ip rule show` to see what fills the band |
 | degraded, `a second unconditional lookup main at S follows the one at F` | Skipping the first `main` would only reach the second; nothing written or changed | Usually a provisioning pass caught half-way; if it persists, find which one the platform meant to keep |
 | degraded, `repair failing: X of Y rules in place; ...` | A dump or write failed. Writes stop at the first failed stage (anchor, then keep, then goto), and nothing old is removed until every new rule is in, so a partial pass never leaves a goto without its keep rules | The error names the rule and the netlink error; it retries every pass |
+| degraded, `repair failing: ...; no netlink reply within 30s; abandoned where it stood` | The kernel never answered a request in the pass (a reply it could not allocate is never sent). Without the bound the pass would wait forever, stopping every later pass and every reload's. Writes go out in stage order, so a pass cut short leaves a safe prefix of them | It retries every pass; a run of these means the box is starved of memory or RTNL |
+| degraded, `repair failing: an unknown number of Y rules in place; ...` | The pass never saw the rules (the dump failed or went unanswered), so how many are in place is not known; the `present` gauge is absent until a pass sees them | As above |
 | degraded, `removed from the config, but its rules could not all be removed` | A reload dropped the directive and the removal did not finish | It retries every pass and on the next reload; `packetframe detach` also removes them |
 
 **udapi-server will not start and logs `neither table nor goto is
@@ -1660,6 +1689,158 @@ journalctl -u packetframe | grep "router's own address (local)"
 vpp-offload counts the same routes as kernel-delivered, not unresolvable
 (see the vpp-offload runbook, "Kernel-delivered routes").
 
+### Symptom: nexthops stuck `incomplete` while the kernel neighbour is REACHABLE
+
+What it means: the kernel has resolved the nexthops, but the neighbour
+resolver is not passing that on, so the FIB holds them `incomplete` and
+every packet routed through them takes the kernel path. This is not the
+re-probe problem in the previous entry: there, the *kernel* has lost the
+neighbour. Here `ip neigh show <nexthop-ip> dev <device>` says REACHABLE
+(or STALE, PERMANENT) on the device the nexthop forwards out of, and the
+FIB still says `incomplete`.
+
+The fingerprint, from 2026-10-07 (a configuration apply toggled a member
+port and an IX bridge to flush routes, and the kernel flushed every
+neighbour on them):
+
+- `fib_no_neigh` (the `pass_no_neigh` rate) is close to the whole
+  matched rate, and `fwd_ok` is flat. Softirq load is high on every core
+  as the kernel path takes everything.
+- `packetframe status` shows a handful of `nexthops (resolved)` against
+  hundreds `incomplete`.
+- No `neighbour resolver stats` line in the journal for minutes; it is
+  normally logged every 10 s.
+- vpp-offload counts its routes as unresolvable ("no neighbour: the
+  kernel has not resolved it"), from the same source.
+- `/proc/net/netlink`: the resolver's multicast socket (protocol `0`,
+  groups `00000005`, which is RTNLGRP_LINK and RTNLGRP_NEIGH) shows a
+  large `Drops` count. The kernel dropped notifications on its full
+  receive buffer.
+
+How it happened, and what changed. The resolver's multicast socket
+overflowed during the neighbour flush. Its own requests (route lookups,
+neighbour kicks, read-backs) went over that same socket with no timeout.
+The kernel dropped one request's reply along with the notifications, the
+loop waited for it forever, and nothing noticed. The daemon now:
+
+- **Sends requests over a separate socket, and bounds each one**: 5 s for
+  a request, 10 s for a dump. A request that times out leaves its nexthop
+  to the programmer's next re-probe. Its socket is retired, and no new
+  one opens until the kernel has let go of the old one (a request blocked
+  on `rtnl_lock` holds a worker thread until the lock is released, and
+  the resolver shares a two-thread runtime with the programmer and the
+  route source). Probes skipped meanwhile are asked for again as soon as
+  requests can go out.
+- **Resyncs after an overrun.** When notifications are lost, it re-reads
+  the links, the neighbours and the bridge FDB about a second later (at
+  most one resync every 5 s) and announces what changed. The dumps are
+  taken with a **fresh subscription** already open, and the old socket
+  is then dropped with everything still queued on it. After an overflow
+  the kernel goes on delivering what it queued *before* the drop, which
+  is older than what it dropped; replayed after the dump, it would
+  re-learn deleted neighbours or withdraw live ones. (A resync that
+  could not apply anything, for example because no request socket was
+  free, keeps the old subscription.)
+
+  What the dumps list is applied first. A link or neighbour the dump does
+  not list is then asked about individually before it is withdrawn,
+  because a dump can skip a live entry. Each outcome is announced as its
+  notification would have been:
+  - A neighbour the kernel now holds `FAILED` (dumps leave those out) is
+    announced `Failed`, not lost, and keeps its local-prefix route.
+  - A neighbour that moved to another interface is learned there, and
+    its entry on the old one is lost, which withdraws the local-prefix
+    host route it had there.
+  - A neighbour on a device that no longer exists counts as gone, and
+    when a device goes, any neighbours the resolver still held on it go
+    with it.
+
+  Confirmations stop as soon as
+  the request socket is retired, and take at most 2 s per read. One that
+  is not made is left as it is and the resync is retried, so the loop
+  never sits behind a blocked socket. The multicast receive buffer is
+  also raised to 16 MiB, which makes overruns rarer.
+- **Reads back suppressed probes.** A nexthop behind an `ix-mode`
+  interface is still never kicked, but its kernel entry is now read back
+  (a unicast get, nothing on the fabric). An entry the snooper installed
+  but whose notification was lost resolves on the next re-probe instead
+  of waiting for the kernel to change it.
+- **Restarts a stuck resolver itself.** A loop that exits with an error,
+  or makes no progress for 30 s outside a wait on the FIB programmer, is
+  dropped and replaced, with restarts backing off from 1 s to 60 s. The
+  new loop re-reads the kernel and announces what the old one missed.
+  After every resync and restart, the programmer brings every unresolved
+  nexthop's next re-probe forward to now. Its backoff keeps counting, so
+  a dead neighbour is not solicited every few seconds through a long
+  storm.
+
+**Read the `neigh-resolver` row in `packetframe status`.** It is present
+whenever the PacketFrame FIB control plane runs, and its `last ok` age is
+the loop's progress age; an idle loop still makes progress every second.
+
+| Row reads | Meaning |
+|---|---|
+| healthy, `running (incarnation N); last progress Ns ago; overruns …` | Working. Non-zero overruns with an equal number of resyncs are history. |
+| **unhealthy**, `no progress for …` | The loop is stuck right now. The supervisor restarts it after 30 s. During a long kernel `rtnl_lock` hold the whole control-plane runtime can stall, and this reads unhealthy until the lock is released, without a restart. |
+| **unhealthy**, `NOT RUNNING: the resolver <cause>; restart #N in …` | Between a failure and its restart. The cause names the error or the stall. |
+| degraded, `restarted … ago (restart #N): the previous loop …` | Recovered by a restart in the last 10 minutes. The text says why the old loop was replaced. |
+| degraded, `… notifications were lost … ago (socket overrun); a resync is pending` (or `the resync failed (…) and is retried`) | An overrun is not yet answered. A failed resync is retried every 5 s. |
+| degraded, `a read of the kernel's links and neighbours did not complete … ago; the resync failed (…)` | A read failed, for example a dump timed out or an entry missing from a dump could not be confirmed gone. It is retried every 5 s, and the error says what failed. |
+| degraded, `waiting … for the FibProgrammer to accept its events` | The **programmer** is not draining, for example during a route-ledger seed or a full-table load. Restarting the resolver cannot help, so it is not restarted. If this lasts, the programmer is the problem. |
+| degraded, `the request socket was retired … ago and the kernel still holds it` | A request timed out and its socket is blocked in the kernel, typically on `rtnl_lock`. Proactive probes are skipped until it is released, and the programmer re-probes later. |
+
+The same numbers, as textfile metrics:
+
+```
+packetframe_fib_neigh_resolver_overruns_total{module="fast-path"}
+packetframe_fib_neigh_resolver_resyncs_total{module="fast-path"}
+packetframe_fib_neigh_resolver_resync_failures_total{module="fast-path"}
+packetframe_fib_neigh_resolver_request_timeouts_total{module="fast-path"}
+packetframe_fib_neigh_resolver_probes_skipped_total{module="fast-path"}
+packetframe_fib_neigh_resolver_restarts_total{module="fast-path"}
+packetframe_fib_neigh_resolver_running{module="fast-path"}                  # 0 between a failure and its restart
+packetframe_fib_neigh_resolver_progress_age_seconds{module="fast-path"}     # above 30 while not waiting on the programmer: stuck
+packetframe_fib_neigh_resolver_programmer_wait_seconds{module="fast-path"}  # 0 unless the programmer is not draining
+```
+
+Check:
+
+```sh
+sudo packetframe status | grep -A3 neigh-resolver
+sudo packetframe events --module fast-path --since 1h   # neigh_resolver_restarted, module_health
+journalctl -u packetframe --since -1h | grep -E 'neighbour resolver (stats|stopped)|notifications lost|resynced|request timed out|probe skipped'
+cat /proc/net/netlink    # protocol 0, groups 00000005: the Drops column
+```
+
+Every restart logs `neighbour resolver stopped working; restarting it`
+at error, with the cause, and records a `neigh_resolver_restarted` event
+(`cause`: `stalled` with `silent_ms`, `failed` with the error in
+`detail`, or `returned`). The `neighbour resolver stats` line now carries
+`incarnation`, `overruns`, `resyncs`, `resync_failures`,
+`request_timeouts`, `probes_skipped` and `restarts`.
+
+If the restart count keeps climbing (`restart #N` with N rising, and the
+row unhealthy between restarts), the resolver cannot get going at all.
+The cause in the row names the error: a socket that cannot be opened, or
+a multicast stream that keeps closing. The last resort is a daemon
+restart, and the event log keeps the history for the bug report. Restart
+like this, because a plain `systemctl restart` cannot start over the
+pins the old process leaves:
+
+```sh
+systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe
+```
+
+The same restart is the remedy on a build older than this fix. Before
+it, the resolver hung without a sound and only a restart recovered it.
+
+None of this covers a **panic**. The release build aborts on panic, which
+ends the whole daemon. `Restart=on-failure` then cannot bring it back,
+because fast-path refuses to start over the bpffs pins the dead process
+left. The unit's start limit marks it `failed`, and XDP keeps forwarding
+on the frozen maps until someone runs the teardown in the header of
+`crates/cli/debian/packetframe.service`.
+
 ### Symptom: `pass_not_in_devmap` climbs
 
 What it means: the FIB resolved an egress interface that is not in
@@ -1675,12 +1856,53 @@ bridge egress short-circuits) *before* admitting the new link, so a
 recreated `switch0.N` is redirected through its parent with the tag,
 never to the virtual device itself.
 
+The kernel drops link notifications the watcher's receive buffer has no
+room for (a burst of link changes while softirq load keeps the thread
+from draining) and says so only once, as an overrun. None of them is
+resent, so the watcher re-reads the whole link table instead: every
+qualifying link is admitted as its notification would have admitted it,
+and every ifindex the maps hold that the kernel no longer knows is
+evicted. The re-read subscribes afresh before its dump and reads on from
+that subscription once it has been applied: what the old one still held
+predates the loss, and replayed after the dump it could undo it (a
+delete queued before the loss evicting a link the dump just admitted at
+a reused ifindex).
+
 Check:
 
+- `packetframe status`, the fast-path `redirect-watch` row: healthy
+  `following the link table` is the normal state (with a count of
+  overruns, if any, each made good by a re-read). Degraded `link
+  notifications lost (N overruns)` means the maps are not known to be
+  current yet: the re-read runs a quarter second after the burst of link
+  events settles, and the recovery is done once its links have been read
+  and offered to the maps. Until then `not recovered yet (retrying)` says
+  why (the dump failed, or the link topology could not be read to apply
+  it); a failed dump is retried every 5 s. Links that qualify but are not
+  in the maps are a separate fact, shown whatever the overrun history,
+  in two forms:
+  - Degraded `N qualifying links are not in the redirect maps: the maps
+    are full`: an insert was refused with `E2BIG`. The maps hold 64 links
+    each. Each such link is warned about once (`redirect target refused:
+    the maps are full`) and offered again as soon as an eviction makes
+    room — a link deleted, or a reload — not on a timer.
+  - Degraded `N qualifying links could not be inserted into the redirect
+    maps (<error>)`: any other failure, such as a transient `ENOMEM`
+    from the devmap's atomic allocation. It is retried every 5 s and
+    warned when first seen or when its errno changes
+    (`redirect target insert failed`).
+
+  Either way their traffic takes the kernel path meanwhile.
+  Degraded `stopped (...)` means the watcher is gone and SIGHUP is
+  again the only refresh — `systemctl reload packetframe` reconciles
+  immediately; only a restart brings the watcher back. Metrics:
+  `packetframe_redirect_watch_running`,
+  `packetframe_redirect_watch_overruns_total`,
+  `packetframe_redirect_watch_resyncs_total{outcome="ok|failed"}`,
+  `packetframe_redirect_watch_unadmitted_links{reason="map_full|insert_failing"}`.
 - `journalctl -u packetframe | grep 'redirect-target'`: the watcher
   logs `live (RTNLGRP_LINK)` at start and every add/remove; a line
-  saying it stopped means SIGHUP is again the only refresh —
-  `systemctl reload packetframe` reconciles immediately.
+  saying it stopped means SIGHUP is again the only refresh, as above.
 - `bpftool map dump pinned /sys/fs/bpf/packetframe/fast-path/maps/REDIRECT_DEVMAP`
   against `ip -br link`: every up Ethernet-type ifindex should be a key.
 - `packetframe fib lookup <dst>` for an affected destination: the
@@ -1766,6 +1988,31 @@ Check:
   storm?
 - No process other than packetframe should be writing to
   `/sys/fs/bpf/packetframe/fast-path/maps/NEXTHOPS`.
+
+### Symptom: the feed session drops during a full-table load
+
+What it means: a hold timer expired, and every drop costs a `Resync`
+and the whole table again. Which side's timer fired says where to look.
+
+- **FRR's.** FRR logs `Notification sent (Hold Timer Expired)` and
+  `show bgp neighbor` gives it as the last reset: FRR heard no
+  KEEPALIVE from packetframe for its hold time. packetframe sends them
+  from a task of their own, every third of the hold time (30 s at the
+  default 90), so a slow load does not delay them. What still can is a
+  packetframe that gets no CPU at all, or a send that cannot complete
+  because FRR stopped reading. Look at
+  `top -H -p "$(pgrep -x packetframe)"` around the drop.
+- **packetframe's.** packetframe logs `BGP connection handler exited
+  with error` with `hold timer (90 s) expired`: it waited on the
+  socket for a whole hold time without a complete message from FRR.
+  Time spent behind on route processing does not count, because the
+  socket is not read while the backlog drains and the timer runs only
+  while it is. So this is FRR, or the path to it, going quiet: read
+  FRR's log at the same timestamp.
+
+The reverse also holds: packetframe keeps the session up however
+slowly routes apply, so FRR showing `Established` says nothing about
+whether they are landing.
 
 ### Symptom: route-source session stays up but routes stop flowing
 

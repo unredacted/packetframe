@@ -93,11 +93,12 @@ Kinds are stable: scripts and alerts may key on them.
 | `steering_down` | Traffic returned to the eBPF tier | `cause` (`unsteer`, `nothing-to-steer`) |
 | `steering_restored` | An adopted VPP took the traffic back while the fallback was not ready | `detail` |
 | `steer_failed` | A steer or restore-steer failed; repeats of the same failure are recorded once. With `rules_remain: true` the rollback left rules in the NIC and traffic matching them is still on VPP | `action`, `reason`, `rules_remain` |
+| `steer_held` | The [first-steer hold](vpp-offload.md#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table) kept a steer that would divert more traffic onto VPP from the NIC. Not a failure: nothing was attempted and nothing changed — with `steered: true` the rules already installed keep forwarding and traffic stays on VPP; with `steered: false` traffic stays on the eBPF tier. The reason says what clears it; repeats of the same reason are recorded once | `reason`, `steered` |
 | `unsteer_failed` | Steering could not be removed; the VF is withheld | `reason` |
-| `verify_passed` / `verify_failed` / `verify_incomplete` | A verify finished | `outcome`, `seeded`, `may_steer`; a re-run of a stale incomplete verdict carries `outcome` and `rerun: true` instead, and decides nothing |
+| `verify_passed` / `verify_failed` / `verify_incomplete` | A verify finished | `outcome`, `seeded`, `may_steer`; a re-run of a stale verdict (one that failed only on what the table outgrew, or one the table has outgrown) carries `outcome`, `rerun: true` and `cause` instead, and decides nothing itself |
 | `unresolvable_routes` | The set of named unresolvable routes changed (at most once a minute) | `ipv4`, `ipv6` (`<prefix> via <nexthop> [dev <device>] (<why>)`, `; `-separated, then `+K more`); `detail: none` once the set empties |
 | `adoption_path` | How a start took over VPP's FIB | `path` (`preserved-ledger`, `readback`, `readback-deferred`, `fresh`), `routes` |
-| `preserved_ledger_rejected` | The preserved route ledger was not used | `stage`, `reason` |
+| `preserved_ledger_rejected` | The preserved route ledger was not used | `stage`: the check that refused it — at bring-up `untrusted`, `too-large`, `unreadable`, `corrupt`, `format-version`, `unremovable`, `process`, `token`, `interfaces`; later `seed`, `fingerprint`, `fingerprint-moved`, `verify` ([table](vpp-offload.md#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)) — and `reason` |
 | `ledger_preserved` | A preserving stop handed (or failed to hand) the ledger to the next start | `preserved`, `routes` or `reason`, `state` |
 | `vpp_teardown` | The supervisor ordered VPP torn down | `cause`, `from_state`, `to_state`; with `cause: Wedged` also the evidence: `silent_ms`, `counted_ms`, `budget_ms`, `steered`, `unanswered_probes`, `last_probe_error`, `vpp_wait_ms`, `loop_gap_ms`, `stalls_excused` ([reading them](vpp-offload.md#a-teardown-with-causewedged)) |
 | `handback_ready` / `handback_held_back` | The IPv6 hand-back path changed readiness; the v6 half of steering follows it | `detail` |
@@ -113,6 +114,7 @@ Kinds are stable: scripts and alerts may key on them.
 | `route_ledger_seeded` | A start seeded the route mirror from the ledger | `routes_v4`, `routes_v6`, `advertisements`, `age_secs`, `writer_version`, `took_ms`, `failed` when some prefixes could not be installed |
 | `route_ledger_refused` | A start did not seed (warn for the faults, info for the expected outcomes); the mirror loads cold | `reason` (`missing`, `disabled`, `forwarding-mode`, `no-route-source`, `unreadable`, `unremovable`, `corrupt`, `format-version`, `identity`, `too-old`, `clock`, `peer-id`), `detail` |
 | `route_ledger_reconciled` | The route source's first completed dump after a seed garbage-collected what it did not re-advertise | `gc_removed` |
+| `neigh_resolver_restarted` | The neighbour resolver's loop exited, or made no progress for 30 s outside a wait on the FIB programmer, and the daemon replaced it (warn). The new loop re-reads the kernel and announces what the old one missed ([triage](packetframe-fib.md#symptom-nexthops-stuck-incomplete-while-the-kernel-neighbour-is-reachable)) | `cause` (`stalled`, `failed`, `returned`), `detail`, `restarts`, `ran_for_s`, `backoff_ms`; `silent_ms` with `stalled` |
 
 **The log itself (`module: event-log`)**
 
