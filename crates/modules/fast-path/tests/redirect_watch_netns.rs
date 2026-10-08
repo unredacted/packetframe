@@ -632,13 +632,14 @@ fn links_the_maps_cannot_hold_are_reported_and_admitted_when_room_is_made() {
     let rig = OverrunRig::start("c", 72, "79", ROOMY);
     ns_run(&rig.netns, &["ip", "link", "set", "group", rig.group, "up"]);
     let s = rig.status_until("the refused links reported", Duration::from_secs(15), |s| {
-        s.unadmitted > 0
+        s.map_full > 0
     });
     assert_eq!(s.overruns, 0, "premise: nothing was lost; {s:?}");
     let left = rig.outside();
     assert!(!left.is_empty(), "premise: the maps overflowed");
+    // Counted as a full map (E2BIG), not as an insert that is failing.
     let s = rig.status_until("every link left out counted", Duration::from_secs(5), |s| {
-        s.unadmitted == left.len() as u64
+        s.map_full == left.len() as u64 && s.insert_failing == 0
     });
     let h = s.subsystem_health();
     assert_eq!(h.state, HealthState::Degraded, "{s:?}");
@@ -650,7 +651,7 @@ fn links_the_maps_cannot_hold_are_reported_and_admitted_when_room_is_made() {
 
     let gone = rig.delete_admitted(left.len() + 2);
     let s = rig.status_until("room made, all admitted", Duration::from_secs(15), |s| {
-        s.unadmitted == 0
+        s.map_full == 0
     });
     assert_eq!(s.subsystem_health().state, HealthState::Healthy, "{s:?}");
     rig.all_admitted_but(&gone);
@@ -669,7 +670,7 @@ fn a_recovery_completes_though_the_maps_are_full() {
     let s = rig.status_until("recovery recorded", Duration::from_secs(15), |s| {
         !s.resync_pending && s.resyncs_ok > before.resyncs_ok
     });
-    assert!(s.unadmitted > 0, "premise: the maps overflowed; {s:?}");
+    assert!(s.map_full > 0, "premise: the maps overflowed; {s:?}");
     let m = s.subsystem_health().message.unwrap();
     assert!(
         m.contains("not in the redirect maps") && !m.contains("notifications lost"),
@@ -678,7 +679,7 @@ fn a_recovery_completes_though_the_maps_are_full() {
     let left = rig.outside();
     let gone = rig.delete_admitted(left.len() + 2);
     rig.status_until("room made, all admitted", Duration::from_secs(15), |s| {
-        s.unadmitted == 0 && !s.resync_pending
+        s.map_full == 0 && !s.resync_pending
     });
     rig.all_admitted_but(&gone);
 }

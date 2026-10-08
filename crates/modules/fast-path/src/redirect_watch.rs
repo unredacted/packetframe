@@ -52,12 +52,14 @@
 //! for admission exactly as its `RTM_NEWLINK` would have been, and every
 //! ifindex the maps hold that the kernel no longer knows is evicted.
 //!
-//! The maps hold 64 links each. A link whose insert is refused (they
-//! are full) is warned about once and offered again only when an
-//! eviction makes room: no timer can fix a full map. How many are left
-//! out is reported on every refresh, apart from any overrun. The
-//! watcher's state — running or stopped, overruns, re-reads, refused
-//! links — is the `redirect-watch` status row ([`WatchStatus`]).
+//! The maps hold 64 links each. A link a map refuses with `E2BIG` (it
+//! is full) is warned about once and offered again only when an
+//! eviction makes room: no timer can fix a full map. An insert that
+//! fails any other way (the devmap allocates atomically and can return
+//! a transient `ENOMEM`) is retried every few seconds instead. Both are
+//! reported on every refresh, apart from any overrun. The watcher's
+//! state — running or stopped, overruns, re-reads, links left out and
+//! why — is the `redirect-watch` status row ([`WatchStatus`]).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -296,11 +298,45 @@ struct Targets {
     rx_ports: Vec<(String, u32)>,
     /// Ports whose receive MACs the last refresh could not read.
     rx_unknown: HashSet<u32>,
-    /// Links whose insert into either redirect map was refused. The maps
-    /// hold 64 entries each, so the usual reason is that they are full,
-    /// which no timer can fix: each is warned about once, and offered
-    /// again only when an eviction makes room.
-    refused: HashSet<u32>,
+    /// Links a redirect map refused with `E2BIG`: it is full (64 links
+    /// each). No retry can fix that, so each is warned about once and
+    /// offered again only when an eviction makes room.
+    full: HashSet<u32>,
+    /// Links whose insert failed any other way, with the errno (0 when
+    /// none could be read): `REDIRECT_DEVMAP` allocates its entries
+    /// atomically and can fail with a transient `ENOMEM`. These may pass
+    /// on their own, so they are retried on [`RESYNC_RETRY`]'s pace, and
+    /// warned about when first seen or when the errno changes.
+    failing: std::collections::HashMap<u32, i32>,
+}
+
+/// Why one insert into a redirect map failed, as far as what to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsertFailure {
+    /// `E2BIG`: the map is full. Only room made by an eviction helps.
+    Full,
+    /// Anything else, with its errno when there is one: retried.
+    Failing(Option<i32>),
+}
+
+impl InsertFailure {
+    fn of(e: &(dyn std::error::Error + 'static)) -> Self {
+        // aya's map errors are transparent down to the syscall's
+        // `io::Error`, so the errno is found by walking the sources.
+        let mut cur = Some(e);
+        let mut errno = None;
+        while let Some(err) = cur {
+            if let Some(io) = err.downcast_ref::<std::io::Error>() {
+                errno = io.raw_os_error();
+                break;
+            }
+            cur = err.source();
+        }
+        match errno {
+            Some(libc::E2BIG) => Self::Full,
+            other => Self::Failing(other),
+        }
+    }
 }
 
 impl Targets {
@@ -338,7 +374,8 @@ impl Targets {
             rx,
             rx_ports,
             rx_unknown: HashSet::new(),
-            refused: HashSet::new(),
+            full: HashSet::new(),
+            failing: std::collections::HashMap::new(),
         })
     }
 
@@ -373,14 +410,14 @@ impl Targets {
 
     fn admit(&mut self, ifindex: u32, why: &'static str) {
         let mut changed = false;
-        let mut refused = Vec::new();
+        let mut failures: Vec<(&str, InsertFailure, String)> = Vec::new();
         if !self.in_devmap.contains(&ifindex) {
             match self.devmap.insert(ifindex, ifindex, None, 0) {
                 Ok(()) => {
                     self.in_devmap.insert(ifindex);
                     changed = true;
                 }
-                Err(e) => refused.push(format!("REDIRECT_DEVMAP: {e}")),
+                Err(e) => failures.push(("REDIRECT_DEVMAP", InsertFailure::of(&e), e.to_string())),
             }
         }
         if !self.in_tc.contains(&ifindex) {
@@ -389,32 +426,65 @@ impl Targets {
                     self.in_tc.insert(ifindex);
                     changed = true;
                 }
-                Err(e) => refused.push(format!("TC_REDIRECT_TARGETS: {e}")),
+                Err(e) => {
+                    failures.push(("TC_REDIRECT_TARGETS", InsertFailure::of(&e), e.to_string()))
+                }
             }
         }
         if changed {
             info!(ifindex, why, "redirect target added");
         }
-        if refused.is_empty() {
-            self.refused.remove(&ifindex);
-        } else if self.refused.insert(ifindex) {
-            warn!(
-                ifindex,
-                errors = %refused.join("; "),
-                "redirect target refused (the maps hold 64 links each); its traffic takes the \
-                 kernel path until an eviction makes room"
-            );
+        let errors = || {
+            failures
+                .iter()
+                .map(|(map, _, e)| format!("{map}: {e}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        // A failure that might pass wins over a full map: it is retried,
+        // and a retry that then meets only E2BIG moves it to `full`.
+        let failing = failures.iter().find_map(|(_, f, _)| match f {
+            InsertFailure::Failing(errno) => Some(errno.unwrap_or(0)),
+            InsertFailure::Full => None,
+        });
+        if let Some(errno) = failing {
+            self.full.remove(&ifindex);
+            if self.failing.insert(ifindex, errno) != Some(errno) {
+                warn!(
+                    ifindex,
+                    errno,
+                    errors = %errors(),
+                    "redirect target insert failed; retried every {}s, its traffic on the \
+                     kernel path meanwhile",
+                    RESYNC_RETRY.as_secs()
+                );
+            } else {
+                debug!(ifindex, errno, errors = %errors(), "redirect target insert still failing");
+            }
+        } else if !failures.is_empty() {
+            self.failing.remove(&ifindex);
+            if self.full.insert(ifindex) {
+                warn!(
+                    ifindex,
+                    errors = %errors(),
+                    "redirect target refused: the maps are full (64 links each); its traffic \
+                     takes the kernel path until an eviction makes room"
+                );
+            } else {
+                debug!(ifindex, errors = %errors(), "redirect target still refused, maps full");
+            }
         } else {
-            debug!(ifindex, errors = %refused.join("; "), "redirect target still refused");
+            self.full.remove(&ifindex);
+            self.failing.remove(&ifindex);
         }
     }
 
-    /// Room was made in the maps: offer every refused link again.
-    fn offer_refused(&self, pending: &mut Pending) {
-        if self.refused.is_empty() {
+    /// Room was made in the maps: offer every link a full map refused.
+    fn offer_full(&self, pending: &mut Pending) {
+        if self.full.is_empty() {
             return;
         }
-        for &ifindex in &self.refused {
+        for &ifindex in &self.full {
             if !pending.admit.contains(&ifindex) {
                 pending.admit.push(ifindex);
             }
@@ -422,14 +492,30 @@ impl Targets {
         pending.touch();
     }
 
-    /// Forget refused links the kernel no longer knows.
-    fn prune_refused(&mut self) {
-        self.refused.retain(|i| ifindex_exists(*i));
+    /// Queue the links whose insert failed other than on a full map for
+    /// another attempt, on the failed re-read's pace.
+    fn retry_failing(&self, pending: &mut Pending) {
+        if self.failing.is_empty() {
+            return;
+        }
+        for &ifindex in self.failing.keys() {
+            if !pending.admit.contains(&ifindex) {
+                pending.admit.push(ifindex);
+            }
+        }
+        pending.due_by(Instant::now() + RESYNC_RETRY);
+    }
+
+    /// Forget unadmitted links the kernel no longer knows.
+    fn prune_unadmitted(&mut self) {
+        self.full.retain(|i| ifindex_exists(*i));
+        self.failing.retain(|i, _| ifindex_exists(*i));
     }
 
     /// Returns whether anything left either map, which makes room.
     fn evict(&mut self, ifindex: u32, why: &'static str) -> bool {
-        self.refused.remove(&ifindex);
+        self.full.remove(&ifindex);
+        self.failing.remove(&ifindex);
         let mut changed = false;
         if self.in_devmap.remove(&ifindex) {
             changed = true;
@@ -545,8 +631,8 @@ struct Pending {
     /// admissions it queued, after `VLAN_RESOLVE` — has not yet got past
     /// the topology read. Reading the table is half of a recovery;
     /// attempting what it found is the other half. Whether an attempted
-    /// admission fits in the maps is a separate fact ([`Targets::refused`]),
-    /// tracked whatever the overrun history.
+    /// admission landed is a separate fact ([`Targets::full`],
+    /// [`Targets::failing`]), tracked whatever the overrun history.
     recovering: bool,
 }
 
@@ -632,7 +718,7 @@ async fn resync(targets: &mut Targets, pending: &mut Pending) -> Result<(usize, 
         }
     }
     if evicted > 0 {
-        targets.offer_refused(pending);
+        targets.offer_full(pending);
     }
     Ok((plan.admit.len(), evicted))
 }
@@ -683,9 +769,9 @@ async fn run_resync(targets: &mut Targets, pending: &mut Pending, status: &Mutex
 
 /// After a refresh: a completed re-read is a completed recovery once the
 /// refresh got past the topology read, i.e. attempted every admission
-/// the re-read queued. One the maps refused is not a recovery failure —
-/// the maps would have refused its notification too — and is reported
-/// as such on every refresh ([`Targets::refused`]). A topology read that
+/// the re-read queued. One whose insert failed is not a recovery failure
+/// — its notification would have met the same insert — and is reported
+/// as such on every refresh ([`publish_unadmitted`]). A topology read that
 /// failed is: the refresh retries it within a quarter second, and the
 /// row says why until then.
 fn settle_recovery(
@@ -710,13 +796,15 @@ fn settle_recovery(
     s.resync_pending = pending.resync || pending.recovering;
 }
 
-/// The links the maps refused, as the status row reports them.
-fn publish_refused(targets: &mut Targets, status: &Mutex<WatchStatus>) {
-    targets.prune_refused();
-    status
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .unadmitted = targets.refused.len() as u64;
+/// The qualifying links not in the maps, as the status row reports them:
+/// those a full map refused, apart from those whose insert is failing
+/// some other way (and is being retried).
+fn publish_unadmitted(targets: &mut Targets, status: &Mutex<WatchStatus>) {
+    targets.prune_unadmitted();
+    let mut s = status.lock().unwrap_or_else(PoisonError::into_inner);
+    s.map_full = targets.full.len() as u64;
+    s.insert_failing = targets.failing.len() as u64;
+    s.insert_errno = targets.failing.values().copied().max();
 }
 
 /// Record why the watcher ended, for the status row, and log it.
@@ -776,7 +864,8 @@ async fn run(
     // A topology read failure here re-arms the debounce like any other.
     let _ = refresh(&mut targets, &mut pending, &directives);
     targets.reconcile_targets();
-    publish_refused(&mut targets, &status);
+    publish_unadmitted(&mut targets, &status);
+    targets.retry_failing(&mut pending);
     info!(
         devmap = targets.in_devmap.len(),
         tc = targets.in_tc.len(),
@@ -820,7 +909,8 @@ async fn run(
                 }
                 let refreshed = refresh(&mut targets, &mut pending, &directives);
                 settle_recovery(&mut pending, &refreshed, &status);
-                publish_refused(&mut targets, &status);
+                publish_unadmitted(&mut targets, &status);
+                targets.retry_failing(&mut pending);
                 if pending.resync {
                     // Owed but not yet retried (it failed, or is paced):
                     // keep the refresh coming round for it.
@@ -832,7 +922,7 @@ async fn run(
                 // A SIGHUP changed the directives; converge on them
                 // after whatever refresh may just have run. Its own
                 // reconcile may have made room, too.
-                targets.offer_refused(&mut pending);
+                targets.offer_full(&mut pending);
                 pending.touch();
             }
             Some((d, began)) = stalls.recv() => {
@@ -918,8 +1008,8 @@ fn handle(targets: &mut Targets, pending: &mut Pending, msg: NetlinkMessage<Rout
             let ifindex = link.header.index;
             pending.admit.retain(|i| *i != ifindex);
             if targets.evict(ifindex, "RTM_DELLINK") {
-                // Room was made: what the maps refused gets its turn.
-                targets.offer_refused(pending);
+                // Room was made: what a full map refused gets its turn.
+                targets.offer_full(pending);
             }
             pending.touch();
         }
@@ -997,6 +1087,44 @@ mod tests {
             }
         );
         assert_eq!(resync_plan(&[], &HashSet::new()), ResyncPlan::default());
+    }
+
+    /// Only `E2BIG` means a map is full; anything else, the devmap's
+    /// transient `ENOMEM` above all, is a failure a retry may get past.
+    /// Read through aya's own error types, as the inserts return them.
+    #[test]
+    fn only_e2big_is_a_full_map() {
+        use aya::maps::{xdp::XdpMapError, MapError};
+        use aya::sys::SyscallError;
+        let map_err = |errno| {
+            MapError::SyscallError(SyscallError {
+                call: "bpf_map_update_elem",
+                io_error: std::io::Error::from_raw_os_error(errno),
+            })
+        };
+        // TC_REDIRECT_TARGETS: a plain hash, `MapError`.
+        assert_eq!(
+            InsertFailure::of(&map_err(libc::E2BIG)),
+            InsertFailure::Full
+        );
+        assert_eq!(
+            InsertFailure::of(&map_err(libc::ENOMEM)),
+            InsertFailure::Failing(Some(libc::ENOMEM))
+        );
+        // REDIRECT_DEVMAP: a devmap hash, `XdpMapError` wrapping it.
+        assert_eq!(
+            InsertFailure::of(&XdpMapError::MapError(map_err(libc::E2BIG))),
+            InsertFailure::Full
+        );
+        assert_eq!(
+            InsertFailure::of(&XdpMapError::MapError(map_err(libc::ENOMEM))),
+            InsertFailure::Failing(Some(libc::ENOMEM))
+        );
+        // No errno to be had: not evidence of a full map either.
+        assert_eq!(
+            InsertFailure::of(&XdpMapError::ChainedProgramNotSupported),
+            InsertFailure::Failing(None)
+        );
     }
 
     /// A completed re-read is a completed recovery once the refresh after

@@ -1695,20 +1695,28 @@ Check:
   events settles, and the recovery is done once its links have been read
   and offered to the maps. Until then `not recovered yet (retrying)` says
   why (the dump failed, or the link topology could not be read to apply
-  it); a failed dump is retried every 5 s. Degraded `N qualifying links
-  are not in the redirect maps` is a separate fact, shown whatever the
-  overrun history: the maps hold 64 links each, and those links' inserts
-  were refused (in practice, the maps are full), so their traffic takes
-  the kernel path. Each refused link is warned about once
-  (`redirect target refused`). It is offered again as soon as an
-  eviction makes room — a link deleted, or a reload — not on a timer.
+  it); a failed dump is retried every 5 s. Links that qualify but are not
+  in the maps are a separate fact, shown whatever the overrun history,
+  in two forms:
+  - Degraded `N qualifying links are not in the redirect maps: the maps
+    are full`: an insert was refused with `E2BIG`. The maps hold 64 links
+    each. Each such link is warned about once (`redirect target refused:
+    the maps are full`) and offered again as soon as an eviction makes
+    room — a link deleted, or a reload — not on a timer.
+  - Degraded `N qualifying links could not be inserted into the redirect
+    maps (<error>)`: any other failure, such as a transient `ENOMEM`
+    from the devmap's atomic allocation. It is retried every 5 s and
+    warned when first seen or when its errno changes
+    (`redirect target insert failed`).
+
+  Either way their traffic takes the kernel path meanwhile.
   Degraded `stopped (...)` means the watcher is gone and SIGHUP is
   again the only refresh — `systemctl reload packetframe` reconciles
   immediately; only a restart brings the watcher back. Metrics:
   `packetframe_redirect_watch_running`,
   `packetframe_redirect_watch_overruns_total`,
   `packetframe_redirect_watch_resyncs_total{outcome="ok|failed"}`,
-  `packetframe_redirect_watch_unadmitted_links`.
+  `packetframe_redirect_watch_unadmitted_links{reason="map_full|insert_failing"}`.
 - `journalctl -u packetframe | grep 'redirect-target'`: the watcher
   logs `live (RTNLGRP_LINK)` at start and every add/remove; a line
   saying it stopped means SIGHUP is again the only refresh, as above.

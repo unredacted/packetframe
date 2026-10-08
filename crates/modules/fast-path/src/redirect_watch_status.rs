@@ -1,8 +1,9 @@
 //! What the redirect-target watcher (`redirect_watch`, Linux-only)
 //! reports about itself: whether it still follows the link table, how
 //! often the kernel dropped link notifications on it, and how many
-//! qualifying links the redirect maps refused. Portable, so the
-//! `redirect-watch` status row and its gauges are tested on every host.
+//! qualifying links are not in the redirect maps, and why. Portable, so
+//! the `redirect-watch` status row and its gauges are tested on every
+//! host.
 
 use std::fmt::Write as _;
 
@@ -30,21 +31,42 @@ pub struct WatchStatus {
     /// topology could not be read to apply it. Cleared by a completed
     /// recovery.
     pub last_resync_error: Option<String>,
-    /// Qualifying links whose insert into a redirect map was refused —
-    /// in practice, the maps are full (64 links each). Recomputed on every
-    /// refresh, whatever the overrun history; their traffic takes the
-    /// kernel path until an eviction makes room.
-    pub unadmitted: u64,
+    /// Qualifying links a redirect map refused with `E2BIG`: the maps are
+    /// full (64 links each). Recomputed on every refresh, whatever the
+    /// overrun history; their traffic takes the kernel path until an
+    /// eviction makes room.
+    pub map_full: u64,
+    /// Qualifying links whose insert failed any other way (a transient
+    /// `ENOMEM` from the devmap, say), retried every few seconds.
+    pub insert_failing: u64,
+    /// One of their errnos, for the row.
+    pub insert_errno: Option<i32>,
 }
 
 impl WatchStatus {
-    fn refused_text(&self) -> String {
-        format!(
-            "{} qualifying links are not in the redirect maps: their insert was refused (the \
-             maps hold 64 links each, so usually they are full); their traffic takes the \
-             kernel path until an eviction makes room",
-            self.unadmitted
-        )
+    /// What the row says about qualifying links that are not targets;
+    /// empty when there are none.
+    fn unadmitted_text(&self) -> String {
+        let mut parts = Vec::new();
+        if self.map_full > 0 {
+            parts.push(format!(
+                "{} qualifying links are not in the redirect maps: the maps are full (64 links \
+                 each), and their traffic takes the kernel path until an eviction makes room",
+                self.map_full
+            ));
+        }
+        if self.insert_failing > 0 {
+            let why = match self.insert_errno {
+                Some(e) if e != 0 => std::io::Error::from_raw_os_error(e).to_string(),
+                _ => "no errno".to_string(),
+            };
+            parts.push(format!(
+                "{} qualifying links could not be inserted into the redirect maps ({why}); \
+                 retrying, their traffic on the kernel path meanwhile",
+                self.insert_failing
+            ));
+        }
+        parts.join("; ")
     }
 
     pub fn subsystem_health(&self) -> SubsystemHealth {
@@ -66,12 +88,13 @@ impl WatchStatus {
             if let Some(e) = &self.last_resync_error {
                 let _ = write!(m, "; not recovered yet (retrying): {e}");
             }
-            if self.unadmitted > 0 {
-                let _ = write!(m, "; {}", self.refused_text());
+            let unadmitted = self.unadmitted_text();
+            if !unadmitted.is_empty() {
+                let _ = write!(m, "; {unadmitted}");
             }
             (HealthState::Degraded, m)
-        } else if self.unadmitted > 0 {
-            (HealthState::Degraded, self.refused_text())
+        } else if self.map_full > 0 || self.insert_failing > 0 {
+            (HealthState::Degraded, self.unadmitted_text())
         } else {
             let mut m = "following the link table".to_string();
             if self.overruns > 0 {
@@ -133,17 +156,21 @@ impl WatchStatus {
         }
         let _ = writeln!(
             out,
-            "# HELP packetframe_redirect_watch_unadmitted_links qualifying links the redirect maps refused (usually: full)"
+            "# HELP packetframe_redirect_watch_unadmitted_links qualifying links not in the redirect maps (map_full: refused with E2BIG; insert_failing: any other error, retried)"
         );
         let _ = writeln!(
             out,
             "# TYPE packetframe_redirect_watch_unadmitted_links gauge"
         );
-        let _ = writeln!(
-            out,
-            "packetframe_redirect_watch_unadmitted_links{{module=\"fast-path\"}} {}",
-            self.unadmitted
-        );
+        for (reason, n) in [
+            ("map_full", self.map_full),
+            ("insert_failing", self.insert_failing),
+        ] {
+            let _ = writeln!(
+                out,
+                "packetframe_redirect_watch_unadmitted_links{{module=\"fast-path\",reason=\"{reason}\"}} {n}"
+            );
+        }
     }
 }
 
@@ -203,28 +230,50 @@ mod tests {
         assert!(out.contains("packetframe_redirect_watch_running{module=\"fast-path\"} 0"));
     }
 
-    /// Links the maps refused are their own condition: Degraded with or
-    /// without an overrun behind it, and named as a capacity problem, not
-    /// as lost notifications.
+    /// Links left out of the maps are their own condition: Degraded with or
+    /// without an overrun behind it, and never blamed on lost notifications.
+    /// A full map and a failing insert are told apart, the latter with its
+    /// errno.
     #[test]
-    fn refused_links_degrade_whatever_the_overrun_history() {
+    fn links_left_out_degrade_whatever_the_overrun_history() {
         let s = WatchStatus {
-            unadmitted: 8,
+            map_full: 8,
             ..WatchStatus::default()
         };
         let h = s.subsystem_health();
         assert_eq!(h.state, HealthState::Degraded);
         let m = h.message.unwrap();
         assert!(
-            m.starts_with("8 qualifying links are not in the redirect maps"),
+            m.starts_with("8 qualifying links are not in the redirect maps: the maps are full"),
             "{m}"
         );
-        assert!(!m.contains("notifications lost"), "{m}");
+        assert!(
+            !m.contains("notifications lost") && !m.contains("could not be inserted"),
+            "{m}"
+        );
+
+        let s = WatchStatus {
+            insert_failing: 2,
+            insert_errno: Some(12),
+            ..WatchStatus::default()
+        };
+        let h = s.subsystem_health();
+        assert_eq!(h.state, HealthState::Degraded);
+        let m = h.message.unwrap();
+        let enomem = std::io::Error::from_raw_os_error(12).to_string();
+        assert!(
+            m.starts_with("2 qualifying links could not be inserted") && m.contains(&enomem),
+            "{m}"
+        );
+        assert!(
+            !m.contains("full"),
+            "a failing insert is not a full map: {m}"
+        );
 
         let s = WatchStatus {
             overruns: 1,
             resync_pending: true,
-            unadmitted: 8,
+            map_full: 8,
             ..WatchStatus::default()
         };
         let m = s.subsystem_health().message.unwrap();
@@ -240,7 +289,8 @@ mod tests {
             overruns: 3,
             resyncs_ok: 2,
             resyncs_failed: 1,
-            unadmitted: 4,
+            map_full: 4,
+            insert_failing: 5,
             ..WatchStatus::default()
         };
         let mut out = String::new();
@@ -250,7 +300,8 @@ mod tests {
             "packetframe_redirect_watch_overruns_total{module=\"fast-path\"} 3",
             "packetframe_redirect_watch_resyncs_total{module=\"fast-path\",outcome=\"ok\"} 2",
             "packetframe_redirect_watch_resyncs_total{module=\"fast-path\",outcome=\"failed\"} 1",
-            "packetframe_redirect_watch_unadmitted_links{module=\"fast-path\"} 4",
+            "packetframe_redirect_watch_unadmitted_links{module=\"fast-path\",reason=\"map_full\"} 4",
+            "packetframe_redirect_watch_unadmitted_links{module=\"fast-path\",reason=\"insert_failing\"} 5",
         ] {
             assert!(out.lines().any(|l| l == line), "missing {line} in:\n{out}");
         }
