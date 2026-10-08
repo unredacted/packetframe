@@ -849,6 +849,8 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         ));
     }
 
+    crate::vrrp::check_attach_set(cfg)?;
+
     // Refuse startup when pins from a prior invocation survive.
     // SPEC.md §8.5 "exit without detach" leaves pins in bpffs after
     // SIGTERM; they are not adopted, so the operator must run
