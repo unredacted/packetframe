@@ -23,6 +23,7 @@ pub mod coalesce;
 pub mod fib;
 pub mod metrics;
 pub mod pin;
+pub mod redirect_watch_status;
 pub mod registry;
 pub mod rx_macs;
 pub mod sample;
@@ -51,6 +52,9 @@ pub mod reconcile;
 
 #[cfg(target_os = "linux")]
 pub mod redirect_watch;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod netlink_bounds;
 
 #[cfg(target_os = "linux")]
 pub use linux_impl::{
@@ -313,13 +317,17 @@ impl Module for FastPathModule {
         Ok(())
     }
 
-    /// Only the `wan-egress` gauges come through here: they live in
-    /// the daemon's memory, not in a pinned map. Everything else the
-    /// cli's MetricsExporter (`crates/cli/src/metrics.rs`) reads from
-    /// the pins directly on its 15 s cadence.
+    /// Only the gauges that live in the daemon's memory rather than in a
+    /// pinned map come through here: `wan-egress`, the route ledger and
+    /// the redirect-target watcher. Everything else the cli's
+    /// MetricsExporter (`crates/cli/src/metrics.rs`) reads from the pins
+    /// directly on its 15 s cadence.
     #[cfg(target_os = "linux")]
     fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
         if let Some(w) = self.state.as_ref().and_then(|s| s.wan_egress.as_ref()) {
+            w.status().render_metrics(out.out);
+        }
+        if let Some(w) = self.state.as_ref().and_then(|s| s.redirect_watch.as_ref()) {
             w.status().render_metrics(out.out);
         }
         if let Some(l) = self
@@ -360,6 +368,10 @@ impl Module for FastPathModule {
     /// A third, `route-ledger`, whenever the PacketFrame FIB control
     /// plane runs: seeded from a ledger (and how far the route source's
     /// replay has confirmed it), or why this start loaded cold.
+    ///
+    /// A fourth, `redirect-watch`, whenever attached (in any forwarding
+    /// mode): whether the redirect maps still follow the link table, or
+    /// why not.
     #[cfg(target_os = "linux")]
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
         let mut subsystems: Vec<_> = self
@@ -381,6 +393,9 @@ impl Module for FastPathModule {
         {
             subsystems
                 .push(l.subsystem_health(fib::route_ledger::now_unix(), std::time::Instant::now()));
+        }
+        if let Some(w) = self.state.as_ref().and_then(|s| s.redirect_watch.as_ref()) {
+            subsystems.push(w.status().subsystem_health());
         }
         // `worse_of` rather than a hand-rolled escalation: a module that
         // reports Healthy over a Degraded subsystem disagrees with its

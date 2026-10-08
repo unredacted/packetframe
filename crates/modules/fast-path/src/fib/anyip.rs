@@ -56,6 +56,7 @@
 #![cfg(target_os = "linux")]
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
 
 use futures::TryStreamExt;
 use netlink_packet_route::address::AddressAttribute;
@@ -65,6 +66,8 @@ use netlink_packet_route::route::{
 use rtnetlink::sys::{AsyncSocket, TokioSocket};
 use rtnetlink::{Handle, RouteMessageBuilder};
 use tracing::info;
+
+use crate::netlink_bounds::NETLINK_EXCHANGE_TIMEOUT;
 
 /// The kernel's `local` routing table, where type-`local` routes
 /// conventionally live (`ip route show table local`).
@@ -128,6 +131,22 @@ pub enum AnyipError {
          refusing to replace a kernel-owned entry with an anyip local route"
     )]
     RouteKindConflict { addr: Ipv4Addr, kind: RouteType },
+    #[error("no netlink reply within {}s; abandoned", .0.as_secs())]
+    TimedOut(Duration),
+}
+
+/// Every call here under [`NETLINK_EXCHANGE_TIMEOUT`]. Its callers wait
+/// on it where a hang costs the most: the BGP listener's retry loop
+/// re-ensures the route before every restart (a call that never returns
+/// keeps the feed down for good), and shutdown removes it inside a
+/// blocking drain. Each call opens its own connections, so abandoning
+/// one drops them with it.
+async fn bounded<T>(
+    call: impl std::future::Future<Output = Result<T, AnyipError>>,
+) -> Result<T, AnyipError> {
+    tokio::time::timeout(NETLINK_EXCHANGE_TIMEOUT, call)
+        .await
+        .unwrap_or(Err(AnyipError::TimedOut(NETLINK_EXCHANGE_TIMEOUT)))
 }
 
 /// Whether [`ensure_local_route`] created the route or adopted one a
@@ -150,8 +169,13 @@ pub enum EnsureOutcome {
 /// [`EnsureOutcome::Adopted`] from a previous daemon life.
 ///
 /// Fails with [`AnyipError::AddressOwned`] if any interface holds
-/// `addr` — see the module docs for why that is a hard refusal.
+/// `addr` — see the module docs for why that is a hard refusal — and
+/// with [`AnyipError::TimedOut`] if the kernel stops answering.
 pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipError> {
+    bounded(ensure_unbounded(addr)).await
+}
+
+async fn ensure_unbounded(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipError> {
     let (conn, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(conn);
 
@@ -243,6 +267,10 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipEr
 /// owned by anything else is unreachable from here — it survives as
 /// an ESRCH, which the tolerant arm below reports as success.
 pub async fn remove_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
+    bounded(remove_unbounded(addr)).await
+}
+
+async fn remove_unbounded(addr: Ipv4Addr) -> Result<(), AnyipError> {
     let (conn, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(conn);
 

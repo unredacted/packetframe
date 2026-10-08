@@ -45,19 +45,28 @@
 //! oper-down does not remove it — the kernel refuses a redirect to a
 //! down device and the frame is counted, which is the conservative
 //! failure and identical to what the attach-time fill would have left.
+//!
+//! Link notifications the kernel drops on a full receive buffer
+//! (reported once, as an overrun) are never resent, so an overrun
+//! re-reads the link table instead: every link that qualifies is queued
+//! for admission exactly as its `RTM_NEWLINK` would have been, and every
+//! ifindex the maps hold that the kernel no longer knows is evicted. The
+//! watcher's state — running or stopped, overruns, re-reads — is the
+//! `redirect-watch` status row ([`WatchStatus`]).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use aya::maps::{xdp::DevMapHash, Array, HashMap as AyaHashMap, Map, MapData};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::link::{LinkAttribute, LinkLayerType, LinkMessage, State};
 use netlink_packet_route::RouteNetlinkMessage;
 use packetframe_common::config::ModuleDirective;
+use rtnetlink::sys::AsyncSocket;
 use rtnetlink::{new_multicast_connection, MulticastGroup};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -67,14 +76,28 @@ use crate::linux_impl::{
     enumerate_redirect_targets, set_cfg_flag_in, sync_rx_macs, FpCfg, RxMacKey, VlanResolve,
     FP_CFG_FLAG_VLAN_PRESENT,
 };
+use crate::netlink_bounds::{raise_rcvbuf, NETLINK_EXCHANGE_TIMEOUT};
 use crate::pin;
 use crate::reconcile::{apply_vlan_resolve, desired_vlan_resolve, ifindex_exists};
+pub use crate::redirect_watch_status::WatchStatus;
 
 /// How long after the last link event the topology refresh runs.
 /// Long enough to fold a provisioning burst into one pass, short
 /// enough that a single new link is forwarding within the time its
 /// neighbours resolve.
 const DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// What the subscription asks for as its receive buffer. A provisioning
+/// pass re-creates dozens of bridges and VLAN devices, each announced by
+/// several `RTM_NEWLINK`s of a few KiB, while the softirq load around it
+/// can keep this thread from draining; the default (about 200 KiB) holds
+/// a few dozen. This holds hundreds more. It makes an overrun rarer;
+/// the re-read is what makes one harmless.
+const LINK_RCVBUF: usize = 2 << 20;
+
+/// The least time between two failed link-table re-reads, so a dump that
+/// keeps failing is retried rather than hammered every debounce.
+const RESYNC_RETRY: Duration = Duration::from_secs(5);
 
 /// Handle on the running watcher. Owned by `ActiveState`; `detach`
 /// calls [`shutdown`](Self::shutdown) before it removes the pins the
@@ -86,6 +109,8 @@ pub struct RedirectTargetWatcher {
     /// Wakes the watcher for a refresh that no link event caused: a
     /// SIGHUP handed over new directives.
     refresh_now: Arc<tokio::sync::Notify>,
+    /// Written by the watcher thread, read by the status row.
+    status: Arc<Mutex<WatchStatus>>,
 }
 
 impl RedirectTargetWatcher {
@@ -100,11 +125,25 @@ impl RedirectTargetWatcher {
     /// `Err` only when the thread itself cannot be created. A netlink
     /// or map failure *inside* the thread is logged and ends it: attach
     /// stays up and the SIGHUP reconcile remains the fallback refresh,
-    /// exactly as before this existed.
+    /// exactly as before this existed, and the `redirect-watch` status
+    /// row says so ([`Self::status`]).
     pub fn start(
         bpffs_root: &Path,
         directives: Vec<ModuleDirective>,
         rx_ports: Vec<(String, u32)>,
+    ) -> std::io::Result<Self> {
+        Self::start_with_rcvbuf(bpffs_root, directives, rx_ports, LINK_RCVBUF)
+    }
+
+    /// [`Self::start`] with the subscription's receive buffer chosen by
+    /// the caller. For tests, which shrink it to force an overrun on
+    /// demand.
+    #[doc(hidden)]
+    pub fn start_with_rcvbuf(
+        bpffs_root: &Path,
+        directives: Vec<ModuleDirective>,
+        rx_ports: Vec<(String, u32)>,
+        rcvbuf: usize,
     ) -> std::io::Result<Self> {
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
@@ -113,6 +152,8 @@ impl RedirectTargetWatcher {
         let shared = Arc::clone(&directives);
         let refresh_now = Arc::new(tokio::sync::Notify::new());
         let wake = Arc::clone(&refresh_now);
+        let status = Arc::new(Mutex::new(WatchStatus::default()));
+        let theirs = Arc::clone(&status);
         let thread = std::thread::Builder::new()
             .name("pf-redirect-watch".into())
             .spawn(move || {
@@ -122,22 +163,52 @@ impl RedirectTargetWatcher {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        warn!(
-                            error = %e,
-                            "redirect-target watcher: runtime build failed; REDIRECT_DEVMAP \
-                             refreshes only on SIGHUP"
-                        );
+                        stopped(&theirs, format!("runtime build failed: {e}"));
                         return;
                     }
                 };
-                rt.block_on(run(root, token, shared, wake, rx_ports));
+                rt.block_on(run(root, token, shared, wake, rx_ports, rcvbuf, theirs));
             })?;
         Ok(Self {
             shutdown,
             thread: Some(thread),
             directives,
             refresh_now,
+            status,
         })
+    }
+
+    /// A watcher whose thread could not be spawned. Nothing follows the
+    /// link table, and holding this instead of nothing keeps the status
+    /// row saying so rather than going silent.
+    pub fn not_started(why: String) -> Self {
+        Self {
+            shutdown: CancellationToken::new(),
+            thread: None,
+            directives: Arc::new(Mutex::new(Vec::new())),
+            refresh_now: Arc::new(tokio::sync::Notify::new()),
+            status: Arc::new(Mutex::new(WatchStatus {
+                stopped: Some(why),
+                ..WatchStatus::default()
+            })),
+        }
+    }
+
+    /// The `redirect-watch` status: the thread's own account, or — when
+    /// the thread has ended without giving one, which only a panic does
+    /// (it otherwise ends only when [`Self::shutdown`] consumes this
+    /// handle) — that it exited.
+    pub fn status(&self) -> WatchStatus {
+        let mut s = self
+            .status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let exited = self.thread.as_ref().is_some_and(JoinHandle::is_finished);
+        if exited && s.stopped.is_none() {
+            s.stopped = Some("the watcher thread exited unexpectedly".into());
+        }
+        s
     }
 
     /// Replace the directives the topology refresh derives
@@ -394,12 +465,150 @@ struct Pending {
     admit: Vec<u32>,
     /// When the refresh is due; `None` when nothing changed.
     due: Option<Instant>,
+    /// Link notifications were lost: the refresh re-reads the link table
+    /// first.
+    resync: bool,
+    /// A failed re-read is not retried before this.
+    resync_not_before: Option<Instant>,
 }
 
 impl Pending {
     fn touch(&mut self) {
         self.due = Some(Instant::now() + DEBOUNCE);
     }
+
+    /// The kernel reported lost notifications. Debounced like any event,
+    /// so a burst of overruns costs one re-read.
+    fn overrun(&mut self) {
+        self.resync = true;
+        self.touch();
+    }
+
+    fn resync_due(&self, now: Instant) -> bool {
+        self.resync && self.resync_not_before.is_none_or(|t| now >= t)
+    }
+
+    /// Make sure the refresh comes round again by `at`.
+    fn due_by(&mut self, at: Instant) {
+        self.due = Some(self.due.map_or(at, |d| d.min(at)));
+    }
+}
+
+/// What a link-table re-read changes: the links to queue for admission
+/// (each qualifying link, as its `RTM_NEWLINK` would have queued it) and
+/// the ifindexes the maps hold that the dump does not (each a lost
+/// `RTM_DELLINK`, evicted once the kernel confirms the ifindex is gone).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResyncPlan {
+    admit: Vec<u32>,
+    gone: Vec<u32>,
+}
+
+fn resync_plan(links: &[LinkMessage], known: &HashSet<u32>) -> ResyncPlan {
+    let mut admit: Vec<u32> = links.iter().filter_map(viable_target).collect();
+    admit.sort_unstable();
+    let present: HashSet<u32> = links.iter().map(|l| l.header.index).collect();
+    let mut gone: Vec<u32> = known.difference(&present).copied().collect();
+    gone.sort_unstable();
+    ResyncPlan { admit, gone }
+}
+
+/// One `RTM_GETLINK` dump on a fresh connection, bounded. Abandoning a
+/// timed-out dump drops the connection with it, so nothing is left
+/// waiting on a reply that will not come.
+async fn dump_links() -> Result<Vec<LinkMessage>, String> {
+    let (conn, handle, _) =
+        rtnetlink::new_connection().map_err(|e| format!("netlink connection: {e}"))?;
+    tokio::spawn(conn);
+    let dump = handle.link().get().execute().try_collect::<Vec<_>>();
+    match tokio::time::timeout(NETLINK_EXCHANGE_TIMEOUT, dump).await {
+        Ok(r) => r.map_err(|e| format!("link dump: {e}")),
+        Err(_) => Err(format!(
+            "link dump: no reply within {}s",
+            NETLINK_EXCHANGE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Re-read the link table after lost notifications (see the module
+/// docs). Returns how many links qualify (each queued; admission skips
+/// what is already in) and how many were evicted.
+async fn resync(targets: &mut Targets, pending: &mut Pending) -> Result<(usize, usize), String> {
+    let links = dump_links().await?;
+    let known: HashSet<u32> = targets.in_devmap.union(&targets.in_tc).copied().collect();
+    let plan = resync_plan(&links, &known);
+    let queued = plan.admit.len();
+    for ifindex in plan.admit {
+        if !pending.admit.contains(&ifindex) {
+            pending.admit.push(ifindex);
+        }
+    }
+    let mut evicted = 0;
+    for ifindex in plan.gone {
+        // A link created after the dump is not in it; only an ifindex
+        // the kernel no longer knows is a lost delete.
+        if !ifindex_exists(ifindex) {
+            pending.admit.retain(|i| *i != ifindex);
+            targets.evict(ifindex, "absent from the link re-read");
+            evicted += 1;
+        }
+    }
+    Ok((queued, evicted))
+}
+
+/// The kernel dropped link notifications on the full buffer (netlink-
+/// proto's rendering of ENOBUFS). None is resent, so the link table is
+/// re-read at the next refresh.
+fn on_overrun(pending: &mut Pending, status: &Mutex<WatchStatus>) {
+    pending.overrun();
+    let mut s = status.lock().unwrap_or_else(PoisonError::into_inner);
+    s.overruns += 1;
+    if !std::mem::replace(&mut s.resync_pending, true) {
+        warn!(
+            "redirect-target watcher: link notifications lost (receive buffer overrun); \
+             re-reading the link table"
+        );
+    }
+}
+
+async fn run_resync(targets: &mut Targets, pending: &mut Pending, status: &Mutex<WatchStatus>) {
+    // This re-read covers every loss reported until now. One reported
+    // from here on arrives as another overrun, after it, and is owed a
+    // re-read of its own.
+    pending.resync = false;
+    let result = resync(targets, pending).await;
+    let mut s = status.lock().unwrap_or_else(PoisonError::into_inner);
+    match result {
+        Ok((viable, evicted)) => {
+            s.resyncs_ok += 1;
+            s.last_resync_error = None;
+            pending.resync_not_before = None;
+            info!(
+                viable,
+                evicted, "redirect-target watcher: link table re-read after lost notifications"
+            );
+        }
+        Err(e) => {
+            s.resyncs_failed += 1;
+            warn!(error = %e, "redirect-target watcher: link table re-read failed; retrying");
+            s.last_resync_error = Some(e);
+            pending.resync = true;
+            pending.resync_not_before = Some(Instant::now() + RESYNC_RETRY);
+        }
+    }
+    s.resync_pending = pending.resync;
+}
+
+/// Record why the watcher ended, for the status row, and log it.
+fn stopped(status: &Mutex<WatchStatus>, why: String) {
+    warn!(
+        reason = %why,
+        "redirect-target watcher stopped; REDIRECT_DEVMAP refreshes only on SIGHUP"
+    );
+    status
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .stopped = Some(why);
 }
 
 async fn run(
@@ -408,31 +617,33 @@ async fn run(
     directives: Arc<Mutex<Vec<ModuleDirective>>>,
     refresh_now: Arc<tokio::sync::Notify>,
     rx_ports: Vec<(String, u32)>,
+    rcvbuf: usize,
+    status: Arc<Mutex<WatchStatus>>,
 ) {
     // Subscribe BEFORE the reconcile so a link that changes during the
     // reconcile is replayed from the socket buffer afterwards instead
     // of being missed (same ordering argument as the resolver's FDB
     // seed).
-    let (conn, _handle, mut messages) = match new_multicast_connection(&[MulticastGroup::Link]) {
+    let (mut conn, _handle, mut messages) = match new_multicast_connection(&[MulticastGroup::Link])
+    {
         Ok(c) => c,
         Err(e) => {
-            warn!(
-                error = %e,
-                "redirect-target watcher: RTNLGRP_LINK subscription failed; REDIRECT_DEVMAP \
-                 refreshes only on SIGHUP"
-            );
+            stopped(&status, format!("RTNLGRP_LINK subscription failed: {e}"));
             return;
         }
     };
+    // Not fatal: the default buffer works, and an overrun is recovered
+    // from either way; a bigger one overruns less often.
+    match raise_rcvbuf(conn.socket_mut().socket_mut(), rcvbuf) {
+        Ok(granted) => debug!(granted, "redirect-target watcher: receive buffer"),
+        Err(e) => warn!(error = %e, "redirect-target watcher: could not raise the receive buffer"),
+    }
     tokio::spawn(conn);
 
     let mut targets = match Targets::open(&root, rx_ports) {
         Ok(t) => t,
         Err(e) => {
-            warn!(
-                error = %e,
-                "redirect-target watcher: map open failed; REDIRECT_DEVMAP refreshes only on SIGHUP"
-            );
+            stopped(&status, format!("map open failed: {e}"));
             return;
         }
     };
@@ -456,17 +667,29 @@ async fn run(
                 return;
             }
             next = messages.next() => match next {
-                Some((msg, _)) => handle(&mut targets, &mut pending, msg),
+                Some((msg, _)) => {
+                    if matches!(msg.payload, NetlinkPayload::Overrun(_)) {
+                        on_overrun(&mut pending, &status);
+                    } else {
+                        handle(&mut targets, &mut pending, msg);
+                    }
+                }
                 None => {
-                    warn!(
-                        "redirect-target watcher: netlink stream closed; REDIRECT_DEVMAP \
-                         refreshes only on SIGHUP"
-                    );
+                    stopped(&status, "netlink stream closed".into());
                     return;
                 }
             },
             _ = async { tokio::time::sleep_until(due.unwrap_or_else(Instant::now)).await }, if due.is_some() => {
+                if pending.resync_due(Instant::now()) {
+                    run_resync(&mut targets, &mut pending, &status).await;
+                }
                 refresh(&mut targets, &mut pending, &directives);
+                if pending.resync {
+                    // Owed but not yet retried (it failed, or is paced):
+                    // keep the refresh coming round for it.
+                    let at = pending.resync_not_before.unwrap_or_else(Instant::now);
+                    pending.due_by(at);
+                }
             }
             _ = refresh_now.notified() => {
                 // A SIGHUP changed the directives; converge on them
@@ -601,5 +824,59 @@ mod tests {
             viable_target(&link(1, LinkLayerType::Loopback, Some(State::Unknown))),
             None
         );
+    }
+
+    /// A re-read stands in for every notification that was lost: what
+    /// qualifies is queued as its `RTM_NEWLINK` would have been, what the
+    /// maps hold and the kernel no longer lists is a lost `RTM_DELLINK`,
+    /// and a link that merely went down stays (the membership policy).
+    #[test]
+    fn a_re_read_plans_the_lost_adds_and_deletes() {
+        let links = [
+            link(7, LinkLayerType::Ether, Some(State::Up)),
+            link(8, LinkLayerType::Ether, Some(State::Unknown)),
+            link(9, LinkLayerType::Ether, Some(State::Down)),
+            link(1, LinkLayerType::Loopback, Some(State::Unknown)),
+        ];
+        let known: HashSet<u32> = [7, 9, 12].into_iter().collect();
+        assert_eq!(
+            resync_plan(&links, &known),
+            ResyncPlan {
+                admit: vec![7, 8],
+                gone: vec![12],
+            }
+        );
+        assert_eq!(resync_plan(&[], &HashSet::new()), ResyncPlan::default());
+    }
+
+    /// A watcher that never ran is reported as stopped, not left out.
+    #[test]
+    fn a_watcher_that_never_started_reports_it() {
+        use packetframe_common::module::HealthState;
+        let w = RedirectTargetWatcher::not_started("thread could not be spawned: EAGAIN".into());
+        let h = w.status().subsystem_health();
+        assert_eq!(h.state, HealthState::Degraded);
+        assert!(h.message.unwrap().contains("EAGAIN"));
+        w.shutdown();
+    }
+
+    /// An overrun schedules the re-read through the same debounce as any
+    /// event, so a burst of them costs one; a failed one is paced.
+    #[test]
+    fn an_overrun_schedules_a_paced_re_read() {
+        let mut p = Pending::default();
+        let now = Instant::now();
+        assert!(!p.resync_due(now));
+        p.overrun();
+        assert!(p.resync && p.due.is_some());
+        assert!(p.resync_due(now));
+        p.resync_not_before = Some(now + RESYNC_RETRY);
+        assert!(!p.resync_due(now));
+        assert!(p.resync_due(now + RESYNC_RETRY));
+        p.due = None;
+        p.due_by(now + RESYNC_RETRY);
+        assert_eq!(p.due, Some(now + RESYNC_RETRY));
+        p.due_by(now);
+        assert_eq!(p.due, Some(now), "never later than already due");
     }
 }

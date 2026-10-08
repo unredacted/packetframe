@@ -23,6 +23,7 @@ use super::{
     PlanError, RepairLimiter, RuleAction, Status, WanEgressSpec, LOCAL_TABLE, MAIN_TABLE,
     RECONCILE_INTERVAL,
 };
+use crate::netlink_bounds::NETLINK_EXCHANGE_TIMEOUT;
 use crate::{MODULE_NAME, PACKETFRAME_RT_PROTOCOL};
 
 /// How long after a rule event the pass runs. Folds a provisioning
@@ -38,6 +39,26 @@ pub enum WanEgressError {
     Request(#[from] rtnetlink::Error),
     #[error("removed {removed} rules, then stopped: {first}")]
     Incomplete { removed: usize, first: String },
+    #[error(
+        "no netlink reply within {}s; the pass was abandoned where it stood and is retried",
+        .0.as_secs()
+    )]
+    TimedOut(Duration),
+}
+
+/// A whole pass under [`NETLINK_EXCHANGE_TIMEOUT`]. A pass that never
+/// returns holds the pass lock for good: the periodic pass stops and a
+/// SIGHUP's reconcile waits on the lock forever. Abandoning one is safe
+/// for the reason stopping at a failed write is: writes go out one at a
+/// time in stage order, each awaited before the next, so a pass cut
+/// short leaves an ordered prefix of them (the one in flight landed or
+/// not), and the next pass, which starts from a fresh dump, does the rest.
+async fn bounded<T>(
+    pass: impl std::future::Future<Output = Result<T, WanEgressError>>,
+) -> Result<T, WanEgressError> {
+    tokio::time::timeout(NETLINK_EXCHANGE_TIMEOUT, pass)
+        .await
+        .unwrap_or(Err(WanEgressError::TimedOut(NETLINK_EXCHANGE_TIMEOUT)))
 }
 
 type StrictConnection =
@@ -235,8 +256,12 @@ impl PassReport {
 }
 
 /// One reconcile: dump, plan, diff, write the difference. A converged
-/// kernel gets a dump and nothing else.
+/// kernel gets a dump and nothing else. Bounded ([`bounded`]).
 pub async fn reconcile_once(spec: &WanEgressSpec) -> Result<PassReport, WanEgressError> {
+    bounded(reconcile_unbounded(spec)).await
+}
+
+async fn reconcile_unbounded(spec: &WanEgressSpec) -> Result<PassReport, WanEgressError> {
     let (conn, handle) = strict_connection()?;
     tokio::spawn(conn);
     let (raw, observed) = dump(&handle).await?;
@@ -330,8 +355,12 @@ async fn remove_staged(
 /// left pointing at nothing or live without its keep rules (a stage
 /// with a failure ends the removal; see [`remove_staged`]). Foreign
 /// rules are structurally out of reach: the delete echoes an owned
-/// rule, protocol and all.
+/// rule, protocol and all. Bounded ([`bounded`]).
 pub async fn remove_all_owned() -> Result<usize, WanEgressError> {
+    bounded(remove_all_owned_unbounded()).await
+}
+
+async fn remove_all_owned_unbounded() -> Result<usize, WanEgressError> {
     let (conn, handle) = strict_connection()?;
     tokio::spawn(conn);
     let (raw, observed) = dump(&handle).await?;
@@ -435,7 +464,11 @@ async fn run_pass(shared: &Shared) {
     };
     match reconcile_once(&spec).await {
         Err(e) => {
-            next.condition = Condition::Failing(format!("cannot read policy rules: {e}"));
+            next.condition = Condition::Failing(match e {
+                // Abandoned anywhere in the pass, the dump included.
+                WanEgressError::TimedOut(_) => e.to_string(),
+                _ => format!("cannot read policy rules: {e}"),
+            });
             next.desired = prev.desired;
             next.layout = prev.layout;
         }
@@ -538,6 +571,9 @@ async fn watch(shared: Arc<Shared>, token: CancellationToken) {
                     None => std::future::pending().await,
                 }
             } => match ev {
+                // Any message, the overrun marker for lost events
+                // included: what it said does not matter, because a pass
+                // re-reads every rule.
                 Some(_) => {
                     due.get_or_insert_with(|| tokio::time::Instant::now() + EVENT_DEBOUNCE);
                 }

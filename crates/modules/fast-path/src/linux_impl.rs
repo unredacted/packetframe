@@ -2092,11 +2092,16 @@ pub fn attach(
         xdp_ports(state),
     ) {
         Ok(w) => state.redirect_watch = Some(w),
-        Err(e) => warn!(
-            error = %e,
-            "redirect-target watcher thread could not be spawned; REDIRECT_DEVMAP refreshes \
-             only on SIGHUP"
-        ),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "redirect-target watcher thread could not be spawned; REDIRECT_DEVMAP refreshes \
+                 only on SIGHUP"
+            );
+            state.redirect_watch = Some(crate::redirect_watch::RedirectTargetWatcher::not_started(
+                format!("thread could not be spawned: {e}"),
+            ));
+        }
     }
 
     // The route ledger a clean stop left, consumed in every mode (see
