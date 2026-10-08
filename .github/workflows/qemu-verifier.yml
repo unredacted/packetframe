@@ -253,9 +253,14 @@ jobs:
           cargo test -p packetframe-vpp-offload --test drift_netns --no-run
 
       - name: Run integration tests in QEMU
-        # Two full attempts must fit (see retry policy below); a
-        # healthy run is ~7 minutes under TCG.
-        timeout-minutes: 20
+        # Two full attempts must fit (see retry policy below). One
+        # attempt is ~6-14 minutes under TCG, by runner speed: over the
+        # single-attempt successes since #315 (~30 per leg, measured
+        # 2026-10-07) p50 11, p90 13, slowest 13.1 (5.15) and 13.8
+        # (6.6). Rarely the guest rebuilds every dependency rather than
+        # the usual two crates: 16.8 on 5.15, before #315 added ~1. Two
+        # of those fit in 40.
+        timeout-minutes: 40
         run: |
           set -eux
           # Pass the installed vmlinuz path (not the .deb). virtme-ng
@@ -281,7 +286,7 @@ jobs:
           # outright. bpf_test_run executes uninterruptibly, and under
           # TCG a bench stalls a vCPU past the soft-lockup watchdog;
           # the per-fire ~35-line splat to the emulated serial console
-          # then compounds until the 20-min job timeout. Two rounds of
+          # then compounds until the step timeout. Two rounds of
           # PACKETFRAME_BENCH_QUICK capping (per-syscall repeat in
           # #82, then a ~400-execution total budget) still flaked on
           # slow 5.15 runners (PR #206, PR #207) — runner speed varies
@@ -307,14 +312,18 @@ jobs:
           # Retry policy: virtme-ng propagates the guest command's exit
           # status, so a genuine test failure arrives as cargo's 101
           # and fails immediately — no retry. Exit 255 means the VM
-          # died before the guest script ever ran (observed on hosted
-          # runners as a TCG boot hang: dmesg stops mid PCI
-          # enumeration ~20s in, zero test output; PR #69's v6.6 job).
-          # That failure mode is runner noise, not a signal about the
-          # code, so it gets exactly one more attempt.
+          # died. Usually that is before the guest script ever ran
+          # (observed on hosted runners as a TCG boot hang: dmesg stops
+          # mid PCI enumeration ~20s in, zero test output; PR #69's
+          # v6.6 job), which is runner noise, not a signal about the
+          # code, so it gets exactly one more attempt. A guest kernel
+          # panic mid-suite also exits 255 and is retried the same way,
+          # so the warning names both: the 5.15 XDP dispatcher oops
+          # (XDP_DISPATCHER in the fast-path test harness) once went
+          # green on its retry under a "boot flake" warning.
           rc=0; run_vm || rc=$?
           if [ "${rc}" -eq 255 ]; then
-            echo "::warning::virtme-ng exited 255 before the guest script ran (boot flake); retrying once"
+            echo "::warning::virtme-ng exited 255: the VM died, in a boot hang or a guest kernel panic (search this step's log for 'Kernel panic'); retrying once"
             rc=0; run_vm || rc=$?
           fi
           exit "${rc}"

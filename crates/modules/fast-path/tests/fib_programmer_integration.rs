@@ -2877,6 +2877,56 @@ fn lost_nexthop_is_reprobed_until_it_resolves() {
     );
 }
 
+/// After the neighbour resolver re-reads the kernel — a resync after an
+/// overrun, or a restarted resolver (2026-10-07) — the nexthops the
+/// programmer still holds unresolved are asked about again at once, not
+/// when a backoff that may have reached a minute says so.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_reprobe_nudge_asks_again_now_instead_of_at_the_backoff() {
+    let (h, _sink, mut resolves) = ProgrammerHarness::with_sink_and_resolver();
+    let nh = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 24));
+    h.run(async { h.handle.register_nexthop(nh).await })
+        .expect("register_nexthop");
+
+    // Nothing answers, so the backoff climbs: the allocation's request,
+    // then re-probes 1, 2 and 4 s apart. Wait for the fourth request
+    // rather than for a fixed time, so the next one is known to be a full
+    // 8 s backoff away however slow the guest is.
+    let mut early = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while early.len() < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fixture must back off before the nudge: {early:?}"
+        );
+        early.extend(h.drain_resolves(&mut resolves, Duration::from_millis(250)));
+    }
+    assert!(early.iter().all(|ip| *ip == nh), "{early:?}");
+
+    // The nudge brings the next request forward to the next tick (1 s at
+    // most), and the window allows for a slow guest while staying well
+    // inside the 8 s backoff still to run. The nudged probe itself counts
+    // as an attempt, so nothing else is due inside the window either.
+    assert!(h.handle.reprobe_unresolved_now(), "nudge queued");
+    let nudged = h.drain_resolves(&mut resolves, Duration::from_millis(4000));
+    assert_eq!(
+        nudged,
+        vec![nh],
+        "a nudged re-probe must fire on the next tick, once"
+    );
+
+    // Only that probe moved: the backoff kept its count, so the next one
+    // is 16 s out, not the 2 s a restarted backoff would give. A resolver
+    // nudging every few seconds through an overflow must not turn a dead
+    // neighbour into a probe every few seconds.
+    let after = h.drain_resolves(&mut resolves, Duration::from_millis(3000));
+    assert!(
+        after.is_empty(),
+        "the nudge must not restart the backoff (got {after:?})"
+    );
+}
+
 /// A freed slot and a live nexthop the kernel gave up on both carry
 /// `state = FAILED`; `family` is what tells them apart, and the shared
 /// classifier is what `status`, the exporter and `fib dump` all read.
@@ -3431,16 +3481,33 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
         route(v6_48(), nh6()),
     ];
     let status = shared_status();
+    let session = Arc::new(packetframe_common::fib::FeedSession::new());
     let ctrl = RouteController::start(
         &pins.dir,
         RouteFeed {
-            source: None,
+            // A real listener nothing will dial: with no route source at
+            // all the controller declares the feed reconciled by
+            // definition, which is not the restart under test.
+            source: Some(
+                packetframe_fast_path::fib::controller::RouteSourceConfig::Bgp {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    local_as: 64512,
+                    peer_as: 64512,
+                    router_id: Ipv4Addr::new(192, 0, 2, 10),
+                    peer_acl: Vec::new(),
+                    expected_peer_ip: None,
+                    anyip: false,
+                },
+            ),
             integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::None,
         },
         ResolverPolicy::default(),
         std::collections::HashMap::new(),
         None,
-        SecondTierSignals::default(),
+        SecondTierSignals {
+            completeness: None,
+            feed_session: Some(session.clone()),
+        },
         LedgerWiring {
             seed: Some(ledger(&routes, now_unix())),
             status: status.clone(),
@@ -3457,6 +3524,12 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
         rt.block_on(prog.mirror_counts()).expect("counts"),
         (2, 1),
         "the seed is in before the first command is served"
+    );
+    let seen = session.liveness();
+    assert!(
+        seen.mirror_seeded && !seen.up,
+        "the second tier is told the mirror is a seed, not a table loading from empty, \
+         before any route source has spoken: {seen:?}"
     );
 
     let written = ctrl.preserve_route_ledger(&state_dir);

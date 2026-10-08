@@ -32,6 +32,7 @@ use crate::fib::integrity::{
     shared_snapshot, IntegrityChecker, IntegrityConfig, IntegrityPosture, SharedSnapshot,
     DEFAULT_INTERVAL,
 };
+use crate::fib::neigh_supervision::{ResolverStatus, SharedResolverStatus};
 use crate::fib::netlink_neigh::{
     FallbackDefaultSpec, LocalPrefixSpec, NeighborResolveHandle, NetlinkNeighborResolver,
 };
@@ -243,6 +244,9 @@ pub struct RouteController {
     /// stop writes into the ledger. `None` with no route source: there is
     /// nothing a ledger could be matched against.
     ledger_identity: Option<String>,
+    /// What the neighbour resolver publishes about itself; read by the
+    /// `neigh-resolver` health row and the metrics.
+    neigh_status: SharedResolverStatus,
 }
 
 /// The route ledger, for [`RouteController::start`]: the seed a start
@@ -408,6 +412,13 @@ impl RouteController {
         programmer.set_ledger_status(ledger_status.clone());
         if let Some(seed) = seed {
             programmer.set_seed(seed);
+            // Told to the second tier before the route source can
+            // connect, through the handle its gates already read: the
+            // mirror is not a table loading from empty. Cleared by the
+            // route source's first GC (`mark_reconciled`).
+            if let Some(h) = &feed_session {
+                h.mark_mirror_seeded();
+            }
         }
 
         // v0.2.1: enable the connected fast-path when the operator
@@ -445,14 +456,16 @@ impl RouteController {
             resolver.with_ix_interfaces(ix_interfaces)
         };
 
-        let resolver_task = runtime.spawn(async move {
-            if let Err(e) = resolver.run().await {
-                // Non-fatal: the controller stays up and the programmer
-                // keeps draining commands. Operators notice via the
-                // Phase 3.5 health report / metrics.
-                warn!(error = %e, "NeighborResolver task exited with error");
-            }
-        });
+        // Every resync and every restarted incarnation tells the
+        // programmer to re-probe what it holds unresolved: the kernel may
+        // have resolved it while the resolver was not listening.
+        let resolver = resolver.with_reprobe_target(prog_handle.clone());
+        let neigh_status = resolver.status();
+        // `run` supervises: it restarts an incarnation that exits or
+        // stops making progress, and returns only at shutdown. Before
+        // 2026-10-07 this spawned one incarnation and logged a single
+        // WARN if it ended — and nothing at all if it hung.
+        let resolver_task = runtime.spawn(resolver.run());
         let programmer_task = runtime.spawn(async move { programmer.run().await });
 
         let mut tasks = vec![resolver_task, programmer_task];
@@ -667,6 +680,13 @@ impl RouteController {
                     let shut = shutdown_token.clone();
                     tasks.push(runtime.spawn(async move {
                         let mut tick = tokio::time::interval(ANYIP_RECONCILE_INTERVAL);
+                        // One reconcile is a netlink round trip that can
+                        // wait on `rtnl_lock` for longer than the interval.
+                        // After one that ran late, the next is due a full
+                        // interval on, not at once: the default `Burst`
+                        // would replay every missed tick back to back,
+                        // into the same contended lock.
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
                             tokio::select! {
                                 _ = shut.cancelled() => return,
@@ -730,12 +750,19 @@ impl RouteController {
             anyip_addr: anyip_installed,
             ledger_status,
             ledger_identity,
+            neigh_status,
         })
     }
 
     /// The route ledger's status, for the health and metrics surfaces.
     pub fn ledger_status(&self) -> &SharedLedgerStatus {
         &self.ledger_status
+    }
+
+    /// The neighbour resolver's status, for the health and metrics
+    /// surfaces. A snapshot: one read, so the row and the gauges agree.
+    pub fn neigh_resolver_status(&self) -> ResolverStatus {
+        self.neigh_status.snapshot()
     }
 
     /// Write the mirror's route-source advertisements to `state_dir` as
