@@ -20,6 +20,7 @@ packetframe-guard = { workspace = true, optional = true }
 packetframe-neigh-snoop = { workspace = true, optional = true }
 packetframe-probe = { workspace = true, optional = true }
 packetframe-flow-encode = { workspace = true, optional = true }
+packetframe-flow-export = { workspace = true, optional = true }
 
 anyhow.workspace = true
 clap.workspace = true
@@ -34,12 +35,13 @@ libc.workspace = true
 signal-hook.workspace = true
 
 [features]
-default = ["fast-path", "guard", "neigh-snoop", "probe", "vpp-offload"]
+default = ["fast-path", "guard", "neigh-snoop", "probe", "vpp-offload", "flow-export"]
 fast-path = ["dep:packetframe-fast-path"]
 vpp-offload = ["dep:packetframe-vpp-offload", "dep:packetframe-sampler-shm"]
 guard = ["dep:packetframe-guard"]
 neigh-snoop = ["dep:packetframe-neigh-snoop"]
 probe = ["dep:packetframe-probe"]
+flow-export = ["dep:packetframe-flow-export"]
 # Development tooling, never in release builds: `flow-synth`.
 dev-tools = ["dep:packetframe-flow-encode"]
 

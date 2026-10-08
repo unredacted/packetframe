@@ -40,6 +40,8 @@ pub const CONTROL_PLANE_THREADS: &[&str] = &[
     "vpp-supervision",
     "pf-drift-scan",
     "pf-vpp-fdb",
+    // flow-export's worker (`packetframe_flow_export::THREAD_NAME`).
+    "pf-flow-export",
 ];
 
 /// What [`publish`] did to the threads that already existed.

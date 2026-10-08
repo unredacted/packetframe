@@ -1,0 +1,28 @@
+[package]
+name = "packetframe-flow-export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PacketFrame flow-export module: sampled packets from PacketFrame's forwarding paths to sFlow collectors"
+
+[lib]
+path = "src/lib.rs"
+
+# Userspace only: the samplers live in the modules whose packets they
+# see (fast-path's ELF, the VPP plugin). Everything that decides what is
+# sent, counted or reported is portable and tested on any host; opening
+# the maps, the perf rings and the worker thread arrive cfg-gated.
+[dependencies]
+packetframe-common.workspace = true
+packetframe-flow-encode.workspace = true
+packetframe-fast-path.workspace = true
+tracing.workspace = true
+libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+aya.workspace = true

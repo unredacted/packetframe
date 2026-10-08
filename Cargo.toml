@@ -5,6 +5,7 @@ members = [
     "crates/cli",
     "crates/flow-encode",
     "crates/modules/fast-path",
+    "crates/modules/flow-export",
     "crates/modules/guard",
     "crates/modules/neigh-snoop",
     "crates/modules/probe",
@@ -53,6 +54,7 @@ repository = "https://github.com/unredacted/packetframe"
 packetframe-common = { path = "crates/common" }
 packetframe-flow-encode = { path = "crates/flow-encode" }
 packetframe-fast-path = { path = "crates/modules/fast-path" }
+packetframe-flow-export = { path = "crates/modules/flow-export" }
 packetframe-guard = { path = "crates/modules/guard" }
 packetframe-neigh-snoop = { path = "crates/modules/neigh-snoop" }
 packetframe-probe = { path = "crates/modules/probe" }
