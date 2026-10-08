@@ -439,7 +439,40 @@ pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
 #[doc(hidden)]
 pub fn recording_handle_reporting(counts: (usize, usize)) -> (FibProgrammerHandle, RouteEventLog) {
     let (tx, rx) = mpsc::channel::<Command>(256);
-    (FibProgrammerHandle { tx }, spawn_recorder(rx, counts))
+    (FibProgrammerHandle { tx }, spawn_recorder(rx, counts, None))
+}
+
+/// Holds a [`gated_recording_handle`]'s applies until opened.
+#[cfg(test)]
+pub(crate) struct ApplyGate {
+    open: tokio::sync::watch::Sender<bool>,
+    arrived: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl ApplyGate {
+    /// Release the held apply and every one after it.
+    pub(crate) fn open(&self) {
+        self.open.send_replace(true);
+    }
+
+    /// How many `ApplyRouteEvent`s have reached the actor, held or not.
+    pub(crate) fn arrived(&self) -> usize {
+        self.arrived.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// [`recording_handle`] whose actor holds the first `ApplyRouteEvent`
+/// until the gate opens: a programmer stalled mid-ingest. Serial like
+/// the real actor, so nothing queued behind the held apply is answered
+/// either — the route source's await on it simply does not return.
+#[cfg(test)]
+pub(crate) fn gated_recording_handle() -> (FibProgrammerHandle, RouteEventLog, ApplyGate) {
+    let (open, open_rx) = tokio::sync::watch::channel(false);
+    let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (tx, rx) = mpsc::channel::<Command>(256);
+    let log = spawn_recorder(rx, (0, 0), Some((open_rx, arrived.clone())));
+    (FibProgrammerHandle { tx }, log, ApplyGate { open, arrived })
 }
 
 /// A [`recording_handle`] whose commands nobody answers until
@@ -461,11 +494,20 @@ impl HeldCommands {
     /// Start answering, as [`recording_handle`] does, from the first
     /// command held. Call inside a tokio runtime.
     pub fn release(self) -> RouteEventLog {
-        spawn_recorder(self.0, (0, 0))
+        spawn_recorder(self.0, (0, 0), None)
     }
 }
 
-fn spawn_recorder(mut rx: mpsc::Receiver<Command>, counts: (usize, usize)) -> RouteEventLog {
+type RecorderGate = (
+    tokio::sync::watch::Receiver<bool>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
+
+fn spawn_recorder(
+    mut rx: mpsc::Receiver<Command>,
+    counts: (usize, usize),
+    mut gate: Option<RecorderGate>,
+) -> RouteEventLog {
     let log = RouteEventLog::default();
     let sink = log.clone();
     tokio::spawn(async move {
@@ -473,6 +515,11 @@ fn spawn_recorder(mut rx: mpsc::Receiver<Command>, counts: (usize, usize)) -> Ro
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 Command::ApplyRouteEvent { event, reply } => {
+                    if let Some((open, arrived)) = gate.as_mut() {
+                        arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // A dropped gate releases too: the test is over.
+                        let _ = open.wait_for(|open| *open).await;
+                    }
                     sink.events
                         .lock()
                         .expect("RouteEventLog poisoned")
