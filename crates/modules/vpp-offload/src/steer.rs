@@ -152,6 +152,65 @@ pub enum RuleMatch {
     V6L4(L4Match),
 }
 
+impl RuleMatch {
+    /// Whether every frame `other` matches, this matches too — so a rule
+    /// of this shape already takes all of `other`'s traffic wherever it
+    /// sends it ([`adds_diversion`]).
+    ///
+    /// Conservative: only what can be shown is. A v4 prefix covers a
+    /// longer one inside it on the same side, and a `dmac` term covers
+    /// only the same MAC (no term covers any); a v6 frame match needs the
+    /// same receive MAC, and covers a tagged one only from the untagged
+    /// form (which carries no VLAN term) and an L4 one only from the
+    /// whole-ethertype form. A v6 keep covers only itself. Different
+    /// kinds never cover each other.
+    pub fn covers(&self, other: &RuleMatch) -> bool {
+        match (self, other) {
+            (
+                RuleMatch::V4 {
+                    prefix: wide,
+                    prefix_len: wide_len,
+                    side: wide_side,
+                    dmac: wide_dmac,
+                },
+                RuleMatch::V4 {
+                    prefix: narrow,
+                    prefix_len: narrow_len,
+                    side: narrow_side,
+                    dmac: narrow_dmac,
+                },
+            ) => {
+                let mask = |len: u8| match len.min(32) {
+                    0 => 0,
+                    l => u32::MAX << (32 - u32::from(l)),
+                };
+                wide_side == narrow_side
+                    && wide_len <= narrow_len
+                    && u32::from(*wide) & mask(*wide_len) == u32::from(*narrow) & mask(*wide_len)
+                    && (wide_dmac.is_none() || wide_dmac == narrow_dmac)
+            }
+            (
+                RuleMatch::V6Frame {
+                    dmac: wide_dmac,
+                    vlan: wide_vlan,
+                    l4: wide_l4,
+                },
+                RuleMatch::V6Frame {
+                    dmac: narrow_dmac,
+                    vlan: narrow_vlan,
+                    l4: narrow_l4,
+                },
+            ) => {
+                wide_dmac == narrow_dmac
+                    && (wide_vlan.is_none() || wide_vlan == narrow_vlan)
+                    && (wide_l4.is_none() || wide_l4 == narrow_l4)
+            }
+            (RuleMatch::V6L4(wide), RuleMatch::V6L4(narrow)) => wide == narrow,
+            _ => false,
+        }
+    }
+}
+
 /// The L4 half of a v6 keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum L4Match {
@@ -940,25 +999,28 @@ impl RuleSet {
 
 /// Whether reconciling a port set from `installed` to `target` diverts
 /// traffic onto VPP that `installed` does not: a `Divert` match on a port
-/// that no installed `Divert` on that port carries — a new port, a new
-/// prefix, a new direction, a new receive MAC, a new `v6-divert` frame.
+/// that no installed `Divert` on that port covers ([`RuleMatch::covers`])
+/// — a new port, a new or wider prefix, a new direction, a new receive
+/// MAC, a new `v6-divert` frame.
 ///
 /// Every one of those is new traffic routed by VPP's whole FIB: a
 /// diversion selects flows by source or by frame, and VPP then looks up
 /// each one's destination, so a newly diverted flow meets every route VPP
 /// lacks however small the allowlist change that diverted it.
 ///
-/// So is a `Keep` REMOVED from a port that goes on diverting: keeps sit
-/// at higher MCAM priority and take their matches back to the kernel, so
-/// dropping a `steer-exempt` or a `steer-keep6` from a steered port puts
-/// that traffic onto VPP as surely as a new diversion would (review
-/// finding, PR #333). On a port the target no longer diverts at all, its
-/// keeps go with its diversions, which is a removal.
+/// So is a `Keep` REMOVED or narrowed on a port that goes on diverting —
+/// one no target `Keep` there covers: keeps sit at higher MCAM priority
+/// and take their matches back to the kernel, so dropping a
+/// `steer-exempt` or a `steer-keep6` from a steered port puts that
+/// traffic onto VPP as surely as a new diversion would (review finding,
+/// PR #333). On a port the target no longer diverts at all, its keeps go
+/// with its diversions, which is a removal.
 ///
 /// What does NOT add is removal (a port, prefix or direction dropped), a
-/// `Keep` added (that takes traffic back to the kernel), and a rule moved
-/// to another slot or another VF index — slots are the planner's, and the
-/// VF is VPP either way.
+/// diversion narrowed inside an installed one, a `Keep` added or widened
+/// (that takes traffic back to the kernel), and a rule moved to another
+/// slot or another VF index — slots are the planner's, and the VF is VPP
+/// either way.
 pub fn adds_diversion(
     target: &[(String, u32, RuleSet)],
     installed: &[(String, u32, RuleSet)],
@@ -972,11 +1034,16 @@ pub fn adds_diversion(
             .map(|r| r.shape)
             .collect::<Vec<RuleMatch>>()
     };
+    // By COVERAGE, not equal shapes: a /16 replacing an installed /8 it
+    // sits inside diverts nothing the /8 did not, and judged as new it was
+    // held — leaving the broader /8 diverting, indefinitely under a
+    // mismatch (review finding, PR #333). One rule must cover another
+    // whole; a match covered only by several together counts as new.
     let new_divert = target.iter().any(|(port, _, _)| {
         let have = rules_on(installed, port, RuleAction::Divert);
         rules_on(target, port, RuleAction::Divert)
             .iter()
-            .any(|shape| !have.contains(shape))
+            .any(|shape| !have.iter().any(|h| h.covers(shape)))
     });
     let lost_keep = installed.iter().any(|(port, _, _)| {
         let still_diverting = !rules_on(target, port, RuleAction::Divert).is_empty();
@@ -984,7 +1051,7 @@ pub fn adds_diversion(
         still_diverting
             && rules_on(installed, port, RuleAction::Keep)
                 .iter()
-                .any(|shape| !keeps.contains(shape))
+                .any(|shape| !keeps.iter().any(|k| k.covers(shape)))
     });
     new_divert || lost_keep
 }
@@ -1056,6 +1123,113 @@ mod tests {
             r.location += 100;
         }
         assert!(!adds_diversion(&moved, &installed));
+    }
+
+    /// Additions by COVERAGE, not equal shapes (review finding, PR #333):
+    /// a diversion narrowed inside an installed one adds nothing and a
+    /// broadened one does; a keep narrowed gives traffic back to VPP and
+    /// a broadened one does not.
+    #[test]
+    fn coverage_decides_what_a_reconcile_adds() {
+        let mac = [0x02, 0, 0, 0, 0, 1];
+        let src = VppSteerDirection::Src;
+        let plan = |allow: &[IpPrefix], exempt: &[packetframe_common::config::Ipv4Prefix]| {
+            vec![(
+                "eth4".to_string(),
+                0u32,
+                RuleSet::plan(allow, exempt, McamBudget::default(), src, &[mac]).expect("fits"),
+            )]
+        };
+        let wide = plan(&[v4(198, 51, 100, 0, 24)], &[]);
+        let narrow = plan(&[v4(198, 51, 100, 0, 25)], &[]);
+        assert!(!adds_diversion(&narrow, &wide), "a diversion narrowed");
+        assert!(adds_diversion(&wide, &narrow), "a diversion broadened");
+        let beside = plan(&[v4(198, 51, 100, 128, 25)], &[]);
+        assert!(adds_diversion(&beside, &narrow), "a disjoint one");
+
+        let exempt = |a: u8, len: u8| packetframe_common::config::Ipv4Prefix {
+            addr: Ipv4Addr::new(198, 51, 100, a),
+            prefix_len: len,
+        };
+        let keep_wide = plan(&[v4(198, 51, 100, 0, 24)], &[exempt(0, 28)]);
+        let keep_narrow = plan(&[v4(198, 51, 100, 0, 24)], &[exempt(1, 32)]);
+        assert!(
+            adds_diversion(&keep_narrow, &keep_wide),
+            "a keep narrowed hands the rest of its traffic to VPP"
+        );
+        assert!(
+            !adds_diversion(&keep_wide, &keep_narrow),
+            "a keep broadened takes traffic off VPP"
+        );
+
+        // A plan recorded before diversions carried a receive MAC covers
+        // the same diversion with one; not the other way round.
+        let mut unscoped = wide.clone();
+        for r in &mut unscoped[0].2.rules {
+            if let RuleMatch::V4 { dmac, .. } = &mut r.shape {
+                *dmac = None;
+            }
+        }
+        assert!(!adds_diversion(&wide, &unscoped));
+        assert!(adds_diversion(&unscoped, &wide));
+    }
+
+    /// The containment rule itself, both ways, for every shape.
+    #[test]
+    fn a_match_covers_only_what_it_provably_contains() {
+        let v4m = |a: [u8; 4], len: u8, side: Side, dmac: Option<[u8; 6]>| RuleMatch::V4 {
+            prefix: Ipv4Addr::from(a),
+            prefix_len: len,
+            side,
+            dmac,
+        };
+        let m = Some([0x02, 0, 0, 0, 0, 1]);
+        let wide = v4m([198, 51, 100, 0], 24, Side::Src, m);
+        let narrow = v4m([198, 51, 100, 64], 26, Side::Src, m);
+        assert!(wide.covers(&narrow) && wide.covers(&wide));
+        assert!(!narrow.covers(&wide));
+        assert!(
+            !wide.covers(&v4m([198, 51, 100, 64], 26, Side::Dst, m)),
+            "side"
+        );
+        assert!(
+            !wide.covers(&v4m([192, 0, 2, 0], 26, Side::Src, m)),
+            "elsewhere"
+        );
+        assert!(
+            !wide.covers(&v4m([198, 51, 100, 64], 26, Side::Src, None)),
+            "dmac"
+        );
+        assert!(
+            v4m([0, 0, 0, 0], 0, Side::Src, None).covers(&narrow),
+            "default"
+        );
+
+        let frame = |vlan: Option<u16>, l4: Option<L4Proto>| RuleMatch::V6Frame {
+            dmac: [0x02, 0, 0, 0, 0, 1],
+            vlan,
+            l4,
+        };
+        assert!(frame(None, None).covers(&frame(Some(100), Some(L4Proto::Tcp))));
+        assert!(frame(Some(100), None).covers(&frame(Some(100), Some(L4Proto::Udp))));
+        assert!(!frame(Some(100), None).covers(&frame(Some(200), None)));
+        assert!(!frame(Some(100), Some(L4Proto::Tcp)).covers(&frame(Some(100), None)));
+        assert!(!frame(None, None).covers(&RuleMatch::V6Frame {
+            dmac: [0x02, 0, 0, 0, 0, 2],
+            vlan: None,
+            l4: None,
+        }));
+
+        let keep = |port: u16| {
+            RuleMatch::V6L4(L4Match::Port {
+                proto: L4Proto::Tcp,
+                side: Side::Dst,
+                port,
+            })
+        };
+        assert!(keep(179).covers(&keep(179)) && !keep(179).covers(&keep(22)));
+        assert!(!frame(None, None).covers(&keep(179)), "kinds never cover");
+        assert!(!wide.covers(&frame(None, None)));
     }
 
     /// Both directions, in slot order, with v6 counted rather than

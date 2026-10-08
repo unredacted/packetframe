@@ -778,16 +778,22 @@ gates:
 **Which steers it judges: any that diverts more traffic onto VPP.** The
 first steer (nothing in the NIC yet), and equally a change to ports
 already steered that adds a port, a prefix, a direction, a receive MAC
-or a `v6-divert` — the canary ladder's second rung moved during a reload
-diverts into the same behind-and-unverified VPP the first would have.
-So does removing a `steer-exempt` or a `steer-keep6` from a port that
-goes on diverting: those rules take their matches back to the kernel,
-and dropping one puts that traffic onto VPP. So does re-asserting rules
-the last NIC readback found wiped or altered (a provisioning push), since
-they divert nothing until they are back. The change is judged against
-what the NIC is doing now, after the [hand-back
-path](#the-hand-back-path) has set the IPv6 gate, so a `v6-divert` whose
-path turns ready inside the same steer is judged with the rest.
+or a `v6-divert`, or widens a prefix — the canary ladder's second rung
+moved during a reload diverts into the same behind-and-unverified VPP
+the first would have. So does removing or narrowing a `steer-exempt` or
+a `steer-keep6` on a port that goes on diverting: those rules take their
+matches back to the kernel, and dropping one puts that traffic onto VPP.
+It is judged by coverage, not by identical rules: a prefix narrowed
+inside one already diverted, or an exemption widened, adds nothing and
+is not held; a match only several installed rules cover between them
+counts as new. So does re-asserting rules the last NIC readback found
+wiped or altered (a provisioning push), since they divert nothing until
+they are back, and rules a failed reconcile rolled out of the NIC, which
+count as not installed even though the last steer that landed planned
+them. The change is judged against what the NIC is doing now, after the
+[hand-back path](#the-hand-back-path) has set the IPv6 gate, so a
+`v6-divert` whose path turns ready inside the same steer is judged with
+the rest.
 The operator's lever, the module's own retry and a convergence
 re-steering a remembered want all pass through it. A change that
 diverts the same or less is never held (refusing it would leave the
@@ -858,6 +864,13 @@ and what clears it depends on the half that refused:
   not a transient of churn: verify runs only with nothing in flight, on
   the thread that would apply any update, so no update can land between
   a probe's sample and VPP's answer.
+
+  An IPv6 mismatch (`fib-v6`) does not hold an IPv4 steer — IPv4
+  steering is judged on the IPv4 verdict, as everywhere — but it does
+  disprove the ledger: the stopping daemon will not preserve a ledger
+  that ANY verify since it was last rebuilt found wrong in either
+  family, even after a later re-run's fresh sample came back clean, so
+  the same restart corrects it.
 
 **What you see.** `packetframe reconfigure` answers with the hold's own
 numbers:

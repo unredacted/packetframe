@@ -5834,8 +5834,8 @@ mod nud {
         fn backlog(&self) -> u64 {
             self.feed.backlog()
         }
-        fn neighbour_backlog(&self) -> u64 {
-            self.feed.neighbour_backlog()
+        fn backlog_split(&self) -> packetframe_vpp_offload::engine::SourceBacklog {
+            self.feed.backlog_split()
         }
         fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
             self.feed.for_each_route(visit)

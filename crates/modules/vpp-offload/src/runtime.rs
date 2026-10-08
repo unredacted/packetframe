@@ -1455,7 +1455,7 @@ pub struct Behind {
     /// pulled.
     pub backlog: u64,
     /// Neighbour changes it holds — any one is too many
-    /// ([`RouteSource::neighbour_backlog`]).
+    /// ([`RouteSource::backlog_split`]).
     pub neighbours: u64,
     /// Ops the engine has pulled and not yet sent.
     pub pending: u64,
@@ -1988,10 +1988,15 @@ impl Runtime {
         // sample could miss them — clearing the first-steer hold with
         // nothing rebuilt (review finding, PR #333). Refused, the next
         // start reads VPP's FIB, and the resync corrects what it holds.
-        if c.engine
-            .last_verify()
-            .is_some_and(crate::verify::VerifyOutcome::restart_worthy)
-        {
+        //
+        // EITHER family, and any verify since the ledger was rebuilt, not
+        // only the last (`ConvergenceEngine::ledger_disproved`): an IPv6
+        // mismatch cannot fail the pass or stop an IPv4 re-run, and a
+        // re-run's fresh v6 sample can miss what the last one caught, so
+        // the last verdict alone let a ledger with a wrong v6 route be
+        // preserved and seeded again — under `v6-divert`, a steered one
+        // (review finding, PR #333).
+        if c.engine.ledger_disproved() {
             return Err(
                 "the last verify found VPP disagreeing with the route ledger, so the ledger is \
                  disproved: the next start reads VPP's FIB instead, and its resync corrects \
@@ -3196,8 +3201,12 @@ impl Core {
     /// it checks a probed route has paths on owned interfaces, not where
     /// they lead (review finding, PR #333).
     fn behind(&self) -> Option<Behind> {
-        let neighbours = self.source.neighbour_backlog();
-        let backlog = self.source.backlog().saturating_sub(neighbours);
+        // One snapshot of both (`RouteSource::backlog_split`): two reads
+        // let a neighbour change landing between them pass as route churn.
+        let crate::engine::SourceBacklog {
+            routes: backlog,
+            neighbours,
+        } = self.source.backlog_split();
         let pending = self.engine.pending().len() as u64;
         let allowance = caught_up_allowance(self.source.route_count());
         let failing = self.last_drain_error.is_some();
@@ -3264,10 +3273,16 @@ impl Core {
     /// With rules installed it is [`crate::steer::adds_diversion`] over
     /// the target and the plan the rules were installed under — the NIC
     /// ledger, not the supervisor's `steered`, which reaches this core only
-    /// as a copy synced after each pass — less any rule the last readback
-    /// found emptied or damaged (`steer_gone_at`): a rule a provisioning
-    /// push wiped diverts nothing, and re-asserting it diverts its traffic
-    /// anew (review finding, PR #333).
+    /// as a copy synced after each pass — narrowed to what is actually
+    /// there. Only the plan's rules whose location the LEDGER still holds:
+    /// the plan is the last steer that landed, and a later reconcile that
+    /// failed can have rolled some of its rules out while others would not
+    /// come out, so a shrink {A,B} → {A} left holding only B made
+    /// reinstalling A read as nothing new (review finding, PR #333). And
+    /// less any rule the last readback found emptied or damaged
+    /// (`steer_gone_at`): a rule a provisioning push wiped diverts
+    /// nothing, and re-asserting it diverts its traffic anew (review
+    /// finding, PR #333).
     ///
     /// Rules with NO recorded plan — a state file from before plans were
     /// kept, or what a first steer's rollback could not delete — are
@@ -3300,8 +3315,10 @@ impl Core {
         let present: Vec<(String, u32, crate::steer::RuleSet)> = plan
             .into_iter()
             .map(|(port, vf, mut set)| {
-                set.rules
-                    .retain(|r| !gone.contains(&(port.clone(), r.location)));
+                set.rules.retain(|r| {
+                    let at = (port.clone(), r.location);
+                    ledger.contains(&at) && !gone.contains(&at)
+                });
                 (port, vf, set)
             })
             .collect();
@@ -6863,11 +6880,17 @@ mod tests {
             fn change_seq(&self) -> u64 {
                 0
             }
+            // The hold reads ONE snapshot of both kinds; a second read
+            // of the total is how a neighbour change landing in between
+            // passed as route churn (review finding, PR #333).
             fn backlog(&self) -> u64 {
-                self.routes + self.neighbours
+                unreachable!("the caught-up test must read backlog_split, in one snapshot")
             }
-            fn neighbour_backlog(&self) -> u64 {
-                self.neighbours
+            fn backlog_split(&self) -> crate::engine::SourceBacklog {
+                crate::engine::SourceBacklog {
+                    routes: self.routes,
+                    neighbours: self.neighbours,
+                }
             }
             fn requeue(&self, _: crate::engine::SourceChanges) {
                 unreachable!("this source hands nothing over, so nothing can be requeued");
@@ -7056,7 +7079,14 @@ mod tests {
             prefix_len: 24,
         };
         let eth4 = vec![("eth4".to_string(), 0u32, plan(&[a]))];
-        let installed = vec![("eth4".to_string(), 1024u32)];
+        // The ledger holds the plan's own locations: a planned rule the
+        // ledger does not hold is not installed.
+        let installed: Vec<(String, u32)> = eth4[0]
+            .2
+            .locations()
+            .into_iter()
+            .map(|l| ("eth4".to_string(), l))
+            .collect();
         rt.core.borrow_mut().steering = Box::new(LedgerSteering {
             rules: installed.clone(),
             next: Some((installed.clone(), true)),
@@ -7349,6 +7379,157 @@ mod tests {
             fx.steer(),
             "the same target over the rules just re-asserted adds nothing",
         );
+    }
+
+    /// A ledger an IPv6 verify disproved is not preserved, and a later
+    /// re-run whose fresh sample missed the bad prefix does not make it
+    /// preservable (review finding, PR #333). An IPv6 mismatch cannot fail
+    /// the pass or stop an IPv4 re-run, so the last verdict alone is not
+    /// the record of what was disproved.
+    #[test]
+    fn a_ledger_an_ipv6_verify_disproved_is_not_preserved() {
+        use crate::supervisor::State;
+        use crate::verify::{FamilyVerify, Mismatch, VerifyOutcome};
+        let verdict = |mismatches: Vec<Mismatch>| VerifyOutcome {
+            sampled: 1,
+            table: 1,
+            v6: Some(FamilyVerify {
+                sampled: 1,
+                table: 1,
+                mismatches,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bad = Mismatch::Absent {
+            prefix: IpPrefix::V6 {
+                addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                prefix_len: 32,
+            },
+            retval: -6,
+        };
+        let runtime = |eng: ConvergenceEngine| {
+            Runtime::new(
+                eng,
+                Box::new(EmptySource),
+                Box::new(LedgerSteering::default()),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            )
+        };
+
+        let mut eng = engine();
+        eng.record_verdict_for_test(verdict(vec![bad]));
+        assert!(
+            !eng.last_verify().is_some_and(VerifyOutcome::restart_worthy),
+            "the premise: an IPv6 mismatch does not fail the pass"
+        );
+        // An IPv4 re-run, whose fresh IPv6 sample missed the bad prefix.
+        eng.record_verdict_for_test(verdict(Vec::new()));
+        let e = runtime(eng)
+            .preserve(State::Ready)
+            .expect_err("a disproved ledger");
+        assert!(e.contains("disagreeing with the route ledger"), "{e}");
+
+        // Never disproved: refused for another reason, if at all.
+        let mut eng = engine();
+        eng.record_verdict_for_test(verdict(Vec::new()));
+        let other = runtime(eng).preserve(State::Ready);
+        assert!(
+            !other.as_ref().is_err_and(|e| e.contains("disagreeing")),
+            "{other:?}"
+        );
+    }
+
+    /// The recorded plan counts only where the ledger still holds its
+    /// rules (review finding, PR #333). A shrink {A,B} -> {A} whose
+    /// reconcile failed, rolling A out while B would not come out, leaves
+    /// the plan of the last steer that landed — {A,B} — over a ledger
+    /// holding B alone. Reinstalling A diverts A's traffic anew, and is
+    /// held while VPP is behind; re-asserting B alone is not.
+    #[test]
+    fn a_planned_rule_the_ledger_no_longer_holds_is_not_installed() {
+        struct Behind;
+        impl RouteSource for Behind {
+            fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+            fn for_each_neighbour(&self, _: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {}
+            fn route_count(&self) -> u64 {
+                1_000_000
+            }
+            fn change_seq(&self) -> u64 {
+                0
+            }
+            fn backlog(&self) -> u64 {
+                430_000
+            }
+            fn requeue(&self, _: crate::engine::SourceChanges) {
+                unreachable!("this source hands nothing over, so nothing can be requeued");
+            }
+        }
+        let plan = |allow: &[IpPrefix]| {
+            crate::steer::RuleSet::plan(
+                allow,
+                &[],
+                crate::steer::McamBudget::default(),
+                packetframe_common::config::VppSteerDirection::Src,
+                &[[0x02, 0, 0, 0, 0, 1]],
+            )
+            .expect("fits")
+        };
+        let (a, b) = (
+            IpPrefix::V4 {
+                addr: [192, 0, 2, 0],
+                prefix_len: 24,
+            },
+            IpPrefix::V4 {
+                addr: [198, 51, 100, 0],
+                prefix_len: 24,
+            },
+        );
+        let both = plan(&[a, b]);
+        let b_shape = |r: &crate::steer::SteerRule| {
+            r.action == crate::steer::RuleAction::Divert
+                && plan(&[b]).rules.iter().any(|o| o.shape == r.shape)
+        };
+        // B's diversion is all the ledger holds of the plan.
+        let survivors: Vec<(String, u32)> = both
+            .rules
+            .iter()
+            .filter(|r| b_shape(r))
+            .map(|r| ("eth4".to_string(), r.location))
+            .collect();
+        assert!(!survivors.is_empty(), "the premise: B has a diversion");
+        let steering = |target: crate::steer::RuleSet| {
+            Box::new(LedgerSteering {
+                rules: survivors.clone(),
+                next: Some((survivors.clone(), true)),
+                configured: 1,
+                plan: vec![("eth4".to_string(), 0, both.clone())],
+                target: vec![("eth4".to_string(), 0, target)],
+            })
+        };
+        let rt = Runtime::new(
+            engine(),
+            Box::new(Behind),
+            steering(plan(&[a])),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        rt.core.borrow_mut().engine.test_dead_members = Some(Vec::new());
+        {
+            let (_, mut fx) = rt.views();
+            assert!(
+                held(fx.steer()).contains("VPP has not caught up"),
+                "A is in the plan and not in the NIC"
+            );
+        }
+        rt.core.borrow_mut().steering = steering(plan(&[b]));
+        let (_, mut fx) = rt.views();
+        admitted(fx.steer(), "B is what the NIC holds");
     }
 
     /// A planned slot is not a lost rule (review finding, PR #333). An

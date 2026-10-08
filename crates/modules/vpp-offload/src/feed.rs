@@ -392,8 +392,14 @@ impl RouteSource for RouteFeed {
         (g.pending.len() + g.neigh_pending.len()) as u64
     }
 
-    fn neighbour_backlog(&self) -> u64 {
-        self.lock().neigh_pending.len() as u64
+    /// Both counts under the ONE lock every writer takes, so a neighbour
+    /// report cannot land between them (`RouteSource::backlog_split`).
+    fn backlog_split(&self) -> crate::engine::SourceBacklog {
+        let g = self.lock();
+        crate::engine::SourceBacklog {
+            routes: g.pending.len() as u64,
+            neighbours: g.neigh_pending.len() as u64,
+        }
     }
 
     fn route_count(&self) -> u64 {
@@ -481,8 +487,8 @@ impl RouteSource for std::sync::Arc<RouteFeed> {
     fn backlog(&self) -> u64 {
         (**self).backlog()
     }
-    fn neighbour_backlog(&self) -> u64 {
-        (**self).neighbour_backlog()
+    fn backlog_split(&self) -> crate::engine::SourceBacklog {
+        (**self).backlog_split()
     }
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         (**self).for_each_route(visit)
@@ -882,21 +888,27 @@ mod tests {
         assert_eq!(got, vec![(v4(192, 2), Some(vec![nh(1)]))]);
     }
 
-    /// The neighbour share of the backlog is counted on its own — the
-    /// first-steer hold allows route churn and no neighbour work — and
-    /// reaches the engine through the `Arc` the loader boxes, which has
-    /// to forward it by hand.
+    /// The backlog split into route and neighbour work — the first-steer
+    /// hold allows route churn and no neighbour work — in one snapshot,
+    /// reaching the engine through the `Arc` the loader boxes, which has
+    /// to forward it by hand (the default would call every change route
+    /// work).
     #[test]
     fn the_neighbour_backlog_is_counted_apart_through_the_arc() {
         let f = std::sync::Arc::new(RouteFeed::new());
         let src: &dyn RouteSource = &f;
+        let split = |s: &dyn RouteSource| {
+            let b = s.backlog_split();
+            (b.routes, b.neighbours)
+        };
         f.route_resolved(v4(192, 0), &[nh(1)]);
         f.route_resolved(v4(192, 1), &[nh(1)]);
-        assert_eq!((src.backlog(), src.neighbour_backlog()), (2, 0));
+        assert_eq!(split(src), (2, 0));
         f.neighbour_resolved(nh(1), [2, 0, 0, 0, 0, 1], u32::MAX);
-        assert_eq!((src.backlog(), src.neighbour_backlog()), (3, 1));
+        assert_eq!(split(src), (2, 1));
+        assert_eq!(src.backlog(), 3, "the total is still both");
         let _ = f.drain_changes(64);
-        assert_eq!((src.backlog(), src.neighbour_backlog()), (0, 0));
+        assert_eq!(split(src), (0, 0));
     }
 
     /// A NUD transition that changes nothing — the same MAC on the same
@@ -908,19 +920,23 @@ mod tests {
         let f = RouteFeed::new();
         let (m1, m2) = ([2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2]);
         f.neighbour_resolved(nh(1), m1, 7);
-        assert_eq!(f.neighbour_backlog(), 1, "a first resolution is one");
+        assert_eq!(f.backlog_split().neighbours, 1, "a first resolution is one");
         let _ = f.drain_changes(64);
         let seq = f.change_seq();
         for _ in 0..5 {
             f.neighbour_resolved(nh(1), m1, 7);
         }
-        assert_eq!(f.neighbour_backlog(), 0, "REACHABLE/STALE/DELAY, same MAC");
+        assert_eq!(
+            f.backlog_split().neighbours,
+            0,
+            "REACHABLE/STALE/DELAY, same MAC"
+        );
         assert_eq!(f.change_seq(), seq, "and no source activity");
         f.neighbour_resolved(nh(1), m2, 7);
-        assert_eq!(f.neighbour_backlog(), 1, "a moved MAC is a change");
+        assert_eq!(f.backlog_split().neighbours, 1, "a moved MAC is a change");
         let _ = f.drain_changes(64);
         f.neighbour_resolved(nh(1), m2, 8);
-        assert_eq!(f.neighbour_backlog(), 1, "so is a moved device");
+        assert_eq!(f.backlog_split().neighbours, 1, "so is a moved device");
         let _ = f.drain_changes(64);
         f.neighbour_resolved(nh(1), m2, some_real_ifindex());
         let _ = f.drain_changes(64);
