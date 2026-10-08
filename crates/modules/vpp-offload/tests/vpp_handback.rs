@@ -1165,6 +1165,9 @@ impl packetframe_vpp_offload::runtime::Steering for GateProbe {
     fn installed_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
         Vec::new()
     }
+    fn target_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
+        Vec::new()
+    }
     fn retarget(&mut self, _targets: Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)>) {}
     fn configured_ports(&self) -> usize {
         1

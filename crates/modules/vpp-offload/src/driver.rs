@@ -1125,9 +1125,9 @@ impl Driver {
     /// left to send, and it is a PRECONDITION, not a nicety. It is only
     /// half the currency question — the source can still be holding
     /// changes the engine has not pulled, which `steer_permitted`'s
-    /// backlog check covers — and neither half sees work that was
+    /// first-steer hold covers — and neither half sees work that was
     /// drained out of the source and then dropped rather than handed
-    /// back. See `Core::source_current` for why that last part is an
+    /// back. See `Core::behind` for why that last part is an
     /// invariant other code has to keep, not something checkable here. The
     /// ledger's counts are the other gate's evidence and they can be
     /// clean over deltas VPP never received: `RouteFeed::drain_changes`

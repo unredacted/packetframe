@@ -799,6 +799,18 @@ impl StatusSnapshot {
         (!crate::verify::covers(sampled, table, self.counts.installed)).then_some((sampled, table))
     }
 
+    /// The first-steer hold standing over a change to ports ALREADY
+    /// steered: rules in the NIC, the supervisor in `Ready` with the want
+    /// kept — where a refused reconcile settles — and the hold answering
+    /// for a target that diverts more than is installed. `Steered` is the
+    /// normal resting state and carries no outstanding change. One reading
+    /// for the steering row and `nominal`.
+    fn held_addition(&self) -> Option<&crate::runtime::SteerHold> {
+        (self.steered && self.steer_intended && matches!(self.state, State::Ready))
+            .then_some(self.steer_hold.as_ref())
+            .flatten()
+    }
+
     /// Ports that cannot forward.
     fn dead_ports(&self) -> Vec<&PortLink> {
         self.ports.iter().filter(|p| !p.forwards()).collect()
@@ -1096,6 +1108,9 @@ impl StatusSnapshot {
             && self.dead_ports().is_empty()
             // Steering wanted but absent: a broken rollout, not staging.
             && (self.steered || !self.steer_intended)
+            // ...or partly absent: an addition held over ports already
+            // steered, which the steering row says Degraded for.
+            && self.held_addition().is_none()
             // Convergence is fine and the interfaces work, but the next
             // daemon restart will refuse adoption and cycle a VPP that
             // was forwarding. Nominal has to mean "and it will survive a
@@ -1823,6 +1838,24 @@ impl StatusSnapshot {
                     )),
                 )
             }
+            // From `Ready` or `Steered` this is a re-run's verdict — a
+            // convergence's tears the process down and is expired with it
+            // — and nothing will tear down for it, so the row names what
+            // it holds and what clears it. It is not re-run: a new sample
+            // can miss the prefix this one caught (`Unvouched::Mismatch`).
+            FibSync::Failed { summary, age }
+                if matches!(self.state, State::Ready | State::Steered) =>
+            {
+                (
+                    HealthState::Unhealthy,
+                    Some(format!(
+                        "{summary} (verify ran {}s ago). No steer that diverts more traffic \
+                         onto VPP is admitted on it, and it is not re-run; {}",
+                        age.as_secs(),
+                        crate::verify::MISMATCH_REMEDY
+                    )),
+                )
+            }
             FibSync::Failed { summary, age } => (
                 HealthState::Unhealthy,
                 Some(format!("{summary} (verify ran {}s ago)", age.as_secs())),
@@ -2215,9 +2248,10 @@ impl StatusSnapshot {
                 "a convergence re-applies steering only if it verifies clean — one that \
                  ends with routes withheld or unresolvable parks in the staging state and \
                  emits no steer at all, and a steer that IS emitted can still be refused \
-                 by the completeness gate. Both settle in the staging state with the want \
-                 remembered, and from there the module re-attempts the steer by itself \
-                 once both gates permit. {tail}"
+                 by the completeness gate or held until VPP has caught up with the route \
+                 mirror. Each settles in the staging state with the want remembered, and \
+                 from there the module re-attempts the steer by itself once nothing \
+                 refuses it. {tail}"
             )
         };
         // Stray rules do NOT share that remedy, and sharing it was a
@@ -2285,6 +2319,22 @@ impl StatusSnapshot {
                      ones: {unverifiable}"
                 )
             });
+        }
+        // Last, so the readback clause's "the count(s) above" still means
+        // the audit's counts. A held addition on ports already steered —
+        // the canary ladder's next rung during a reload — is steering
+        // asked for and not in place, which the arms below would print as
+        // plain `steered`.
+        if let Some(h) = self.held_addition() {
+            clauses.push(format!(
+                "a steering change that diverts more traffic onto VPP is held because {h}. \
+                 The rules already installed stay as they are and keep forwarding; {}",
+                if h.clears_itself() {
+                    "the change lands on its own once nothing holds it"
+                } else {
+                    "waiting does not clear this, so the change waits until it is cleared"
+                }
+            ));
         }
         let message = (!clauses.is_empty()).then(|| clauses.join(". "));
         if let Some(message) = message {
@@ -2371,7 +2421,14 @@ impl StatusSnapshot {
                         crate::driver::STEER_RETRY_EVERY.as_secs(),
                         self.steer_hold
                             .as_ref()
-                            .map(|h| format!(". Held now because {h}"))
+                            .map(|h| format!(
+                                ". Held now because {h}{}",
+                                if h.clears_itself() {
+                                    ""
+                                } else {
+                                    " — waiting does not clear this, so it will not steer by itself"
+                                }
+                            ))
                             .unwrap_or_default()
                     )
                 } else {
@@ -2410,10 +2467,14 @@ impl StatusSnapshot {
                      reconfigure again (canary ladder, docs/runbooks/vpp-offload.md){}",
                     self.steer_hold
                         .as_ref()
-                        .map(|h| format!(
-                            ". A lever move now would be held, and steer on its own once \
-                             nothing holds it, because {h}"
-                        ))
+                        .map(|h| if h.clears_itself() {
+                            format!(
+                                ". A lever move now would be held, and steer on its own once \
+                                 nothing holds it, because {h}"
+                            )
+                        } else {
+                            format!(". A lever move now would be held, because {h}")
+                        })
                         .unwrap_or_default()
                 )),
             ),
@@ -3401,8 +3462,11 @@ mod tests {
     fn hold_postures() -> Vec<(Option<crate::runtime::SteerHold>, FibSync)> {
         use crate::runtime::{Behind, SteerHold};
         use crate::verify::Unvouched;
+        // A neighbour change with the failing posture's drain, so both
+        // wordings of the neighbour count render.
         let behind = |failing| Behind {
             backlog: 149,
+            neighbours: if failing { 0 } else { 2 },
             pending: 3,
             allowance: 64,
             failing,
@@ -3652,6 +3716,10 @@ mod tests {
         const ALLOWED: &[&str] = &[
             "packetframe reconfigure",
             "packetframe detach --all",
+            // The mismatch remedy (`verify::MISMATCH_REMEDY`), rendered
+            // through the first-steer hold.
+            "systemctl restart packetframe",
+            "detach --keep-vpp",
             "ethtool -n <iface>",
             "ethtool -N <iface> delete <loc>",
             "steer",

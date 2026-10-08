@@ -379,6 +379,10 @@ impl RouteSource for RouteFeed {
         (g.pending.len() + g.neigh_pending.len()) as u64
     }
 
+    fn neighbour_backlog(&self) -> u64 {
+        self.lock().neigh_pending.len() as u64
+    }
+
     fn route_count(&self) -> u64 {
         // The mirror's own length — O(1), safe to poll every tick while
         // an adopted resync waits for the feed to finish loading.
@@ -463,6 +467,9 @@ impl RouteSource for std::sync::Arc<RouteFeed> {
     }
     fn backlog(&self) -> u64 {
         (**self).backlog()
+    }
+    fn neighbour_backlog(&self) -> u64 {
+        (**self).neighbour_backlog()
     }
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         (**self).for_each_route(visit)
@@ -860,6 +867,23 @@ mod tests {
         f.route_resolved(v4(192, 2), &[nh(1)]);
         let got = f.drain_changes(64).routes;
         assert_eq!(got, vec![(v4(192, 2), Some(vec![nh(1)]))]);
+    }
+
+    /// The neighbour share of the backlog is counted on its own — the
+    /// first-steer hold allows route churn and no neighbour work — and
+    /// reaches the engine through the `Arc` the loader boxes, which has
+    /// to forward it by hand.
+    #[test]
+    fn the_neighbour_backlog_is_counted_apart_through_the_arc() {
+        let f = std::sync::Arc::new(RouteFeed::new());
+        let src: &dyn RouteSource = &f;
+        f.route_resolved(v4(192, 0), &[nh(1)]);
+        f.route_resolved(v4(192, 1), &[nh(1)]);
+        assert_eq!((src.backlog(), src.neighbour_backlog()), (2, 0));
+        f.neighbour_resolved(nh(1), [2, 0, 0, 0, 0, 1], u32::MAX);
+        assert_eq!((src.backlog(), src.neighbour_backlog()), (3, 1));
+        let _ = f.drain_changes(64);
+        assert_eq!((src.backlog(), src.neighbour_backlog()), (0, 0));
     }
 
     /// A neighbour whose link is gone is skipped, not reported with a

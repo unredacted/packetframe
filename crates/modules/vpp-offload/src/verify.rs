@@ -102,6 +102,26 @@ pub fn covers(sampled: usize, table: u64, installed: u64) -> bool {
     probed && large_enough
 }
 
+/// What clears a mismatch a verify found. One wording for every surface
+/// that names it — the steer refusal, the `fib-synced` row and the
+/// re-run's log line.
+///
+/// A restart that keeps VPP does, because the stopping daemon will not
+/// preserve a route ledger a verify has disproved (`Runtime::preserve`):
+/// the next start has no record to trust, reads VPP's FIB, and its resync
+/// diff corrects what VPP holds against the mirror before it verifies.
+/// Preserved, the ledger would be seeded instead, VPP's per-length counts
+/// would match it, and the diff would skip exactly the prefixes VPP has
+/// wrong. Replacing VPP clears it as well, at the cost of a cold attach.
+///
+/// The want does not survive for a port that was never steered: an
+/// unsteered adoption starts with none, so its lever has to move again.
+pub const MISMATCH_REMEDY: &str = "restart the daemon (`systemctl restart packetframe`, or the \
+     `detach --keep-vpp` sequence): the stop will not preserve a route ledger a verify has \
+     disproved, so the next start reads VPP's FIB and its resync corrects what VPP holds. A port \
+     that was never steered needs its lever moved again afterwards. Replacing VPP also clears \
+     it: stop the daemon, run `packetframe detach --all`, start it";
+
 /// Why the last verify does not vouch for the IPv4 table installed now,
 /// as a first steer needs it to — [`unvouched`] decides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +129,15 @@ pub enum Unvouched {
     /// No verify has completed against this VPP.
     NoVerdict,
     /// The last verify found VPP disagreeing with the ledger. Not
-    /// outgrown by waiting: a daemon restart rebuilds the FIB.
+    /// outgrown by waiting, and never re-run away: a new sample can miss
+    /// the prefix this one caught. [`MISMATCH_REMEDY`] clears it.
+    ///
+    /// Not a transient of churn. Verify runs only when nothing is in
+    /// flight — at the end of a convergence, which drains nothing while
+    /// verifying, or as a re-run on a tick whose drain went idle — and
+    /// the drain and the probes share one thread, so no update can land
+    /// between a probe's sample and VPP's answer. A mismatch is VPP's
+    /// FIB, not the moment.
     Mismatch,
     /// The last verify was taken against a table [`covers`] says is too
     /// small for the one installed now.
@@ -126,8 +154,8 @@ impl std::fmt::Display for Unvouched {
             Unvouched::NoVerdict => write!(f, "no verify has completed against this VPP"),
             Unvouched::Mismatch => write!(
                 f,
-                "the last verify found VPP disagreeing with the route ledger, and a restart \
-                 of the daemon is what rebuilds the FIB"
+                "the last verify found VPP disagreeing with the route ledger, which waiting \
+                 and re-verifying do not clear — {MISMATCH_REMEDY}"
             ),
             Unvouched::Outgrown {
                 sampled,
@@ -726,11 +754,31 @@ fn named_in_parens(names: &[String]) -> String {
 /// against how long an operator watches a Degraded row.
 pub const REVERIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The least time between two re-runs. A verify probes VPP with
-/// [`DEFAULT_SAMPLE`] requests on the supervision loop; this keeps a
-/// table that keeps getting dirty and clean again from turning a
-/// convergence-time gate into a heartbeat.
+/// The least time between two re-runs of an INCOMPLETE verdict
+/// ([`Stale::Incomplete`]). A verify probes VPP with [`DEFAULT_SAMPLE`]
+/// requests on the supervision loop; this keeps a table that keeps
+/// getting dirty and clean again from turning a convergence-time gate
+/// into a heartbeat.
+///
+/// An outgrown verdict ([`Stale::Outgrown`]) does not wait it out. It
+/// cannot recur without the table growing by another ~11% past the
+/// verdict the re-run takes, so it needs no rate limit to stay off the
+/// heartbeat — and a first steer is waiting on it: a re-run taken during
+/// a lull part-way through a reload left the steer held for most of this
+/// interval after VPP had caught up (review finding, PR #333).
 pub const REVERIFY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Why a standing verdict is due a re-run ([`ReverifySchedule`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stale {
+    /// It failed only on what the table can outgrow
+    /// ([`VerifyOutcome::awaits_clean_table`]).
+    Incomplete,
+    /// It no longer covers the table ([`VerifyOutcome::covers`]), and
+    /// found no mismatch. Wins over `Incomplete` when both hold: it is the
+    /// one a held first steer waits on.
+    Outgrown,
+}
 
 /// When a verdict known to be stale is re-run, once the table it is stale
 /// against is clean and VPP has caught up with the route mirror.
@@ -746,7 +794,9 @@ pub const REVERIFY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from
 ///   exemption, or nothing at all, and now holds none of those;
 /// - the table has outgrown it ([`VerifyOutcome::covers`]): it was
 ///   taken against too small a share of what is installed now to vouch
-///   for it, which is what a first steer needs from it.
+///   for it, which is what a first steer needs from it — unless it found
+///   a MISMATCH, which no new sample may overwrite
+///   ([`Unvouched::Mismatch`]).
 ///
 /// One re-run per clearing, debounced by [`REVERIFY_DEBOUNCE`] and at
 /// most once per [`REVERIFY_MIN_INTERVAL`]. A re-run verdict covers the
@@ -772,24 +822,25 @@ pub struct ReverifySchedule {
 }
 
 impl ReverifySchedule {
-    /// Whether to re-run verify now. `stale` is "the standing verdict
-    /// [`VerifyOutcome::awaits_clean_table`] or no longer
-    /// [`VerifyOutcome::covers`] the table", `clean` is the caller's
-    /// reading that the live table no longer holds what failed it and
-    /// the moment is quiet enough to probe. A `true` is spent: the caller
-    /// runs verify, and the schedule starts over.
-    pub fn poll(&mut self, now: std::time::Instant, stale: bool, clean: bool) -> bool {
-        if !(stale && clean) {
+    /// Whether to re-run verify now. `stale` is why the standing verdict
+    /// is due one, if it is; `clean` is the caller's reading that the live
+    /// table no longer holds what failed it and the moment is quiet enough
+    /// to probe. Both triggers wait out [`REVERIFY_DEBOUNCE`]; only
+    /// [`Stale::Incomplete`] waits out [`REVERIFY_MIN_INTERVAL`]. A `true`
+    /// is spent: the caller runs verify, and the schedule starts over.
+    pub fn poll(&mut self, now: std::time::Instant, stale: Option<Stale>, clean: bool) -> bool {
+        let Some(stale) = stale.filter(|_| clean) else {
             self.clean_since = None;
             return false;
-        }
+        };
         let since = *self.clean_since.get_or_insert(now);
         if now.duration_since(since) < REVERIFY_DEBOUNCE {
             return false;
         }
-        if self
-            .last_run
-            .is_some_and(|t| now.duration_since(t) < REVERIFY_MIN_INTERVAL)
+        if stale == Stale::Incomplete
+            && self
+                .last_run
+                .is_some_and(|t| now.duration_since(t) < REVERIFY_MIN_INTERVAL)
         {
             return false;
         }
@@ -1058,23 +1109,46 @@ mod tests {
         let t0 = std::time::Instant::now();
         let at = |s: u64| t0 + std::time::Duration::from_secs(s);
         let mut r = ReverifySchedule::default();
+        let stale = Some(Stale::Incomplete);
         // A stale verdict over a dirty table: nothing.
-        assert!(!r.poll(at(0), true, false));
+        assert!(!r.poll(at(0), stale, false));
         // Clean from t=1: not before the debounce has run.
-        assert!(!r.poll(at(1), true, true));
-        assert!(!r.poll(at(5), true, true));
+        assert!(!r.poll(at(1), stale, true));
+        assert!(!r.poll(at(5), stale, true));
         // Dirty again at t=8 resets it.
-        assert!(!r.poll(at(8), true, false));
-        assert!(!r.poll(at(9), true, true));
-        assert!(!r.poll(at(18), true, true));
-        assert!(r.poll(at(19), true, true), "clean for the debounce: fire");
+        assert!(!r.poll(at(8), stale, false));
+        assert!(!r.poll(at(9), stale, true));
+        assert!(!r.poll(at(18), stale, true));
+        assert!(r.poll(at(19), stale, true), "clean for the debounce: fire");
         // Spent: a verdict that is still stale (the re-run did not clear
         // it) waits out the interval, however clean the table reads.
-        assert!(!r.poll(at(30), true, true));
-        assert!(!r.poll(at(19 + 299), true, true));
-        assert!(r.poll(at(19 + 300), true, true), "the interval has run");
+        assert!(!r.poll(at(30), stale, true));
+        assert!(!r.poll(at(19 + 299), stale, true));
+        assert!(r.poll(at(19 + 300), stale, true), "the interval has run");
         // A verdict that is no longer stale asks for nothing.
-        assert!(!r.poll(at(10_000), false, true));
-        assert!(!r.poll(at(10_100), false, true));
+        assert!(!r.poll(at(10_000), None, true));
+        assert!(!r.poll(at(10_100), None, true));
+    }
+
+    /// An outgrown verdict waits out the debounce and not the minimum
+    /// interval: a re-run a moment ago (taken in a lull part-way through
+    /// a reload) does not hold a steer for five minutes once the table
+    /// has outgrown THAT verdict and VPP has caught up.
+    #[test]
+    fn an_outgrown_verdict_is_not_rate_limited_by_an_earlier_re_run() {
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        let mut r = ReverifySchedule::default();
+        assert!(!r.poll(at(0), Some(Stale::Outgrown), true));
+        assert!(r.poll(at(10), Some(Stale::Outgrown), true), "debounced");
+        // Twenty seconds later the table has outgrown the new verdict too.
+        assert!(!r.poll(at(30), Some(Stale::Outgrown), true));
+        assert!(
+            r.poll(at(40), Some(Stale::Outgrown), true),
+            "the debounce again, and no five-minute wait"
+        );
+        // An incomplete one still waits the interval out.
+        assert!(!r.poll(at(41), Some(Stale::Incomplete), true));
+        assert!(!r.poll(at(60), Some(Stale::Incomplete), true));
     }
 }

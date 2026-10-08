@@ -738,6 +738,9 @@ fn a_loop_that_panics_after_publishing_is_not_a_clean_stop() {
         fn installed_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
             Vec::new()
         }
+        fn target_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
+            Vec::new()
+        }
         fn missing_from_nic(
             &self,
         ) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
@@ -1194,6 +1197,9 @@ impl packetframe_vpp_offload::runtime::Steering for SpySteering {
     fn installed_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
         Vec::new()
     }
+    fn target_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
+        Vec::new()
+    }
     fn missing_from_nic(&self) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
         // No NIC behind this double, so nothing can be missing from one.
         Ok(packetframe_vpp_offload::runtime::SteeringAudit::clean())
@@ -1241,6 +1247,9 @@ struct GatedSteer {
 
 impl packetframe_vpp_offload::runtime::Steering for GatedSteer {
     fn installed_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
+        Vec::new()
+    }
+    fn target_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
         Vec::new()
     }
     fn missing_from_nic(&self) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {

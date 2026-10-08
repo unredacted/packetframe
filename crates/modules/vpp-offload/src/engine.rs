@@ -284,6 +284,24 @@ pub trait RouteSource {
         0
     }
 
+    /// How many of [`Self::backlog`]'s changes are NEIGHBOUR changes — a
+    /// next hop resolved, lost, or moved to another MAC or device.
+    ///
+    /// Counted apart because one of them is not churn-sized. A route
+    /// delta moves one prefix; a neighbour delta moves the adjacency of
+    /// every route through that next hop, and verify cannot see a stale
+    /// one (it checks that a probed route has paths on owned interfaces,
+    /// not where the adjacency points). The first-steer hold therefore
+    /// tolerates a little route churn at the source and no neighbour work
+    /// at all (`Runtime`'s caught-up test).
+    ///
+    /// Default `0` for the static sources, which never queue anything; the
+    /// delegating `Arc<RouteFeed>` forwards it explicitly, as it must
+    /// every defaulted method.
+    fn neighbour_backlog(&self) -> u64 {
+        0
+    }
+
     /// How many routes the source currently holds.
     ///
     /// Read every tick by two consumers: the adopted-resync deferral,

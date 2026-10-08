@@ -2859,6 +2859,14 @@ impl crate::runtime::Steering for NtupleSteering {
         self.installed_as.clone().unwrap_or_default()
     }
 
+    /// `targets`, the effective target: what [`Self::steer`] installs,
+    /// with the IPv6 half already withheld while the hand-back path is
+    /// not ready — so a v6 diversion that would not go in does not count
+    /// as one being added.
+    fn target_plan(&self) -> Vec<(String, u32, RuleSet)> {
+        self.targets.clone()
+    }
+
     fn retarget(&mut self, targets: Vec<(String, u32, RuleSet)>) {
         self.targets = Self::effective(&targets, self.v6_ready);
         self.configured = targets;

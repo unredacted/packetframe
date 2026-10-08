@@ -938,6 +938,39 @@ impl RuleSet {
     }
 }
 
+/// Whether reconciling a port set from `installed` to `target` diverts
+/// traffic onto VPP that `installed` does not: a `Divert` match on a port
+/// that no installed `Divert` on that port carries — a new port, a new
+/// prefix, a new direction, a new receive MAC, a new `v6-divert` frame.
+///
+/// Every one of those is new traffic routed by VPP's whole FIB: a
+/// diversion selects flows by source or by frame, and VPP then looks up
+/// each one's destination, so a newly diverted flow meets every route VPP
+/// lacks however small the allowlist change that diverted it. What does
+/// NOT add is removal (a port, prefix or direction dropped), a `Keep`
+/// added (that takes traffic back to the kernel), and a rule moved to
+/// another slot or another VF index — slots are the planner's, and the
+/// VF is VPP either way.
+pub fn adds_diversion(
+    target: &[(String, u32, RuleSet)],
+    installed: &[(String, u32, RuleSet)],
+) -> bool {
+    target.iter().any(|(port, _, plan)| {
+        plan.rules
+            .iter()
+            .filter(|r| r.action == RuleAction::Divert)
+            .any(|r| {
+                !installed.iter().any(|(p, _, have)| {
+                    p == port
+                        && have
+                            .rules
+                            .iter()
+                            .any(|h| h.action == RuleAction::Divert && h.shape == r.shape)
+                })
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,6 +980,58 @@ mod tests {
             addr: [a, b, c, d],
             prefix_len: len,
         }
+    }
+
+    /// What a reconcile adds, as the first-steer hold judges it: a port,
+    /// a prefix or a direction diverted that was not — never a removal, an
+    /// exemption added, or the same rules on other slots.
+    #[test]
+    fn only_new_diversions_count_as_added() {
+        let mac = [0x02, 0, 0, 0, 0, 1];
+        let plan = |allow: &[IpPrefix], exempt: &[packetframe_common::config::Ipv4Prefix], dir| {
+            RuleSet::plan(allow, exempt, McamBudget::default(), dir, &[mac]).expect("fits")
+        };
+        let a = v4(192, 0, 2, 0, 24);
+        let b = v4(198, 51, 100, 0, 24);
+        let src = VppSteerDirection::Src;
+        let one = |port: &str, set: RuleSet| vec![(port.to_string(), 0u32, set)];
+        let installed = one("eth4", plan(&[a], &[], src));
+
+        assert!(!adds_diversion(&installed, &installed), "unchanged");
+        assert!(!adds_diversion(&[], &[]), "nothing at all");
+        // A second port: the canary ladder's next rung.
+        let mut two = installed.clone();
+        two.push(("eth5".into(), 0, plan(&[a], &[], src)));
+        assert!(adds_diversion(&two, &installed));
+        // A prefix, and a direction, on the port already steered.
+        assert!(adds_diversion(
+            &one("eth4", plan(&[a, b], &[], src)),
+            &installed
+        ));
+        assert!(adds_diversion(
+            &one("eth4", plan(&[a], &[], VppSteerDirection::Both)),
+            &installed
+        ));
+        // Removals and exemptions take traffic OFF VPP.
+        assert!(!adds_diversion(
+            &one("eth4", plan(&[], &[], src)),
+            &installed
+        ));
+        assert!(!adds_diversion(&installed, &two), "a port dropped");
+        let exempt = [packetframe_common::config::Ipv4Prefix {
+            addr: Ipv4Addr::new(192, 0, 2, 1),
+            prefix_len: 32,
+        }];
+        assert!(!adds_diversion(
+            &one("eth4", plan(&[a], &exempt, src)),
+            &installed
+        ));
+        // The same diversion on another slot is not a new one.
+        let mut moved = installed.clone();
+        for r in &mut moved[0].2.rules {
+            r.location += 100;
+        }
+        assert!(!adds_diversion(&moved, &installed));
     }
 
     /// Both directions, in slot order, with v6 counted rather than

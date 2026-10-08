@@ -454,6 +454,19 @@ pub trait Steering {
     /// did, and silently — the failure this module has already paid for
     /// once with `adopt_installed` shipping with no caller (#127).
     fn installed_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)>;
+    /// `(iface, VF, plan)` the next [`Self::steer`] would install — the
+    /// target as it stands, after anything held back from it (the IPv6
+    /// half while the hand-back path is not ready). Read against
+    /// [`Self::installed_plan`] to tell a reconcile that diverts MORE
+    /// traffic onto VPP from one that diverts the same or less
+    /// ([`crate::steer::adds_diversion`]), which is what decides whether
+    /// the first-steer hold applies to it.
+    ///
+    /// Not a trait default, for the same reason as `installed_plan`: an
+    /// implementor answering "nothing" would make every reconcile look
+    /// like a pure removal, and a later canary port would be diverted
+    /// into a VPP still loading the table.
+    fn target_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)>;
     /// Change what steering *should* be, without touching the NIC.
     ///
     /// Deliberately infallible and side-effect-free: it records intent,
@@ -525,6 +538,9 @@ impl Steering for SteeringUnavailable {
     /// Nothing, and truthfully so: this seam refuses every `steer`, so
     /// no plan of its ever reached a NIC.
     fn installed_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
+        Vec::new()
+    }
+    fn target_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
         Vec::new()
     }
 
@@ -1018,7 +1034,7 @@ enum SteerRequest {
 /// Release needs the authority's CURRENT word (`authority_current`,
 /// the same helper the adopted release consults) AND a drained source
 /// backlog — the mirror-vs-bird comparison cannot see updates the feed
-/// still holds (`source_current`'s doc describes that gap). With no
+/// still holds (`Core::behind`'s doc describes that gap). With no
 /// authority configured there is nothing honest to wait for, the hold
 /// is never armed, and `Verdict::event`'s `VerifyIncomplete` arm is
 /// the backstop.
@@ -1385,7 +1401,14 @@ fn source_quiet_rate_per_sec(adopted: u64) -> u64 {
 ///
 /// A count of route WORK, not of a time: it says nothing about how fast
 /// VPP will absorb it, only that what is owed is churn-sized rather than
-/// table-sized.
+/// table-sized. That is all it can say about a reload's TAIL, too: the
+/// last few hundred changes of a reload pass under it as they would under
+/// a quiet source, so a steer can land with that many prefixes still to
+/// reach VPP. They follow a less specific VPP route until the next drain
+/// or two takes them — the exposure a steered box has to any burst of
+/// churn, which is a moment of staleness rather than a table missing.
+///
+/// Route work only. Neighbour work has no allowance (`Core::behind`).
 fn caught_up_allowance(mirror: u64) -> u64 {
     source_quiet_rate_per_sec(mirror)
 }
@@ -1394,12 +1417,16 @@ fn caught_up_allowance(mirror: u64) -> u64 {
 /// steer allows ([`Core::behind`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Behind {
-    /// Changes the route source holds that the engine has not pulled.
+    /// ROUTE changes the route source holds that the engine has not
+    /// pulled.
     pub backlog: u64,
+    /// Neighbour changes it holds — any one is too many
+    /// ([`RouteSource::neighbour_backlog`]).
+    pub neighbours: u64,
     /// Ops the engine has pulled and not yet sent.
     pub pending: u64,
-    /// The most of the two together that counts as caught up
-    /// ([`caught_up_allowance`]).
+    /// The most of `backlog` and `pending` together that counts as
+    /// caught up ([`caught_up_allowance`]).
     pub allowance: u64,
     /// The last attempt to apply route updates to VPP failed, so how far
     /// behind it is cannot be told from the counts: a batch handed back
@@ -1417,6 +1444,21 @@ pub struct SteerHold {
     pub unvouched: Option<crate::verify::Unvouched>,
 }
 
+impl SteerHold {
+    /// Whether this hold clears with time, so a remembered want steers on
+    /// its own: VPP catches up, and an outgrown verdict is re-run. A
+    /// mismatch does not — it is never re-run, and the restart that clears
+    /// it starts a never-steered port with no want (`MISMATCH_REMEDY`) —
+    /// and neither does a missing verdict, which waiting cannot produce.
+    /// What every surface promising "on its own" asks first.
+    pub fn clears_itself(&self) -> bool {
+        !matches!(
+            self.unvouched,
+            Some(crate::verify::Unvouched::Mismatch | crate::verify::Unvouched::NoVerdict)
+        )
+    }
+}
+
 impl std::fmt::Display for SteerHold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut parts = Vec::new();
@@ -1426,22 +1468,32 @@ impl std::fmt::Display for SteerHold {
                     "the last attempt to apply route updates to VPP failed, so VPP is behind \
                      the route mirror by an amount the counts cannot show ({} change(s) still \
                      at the route source, {} queued for VPP)",
-                    b.backlog, b.pending
+                    b.backlog + b.neighbours,
+                    b.pending
                 )
             } else {
+                let neighbours = if b.neighbours > 0 {
+                    format!(
+                        " and {} neighbour change(s), where caught up is none: one moves \
+                         every route through that next hop",
+                        b.neighbours
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
                     "VPP has not caught up with the route mirror: {} change(s) still at the \
-                     route source and {} queued for VPP, where caught up is at most {}",
-                    b.backlog, b.pending, b.allowance
+                     route source and {} queued for VPP, where caught up is at most {}{}",
+                    b.backlog, b.pending, b.allowance, neighbours
                 )
             });
         }
         if let Some(u) = &self.unvouched {
             parts.push(match u {
                 crate::verify::Unvouched::Outgrown { .. } => format!(
-                    "{u}; verify re-runs on its own once VPP has caught up and the table is \
-                     clean (at most every {}s)",
-                    crate::verify::REVERIFY_MIN_INTERVAL.as_secs()
+                    "{u}; verify re-runs on its own {}s after VPP has caught up and the table \
+                     is clean",
+                    crate::verify::REVERIFY_DEBOUNCE.as_secs()
                 ),
                 _ => u.to_string(),
             });
@@ -1879,6 +1931,25 @@ impl Runtime {
             return Err(format!(
                 "the supervisor is {state:?}, so the ledger is not a verified picture of VPP's FIB"
             ));
+        }
+        // Converged is not vouched for: a verify re-run that found VPP
+        // disagreeing leaves the module in `Ready`/`Steered` with a ledger
+        // that verify just disproved. Preserved, it would be seeded at the
+        // next start, VPP's per-length counts would still match it, the
+        // diff would skip exactly the prefixes VPP has wrong, and a fresh
+        // sample could miss them — clearing the first-steer hold with
+        // nothing rebuilt (review finding, PR #333). Refused, the next
+        // start reads VPP's FIB, and the resync corrects what it holds.
+        if c.engine
+            .last_verify()
+            .is_some_and(crate::verify::VerifyOutcome::restart_worthy)
+        {
+            return Err(
+                "the last verify found VPP disagreeing with the route ledger, so the ledger is \
+                 disproved: the next start reads VPP's FIB instead, and its resync corrects \
+                 what VPP holds"
+                    .into(),
+            );
         }
         let Core { engine, store, .. } = &mut *c;
         let interfaces = engine.attached_indices();
@@ -3060,17 +3131,27 @@ impl Core {
     /// Shared by the first-steer hold ([`Self::steer_hold`]) and the
     /// verify re-run's quiet moment (`Observe::poll_reverify`), so "VPP
     /// has caught up" means one thing on both.
+    ///
+    /// The allowance is for ROUTE work only. A neighbour change still at
+    /// the source must be zero: it moves the adjacency of every route
+    /// through that next hop, and verify cannot see a stale adjacency —
+    /// it checks a probed route has paths on owned interfaces, not where
+    /// they lead (review finding, PR #333).
     fn behind(&self) -> Option<Behind> {
-        let backlog = self.source.backlog();
+        let neighbours = self.source.neighbour_backlog();
+        let backlog = self.source.backlog().saturating_sub(neighbours);
         let pending = self.engine.pending().len() as u64;
         let allowance = caught_up_allowance(self.source.route_count());
         let failing = self.last_drain_error.is_some();
-        (failing || backlog.saturating_add(pending) > allowance).then_some(Behind {
-            backlog,
-            pending,
-            allowance,
-            failing,
-        })
+        (failing || neighbours > 0 || backlog.saturating_add(pending) > allowance).then_some(
+            Behind {
+                backlog,
+                neighbours,
+                pending,
+                allowance,
+                failing,
+            },
+        )
     }
 
     /// Why a first steer must wait right now, or `None` when nothing here
@@ -3095,18 +3176,48 @@ impl Core {
     /// table vouched for a lever move made over ~666k installed routes,
     /// with ~430k more still on their way.
     ///
+    /// It judges a steer that would put NEW traffic onto VPP
+    /// ([`Self::expands_diversion`]): the first steer, and equally a
+    /// reconcile that adds a port, a prefix or a direction to ports
+    /// already steered — the canary ladder's second rung during a reload
+    /// diverts into the same behind-and-unverified VPP the first rung
+    /// would have. A reconcile that diverts the same or less is not
+    /// judged, because refusing it would leave the previous rules
+    /// installed — including ones the operator just asked to remove.
+    ///
     /// Carries the empty-target exception itself, next to the gate it
     /// exempts, as `steer_verdict` and `fib_fit_to_steer` do: a target
     /// with no port only removes rules, and a `steer off` must never wait
     /// on VPP or on a verify.
     fn steer_hold(&self) -> Option<SteerHold> {
-        if !self.steer_diverts_traffic() {
+        if !self.steer_diverts_traffic() || !self.expands_diversion() {
             return None;
         }
         let behind = self.behind();
         let unvouched =
             crate::verify::unvouched(self.engine.last_verify(), self.engine.counts().installed);
         (behind.is_some() || unvouched.is_some()).then_some(SteerHold { behind, unvouched })
+    }
+
+    /// Whether steering the current target would divert traffic onto VPP
+    /// that the rules installed now do not.
+    ///
+    /// With nothing installed every diversion is new: the first steer.
+    /// With rules installed it is [`crate::steer::adds_diversion`] over
+    /// the target and the plan the rules were installed under — the NIC
+    /// ledger, not the supervisor's `steered`, which reaches this core only
+    /// as a copy synced after each pass. Rules in the NIC with NO recorded
+    /// plan (a state file from before plans were kept, or a first steer
+    /// whose rollback could not delete) cannot be compared, so they are
+    /// read as adding: holding is the direction that cannot divert traffic
+    /// into a VPP that is behind.
+    fn expands_diversion(&self) -> bool {
+        if self.steering.installed().is_empty() {
+            return true;
+        }
+        let installed = self.steering.installed_plan();
+        installed.is_empty()
+            || crate::steer::adds_diversion(&self.steering.target_plan(), &installed)
     }
 
     /// Write the named unresolvable routes to the event log when the set
@@ -3548,13 +3659,24 @@ impl Observe for ObserveView {
         // what the table can outgrow, or taken against too little of the
         // table to vouch for it now — the coverage rule the first-steer
         // hold applies, through the same predicate.
+        //
+        // Never a MISMATCH, however much the table has grown. The probes
+        // found VPP disagreeing with the ledger, and a re-run draws a new
+        // sample that can simply miss the prefix it disagreed on — a pass
+        // that would release a held first steer with nothing rebuilt
+        // (review finding, PR #333). Nothing samples its way out of a
+        // mismatch; a FIB rebuild does (`verify::Unvouched::Mismatch`).
         let (incomplete, outgrown) = c.engine.last_verify().map_or((false, None), |v| {
             (
                 v.awaits_clean_table(),
-                (!v.covers(counts.installed)).then_some(v.table),
+                (!v.restart_worthy() && !v.covers(counts.installed)).then_some(v.table),
             )
         });
-        let stale = incomplete || outgrown.is_some();
+        let stale = if outgrown.is_some() {
+            Some(crate::verify::Stale::Outgrown)
+        } else {
+            incomplete.then_some(crate::verify::Stale::Incomplete)
+        };
         // Clean: nothing the verdict failed on is left, and nothing about
         // the moment would make a probe race the table — the same
         // conditions the convergence verify runs under. Nothing in
@@ -3599,9 +3721,10 @@ impl Observe for ObserveView {
                     tracing::warn!(
                         outcome = %summary,
                         cause = %cause,
+                        remedy = crate::verify::MISMATCH_REMEDY,
                         "verify re-run found FIB mismatches; a re-run tears nothing down, so \
-                         VPP stays up and steering already in place is unchanged, but no first \
-                         steer is admitted on this verdict — a daemon restart rebuilds the FIB"
+                         VPP stays up and steering already in place is unchanged, but no steer \
+                         that diverts more is admitted on this verdict, and it is not re-run"
                     );
                     event_log::Event::warn(crate::MODULE_NAME, event_kind::VERIFY_FAILED).detail(
                         "re-run; nothing is torn down by a re-run, and a first steer is held",
@@ -4151,7 +4274,7 @@ impl ObserveView {
         // convergence out either. Backlog must be drained too: the
         // authority compares bird against the MIRROR, which the tee has
         // already updated, so an idle map plus a converged word can
-        // still hide a burst the feed holds (`source_current`'s gap).
+        // still hide a burst the feed holds (`Core::behind`'s gap).
         let mut release_hold = false;
         if let (Ok(crate::driver::Drain::Idle), Some(hold)) = (&r, fresh_hold.as_mut()) {
             let have = source.route_count();
@@ -4324,33 +4447,44 @@ impl Effects for EffectsView {
         // — the retry and a convergence's `VerifyPassed` re-steer of a
         // want come straight to this effect.
         //
-        // FIRST steer only: nothing in the NIC yet. A port already
-        // diverting traffic is reconciled whatever the backlog, because
-        // refusing leaves the PREVIOUS rules installed — a prefix just
-        // dropped from the allowlist would go on being diverted. The NIC
-        // ledger rather than the supervisor's `steered`, which reaches
-        // this core only as a copy synced after each pass; the ledger is
-        // what puts packets on VPP, and `start_resync` asks it the same
-        // question. The retry applies the hold unconditionally, as it
-        // does `fib_fit_to_steer`; see there.
+        // Any steer that diverts MORE, not only the first: the accessor
+        // asks `expands_diversion`, so a reconcile adding a canary port
+        // to ports already steered is held as the first port was, while
+        // one that diverts the same or less goes through whatever the
+        // backlog — refusing it would leave the previous rules installed.
+        // The refusal is before the NIC, so the ports already steered
+        // keep exactly the rules they have.
         //
         // A refusal is `SteerFailed` with the want kept, and the retry
         // re-attempts once `steer_permitted` — the same accessor — says
         // the hold has cleared; an outgrown verdict is refreshed by the
         // verify re-run first. The empty-target exception is inside the
         // accessor.
-        if c.steering.installed().is_empty() {
-            if let Some(hold) = c.steer_hold() {
-                return Err(format!(
-                    "refusing to steer: {hold}. A steered packet whose prefix VPP does not \
-                     hold yet, or holds through a FIB no verify has sampled, is dropped or \
-                     follows a less specific route inside VPP rather than falling back to the \
-                     kernel path. The want is remembered and re-attempted on its own, at most \
-                     every {}s, once nothing holds it — `packetframe status` says what it \
-                     waits for, and `packetframe reconfigure` asks immediately",
+        if let Some(hold) = c.steer_hold() {
+            let kept = if c.steering.installed().is_empty() {
+                ""
+            } else {
+                " Nothing was changed: the rules already installed stay as they are, \
+                 including any this change would remove — a change that only removes \
+                 rules is never held, so apply a removal on its own if it cannot wait."
+            };
+            let then = if hold.clears_itself() {
+                format!(
+                    "The want is remembered and re-attempted on its own, at most every {}s, \
+                     once nothing holds it — `packetframe status` says what it waits for, and \
+                     `packetframe reconfigure` asks immediately",
                     crate::driver::STEER_RETRY_EVERY.as_secs()
-                ));
-            }
+                )
+            } else {
+                "Waiting does not clear this, so the remembered want will not steer by itself"
+                    .to_string()
+            };
+            return Err(format!(
+                "refusing to steer: {hold}. A steered packet whose prefix VPP does not \
+                 hold yet, or holds through a FIB no verify has sampled, is dropped or \
+                 follows a less specific route inside VPP rather than falling back to the \
+                 kernel path.{kept} {then}"
+            ));
         }
         // The link gate, same chokepoint, same shape, FRESH read. The
         // verify verdict deliberately routes dark members through
@@ -5487,6 +5621,9 @@ mod tests {
         /// a record holding locations without their spec is a teardown
         /// that cannot remove the exemptions.
         plan: Vec<(String, u32, crate::steer::RuleSet)>,
+        /// What the next steer would install, for the first-steer hold's
+        /// "does this reconcile divert more" question.
+        target: Vec<(String, u32, crate::steer::RuleSet)>,
     }
 
     impl Steering for LedgerSteering {
@@ -5495,6 +5632,9 @@ mod tests {
         }
         fn installed_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
             self.plan.clone()
+        }
+        fn target_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
+            self.target.clone()
         }
         fn configured_ports(&self) -> usize {
             self.configured
@@ -5583,6 +5723,7 @@ mod tests {
             next: Some((vec![("eth4".into(), 1025)], false)),
             configured: 1,
             plan: Vec::new(),
+            target: Vec::new(),
         });
         fx.unsteer().expect_err("one rule would not come out");
 
@@ -5742,6 +5883,9 @@ mod tests {
             fn installed_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
                 Vec::new()
             }
+            fn target_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
+                Vec::new()
+            }
             fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
                 Ok(SteeringAudit {
                     missing: vec![("eth4".into(), 1024)],
@@ -5806,6 +5950,9 @@ mod tests {
         struct DriftsAfterFirstPass(std::cell::Cell<usize>);
         impl Steering for DriftsAfterFirstPass {
             fn installed_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
+                Vec::new()
+            }
+            fn target_plan(&self) -> Vec<(String, u32, crate::steer::RuleSet)> {
                 Vec::new()
             }
             fn missing_from_nic(&self) -> Result<SteeringAudit, String> {
@@ -6564,14 +6711,92 @@ mod tests {
             .expect("an empty target diverts nothing and must not be link-gated");
     }
 
+    /// Route churn at the source is tolerated, neighbour work is not: one
+    /// queued neighbour change — a next hop's MAC moved — holds a first
+    /// steer that a handful of queued route changes does not, and the
+    /// refusal says why (review finding, PR #333).
+    #[test]
+    fn a_queued_neighbour_change_holds_a_first_steer_that_route_churn_does_not() {
+        struct Queued {
+            routes: u64,
+            neighbours: u64,
+        }
+        impl RouteSource for Queued {
+            fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
+            fn for_each_neighbour(&self, _: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {}
+            fn route_count(&self) -> u64 {
+                1_000_000
+            }
+            fn change_seq(&self) -> u64 {
+                0
+            }
+            fn backlog(&self) -> u64 {
+                self.routes + self.neighbours
+            }
+            fn neighbour_backlog(&self) -> u64 {
+                self.neighbours
+            }
+            fn requeue(&self, _: crate::engine::SourceChanges) {
+                unreachable!("this source hands nothing over, so nothing can be requeued");
+            }
+        }
+        let mut eng = engine();
+        {
+            let mut map = crate::sink::NexthopMap::new(vec!["eth4".into()]);
+            let nh = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+            map.set_device(nh, "eth4");
+            let p = IpPrefix::V4 {
+                addr: [203, 0, 113, 0],
+                prefix_len: 24,
+            };
+            eng.ledger_mut().classify_upsert(p, &[nh], &map);
+            eng.ledger_mut().commit_installed(p);
+        }
+        eng.verified_for_test();
+        let rt = Runtime::new(
+            eng,
+            Box::new(Queued {
+                routes: 5,
+                neighbours: 0,
+            }),
+            Box::new(LedgerSteering {
+                next: Some((vec![("eth4".into(), 1024)], true)),
+                configured: 1,
+                ..Default::default()
+            }),
+            Box::new(NullStore),
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        );
+        rt.core.borrow_mut().engine.test_dead_members = Some(Vec::new());
+        {
+            let (mut obs, _) = rt.views();
+            assert!(obs.steer_permitted(), "five route changes are churn");
+        }
+        rt.core.borrow_mut().source = Box::new(Queued {
+            routes: 0,
+            neighbours: 1,
+        });
+        let (mut obs, mut fx) = rt.views();
+        assert!(!obs.steer_permitted(), "one neighbour change is not");
+        let e = fx.steer().expect_err("a neighbour change is queued");
+        assert!(
+            e.contains("and 1 neighbour change(s), where caught up is none"),
+            "{e}"
+        );
+        assert!(rt.core.borrow().steering.installed().is_empty());
+    }
+
     /// The first-steer hold at the chokepoint: a FIRST diverting steer is
     /// refused while VPP is behind the mirror or no verify vouches for the
-    /// table, and the refusal names both; a port already steered is
-    /// reconciled whatever either says; and a target that diverts nothing
+    /// table, and the refusal names both; a reconcile of ports already
+    /// steered is refused only when it diverts MORE (a port added), and
+    /// then touches nothing installed; and a target that diverts nothing
     /// — `steer off`'s reconcile — is held by neither the steer nor the
     /// retry that drives it.
     #[test]
-    fn the_first_steer_hold_refuses_a_first_steer_and_never_a_reconcile_or_a_removal() {
+    fn the_first_steer_hold_refuses_a_steer_that_diverts_more_and_never_a_removal() {
         struct Behind;
         impl RouteSource for Behind {
             fn for_each_route(&self, _: &mut dyn FnMut(IpPrefix, &[IpAddr])) {}
@@ -6625,18 +6850,63 @@ mod tests {
             "and status carries the gate's own answer"
         );
 
-        // Already steered — rules in the NIC: a reconcile, refused by
-        // nothing here.
+        // Already steered on eth4, plan recorded. A reconcile that
+        // diverts no more — the same target — is refused by nothing here.
+        let plan = |allow: &[IpPrefix]| {
+            crate::steer::RuleSet::plan(
+                allow,
+                &[],
+                crate::steer::McamBudget::default(),
+                packetframe_common::config::VppSteerDirection::Src,
+                &[[0x02, 0, 0, 0, 0, 1]],
+            )
+            .expect("fits")
+        };
+        let a = IpPrefix::V4 {
+            addr: [192, 0, 2, 0],
+            prefix_len: 24,
+        };
+        let eth4 = vec![("eth4".to_string(), 0u32, plan(&[a]))];
+        let installed = vec![("eth4".to_string(), 1024u32)];
         rt.core.borrow_mut().steering = Box::new(LedgerSteering {
-            rules: vec![("eth4".into(), 1024)],
-            next: Some((vec![("eth4".into(), 1024)], true)),
+            rules: installed.clone(),
+            next: Some((installed.clone(), true)),
             configured: 1,
-            ..Default::default()
+            plan: eth4.clone(),
+            target: eth4.clone(),
         });
         {
             let (_, mut fx) = rt.views();
             fx.steer()
-                .expect("a port already diverting traffic is reconciled");
+                .expect("a reconcile that diverts no more is not held");
+        }
+
+        // The next canary rung: eth5 added to the target. Refused before
+        // the NIC, eth4's rules exactly as they were, and the refusal
+        // says so.
+        let mut eth4_and_eth5 = eth4.clone();
+        eth4_and_eth5.push(("eth5".to_string(), 0, plan(&[a])));
+        rt.core.borrow_mut().steering = Box::new(LedgerSteering {
+            rules: installed.clone(),
+            next: Some((
+                vec![("eth4".to_string(), 1024), ("eth5".to_string(), 1024)],
+                true,
+            )),
+            configured: 2,
+            plan: eth4.clone(),
+            target: eth4_and_eth5,
+        });
+        {
+            let (_, mut fx) = rt.views();
+            let e = fx.steer().expect_err("a port added while VPP is behind");
+            assert!(
+                e.contains("VPP has not caught up") && e.contains("Nothing was changed"),
+                "{e}"
+            );
+            assert_eq!(rt.core.borrow().steering.installed(), installed);
+            assert_eq!(rt.core.borrow().steering.installed_plan(), eth4);
+            let (mut obs, _) = rt.views();
+            assert!(!obs.steer_permitted(), "nor does the retry add it");
         }
 
         // A removal, from an unsteered port: never held.
