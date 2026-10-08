@@ -1692,17 +1692,23 @@ Check:
   overruns, if any, each made good by a re-read). Degraded `link
   notifications lost (N overruns)` means the maps are not known to be
   current yet: the re-read runs a quarter second after the burst of link
-  events settles, and the recovery is done only once every link it found
-  is in both redirect maps. Until then `not recovered yet (retrying)`
-  says why — the dump failed, or some links are not admitted yet (VLAN
-  translation held, or a map write failed, e.g. the maps are full) — and
-  it retries every 5 s. Degraded
-  `stopped (...)` means the watcher is gone and SIGHUP is again the
-  only refresh — `systemctl reload packetframe` reconciles immediately;
-  only a restart brings the watcher back. Metrics:
+  events settles, and the recovery is done once its links have been read
+  and offered to the maps. Until then `not recovered yet (retrying)` says
+  why (the dump failed, or the link topology could not be read to apply
+  it); a failed dump is retried every 5 s. Degraded `N qualifying links
+  are not in the redirect maps` is a separate fact, shown whatever the
+  overrun history: the maps hold 64 links each, and those links' inserts
+  were refused (in practice, the maps are full), so their traffic takes
+  the kernel path. Each refused link is warned about once
+  (`redirect target refused`). It is offered again as soon as an
+  eviction makes room — a link deleted, or a reload — not on a timer.
+  Degraded `stopped (...)` means the watcher is gone and SIGHUP is
+  again the only refresh — `systemctl reload packetframe` reconciles
+  immediately; only a restart brings the watcher back. Metrics:
   `packetframe_redirect_watch_running`,
   `packetframe_redirect_watch_overruns_total`,
-  `packetframe_redirect_watch_resyncs_total{outcome="ok|failed"}`.
+  `packetframe_redirect_watch_resyncs_total{outcome="ok|failed"}`,
+  `packetframe_redirect_watch_unadmitted_links`.
 - `journalctl -u packetframe | grep 'redirect-target'`: the watcher
   logs `live (RTNLGRP_LINK)` at start and every add/remove; a line
   saying it stopped means SIGHUP is again the only refresh, as above.

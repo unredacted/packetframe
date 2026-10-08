@@ -965,53 +965,96 @@ fn rows_that_appear_unheard_are_repaired() {
     for i in 0..N {
         rig.inject(&arp_request(mac(i), mac(i), addr(i), v4(200)));
     }
-    let learned = Instant::now();
+    let all_resolved = |s: &Snapshot| {
+        let c = s.bridges[0].participant_coverage;
+        c.total == u64::from(N) && c.resolved == u64::from(N)
+    };
     wait_for(
         Duration::from_secs(15),
         "every learned address resolved in the mirror",
         || {
             let s = rig.snapshot();
-            let c = s.bridges[0].participant_coverage;
-            (c.total == u64::from(N) && c.resolved == u64::from(N)).then(|| format!("{s:?}"))
+            all_resolved(&s).then(|| format!("{s:?}"))
         },
     );
+    let held = || {
+        let table = neigh_table(&rig.names.netns, &rig.names.veth_a);
+        (0..N)
+            .filter(|i| {
+                table
+                    .lines()
+                    .any(|l| l.starts_with(&format!("{} ", addr(*i))))
+            })
+            .count()
+    };
 
-    // One delete per request, paced, so every RTM_DELNEIGH is heard.
-    for i in 0..N {
-        ns_run(
-            &rig.names.netns,
-            &[
-                "ip",
-                "neigh",
-                "del",
-                &addr(i).to_string(),
-                "dev",
-                &rig.names.veth_a,
-            ],
+    // Delete them all, one request per address, paced, so that each
+    // RTM_DELNEIGH is heard and the mirror holds no row for any of them.
+    // The premise can still fail on the shrunk buffer: a lost delete is an
+    // overrun, and its re-read re-seeds every address. So a round counts
+    // only if it ends with no overrun, nothing owed and nothing held;
+    // otherwise wait for the re-seed and delete again.
+    let mut clean = false;
+    for _ in 0..3 {
+        let round = rig.snapshot().netlink.overruns;
+        for i in 0..N {
+            ns_run(
+                &rig.names.netns,
+                &[
+                    "ip",
+                    "neigh",
+                    "del",
+                    &addr(i).to_string(),
+                    "dev",
+                    &rig.names.veth_a,
+                ],
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Long enough for an overrun to be reported and published.
+        std::thread::sleep(Duration::from_secs(2));
+        let s = rig.snapshot();
+        if s.netlink.overruns == round
+            && !s.netlink.resync_pending
+            && s.bridges[0].participant_coverage.resolved == 0
+            && held() == 0
+        {
+            clean = true;
+            break;
+        }
+        wait_for(
+            Duration::from_secs(20),
+            "the re-seed after a lost delete",
+            || {
+                let s = rig.snapshot();
+                (all_resolved(&s) && !s.netlink.resync_pending && held() == usize::from(N))
+                    .then(|| format!("{s:?}"))
+            },
         );
-        std::thread::sleep(Duration::from_millis(20));
     }
-    wait_for(
-        Duration::from_secs(15),
-        "the deletes heard: no row and nothing owed",
-        || {
-            let s = rig.snapshot();
-            (s.bridges[0].participant_coverage.resolved == 0 && !s.netlink.resync_pending)
-                .then(|| format!("{s:?}"))
-        },
-    );
-    assert!(
-        neigh_table(&rig.names.netns, &rig.names.veth_a)
-            .lines()
-            .all(|l| (0..N).all(|i| !l.starts_with(&format!("{} ", addr(i))))),
-        "precondition: the kernel holds none of them"
-    );
-    // Out of the holddown (`DEFAULT_HOLDDOWN`, 30 s from the learn's
-    // installs), with margin.
-    let holddown_over = learned + Duration::from_secs(32);
-    std::thread::sleep(holddown_over.saturating_duration_since(Instant::now()));
+    assert!(clean, "premise: a round of deletes was heard in full");
+
+    // Out of the holddown (`DEFAULT_HOLDDOWN`, 30 s from each install's
+    // dispatch): from the moment the install counters stop moving, which
+    // covers the learn's installs and any re-seed's.
+    let dispatched = |s: &Snapshot| {
+        let c = &s.bridges[0].counters;
+        c.installs[InstallOutcome::Requested.index()] + c.seeds[SeedOutcome::Requested.index()]
+    };
+    let mut last = dispatched(&rig.snapshot());
+    let mut still_since = Instant::now();
+    while still_since.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(500));
+        let now = dispatched(&rig.snapshot());
+        if now != last {
+            last = now;
+            still_since = Instant::now();
+        }
+    }
+    std::thread::sleep(Duration::from_secs(31));
     let before = rig.snapshot();
     assert!(!before.netlink.resync_pending, "{:?}", before.netlink);
+    assert_eq!(dispatched(&before), last, "no install since the wait began");
 
     let a_ifindex = if_nametoindex(&rig.names.veth_a);
     let entries: Vec<(Ipv4Addr, [u8; 6])> = (0..N).map(|i| (addr(i), other(i))).collect();

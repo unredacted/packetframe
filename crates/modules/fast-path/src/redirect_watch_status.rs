@@ -1,8 +1,8 @@
 //! What the redirect-target watcher (`redirect_watch`, Linux-only)
-//! reports about itself: whether it still follows the link table, and
-//! how often the kernel dropped link notifications on it. Portable, so
-//! the `redirect-watch` status row and its gauges are tested on every
-//! host.
+//! reports about itself: whether it still follows the link table, how
+//! often the kernel dropped link notifications on it, and how many
+//! qualifying links the redirect maps refused. Portable, so the
+//! `redirect-watch` status row and its gauges are tested on every host.
 
 use std::fmt::Write as _;
 
@@ -19,19 +19,34 @@ pub struct WatchStatus {
     /// Times the kernel reported link notifications lost to a full
     /// receive buffer (`ENOBUFS`). One report stands for any number.
     pub overruns: u64,
-    /// Recoveries from lost notifications: `ok` once a re-read's links
-    /// are all in the redirect maps, `failed` for each dump that failed.
+    /// Recoveries from lost notifications: `ok` once a re-read has been
+    /// read and every admission it queued attempted, `failed` for each
+    /// dump that failed.
     pub resyncs_ok: u64,
     pub resyncs_failed: u64,
-    /// Notifications were lost and the maps are not known to be current
-    /// yet: no re-read has covered them, or its links are not all in.
+    /// Notifications were lost and no completed recovery covers them yet.
     pub resync_pending: bool,
-    /// Why the recovery has not finished: the dump failed, or some links
-    /// it found are not admitted yet. Cleared by a completed recovery.
+    /// Why the recovery has not finished: the dump failed, or the link
+    /// topology could not be read to apply it. Cleared by a completed
+    /// recovery.
     pub last_resync_error: Option<String>,
+    /// Qualifying links whose insert into a redirect map was refused —
+    /// in practice, the maps are full (64 links each). Recomputed on every
+    /// refresh, whatever the overrun history; their traffic takes the
+    /// kernel path until an eviction makes room.
+    pub unadmitted: u64,
 }
 
 impl WatchStatus {
+    fn refused_text(&self) -> String {
+        format!(
+            "{} qualifying links are not in the redirect maps: their insert was refused (the \
+             maps hold 64 links each, so usually they are full); their traffic takes the \
+             kernel path until an eviction makes room",
+            self.unadmitted
+        )
+    }
+
     pub fn subsystem_health(&self) -> SubsystemHealth {
         let (state, message) = if let Some(why) = &self.stopped {
             (
@@ -51,7 +66,12 @@ impl WatchStatus {
             if let Some(e) = &self.last_resync_error {
                 let _ = write!(m, "; not recovered yet (retrying): {e}");
             }
+            if self.unadmitted > 0 {
+                let _ = write!(m, "; {}", self.refused_text());
+            }
             (HealthState::Degraded, m)
+        } else if self.unadmitted > 0 {
+            (HealthState::Degraded, self.refused_text())
         } else {
             let mut m = "following the link table".to_string();
             if self.overruns > 0 {
@@ -99,7 +119,7 @@ impl WatchStatus {
         );
         let _ = writeln!(
             out,
-            "# HELP packetframe_redirect_watch_resyncs_total recoveries from lost link notifications (ok: every re-read link in the redirect maps; failed: a dump that failed)"
+            "# HELP packetframe_redirect_watch_resyncs_total recoveries from lost link notifications (ok: re-read and applied; failed: a dump that failed)"
         );
         let _ = writeln!(
             out,
@@ -111,6 +131,19 @@ impl WatchStatus {
                 "packetframe_redirect_watch_resyncs_total{{module=\"fast-path\",outcome=\"{outcome}\"}} {n}"
             );
         }
+        let _ = writeln!(
+            out,
+            "# HELP packetframe_redirect_watch_unadmitted_links qualifying links the redirect maps refused (usually: full)"
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE packetframe_redirect_watch_unadmitted_links gauge"
+        );
+        let _ = writeln!(
+            out,
+            "packetframe_redirect_watch_unadmitted_links{{module=\"fast-path\"}} {}",
+            self.unadmitted
+        );
     }
 }
 
@@ -170,12 +203,44 @@ mod tests {
         assert!(out.contains("packetframe_redirect_watch_running{module=\"fast-path\"} 0"));
     }
 
+    /// Links the maps refused are their own condition: Degraded with or
+    /// without an overrun behind it, and named as a capacity problem, not
+    /// as lost notifications.
+    #[test]
+    fn refused_links_degrade_whatever_the_overrun_history() {
+        let s = WatchStatus {
+            unadmitted: 8,
+            ..WatchStatus::default()
+        };
+        let h = s.subsystem_health();
+        assert_eq!(h.state, HealthState::Degraded);
+        let m = h.message.unwrap();
+        assert!(
+            m.starts_with("8 qualifying links are not in the redirect maps"),
+            "{m}"
+        );
+        assert!(!m.contains("notifications lost"), "{m}");
+
+        let s = WatchStatus {
+            overruns: 1,
+            resync_pending: true,
+            unadmitted: 8,
+            ..WatchStatus::default()
+        };
+        let m = s.subsystem_health().message.unwrap();
+        assert!(
+            m.contains("notifications lost") && m.contains("8 qualifying links"),
+            "{m}"
+        );
+    }
+
     #[test]
     fn metrics_render_every_series() {
         let s = WatchStatus {
             overruns: 3,
             resyncs_ok: 2,
             resyncs_failed: 1,
+            unadmitted: 4,
             ..WatchStatus::default()
         };
         let mut out = String::new();
@@ -185,6 +250,7 @@ mod tests {
             "packetframe_redirect_watch_overruns_total{module=\"fast-path\"} 3",
             "packetframe_redirect_watch_resyncs_total{module=\"fast-path\",outcome=\"ok\"} 2",
             "packetframe_redirect_watch_resyncs_total{module=\"fast-path\",outcome=\"failed\"} 1",
+            "packetframe_redirect_watch_unadmitted_links{module=\"fast-path\"} 4",
         ] {
             assert!(out.lines().any(|l| l == line), "missing {line} in:\n{out}");
         }

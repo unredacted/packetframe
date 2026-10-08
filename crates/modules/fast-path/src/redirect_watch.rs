@@ -50,9 +50,14 @@
 //! (reported once, as an overrun) are never resent, so an overrun
 //! re-reads the link table instead: every link that qualifies is queued
 //! for admission exactly as its `RTM_NEWLINK` would have been, and every
-//! ifindex the maps hold that the kernel no longer knows is evicted. The
-//! watcher's state — running or stopped, overruns, re-reads — is the
-//! `redirect-watch` status row ([`WatchStatus`]).
+//! ifindex the maps hold that the kernel no longer knows is evicted.
+//!
+//! The maps hold 64 links each. A link whose insert is refused (they
+//! are full) is warned about once and offered again only when an
+//! eviction makes room: no timer can fix a full map. How many are left
+//! out is reported on every refresh, apart from any overrun. The
+//! watcher's state — running or stopped, overruns, re-reads, refused
+//! links — is the `redirect-watch` status row ([`WatchStatus`]).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -291,6 +296,11 @@ struct Targets {
     rx_ports: Vec<(String, u32)>,
     /// Ports whose receive MACs the last refresh could not read.
     rx_unknown: HashSet<u32>,
+    /// Links whose insert into either redirect map was refused. The maps
+    /// hold 64 entries each, so the usual reason is that they are full,
+    /// which no timer can fix: each is warned about once, and offered
+    /// again only when an eviction makes room.
+    refused: HashSet<u32>,
 }
 
 impl Targets {
@@ -328,6 +338,7 @@ impl Targets {
             rx,
             rx_ports,
             rx_unknown: HashSet::new(),
+            refused: HashSet::new(),
         })
     }
 
@@ -362,13 +373,14 @@ impl Targets {
 
     fn admit(&mut self, ifindex: u32, why: &'static str) {
         let mut changed = false;
+        let mut refused = Vec::new();
         if !self.in_devmap.contains(&ifindex) {
             match self.devmap.insert(ifindex, ifindex, None, 0) {
                 Ok(()) => {
                     self.in_devmap.insert(ifindex);
                     changed = true;
                 }
-                Err(e) => warn!(ifindex, error = %e, "REDIRECT_DEVMAP insert failed"),
+                Err(e) => refused.push(format!("REDIRECT_DEVMAP: {e}")),
             }
         }
         if !self.in_tc.contains(&ifindex) {
@@ -377,15 +389,47 @@ impl Targets {
                     self.in_tc.insert(ifindex);
                     changed = true;
                 }
-                Err(e) => warn!(ifindex, error = %e, "TC_REDIRECT_TARGETS insert failed"),
+                Err(e) => refused.push(format!("TC_REDIRECT_TARGETS: {e}")),
             }
         }
         if changed {
             info!(ifindex, why, "redirect target added");
         }
+        if refused.is_empty() {
+            self.refused.remove(&ifindex);
+        } else if self.refused.insert(ifindex) {
+            warn!(
+                ifindex,
+                errors = %refused.join("; "),
+                "redirect target refused (the maps hold 64 links each); its traffic takes the \
+                 kernel path until an eviction makes room"
+            );
+        } else {
+            debug!(ifindex, errors = %refused.join("; "), "redirect target still refused");
+        }
     }
 
-    fn evict(&mut self, ifindex: u32, why: &'static str) {
+    /// Room was made in the maps: offer every refused link again.
+    fn offer_refused(&self, pending: &mut Pending) {
+        if self.refused.is_empty() {
+            return;
+        }
+        for &ifindex in &self.refused {
+            if !pending.admit.contains(&ifindex) {
+                pending.admit.push(ifindex);
+            }
+        }
+        pending.touch();
+    }
+
+    /// Forget refused links the kernel no longer knows.
+    fn prune_refused(&mut self) {
+        self.refused.retain(|i| ifindex_exists(*i));
+    }
+
+    /// Returns whether anything left either map, which makes room.
+    fn evict(&mut self, ifindex: u32, why: &'static str) -> bool {
+        self.refused.remove(&ifindex);
         let mut changed = false;
         if self.in_devmap.remove(&ifindex) {
             changed = true;
@@ -402,6 +446,7 @@ impl Targets {
         if changed {
             info!(ifindex, why, "redirect target removed");
         }
+        changed
     }
 
     /// Bring `VLAN_RESOLVE` and its gate bit to what the topology says
@@ -447,6 +492,10 @@ impl Targets {
             .copied()
             .filter(|i| !ifindex_exists(*i))
             .collect();
+        // Stale first, so what they held is room for the admits.
+        for ifindex in stale {
+            self.evict(ifindex, "gone before watcher start");
+        }
         // Every desired ifindex goes through `admit`, whose per-map
         // checks fill whichever side is missing: an interface attach
         // put in one map but failed to insert into the other is still
@@ -457,9 +506,6 @@ impl Targets {
         desired_sorted.sort_unstable();
         for ifindex in desired_sorted {
             self.admit(ifindex, "present at watcher start");
-        }
-        for ifindex in stale {
-            self.evict(ifindex, "gone before watcher start");
         }
     }
 }
@@ -495,11 +541,13 @@ struct Pending {
     resync: bool,
     /// A failed re-read is not retried before this.
     resync_not_before: Option<Instant>,
-    /// What the last completed re-read found qualifying, until every one
-    /// of them is in both redirect maps (or gone). Reading the table is
-    /// half of a recovery; the admissions it queues are the other half,
-    /// and they can be held (an untranslated VLAN) or fail (a map write).
-    recovering: Option<Vec<u32>>,
+    /// A re-read has completed but the refresh that applies it — the
+    /// admissions it queued, after `VLAN_RESOLVE` — has not yet got past
+    /// the topology read. Reading the table is half of a recovery;
+    /// attempting what it found is the other half. Whether an attempted
+    /// admission fits in the maps is a separate fact ([`Targets::refused`]),
+    /// tracked whatever the overrun history.
+    recovering: bool,
 }
 
 impl Pending {
@@ -560,25 +608,10 @@ async fn dump_links() -> Result<Vec<LinkMessage>, String> {
     }
 }
 
-/// The links a re-read found qualifying that are still not redirect
-/// targets: alive, and missing from either map.
-fn unrecovered(
-    recovering: &[u32],
-    in_devmap: &HashSet<u32>,
-    in_tc: &HashSet<u32>,
-    exists: impl Fn(u32) -> bool,
-) -> Vec<u32> {
-    recovering
-        .iter()
-        .copied()
-        .filter(|i| !(in_devmap.contains(i) && in_tc.contains(i)) && exists(*i))
-        .collect()
-}
-
 /// Re-read the link table after lost notifications (see the module
-/// docs). Returns the links that qualify (each queued; admission skips
+/// docs). Returns how many links qualify (each queued; admission skips
 /// what is already in) and how many were evicted.
-async fn resync(targets: &mut Targets, pending: &mut Pending) -> Result<(Vec<u32>, usize), String> {
+async fn resync(targets: &mut Targets, pending: &mut Pending) -> Result<(usize, usize), String> {
     let links = dump_links().await?;
     let known: HashSet<u32> = targets.in_devmap.union(&targets.in_tc).copied().collect();
     let plan = resync_plan(&links, &known);
@@ -593,11 +626,15 @@ async fn resync(targets: &mut Targets, pending: &mut Pending) -> Result<(Vec<u32
         // the kernel no longer knows is a lost delete.
         if !ifindex_exists(ifindex) {
             pending.admit.retain(|i| *i != ifindex);
-            targets.evict(ifindex, "absent from the link re-read");
-            evicted += 1;
+            if targets.evict(ifindex, "absent from the link re-read") {
+                evicted += 1;
+            }
         }
     }
-    Ok((plan.admit, evicted))
+    if evicted > 0 {
+        targets.offer_refused(pending);
+    }
+    Ok((plan.admit.len(), evicted))
 }
 
 /// The kernel dropped link notifications on the full buffer (netlink-
@@ -626,12 +663,12 @@ async fn run_resync(targets: &mut Targets, pending: &mut Pending, status: &Mutex
         Ok((viable, evicted)) => {
             pending.resync_not_before = None;
             info!(
-                viable = viable.len(),
+                viable,
                 evicted, "redirect-target watcher: link table re-read after lost notifications"
             );
-            // Counted as a recovery only once the refresh that follows
-            // has admitted them ([`settle_recovery`]).
-            pending.recovering = Some(viable);
+            // Counted as a recovery once the refresh that follows has
+            // attempted what it queued ([`settle_recovery`]).
+            pending.recovering = true;
         }
         Err(e) => {
             s.resyncs_failed += 1;
@@ -641,42 +678,45 @@ async fn run_resync(targets: &mut Targets, pending: &mut Pending, status: &Mutex
             pending.resync_not_before = Some(Instant::now() + RESYNC_RETRY);
         }
     }
-    s.resync_pending = pending.resync || pending.recovering.is_some();
+    s.resync_pending = pending.resync || pending.recovering;
 }
 
-/// After a refresh: is every link the last re-read found qualifying in
-/// both maps now? Then the recovery is complete and counted. If not, the
-/// stragglers are queued again and retried on the failed re-read's pace,
-/// and the status row keeps saying the maps are not current.
-fn settle_recovery(targets: &Targets, pending: &mut Pending, status: &Mutex<WatchStatus>) {
-    let Some(recovering) = pending.recovering.take() else {
+/// After a refresh: a completed re-read is a completed recovery once the
+/// refresh got past the topology read, i.e. attempted every admission
+/// the re-read queued. One the maps refused is not a recovery failure —
+/// the maps would have refused its notification too — and is reported
+/// as such on every refresh ([`Targets::refused`]). A topology read that
+/// failed is: the refresh retries it within a quarter second, and the
+/// row says why until then.
+fn settle_recovery(
+    pending: &mut Pending,
+    refreshed: &Result<(), String>,
+    status: &Mutex<WatchStatus>,
+) {
+    if !pending.recovering {
         return;
-    };
-    let left = unrecovered(
-        &recovering,
-        &targets.in_devmap,
-        &targets.in_tc,
-        ifindex_exists,
-    );
-    let mut s = status.lock().unwrap_or_else(PoisonError::into_inner);
-    if left.is_empty() {
-        s.resyncs_ok += 1;
-        s.last_resync_error = None;
-    } else {
-        for &ifindex in &left {
-            if !pending.admit.contains(&ifindex) {
-                pending.admit.push(ifindex);
-            }
-        }
-        s.last_resync_error = Some(format!(
-            "{} links from the re-read are not in the redirect maps yet (VLAN translation \
-             held or a map write failed)",
-            left.len()
-        ));
-        pending.due_by(Instant::now() + RESYNC_RETRY);
-        pending.recovering = Some(left);
     }
-    s.resync_pending = pending.resync || pending.recovering.is_some();
+    let mut s = status.lock().unwrap_or_else(PoisonError::into_inner);
+    match refreshed {
+        Ok(()) => {
+            pending.recovering = false;
+            s.resyncs_ok += 1;
+            s.last_resync_error = None;
+        }
+        Err(e) => {
+            s.last_resync_error = Some(format!("the link topology could not be read: {e}"));
+        }
+    }
+    s.resync_pending = pending.resync || pending.recovering;
+}
+
+/// The links the maps refused, as the status row reports them.
+fn publish_refused(targets: &mut Targets, status: &Mutex<WatchStatus>) {
+    targets.prune_refused();
+    status
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .unadmitted = targets.refused.len() as u64;
 }
 
 /// Record why the watcher ended, for the status row, and log it.
@@ -733,8 +773,10 @@ async fn run(
     let mut pending = Pending::default();
     // First refresh right away: the attach-time fill is what the maps
     // hold, and this closes whatever moved between it and now.
-    refresh(&mut targets, &mut pending, &directives);
+    // A topology read failure here re-arms the debounce like any other.
+    let _ = refresh(&mut targets, &mut pending, &directives);
     targets.reconcile_targets();
+    publish_refused(&mut targets, &status);
     info!(
         devmap = targets.in_devmap.len(),
         tc = targets.in_tc.len(),
@@ -776,8 +818,9 @@ async fn run(
                         _ = run_resync(&mut targets, &mut pending, &status) => {}
                     }
                 }
-                refresh(&mut targets, &mut pending, &directives);
-                settle_recovery(&targets, &mut pending, &status);
+                let refreshed = refresh(&mut targets, &mut pending, &directives);
+                settle_recovery(&mut pending, &refreshed, &status);
+                publish_refused(&mut targets, &status);
                 if pending.resync {
                     // Owed but not yet retried (it failed, or is paced):
                     // keep the refresh coming round for it.
@@ -787,7 +830,9 @@ async fn run(
             }
             _ = refresh_now.notified() => {
                 // A SIGHUP changed the directives; converge on them
-                // after whatever refresh may just have run.
+                // after whatever refresh may just have run. Its own
+                // reconcile may have made room, too.
+                targets.offer_refused(&mut pending);
                 pending.touch();
             }
             Some((d, began)) = stalls.recv() => {
@@ -806,12 +851,13 @@ async fn run(
 /// THAT admit pending the same way, and so does a port whose receive
 /// MACs could not be read. Either way a transient failure costs a
 /// retry, never a redirect to an untranslated sub-interface or a MAC
-/// change left unapplied until some later event.
+/// change left unapplied until some later event. `Err` is the topology
+/// read failure: nothing was admitted.
 fn refresh(
     targets: &mut Targets,
     pending: &mut Pending,
     directives: &Arc<Mutex<Vec<ModuleDirective>>>,
-) {
+) -> Result<(), String> {
     let rx_retry = targets.refresh_rx_macs();
     let snapshot: Vec<ModuleDirective> = match directives.lock() {
         Ok(d) => d.clone(),
@@ -822,7 +868,7 @@ fn refresh(
         Err(e) => {
             warn!(error = %e, "topology read failed; redirect admits held for retry");
             pending.touch();
-            return;
+            return Err(e);
         }
     };
     pending.due = None;
@@ -851,6 +897,7 @@ fn refresh(
     if rx_retry {
         pending.touch();
     }
+    Ok(())
 }
 
 fn handle(targets: &mut Targets, pending: &mut Pending, msg: NetlinkMessage<RouteNetlinkMessage>) {
@@ -870,7 +917,10 @@ fn handle(targets: &mut Targets, pending: &mut Pending, msg: NetlinkMessage<Rout
         NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelLink(link)) => {
             let ifindex = link.header.index;
             pending.admit.retain(|i| *i != ifindex);
-            targets.evict(ifindex, "RTM_DELLINK");
+            if targets.evict(ifindex, "RTM_DELLINK") {
+                // Room was made: what the maps refused gets its turn.
+                targets.offer_refused(pending);
+            }
             pending.touch();
         }
         _ => {}
@@ -949,18 +999,44 @@ mod tests {
         assert_eq!(resync_plan(&[], &HashSet::new()), ResyncPlan::default());
     }
 
-    /// A recovery is done only when what the re-read found qualifying is
-    /// in both maps: a link held out of either (an untranslated VLAN, a
-    /// failed insert) keeps it open; one deleted since does not.
+    /// A completed re-read is a completed recovery once the refresh after
+    /// it got past the topology read; a refresh that could not read it
+    /// keeps the recovery open and says why. Nothing else does: what the
+    /// maps refused is reported on its own.
     #[test]
-    fn a_recovery_waits_for_both_maps() {
-        let devmap: HashSet<u32> = [7, 8].into();
-        let alive = |i: u32| i != 9;
-        let tc: HashSet<u32> = [7].into();
-        assert_eq!(unrecovered(&[7, 8, 9], &devmap, &tc, alive), vec![8]);
-        let tc: HashSet<u32> = [7, 8].into();
-        assert!(unrecovered(&[7, 8, 9], &devmap, &tc, alive).is_empty());
-        assert!(unrecovered(&[], &devmap, &tc, alive).is_empty());
+    fn a_recovery_completes_when_its_admissions_were_attempted() {
+        let status = Mutex::new(WatchStatus {
+            overruns: 1,
+            resync_pending: true,
+            ..WatchStatus::default()
+        });
+        let mut p = Pending {
+            recovering: true,
+            ..Pending::default()
+        };
+        settle_recovery(&mut p, &Err("vlan config unreadable".into()), &status);
+        let s = status.lock().unwrap().clone();
+        assert!(p.recovering && s.resync_pending, "{s:?}");
+        assert_eq!(s.resyncs_ok, 0);
+        assert!(s
+            .last_resync_error
+            .as_deref()
+            .is_some_and(|e| e.contains("vlan config unreadable")));
+
+        settle_recovery(&mut p, &Ok(()), &status);
+        let s = status.lock().unwrap().clone();
+        assert!(!p.recovering && !s.resync_pending, "{s:?}");
+        assert_eq!((s.resyncs_ok, s.last_resync_error), (1, None));
+
+        // Nothing owed: a refresh changes nothing.
+        settle_recovery(&mut p, &Ok(()), &status);
+        assert_eq!(status.lock().unwrap().resyncs_ok, 1);
+
+        // A loss reported meanwhile keeps the row pending.
+        p.recovering = true;
+        p.resync = true;
+        settle_recovery(&mut p, &Ok(()), &status);
+        assert!(status.lock().unwrap().resync_pending);
     }
 
     /// A watcher that never ran is reported as stopped, not left out.

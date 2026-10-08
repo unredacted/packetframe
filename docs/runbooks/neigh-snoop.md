@@ -307,8 +307,11 @@ session has never been up from their side).
   mirror's rows and re-seeds a bridge any of whose neighbour rows
   vanished, changed or appeared unheard (`seed_total{outcome="requested"}`
   moves), since a bounce whose down and up were both lost, or an entry
-  the kernel failed while nobody listened, leaves no other trigger; the
-  seed still never overrides a MAC the kernel has confirmed. The row
+  the kernel failed while nobody listened, leaves no other trigger. The
+  re-seed applies the usual install rules to every learned address on
+  that bridge: a confirmed (REACHABLE/DELAY/PROBE) MAC is never
+  overridden, and a STALE row holding another MAC is replaced once it
+  is out of its 30 s holddown. The row
   clears on its own when the re-read lands; "the last re-read failed"
   names the dump that did not answer, and it is retried.
   `netlink_overruns_total` climbing steadily outside such events means

@@ -745,9 +745,11 @@ impl Engine {
     /// left to say so, a row that appeared unheard may be a learned
     /// address the kernel holds FAILED or with another MAC, and on a
     /// fabric that drops our broadcasts nothing else repairs either until
-    /// each participant happens to speak again. The seed's install
-    /// decision is what spares rows that are already usable, and it
-    /// never overrides a MAC the kernel has confirmed.
+    /// each participant happens to speak again. The seed applies the
+    /// install decision to every learned address on the bridge: a row
+    /// already holding the learned MAC is left alone, a confirmed
+    /// (REACHABLE/DELAY/PROBE) MAC is never overridden, and a STALE row
+    /// holding another MAC is replaced once out of its holddown.
     ///
     /// The re-read opens a fresh subscription *before* its dumps and
     /// returns it, for the caller to swap in and drop the old one. After

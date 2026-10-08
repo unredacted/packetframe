@@ -173,13 +173,32 @@ pub enum EnsureOutcome {
 /// with [`AnyipError::TimedOut`] if the kernel stops answering.
 ///
 /// A write that goes unanswered may have landed with only its ACK lost,
-/// and a caller that fails on the error (attach) would never arm the
-/// removal of a route it does not know exists. So the outcome is settled
-/// before returning ([`after_unanswered_write`]): a fresh connection
-/// looks for the route as written, a landed write is success, and a
-/// route this call was creating that cannot be confirmed either way is
-/// removed before the error goes back.
+/// so before returning a fresh connection looks for the route as
+/// written, and a landed write is success ([`after_unanswered_write`]).
+///
+/// This is the form a running daemon uses (the BGP listener's retry
+/// loop, the reconcile tick): a write it cannot confirm either way is
+/// left as it is, because those callers are not serialised with each
+/// other, and removing it could delete the route another call has just
+/// put back under a bound listener. The next tick settles it.
+/// [`ensure_local_route_blocking`], the attach preflight, removes it.
 pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipError> {
+    ensure(addr, Caller::Running).await
+}
+
+/// Who is ensuring the route, which decides what happens to a write that
+/// cannot be confirmed either way ([`after_unanswered_write`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    /// Attach's preflight: one call, under the attach lock, whose error
+    /// fails attach before its unwind is armed. A route it was creating
+    /// must not outlive that error, so it is removed.
+    Attach,
+    /// A running daemon's re-ensure: left as it is for the next tick.
+    Running,
+}
+
+async fn ensure(addr: Ipv4Addr, caller: Caller) -> Result<EnsureOutcome, AnyipError> {
     let (outcome, lo) = match bounded(plan(addr)).await? {
         Plan::LeftAlone(outcome) => return Ok(outcome),
         Plan::Write { outcome, lo } => (outcome, lo),
@@ -191,7 +210,7 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipEr
         }
         Err(AnyipError::TimedOut(waited)) => {
             let landed = bounded(installed_as_written(addr)).await;
-            let (result, remove) = after_unanswered_write(landed, outcome, waited);
+            let (result, remove) = after_unanswered_write(landed, outcome, caller, waited);
             if remove {
                 if let Err(e) = bounded(remove_unbounded(addr)).await {
                     tracing::warn!(
@@ -222,14 +241,16 @@ enum Plan {
 /// - Found as written: the write landed and only its reply was lost.
 /// - Not found as written: nothing of this write is in the table (an
 ///   adopted route being repaired is left as it was found).
-/// - Could not look: unknown. A route this call was creating must not
-///   outlive the error — the caller cannot clean up what it never
+/// - Could not look: unknown. For attach, a route this call was creating
+///   must not outlive the error — attach cannot clean up what it never
 ///   learned exists — so it is removed (the delete is protocol-scoped,
 ///   so it cannot touch anyone else's). An adopted one predates the call
 ///   and may be serving another daemon, so it is never removed here.
+///   A running daemon's call removes nothing ([`Caller::Running`]).
 fn after_unanswered_write(
     landed: Result<bool, AnyipError>,
     outcome: EnsureOutcome,
+    caller: Caller,
     waited: Duration,
 ) -> (Result<EnsureOutcome, AnyipError>, bool) {
     match landed {
@@ -237,7 +258,7 @@ fn after_unanswered_write(
         Ok(false) => (Err(AnyipError::TimedOut(waited)), false),
         Err(_) => (
             Err(AnyipError::TimedOut(waited)),
-            outcome == EnsureOutcome::Created,
+            caller == Caller::Attach && outcome == EnsureOutcome::Created,
         ),
     }
 }
@@ -541,12 +562,14 @@ async fn existing_local_table_entry(
 /// Blocking wrappers for callers without a live tokio runtime: the
 /// attach preflight (a sync path that runs before the controller's
 /// runtime exists) and unwind/Drop cleanup. Each builds a throwaway
-/// current-thread runtime; both sites are cold one-shots.
+/// current-thread runtime; both sites are cold one-shots. The ensure is
+/// the attach preflight's, so a write it cannot confirm is removed
+/// ([`Caller::Attach`]).
 pub fn ensure_local_route_blocking(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipError> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(ensure_local_route(addr))
+        .block_on(ensure(addr, Caller::Attach))
 }
 
 /// See [`ensure_local_route_blocking`].
@@ -573,10 +596,13 @@ mod tests {
 
     /// A write whose reply was lost but which landed is success: a caller
     /// that failed on it (attach) would never arm the route's removal.
+    const OUTCOMES: [EnsureOutcome; 2] = [EnsureOutcome::Created, EnsureOutcome::Adopted];
+    const CALLERS: [Caller; 2] = [Caller::Attach, Caller::Running];
+
     #[test]
     fn a_landed_write_is_success() {
-        for outcome in [EnsureOutcome::Created, EnsureOutcome::Adopted] {
-            let (result, remove) = after_unanswered_write(Ok(true), outcome, WAITED);
+        for (outcome, caller) in OUTCOMES.into_iter().zip(CALLERS) {
+            let (result, remove) = after_unanswered_write(Ok(true), outcome, caller, WAITED);
             assert_eq!(result.ok(), Some(outcome));
             assert!(!remove);
         }
@@ -584,31 +610,36 @@ mod tests {
 
     #[test]
     fn a_write_that_did_not_land_leaves_nothing_to_remove() {
-        for outcome in [EnsureOutcome::Created, EnsureOutcome::Adopted] {
-            let (result, remove) = after_unanswered_write(Ok(false), outcome, WAITED);
-            assert!(matches!(result, Err(AnyipError::TimedOut(_))));
-            assert!(!remove);
+        for outcome in OUTCOMES {
+            for caller in CALLERS {
+                let (result, remove) = after_unanswered_write(Ok(false), outcome, caller, WAITED);
+                assert!(matches!(result, Err(AnyipError::TimedOut(_))));
+                assert!(!remove);
+            }
         }
     }
 
-    /// Unknown either way: a route this call was creating is removed
-    /// before the error returns, so it cannot outlive a failed attach
-    /// unowned; an adopted one predates the call and is never removed.
+    /// Unknown either way: attach removes a route it was creating before
+    /// the error returns, so it cannot outlive a failed attach unowned;
+    /// an adopted one predates the call and is never removed; and a
+    /// running daemon's re-ensure removes nothing, since another call may
+    /// just have put the route back under a bound listener.
     #[test]
-    fn an_unconfirmable_write_removes_only_what_it_was_creating() {
-        let (result, remove) = after_unanswered_write(
-            Err(AnyipError::TimedOut(WAITED)),
-            EnsureOutcome::Created,
-            WAITED,
-        );
+    fn only_attach_removes_an_unconfirmable_write_and_only_its_own() {
+        let unknown = || Err(AnyipError::TimedOut(WAITED));
+        let (result, remove) =
+            after_unanswered_write(unknown(), EnsureOutcome::Created, Caller::Attach, WAITED);
         assert!(matches!(result, Err(AnyipError::TimedOut(_))));
         assert!(remove);
-        let (_, remove) = after_unanswered_write(
-            Err(AnyipError::NoLoopbackIface),
-            EnsureOutcome::Adopted,
-            WAITED,
-        );
-        assert!(!remove);
+        for (outcome, caller) in [
+            (EnsureOutcome::Adopted, Caller::Attach),
+            (EnsureOutcome::Created, Caller::Running),
+            (EnsureOutcome::Adopted, Caller::Running),
+        ] {
+            let (result, remove) = after_unanswered_write(unknown(), outcome, caller, WAITED);
+            assert!(matches!(result, Err(AnyipError::TimedOut(_))));
+            assert!(!remove, "{outcome:?} {caller:?}");
+        }
     }
 
     /// The leave-alone check and the landed check share one definition.

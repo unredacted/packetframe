@@ -5,11 +5,12 @@
 //! `VLAN_PRESENT` gate) along with its admission.
 //!
 //! A second test follows `RX_MACS` through a port MAC change and a
-//! bridge enslavement, in the host namespace (see its doc for why). Two
-//! more shrink the subscription's buffer and stall its reader
+//! bridge enslavement, in the host namespace (see its doc for why). The
+//! rest shrink the subscription's buffer and stall its reader
 //! (`stall_reader`) so a burst of link changes overruns it every time,
-//! and check the re-read that makes the lost notifications good — and
-//! that a recovery stays owed until its links are actually admitted.
+//! and check the re-read that makes the lost notifications good; or
+//! bring up more links than the maps hold, and check that the ones left
+//! out are reported as such and admitted once room is made.
 //!
 //! Needs CAP_NET_ADMIN + CAP_SYS_ADMIN (netns) and CAP_BPF + bpffs
 //! (pins); runs in the qemu-verifier job via `--ignored`.
@@ -391,13 +392,19 @@ fn rx_macs_follow_a_port_mac_change_and_its_bridge() {
 /// How long a burst's window is: the watcher's thread, and with it the
 /// reader of its subscription, is blocked for this long while the burst
 /// runs, so the burst overruns the shrunk buffer by construction rather
-/// than by racing the reader. Long enough for an `ip` process under a
-/// TCG guest.
-const STALL: Duration = Duration::from_secs(3);
+/// than by racing the reader. Generous, for an `ip` process under a slow
+/// TCG guest: a burst that outlasts it fails the test loudly.
+const STALL: Duration = Duration::from_secs(10);
 
-/// A namespace with its own pins, a watcher whose subscription buffer is
-/// the kernel's minimum (about one message), and `n` dummies created down
-/// in one link group (so none qualifies yet), all from one `ip` process.
+/// The subscription buffer [`OverrunRig::start`] asks for when a burst
+/// must overrun it: the kernel's minimum, about one message.
+const SHRUNK: usize = 1;
+/// One no burst here can fill.
+const ROOMY: usize = 8 << 20;
+
+/// A namespace with its own pins, a watcher with a `rcvbuf`-byte
+/// subscription buffer, and `n` dummies created down in one link group
+/// (so none qualifies yet), all from one `ip` process.
 struct OverrunRig {
     netns: String,
     pins: Pins,
@@ -409,7 +416,7 @@ struct OverrunRig {
 }
 
 impl OverrunRig {
-    fn start(tag: &str, n: usize, group: &'static str) -> Self {
+    fn start(tag: &str, n: usize, group: &'static str, rcvbuf: usize) -> Self {
         if !bpffs_present(Path::new(BPFFS_ROOT)) {
             run(&["mount", "-t", "bpf", "bpf", BPFFS_ROOT]);
         }
@@ -426,7 +433,7 @@ impl OverrunRig {
         let ns_fd = enter_netns(&netns);
         let pins = Pins::setup(tag);
         let watcher =
-            RedirectTargetWatcher::start_with_rcvbuf(&pins.root, Vec::new(), Vec::new(), 1)
+            RedirectTargetWatcher::start_with_rcvbuf(&pins.root, Vec::new(), Vec::new(), rcvbuf)
                 .expect("watcher start");
         std::thread::sleep(Duration::from_millis(500));
 
@@ -531,7 +538,7 @@ impl Drop for OverrunRig {
 #[test]
 #[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN + CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
 fn links_whose_notifications_were_lost_are_re_read() {
-    let rig = OverrunRig::start("o", 48, "77");
+    let rig = OverrunRig::start("o", 48, "77", SHRUNK);
     let before = rig.burst(&["set", "group", rig.group, "up"]);
     wait_for(
         &rig.pins,
@@ -567,75 +574,111 @@ fn links_whose_notifications_were_lost_are_re_read() {
     assert!(s.resyncs_ok > before.resyncs_ok, "{s:?}");
 }
 
-/// A recovery is not over when the link table has been read, only when
-/// what it found is in the redirect maps. More links come up in one
-/// burst than the maps hold (64), so after the re-read some cannot be
-/// admitted: the row must keep saying the maps are not current, and why,
-/// across the retries. Once room is made, the retry admits them and the
-/// recovery completes.
-#[test]
-#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN + CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
-fn a_recovery_stays_owed_until_its_links_are_in_the_maps() {
-    let rig = OverrunRig::start("f", 72, "78");
-    let before = rig.burst(&["set", "group", rig.group, "up"]);
-    let s = rig.status_until(
-        "the unadmitted links reported",
-        Duration::from_secs(15),
-        |s| {
-            s.resync_pending
-                && s.last_resync_error
-                    .as_deref()
-                    .is_some_and(|e| e.contains("not in the redirect maps yet"))
-        },
-    );
-    assert_eq!(s.subsystem_health().state, HealthState::Degraded, "{s:?}");
-    let outside = |pins: &Pins| -> Vec<u32> {
-        let (dm, tc) = (pins.devmap_keys(), pins.tc_keys());
-        rig.idx
+impl OverrunRig {
+    /// The rig's links that are not targets: missing from either map.
+    fn outside(&self) -> Vec<u32> {
+        let (dm, tc) = (self.pins.devmap_keys(), self.pins.tc_keys());
+        self.idx
             .iter()
             .copied()
             .filter(|i| !(dm.contains(i) && tc.contains(i)))
             .collect()
-    };
-    let left = outside(&rig.pins);
-    assert!(!left.is_empty(), "precondition: the maps overflowed");
-    // Past a retry, still owed: nothing has made room.
-    std::thread::sleep(Duration::from_secs(6));
-    let s = rig.watcher().status();
-    assert!(s.resync_pending, "{s:?}");
-    assert_eq!(s.resyncs_ok, before.resyncs_ok, "{s:?}");
-
-    // Make room: delete as many admitted links as there are left out,
-    // and a couple more, one request each.
-    let admitted: Vec<u32> = rig
-        .idx
-        .iter()
-        .copied()
-        .filter(|i| !left.contains(i))
-        .take(left.len() + 2)
-        .collect();
-    let mut gone = Vec::new();
-    for i in admitted {
-        let mut buf = [0u8; libc::IF_NAMESIZE];
-        let name = unsafe { libc::if_indextoname(i, buf.as_mut_ptr().cast()) };
-        assert!(!name.is_null(), "if_indextoname({i})");
-        let name = unsafe { std::ffi::CStr::from_ptr(name) }
-            .to_string_lossy()
-            .into_owned();
-        ns_run(&rig.netns, &["ip", "link", "del", &name]);
-        gone.push(i);
     }
-    let s = rig.status_until("recovery recorded", Duration::from_secs(15), |s| {
-        !s.resync_pending
-    });
-    assert!(s.resyncs_ok > before.resyncs_ok, "{s:?}");
-    assert_eq!(s.subsystem_health().state, HealthState::Healthy, "{s:?}");
-    let (dm, tc) = (rig.pins.devmap_keys(), rig.pins.tc_keys());
-    assert!(
-        rig.idx
+
+    /// Delete `n` of the rig's links that are targets, one request each,
+    /// which makes room in the maps. Returns their ifindexes.
+    fn delete_admitted(&self, n: usize) -> Vec<u32> {
+        let outside = self.outside();
+        let doomed: Vec<u32> = self
+            .idx
             .iter()
-            .filter(|i| !gone.contains(i))
-            .all(|i| dm.contains(i) && tc.contains(i)),
-        "every remaining link a target: devmap={dm:?} tc={tc:?}"
+            .copied()
+            .filter(|i| !outside.contains(i))
+            .take(n)
+            .collect();
+        for &i in &doomed {
+            let mut buf = [0u8; libc::IF_NAMESIZE];
+            let name = unsafe { libc::if_indextoname(i, buf.as_mut_ptr().cast()) };
+            assert!(!name.is_null(), "if_indextoname({i})");
+            let name = unsafe { std::ffi::CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned();
+            ns_run(&self.netns, &["ip", "link", "del", &name]);
+        }
+        doomed
+    }
+
+    /// Every remaining link is a target.
+    fn all_admitted_but(&self, gone: &[u32]) {
+        let (dm, tc) = (self.pins.devmap_keys(), self.pins.tc_keys());
+        assert!(
+            self.idx
+                .iter()
+                .filter(|i| !gone.contains(i))
+                .all(|i| dm.contains(i) && tc.contains(i)),
+            "every remaining link a target: devmap={dm:?} tc={tc:?}"
+        );
+    }
+}
+
+/// More links qualify than the redirect maps hold (64 each), with no
+/// notification lost. The links left out are reported as such — the row
+/// is Degraded on capacity, not on overrun history, which here is none —
+/// and they are admitted as soon as an eviction makes room, with no
+/// timer involved.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN + CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn links_the_maps_cannot_hold_are_reported_and_admitted_when_room_is_made() {
+    let rig = OverrunRig::start("c", 72, "79", ROOMY);
+    ns_run(&rig.netns, &["ip", "link", "set", "group", rig.group, "up"]);
+    let s = rig.status_until("the refused links reported", Duration::from_secs(15), |s| {
+        s.unadmitted > 0
+    });
+    assert_eq!(s.overruns, 0, "premise: nothing was lost; {s:?}");
+    let left = rig.outside();
+    assert!(!left.is_empty(), "premise: the maps overflowed");
+    let s = rig.status_until("every link left out counted", Duration::from_secs(5), |s| {
+        s.unadmitted == left.len() as u64
+    });
+    let h = s.subsystem_health();
+    assert_eq!(h.state, HealthState::Degraded, "{s:?}");
+    let m = h.message.unwrap();
+    assert!(
+        m.contains("not in the redirect maps") && !m.contains("notifications lost"),
+        "{m}"
     );
+
+    let gone = rig.delete_admitted(left.len() + 2);
+    let s = rig.status_until("room made, all admitted", Duration::from_secs(15), |s| {
+        s.unadmitted == 0
+    });
+    assert_eq!(s.subsystem_health().state, HealthState::Healthy, "{s:?}");
+    rig.all_admitted_but(&gone);
+}
+
+/// A recovery is over when the re-read has been applied, maps full or
+/// not. Links come up past the maps' capacity in one overrun burst: the
+/// recovery must complete (counted, nothing owed), leaving only the
+/// capacity condition on the row, instead of retrying a full map forever
+/// and blaming lost notifications for it.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN + CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_recovery_completes_though_the_maps_are_full() {
+    let rig = OverrunRig::start("f", 72, "78", SHRUNK);
+    let before = rig.burst(&["set", "group", rig.group, "up"]);
+    let s = rig.status_until("recovery recorded", Duration::from_secs(15), |s| {
+        !s.resync_pending && s.resyncs_ok > before.resyncs_ok
+    });
+    assert!(s.unadmitted > 0, "premise: the maps overflowed; {s:?}");
+    let m = s.subsystem_health().message.unwrap();
+    assert!(
+        m.contains("not in the redirect maps") && !m.contains("notifications lost"),
+        "{m}"
+    );
+    let left = rig.outside();
+    let gone = rig.delete_admitted(left.len() + 2);
+    rig.status_until("room made, all admitted", Duration::from_secs(15), |s| {
+        s.unadmitted == 0 && !s.resync_pending
+    });
+    rig.all_admitted_but(&gone);
 }
