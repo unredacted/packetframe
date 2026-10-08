@@ -381,8 +381,11 @@ birdc enable bmp1
 packetframe emits `RouteEvent::Resync` on disconnect and receives
 the fresh dump on reconnect. Routes the new session does not
 re-announce are GC'd at `InitiationComplete`, which fires after 5 s of
-post-first-update quiescence. A session that drops before then GCs
-nothing; the next session's `InitiationComplete` does.
+post-first-update quiescence. On the iBGP feed those 5 s run from the
+last UPDATE *received*, and the event waits until every UPDATE
+received has been applied, so a slow programmer neither fires it
+early (ahead of a backlog, mid-reload) nor late. A session that drops
+before then GCs nothing; the next session's `InitiationComplete` does.
 
 The GC covers the feed's routes only. The `fallback-default` 0/0 and
 the `local-prefix` host routes come from the neighbour resolver, not

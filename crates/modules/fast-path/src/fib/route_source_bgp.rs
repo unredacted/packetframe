@@ -64,7 +64,7 @@
 #![cfg(target_os = "linux")]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -211,10 +211,17 @@ pub struct BgpListener {
     cfg: BgpListenerConfig,
     prog_handle: FibProgrammerHandle,
     shutdown: CancellationToken,
-    /// Shared atomic updated on each UPDATE frame. Unix seconds; 0 =
-    /// none seen since process start. Read by the same stall monitor
-    /// that BmpStation uses, both feeds publish to the same signal.
+    /// Unix seconds of the last UPDATE accepted; 0 = none since process
+    /// start. Written and, today, read by nothing: unlike `BmpStation`,
+    /// this listener spawns no stall monitor (see `stall_gate`).
     last_update_unix: Arc<AtomicI64>,
+    /// The integrity snapshot the controller hands every route source
+    /// for a stall monitor. Stored, not yet consulted. `BmpStation`'s
+    /// `stall_monitor` is not a fit as it stands: it only logs, and it
+    /// gates on `authority_established_peers`, which only the bird
+    /// authority fills, so on an FRR-fed box it would stay silent. A
+    /// programmer wedged behind an established session is therefore
+    /// reported by nothing on this path yet.
     stall_gate: Option<SharedIntegritySnapshot>,
 }
 
@@ -233,6 +240,8 @@ impl BgpListener {
         }
     }
 
+    /// Same builder as `BmpStation::with_stall_gate`, but nothing here
+    /// reads the snapshot yet: see the `stall_gate` field.
     pub fn with_stall_gate(mut self, snapshot: SharedIntegritySnapshot) -> Self {
         self.stall_gate = Some(snapshot);
         self
@@ -399,13 +408,15 @@ impl BgpListener {
         // and the peer tore the session down (2026-08-19, 2026-10-07),
         // costing a full re-dump each time.
         let (read_half, write_half) = stream.into_split();
-        let (frame_tx, mut frame_rx) = mpsc::channel::<BgpMessage>(FRAME_CHANNEL_CAPACITY);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Received>(FRAME_CHANNEL_CAPACITY);
         let hold = Duration::from_secs(effective_hold as u64);
+        let updates_received = Arc::new(AtomicUsize::new(0));
         let mut reader = SessionTask(tokio::spawn(reader_task(
             read_half,
             frame_tx,
             add_path_in_effect,
             hold,
+            updates_received.clone(),
         )));
         let mut writer = SessionTask(tokio::spawn(keepalive_writer(
             write_half,
@@ -447,8 +458,8 @@ impl BgpListener {
                 }
                 msg = frame_rx.recv() => {
                     match msg {
-                        Some(m) => {
-                            self.process_msg(m, peer_id, peer_asn_observed, &mut last_update, &mut updates_seen).await?;
+                        Some(received) => {
+                            self.process_msg(received, peer_id, peer_asn_observed, &mut last_update, &mut updates_seen).await?;
                         }
                         None => {
                             // Reader exited (EOF, read error, or hold
@@ -476,8 +487,27 @@ impl BgpListener {
                     }));
                 }
                 _ = quiescence_tick.tick() => {
-                    // InitiationComplete heuristic.
-                    if !init_complete_fired {
+                    // InitiationComplete heuristic: INIT_COMPLETE_QUIESCENCE
+                    // since the last UPDATE was RECEIVED, with every
+                    // UPDATE received already applied. The event GCs
+                    // whatever this session has not re-sent, so both
+                    // halves matter. Timed from processing, as it was, a
+                    // stall that long inside one apply read as a quiet
+                    // peer, and this arm could win the `select!` as the
+                    // stall cleared, ahead of the backlog it had held: a
+                    // GC mid-reload, pulling routes not yet re-applied
+                    // out of the FIB. Timed from receipt alone, the last
+                    // UPDATE applied can be long received while newer
+                    // ones still wait behind it. The reader counts an
+                    // UPDATE before handing it over, so one it holds
+                    // while blocked on a full channel counts as pending;
+                    // `updates_seen` counts each one `process_msg`
+                    // accepted, and one it refuses ends the session, so
+                    // the two are equal exactly when nothing received
+                    // is left to apply.
+                    let backlog_applied =
+                        updates_seen == updates_received.load(Ordering::Acquire);
+                    if !init_complete_fired && backlog_applied {
                         if let Some(last) = last_update {
                             if last.elapsed() >= INIT_COMPLETE_QUIESCENCE {
                                 if let Err(e) = self
@@ -533,12 +563,13 @@ impl BgpListener {
     /// had been thrown away whole.
     async fn process_msg(
         &self,
-        msg: BgpMessage,
+        received: Received,
         peer_id: PeerId,
         peer_asn: u32,
         last_update: &mut Option<Instant>,
         updates_seen: &mut usize,
     ) -> Result<(), RouteSourceError> {
+        let Received { msg, at } = received;
         match msg {
             BgpMessage::Open(_) => {
                 // Spurious post-handshake OPEN, bird shouldn't do
@@ -602,7 +633,11 @@ impl BgpListener {
                 // healthy connection reads as a flap, and the
                 // attestation is gone for good (review finding; the
                 // BMP path had the same ordering).
-                *last_update = Some(Instant::now());
+                //
+                // Stamped with when the reader received it, not now: the
+                // quiescence arm times the peer's silence, and the time
+                // this UPDATE waited behind a slow apply is ours.
+                *last_update = Some(at);
                 *updates_seen += 1;
                 self.last_update_unix.store(
                     SystemTime::now()
@@ -721,6 +756,15 @@ where
     }
 }
 
+/// A message as the reader framed it, stamped with when it came off
+/// the socket. One that waited in the socket buffer while the reader
+/// was blocked is stamped when read, which can only make the peer look
+/// more recently active than it was.
+struct Received {
+    msg: BgpMessage,
+    at: Instant,
+}
+
 /// Drains the TCP stream, parses BGP messages, and forwards them to
 /// the main `select!` loop via a bounded channel, and runs the
 /// session's hold timer. Same cancel-safety pattern as
@@ -731,11 +775,15 @@ where
 /// the per-message NLRI decode in [`read_one_message`]: when true,
 /// every prefix in MP_REACH / MP_UNREACH / legacy NLRI is prefixed
 /// by a 4-byte path_id.
+///
+/// `updates_received` counts every UPDATE read, before it is handed
+/// over; the quiescence arm compares it with what has been applied.
 async fn reader_task<R>(
     mut stream: R,
-    tx: mpsc::Sender<BgpMessage>,
+    tx: mpsc::Sender<Received>,
     add_path: bool,
     hold: Duration,
+    updates_received: Arc<AtomicUsize>,
 ) -> Result<(), RouteSourceError>
 where
     R: AsyncReadExt + Unpin + Send,
@@ -785,8 +833,15 @@ where
                 )));
             }
         };
+        let at = Instant::now();
         messages_parsed += 1;
-        if tx.send(msg).await.is_err() {
+        if matches!(msg, BgpMessage::Update(_)) {
+            // Release pairs with the quiescence arm's Acquire. Counted
+            // before the send, so an UPDATE this task holds while
+            // blocked on a full channel already counts as unapplied.
+            updates_received.fetch_add(1, Ordering::Release);
+        }
+        if tx.send(Received { msg, at }).await.is_err() {
             debug!(messages_parsed, "frame receiver closed; reader exiting");
             return Ok(());
         }
@@ -1790,22 +1845,42 @@ mod tests {
         worst.max(to - last)
     }
 
-    /// Route announcements applied so far. Counted apart from the rest
-    /// of the log because a stall of `INIT_COMPLETE_QUIESCENCE` or more
-    /// can let the quiescence arm fire InitiationComplete as soon as the
-    /// held apply returns: the heuristic times silence from the last
-    /// UPDATE *processed*, so a stalled programmer reads as a quiet peer.
-    fn adds(log: &RouteEventLog) -> usize {
+    /// Where InitiationComplete sits in the log, once it has been applied.
+    fn initiation_complete_at(log: &RouteEventLog) -> Option<usize> {
         log.events()
             .iter()
-            .filter(|e| matches!(e, RouteEvent::Add { .. }))
-            .count()
+            .position(|e| matches!(e, RouteEvent::InitiationComplete))
     }
 
     async fn wait_until(what: &str, within: Duration, cond: impl Fn() -> bool) {
         let deadline = Instant::now() + within;
         while !cond() {
             assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Play a peer that is up but sends no UPDATEs, a KEEPALIVE every
+    /// 500 ms to keep our hold timer fed, until `cond` holds or `within`
+    /// runs out. Returns when `cond` was first seen to hold.
+    async fn quiet_peer_until(
+        wr: &mut tokio::net::tcp::OwnedWriteHalf,
+        within: Duration,
+        cond: impl Fn() -> bool,
+    ) -> Option<Instant> {
+        let deadline = Instant::now() + within;
+        let mut next_keepalive = Instant::now();
+        loop {
+            if cond() {
+                return Some(Instant::now());
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            if Instant::now() >= next_keepalive {
+                wr.write_all(&encode_keepalive()).await.expect("KEEPALIVE");
+                next_keepalive += Duration::from_millis(500);
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -1868,7 +1943,7 @@ mod tests {
         // session.
         gate.open();
         wait_until("every UPDATE is applied", Duration::from_secs(5), || {
-            adds(&log) == sent
+            log.len() == sent
         })
         .await;
         assert!(!session.is_finished(), "the session ended after the stall");
@@ -1942,7 +2017,7 @@ mod tests {
         // main loop hides its expiry until the stall clears, and then the
         // session ends with the rest of the backlog unread.
         assert_eq!(
-            adds(&log),
+            log.len(),
             FLOOD,
             "every UPDATE the peer sent applies before the session ends"
         );
@@ -1979,7 +2054,7 @@ mod tests {
         let silent_for = last_sent.elapsed();
         let err = ended.expect_err("a hold-timer expiry is an error");
         assert!(err.cause.contains("hold timer (3 s) expired"), "{err}");
-        assert_eq!(adds(&log), 1, "the UPDATE applied");
+        assert_eq!(log.len(), 1, "the UPDATE applied");
         assert!(
             silent_for >= TEST_HOLD && silent_for < TEST_HOLD + Duration::from_secs(2),
             "expired after {silent_for:?} of silence, hold {TEST_HOLD:?}"
@@ -1996,5 +2071,128 @@ mod tests {
             "we kept sending KEEPALIVEs while the peer was silent"
         );
         assert!(seen.unexpected.is_empty(), "sent {:?}", seen.unexpected);
+    }
+
+    // --- InitiationComplete quiescence -------------------------------
+
+    /// A stall longer than the quiescence window, mid-stream, with the
+    /// peer streaming through it and then going quiet while it lasts.
+    /// InitiationComplete GCs whatever the session has not re-sent, so
+    /// it must come after the last UPDATE is applied, and must time the
+    /// quiet from that UPDATE's receipt: once the backlog clears, it
+    /// fires sooner than a window timed from processing could.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initiation_complete_waits_for_a_stalled_backlog_and_times_quiet_from_receipt() {
+        let (prog, log, gate) = gated_recording_handle();
+        let (peer, session, shutdown) = establish(prog).await;
+        let (rd, mut wr) = peer.into_split();
+        let seen = watch(rd);
+
+        wr.write_all(&test_update()).await.expect("UPDATE");
+        let mut sent = 1;
+        wait_until(
+            "the first UPDATE is held in the programmer",
+            Duration::from_secs(5),
+            || gate.arrived() == 1,
+        )
+        .await;
+
+        // Stream through the stall for longer than the window, an UPDATE
+        // every 100 ms and a KEEPALIVE every 500 ms...
+        let from = Instant::now();
+        let mut last_sent = from;
+        while from.elapsed() < INIT_COMPLETE_QUIESCENCE + Duration::from_secs(1) {
+            for _ in 0..5 {
+                // Before the write, so its receipt cannot precede it.
+                last_sent = Instant::now();
+                wr.write_all(&test_update()).await.expect("UPDATE");
+                sent += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            wr.write_all(&encode_keepalive()).await.expect("KEEPALIVE");
+        }
+        // ...then go quiet for most of another window, still stalled.
+        let quiet = INIT_COMPLETE_QUIESCENCE - Duration::from_secs(1);
+        assert_eq!(quiet_peer_until(&mut wr, quiet, || false).await, None);
+        assert_eq!(
+            gate.arrived(),
+            1,
+            "premise: the programmer held the first UPDATE throughout"
+        );
+        assert!(
+            log.is_empty(),
+            "premise: nothing was applied during the stall"
+        );
+
+        let opened = Instant::now();
+        gate.open();
+        let fired_at = quiet_peer_until(&mut wr, 2 * INIT_COMPLETE_QUIESCENCE, || {
+            initiation_complete_at(&log).is_some()
+        })
+        .await
+        .expect("InitiationComplete fires once the peer is quiet and the backlog applied");
+
+        assert_eq!(
+            initiation_complete_at(&log),
+            Some(sent),
+            "InitiationComplete must follow all {sent} UPDATEs the peer sent, not run ahead of \
+             the backlog the stall was holding"
+        );
+        assert!(
+            fired_at - last_sent >= INIT_COMPLETE_QUIESCENCE,
+            "fired {:?} after the last UPDATE was sent",
+            fired_at - last_sent
+        );
+        assert!(
+            fired_at - opened < INIT_COMPLETE_QUIESCENCE,
+            "fired {:?} after the stall cleared: the window must run from the last UPDATE's \
+             receipt, {:?} before the stall cleared, not from when it was applied",
+            fired_at - opened,
+            opened - last_sent
+        );
+        assert_eq!(seen.lock().expect("seen").closed, None);
+        assert!(!session.is_finished(), "the session ended on a live peer");
+        shutdown.cancel();
+        session
+            .await
+            .expect("join")
+            .expect("shutdown ends a session cleanly");
+    }
+
+    /// The ordinary case still holds: a peer that streams and then goes
+    /// quiet gets InitiationComplete a window after its last UPDATE,
+    /// behind every UPDATE it sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initiation_complete_fires_once_the_peer_goes_quiet() {
+        let (prog, log) = recording_handle();
+        let (peer, session, shutdown) = establish(prog).await;
+        let (rd, mut wr) = peer.into_split();
+        let seen = watch(rd);
+
+        let mut last_sent = Instant::now();
+        for _ in 0..3 {
+            last_sent = Instant::now();
+            wr.write_all(&test_update()).await.expect("UPDATE");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let fired_at = quiet_peer_until(&mut wr, 2 * INIT_COMPLETE_QUIESCENCE, || {
+            initiation_complete_at(&log).is_some()
+        })
+        .await
+        .expect("InitiationComplete fires once the peer goes quiet");
+
+        assert_eq!(initiation_complete_at(&log), Some(3), "after all 3 UPDATEs");
+        let quiet = fired_at - last_sent;
+        assert!(
+            quiet >= INIT_COMPLETE_QUIESCENCE
+                && quiet < INIT_COMPLETE_QUIESCENCE + Duration::from_secs(3),
+            "fired after {quiet:?} of quiet, window {INIT_COMPLETE_QUIESCENCE:?}"
+        );
+        assert_eq!(seen.lock().expect("seen").closed, None);
+        shutdown.cancel();
+        session
+            .await
+            .expect("join")
+            .expect("shutdown ends a session cleanly");
     }
 }
