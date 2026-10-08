@@ -381,8 +381,13 @@ birdc enable bmp1
 packetframe emits `RouteEvent::Resync` on disconnect and receives
 the fresh dump on reconnect. Routes the new session does not
 re-announce are GC'd at `InitiationComplete`, which fires after 5 s of
-post-first-update quiescence. A session that drops before then GCs
-nothing; the next session's `InitiationComplete` does.
+post-first-update quiescence. On the iBGP feed the listener's socket
+reader judges it: 5 s with no UPDATE read and nothing left unread on
+the socket (KEEPALIVEs do not count either way), and the event is
+applied behind every UPDATE read before it. A slow programmer
+therefore neither fires it early (ahead of a backlog, mid-reload) nor
+late. A session that drops before then GCs nothing; the next
+session's `InitiationComplete` does.
 
 The GC covers the feed's routes only. The `fallback-default` 0/0 and
 the `local-prefix` host routes come from the neighbour resolver, not
@@ -1766,6 +1771,31 @@ Check:
   storm?
 - No process other than packetframe should be writing to
   `/sys/fs/bpf/packetframe/fast-path/maps/NEXTHOPS`.
+
+### Symptom: the feed session drops during a full-table load
+
+What it means: a hold timer expired, and every drop costs a `Resync`
+and the whole table again. Which side's timer fired says where to look.
+
+- **FRR's.** FRR logs `Notification sent (Hold Timer Expired)` and
+  `show bgp neighbor` gives it as the last reset: FRR heard no
+  KEEPALIVE from packetframe for its hold time. packetframe sends them
+  from a task of their own, every third of the hold time (30 s at the
+  default 90), so a slow load does not delay them. What still can is a
+  packetframe that gets no CPU at all, or a send that cannot complete
+  because FRR stopped reading. Look at
+  `top -H -p "$(pgrep -x packetframe)"` around the drop.
+- **packetframe's.** packetframe logs `BGP connection handler exited
+  with error` with `hold timer (90 s) expired`: it waited on the
+  socket for a whole hold time without a complete message from FRR.
+  Time spent behind on route processing does not count, because the
+  socket is not read while the backlog drains and the timer runs only
+  while it is. So this is FRR, or the path to it, going quiet: read
+  FRR's log at the same timestamp.
+
+The reverse also holds: packetframe keeps the session up however
+slowly routes apply, so FRR showing `Established` says nothing about
+whether they are landing.
 
 ### Symptom: route-source session stays up but routes stop flowing
 
