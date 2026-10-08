@@ -406,6 +406,50 @@ pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
 /// authority's count.
 #[doc(hidden)]
 pub fn recording_handle_reporting(counts: (usize, usize)) -> (FibProgrammerHandle, RouteEventLog) {
+    spawn_recorder(counts, None)
+}
+
+/// Holds a [`gated_recording_handle`]'s applies until opened.
+#[cfg(test)]
+pub(crate) struct ApplyGate {
+    open: tokio::sync::watch::Sender<bool>,
+    arrived: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl ApplyGate {
+    /// Release the held apply and every one after it.
+    pub(crate) fn open(&self) {
+        self.open.send_replace(true);
+    }
+
+    /// How many `ApplyRouteEvent`s have reached the actor, held or not.
+    pub(crate) fn arrived(&self) -> usize {
+        self.arrived.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// [`recording_handle`] whose actor holds the first `ApplyRouteEvent`
+/// until the gate opens: a programmer stalled mid-ingest. Serial like
+/// the real actor, so nothing queued behind the held apply is answered
+/// either — the route source's await on it simply does not return.
+#[cfg(test)]
+pub(crate) fn gated_recording_handle() -> (FibProgrammerHandle, RouteEventLog, ApplyGate) {
+    let (open, open_rx) = tokio::sync::watch::channel(false);
+    let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (handle, log) = spawn_recorder((0, 0), Some((open_rx, arrived.clone())));
+    (handle, log, ApplyGate { open, arrived })
+}
+
+type RecorderGate = (
+    tokio::sync::watch::Receiver<bool>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
+
+fn spawn_recorder(
+    counts: (usize, usize),
+    mut gate: Option<RecorderGate>,
+) -> (FibProgrammerHandle, RouteEventLog) {
     let (tx, mut rx) = mpsc::channel::<Command>(256);
     let log = RouteEventLog::default();
     let sink = log.clone();
@@ -414,6 +458,11 @@ pub fn recording_handle_reporting(counts: (usize, usize)) -> (FibProgrammerHandl
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 Command::ApplyRouteEvent { event, reply } => {
+                    if let Some((open, arrived)) = gate.as_mut() {
+                        arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // A dropped gate releases too: the test is over.
+                        let _ = open.wait_for(|open| *open).await;
+                    }
                     sink.0
                         .lock()
                         .expect("RouteEventLog poisoned")

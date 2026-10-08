@@ -1767,6 +1767,31 @@ Check:
 - No process other than packetframe should be writing to
   `/sys/fs/bpf/packetframe/fast-path/maps/NEXTHOPS`.
 
+### Symptom: the feed session drops during a full-table load
+
+What it means: a hold timer expired, and every drop costs a `Resync`
+and the whole table again. Which side's timer fired says where to look.
+
+- **FRR's.** FRR logs `Notification sent (Hold Timer Expired)` and
+  `show bgp neighbor` gives it as the last reset: FRR heard no
+  KEEPALIVE from packetframe for its hold time. packetframe sends them
+  from a task of their own, every third of the hold time (30 s at the
+  default 90), so a slow load does not delay them. What still can is a
+  packetframe that gets no CPU at all, or a send that cannot complete
+  because FRR stopped reading. Look at
+  `top -H -p "$(pgrep -x packetframe)"` around the drop.
+- **packetframe's.** packetframe logs `BGP connection handler exited
+  with error` with `hold timer (90 s) expired`: it waited on the
+  socket for a whole hold time without a complete message from FRR.
+  Time spent behind on route processing does not count, because the
+  socket is not read while the backlog drains and the timer runs only
+  while it is. So this is FRR, or the path to it, going quiet: read
+  FRR's log at the same timestamp.
+
+The reverse also holds: packetframe keeps the session up however
+slowly routes apply, so FRR showing `Established` says nothing about
+whether they are landing.
+
 ### Symptom: route-source session stays up but routes stop flowing
 
 What it means: bird is connected and idle. No new BGP churn, no new
