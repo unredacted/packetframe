@@ -738,6 +738,9 @@ fn a_loop_that_panics_after_publishing_is_not_a_clean_stop() {
         fn installed_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
             Vec::new()
         }
+        fn target_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
+            Vec::new()
+        }
         fn missing_from_nic(
             &self,
         ) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
@@ -1194,6 +1197,9 @@ impl packetframe_vpp_offload::runtime::Steering for SpySteering {
     fn installed_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
         Vec::new()
     }
+    fn target_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
+        Vec::new()
+    }
     fn missing_from_nic(&self) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
         // No NIC behind this double, so nothing can be missing from one.
         Ok(packetframe_vpp_offload::runtime::SteeringAudit::clean())
@@ -1241,6 +1247,9 @@ struct GatedSteer {
 
 impl packetframe_vpp_offload::runtime::Steering for GatedSteer {
     fn installed_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
+        Vec::new()
+    }
+    fn target_plan(&self) -> Vec<(String, u32, packetframe_vpp_offload::steer::RuleSet)> {
         Vec::new()
     }
     fn missing_from_nic(&self) -> Result<packetframe_vpp_offload::runtime::SteeringAudit, String> {
@@ -2247,6 +2256,157 @@ fn an_allowlist_change_under_live_steering_is_always_reconciled() {
          not move, or a withdrawn prefix keeps being diverted: {seen:?}"
     );
 
+    svc.stop();
+}
+
+/// A table whose changes are still at the source: the mirror holds the
+/// routes, and `behind` more are queued for VPP that the engine is not
+/// handed — VPP installing slower than the feed delivers, as the steer
+/// gate sees it.
+struct Behind {
+    routes: Vec<IpPrefix>,
+    behind: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+impl RouteSource for Behind {
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("this source hands nothing over, so nothing can come back")
+    }
+    fn backlog(&self) -> u64 {
+        self.behind.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn route_count(&self) -> u64 {
+        self.routes.len() as u64
+    }
+    fn change_seq(&self) -> u64 {
+        0
+    }
+    fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+        for p in &self.routes {
+            visit(*p, &[fake_vpp::nh()]);
+        }
+    }
+    fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+        visit(fake_vpp::nh(), "eth4", MAC);
+    }
+}
+
+/// `packetframe reconfigure`'s lever, through the running service, while
+/// VPP is behind the route mirror (2026-10-07): refused with the reason,
+/// the ask remembered and named on the steering row — and `steer off`,
+/// in the same weather, admitted. Once VPP has caught up the same lever
+/// steers.
+#[test]
+fn a_lever_moved_while_vpp_is_behind_the_mirror_is_held_and_steer_off_is_not() {
+    let fake = Fake::start("svc-first-steer-hold");
+    let sock = fake.path.clone();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spy = std::sync::Arc::clone(&log);
+    let behind = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let backlog = std::sync::Arc::clone(&behind);
+
+    let svc = SupervisionService::start(
+        "vpp-offload",
+        Box::new(move || {
+            let engine = ConvergenceEngine::new(
+                &sock,
+                vec![PortAttach {
+                    port: "eth4".into(),
+                    pci_addr: "0002:07:00.1".into(),
+                    port_id: 0,
+                    num_rx_queues: 1,
+                    pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                    accept_macs: vec![],
+                    mtu: None,
+                    vlans: vec![],
+                }],
+                vec!["eth4".into()],
+                1_000_000,
+                FamilyPolicy::V4Only,
+                packetframe_common::config::Ipv4Prefix {
+                    addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                    prefix_len: 32,
+                },
+            );
+            let runtime = Runtime::new(
+                engine,
+                Box::new(Behind {
+                    routes: (0..6).map(|i| fake_vpp::v4(0, i)).collect(),
+                    behind: backlog,
+                }),
+                Box::new(SpySteering(spy)),
+                Box::new(NullStore),
+                Box::new(NoResources),
+                "/usr/bin/vpp",
+                "/tmp/startup.conf",
+            );
+            {
+                use packetframe_vpp_offload::driver::Observe as _;
+                let (mut obs, _) = runtime.views();
+                assert!(obs.api_ready());
+            }
+            Ok((
+                Driver::new(),
+                runtime,
+                vec![Event::Adopted { steered: false }],
+            ))
+        }),
+    )
+    .expect("service starts");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while svc.status().expect("published").state != State::Ready {
+        assert!(Instant::now() < deadline, "did not reach Ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let steering_line = |s: &packetframe_vpp_offload::service::Published| {
+        s.report
+            .subsystems
+            .iter()
+            .find(|x| x.name == "steering")
+            .and_then(|x| x.message.clone())
+            .unwrap_or_default()
+    };
+
+    // A reload's worth arrives at the source; VPP has not taken it.
+    behind.store(10_000, std::sync::atomic::Ordering::SeqCst);
+    let err = svc
+        .apply_steering(uniform1(plan_for(2)), Default::default(), true, true)
+        .expect_err("VPP is behind the mirror");
+    assert!(
+        err.contains(
+            "refusing to steer: VPP has not caught up with the route mirror: 10000 change(s)"
+        ),
+        "{err}"
+    );
+    assert!(err.contains("remembered"), "{err}");
+    let after = svc.status().expect("published");
+    let line = steering_line(&after);
+    assert!(
+        line.contains("intended but not in place")
+            && line.contains("Held now because VPP has not caught up with the route mirror"),
+        "{line}"
+    );
+    assert!(
+        log.lock().unwrap().iter().all(|c| c != "steer"),
+        "nothing installed: {:?}",
+        log.lock().unwrap()
+    );
+
+    // The rollback lever, in the same weather: admitted, and the held ask
+    // is withdrawn with it. (This double reports a configured port
+    // whatever the target, so the row reads the configured staging line.)
+    svc.apply_steering(Vec::new(), Default::default(), false, true)
+        .expect("`steer off` is never held");
+    let rolled_back = svc.status().expect("published");
+    assert_eq!(rolled_back.state, State::Ready);
+    let line = steering_line(&rolled_back);
+    assert!(!line.contains("intended but not in place"), "{line}");
+
+    // VPP catches up; the same lever now steers.
+    behind.store(0, std::sync::atomic::Ordering::SeqCst);
+    svc.apply_steering(uniform1(plan_for(2)), Default::default(), true, true)
+        .expect("caught up and verified");
+    assert_eq!(svc.status().expect("published").state, State::Steered);
     svc.stop();
 }
 
