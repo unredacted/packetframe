@@ -64,9 +64,9 @@
 #![cfg(target_os = "linux")]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bgpkit_parser::models::{Asn, AsnLength, BgpMessage, ElemType, NetworkPrefix};
 use bgpkit_parser::parser::bgp::messages::parse_bgp_message;
@@ -223,6 +223,8 @@ pub struct BgpListener {
     /// programmer wedged behind an established session is therefore
     /// reported by nothing on this path yet.
     stall_gate: Option<SharedIntegritySnapshot>,
+    /// Empty outside tests; see [`ReadHold`].
+    read_hold: ReadHold,
 }
 
 impl BgpListener {
@@ -237,6 +239,7 @@ impl BgpListener {
             shutdown,
             last_update_unix: Arc::new(AtomicI64::new(0)),
             stall_gate: None,
+            read_hold: ReadHold::default(),
         }
     }
 
@@ -408,15 +411,14 @@ impl BgpListener {
         // and the peer tore the session down (2026-08-19, 2026-10-07),
         // costing a full re-dump each time.
         let (read_half, write_half) = stream.into_split();
-        let (frame_tx, mut frame_rx) = mpsc::channel::<Received>(FRAME_CHANNEL_CAPACITY);
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(FRAME_CHANNEL_CAPACITY);
         let hold = Duration::from_secs(effective_hold as u64);
-        let updates_received = Arc::new(AtomicUsize::new(0));
         let mut reader = SessionTask(tokio::spawn(reader_task(
             read_half,
             frame_tx,
             add_path_in_effect,
             hold,
-            updates_received.clone(),
+            self.read_hold.clone(),
         )));
         let mut writer = SessionTask(tokio::spawn(keepalive_writer(
             write_half,
@@ -438,10 +440,7 @@ impl BgpListener {
         // mirror-scaled rate answers it: an initial load runs orders
         // of magnitude above the quiet rate, so live-but-loading can
         // never release early.
-        let mut last_update: Option<Instant> = None;
         let mut init_complete_fired = false;
-        let mut quiescence_tick = tokio::time::interval(Duration::from_secs(1));
-        quiescence_tick.tick().await; // skip immediate fire
         let mut updates_seen = 0usize;
 
         // Synthetic peer_id for an iBGP session: bird is the singular
@@ -456,10 +455,61 @@ impl BgpListener {
                 _ = self.shutdown.cancelled() => {
                     return Ok(());
                 }
-                msg = frame_rx.recv() => {
-                    match msg {
-                        Some(received) => {
-                            self.process_msg(received, peer_id, peer_asn_observed, &mut last_update, &mut updates_seen).await?;
+                frame = frame_rx.recv() => {
+                    match frame {
+                        Some(Frame::Message(m)) => {
+                            self.process_msg(m, peer_id, peer_asn_observed, &mut updates_seen).await?;
+                        }
+                        Some(Frame::Quiet) => {
+                            // InitiationComplete heuristic. The reader sends
+                            // Quiet only once it has gone
+                            // INIT_COMPLETE_QUIESCENCE without reading an
+                            // UPDATE and has just found the socket empty, and
+                            // Quiet travels behind every UPDATE it read: so
+                            // here the peer has been quiet that long by the
+                            // socket's own account, and everything it sent
+                            // before has been applied. See `reader_task` for
+                            // why only the reader can judge that.
+                            if !init_complete_fired {
+                                if let Err(e) = self
+                                    .prog_handle
+                                    .apply_route_event(RouteEvent::InitiationComplete)
+                                    .await
+                                {
+                                    warn!(error = %e, "InitiationComplete dispatch failed");
+                                } else {
+                                    info!(
+                                        updates_seen,
+                                        quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
+                                        "InitiationComplete fired"
+                                    );
+                                    init_complete_fired = true;
+                                    // The GC this event triggers removed
+                                    // every unseen prior-session route,
+                                    // so the mirror is now this epoch's
+                                    // and nothing of the one before it.
+                                    // The second tier's gate treats this
+                                    // — and nothing else — as grounds to
+                                    // trust an authority report again
+                                    // after a session flap.
+                                    //
+                                    // Safe HERE, unlike the BMP station:
+                                    // the reader sends Quiet only after
+                                    // an UPDATE, and Quiet follows it
+                                    // through the channel, so
+                                    // `process_msg` has already accepted
+                                    // that UPDATE and raised on the
+                                    // session's first, and the epoch is
+                                    // open. Marking before a raise stamps
+                                    // the epoch that is ending and
+                                    // `set_up` clears it a moment later
+                                    // (review finding, on the BMP path).
+                                    // Do not move this above the raise.
+                                    if let Some(sess) = &self.cfg.session {
+                                        sess.mark_reconciled();
+                                    }
+                                }
+                            }
                         }
                         None => {
                             // Reader exited (EOF, read error, or hold
@@ -486,71 +536,6 @@ impl BgpListener {
                         RouteSourceError::recoverable(format!("keepalive writer join: {e}"))
                     }));
                 }
-                _ = quiescence_tick.tick() => {
-                    // InitiationComplete heuristic: INIT_COMPLETE_QUIESCENCE
-                    // since the last UPDATE was RECEIVED, with every
-                    // UPDATE received already applied. The event GCs
-                    // whatever this session has not re-sent, so both
-                    // halves matter. Timed from processing, as it was, a
-                    // stall that long inside one apply read as a quiet
-                    // peer, and this arm could win the `select!` as the
-                    // stall cleared, ahead of the backlog it had held: a
-                    // GC mid-reload, pulling routes not yet re-applied
-                    // out of the FIB. Timed from receipt alone, the last
-                    // UPDATE applied can be long received while newer
-                    // ones still wait behind it. The reader counts an
-                    // UPDATE before handing it over, so one it holds
-                    // while blocked on a full channel counts as pending;
-                    // `updates_seen` counts each one `process_msg`
-                    // accepted, and one it refuses ends the session, so
-                    // the two are equal exactly when nothing received
-                    // is left to apply.
-                    let backlog_applied =
-                        updates_seen == updates_received.load(Ordering::Acquire);
-                    if !init_complete_fired && backlog_applied {
-                        if let Some(last) = last_update {
-                            if last.elapsed() >= INIT_COMPLETE_QUIESCENCE {
-                                if let Err(e) = self
-                                    .prog_handle
-                                    .apply_route_event(RouteEvent::InitiationComplete)
-                                    .await
-                                {
-                                    warn!(error = %e, "InitiationComplete dispatch failed");
-                                } else {
-                                    info!(
-                                        updates_seen,
-                                        quiescence_secs = INIT_COMPLETE_QUIESCENCE.as_secs(),
-                                        "InitiationComplete fired"
-                                    );
-                                    init_complete_fired = true;
-                                    // The GC this event triggers removed
-                                    // every unseen prior-session route,
-                                    // so the mirror is now this epoch's
-                                    // and nothing of the one before it.
-                                    // The second tier's gate treats this
-                                    // — and nothing else — as grounds to
-                                    // trust an authority report again
-                                    // after a session flap.
-                                    //
-                                    // Safe HERE, unlike the BMP station,
-                                    // because this arm is gated on
-                                    // `last_update` being set — and that
-                                    // is assigned in the same block that
-                                    // raises on the first UPDATE, so the
-                                    // epoch is already open. Marking
-                                    // before a raise stamps the epoch
-                                    // that is ending and `set_up` clears
-                                    // it a moment later (review finding,
-                                    // on the BMP path). Do not move this
-                                    // above the raise.
-                                    if let Some(sess) = &self.cfg.session {
-                                        sess.mark_reconciled();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -563,13 +548,11 @@ impl BgpListener {
     /// had been thrown away whole.
     async fn process_msg(
         &self,
-        received: Received,
+        msg: BgpMessage,
         peer_id: PeerId,
         peer_asn: u32,
-        last_update: &mut Option<Instant>,
         updates_seen: &mut usize,
     ) -> Result<(), RouteSourceError> {
-        let Received { msg, at } = received;
         match msg {
             BgpMessage::Open(_) => {
                 // Spurious post-handshake OPEN, bird shouldn't do
@@ -633,11 +616,6 @@ impl BgpListener {
                 // healthy connection reads as a flap, and the
                 // attestation is gone for good (review finding; the
                 // BMP path had the same ordering).
-                //
-                // Stamped with when the reader received it, not now: the
-                // quiescence arm times the peer's silence, and the time
-                // this UPDATE waited behind a slow apply is ours.
-                *last_update = Some(at);
                 *updates_seen += 1;
                 self.last_update_unix.store(
                     SystemTime::now()
@@ -756,40 +734,59 @@ where
     }
 }
 
-/// A message as the reader framed it, stamped with when it came off
-/// the socket. One that waited in the socket buffer while the reader
-/// was blocked is stamped when read, which can only make the peer look
-/// more recently active than it was.
-struct Received {
-    msg: BgpMessage,
-    at: Instant,
+/// What the reader hands the main loop, in the order it happened.
+enum Frame {
+    Message(BgpMessage),
+    /// No UPDATE read for [`INIT_COMPLETE_QUIESCENCE`], judged on an
+    /// empty socket; see `reader_task`. Behind every UPDATE read before
+    /// it, so the main loop applies InitiationComplete only after them.
+    Quiet,
+}
+
+/// Test seam: holds the reader between handing a message over and
+/// starting its next read, the way a reader the scheduler has not run
+/// yet sits. Empty outside tests, where `wait` returns at once.
+#[derive(Clone, Default)]
+struct ReadHold {
+    #[cfg(test)]
+    open: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+impl ReadHold {
+    async fn wait(&mut self) {
+        #[cfg(test)]
+        if let Some(open) = self.open.as_mut() {
+            let _ = open.wait_for(|open| *open).await;
+        }
+    }
 }
 
 /// Drains the TCP stream, parses BGP messages, and forwards them to
 /// the main `select!` loop via a bounded channel, and runs the
-/// session's hold timer. Same cancel-safety pattern as
-/// `BmpStation::reader_task`.
+/// session's hold timer and its quiescence judgement. Same
+/// cancel-safety pattern as `BmpStation::reader_task`.
 ///
 /// `add_path` carries the result of OPEN-time RFC 7911 capability
 /// negotiation (computed by [`walk_open_capabilities`]). It controls
 /// the per-message NLRI decode in [`read_one_message`]: when true,
 /// every prefix in MP_REACH / MP_UNREACH / legacy NLRI is prefixed
 /// by a 4-byte path_id.
-///
-/// `updates_received` counts every UPDATE read, before it is handed
-/// over; the quiescence arm compares it with what has been applied.
 async fn reader_task<R>(
     mut stream: R,
-    tx: mpsc::Sender<Received>,
+    tx: mpsc::Sender<Frame>,
     add_path: bool,
     hold: Duration,
-    updates_received: Arc<AtomicUsize>,
+    mut read_hold: ReadHold,
 ) -> Result<(), RouteSourceError>
 where
     R: AsyncReadExt + Unpin + Send,
 {
     let mut messages_parsed = 0usize;
+    // When the session goes quiet if no UPDATE comes first: set by each
+    // UPDATE read, cleared once Quiet is sent.
+    let mut quiet_at: Option<tokio::time::Instant> = None;
     loop {
+        read_hold.wait().await;
         // THE HOLD TIMER (RFC 4271 §6.5) is this timeout, armed afresh
         // for every message, and it runs only while we wait on the
         // socket. That is the one interval that says anything about the
@@ -815,7 +812,50 @@ where
         // main loop that never takes another frame (a wedged
         // programmer) keeps the session up: that is our fault, not the
         // peer's, and this timer is not the place to report it.
-        let msg = match tokio::time::timeout(hold, read_one_message(&mut stream, add_path)).await {
+        let read = tokio::time::timeout(hold, read_one_message(&mut stream, add_path));
+        tokio::pin!(read);
+        let read = loop {
+            // QUIESCENCE (InitiationComplete, which GCs whatever the
+            // session has not re-sent) is judged here too, and only
+            // here: no UPDATE read for INIT_COMPLETE_QUIESCENCE, AND the
+            // socket found empty. Only this task can see the second
+            // half. Anywhere else, UPDATEs still unread in our receive
+            // buffer are invisible: counting what was read against what
+            // was applied, and timing from when it was read, declared
+            // quiet whenever the main loop caught up with a reader the
+            // scheduler had not yet run to read the rest, and after a
+            // stall longer than the window the stamps it compared were
+            // old, so the GC ran mid-reload (review finding).
+            //
+            // `biased` polls the read first, so Quiet goes out only on
+            // a poll where the read found nothing, and an overdue
+            // deadline after a stall loses to whatever the stall left
+            // in the buffer. A budget-starved poll cannot pass for an
+            // empty socket: the sleep is budgeted too and stays pending
+            // with it. KEEPALIVEs do not restart the window; if they
+            // did, a hold time under 15 s (a KEEPALIVE more often than
+            // every 5 s) would keep it shut for good. Quiet queues
+            // behind every UPDATE handed over, so it reaches the main
+            // loop only after they are applied.
+            let quiet = async move {
+                match quiet_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                biased;
+                read = &mut read => break read,
+                () = quiet => {
+                    quiet_at = None;
+                    if tx.send(Frame::Quiet).await.is_err() {
+                        debug!(messages_parsed, "frame receiver closed; reader exiting");
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let msg = match read {
             Err(_) => {
                 return Err(RouteSourceError::recoverable(format!(
                     "hold timer ({} s) expired",
@@ -833,15 +873,11 @@ where
                 )));
             }
         };
-        let at = Instant::now();
         messages_parsed += 1;
         if matches!(msg, BgpMessage::Update(_)) {
-            // Release pairs with the quiescence arm's Acquire. Counted
-            // before the send, so an UPDATE this task holds while
-            // blocked on a full channel already counts as unapplied.
-            updates_received.fetch_add(1, Ordering::Release);
+            quiet_at = Some(tokio::time::Instant::now() + INIT_COMPLETE_QUIESCENCE);
         }
-        if tx.send(Received { msg, at }).await.is_err() {
+        if tx.send(Frame::Message(msg)).await.is_err() {
             debug!(messages_parsed, "frame receiver closed; reader exiting");
             return Ok(());
         }
@@ -1734,6 +1770,7 @@ mod tests {
     // hold-timer expiry looks like from the far end.
 
     use crate::fib::programmer::{gated_recording_handle, recording_handle, RouteEventLog};
+    use std::time::Instant;
     use tokio::net::tcp::OwnedReadHalf;
     use tokio::task::JoinHandle;
 
@@ -1768,21 +1805,28 @@ mod tests {
         Ok(header[18])
     }
 
-    /// Run `handle_connection` on a loopback connection and complete the
-    /// OPEN exchange as the peer. Returns the peer's end and the session.
-    async fn establish(
-        prog: FibProgrammerHandle,
-    ) -> (
+    type Established = (
         TcpStream,
         JoinHandle<Result<(), RouteSourceError>>,
         CancellationToken,
-    ) {
+    );
+
+    /// Run `handle_connection` on a loopback connection and complete the
+    /// OPEN exchange as the peer. Returns the peer's end and the session.
+    async fn establish(prog: FibProgrammerHandle) -> Established {
+        establish_with(prog, ReadHold::default()).await
+    }
+
+    /// [`establish`], with the reader's [`ReadHold`] in the test's hands.
+    async fn establish_with(prog: FibProgrammerHandle, read_hold: ReadHold) -> Established {
         let lst = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = lst.local_addr().expect("local addr");
         let mut cfg = BgpListenerConfig::new(addr, TEST_AS, TEST_AS, Ipv4Addr::new(192, 0, 2, 1));
         cfg.hold_time = TEST_HOLD.as_secs() as u16;
         let shutdown = CancellationToken::new();
-        let listener = Arc::new(BgpListener::new(cfg, prog, shutdown.clone()));
+        let mut listener = BgpListener::new(cfg, prog, shutdown.clone());
+        listener.read_hold = read_hold;
+        let listener = Arc::new(listener);
         let mut peer = TcpStream::connect(addr).await.expect("connect");
         let (stream, _) = lst.accept().await.expect("accept");
         let session = tokio::spawn(async move { listener.handle_connection(stream).await });
@@ -2189,6 +2233,102 @@ mod tests {
             "fired after {quiet:?} of quiet, window {INIT_COMPLETE_QUIESCENCE:?}"
         );
         assert_eq!(seen.lock().expect("seen").closed, None);
+        shutdown.cancel();
+        session
+            .await
+            .expect("join")
+            .expect("shutdown ends a session cleanly");
+    }
+
+    /// The race only the reader can close. A stall longer than the
+    /// window leaves the reader blocked on a full channel with UPDATEs
+    /// still unread in the socket. When the stall clears, the reader is
+    /// held after its handoff, as one the scheduler has not run yet
+    /// would sit, while the main loop applies everything handed over.
+    /// Nothing may call the session quiet then: InitiationComplete must
+    /// wait for the unread UPDATEs, and for a window after the last of
+    /// them is read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initiation_complete_waits_for_updates_still_unread_in_the_socket() {
+        // The stalled apply, a full channel and one in the reader's
+        // hands, with as many again left in the socket buffer.
+        const FLOOD: usize = 2 * FRAME_CHANNEL_CAPACITY;
+        let (prog, log, gate) = gated_recording_handle();
+        let (hold_open, hold_rx) = tokio::sync::watch::channel(true);
+        let (peer, session, shutdown) = establish_with(
+            prog,
+            ReadHold {
+                open: Some(hold_rx),
+            },
+        )
+        .await;
+        let (rd, mut wr) = peer.into_split();
+        let seen = watch(rd);
+
+        let flood: Vec<u8> = (0..FLOOD).flat_map(|_| test_update()).collect();
+        tokio::time::timeout(Duration::from_secs(5), wr.write_all(&flood))
+            .await
+            .expect("premise: the flood fits in the socket buffers")
+            .expect("flood");
+        wait_until(
+            "the first UPDATE is held in the programmer",
+            Duration::from_secs(5),
+            || gate.arrived() == 1,
+        )
+        .await;
+        // The reader stops at its next read: once the stall clears and it
+        // completes the handoff it is blocked in, or sooner.
+        hold_open.send_replace(false);
+
+        // A stall longer than the window; the peer stays up, sending no
+        // UPDATEs.
+        let stall = INIT_COMPLETE_QUIESCENCE + Duration::from_secs(1);
+        assert_eq!(quiet_peer_until(&mut wr, stall, || false).await, None);
+        assert_eq!(gate.arrived(), 1, "premise: the programmer stayed stalled");
+        assert!(
+            log.is_empty(),
+            "premise: nothing was applied during the stall"
+        );
+
+        // The stall clears. The main loop applies all it was handed while
+        // the reader stays held, for longer than the old once-a-second
+        // check needed to misfire.
+        gate.open();
+        let held = Duration::from_millis(2500);
+        assert_eq!(quiet_peer_until(&mut wr, held, || false).await, None);
+        if let Some(after) = initiation_complete_at(&log) {
+            panic!(
+                "InitiationComplete fired after {after} UPDATEs, with {} still unread in the socket",
+                FLOOD - after
+            );
+        }
+        let applied = log.len();
+        assert!(
+            applied > 0 && applied < FLOOD,
+            "premise: what was handed over is applied ({applied}) and UPDATEs remain unread"
+        );
+
+        let released = Instant::now();
+        hold_open.send_replace(true);
+        let fired_at = quiet_peer_until(&mut wr, 2 * INIT_COMPLETE_QUIESCENCE, || {
+            initiation_complete_at(&log).is_some()
+        })
+        .await
+        .expect("InitiationComplete fires once the reader has read everything and gone quiet");
+        assert_eq!(
+            initiation_complete_at(&log),
+            Some(FLOOD),
+            "after every UPDATE the peer sent"
+        );
+        let after = fired_at - released;
+        assert!(
+            after >= INIT_COMPLETE_QUIESCENCE
+                && after < INIT_COMPLETE_QUIESCENCE + Duration::from_secs(3),
+            "fired {after:?} after the reader was released: the window runs from the last \
+             UPDATE it read, which came after the release"
+        );
+        assert_eq!(seen.lock().expect("seen").closed, None);
+        assert!(!session.is_finished(), "the session ended on a live peer");
         shutdown.cancel();
         session
             .await
