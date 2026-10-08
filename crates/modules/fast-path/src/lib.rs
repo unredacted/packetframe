@@ -30,6 +30,7 @@ pub mod sample;
 pub mod sample_rings;
 pub mod softnet;
 pub mod tc_links;
+pub mod vrrp;
 pub mod wan_egress;
 
 /// The protocol number that tags kernel routing objects as
