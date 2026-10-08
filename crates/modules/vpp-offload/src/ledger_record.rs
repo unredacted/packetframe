@@ -36,6 +36,17 @@
 //!   adoption's verify probes VPP against the seeded ledger with the
 //!   PATHS compared too ([`crate::verify::verify_paths`]); a
 //!   disagreement discards the seed and falls back to the dump path.
+//! - *Whose.* Its routes are what this root daemon believes VPP holds,
+//!   and a record another account could have written is a fabricated
+//!   FIB whatever its checksum says (an unkeyed checksum proves
+//!   integrity, not provenance). Before a byte is read, the open
+//!   descriptors must show a regular file owned by the daemon's uid and
+//!   closed to group and others, in a directory likewise, under
+//!   ancestors nobody else can rename; anything else is refused
+//!   (`untrusted`). See [`packetframe_common::statefile::read_owned_no_follow`].
+//! - *How big.* Past [`max_ledger_bytes`] (the widest record this run's
+//!   route capacity could encode to) it is refused from `fstat`
+//!   (`too-large`), never read.
 //! - *Used once.* The adoption removes the file the moment it reads it,
 //!   before anything touches VPP, whether or not the record checks out.
 //!   A crash or an unclean stop writes no record at all, so a stale one
@@ -52,6 +63,7 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use packetframe_common::events::{self as event_log, kind as event_kind};
 use packetframe_common::fib::IpPrefix;
 
 use crate::sink::PathKey;
@@ -73,6 +85,83 @@ const MAGIC: &[u8; 8] = b"PFVPPLGR";
 /// process held without having observed its paths (a dump adoption it
 /// never re-sent). Seeded as installed; never skipped, never path-checked.
 const NO_PATHS: u32 = u32::MAX;
+
+/// A length-prefixed string at the format's limit: a `u16` length and
+/// that many bytes ([`put_str`] truncates anything longer).
+const STR_MAX_BYTES: u64 = 2 + u16::MAX as u64;
+
+/// The wire's MPLS label stack (`fib_path.label_stack`): the most labels
+/// a path read off the wire carries, so the most a recorded one can.
+const WIRE_LABELS_MAX: u64 = 16;
+
+/// One path at its widest: a v6 nexthop (family byte and address),
+/// interface, weight, preference, kind, flags, proto, the label count,
+/// and the wire's full label stack at seven bytes a label.
+const PATH_MAX_BYTES: u64 = 17 + 4 + 1 + 1 + 4 + 4 + 4 + 1 + WIRE_LABELS_MAX * 7;
+
+/// One entry at its widest: family, length, a v6 address, the path-set
+/// index.
+const ENTRY_MAX_BYTES: u64 = 1 + 1 + 16 + 4;
+
+/// What one route is charged in [`max_ledger_bytes`]: its entry at its
+/// widest, plus a path set of its own (a `u16` count and one path at
+/// its widest).
+///
+/// A set per route because every set a record holds is one some entry
+/// names (`ConvergenceEngine::preservable_ledger` writes only the sets
+/// its entries reference), so there are never more sets than routes.
+/// One path per set is an allowance, not the format's maximum: nothing
+/// below the wire's 255 caps an ECMP width. It is a wide one. The paths
+/// this module installs carry no labels (`fib_sync::wire_path`), 36
+/// bytes at most, so the charge holds four of them per route, and
+/// distinct sets are a property of the topology, not the table: 129
+/// nexthops and no ECMP group on the reference fleet against a million
+/// routes (`feed`'s module docs).
+const ROUTE_MAX_BYTES: u64 = ENTRY_MAX_BYTES + 2 + PATH_MAX_BYTES;
+
+/// One interface at its widest: its name and `sw_if_index`.
+const INTERFACE_MAX_BYTES: u64 = STR_MAX_BYTES + 4;
+
+/// Fingerprint rows: one per prefix length of the one table per family
+/// this module programs (table 0) — 33 for IPv4, 129 for IPv6.
+const FINGERPRINT_ROWS_MAX: u64 = 33 + 129;
+
+/// One fingerprint row at its widest: table name, length, count.
+const FINGERPRINT_ROW_MAX_BYTES: u64 = STR_MAX_BYTES + 1 + 8;
+
+/// Everything without a per-route or per-interface count, at its widest:
+/// magic, format version, pid, start ticks, the boot id, the token, the
+/// four counts, every fingerprint row, and the checksum.
+const FIXED_MAX_BYTES: u64 = 8
+    + 4
+    + 4
+    + 8
+    + STR_MAX_BYTES
+    + 8
+    + 4 * 4
+    + FINGERPRINT_ROWS_MAX * FINGERPRINT_ROW_MAX_BYTES
+    + 8;
+
+/// The largest file a start reads as a preserved ledger, judged from
+/// `fstat` before a byte of it is read: the widest record an engine
+/// admitting `routes` prefixes (both families' high-water marks
+/// together) could write against `interfaces` ports. Past it the record
+/// is refused (`too-large`) and removed unread.
+///
+/// `routes` is this run's capacity, and that is the writer's too: an
+/// adoption is refused outright unless `expected-routes`, `v6` and the
+/// ports are the ones the adopted VPP was started under (`acquire`), and
+/// the engine withholds rather than installs past its marks. At the
+/// default `expected-routes` with `v6 on` the bound is about 500 MB,
+/// against ~11 MB for the reference router's 1.09M-route table — the
+/// per-route charge is ~17x a real v4 route's — so no ledger this engine
+/// writes meets it, and a huge or sparse file in `state-dir` cannot make
+/// a start allocate without limit.
+pub fn max_ledger_bytes(routes: u64, interfaces: usize) -> u64 {
+    FIXED_MAX_BYTES
+        .saturating_add((interfaces as u64).saturating_mul(INTERFACE_MAX_BYTES))
+        .saturating_add(routes.saturating_mul(ROUTE_MAX_BYTES))
+}
 
 /// VPP's own route count per table and prefix length.
 ///
@@ -169,10 +258,108 @@ pub struct LedgerRecord {
     pub body: LedgerBody,
 }
 
-/// Why a record was not used. Every one of these falls back to the
-/// dump path; none fails the adoption.
-fn refuse(why: impl std::fmt::Display) -> String {
-    format!("preserved route ledger not used: {why}")
+/// Why a record found at bring-up was not used. Every one of these falls
+/// back to the dump path; none fails the adoption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// Someone other than this daemon's uid could have written it or put
+    /// it there: the file is owned by another uid or writable by group or
+    /// others, so is the directory holding it, or an ancestor lets a
+    /// third account rename the directories under it (or it is not a
+    /// regular file). Never read; removed.
+    Untrusted(String),
+    /// Larger than [`max_ledger_bytes`] allows this run. Never read;
+    /// removed.
+    TooLarge { len: u64, max: u64 },
+    /// It could not be read: an I/O error, or a symlink at any component.
+    Unreadable(String),
+    /// It was read but could not be removed, so it cannot be consumed
+    /// once.
+    Unremovable(String),
+    /// Not exactly one intact record: truncated, corrupt, or malformed.
+    Corrupt(String),
+    /// A record of another layout.
+    FormatVersion { found: u32 },
+    /// It describes another VPP process than the one adopted.
+    Process(String),
+    /// The state file's ledger token is missing or another stop's.
+    Token(String),
+    /// It was installed against other interfaces than the state file
+    /// records.
+    Interfaces(String),
+}
+
+impl Refusal {
+    /// The check that refused it — the `stage` field of the
+    /// `preserved_ledger_rejected` event, beside the later stages'
+    /// `fingerprint`, `seed`, `fingerprint-moved` and `verify`.
+    /// Append-only: operators filter on these.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Refusal::Untrusted(_) => "untrusted",
+            Refusal::TooLarge { .. } => "too-large",
+            Refusal::Unreadable(_) => "unreadable",
+            Refusal::Unremovable(_) => "unremovable",
+            Refusal::Corrupt(_) => "corrupt",
+            Refusal::FormatVersion { .. } => "format-version",
+            Refusal::Process(_) => "process",
+            Refusal::Token(_) => "token",
+            Refusal::Interfaces(_) => "interfaces",
+        }
+    }
+
+    /// The reason, without the "not used" preamble the journal line
+    /// carries ([`std::fmt::Display`]).
+    pub fn detail(&self) -> String {
+        match self {
+            Refusal::Untrusted(why) => format!(
+                "untrusted ownership/permissions: {why}. A ledger is read only when this \
+                 daemon's own uid wrote it, into a state-dir no other account can write, under \
+                 ancestors no other account can rename; removed unread"
+            ),
+            Refusal::TooLarge { len, max } => format!(
+                "it is too large: {len} bytes, past the {max} bytes the widest ledger this \
+                 run's route capacity could encode to; removed unread"
+            ),
+            Refusal::Unreadable(e) => e.clone(),
+            Refusal::Unremovable(e) => format!(
+                "it could not be removed after reading ({e}), so it cannot be consumed once — \
+                 remove {LEDGER_FILE_NAME} from state-dir by hand"
+            ),
+            Refusal::Corrupt(why) => why.clone(),
+            Refusal::FormatVersion { found } => format!(
+                "it is format version {found} and this binary reads {LEDGER_FORMAT_VERSION}"
+            ),
+            Refusal::Process(why) | Refusal::Token(why) | Refusal::Interfaces(why) => why.clone(),
+        }
+    }
+
+    /// The event this refusal records.
+    pub fn event(&self) -> event_log::Event {
+        rejected_event(self.code(), &self.detail())
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "preserved route ledger not used: {}", self.detail())
+    }
+}
+
+fn corrupt(why: impl Into<String>) -> Refusal {
+    Refusal::Corrupt(why.into())
+}
+
+/// `preserved_ledger_rejected`: the preserved ledger was not used, or was
+/// disproved; `stage` names the check that refused it, here at bring-up
+/// ([`Refusal::code`]) or later in the adoption (`runtime`). The dump
+/// path follows. The one place the event is built, so the two halves
+/// cannot drift apart.
+pub(crate) fn rejected_event(stage: &'static str, reason: &str) -> event_log::Event {
+    event_log::Event::warn(crate::MODULE_NAME, event_kind::PRESERVED_LEDGER_REJECTED)
+        .field("stage", stage)
+        .field("reason", reason)
+        .detail("the preserved route ledger was not used; this adoption reads VPP's FIB instead")
 }
 
 impl LedgerRecord {
@@ -189,9 +376,9 @@ impl LedgerRecord {
         boot_id: &str,
         token: Option<u64>,
         recorded_interfaces: &[(String, u32)],
-    ) -> Result<(), String> {
+    ) -> Result<(), Refusal> {
         if (self.pid, self.start_ticks, self.boot_id.as_str()) != (pid, start_ticks, boot_id) {
-            return Err(refuse(format!(
+            return Err(Refusal::Process(format!(
                 "it describes VPP pid {} (start {}, boot {}) but the adopted process is pid \
                  {pid} (start {start_ticks}, boot {boot_id})",
                 self.pid, self.start_ticks, self.boot_id
@@ -200,15 +387,17 @@ impl LedgerRecord {
         match token {
             Some(t) if t == self.token => {}
             Some(_) => {
-                return Err(refuse(
+                return Err(Refusal::Token(
                     "the state file's ledger token is a different stop's, so another daemon \
-                     wrote this VPP's record after this ledger was preserved",
+                     wrote this VPP's record after this ledger was preserved"
+                        .into(),
                 ))
             }
             None => {
-                return Err(refuse(
+                return Err(Refusal::Token(
                     "the state file carries no ledger token — rewritten since the stop that \
-                     preserved this ledger (another adopter, or a build that predates it)",
+                     preserved this ledger (another adopter, or a build that predates it)"
+                        .into(),
                 ))
             }
         }
@@ -217,7 +406,7 @@ impl LedgerRecord {
         mine.sort();
         theirs.sort();
         if mine != theirs {
-            return Err(refuse(format!(
+            return Err(Refusal::Interfaces(format!(
                 "it was installed against interfaces {mine:?} but the state file records \
                  {theirs:?}"
             )));
@@ -289,14 +478,14 @@ impl LedgerRecord {
 
     /// Parse a record, refusing anything that is not exactly one intact
     /// record of this version.
-    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, Refusal> {
         if bytes.len() < MAGIC.len() + 4 + 8 {
-            return Err(refuse("the file is too short to be a record"));
+            return Err(corrupt("the file is too short to be a record"));
         }
         let (body, sum) = bytes.split_at(bytes.len() - 8);
         let sum = u64::from_le_bytes(sum.try_into().expect("8 bytes"));
         if &body[..MAGIC.len()] != MAGIC {
-            return Err(refuse("the file is not a preserved route ledger"));
+            return Err(corrupt("the file is not a preserved route ledger"));
         }
         let mut r = Reader {
             buf: body,
@@ -304,15 +493,12 @@ impl LedgerRecord {
         };
         let version = r.u32()?;
         if version != LEDGER_FORMAT_VERSION {
-            return Err(refuse(format!(
-                "it is format version {version} and this binary reads \
-                 {LEDGER_FORMAT_VERSION}"
-            )));
+            return Err(Refusal::FormatVersion { found: version });
         }
         // Checked after the version, so a future layout is named as such
         // rather than as corruption.
         if fnv1a(body) != sum {
-            return Err(refuse(
+            return Err(corrupt(
                 "its checksum does not match — truncated or corrupted since it was written",
             ));
         }
@@ -382,7 +568,7 @@ impl LedgerRecord {
                     prefix_len,
                 },
                 _ => {
-                    return Err(refuse(format!(
+                    return Err(corrupt(format!(
                         "entry with family {fam} and length {prefix_len} is not a prefix"
                     )))
                 }
@@ -393,7 +579,7 @@ impl LedgerRecord {
             } else if (set as usize) < path_sets.len() {
                 Some(set)
             } else {
-                return Err(refuse(format!(
+                return Err(corrupt(format!(
                     "an entry names path set {set} of {}",
                     path_sets.len()
                 )));
@@ -401,7 +587,7 @@ impl LedgerRecord {
             entries.push((prefix, set));
         }
         if r.remaining() != 0 {
-            return Err(refuse("trailing bytes after the last entry"));
+            return Err(corrupt("trailing bytes after the last entry"));
         }
         Ok(Self {
             pid,
@@ -431,11 +617,13 @@ impl LedgerRecord {
     /// Consumption is unconditional because the record's whole claim is
     /// "VPP has not changed since" — and from the moment an adoption
     /// starts, it will. `Ok(None)` = no record. `Err` = there was
-    /// something there and it is not a usable record (unreadable,
-    /// planted symlink, corrupt, another version); it is removed too.
-    pub fn take(state_dir: &Path) -> Result<Option<Self>, String> {
+    /// something there and it is not a usable record (another account's,
+    /// past `max_len`, unreadable, planted symlink, corrupt, another
+    /// version); it is removed too — the first two without a byte of them
+    /// read.
+    pub fn take(state_dir: &Path, max_len: u64) -> Result<Option<Self>, Refusal> {
         let path = Self::path_in(state_dir);
-        let read = read_record(&path);
+        let read = read_record(&path, max_len);
         if matches!(read, Ok(None)) {
             return Ok(None);
         }
@@ -444,15 +632,15 @@ impl LedgerRecord {
         let parsed = match read {
             Ok(Some(bytes)) => Self::decode(&bytes).map(Some),
             Ok(None) => unreachable!("returned above"),
-            Err(e) => Err(refuse(format!("{}: {e}", path.display()))),
+            Err(ReadFailure::Untrusted(why)) => Err(Refusal::Untrusted(why)),
+            Err(ReadFailure::TooLarge { len, max }) => Err(Refusal::TooLarge { len, max }),
+            Err(ReadFailure::Io(e)) => Err(Refusal::Unreadable(format!("{}: {e}", path.display()))),
         };
         match removed {
             // A record that cannot be removed can be read again by the
             // next start, after this one has changed VPP — refusing it
             // here is what keeps "used once" true.
-            Err(e) => Err(refuse(format!(
-                "it could not be removed after reading ({e}), so it cannot be consumed once"
-            ))),
+            Err(e) => Err(Refusal::Unremovable(e)),
             Ok(()) => parsed,
         }
     }
@@ -486,18 +674,65 @@ fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-#[cfg(target_os = "linux")]
-fn read_record(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    packetframe_common::statefile::read_no_follow(path)
+/// Why the record could not be read, before any check of its contents.
+#[derive(Debug)]
+enum ReadFailure {
+    Io(String),
+    // Only the Linux reader judges provenance; see the stub below.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Untrusted(String),
+    TooLarge {
+        len: u64,
+        max: u64,
+    },
 }
 
+/// Read the record only if this daemon's own uid could have put it
+/// there, and only up to `max_len` bytes. Its contents are a FIB this
+/// root daemon adopts as VPP's without reading VPP, so a record anyone
+/// else could have written is a fabricated FIB; see
+/// [`packetframe_common::statefile::read_owned_no_follow`] for exactly
+/// what is checked (on the open descriptors, not by path). Ownership
+/// rather than a keyed MAC for fast-path's reason (`route_ledger`'s
+/// `read_record`): the key would have to live somewhere other accounts
+/// cannot write, which is the property checked here directly.
+#[cfg(target_os = "linux")]
+fn read_record(path: &Path, max_len: u64) -> Result<Option<Vec<u8>>, ReadFailure> {
+    use packetframe_common::statefile::{read_owned_no_follow, OwnedReadError};
+    read_owned_no_follow(path, max_len).map_err(|e| match e {
+        OwnedReadError::Untrusted(why) => ReadFailure::Untrusted(why),
+        OwnedReadError::TooLarge { len, max } => ReadFailure::TooLarge { len, max },
+        OwnedReadError::Io(e) => ReadFailure::Io(e.to_string()),
+    })
+}
+
+/// The dev-laptop stub keeps the size bound (it is what keeps a huge
+/// file from being read whole) and leaves provenance to the Linux build:
+/// nothing privileged runs here.
 #[cfg(not(target_os = "linux"))]
-fn read_record(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    match std::fs::read(path) {
-        Ok(r) => Ok(Some(r)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+fn read_record(path: &Path, max_len: u64) -> Result<Option<Vec<u8>>, ReadFailure> {
+    use std::io::Read as _;
+    let io = |e: std::io::Error| ReadFailure::Io(e.to_string());
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io(e)),
+    };
+    let len = f.metadata().map_err(io)?.len();
+    if len > max_len {
+        return Err(ReadFailure::TooLarge { len, max: max_len });
     }
+    let mut buf = Vec::with_capacity(len as usize);
+    f.take(max_len.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(io)?;
+    if buf.len() as u64 > max_len {
+        return Err(ReadFailure::TooLarge {
+            len: buf.len() as u64,
+            max: max_len,
+        });
+    }
+    Ok(Some(buf))
 }
 
 #[cfg(target_os = "linux")]
@@ -518,51 +753,91 @@ pub struct Adoptee<'a> {
     pub boot_id: &'a str,
 }
 
+/// What bring-up did with whatever record `state_dir` held.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Consumed {
+    /// No record.
+    Missing,
+    /// A record, consumed unjudged: nothing is being adopted, so the VPP
+    /// it describes is not the one this daemon will run.
+    NotAdopted,
+    /// Not used, and why.
+    Refused(Refusal),
+    /// Checked; seed the adoption from it.
+    Usable(LedgerRecord),
+}
+
+/// Consume whatever record `state_dir` holds and judge it against
+/// `adoptee` (`None` when nothing is being adopted), the state file's
+/// `token` and its `recorded` interfaces, reading no more than `max_len`
+/// bytes ([`max_ledger_bytes`]). A pure judgement apart from the read and
+/// the removal; [`consume_for_adoption`] reports it.
+pub fn judge_for_adoption(
+    state_dir: &Path,
+    max_len: u64,
+    adoptee: Option<Adoptee<'_>>,
+    token: Option<u64>,
+    recorded: &[(String, u32)],
+) -> Consumed {
+    match (LedgerRecord::take(state_dir, max_len), adoptee) {
+        (Ok(None), _) => Consumed::Missing,
+        // Refused whether or not anything is adopted: a record another
+        // account could have written, or one past any size this run
+        // writes, is worth naming even when it would have been moot.
+        (Err(r), _) => Consumed::Refused(r),
+        (Ok(Some(_)), None) => Consumed::NotAdopted,
+        (Ok(Some(rec)), Some(a)) => {
+            match rec.check_adoptee(a.pid, a.start_ticks, a.boot_id, token, recorded) {
+                Ok(()) => Consumed::Usable(rec),
+                Err(r) => Consumed::Refused(r),
+            }
+        }
+    }
+}
+
 /// The adoption's half, whole: consume whatever record `state_dir` holds
 /// and return it only if it describes `adoptee` under the state file's
 /// `token` and `recorded` interfaces. `adoptee` is `None` when nothing is
 /// being adopted — a record is then consumed and discarded, because the
 /// VPP it describes is not the one this daemon will run.
 ///
-/// Never an error: every refusal is logged with its reason and answers
-/// `None`, which is the dump path every adoption took before the record
-/// existed. That is the whole upgrade story too — a state file an older
-/// build wrote has no token and no record beside it.
+/// Never an error: every refusal is logged with its reason, recorded as
+/// `preserved_ledger_rejected` with the check that refused it as its
+/// `stage` ([`Refusal::code`]), and answers `None` — the dump path every
+/// adoption took before the record existed. That is the whole upgrade
+/// story too — a state file an older build wrote has no token and no
+/// record beside it.
 pub fn consume_for_adoption(
     state_dir: &Path,
+    max_len: u64,
     adoptee: Option<Adoptee<'_>>,
     token: Option<u64>,
     recorded: &[(String, u32)],
 ) -> Option<LedgerRecord> {
-    match (LedgerRecord::take(state_dir), adoptee) {
-        (Ok(None), None) => None,
-        (Ok(None), Some(_)) => {
-            tracing::info!(
-                "no preserved route ledger (the previous stop was not a clean preserving \
-                 exit, or was an older build); this adoption reads VPP's FIB — on a steered \
-                 VPP that means unsteering while it does"
-            );
+    let adopting = adoptee.is_some();
+    match judge_for_adoption(state_dir, max_len, adoptee, token, recorded) {
+        Consumed::Missing => {
+            if adopting {
+                tracing::info!(
+                    "no preserved route ledger (the previous stop was not a clean preserving \
+                     exit, or was an older build); this adoption reads VPP's FIB — on a steered \
+                     VPP that means unsteering while it does"
+                );
+            }
             None
         }
-        (Err(why), _) => {
-            tracing::warn!(reason = %why, "this adoption reads VPP's FIB instead");
-            None
-        }
-        (Ok(Some(_)), None) => {
+        Consumed::NotAdopted => {
             tracing::info!(
                 "preserved route ledger discarded: the VPP it describes is not being adopted"
             );
             None
         }
-        (Ok(Some(rec)), Some(a)) => {
-            match rec.check_adoptee(a.pid, a.start_ticks, a.boot_id, token, recorded) {
-                Ok(()) => Some(rec),
-                Err(why) => {
-                    tracing::warn!(reason = %why, "this adoption reads VPP's FIB instead");
-                    None
-                }
-            }
+        Consumed::Refused(r) => {
+            tracing::warn!(stage = r.code(), reason = %r, "this adoption reads VPP's FIB instead");
+            r.event().emit();
+            None
         }
+        Consumed::Usable(rec) => Some(rec),
     }
 }
 
@@ -623,46 +898,46 @@ impl Reader<'_> {
         self.buf.len() - self.at
     }
 
-    fn take(&mut self, n: usize) -> Result<&[u8], String> {
+    fn take(&mut self, n: usize) -> Result<&[u8], Refusal> {
         if self.remaining() < n {
-            return Err(refuse("the record ends mid-field"));
+            return Err(corrupt("the record ends mid-field"));
         }
         let s = &self.buf[self.at..self.at + n];
         self.at += n;
         Ok(s)
     }
 
-    fn bytes<const N: usize>(&mut self) -> Result<[u8; N], String> {
+    fn bytes<const N: usize>(&mut self) -> Result<[u8; N], Refusal> {
         Ok(self.take(N)?.try_into().expect("N bytes"))
     }
 
-    fn u8(&mut self) -> Result<u8, String> {
+    fn u8(&mut self) -> Result<u8, Refusal> {
         Ok(self.bytes::<1>()?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, String> {
+    fn u16(&mut self) -> Result<u16, Refusal> {
         Ok(u16::from_le_bytes(self.bytes()?))
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    fn u32(&mut self) -> Result<u32, Refusal> {
         Ok(u32::from_le_bytes(self.bytes()?))
     }
 
-    fn i32(&mut self) -> Result<i32, String> {
+    fn i32(&mut self) -> Result<i32, Refusal> {
         Ok(i32::from_le_bytes(self.bytes()?))
     }
 
-    fn u64(&mut self) -> Result<u64, String> {
+    fn u64(&mut self) -> Result<u64, Refusal> {
         Ok(u64::from_le_bytes(self.bytes()?))
     }
 
     /// A count of items at least `min_item` bytes each, refused when the
     /// rest of the record could not possibly hold that many — so a
     /// corrupt count cannot ask for a multi-gigabyte allocation.
-    fn count(&mut self, min_item: usize) -> Result<usize, String> {
+    fn count(&mut self, min_item: usize) -> Result<usize, Refusal> {
         let n = self.u32()? as usize;
         if n.saturating_mul(min_item) > self.remaining() {
-            return Err(refuse(format!(
+            return Err(corrupt(format!(
                 "it claims {n} items where {} bytes remain",
                 self.remaining()
             )));
@@ -670,16 +945,16 @@ impl Reader<'_> {
         Ok(n)
     }
 
-    fn string(&mut self) -> Result<String, String> {
+    fn string(&mut self) -> Result<String, Refusal> {
         let n = self.u16()? as usize;
-        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| refuse("a name is not UTF-8"))
+        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| corrupt("a name is not UTF-8"))
     }
 
-    fn addr(&mut self) -> Result<IpAddr, String> {
+    fn addr(&mut self) -> Result<IpAddr, Refusal> {
         match self.u8()? {
             4 => Ok(IpAddr::V4(self.bytes::<4>()?.into())),
             6 => Ok(IpAddr::V6(self.bytes::<16>()?.into())),
-            f => Err(refuse(format!("a path names address family {f}"))),
+            f => Err(corrupt(format!("a path names address family {f}"))),
         }
     }
 }
@@ -690,10 +965,37 @@ mod tests {
     use std::net::Ipv4Addr;
 
     fn tmpdir(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
         let d = std::env::temp_dir().join(format!("pf-ledger-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        // Pinned, not left to the umask: the reader refuses a state-dir
+        // group or others can write.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
         d
+    }
+
+    /// A bound well past the test record, so only the tests about the
+    /// bound meet it.
+    fn bound() -> u64 {
+        max_ledger_bytes(1_000, 1)
+    }
+
+    fn ifs() -> Vec<(String, u32)> {
+        vec![("eth4".to_string(), 3)]
+    }
+
+    fn me() -> Adoptee<'static> {
+        Adoptee {
+            pid: 4242,
+            start_ticks: 99,
+            boot_id: "boot-a",
+        }
+    }
+
+    /// What bring-up makes of `dir` for the adoptee `record()` names.
+    fn judge(dir: &Path, max_len: u64) -> Consumed {
+        judge_for_adoption(dir, max_len, Some(me()), Some(7), &ifs())
     }
 
     fn nh(d: u8) -> IpAddr {
@@ -761,12 +1063,16 @@ mod tests {
         let dir = tmpdir("round");
         let r = record();
         r.write(&dir).unwrap();
-        assert_eq!(LedgerRecord::take(&dir).unwrap(), Some(r));
+        assert_eq!(LedgerRecord::take(&dir, bound()).unwrap(), Some(r));
         assert!(
             !LedgerRecord::path_in(&dir).exists(),
             "taking a record consumes it"
         );
-        assert_eq!(LedgerRecord::take(&dir).unwrap(), None, "used once");
+        assert_eq!(
+            LedgerRecord::take(&dir, bound()).unwrap(),
+            None,
+            "used once"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -791,7 +1097,14 @@ mod tests {
         let mut bytes = record().encode();
         bytes[8..12].copy_from_slice(&(LEDGER_FORMAT_VERSION + 1).to_le_bytes());
         let e = LedgerRecord::decode(&bytes).unwrap_err();
-        assert!(e.contains("format version"), "{e}");
+        assert_eq!(
+            e,
+            Refusal::FormatVersion {
+                found: LEDGER_FORMAT_VERSION + 1
+            }
+        );
+        assert_eq!(e.code(), "format-version");
+        assert!(e.to_string().contains("format version"), "{e}");
     }
 
     /// A corrupt record is refused AND removed: the next start must not
@@ -799,12 +1112,15 @@ mod tests {
     #[test]
     fn a_corrupt_record_is_refused_and_consumed() {
         let dir = tmpdir("corrupt");
-        std::fs::write(
-            LedgerRecord::path_in(&dir),
-            b"PFVPPLGR\x01\0\0\0 not a record",
-        )
-        .unwrap();
-        assert!(LedgerRecord::take(&dir).is_err());
+        // This version's magic and header, then junk: the checksum fails.
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&LEDGER_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(b" not a record");
+        std::fs::write(LedgerRecord::path_in(&dir), bytes).unwrap();
+        assert!(matches!(
+            LedgerRecord::take(&dir, bound()),
+            Err(Refusal::Corrupt(_))
+        ));
         assert!(!LedgerRecord::path_in(&dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -823,7 +1139,10 @@ mod tests {
         let rec = LedgerRecord::path_in(&dir);
         std::os::unix::fs::symlink(&victim, &rec).unwrap();
         assert!(
-            LedgerRecord::take(&dir).is_err(),
+            matches!(
+                LedgerRecord::take(&dir, bound()),
+                Err(Refusal::Unreadable(_))
+            ),
             "a symlinked record is refused, not followed — even to a valid record"
         );
         assert!(
@@ -846,12 +1165,12 @@ mod tests {
         let ifs = vec![("eth4".to_string(), 3)];
         r.check_adoptee(4242, 99, "boot-a", Some(7), &ifs)
             .expect("the matching adoptee");
-        for (pid, ticks, boot, token, ifs, leg) in [
-            (4243, 99, "boot-a", Some(7), ifs.clone(), "pid"),
-            (4242, 98, "boot-a", Some(7), ifs.clone(), "start"),
-            (4242, 99, "boot-b", Some(7), ifs.clone(), "boot"),
-            (4242, 99, "boot-a", Some(8), ifs.clone(), "token"),
-            (4242, 99, "boot-a", None, ifs.clone(), "no token"),
+        for (pid, ticks, boot, token, ifs, leg, code) in [
+            (4243, 99, "boot-a", Some(7), ifs.clone(), "pid", "process"),
+            (4242, 98, "boot-a", Some(7), ifs.clone(), "start", "process"),
+            (4242, 99, "boot-b", Some(7), ifs.clone(), "boot", "process"),
+            (4242, 99, "boot-a", Some(8), ifs.clone(), "token", "token"),
+            (4242, 99, "boot-a", None, ifs.clone(), "no token", "token"),
             (
                 4242,
                 99,
@@ -859,40 +1178,44 @@ mod tests {
                 Some(7),
                 vec![("eth4".to_string(), 4)],
                 "interfaces",
+                "interfaces",
             ),
         ] {
-            assert!(
-                r.check_adoptee(pid, ticks, boot, token, &ifs).is_err(),
-                "{leg} mismatch must refuse"
-            );
+            let r = r
+                .check_adoptee(pid, ticks, boot, token, &ifs)
+                .expect_err(leg);
+            assert_eq!(r.code(), code, "{leg} mismatch must refuse by name");
         }
     }
 
-    /// Every fallback the adoption can take on the record itself — and
-    /// in every one the file is consumed, so a second start cannot find
-    /// it after this one has changed VPP.
+    /// Every fallback the adoption can take on the record itself, by name
+    /// — and in every one the file is consumed, so a second start cannot
+    /// find it after this one has changed VPP.
     #[test]
     fn every_record_fallback_answers_none_and_consumes_the_file() {
-        let ifs = vec![("eth4".to_string(), 3)];
-        let me = Adoptee {
-            pid: 4242,
-            start_ticks: 99,
-            boot_id: "boot-a",
-        };
+        let me = me();
         let mut bumped = record().encode();
         bumped[8..12].copy_from_slice(&(LEDGER_FORMAT_VERSION + 1).to_le_bytes());
         let mut corrupt = record().encode();
         let mid = corrupt.len() / 2;
         corrupt[mid] ^= 0xff;
-        // (name, file contents, adoptee, the state file's token)
-        type Case<'a> = (&'a str, Option<Vec<u8>>, Option<Adoptee<'a>>, Option<u64>);
+        // (name, file contents, adoptee, the state file's token, the
+        // refusal's code — `None` where nothing is refused)
+        type Case<'a> = (
+            &'a str,
+            Option<Vec<u8>>,
+            Option<Adoptee<'a>>,
+            Option<u64>,
+            Option<&'a str>,
+        );
         let cases: Vec<Case> = vec![
-            ("missing", None, Some(me), Some(7)),
+            ("missing", None, Some(me), Some(7), None),
             (
                 "stale pid",
                 Some(record().encode()),
                 Some(Adoptee { pid: 4243, ..me }),
                 Some(7),
+                Some("process"),
             ),
             (
                 "stale start time",
@@ -902,48 +1225,327 @@ mod tests {
                     ..me
                 }),
                 Some(7),
+                Some("process"),
             ),
-            ("corrupt", Some(corrupt), Some(me), Some(7)),
-            ("version mismatch", Some(bumped), Some(me), Some(7)),
+            ("corrupt", Some(corrupt), Some(me), Some(7), Some("corrupt")),
+            (
+                "version mismatch",
+                Some(bumped),
+                Some(me),
+                Some(7),
+                Some("format-version"),
+            ),
             (
                 "another stop's token",
                 Some(record().encode()),
                 Some(me),
                 Some(8),
+                Some("token"),
             ),
             (
                 "state rewritten by an older build",
                 Some(record().encode()),
                 Some(me),
                 None,
+                Some("token"),
             ),
-            ("nothing adopted", Some(record().encode()), None, Some(7)),
-        ];
-        for (name, bytes, adoptee, token) in cases {
-            let dir = tmpdir(&name.replace(' ', "-"));
-            if let Some(b) = &bytes {
-                std::fs::write(LedgerRecord::path_in(&dir), b).unwrap();
-            }
-            assert_eq!(
-                consume_for_adoption(&dir, adoptee, token, &ifs),
+            (
+                "nothing adopted",
+                Some(record().encode()),
                 None,
-                "{name}: must fall back to the dump path"
-            );
+                Some(7),
+                None,
+            ),
+        ];
+        for (name, bytes, adoptee, token, code) in cases {
+            let dir = tmpdir(&name.replace(' ', "-"));
+            let plant = || {
+                if let Some(b) = &bytes {
+                    std::fs::write(LedgerRecord::path_in(&dir), b).unwrap();
+                }
+            };
+            plant();
+            let got = judge_for_adoption(&dir, bound(), adoptee, token, &ifs());
+            match (&got, code) {
+                (Consumed::Refused(r), Some(code)) => assert_eq!(r.code(), code, "{name}"),
+                (Consumed::Missing | Consumed::NotAdopted, None) => {}
+                (other, _) => panic!("{name}: {other:?}"),
+            }
             assert!(
                 !LedgerRecord::path_in(&dir).exists(),
                 "{name}: the record must be consumed either way"
             );
+            plant();
+            assert_eq!(
+                consume_for_adoption(&dir, bound(), adoptee, token, &ifs()),
+                None,
+                "{name}: must fall back to the dump path"
+            );
+            assert!(!LedgerRecord::path_in(&dir).exists(), "{name}");
             let _ = std::fs::remove_dir_all(&dir);
         }
         // And the one that checks out.
         let dir = tmpdir("usable");
         record().write(&dir).unwrap();
         assert_eq!(
-            consume_for_adoption(&dir, Some(me), Some(7), &ifs),
+            consume_for_adoption(&dir, bound(), Some(me), Some(7), &ifs()),
             Some(record())
         );
         assert!(!LedgerRecord::path_in(&dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Larger than the bound: refused by name from the file's size,
+    /// never read — the second file is sparse, and reading it whole
+    /// would allocate 64 GiB — and consumed like any refusal. A record
+    /// within the bound is still adopted.
+    #[test]
+    fn a_record_past_the_size_bound_is_refused_unread() {
+        let dir = tmpdir("too-large");
+        let max = record().encode().len() as u64;
+        for len in [max + 1, 1 << 36] {
+            record().write(&dir).unwrap();
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(LedgerRecord::path_in(&dir))
+                .unwrap();
+            f.set_len(len).unwrap();
+            drop(f);
+            match judge(&dir, max) {
+                Consumed::Refused(r @ Refusal::TooLarge { .. }) => {
+                    assert_eq!(r, Refusal::TooLarge { len, max });
+                    assert_eq!(r.code(), "too-large");
+                    assert!(r.detail().contains("too large"), "{}", r.detail());
+                }
+                other => panic!("{len}: {other:?}"),
+            }
+            assert!(!LedgerRecord::path_in(&dir).exists(), "{len}: consumed");
+        }
+        // Exactly at the bound is a record like any other.
+        record().write(&dir).unwrap();
+        assert_eq!(judge(&dir, max), Consumed::Usable(record()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record anyone but this daemon's uid could have written is
+    /// refused by name and never read, whatever its contents: here a
+    /// perfectly good record, made group- or world-writable, or sitting
+    /// in a directory others can write. Any uid can run this (it only
+    /// chmods its own files).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_record_others_could_have_written_is_refused_unread() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tmpdir("untrusted");
+        let path = LedgerRecord::path_in(&dir);
+        let untrusted = |dir: &Path| match judge(dir, bound()) {
+            Consumed::Refused(r @ Refusal::Untrusted(_)) => {
+                assert_eq!(r.code(), "untrusted");
+                r.detail()
+            }
+            other => panic!("{other:?}"),
+        };
+        for mode in [0o620, 0o602, 0o666] {
+            record().write(&dir).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let why = untrusted(&dir);
+            assert!(
+                why.contains("untrusted ownership/permissions")
+                    && why.contains("writable by group or others"),
+                "{mode:o}: {why}"
+            );
+            assert!(!path.exists(), "{mode:o}: consumed");
+        }
+        for mode in [0o775, 0o757] {
+            record().write(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let why = untrusted(&dir);
+            assert!(why.contains("the directory"), "{mode:o}: {why}");
+            assert!(!path.exists(), "{mode:o}: consumed");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The same record, from a trusted place, is adopted.
+        record().write(&dir).unwrap();
+        assert_eq!(judge(&dir, bound()), Consumed::Usable(record()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Owned by another uid: the record, or the directory holding it.
+    /// Needs root to chown; skipped for other users (CI's qemu job and
+    /// the Docker harness run it as root).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_record_owned_by_another_uid_is_refused_when_running_as_root() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to chown");
+            return;
+        }
+        const NOBODY: u32 = 65534;
+        let dir = tmpdir("foreign");
+        let path = LedgerRecord::path_in(&dir);
+        record().write(&dir).unwrap();
+        std::os::unix::fs::chown(&path, Some(NOBODY), None).unwrap();
+        match judge(&dir, bound()) {
+            Consumed::Refused(Refusal::Untrusted(why)) => {
+                assert!(why.contains("owned by uid 65534"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!path.exists(), "consumed");
+
+        record().write(&dir).unwrap();
+        std::os::unix::fs::chown(&dir, Some(NOBODY), None).unwrap();
+        match judge(&dir, bound()) {
+            Consumed::Refused(Refusal::Untrusted(why)) => {
+                assert!(
+                    why.contains("the directory") && why.contains("owned by uid 65534"),
+                    "{why}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!path.exists(), "consumed");
+        std::os::unix::fs::chown(&dir, Some(0), None).unwrap();
+
+        record().write(&dir).unwrap();
+        assert_eq!(judge(&dir, bound()), Consumed::Usable(record()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bound is the widest record the format holds for a given
+    /// capacity, measured against `encode` itself rather than restated:
+    /// the header with every name at the format's limit and a row for
+    /// every prefix length, and each route with a path set of its own
+    /// holding a path at its widest. Equal, not just within — a field
+    /// added to the format without its bound fails here.
+    #[test]
+    fn the_size_bound_is_the_widest_record_the_format_holds() {
+        let long = |c: char| c.to_string().repeat(u16::MAX as usize);
+        let interfaces: Vec<(String, u32)> = ['a', 'b', 'c', 'd']
+            .into_iter()
+            .map(|c| (long(c), u32::MAX))
+            .collect();
+        let counts = (0..=32u8)
+            .chain(0..=128u8)
+            .map(|len| (long('t'), len, u64::MAX))
+            .collect();
+        let header = LedgerRecord {
+            pid: i32::MAX,
+            start_ticks: u64::MAX,
+            boot_id: long('b'),
+            token: u64::MAX,
+            body: LedgerBody {
+                fingerprint: FibFingerprint { counts },
+                interfaces,
+                path_sets: vec![],
+                entries: vec![],
+            },
+        };
+        let n_ifs = header.body.interfaces.len();
+        assert_eq!(
+            header.encode().len() as u64,
+            max_ledger_bytes(0, n_ifs),
+            "the header at its widest"
+        );
+
+        // A path at its widest: a v6 nexthop and the wire's whole label
+        // stack, which is where `WIRE_LABELS_MAX` comes from.
+        let wire_labels = crate::vpp_api::generated::FibPath::default()
+            .label_stack
+            .len();
+        assert_eq!(wire_labels as u64, WIRE_LABELS_MAX);
+        let v6 = |i: u16| std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i);
+        let widest = |i: u16| PathKey {
+            nexthop: IpAddr::V6(v6(i)),
+            sw_if_index: u32::MAX,
+            weight: u8::MAX,
+            preference: u8::MAX,
+            kind: u32::MAX,
+            flags: u32::MAX,
+            proto: u32::MAX,
+            labels: vec![(u32::MAX, u8::MAX, u8::MAX, u8::MAX); wire_labels],
+        };
+        let mut full = header.clone();
+        for i in 0..3u16 {
+            full.body.path_sets.push(vec![widest(i)]);
+            full.body.entries.push((
+                IpPrefix::V6 {
+                    addr: v6(i).octets(),
+                    prefix_len: 128,
+                },
+                Some(u32::from(i)),
+            ));
+        }
+        assert_eq!(
+            full.encode().len() as u64,
+            max_ledger_bytes(3, n_ifs),
+            "three routes, each through a set of its own at its widest"
+        );
+
+        // What this module installs is narrower than the charge: an
+        // unlabelled path (`fib_sync::wire_path`), so four of them in a
+        // set of the route's own still fit it.
+        let mut ecmp = header.clone();
+        ecmp.body.path_sets.push(
+            (1..=4u16)
+                .map(|i| crate::fib_sync::installed_path_key(IpAddr::V6(v6(i)), u32::MAX))
+                .collect(),
+        );
+        ecmp.body.entries.push((
+            IpPrefix::V6 {
+                addr: v6(0).octets(),
+                prefix_len: 128,
+            },
+            Some(0),
+        ));
+        assert!(ecmp.encode().len() as u64 <= max_ledger_bytes(1, n_ifs));
+    }
+
+    /// At the default sizing with `v6 on`, the bound is far past any
+    /// table this engine admits in practice (the reference router's
+    /// 1.09M-route table preserves to ~11 MB) and still a bound.
+    #[test]
+    fn the_default_sizing_bounds_the_ledger_far_past_a_full_table() {
+        let sizing =
+            crate::startup_conf::derive_sizing(crate::DEFAULT_EXPECTED_ROUTES, 4, true).unwrap();
+        let routes = crate::startup_conf::route_capacity(&sizing)
+            + crate::startup_conf::route_capacity_v6(&sizing);
+        let max = max_ledger_bytes(routes, 4);
+        assert!(max > 20 * 11_000_000, "{max}");
+        assert!(max < 1 << 30, "{max}");
+    }
+
+    /// Bring-up's refusals reach the event log as the same event the
+    /// later stages record, with the check that refused as its `stage`;
+    /// the codes are distinct, and none collides with a later stage's.
+    #[test]
+    fn a_bring_up_refusal_records_the_check_that_refused_it() {
+        let all = [
+            Refusal::Untrusted("x".into()),
+            Refusal::TooLarge { len: 2, max: 1 },
+            Refusal::Unreadable("x".into()),
+            Refusal::Unremovable("x".into()),
+            Refusal::Corrupt("x".into()),
+            Refusal::FormatVersion { found: 0 },
+            Refusal::Process("x".into()),
+            Refusal::Token("x".into()),
+            Refusal::Interfaces("x".into()),
+        ];
+        let codes: std::collections::BTreeSet<&str> = all.iter().map(Refusal::code).collect();
+        assert_eq!(codes.len(), all.len(), "distinct codes");
+        for later in ["fingerprint", "seed", "fingerprint-moved", "verify"] {
+            assert!(!codes.contains(later), "{later}");
+        }
+        let r = Refusal::TooLarge { len: 2, max: 1 };
+        let ev = r.event();
+        assert_eq!(ev.kind(), event_kind::PRESERVED_LEDGER_REJECTED);
+        let rec = ev.into_record();
+        assert_eq!(rec.level, event_log::Level::Warn);
+        assert_eq!(rec.fields["stage"], "too-large");
+        assert_eq!(rec.fields["reason"], r.detail().as_str());
+        assert!(r
+            .to_string()
+            .starts_with("preserved route ledger not used: "));
     }
 
     /// A record of a dual-stack ledger — v6 prefixes through v6 next
@@ -975,7 +1577,9 @@ mod tests {
             Some(v6_set),
         ));
         r.write(&dir).unwrap();
-        let back = LedgerRecord::take(&dir).unwrap().expect("the record");
+        let back = LedgerRecord::take(&dir, bound())
+            .unwrap()
+            .expect("the record");
         assert_eq!(back, r);
         let p = &back.body.path_sets[v6_set as usize][0];
         assert_eq!(p.nexthop, v6nh);
