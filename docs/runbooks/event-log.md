@@ -114,6 +114,7 @@ Kinds are stable: scripts and alerts may key on them.
 | `route_ledger_seeded` | A start seeded the route mirror from the ledger | `routes_v4`, `routes_v6`, `advertisements`, `age_secs`, `writer_version`, `took_ms`, `failed` when some prefixes could not be installed |
 | `route_ledger_refused` | A start did not seed (warn for the faults, info for the expected outcomes); the mirror loads cold | `reason` (`missing`, `disabled`, `forwarding-mode`, `no-route-source`, `unreadable`, `unremovable`, `corrupt`, `format-version`, `identity`, `too-old`, `clock`, `peer-id`), `detail` |
 | `route_ledger_reconciled` | The route source's first completed dump after a seed garbage-collected what it did not re-advertise | `gc_removed` |
+| `neigh_resolver_restarted` | The neighbour resolver's loop exited, or made no progress for 30 s outside a wait on the FIB programmer, and the daemon replaced it (warn). The new loop re-reads the kernel and announces what the old one missed ([triage](packetframe-fib.md#symptom-nexthops-stuck-incomplete-while-the-kernel-neighbour-is-reachable)) | `cause` (`stalled`, `failed`, `returned`), `detail`, `restarts`, `ran_for_s`, `backoff_ms`; `silent_ms` with `stalled` |
 
 **The log itself (`module: event-log`)**
 

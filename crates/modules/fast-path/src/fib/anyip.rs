@@ -56,6 +56,7 @@
 #![cfg(target_os = "linux")]
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
 
 use futures::TryStreamExt;
 use netlink_packet_route::address::AddressAttribute;
@@ -65,6 +66,8 @@ use netlink_packet_route::route::{
 use rtnetlink::sys::{AsyncSocket, TokioSocket};
 use rtnetlink::{Handle, RouteMessageBuilder};
 use tracing::info;
+
+use crate::netlink_bounds::NETLINK_EXCHANGE_TIMEOUT;
 
 /// The kernel's `local` routing table, where type-`local` routes
 /// conventionally live (`ip route show table local`).
@@ -128,6 +131,22 @@ pub enum AnyipError {
          refusing to replace a kernel-owned entry with an anyip local route"
     )]
     RouteKindConflict { addr: Ipv4Addr, kind: RouteType },
+    #[error("no netlink reply within {}s; abandoned", .0.as_secs())]
+    TimedOut(Duration),
+}
+
+/// Every call here under [`NETLINK_EXCHANGE_TIMEOUT`]. Its callers wait
+/// on it where a hang costs the most: the BGP listener's retry loop
+/// re-ensures the route before every restart (a call that never returns
+/// keeps the feed down for good), and shutdown removes it inside a
+/// blocking drain. Each call opens its own connections, so abandoning
+/// one drops them with it.
+async fn bounded<T>(
+    call: impl std::future::Future<Output = Result<T, AnyipError>>,
+) -> Result<T, AnyipError> {
+    tokio::time::timeout(NETLINK_EXCHANGE_TIMEOUT, call)
+        .await
+        .unwrap_or(Err(AnyipError::TimedOut(NETLINK_EXCHANGE_TIMEOUT)))
 }
 
 /// Whether [`ensure_local_route`] created the route or adopted one a
@@ -150,8 +169,129 @@ pub enum EnsureOutcome {
 /// [`EnsureOutcome::Adopted`] from a previous daemon life.
 ///
 /// Fails with [`AnyipError::AddressOwned`] if any interface holds
-/// `addr` — see the module docs for why that is a hard refusal.
+/// `addr` — see the module docs for why that is a hard refusal — and
+/// with [`AnyipError::TimedOut`] if the kernel stops answering.
+///
+/// A write that goes unanswered may have landed with only its ACK lost,
+/// so before returning a fresh connection looks for the route as
+/// written, and a landed write is success ([`after_unanswered_write`]).
+///
+/// This is the form a running daemon uses (the BGP listener's retry
+/// loop, the reconcile tick): a write it cannot confirm either way is
+/// left as it is, because those callers are not serialised with each
+/// other, and removing it could delete the route another call has just
+/// put back under a bound listener. The next tick settles it.
+/// [`ensure_local_route_blocking`], the attach preflight, removes it.
 pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipError> {
+    ensure(addr, Caller::Running).await
+}
+
+/// Who is ensuring the route, which decides what happens to a write that
+/// cannot be confirmed either way ([`after_unanswered_write`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    /// Attach's preflight: one call, under the attach lock, whose error
+    /// fails attach before its unwind is armed. A route it was creating
+    /// must not outlive that error, so it is removed.
+    Attach,
+    /// A running daemon's re-ensure: left as it is for the next tick.
+    Running,
+}
+
+async fn ensure(addr: Ipv4Addr, caller: Caller) -> Result<EnsureOutcome, AnyipError> {
+    let (outcome, lo) = match bounded(plan(addr)).await? {
+        Plan::LeftAlone(outcome) => return Ok(outcome),
+        Plan::Write { outcome, lo } => (outcome, lo),
+    };
+    match bounded(write(addr, lo)).await {
+        Ok(()) => {
+            info!(%addr, ?outcome, "anyip: local /32 ensured on lo (kernel AnyIP)");
+            Ok(outcome)
+        }
+        Err(AnyipError::TimedOut(waited)) => {
+            let landed = bounded(installed_as_written(addr)).await;
+            let (result, remove) = after_unanswered_write(landed, outcome, caller, waited);
+            if remove {
+                if let Err(e) = bounded(remove_unbounded(addr)).await {
+                    tracing::warn!(
+                        %addr, error = %e,
+                        "anyip: could not remove a route whose write went unanswered"
+                    );
+                }
+            }
+            if result.is_ok() {
+                info!(%addr, ?outcome, "anyip: local /32 ensured on lo; the write's reply was lost");
+            }
+            result
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// What [`plan`] found: the route needs writing, or is already as
+/// [`write`] would leave it.
+enum Plan {
+    LeftAlone(EnsureOutcome),
+    Write { outcome: EnsureOutcome, lo: u32 },
+}
+
+/// A write went unanswered; `landed` is what a fresh look found. Returns
+/// the call's result and whether to remove the route first.
+///
+/// - Found as written: the write landed and only its reply was lost.
+/// - Not found as written: nothing of this write is in the table (an
+///   adopted route being repaired is left as it was found).
+/// - Could not look: unknown. For attach, a route this call was creating
+///   must not outlive the error — attach cannot clean up what it never
+///   learned exists — so it is removed (the delete is protocol-scoped,
+///   so it cannot touch anyone else's). An adopted one predates the call
+///   and may be serving another daemon, so it is never removed here.
+///   A running daemon's call removes nothing ([`Caller::Running`]).
+fn after_unanswered_write(
+    landed: Result<bool, AnyipError>,
+    outcome: EnsureOutcome,
+    caller: Caller,
+    waited: Duration,
+) -> (Result<EnsureOutcome, AnyipError>, bool) {
+    match landed {
+        Ok(true) => (Ok(outcome), false),
+        Ok(false) => (Err(AnyipError::TimedOut(waited)), false),
+        Err(_) => (
+            Err(AnyipError::TimedOut(waited)),
+            caller == Caller::Attach && outcome == EnsureOutcome::Created,
+        ),
+    }
+}
+
+/// Is the `local <addr>/32` route in the table exactly as [`write`]
+/// leaves it? Read over fresh connections.
+async fn installed_as_written(addr: Ipv4Addr) -> Result<bool, AnyipError> {
+    let (conn, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(conn);
+    let lo = lo_ifindex(&handle).await?;
+    let (strict_conn, strict) = strict_connection()?;
+    tokio::spawn(strict_conn);
+    Ok(existing_local_table_entry(&strict, addr).await? == Some(LocalEntry::as_written(lo)))
+}
+
+async fn write(addr: Ipv4Addr, lo: u32) -> Result<(), AnyipError> {
+    let (conn, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(conn);
+    let route = RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(addr, 32)
+        .output_interface(lo)
+        .table_id(LOCAL_TABLE)
+        .scope(RouteScope::Host)
+        .kind(RouteType::Local)
+        .protocol(ANYIP_ROUTE_PROTOCOL)
+        .build();
+    handle.route().add(route).replace().execute().await?;
+    Ok(())
+}
+
+/// Everything [`ensure_local_route`] reads before it decides to write;
+/// writes nothing.
+async fn plan(addr: Ipv4Addr) -> Result<Plan, AnyipError> {
     let (conn, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(conn);
 
@@ -206,32 +346,21 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipEr
     // the volatile journal every few minutes (2026-09-11). An already
     // correct route is left exactly as it is.
     //
-    // "Correct" means every field the write below sets. An owned route
+    // "Correct" means every field `write` sets. An owned route
     // whose oif or scope has drifted is still repaired — the reconcile
     // exists to heal a route someone altered, and skipping that would
     // trade one silent failure for another.
     if let Some(entry) = existing {
-        if entry.scope == RouteScope::Host && entry.oif == Some(lo) {
+        if entry == LocalEntry::as_written(lo) {
             info!(%addr, "anyip: local /32 already correct, left alone");
-            return Ok(outcome);
+            return Ok(Plan::LeftAlone(outcome));
         }
         info!(
             %addr, scope = ?entry.scope, oif = ?entry.oif,
             "anyip: adopting local /32 with wrong attributes, repairing"
         );
     }
-
-    let route = RouteMessageBuilder::<Ipv4Addr>::new()
-        .destination_prefix(addr, 32)
-        .output_interface(lo)
-        .table_id(LOCAL_TABLE)
-        .scope(RouteScope::Host)
-        .kind(RouteType::Local)
-        .protocol(ANYIP_ROUTE_PROTOCOL)
-        .build();
-    handle.route().add(route).replace().execute().await?;
-    info!(%addr, ?outcome, "anyip: local /32 ensured on lo (kernel AnyIP)");
-    Ok(outcome)
+    Ok(Plan::Write { outcome, lo })
 }
 
 /// Remove the route [`ensure_local_route`] installed. Best-effort by
@@ -243,6 +372,10 @@ pub async fn ensure_local_route(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipEr
 /// owned by anything else is unreachable from here — it survives as
 /// an ESRCH, which the tolerant arm below reports as success.
 pub async fn remove_local_route(addr: Ipv4Addr) -> Result<(), AnyipError> {
+    bounded(remove_unbounded(addr)).await
+}
+
+async fn remove_unbounded(addr: Ipv4Addr) -> Result<(), AnyipError> {
     let (conn, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(conn);
 
@@ -328,6 +461,19 @@ struct LocalEntry {
     proto: RouteProtocol,
     scope: RouteScope,
     oif: Option<u32>,
+}
+
+impl LocalEntry {
+    /// The entry [`write`] leaves. The one definition of "correct" both
+    /// the leave-alone check and the unanswered-write check compare with.
+    fn as_written(lo: u32) -> Self {
+        Self {
+            kind: RouteType::Local,
+            proto: ANYIP_ROUTE_PROTOCOL,
+            scope: RouteScope::Host,
+            oif: Some(lo),
+        }
+    }
 }
 
 /// A netlink connection with `NETLINK_GET_STRICT_CHK` set, so the
@@ -416,12 +562,14 @@ async fn existing_local_table_entry(
 /// Blocking wrappers for callers without a live tokio runtime: the
 /// attach preflight (a sync path that runs before the controller's
 /// runtime exists) and unwind/Drop cleanup. Each builds a throwaway
-/// current-thread runtime; both sites are cold one-shots.
+/// current-thread runtime; both sites are cold one-shots. The ensure is
+/// the attach preflight's, so a write it cannot confirm is removed
+/// ([`Caller::Attach`]).
 pub fn ensure_local_route_blocking(addr: Ipv4Addr) -> Result<EnsureOutcome, AnyipError> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(ensure_local_route(addr))
+        .block_on(ensure(addr, Caller::Attach))
 }
 
 /// See [`ensure_local_route_blocking`].
@@ -437,5 +585,70 @@ async fn lo_ifindex(handle: &Handle) -> Result<u32, AnyipError> {
     match links.try_next().await? {
         Some(link) => Ok(link.header.index),
         None => Err(AnyipError::NoLoopbackIface),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WAITED: Duration = Duration::from_secs(30);
+
+    /// A write whose reply was lost but which landed is success: a caller
+    /// that failed on it (attach) would never arm the route's removal.
+    const OUTCOMES: [EnsureOutcome; 2] = [EnsureOutcome::Created, EnsureOutcome::Adopted];
+    const CALLERS: [Caller; 2] = [Caller::Attach, Caller::Running];
+
+    #[test]
+    fn a_landed_write_is_success() {
+        for (outcome, caller) in OUTCOMES.into_iter().zip(CALLERS) {
+            let (result, remove) = after_unanswered_write(Ok(true), outcome, caller, WAITED);
+            assert_eq!(result.ok(), Some(outcome));
+            assert!(!remove);
+        }
+    }
+
+    #[test]
+    fn a_write_that_did_not_land_leaves_nothing_to_remove() {
+        for outcome in OUTCOMES {
+            for caller in CALLERS {
+                let (result, remove) = after_unanswered_write(Ok(false), outcome, caller, WAITED);
+                assert!(matches!(result, Err(AnyipError::TimedOut(_))));
+                assert!(!remove);
+            }
+        }
+    }
+
+    /// Unknown either way: attach removes a route it was creating before
+    /// the error returns, so it cannot outlive a failed attach unowned;
+    /// an adopted one predates the call and is never removed; and a
+    /// running daemon's re-ensure removes nothing, since another call may
+    /// just have put the route back under a bound listener.
+    #[test]
+    fn only_attach_removes_an_unconfirmable_write_and_only_its_own() {
+        let unknown = || Err(AnyipError::TimedOut(WAITED));
+        let (result, remove) =
+            after_unanswered_write(unknown(), EnsureOutcome::Created, Caller::Attach, WAITED);
+        assert!(matches!(result, Err(AnyipError::TimedOut(_))));
+        assert!(remove);
+        for (outcome, caller) in [
+            (EnsureOutcome::Adopted, Caller::Attach),
+            (EnsureOutcome::Created, Caller::Running),
+            (EnsureOutcome::Adopted, Caller::Running),
+        ] {
+            let (result, remove) = after_unanswered_write(unknown(), outcome, caller, WAITED);
+            assert!(matches!(result, Err(AnyipError::TimedOut(_))));
+            assert!(!remove, "{outcome:?} {caller:?}");
+        }
+    }
+
+    /// The leave-alone check and the landed check share one definition.
+    #[test]
+    fn as_written_is_what_the_write_sets() {
+        let e = LocalEntry::as_written(1);
+        assert_eq!(e.kind, RouteType::Local);
+        assert_eq!(e.proto, ANYIP_ROUTE_PROTOCOL);
+        assert_eq!(e.scope, RouteScope::Host);
+        assert_eq!(e.oif, Some(1));
     }
 }

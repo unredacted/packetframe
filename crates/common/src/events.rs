@@ -162,6 +162,10 @@ pub mod kind {
     /// The route source's first completed initial dump after a seed
     /// garbage-collected what it did not re-advertise.
     pub const ROUTE_LEDGER_RECONCILED: &str = "route_ledger_reconciled";
+    /// The neighbour resolver exited or stopped making progress and the
+    /// supervisor restarted it (`cause`: `stalled`, `failed`,
+    /// `returned`; `detail` the reason).
+    pub const NEIGH_RESOLVER_RESTARTED: &str = "neigh_resolver_restarted";
 
     // --- the event log itself (module `event-log`) ---
     pub const EVENTS_DROPPED: &str = "events_dropped";
