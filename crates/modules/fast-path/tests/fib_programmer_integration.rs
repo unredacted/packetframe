@@ -2904,13 +2904,26 @@ fn a_reprobe_nudge_asks_again_now_instead_of_at_the_backoff() {
     }
     assert!(early.iter().all(|ip| *ip == nh), "{early:?}");
 
-    // The nudge brings the next request forward to the next tick, well
-    // inside the 8 s backoff still to run.
+    // The nudge brings the next request forward to the next tick (1 s at
+    // most), and the window allows for a slow guest while staying well
+    // inside the 8 s backoff still to run. The nudged probe itself counts
+    // as an attempt, so nothing else is due inside the window either.
     assert!(h.handle.reprobe_unresolved_now(), "nudge queued");
-    let nudged = h.drain_resolves(&mut resolves, Duration::from_millis(1800));
+    let nudged = h.drain_resolves(&mut resolves, Duration::from_millis(4000));
+    assert_eq!(
+        nudged,
+        vec![nh],
+        "a nudged re-probe must fire on the next tick, once"
+    );
+
+    // Only that probe moved: the backoff kept its count, so the next one
+    // is 16 s out, not the 2 s a restarted backoff would give. A resolver
+    // nudging every few seconds through an overflow must not turn a dead
+    // neighbour into a probe every few seconds.
+    let after = h.drain_resolves(&mut resolves, Duration::from_millis(3000));
     assert!(
-        !nudged.is_empty() && nudged.iter().all(|ip| *ip == nh),
-        "a nudged re-probe must fire on the next tick (got {nudged:?})"
+        after.is_empty(),
+        "the nudge must not restart the backoff (got {after:?})"
     );
 }
 

@@ -24,11 +24,33 @@
 //! [`super::neigh_supervision`] for the whole incident and the rules
 //! that answer it.
 //!
+//! **One request socket, and never a second while one is stuck.** This
+//! is this module's policy, and it is stricter than "replace a socket
+//! that timed out" for a reason particular to where it runs. A netlink
+//! request is processed inside the sender's `sendmsg`, and neighbour
+//! writes, single-entry gets and (on 5.15) dumps take `rtnl_lock` there,
+//! so a request waiting on the lock blocks the *thread* polling its
+//! connection — an abort cannot interrupt it. The resolver shares a
+//! two-worker runtime with the FIB programmer and the route source: a
+//! second socket blocked the same way would take the other worker, and
+//! with it the programmer and the BGP session's keepalives. So a request
+//! that times out retires its socket, and requests that cannot wait
+//! ([`ProbeOutcome`]) are skipped until that socket's task has actually
+//! exited; the programmer re-probes them, and is nudged when requests can
+//! go out again. Reads of the kernel wait at most [`RETIRED_GRACE`] for it
+//! and are retried by the resync schedule. A reply the kernel dropped
+//! costs one [`REQUEST_TIMEOUT`]; `rtnl_lock` held for a minute costs a
+//! minute of skipped probes, never a stalled runtime.
+//!
 //! **Overruns are resyncs.** A full multicast socket loses notifications
 //! (`ENOBUFS`, surfaced as `NLMSG_OVERRUN`). The loop answers one by
 //! re-reading the kernel's links, neighbours and bridge FDB and
 //! announcing the difference to its own view — the same code an
-//! incarnation's startup runs.
+//! incarnation's startup runs — over a fresh subscription opened before
+//! the dumps, because what the overflowed socket still holds is older
+//! than what it dropped (see [`NetlinkNeighborResolver::resync_now`]).
+//! An entry a dump does not list is confirmed gone with a single-entry
+//! get before it is acted on, since a dump can skip a live entry.
 //!
 //! **Ownership across incarnations.** Everything an incarnation needs to
 //! outlive it — the programmer's event channel, the resolve queue, the
@@ -82,9 +104,9 @@ use packetframe_common::events::{kind, Event};
 use packetframe_common::fib::{IpPrefix, NeighError, NeighEvent, PeerId, RouteEvent};
 
 use crate::fib::neigh_supervision::{
-    reconcile_links, reconcile_neighbours, ExitCause, LinkObs, LogLimiter, Phase, RestartBackoff,
-    RestartRecord, ResyncSchedule, SharedResolverStatus, StallWatch, SupervisionTiming,
-    DUMP_TIMEOUT, REQUEST_TIMEOUT,
+    reconcile_links, reconcile_neighbours, ExitCause, LinkObs, LogLimiter, OwedCause, OwedResync,
+    Phase, RestartBackoff, RestartRecord, ResyncSchedule, SharedResolverStatus, StallWatch,
+    SupervisionTiming, DUMP_TIMEOUT, REQUEST_TIMEOUT,
 };
 use crate::fib::programmer::FibProgrammerHandle;
 
@@ -243,6 +265,14 @@ pub const MULTICAST_RCVBUF: usize = 16 << 20;
 /// made of, so it bounds how stale [`SharedResolverStatus`] can look on a
 /// healthy, quiet box.
 const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(1);
+
+/// How long a read of the kernel (a resync, an incarnation's startup, a
+/// single-link lookup) waits for a retired request socket to exit before
+/// giving up and being retried. Long enough for an idle task's abort to
+/// land; deliberately not long enough to wait out a socket blocked in the
+/// kernel, which would leave the loop deaf to notifications for as long
+/// — the resync's retry timer paces the attempts instead.
+const RETIRED_GRACE: Duration = Duration::from_millis(100);
 
 /// Handle used by the [`FibProgrammer`](super::programmer) (and anyone
 /// else holding a clone) to kick off proactive kernel-driven ARP/ND.
@@ -431,11 +461,89 @@ pub struct NetlinkNeighborResolver {
     overrun_log: LogLimiter,
     skip_log: LogLimiter,
     open_log: LogLimiter,
-    /// Fault injection for the supervision tests only: the first
-    /// incarnation hangs, making no progress, when it serves a resolve
-    /// request for this address — the 2026-10-07 shape. Never set in
-    /// production; see [`Self::with_test_fault_hang_on_resolve`].
-    hang_on_resolve: Option<IpAddr>,
+    /// Fault injection for the tests; all off in production. See
+    /// [`TestFaults`].
+    faults: TestFaults,
+    /// A probe was skipped for want of a request socket since one was
+    /// last available; the next one to become available nudges the
+    /// programmer (see [`Self::retired_socket_exited`]).
+    probes_skipped_since_socket: bool,
+    /// The multicast subscription the loop reads. Owned here, not by the
+    /// loop, because a resync replaces it (see [`Self::resync_now`]);
+    /// `None` between incarnations.
+    subscription: Option<Subscription>,
+}
+
+/// **Fault injection, for the resolver's tests only.** Each field makes
+/// one failure that the real kernel produces only under load or by
+/// timing certain, so a netns test can assert what the resolver does
+/// about it. [`Default`] is no fault at all, which is what production
+/// runs; nothing outside the tests sets one.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct TestFaults {
+    /// The first incarnation, serving a resolve request for this address,
+    /// waits forever without making progress — the 2026-10-07 shape — so
+    /// a test can watch the supervisor drop it and start one that
+    /// recovers. Later incarnations serve the address normally.
+    pub hang_on_resolve: Option<IpAddr>,
+    /// Resync the moment an overrun is read, before the loop reads one
+    /// more notification, so the overflowed socket's backlog is certainly
+    /// still queued when the dump is taken. Production waits
+    /// [`crate::fib::neigh_supervision::RESYNC_SETTLE`] and reads the
+    /// backlog meanwhile, so whether any is left at the dump is timing.
+    pub resync_at_overrun: bool,
+    /// The next this-many request sockets are opened with nothing reading
+    /// them, so every request on them waits for a reply that never comes:
+    /// the 2026-10-07 request, now bounded.
+    pub hang_request_sockets: u32,
+    /// Neighbour dumps that announce (a resync, a restarted incarnation)
+    /// leave these addresses out, as a dump that resumed past a concurrent
+    /// deletion skips a live entry.
+    pub dump_skips: Vec<IpAddr>,
+}
+
+/// What a single-entry get says about an entry a dump did not list.
+enum Still<T> {
+    Gone,
+    /// It exists after all — the dump skipped it — and this is it now.
+    Present(T),
+    /// The get failed or timed out: unverifiable, so not acted on.
+    Unknown(String),
+}
+
+/// Entries missing from a dump that could not be confirmed gone, and so
+/// were left as they were. A non-empty one makes the read incomplete.
+#[derive(Default)]
+struct Unconfirmed {
+    count: usize,
+    first: Option<String>,
+}
+
+impl Unconfirmed {
+    fn add(&mut self, error: String) {
+        self.count += 1;
+        self.first.get_or_insert(error);
+    }
+
+    fn into_result(self, what: &str) -> Result<(), String> {
+        match self.first {
+            None => Ok(()),
+            Some(e) => Err(format!(
+                "{} {what} missing from the dump could not be confirmed gone and were left as \
+                 they were (first: {e})",
+                self.count
+            )),
+        }
+    }
+}
+
+/// One multicast subscription: the notifications in arrival order, and
+/// the connection task that reads them off the socket. Dropping it
+/// closes the socket and everything still queued on it.
+struct Subscription {
+    messages: futures::stream::BoxStream<'static, NetlinkMessage<RouteNetlinkMessage>>,
+    _task: AbortOnDrop,
 }
 
 /// The request socket's lifecycle.
@@ -456,9 +564,9 @@ enum Requester {
     Retired { task: JoinHandle<()> },
 }
 
-/// Aborts a spawned task when dropped: the multicast connection of an
-/// incarnation that is being dropped must not outlive it, still
-/// subscribed and filling a socket nobody reads.
+/// Aborts a spawned task when dropped: a multicast connection that is
+/// being replaced or dropped must not outlive its [`Subscription`],
+/// still subscribed and filling a socket nobody reads.
 struct AbortOnDrop(JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -482,8 +590,7 @@ fn ifindex_by_name(name: &str) -> Option<u32> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
     /// `RTM_NEWNEIGH NTF_USE` was accepted for the neighbour on `oif`;
-    /// the kernel is soliciting (or already had it, see
-    /// `read_back_after_kick`).
+    /// the kernel is soliciting (or already had it, see `read_back`).
     Kicked { oif: u32 },
     /// The neighbour write failed (logged at debug; first-packet ARP
     /// remains the fallback).
@@ -492,8 +599,9 @@ pub enum ProbeOutcome {
     NoRoute,
     /// Unspecified nexthop: nothing to resolve.
     Unspecified,
-    /// The egress is an IX-mode interface: deliberately not kicked.
-    Suppressed,
+    /// The egress, `oif`, is an IX-mode interface: deliberately not
+    /// kicked (the entry is still read back; see `read_back`).
+    Suppressed { oif: u32 },
     /// A request hit [`REQUEST_TIMEOUT`] at `stage`. The nexthop is left
     /// for the programmer's next re-probe and the request socket retired.
     TimedOut { stage: &'static str },
@@ -548,7 +656,9 @@ impl NetlinkNeighborResolver {
                 overrun_log: LogLimiter::default(),
                 skip_log: LogLimiter::default(),
                 open_log: LogLimiter::default(),
-                hang_on_resolve: None,
+                faults: TestFaults::default(),
+                probes_skipped_since_socket: false,
+                subscription: None,
             },
             events_rx,
             NeighborResolveHandle { resolve_tx },
@@ -585,15 +695,11 @@ impl NetlinkNeighborResolver {
         self
     }
 
-    /// **Fault injection, for the supervision tests only.** The first
-    /// incarnation, serving a resolve request for `ip`, waits forever
-    /// without making progress — a reply that never comes, as on
-    /// 2026-10-07 — so a test can watch the supervisor notice, drop it,
-    /// and start a second incarnation that recovers. Later incarnations
-    /// serve `ip` normally.
+    /// **Fault injection, for the resolver's tests only.** See
+    /// [`TestFaults`]; production never calls this.
     #[doc(hidden)]
-    pub fn with_test_fault_hang_on_resolve(mut self, ip: IpAddr) -> Self {
-        self.hang_on_resolve = Some(ip);
+    pub fn with_test_faults(mut self, faults: TestFaults) -> Self {
+        self.faults = faults;
         self
     }
 
@@ -705,10 +811,16 @@ impl NetlinkNeighborResolver {
     /// for the next. A spawned incarnation would own them and take them
     /// with it when aborted, closing the programmer's event channel.
     ///
-    /// A panic is not handled here: the release profile aborts on panic,
-    /// so one ends the daemon and the service manager restarts it. What
-    /// keeps the daemon up with the resolver down is an error exit or a
-    /// stall, and those are what this covers.
+    /// A panic is not handled here. The release profile aborts on panic,
+    /// so one ends the whole daemon, and that does **not** recover by
+    /// itself: the unit's `Restart=on-failure` start fails over the bpffs
+    /// pins the dead daemon left (fast-path refuses to start over them),
+    /// the start limit then marks the unit failed, and XDP keeps
+    /// forwarding on the frozen maps until an operator runs the teardown
+    /// in `crates/cli/debian/packetframe.service`'s header. That holds for
+    /// a panic anywhere in the daemon; nothing here can catch one. What
+    /// this covers is what keeps the daemon up with the resolver down: an
+    /// error exit, or a stall.
     pub async fn run(mut self) {
         let status = self.status.clone();
         let shutdown = self.shutdown.clone();
@@ -738,6 +850,10 @@ impl NetlinkNeighborResolver {
                     }
                 }
             };
+            // The incarnation is gone; its subscription must not linger
+            // through the backoff, subscribed and filling a socket nobody
+            // reads. The next incarnation subscribes afresh.
+            self.subscription = None;
             // `None` is a shutdown, and so is an incarnation that returned
             // because of one: its own shutdown arm can win the race above.
             let Some(cause) = cause.filter(|_| !shutdown.is_cancelled()) else {
@@ -813,32 +929,14 @@ impl NetlinkNeighborResolver {
         // the dumps run queue in the socket and are applied once the loop
         // starts, so nothing changes unseen between a dump and the
         // subscription (the FDB seed always relied on this order; the link
-        // and neighbour reads now do too). A replayed notification the dump
-        // already reflected is an idempotent re-announcement, and nothing
-        // is *processed* before the link dump fills the MAC cache, so no
-        // Learned goes out with a zeroed src_mac. The connection's request
-        // handle is dropped on the spot: nothing is ever asked of the
-        // multicast socket, whose replies an overrun can drop.
-        let groups = [MulticastGroup::Neigh, MulticastGroup::Link];
-        let (mut connection, _, mut messages) = new_multicast_connection(&groups)
-            .map_err(|e| NeighError::new(format!("new_multicast_connection: {e}")))?;
-        match set_rcvbuf(connection.socket_mut().as_raw_fd(), self.multicast_rcvbuf) {
-            Ok((granted, how)) => info!(
-                groups = ?groups,
-                incarnation,
-                rcvbuf_bytes = granted,
-                how,
-                "NeighborResolver netlink multicast subscription live"
-            ),
-            Err(e) => warn!(
-                groups = ?groups,
-                incarnation,
-                error = %e,
-                "NeighborResolver netlink multicast subscription live, but its receive buffer \
-                 could not be raised: overruns (and resyncs) will be more frequent"
-            ),
-        }
-        let _multicast = AbortOnDrop(tokio::spawn(connection));
+        // and neighbour reads now do too). Everything on the new socket is
+        // no older than the subscription, so replaying it after the dump
+        // only moves an entry forward: a notification the dump already
+        // reflected is an idempotent re-announcement. Nothing is
+        // *processed* before the link dump fills the MAC cache, so no
+        // Learned goes out with a zeroed src_mac. The resync does the same
+        // (see `resync_now`).
+        self.subscription = Some(self.subscribe("startup")?);
 
         // The first incarnation fills its view silently, as startup always
         // has: nothing has been announced to the programmer yet, and it asks
@@ -849,7 +947,7 @@ impl NetlinkNeighborResolver {
             // A whole read answers any resync the last incarnation still
             // owed (its schedule did not survive it).
             Ok(()) => self.status.update(|s| {
-                s.resync_owed = false;
+                s.resync_owed = None;
                 s.last_resync_error = None;
             }),
             Err(e) => {
@@ -929,13 +1027,19 @@ impl NetlinkNeighborResolver {
         housekeeping.tick().await;
 
         loop {
+            // Re-borrowed every pass: a resync swaps the subscription.
+            let messages = &mut self
+                .subscription
+                .as_mut()
+                .expect("an incarnation subscribes before its loop")
+                .messages;
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
                     return Ok(());
                 }
                 next = messages.next() => {
                     match next {
-                        Some((packet, _)) => self.handle_packet(packet).await,
+                        Some(packet) => self.handle_packet(packet).await,
                         None => {
                             warn!("netlink multicast stream closed");
                             return Err(NeighError::new("netlink multicast stream closed"));
@@ -968,7 +1072,7 @@ impl NetlinkNeighborResolver {
 
     /// One proactive-resolve request from the programmer.
     async fn on_resolve_request(&mut self, ip: IpAddr) {
-        if self.incarnation == 1 && self.hang_on_resolve == Some(ip) {
+        if self.incarnation == 1 && self.faults.hang_on_resolve == Some(ip) {
             std::future::pending::<()>().await;
         }
         // Phase 3.9: synchronously resolve from the seeded cache first. If
@@ -1003,7 +1107,7 @@ impl NetlinkNeighborResolver {
         let outcome = issue_proactive_resolve(&handle, ip, &ix_oifs).await;
         self.status.beat();
         match outcome {
-            ProbeOutcome::Suppressed => {
+            ProbeOutcome::Suppressed { oif } => {
                 let n = self.ix_probe_suppressed.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 20 {
                     info!(
@@ -1014,9 +1118,16 @@ impl NetlinkNeighborResolver {
                 } else {
                     debug!(?ip, "proactive probe suppressed (ix-mode)");
                 }
+                // No kick, but still a read: a single-entry get is unicast
+                // to the kernel and puts nothing on the fabric. Without it,
+                // an entry the snooper installed that this view missed (an
+                // overrun dropped its notification) would wait for the
+                // kernel to next change it — which on an IX link, where
+                // nothing solicits, may be never.
+                self.read_back(&handle, ip, oif).await;
             }
             ProbeOutcome::Kicked { oif } => {
-                self.read_back_after_kick(&handle, ip, oif).await;
+                self.read_back(&handle, ip, oif).await;
             }
             ProbeOutcome::TimedOut { stage } => self.request_timed_out(stage),
             ProbeOutcome::Failed | ProbeOutcome::NoRoute | ProbeOutcome::Unspecified => {}
@@ -1080,8 +1191,7 @@ impl NetlinkNeighborResolver {
             if !task.is_finished() {
                 return None;
             }
-            self.requester = Requester::Closed;
-            self.status.update(|s| s.request_socket_stuck_since = None);
+            self.retired_socket_exited();
         }
         if let Requester::Open { handle, task } = &self.requester {
             // A connection whose task ended (its socket failed) would fail
@@ -1094,11 +1204,26 @@ impl NetlinkNeighborResolver {
         }
         match new_connection() {
             Ok((connection, handle, _unsolicited)) => {
-                let task = tokio::spawn(connection);
+                let task = if self.faults.hang_request_sockets > 0 {
+                    // Fault injection: a connection nobody polls, so every
+                    // request on it waits forever for its reply.
+                    self.faults.hang_request_sockets -= 1;
+                    tokio::spawn(async move {
+                        let _held = connection;
+                        std::future::pending::<()>().await;
+                    })
+                } else {
+                    tokio::spawn(connection)
+                };
                 self.requester = Requester::Open {
                     handle: handle.clone(),
                     task,
                 };
+                // Probes skipped for want of a socket were still counted
+                // as attempts by the programmer's backoff.
+                if std::mem::take(&mut self.probes_skipped_since_socket) {
+                    self.nudge_reprobe();
+                }
                 Some(handle)
             }
             Err(e) => {
@@ -1129,9 +1254,21 @@ impl NetlinkNeighborResolver {
     fn reap_requester(&mut self) {
         if let Requester::Retired { task } = &self.requester {
             if task.is_finished() {
-                self.requester = Requester::Closed;
-                self.status.update(|s| s.request_socket_stuck_since = None);
+                self.retired_socket_exited();
             }
+        }
+    }
+
+    /// A retired socket's task has exited: requests can go out again. The
+    /// programmer counted every probe skipped meanwhile as an attempt and
+    /// backed it off accordingly — after a long `rtnl_lock` hold, to
+    /// half a minute or more for probes never sent — so it is nudged to
+    /// ask again now.
+    fn retired_socket_exited(&mut self) {
+        self.requester = Requester::Closed;
+        self.status.update(|s| s.request_socket_stuck_since = None);
+        if std::mem::take(&mut self.probes_skipped_since_socket) {
+            self.nudge_reprobe();
         }
     }
 
@@ -1165,6 +1302,7 @@ impl NetlinkNeighborResolver {
     /// A proactive probe that could not be issued for want of a request
     /// socket. The programmer re-probes the nexthop at its next backoff.
     fn probe_skipped(&mut self, ip: IpAddr) {
+        self.probes_skipped_since_socket = true;
         let total = self.status.update(|s| {
             s.counters.probes_skipped += 1;
             s.counters.probes_skipped
@@ -1193,8 +1331,10 @@ impl NetlinkNeighborResolver {
         self.resync.on_overrun(now);
         let total = self.status.update(|s| {
             s.counters.overruns += 1;
-            s.last_overrun = Some(now);
-            s.resync_owed = true;
+            s.resync_owed.get_or_insert(OwedResync {
+                since: now,
+                cause: OwedCause::Overrun,
+            });
             s.counters.overruns
         });
         if let Some(suppressed) = self.overrun_log.admit(now) {
@@ -1207,12 +1347,18 @@ impl NetlinkNeighborResolver {
         }
     }
 
-    /// A read of the kernel failed: it is owed as a resync.
+    /// A read of the kernel did not complete: it is owed as a resync. An
+    /// overrun already owed keeps its cause; the error says why the read
+    /// meant to answer it did not.
     fn owe_resync(&mut self, error: String) {
-        self.resync.failed(Instant::now());
+        let now = Instant::now();
+        self.resync.failed(now);
         self.status.update(|s| {
             s.counters.resync_failures += 1;
-            s.resync_owed = true;
+            s.resync_owed.get_or_insert(OwedResync {
+                since: now,
+                cause: OwedCause::ReadIncomplete,
+            });
             s.last_resync_error = Some(error);
         });
     }
@@ -1220,14 +1366,42 @@ impl NetlinkNeighborResolver {
     /// Re-read the kernel and announce what the lost notifications would
     /// have, then nudge the programmer to re-probe what it holds
     /// unresolved.
+    ///
+    /// **Over a fresh subscription, opened before the dumps.** After an
+    /// overflow the kernel reports `ENOBUFS` once and then hands over
+    /// what it had queued *before* the drop — the oldest notifications,
+    /// older than the ones it dropped. Dump on the same socket while that
+    /// backlog is still queued (it drains a batch at a time, between the
+    /// loop's other arms), and the rest of it replays *after* the dump: a
+    /// `NEWNEIGH` whose `DELNEIGH` was dropped re-learns a dead neighbour
+    /// as resolved, a `DELNEIGH` whose re-learn was dropped takes a live
+    /// nexthop off the fast path, a stale `NEWLINK` re-adds a deleted
+    /// link. So the dump is taken with a new socket already subscribed,
+    /// and the loop then reads only that one: everything it holds is no
+    /// older than its subscription, so applying it after the reconcile
+    /// only moves entries forward, while everything left on the old one
+    /// predates the dump and is dropped with it. The swap happens whether
+    /// the read completed or not — part of it may have been applied, and
+    /// the old backlog is older than that part; what a failed read left
+    /// unreconciled is owed and retried.
     async fn resync_now(&mut self) {
         let started = Instant::now();
         self.resync.start(started);
-        match self.read_kernel(true).await {
+        let fresh = match self.subscribe("resync") {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "resync deferred: no fresh multicast subscription");
+                self.owe_resync(e.to_string());
+                return;
+            }
+        };
+        let read = self.read_kernel(true).await;
+        self.subscription = Some(fresh);
+        match read {
             Ok(()) => {
                 let total = self.status.update(|s| {
                     s.counters.resyncs += 1;
-                    s.resync_owed = false;
+                    s.resync_owed = None;
                     s.last_resync = Some(Instant::now());
                     s.last_resync_error = None;
                     s.counters.resyncs
@@ -1251,6 +1425,42 @@ impl NetlinkNeighborResolver {
         }
     }
 
+    /// Subscribe to the neighbour and link groups on a new socket, with
+    /// its receive buffer raised. The connection's request handle is
+    /// dropped on the spot: nothing is ever asked of a multicast socket,
+    /// whose replies an overrun can drop.
+    fn subscribe(&self, why: &'static str) -> Result<Subscription, NeighError> {
+        let groups = [MulticastGroup::Neigh, MulticastGroup::Link];
+        let (mut connection, _, messages) = new_multicast_connection(&groups)
+            .map_err(|e| NeighError::new(format!("new_multicast_connection: {e}")))?;
+        match set_rcvbuf(connection.socket_mut().as_raw_fd(), self.multicast_rcvbuf) {
+            Ok((granted, how)) if why == "startup" => info!(
+                groups = ?groups,
+                incarnation = self.incarnation,
+                rcvbuf_bytes = granted,
+                how,
+                "NeighborResolver netlink multicast subscription live"
+            ),
+            Ok((granted, how)) => debug!(
+                why,
+                rcvbuf_bytes = granted,
+                how,
+                "NeighborResolver netlink multicast subscription opened"
+            ),
+            Err(e) => warn!(
+                groups = ?groups,
+                why,
+                error = %e,
+                "NeighborResolver netlink multicast subscription live, but its receive buffer \
+                 could not be raised: overruns (and resyncs) will be more frequent"
+            ),
+        }
+        Ok(Subscription {
+            messages: messages.map(|(m, _)| m).boxed(),
+            _task: AbortOnDrop(tokio::spawn(connection)),
+        })
+    }
+
     /// Ask the programmer to re-probe every nexthop it holds unresolved
     /// now. Re-sent from housekeeping while its queue is full.
     fn nudge_reprobe(&mut self) {
@@ -1268,19 +1478,37 @@ impl NetlinkNeighborResolver {
     /// first read, when nothing has been announced) the view is just
     /// filled. The one implementation of the startup seed, a restart's
     /// reconcile and an overrun's resync.
+    ///
+    /// `Err` when any part did not complete — a dump failed, or an entry
+    /// missing from a dump could not be confirmed gone — after applying
+    /// every part that did; the caller owes a resync for the rest.
     async fn read_kernel(&mut self, announce: bool) -> Result<(), String> {
-        let handle = self.requester(DUMP_TIMEOUT).await.ok_or_else(|| {
+        let handle = self.requester(RETIRED_GRACE).await.ok_or_else(|| {
             "no request socket: a timed-out request's socket is still held by the kernel, or a \
              new one could not be opened"
                 .to_string()
         })?;
         let links = self.dump("link dump", dump_link_info(&handle)).await?;
-        self.apply_links(links, announce).await;
-        let neighbours = self
+        let links_unconfirmed = self.apply_links(&handle, links, announce).await.err();
+        let mut neighbours = self
             .dump("neighbour dump", dump_neighbours(&handle))
             .await?;
-        self.apply_neighbours(neighbours, announce).await;
-        self.refresh_fdb(&handle).await
+        if announce && !self.faults.dump_skips.is_empty() {
+            neighbours.retain(|(ip, _, _)| !self.faults.dump_skips.contains(ip));
+        }
+        let neighbours_unconfirmed = self
+            .apply_neighbours(&handle, neighbours, announce)
+            .await
+            .err();
+        let fdb = self.refresh_fdb(&handle).await.err();
+        match [links_unconfirmed, neighbours_unconfirmed, fdb]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+        {
+            incomplete if incomplete.is_empty() => Ok(()),
+            incomplete => Err(incomplete.join("; ")),
+        }
     }
 
     /// Await one dump, bounded by [`DUMP_TIMEOUT`].
@@ -1305,7 +1533,21 @@ impl NetlinkNeighborResolver {
     }
 
     /// Bring the link caches in line with a dump. See [`Self::read_kernel`].
-    async fn apply_links(&mut self, links: Vec<LinkObs>, announce: bool) {
+    ///
+    /// A link the dump does not list is not taken as deleted on that
+    /// alone: a dump resumes from a position, and a deletion ahead of it
+    /// between two of its chunks can skip a live entry. Acting on a
+    /// skipped link would withdraw its local-prefix routes and its
+    /// fallback default and forget its MAC, so every later `Learned` on it
+    /// would carry a zeroed source MAC. Each is confirmed with a
+    /// single-link get first ([`Self::confirm_link`]); one that cannot be
+    /// confirmed is left as it is, and the read reported incomplete.
+    async fn apply_links(
+        &mut self,
+        handle: &Handle,
+        links: Vec<LinkObs>,
+        announce: bool,
+    ) -> Result<(), String> {
         if !announce {
             // Seeded BEFORE any notification is processed: otherwise a
             // NEWNEIGH handled first would emit src_mac=[0;6] because the
@@ -1323,28 +1565,43 @@ impl NetlinkNeighborResolver {
                 names = self.iface_to_ifindex.len(),
                 "iface caches seeded from RTM_GETLINK dump"
             );
-            return;
+            return Ok(());
         }
         let delta = reconcile_links(&self.iface_mac, &self.iface_to_ifindex, &links);
         if delta.changed.is_empty() && delta.gone.is_empty() {
-            return;
+            return Ok(());
         }
         info!(
             changed = delta.changed.len(),
-            gone = delta.gone.len(),
+            missing = delta.gone.len(),
             "links reconciled against a dump; applying what the missed notifications would have"
         );
+        let mut unconfirmed = Unconfirmed::default();
         for ifindex in delta.gone {
-            self.on_link_gone(ifindex).await;
+            match self.confirm_link(handle, ifindex).await {
+                Still::Gone => self.on_link_gone(ifindex).await,
+                // Skipped by the dump; what the get returned is current.
+                Still::Present(link) => self.on_link(link).await,
+                Still::Unknown(e) => unconfirmed.add(e),
+            }
         }
         for link in delta.changed {
             self.on_link(link).await;
         }
+        unconfirmed.into_result("link(s)")
     }
 
     /// Bring the neighbour view in line with a dump. See
-    /// [`Self::read_kernel`] and [`reconcile_neighbours`].
-    async fn apply_neighbours(&mut self, dump: Vec<(IpAddr, u32, [u8; 6])>, announce: bool) {
+    /// [`Self::read_kernel`] and [`reconcile_neighbours`]. A neighbour the
+    /// dump does not list is confirmed gone with a single-entry get before
+    /// it is lost, for the reason [`Self::apply_links`] gives: a skipped
+    /// live neighbour would otherwise take its nexthop off the fast path.
+    async fn apply_neighbours(
+        &mut self,
+        handle: &Handle,
+        dump: Vec<(IpAddr, u32, [u8; 6])>,
+        announce: bool,
+    ) -> Result<(), String> {
         let delta = reconcile_neighbours(&self.neigh_cache, &dump);
         if !announce {
             // Phase 3.9 fix: seed the kernel-neighbour cache so
@@ -1363,22 +1620,107 @@ impl NetlinkNeighborResolver {
                 count = self.neigh_cache.len(),
                 "kernel neighbour cache seeded from RTM_GETNEIGH dump"
             );
-            return;
+            return Ok(());
         }
         if delta.learned.is_empty() && delta.lost.is_empty() {
-            return;
+            return Ok(());
         }
         info!(
             learned = delta.learned.len(),
-            lost = delta.lost.len(),
+            missing = delta.lost.len(),
             "neighbours reconciled against a dump; announcing what the missed notifications \
              would have"
         );
+        let mut unconfirmed = Unconfirmed::default();
         for (ip, ifindex) in delta.lost {
-            self.lose(ip, ifindex).await;
+            match self.confirm_neighbour(handle, ip, ifindex).await {
+                Still::Gone => self.lose(ip, ifindex).await,
+                Still::Present((now_if, mac)) => {
+                    // Skipped by the dump. Announced only if it differs
+                    // from what the view already holds.
+                    if self.neigh_cache.get(&ip) != Some(&(now_if, mac)) {
+                        self.learn(ip, now_if, mac).await;
+                    }
+                }
+                Still::Unknown(e) => unconfirmed.add(e),
+            }
         }
         for (ip, ifindex, mac) in delta.learned {
             self.learn(ip, ifindex, mac).await;
+        }
+        unconfirmed.into_result("neighbour(s)")
+    }
+
+    /// Whether a link a dump did not list is really gone: one non-dump
+    /// `RTM_GETLINK` by index, bounded by [`REQUEST_TIMEOUT`]. `ENODEV` is
+    /// gone; a reply is the link as it is now.
+    async fn confirm_link(&mut self, handle: &Handle, ifindex: u32) -> Still<LinkObs> {
+        let mut links = handle.link().get().match_index(ifindex).execute();
+        let reply = tokio::time::timeout(REQUEST_TIMEOUT, links.try_next()).await;
+        self.status.beat();
+        match reply {
+            Err(_) => {
+                self.request_timed_out("link confirm");
+                Still::Unknown(format!("link {ifindex}: timed out"))
+            }
+            Ok(Ok(Some(msg))) => Still::Present(link_obs(&msg)),
+            Ok(Err(rtnetlink::Error::NetlinkError(e))) if e.raw_code() == -libc::ENODEV => {
+                Still::Gone
+            }
+            Ok(Ok(None)) => Still::Unknown(format!("link {ifindex}: no reply")),
+            Ok(Err(e)) => Still::Unknown(format!("link {ifindex}: {e}")),
+        }
+    }
+
+    /// Whether a neighbour a dump did not list is really gone: one
+    /// non-dump `RTM_GETNEIGH` for `(ifindex, ip)`, bounded by
+    /// [`REQUEST_TIMEOUT`]. `ENOENT` is gone, and so is an entry the kernel
+    /// still holds in a state with no usable MAC — the dump left it out
+    /// for that, exactly as the multicast path would. A kernel without
+    /// single-entry gets (before 5.1, `EOPNOTSUPP`) cannot be asked, and
+    /// there the dump's word is all there is.
+    async fn confirm_neighbour(
+        &mut self,
+        handle: &Handle,
+        ip: IpAddr,
+        ifindex: u32,
+    ) -> Still<(u32, [u8; 6])> {
+        let mut h = handle.clone();
+        let mut replies = match h.request(neigh_get_request(ip, ifindex)) {
+            Ok(r) => r,
+            Err(e) => return Still::Unknown(format!("{ip}: {e}")),
+        };
+        let first = tokio::time::timeout(REQUEST_TIMEOUT, async move {
+            while let Some(msg) = replies.next().await {
+                match msg.payload {
+                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(n)) => {
+                        return Some(Ok(n));
+                    }
+                    NetlinkPayload::Error(e) => return Some(Err(e.raw_code())),
+                    _ => {}
+                }
+            }
+            None
+        })
+        .await;
+        self.status.beat();
+        match first {
+            Err(_) => {
+                self.request_timed_out("neighbour confirm");
+                Still::Unknown(format!("{ip}: timed out"))
+            }
+            Ok(Some(Ok(n))) => match parse_neighbour_add(&n, [0; 6]) {
+                Some(NeighEvent::Learned { ifindex, mac, .. }) => Still::Present((ifindex, mac)),
+                _ => Still::Gone,
+            },
+            Ok(Some(Err(code))) if code == -libc::ENOENT || code == -libc::EOPNOTSUPP => {
+                Still::Gone
+            }
+            Ok(Some(Err(code))) => Still::Unknown(format!(
+                "{ip}: {}",
+                std::io::Error::from_raw_os_error(-code)
+            )),
+            Ok(None) => Still::Unknown(format!("{ip}: no reply")),
         }
     }
 
@@ -1487,7 +1829,12 @@ impl NetlinkNeighborResolver {
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelLink(msg)) => {
                 self.on_link_gone(msg.header.index).await;
             }
-            NetlinkPayload::Overrun(_) => self.on_overrun(),
+            NetlinkPayload::Overrun(_) => {
+                self.on_overrun();
+                if self.faults.resync_at_overrun {
+                    self.resync_now().await;
+                }
+            }
             NetlinkPayload::Error(err) => {
                 warn!(?err, "netlink error message");
             }
@@ -1581,7 +1928,10 @@ impl NetlinkNeighborResolver {
     /// is full — backpressure during a convergence burst, which the
     /// supervisor must not mistake for a stall, hence the wait marker. A
     /// failure means the programmer is gone (shutdown): logged at debug.
-    async fn send_event(&self, evt: NeighEvent) -> bool {
+    // `&mut self`, not `&self`: a shared borrow held across the await
+    // would need the resolver to be `Sync`, and the subscription it owns
+    // is a `Send`-only stream.
+    async fn send_event(&mut self, evt: NeighEvent) -> bool {
         let _wait = self.status.programmer_wait();
         match self.events_tx.send(evt).await {
             Ok(()) => true,
@@ -1598,7 +1948,7 @@ impl NetlinkNeighborResolver {
     /// full-table burst, can be a long wait and is marked as one, for
     /// the reason [`Self::send_event`] gives.
     async fn apply_route(
-        &self,
+        &mut self,
         prog: &FibProgrammerHandle,
         event: RouteEvent,
     ) -> Result<(), crate::fib::programmer::ProgrammerError> {
@@ -1667,7 +2017,8 @@ impl NetlinkNeighborResolver {
         debug!(ifindex, "RTM_DELLINK observed; iface caches purged");
     }
 
-    /// After a kick the kernel accepted, read the entry back.
+    /// After a kick the kernel accepted, or a kick suppressed on an
+    /// IX-mode interface, read the entry back.
     ///
     /// `NTF_USE` is a no-op on a REACHABLE or PERMANENT neighbour. So
     /// when the kernel already knew the answer and only our cache did
@@ -1685,7 +2036,7 @@ impl NetlinkNeighborResolver {
     /// without `neigh_get` (pre-5.1) answers `EOPNOTSUPP`. Both fall
     /// through to the multicast path, which is where the answer arrives
     /// in the common case anyway.
-    async fn read_back_after_kick(&mut self, handle: &Handle, ip: IpAddr, oif: u32) {
+    async fn read_back(&mut self, handle: &Handle, ip: IpAddr, oif: u32) {
         let mut h = handle.clone();
         let mut replies = match h.request(neigh_get_request(ip, oif)) {
             Ok(r) => r,
@@ -2209,7 +2560,7 @@ impl NetlinkNeighborResolver {
     /// [`get_link_by_name`] over the request socket, bounded by
     /// [`REQUEST_TIMEOUT`].
     async fn link_by_name(&mut self, name: &str) -> Result<Option<(u32, Option<[u8; 6]>)>, String> {
-        let Some(handle) = self.requester(REQUEST_TIMEOUT).await else {
+        let Some(handle) = self.requester(RETIRED_GRACE).await else {
             return Err("no request socket".into());
         };
         let looked_up =
@@ -2491,7 +2842,7 @@ async fn issue_proactive_resolve(
     };
     if ix_oifs.contains(&oif) {
         debug!(?ip, oif, "proactive resolve: egress is ix-mode; not kicked");
-        return ProbeOutcome::Suppressed;
+        return ProbeOutcome::Suppressed { oif };
     }
     // Issue the RTM_NEWNEIGH with NTF_USE. The flag is what makes the
     // kernel *do* something: `neigh_add` routes an NTF_USE request to

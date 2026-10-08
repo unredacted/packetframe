@@ -104,10 +104,12 @@ pub const RESTART_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(300);
 /// why. The `neigh_resolver_restarted` event keeps the record.
 pub const RESTART_REPORTED_FOR: Duration = Duration::from_secs(600);
 
-/// After the first overrun of a burst, how long to let the burst's tail
-/// drain from the socket before dumping. Overruns come in bursts — the
-/// flush that overflowed the socket is still delivering — and one
-/// resync after it is worth more than one per overrun.
+/// After the first overrun of a burst, how long to wait before dumping.
+/// Overruns come in bursts — the flush that overflowed the socket is
+/// usually still running — and one resync after it is worth more than
+/// one per overrun. This is not about draining the overflowed socket:
+/// the resync never reads it again (it dumps on a fresh subscription;
+/// see `NetlinkNeighborResolver::resync_now`).
 pub const RESYNC_SETTLE: Duration = Duration::from_secs(1);
 
 /// Floor between two resyncs, so a socket that keeps overflowing costs a
@@ -478,6 +480,23 @@ pub struct RestartRecord {
     pub ran_for: Duration,
 }
 
+/// Why a resync is owed — carried with it, so the row names the cause
+/// of *this* debt rather than the last overrun ever seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwedResync {
+    pub since: Instant,
+    pub cause: OwedCause,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwedCause {
+    /// The multicast socket overflowed: notifications were lost.
+    Overrun,
+    /// A read of the kernel's tables failed, or could not confirm that
+    /// entries missing from a dump are really gone.
+    ReadIncomplete,
+}
+
 /// Lifetime counters, across incarnations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResolverCounters {
@@ -513,10 +532,9 @@ pub struct ResolverStatus {
     /// Set while the loop waits on the FibProgrammer.
     pub programmer_wait_since: Option<Instant>,
     pub last_restart: Option<RestartRecord>,
-    pub last_overrun: Option<Instant>,
-    /// An overrun (or a failed startup read) has not yet been answered by
-    /// a completed resync.
-    pub resync_owed: bool,
+    /// A resync is owed: what first made it owed, and when. Cleared only
+    /// by a completed read of the kernel.
+    pub resync_owed: Option<OwedResync>,
     pub last_resync: Option<Instant>,
     pub last_resync_error: Option<String>,
     /// A request timed out on the request socket and the socket's task
@@ -535,8 +553,7 @@ impl ResolverStatus {
             last_progress: now,
             programmer_wait_since: None,
             last_restart: None,
-            last_overrun: None,
-            resync_owed: false,
+            resync_owed: None,
             last_resync: None,
             last_resync_error: None,
             request_socket_stuck_since: None,
@@ -627,8 +644,7 @@ impl ResolverStatus {
                 problems.push((
                     HealthState::Degraded,
                     format!(
-                        "restarted {} ago (restart #{}): the previous loop {} after running {}; \
-                         the new one re-read the kernel and announced what changed",
+                        "restarted {} ago (restart #{}): the previous loop {} after running {}",
                         ago(r.at),
                         self.counters.restarts,
                         r.cause,
@@ -637,16 +653,17 @@ impl ResolverStatus {
                 ));
             }
         }
-        if self.resync_owed {
-            let lost = self
-                .last_overrun
-                .map(|t| {
-                    format!(
-                        "neighbour/link notifications were lost {} ago (socket overrun)",
-                        ago(t)
-                    )
-                })
-                .unwrap_or_else(|| "the startup read of the kernel's tables failed".into());
+        if let Some(owed) = self.resync_owed {
+            let lost = match owed.cause {
+                OwedCause::Overrun => format!(
+                    "neighbour/link notifications were lost {} ago (socket overrun)",
+                    ago(owed.since)
+                ),
+                OwedCause::ReadIncomplete => format!(
+                    "a read of the kernel's links and neighbours did not complete {} ago",
+                    ago(owed.since)
+                ),
+            };
             let state = match &self.last_resync_error {
                 Some(e) => format!("the resync failed ({e}) and is retried"),
                 None => "a resync is pending".into(),
@@ -1241,8 +1258,10 @@ mod tests {
     fn an_owed_resync_is_degraded_and_names_the_overrun() {
         let now = Instant::now();
         let mut s = running(now);
-        s.last_overrun = Some(now);
-        s.resync_owed = true;
+        s.resync_owed = Some(OwedResync {
+            since: now,
+            cause: OwedCause::Overrun,
+        });
         s.counters.overruns = 4;
         let h = s.subsystem_health(now + Duration::from_secs(2));
         assert_eq!(h.state, HealthState::Degraded);
@@ -1251,7 +1270,7 @@ mod tests {
         assert!(m.contains("resync is pending"), "{m}");
         assert!(m.contains("overruns 4"), "{m}");
 
-        s.resync_owed = false;
+        s.resync_owed = None;
         s.counters.resyncs = 1;
         let h = s.subsystem_health(now + Duration::from_secs(3));
         assert_eq!(
@@ -1261,6 +1280,39 @@ mod tests {
             h.message
         );
         assert!(h.message.unwrap().contains("overruns 4 (resyncs 1"));
+    }
+
+    /// A debt names its own cause. An overrun answered days ago must not
+    /// be what the row blames for a read that fails today, and a restart
+    /// line must not claim a re-read that did not complete.
+    #[test]
+    fn an_owed_read_names_the_failed_read_not_an_old_overrun() {
+        let now = Instant::now();
+        let mut s = running(now);
+        s.counters.overruns = 1;
+        s.counters.resyncs = 1;
+        s.last_resync = Some(now);
+        let later = now + Duration::from_secs(3 * 86_400);
+        s.last_progress = later;
+        s.counters.restarts = 1;
+        s.last_restart = Some(RestartRecord {
+            at: later,
+            cause: ExitCause::Failed("netlink multicast stream closed".into()),
+            ran_for: Duration::from_secs(60),
+        });
+        s.resync_owed = Some(OwedResync {
+            since: later,
+            cause: OwedCause::ReadIncomplete,
+        });
+        s.last_resync_error = Some("neighbour dump timed out after 10 s".into());
+        let m = s
+            .subsystem_health(later + Duration::from_secs(1))
+            .message
+            .unwrap();
+        assert!(!m.contains("socket overrun"), "{m}");
+        assert!(m.contains("did not complete 1s ago"), "{m}");
+        assert!(m.contains("neighbour dump timed out"), "{m}");
+        assert!(!m.contains("re-read the kernel"), "{m}");
     }
 
     /// Whitelist: of every phase, only `Running` can be healthy.

@@ -233,8 +233,8 @@ impl FibProgrammerHandle {
         }
     }
 
-    /// Re-probe every nexthop that is not `Resolved` now, from the start
-    /// of its backoff, instead of when its backoff says (up to
+    /// Re-probe every nexthop that is not `Resolved` now, instead of when
+    /// its backoff says (up to
     /// `REPROBE_MAX`, a minute away).
     ///
     /// The neighbour resolver sends this after it re-reads the kernel —
@@ -1901,22 +1901,22 @@ impl FibProgrammer {
         });
     }
 
-    /// Make every pending re-probe due now, from the start of its
-    /// backoff ([`FibProgrammerHandle::reprobe_unresolved_now`]). The
-    /// next `REPROBE_TICK` fires them, `REPROBE_BATCH` at a time.
+    /// Make every pending re-probe due now
+    /// ([`FibProgrammerHandle::reprobe_unresolved_now`]). The next
+    /// `REPROBE_TICK` fires them, `REPROBE_BATCH` at a time.
     ///
-    /// The backoff restarts too, not just the next probe: the neighbour
-    /// resolver sends this right after re-reading a kernel that may
-    /// still be re-resolving what a link flush took (the 2026-10-07
-    /// shape), and a nexthop that misses the first probe should be asked
-    /// again in seconds, not at the minute its old backoff had reached.
-    /// It cannot turn into a probe storm: the resolver sends it once per
-    /// resync, and resyncs are rate-limited at the source.
+    /// Only the next probe moves; the backoff keeps its count, so the one
+    /// after follows the schedule the nexthop had already earned. The
+    /// resolver may send this every few seconds through a sustained
+    /// overflow (once per resync), and restarting every backoff each time
+    /// would kick a dead neighbour every few seconds — a solicitation, a
+    /// pass through `rtnl_lock`, and more notifications into the very
+    /// socket that is overflowing. A live neighbour needs only the one
+    /// probe brought forward.
     fn reprobe_now(&mut self) {
         let now = Instant::now();
         for r in self.reprobe.values_mut() {
             r.due = now;
-            r.attempts = 0;
         }
         if !self.reprobe.is_empty() {
             info!(

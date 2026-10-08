@@ -1720,17 +1720,35 @@ loop waited for it forever, and nothing noticed. The daemon now:
   a request, 10 s for a dump. A request that times out leaves its nexthop
   to the programmer's next re-probe. Its socket is retired, and no new
   one opens until the kernel has let go of the old one (a request blocked
-  on `rtnl_lock` holds a worker thread until the lock is released).
+  on `rtnl_lock` holds a worker thread until the lock is released, and
+  the resolver shares a two-thread runtime with the programmer and the
+  route source). Probes skipped meanwhile are asked for again as soon as
+  requests can go out.
 - **Resyncs after an overrun.** When notifications are lost, it re-reads
   the links, the neighbours and the bridge FDB about a second later (at
-  most one resync every 5 s) and announces what changed. Its multicast
+  most one resync every 5 s) and announces what changed. The dumps are
+  taken with a **fresh subscription** already open, and the old socket
+  is then dropped with everything still queued on it. After an overflow
+  the kernel goes on delivering what it queued *before* the drop, which
+  is older than what it dropped; replayed after the dump, it would
+  re-learn deleted neighbours or withdraw live ones. A link or neighbour
+  the dump does not list is asked about individually before it is
+  withdrawn, because a dump can skip a live entry. One that cannot be
+  confirmed is left as it is and the resync is retried. The multicast
   receive buffer is also raised to 16 MiB, which makes overruns rarer.
+- **Reads back suppressed probes.** A nexthop behind an `ix-mode`
+  interface is still never kicked, but its kernel entry is now read back
+  (a unicast get, nothing on the fabric). An entry the snooper installed
+  but whose notification was lost resolves on the next re-probe instead
+  of waiting for the kernel to change it.
 - **Restarts a stuck resolver itself.** A loop that exits with an error,
   or makes no progress for 30 s outside a wait on the FIB programmer, is
   dropped and replaced, with restarts backing off from 1 s to 60 s. The
   new loop re-reads the kernel and announces what the old one missed.
-  After every resync and restart, the programmer re-probes every
-  unresolved nexthop at once instead of waiting out its backoff.
+  After every resync and restart, the programmer brings every unresolved
+  nexthop's next re-probe forward to now. Its backoff keeps counting, so
+  a dead neighbour is not solicited every few seconds through a long
+  storm.
 
 **Read the `neigh-resolver` row in `packetframe status`.** It is present
 whenever the PacketFrame FIB control plane runs, and its `last ok` age is
@@ -1743,6 +1761,7 @@ the loop's progress age; an idle loop still makes progress every second.
 | **unhealthy**, `NOT RUNNING: the resolver <cause>; restart #N in …` | Between a failure and its restart. The cause names the error or the stall. |
 | degraded, `restarted … ago (restart #N): the previous loop …` | Recovered by a restart in the last 10 minutes. The text says why the old loop was replaced. |
 | degraded, `… notifications were lost … ago (socket overrun); a resync is pending` (or `the resync failed (…) and is retried`) | An overrun is not yet answered. A failed resync is retried every 5 s. |
+| degraded, `a read of the kernel's links and neighbours did not complete … ago; the resync failed (…)` | A read failed, for example a dump timed out or an entry missing from a dump could not be confirmed gone. It is retried every 5 s, and the error says what failed. |
 | degraded, `waiting … for the FibProgrammer to accept its events` | The **programmer** is not draining, for example during a route-ledger seed or a full-table load. Restarting the resolver cannot help, so it is not restarted. If this lasts, the programmer is the problem. |
 | degraded, `the request socket was retired … ago and the kernel still holds it` | A request timed out and its socket is blocked in the kernel, typically on `rtnl_lock`. Proactive probes are skipped until it is released, and the programmer re-probes later. |
 
@@ -1779,10 +1798,24 @@ at error, with the cause, and records a `neigh_resolver_restarted` event
 If the restart count keeps climbing (`restart #N` with N rising, and the
 row unhealthy between restarts), the resolver cannot get going at all.
 The cause in the row names the error: a socket that cannot be opened, or
-a multicast stream that keeps closing. A daemon restart is the last
-resort, and the event log keeps the history for the bug report. A daemon
-restart is also the remedy on a build older than this fix: before it,
-the resolver hung in silence and only a restart recovered it.
+a multicast stream that keeps closing. The last resort is a daemon
+restart, and the event log keeps the history for the bug report. Restart
+like this, because a plain `systemctl restart` cannot start over the
+pins the old process leaves:
+
+```sh
+systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe
+```
+
+The same restart is the remedy on a build older than this fix. Before
+it, the resolver hung without a sound and only a restart recovered it.
+
+None of this covers a **panic**. The release build aborts on panic, which
+ends the whole daemon. `Restart=on-failure` then cannot bring it back,
+because fast-path refuses to start over the bpffs pins the dead process
+left. The unit's start limit marks it `failed`, and XDP keeps forwarding
+on the frozen maps until someone runs the teardown in the header of
+`crates/cli/debian/packetframe.service`.
 
 ### Symptom: `pass_not_in_devmap` climbs
 

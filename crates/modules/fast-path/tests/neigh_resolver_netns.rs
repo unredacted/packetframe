@@ -44,7 +44,9 @@ use packetframe_common::module::HealthState;
 use packetframe_fast_path::fib::neigh_supervision::{
     ExitCause, SharedResolverStatus, SupervisionTiming,
 };
-use packetframe_fast_path::fib::netlink_neigh::{LocalPrefixSpec, NetlinkNeighborResolver};
+use packetframe_fast_path::fib::netlink_neigh::{
+    LocalPrefixSpec, NetlinkNeighborResolver, TestFaults,
+};
 use packetframe_fast_path::fib::programmer::{held_handle, recording_handle, RouteEventLog};
 
 // --- Test setup utilities (copied from tests/netns.rs) -----------------
@@ -794,7 +796,7 @@ fn an_overrun_is_resynced_and_every_lost_neighbour_is_learned() {
             &status,
             Duration::from_secs(5),
             "the resync to settle",
-            |s| !s.resync_owed,
+            |s| s.resync_owed.is_none(),
         )
         .await;
         let row = status
@@ -853,7 +855,10 @@ fn a_stuck_resolver_is_restarted_and_recovers_what_it_missed() {
         let (nudges_to, nudges): (_, RouteEventLog) = recording_handle();
         let resolver = resolver
             .with_supervision_timing(quick_timing(Duration::from_secs(3)))
-            .with_test_fault_hang_on_resolve(hang)
+            .with_test_faults(TestFaults {
+                hang_on_resolve: Some(hang),
+                ..TestFaults::default()
+            })
             .with_reprobe_target(nudges_to);
         let status = resolver.status();
         let resolver_task = tokio::spawn(resolver.run());
@@ -1029,6 +1034,322 @@ fn a_long_wait_on_the_programmer_is_not_a_stall() {
             log.events()
         );
         assert_eq!(status.snapshot().counters.restarts, 0);
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
+    });
+}
+
+/// Run an `ip -batch` of `lines` in `netns` SYNCHRONOUSLY. Called from
+/// inside a current-thread runtime, that blocks the runtime's only
+/// thread, so nothing reads the resolver's multicast socket while the
+/// kernel delivers the batch's notifications into it.
+fn ip_batch_blocking(netns: &str, lines: &[String]) {
+    let path = std::env::temp_dir().join(format!("{netns}.{}.batch", lines.len()));
+    std::fs::write(&path, lines.concat()).expect("write batch file");
+    let st = Command::new("ip")
+        .args(["-n", netns, "-batch"])
+        .arg(&path)
+        .status()
+        .expect("spawn ip -batch");
+    let _ = std::fs::remove_file(&path);
+    assert!(st.success(), "ip -batch exited {st}");
+}
+
+/// Every event received within `within`, in order.
+async fn collect_events(rx: &mut mpsc::Receiver<NeighEvent>, within: Duration) -> Vec<NeighEvent> {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut out = Vec::new();
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return out;
+        }
+        match timeout(deadline - now, rx.recv()).await {
+            Ok(Some(e)) => out.push(e),
+            Ok(None) | Err(_) => return out,
+        }
+    }
+}
+
+fn event_ip(e: &NeighEvent) -> IpAddr {
+    match e {
+        NeighEvent::Learned { ip, .. }
+        | NeighEvent::Failed { ip, .. }
+        | NeighEvent::Gone { ip, .. } => *ip,
+    }
+}
+
+/// After an overflow the kernel hands over what it had queued *before*
+/// the drop — the oldest notifications — and only then newer ones. A
+/// resync that dumps while that backlog is still queued, on the same
+/// socket, replays it after the dump: here a neighbour created and then
+/// deleted inside one burst, whose creation survived in the backlog and
+/// whose deletion was dropped, would be learned as resolved after the
+/// dump said it was gone. The resync dumps on a fresh subscription and
+/// drops the old one, so the stale creation is never applied. The fault
+/// makes the resync run before anything after the overrun is read, so
+/// the backlog is certainly still queued at the dump.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn a_resync_never_replays_the_overflowed_backlog_after_its_dump() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let netns = names.netns.clone();
+    let veth_a = names.veth_a.clone();
+    let _ns_fd = enter_netns(&names.netns);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async move {
+        let shutdown = CancellationToken::new();
+        let (resolver, mut events_rx, resolve) = NetlinkNeighborResolver::new(shutdown.clone());
+        let resolver = resolver
+            .with_multicast_rcvbuf(4096)
+            .with_test_faults(TestFaults {
+                resync_at_overrun: true,
+                ..TestFaults::default()
+            });
+        let status = resolver.status();
+        let resolver_task = tokio::spawn(resolver.run());
+        await_status(&status, Duration::from_secs(5), "the first loop", |s| {
+            s.phase == packetframe_fast_path::fib::neigh_supervision::Phase::Running
+        })
+        .await;
+
+        // First in the burst, so its notification is in the backlog the
+        // full socket keeps; its deletion comes last, after the socket
+        // has long overflowed, so that notification is dropped.
+        let gone: IpAddr = "198.51.100.240".parse().unwrap();
+        let fillers: Vec<IpAddr> = (1..=200u8)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(198, 51, 100, i)))
+            .collect();
+        let mut batch = vec![format!(
+            "neigh replace {gone} lladdr 02:00:00:00:04:40 dev {veth_a} nud permanent\n"
+        )];
+        batch.extend(fillers.iter().enumerate().map(|(i, ip)| {
+            format!("neigh replace {ip} lladdr 02:00:00:00:05:{i:02x} dev {veth_a} nud permanent\n")
+        }));
+        batch.push(format!("neigh del {gone} dev {veth_a}\n"));
+        ip_batch_blocking(&netns, &batch);
+
+        // The fillers are announced (by the resync), and nothing about
+        // `gone` may end up claiming it resolved.
+        let mut events = collect_events(&mut events_rx, Duration::from_secs(4)).await;
+        let s = status.snapshot();
+        assert!(
+            s.counters.overruns >= 1 && s.counters.resyncs >= 1,
+            "the fixture must overflow the socket and resync, or this test proves nothing: {s:?}"
+        );
+        let learned: HashSet<IpAddr> = events
+            .iter()
+            .filter_map(|e| match e {
+                NeighEvent::Learned { ip, .. } => Some(*ip),
+                _ => None,
+            })
+            .collect();
+        let missing: Vec<&IpAddr> = fillers.iter().filter(|ip| !learned.contains(ip)).collect();
+        assert!(missing.is_empty(), "fillers never announced: {missing:?}");
+
+        // And the view must not hold it: a resolve request is a cache
+        // miss (a probe nobody answers), not a Learned from a stale entry.
+        assert!(resolve.request_resolve(gone));
+        events.extend(collect_events(&mut events_rx, Duration::from_millis(1500)).await);
+        let about_gone: Vec<&NeighEvent> = events.iter().filter(|e| event_ip(e) == gone).collect();
+        assert!(
+            !about_gone
+                .iter()
+                .any(|e| matches!(e, NeighEvent::Learned { .. })),
+            "a neighbour the kernel deleted was announced as resolved, from the overflowed \
+             socket's backlog replayed after the dump: {about_gone:?}"
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
+    });
+}
+
+/// The 2026-10-07 request — one whose reply never comes — end to end, now
+/// bounded. The first request socket answers nothing, so the startup's
+/// first dump times out: the timeout is counted, the socket retired, and
+/// the read owed as a resync, which a fresh socket then completes. A
+/// neighbour that existed all along is announced by it, and a probe goes
+/// out on the fresh socket. Before the fix the dump (or any request)
+/// waited forever and nothing after it ran.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn a_request_that_never_answers_times_out_and_a_fresh_socket_takes_over() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let netns = names.netns.clone();
+    let veth_a = names.veth_a.clone();
+    let known: IpAddr = "198.51.100.31".parse().unwrap();
+    neigh_permanent(&netns, "198.51.100.31", "02:00:00:00:06:31", &veth_a);
+    let _ns_fd = enter_netns(&names.netns);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async move {
+        let shutdown = CancellationToken::new();
+        let (resolver, mut events_rx, resolve) = NetlinkNeighborResolver::new(shutdown.clone());
+        let resolver = resolver.with_test_faults(TestFaults {
+            hang_request_sockets: 1,
+            ..TestFaults::default()
+        });
+        let status = resolver.status();
+        let resolver_task = tokio::spawn(resolver.run());
+
+        await_status(
+            &status,
+            Duration::from_secs(20),
+            "the unanswered dump to time out",
+            |s| s.counters.request_timeouts >= 1,
+        )
+        .await;
+        let row = status
+            .snapshot()
+            .subsystem_health(std::time::Instant::now());
+        assert_eq!(row.state, HealthState::Degraded, "{:?}", row.message);
+        assert!(
+            row.message.as_deref().unwrap_or("").contains("timed out"),
+            "the row says what is owed and why: {:?}",
+            row.message
+        );
+
+        // The fresh socket completes the owed read, which announces what
+        // the timed-out one never delivered.
+        let missing = await_learned(
+            &mut events_rx,
+            [known].into_iter().collect(),
+            Duration::from_secs(15),
+        )
+        .await;
+        assert!(
+            missing.is_empty(),
+            "the owed read must complete on a fresh socket; status: {:?}",
+            status.snapshot()
+        );
+        await_status(&status, Duration::from_secs(5), "the debt to clear", |s| {
+            s.resync_owed.is_none() && s.request_socket_stuck_since.is_none()
+        })
+        .await;
+
+        // And probes go out again: a kick creates the kernel entry.
+        assert!(resolve.request_resolve("198.51.100.78".parse().unwrap()));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let neigh = ns_capture(&netns, &["ip", "neigh", "show", "nud", "all"]);
+            if neigh
+                .lines()
+                .any(|l| l.starts_with("198.51.100.78 ") && l.contains(&veth_a))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no probe went out after the timeout; status: {:?}",
+                status.snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let s = status.snapshot();
+        assert_eq!(s.counters.request_timeouts, 1, "{s:?}");
+        assert_eq!(
+            s.counters.restarts, 0,
+            "a bounded request is not a stall: {s:?}"
+        );
+        let row = s.subsystem_health(std::time::Instant::now());
+        assert_eq!(row.state, HealthState::Healthy, "{:?}", row.message);
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
+    });
+}
+
+/// A dump resumes from a position, and a deletion ahead of it between
+/// two of its chunks can skip a live entry. A live neighbour missing
+/// from a resync's (here: a restarted incarnation's) dump is confirmed
+/// with a single-entry get before anything is done about it, so it is not
+/// announced `Gone` — which would take its nexthop off the fast path —
+/// and stays resolvable.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
+fn a_live_neighbour_a_dump_skipped_is_not_lost() {
+    let names = Names::new();
+    let _guard = NetnsGuard::setup(&names);
+    let netns = names.netns.clone();
+    let veth_a = names.veth_a.clone();
+    let skipped: IpAddr = "198.51.100.32".parse().unwrap();
+    neigh_permanent(&netns, "198.51.100.32", "02:00:00:00:07:32", &veth_a);
+    let _ns_fd = enter_netns(&names.netns);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async move {
+        let shutdown = CancellationToken::new();
+        let hang: IpAddr = "198.51.100.98".parse().unwrap();
+        let (resolver, mut events_rx, resolve) = NetlinkNeighborResolver::new(shutdown.clone());
+        let resolver = resolver
+            .with_supervision_timing(quick_timing(Duration::from_secs(3)))
+            .with_test_faults(TestFaults {
+                hang_on_resolve: Some(hang),
+                dump_skips: vec![skipped],
+                ..TestFaults::default()
+            });
+        let status = resolver.status();
+        let resolver_task = tokio::spawn(resolver.run());
+        await_status(&status, Duration::from_secs(5), "the first loop", |s| {
+            s.incarnation == 1
+                && s.phase == packetframe_fast_path::fib::neigh_supervision::Phase::Running
+        })
+        .await;
+
+        // A restart makes the next incarnation reconcile against a dump
+        // that leaves the live neighbour out.
+        assert!(resolve.request_resolve(hang));
+        await_status(
+            &status,
+            Duration::from_secs(15),
+            "the replacement incarnation",
+            |s| {
+                s.incarnation == 2
+                    && s.phase == packetframe_fast_path::fib::neigh_supervision::Phase::Running
+            },
+        )
+        .await;
+        let events = collect_events(&mut events_rx, Duration::from_millis(500)).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, NeighEvent::Gone { ip, .. } if *ip == skipped)),
+            "a live neighbour a dump skipped was announced gone: {events:?}"
+        );
+        // Still in the view: served from it.
+        assert!(resolve.request_resolve(skipped));
+        let missing = await_learned(
+            &mut events_rx,
+            [skipped].into_iter().collect(),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            missing.is_empty(),
+            "the skipped neighbour must stay resolvable"
+        );
+        assert!(
+            status.snapshot().resync_owed.is_none(),
+            "a confirmed entry leaves nothing owed: {:?}",
+            status.snapshot()
+        );
 
         shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), resolver_task).await;
