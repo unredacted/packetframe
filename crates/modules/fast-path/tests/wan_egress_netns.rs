@@ -478,7 +478,7 @@ fn wan_egress_thread_repairs_on_the_rule_event() {
     let w = WanEgress::start(spec()).expect("start");
     let status = w.status();
     assert_eq!(status.condition, Condition::Converged, "{status:?}");
-    assert_eq!((status.present, status.desired), (8, 8));
+    assert_eq!((status.present, status.desired), (Some(8), 8));
     assert_eq!(egress(&n, VIA_IX, SRC), n.wan);
 
     ns_run(&n.netns, &["ip", "rule", "del", "pref", "32001"]);
@@ -523,7 +523,7 @@ fn wan_egress_thread_repairs_on_the_rule_event() {
     });
     let status = w.status();
     assert_eq!(status.condition, Condition::Converged, "{status:?}");
-    assert_eq!(status.present, 8);
+    assert_eq!(status.present, Some(8));
 
     // The directive leaves the config (the reload path): retire removes
     // every rule and says so before the reconciler is dropped.

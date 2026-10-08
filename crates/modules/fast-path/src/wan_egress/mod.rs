@@ -577,7 +577,10 @@ pub struct Status {
     pub condition: Condition,
     pub layout: Option<Layout>,
     pub desired: usize,
-    pub present: usize,
+    /// Desired rules in place as the last pass saw them; `None` when that
+    /// pass could not see them (no dump, or abandoned), which is unknown,
+    /// not none.
+    pub present: Option<usize>,
     pub last_converged: Option<Instant>,
 }
 
@@ -587,13 +590,18 @@ impl Default for Status {
             condition: Condition::Pending,
             layout: None,
             desired: 0,
-            present: 0,
+            present: None,
             last_converged: None,
         }
     }
 }
 
 impl Status {
+    fn present_text(&self) -> String {
+        self.present
+            .map_or_else(|| "an unknown number".to_string(), |n| n.to_string())
+    }
+
     pub fn subsystem_health(&self, now: Instant) -> SubsystemHealth {
         let (state, message) = match &self.condition {
             Condition::Converged => {
@@ -610,7 +618,7 @@ impl Status {
                 };
                 (
                     HealthState::Healthy,
-                    format!("{} rules in place{placement}", self.present),
+                    format!("{} rules in place{placement}", self.present_text()),
                 )
             }
             Condition::Pending => (
@@ -622,7 +630,8 @@ impl Status {
                 HealthState::Degraded,
                 format!(
                     "repair failing: {} of {} rules in place; {error}",
-                    self.present, self.desired
+                    self.present_text(),
+                    self.desired
                 ),
             ),
             Condition::Retired => (
@@ -664,11 +673,13 @@ impl Status {
             "packetframe_wan_egress_rules{{module=\"fast-path\",state=\"desired\"}} {}",
             self.desired
         );
-        let _ = writeln!(
-            out,
-            "packetframe_wan_egress_rules{{module=\"fast-path\",state=\"present\"}} {}",
-            self.present
-        );
+        // Absent while unknown: a zero would read as "none in place".
+        if let Some(present) = self.present {
+            let _ = writeln!(
+                out,
+                "packetframe_wan_egress_rules{{module=\"fast-path\",state=\"present\"}} {present}"
+            );
+        }
         let _ = writeln!(
             out,
             "# HELP packetframe_wan_egress_converged 1 when the last wan-egress pass left every rule in place"
@@ -1190,7 +1201,7 @@ mod tests {
             condition: Condition::Converged,
             layout: plan_layout(&platform(32000)).ok(),
             desired: 3,
-            present: 3,
+            present: Some(3),
             last_converged: Some(now),
         };
         let h = converged.subsystem_health(now);
@@ -1214,12 +1225,26 @@ mod tests {
         let failing = Status {
             condition: Condition::Failing("EPERM".into()),
             desired: 3,
-            present: 1,
+            present: Some(1),
             ..Status::default()
         };
         let h = failing.subsystem_health(now);
         assert_eq!(h.state, HealthState::Degraded);
         assert!(h.message.unwrap().contains("repair failing: 1 of 3"));
+
+        // A pass that never saw the rules says so rather than "0 of 3".
+        let unseen = Status {
+            present: None,
+            ..failing
+        };
+        let msg = unseen.subsystem_health(now).message.unwrap();
+        assert!(
+            msg.contains("repair failing: an unknown number of 3"),
+            "{msg}"
+        );
+        let mut out = String::new();
+        unseen.render_metrics(&mut out);
+        assert!(!out.contains("state=\"present\""), "{out}");
 
         assert_eq!(
             Status::default().subsystem_health(now).state,
@@ -1243,7 +1268,7 @@ mod tests {
             condition: Condition::Converged,
             layout: None,
             desired: 7,
-            present: 7,
+            present: Some(7),
             last_converged: None,
         }
         .render_metrics(&mut out);
