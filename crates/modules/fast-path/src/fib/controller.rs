@@ -680,6 +680,13 @@ impl RouteController {
                     let shut = shutdown_token.clone();
                     tasks.push(runtime.spawn(async move {
                         let mut tick = tokio::time::interval(ANYIP_RECONCILE_INTERVAL);
+                        // One reconcile is a netlink round trip that can
+                        // wait on `rtnl_lock` for longer than the interval.
+                        // After one that ran late, the next is due a full
+                        // interval on, not at once: the default `Burst`
+                        // would replay every missed tick back to back,
+                        // into the same contended lock.
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
                             tokio::select! {
                                 _ = shut.cancelled() => return,
