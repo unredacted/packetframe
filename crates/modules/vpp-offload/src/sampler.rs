@@ -254,31 +254,65 @@ fn marker_name(token: u64) -> String {
     format!(".packetframe-mount-{token:016x}")
 }
 
-/// The recorded token. Unreadable reads as no record: the safe direction,
-/// since without it nothing is ever unmounted.
+/// The recorded token. The record decides what root unmounts, so it is
+/// read only if this daemon's uid could have written it, and never past a
+/// few bytes (`statefile::read_owned_no_follow`, as for the route ledger).
+/// Unreadable, untrusted or malformed reads as no record: the safe
+/// direction, since without one nothing is ever unmounted.
 pub(crate) fn read_record(state_dir: &Path) -> Option<u64> {
-    let text = std::fs::read_to_string(state_dir.join(MOUNT_RECORD)).ok()?;
-    u64::from_str_radix(text.trim(), 16).ok()
+    let bytes = match read_record_bytes(&state_dir.join(MOUNT_RECORD)) {
+        Ok(b) => b?,
+        Err(e) => {
+            tracing::warn!(error = %e, "the VPP sampler's mount record is unreadable or untrusted; treated as absent");
+            return None;
+        }
+    };
+    u64::from_str_radix(std::str::from_utf8(&bytes).ok()?.trim(), 16).ok()
 }
 
+/// A token in hex and a newline, with room to spare.
+const RECORD_MAX: u64 = 64;
+
+// The state-dir primitives are Linux-only (they are `openat` walks); the
+// dev-laptop build gets plain `std::fs`, the split ledger_record makes.
+// Nothing privileged runs off Linux.
+#[cfg(target_os = "linux")]
+fn read_record_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    packetframe_common::statefile::read_owned_no_follow(path, RECORD_MAX).map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_record_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(b) if b.len() as u64 > RECORD_MAX => Err(format!("{} bytes", b.len())),
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn write_record(state_dir: &Path, token: u64) -> io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
+    packetframe_common::statefile::write_atomic(
+        &state_dir.join(MOUNT_RECORD),
+        format!("{token:016x}\n").as_bytes(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_record(state_dir: &Path, token: u64) -> io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     let tmp = state_dir.join(format!("{MOUNT_RECORD}.tmp"));
-    let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(format!("{token:016x}\n").as_bytes())?;
-    f.sync_all()?;
+    std::fs::write(&tmp, format!("{token:016x}\n"))?;
     std::fs::rename(&tmp, state_dir.join(MOUNT_RECORD))
 }
 
 fn remove_record(state_dir: &Path) -> io::Result<()> {
-    match std::fs::remove_file(state_dir.join(MOUNT_RECORD)) {
+    #[cfg(target_os = "linux")]
+    let r = packetframe_common::statefile::remove_state_record(&state_dir.join(MOUNT_RECORD));
+    #[cfg(not(target_os = "linux"))]
+    let r = std::fs::remove_file(state_dir.join(MOUNT_RECORD));
+    match r {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
@@ -618,6 +652,9 @@ mod tests {
                 .subsec_nanos()
         ));
         std::fs::create_dir_all(&d).unwrap();
+        // The owned reader refuses a directory others can write, as any
+        // umask could leave it.
+        std::fs::set_permissions(&d, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
         d
     }
 
@@ -631,6 +668,30 @@ mod tests {
         assert_eq!(read_record(&d), None);
         remove_record(&d).unwrap();
         remove_record(&d).unwrap();
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The record decides what root unmounts, so one this daemon cannot
+    /// vouch for reads as none: writable by others, or a link.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_record_others_could_have_written_reads_as_none() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = state_dir("trust");
+        write_record(&d, 7).unwrap();
+        assert_eq!(read_record(&d), Some(7));
+        let rec = d.join(MOUNT_RECORD);
+        std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(read_record(&d), None, "group/world-writable");
+        std::fs::remove_file(&rec).unwrap();
+        let real = d.join("elsewhere");
+        std::fs::write(&real, "0000000000000007\n").unwrap();
+        std::os::unix::fs::symlink(&real, &rec).unwrap();
+        assert_eq!(read_record(&d), None, "a symlink at the record's name");
+        // And with no trusted record, release unmounts nothing.
+        let marked = Fake::with(Ok(1000), 0, vec![7]);
+        release(&marked, dir(), &d).unwrap();
+        assert_eq!(*marked.unmounts.borrow(), 0);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
