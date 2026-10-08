@@ -3134,7 +3134,7 @@ fn an_empty_target_is_permitted_over_a_table_with_known_holes() {
     let (mut obs, _) = rt.views();
     use packetframe_vpp_offload::driver::Observe as _;
     assert!(
-        obs.steer_permitted(),
+        obs.steer_permitted(false),
         "a reconcile that only removes must not be held by gates describing a table \
          traffic would be diverted INTO — that is what leaves a rollback unfinished"
     );

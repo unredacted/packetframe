@@ -221,7 +221,18 @@ pub trait Observe {
     /// counts — and a verify that does not vouch for the table now
     /// installed. The driver's own `Drain::Idle` proof covers neither;
     /// see `Driver::poll_steer_retry`.
-    fn steer_permitted(&mut self) -> bool;
+    ///
+    /// `steered` is the supervisor in `Steered`: rules a steer that LANDED
+    /// installed are in place, and what the retry wants is a held
+    /// addition to them ([`Supervisor::steer_retry_pending`]). The
+    /// ledger's count gate is a FIRST-steer gate, which the operator's
+    /// lever does not apply to a port already steered either; asked
+    /// here regardless, a persistent unresolvable route kept a held
+    /// addition from ever retrying on its own while a plain `reconfigure`
+    /// would admit it (review finding, PR #333). Not `is_steered`, which
+    /// a failed first steer's undeletable debris also sets — the case the
+    /// gate exists for on the retry (`Core::fib_fit_to_steer`).
+    fn steer_permitted(&mut self, steered: bool) -> bool;
 
     /// Whether VPP's FIB holds no installed routes right now. Read every
     /// tick while steered, so a lock and a count at most — see
@@ -1197,7 +1208,7 @@ impl Driver {
         {
             return Vec::new();
         }
-        if !obs.steer_permitted() {
+        if !obs.steer_permitted(matches!(self.sup.state(), State::Steered)) {
             // Still refused. Nothing is recorded, so the moment the gate
             // opens the next tick acts — the interval paces attempts,
             // not the waiting.
@@ -1389,6 +1400,8 @@ mod tests {
         /// gate ever being consulted.
         steer_permitted: bool,
         steer_gate_reads: usize,
+        /// What each gate read was told about the supervisor's state.
+        steer_gate_steered: Vec<bool>,
         /// Whether the FIB reads empty. Default `false`: a populated
         /// table is the ordinary case every other test assumes.
         fib_empty: bool,
@@ -1470,8 +1483,9 @@ mod tests {
                 Ok(())
             }
         }
-        fn steer_permitted(&mut self) -> bool {
+        fn steer_permitted(&mut self, steered: bool) -> bool {
             self.steer_gate_reads += 1;
+            self.steer_gate_steered.push(steered);
             self.steer_permitted
         }
         fn fib_empty(&mut self) -> bool {
@@ -3541,6 +3555,69 @@ mod tests {
         assert!(fx.calls.contains(&"steer"), "{:?}", fx.calls);
         assert_eq!(d.state(), State::Steered);
         assert!(!d.supervisor().steer_retry_pending(), "nothing outstanding");
+    }
+
+    /// The retry tells the gates whether a steer that LANDED is in place
+    /// (review finding, PR #333): from `Steered` with an addition held,
+    /// yes — the first-steer FIB gate is then not applied, as the lever
+    /// does not apply it to a port already steered. From `Ready`, no:
+    /// a refused first steer, and equally one whose rollback left rules
+    /// it could not delete, which `is_steered` alone cannot tell apart
+    /// from a port that was steering.
+    #[test]
+    fn the_retry_tells_the_gates_whether_a_landed_steer_is_in_place() {
+        let t0 = Instant::now();
+        let mut d = Driver::new();
+        let mut fx = Fx::default();
+        let mut w = World {
+            api: true,
+            batches: 1,
+            ..Default::default()
+        };
+        refused_canary(t0, &mut d, &mut w, &mut fx);
+        for ms in (100..5_000).step_by(500) {
+            d.tick(at(t0, ms), &mut w, &mut fx);
+        }
+        assert!(
+            !w.steer_gate_steered.is_empty() && w.steer_gate_steered.iter().all(|s| !s),
+            "a refused first steer: {:?}",
+            w.steer_gate_steered
+        );
+
+        // Debris: steered as a fact, `Ready` as a state.
+        d.inject(
+            at(t0, 5_000),
+            Event::SteerFailed { rules_remain: true },
+            &mut fx,
+        );
+        assert!(d.supervisor().is_steered() && d.state() == State::Ready);
+        w.steer_gate_steered.clear();
+        for ms in (5_100..10_000).step_by(500) {
+            d.tick(at(t0, ms), &mut w, &mut fx);
+        }
+        assert!(
+            !w.steer_gate_steered.is_empty() && w.steer_gate_steered.iter().all(|s| !s),
+            "debris is not a steer that landed: {:?}",
+            w.steer_gate_steered
+        );
+
+        // The steer lands, and a later addition is held.
+        fx.steer_fails = false;
+        w.steer_permitted = true;
+        d.tick(at(t0, 10_000), &mut w, &mut fx);
+        assert_eq!(d.state(), State::Steered);
+        d.inject(at(t0, 11_000), Event::SteerHeld, &mut fx);
+        assert_eq!(d.state(), State::Steered);
+        w.steer_permitted = false;
+        w.steer_gate_steered.clear();
+        for ms in (41_000..50_000).step_by(500) {
+            d.tick(at(t0, ms), &mut w, &mut fx);
+        }
+        assert!(
+            !w.steer_gate_steered.is_empty() && w.steer_gate_steered.iter().all(|s| *s),
+            "a held addition over rules that landed: {:?}",
+            w.steer_gate_steered
+        );
     }
 
     /// A steer that keeps failing under an open gate must not be

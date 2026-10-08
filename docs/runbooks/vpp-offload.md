@@ -809,15 +809,25 @@ rule the same change would have removed. A removal that cannot wait
 for the hold goes on its own: apply it in a change that adds nothing.
 
 **A hold is not a failure.** Nothing was attempted, so nothing rolled
-back and nothing moved: a box already steered stays in `steered`
-(`packetframe_vpp_state{state="steered"}` and `packetframe_vpp_steered`
-do not change), and the journal and event log record a `steer_held` event —
-never `steer_failed`, which would say traffic is on the eBPF tier while
-it is still on VPP. `packetframe reconfigure` still answers with the
-hold's words rather than OK, so a canary ladder does not read a held
-rung as taken. The module's retry re-attempts the held change from
-`steered` as it does from `ready`; a `steer off`, an emptied table or a
-VPP death in the meantime unsteers exactly as it would without one.
+back and nothing moved: a port already steered keeps its rules and its
+traffic on VPP (`packetframe_vpp_steered` stays `1`), and the journal
+and event log record a `steer_held` event — never `steer_failed`, which
+would say traffic is on the eBPF tier while it is still on VPP. A
+change held over a box in `steered` leaves it in `steered`. The one
+exception is the re-assert a convergence makes over a steered
+adoption: that runs from `ready`, as every re-assert does until it
+lands, so if it is held (rare — rules with no recorded plan, a changed
+receive MAC, rules a readback found wiped) `packetframe_vpp_state` reads
+`ready` while `packetframe_vpp_steered` reads `1` and traffic is on
+VPP, until the retry lands it; the `steering` row names the hold either
+way. `packetframe reconfigure` still answers with the hold's words
+rather than OK, so a canary ladder does not read a held rung as taken.
+The module's retry re-attempts the held change from `steered` as it
+does from `ready`, and over rules a steer landed it skips the
+first-steer FIB gate (unresolvable, withheld, unexempted kernel-delivered
+or still-installing routes), as the lever does for a port already
+steered. A `steer off`, an emptied table or a VPP death in the meantime
+unsteers exactly as it would without one.
 
 **When it refuses**, the want is remembered, as for every other gate,
 and what clears it depends on the half that refused:
@@ -875,7 +885,8 @@ steering     DEGRADED — steering intended but not in place — ... Held now be
 With ports already steered, the steering row instead reads `DEGRADED —
 a steering change that diverts more traffic onto VPP is held because ….
 The rules already installed stay as they are and keep forwarding; …`
-while the state stays `steered` — and on a mismatch every one of these
+— the state stays `steered`, or `ready` for a convergence's held
+re-assert — and on a mismatch every one of these
 lines says that waiting does not clear it. Each held attempt is a
 `steer_held` event in the event log, with the reason and whether rules
 were already steering.
@@ -3301,7 +3312,7 @@ The [first-steer
 hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table),
 on a first steer or on a change that adds a port, prefix or direction to
 ports already steered, or drops an exemption from one (those keep their
-rules meanwhile, and stay `steered`). The want is
+rules and their traffic on VPP meanwhile). The want is
 remembered and, except after a mismatch, the steer lands on its own once
 the hold clears; `packetframe reconfigure` re-asks at once but cannot
 clear it faster. The same reason is on the `steering` row (`Held now

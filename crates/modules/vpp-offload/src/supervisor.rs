@@ -411,12 +411,15 @@ pub enum Event {
     /// onto VPP from the NIC (`runtime::SteerOutcome::Held`).
     ///
     /// NOT a failure, and the difference is the state: nothing was
-    /// attempted, so nothing rolled back and nothing moved. A steered port
-    /// stays `Steered` with its traffic on VPP — reported as
+    /// attempted, so nothing rolled back and nothing moved. A port in
+    /// `Steered` stays there with its traffic on VPP — reported as
     /// `SteerFailed` it went to `Ready`, the steered-state gauge dropped,
     /// and the journal said traffic was on the eBPF tier while it was not
-    /// (review finding, PR #333). The want is kept, and the addition is
-    /// remembered as held so the retry re-attempts it from `Steered` too
+    /// (review finding, PR #333). One held from `Ready` stays in `Ready`,
+    /// `steered` untouched: a convergence's re-assert over a steered
+    /// adoption waits there for its acknowledgement, as every re-assert
+    /// does. The want is kept, and the addition is remembered as held so
+    /// the retry re-attempts it from `Steered` too
     /// ([`Supervisor::steer_retry_pending`]).
     SteerHeld,
     /// MCAM rules are confirmed removed.
@@ -1069,9 +1072,10 @@ impl Supervisor {
                 vec![]
             }
             // The steer was held before the NIC: nothing moved, so neither
-            // does the state — a steered port stays `Steered` over traffic
-            // still on VPP. The want is kept, and the addition marked held
-            // so the retry acts from `Steered` as it does from `Ready`.
+            // does the state — `Steered` stays `Steered` over traffic still
+            // on VPP, and `Ready` stays `Ready` with `steered` as it was.
+            // The want is kept, and the addition marked held so the retry
+            // acts from `Steered` as it does from `Ready`.
             (Ready | State::Steered, SteerHeld) => {
                 self.steer_wanted = true;
                 self.addition_held = true;
@@ -1421,9 +1425,9 @@ mod tests {
         s
     }
 
-    /// A held steer is not a failure (review finding, PR #333): over a
-    /// port already steered the state stays `Steered` with traffic on
-    /// VPP, the addition is remembered so the retry re-pulls the lever
+    /// A held steer is not a failure (review finding, PR #333): from
+    /// `Steered` the state stays `Steered` with traffic on VPP, the
+    /// addition is remembered so the retry re-pulls the lever
     /// from `Steered`, and every way out of steering still behaves as
     /// it does for a port that is simply steered.
     #[test]

@@ -806,7 +806,7 @@ impl StatusSnapshot {
 
     /// The first-steer hold standing over a change to ports ALREADY
     /// steered: the supervisor recorded the addition as held
-    /// (`Event::SteerHeld`, state left `Steered`), and the hold still
+    /// (`Event::SteerHeld`, state left where it was), and the hold still
     /// answers for it. One reading for the steering row and `nominal`.
     fn held_addition(&self) -> Option<&crate::runtime::SteerHold> {
         self.steer_addition_held
