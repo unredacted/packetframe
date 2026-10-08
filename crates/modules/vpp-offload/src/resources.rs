@@ -404,10 +404,14 @@ impl ResourceState {
     /// fresh `state-dir` group-writable for [`Self::load`] to refuse at
     /// the next attach.
     ///
-    /// The loader only creates state-dir when it saves the pin registry
-    /// AFTER attach, so on a first run — or a config where vpp-offload
-    /// attaches before any module that writes there — the directory may
-    /// not exist yet; the walk makes it.
+    /// `state-dir` may not exist yet. On a first run it is made by
+    /// whichever writer reaches it first: the event log's writer thread
+    /// (at the default `event-log` path), a module earlier in config
+    /// order (fast-path's anyip lock and `tc-links.json` during its
+    /// attach, then the loader's pin-registry save after it; neigh-snoop's
+    /// load, probing the default `persist-dir`), or this save. The
+    /// loader's pid file is written only after every module has attached.
+    /// The walk makes the directory when it is still missing.
     pub fn save(&self, state_dir: &Path) -> Result<(), String> {
         let path = Self::path_in(state_dir);
         let body = serde_json::to_string_pretty(self).expect("state serializes");
