@@ -19,12 +19,15 @@ pub struct WatchStatus {
     /// Times the kernel reported link notifications lost to a full
     /// receive buffer (`ENOBUFS`). One report stands for any number.
     pub overruns: u64,
-    /// Link-table re-reads after lost notifications, completed and failed.
+    /// Recoveries from lost notifications: `ok` once a re-read's links
+    /// are all in the redirect maps, `failed` for each dump that failed.
     pub resyncs_ok: u64,
     pub resyncs_failed: u64,
-    /// Notifications were lost and no completed re-read covers them yet.
+    /// Notifications were lost and the maps are not known to be current
+    /// yet: no re-read has covered them, or its links are not all in.
     pub resync_pending: bool,
-    /// Why the last re-read failed; cleared by one that succeeds.
+    /// Why the recovery has not finished: the dump failed, or some links
+    /// it found are not admitted yet. Cleared by a completed recovery.
     pub last_resync_error: Option<String>,
 }
 
@@ -46,7 +49,7 @@ impl WatchStatus {
                 self.overruns
             );
             if let Some(e) = &self.last_resync_error {
-                let _ = write!(m, "; the last re-read failed (retrying): {e}");
+                let _ = write!(m, "; not recovered yet (retrying): {e}");
             }
             (HealthState::Degraded, m)
         } else {
@@ -96,7 +99,7 @@ impl WatchStatus {
         );
         let _ = writeln!(
             out,
-            "# HELP packetframe_redirect_watch_resyncs_total link-table re-reads after lost notifications, by outcome"
+            "# HELP packetframe_redirect_watch_resyncs_total recoveries from lost link notifications (ok: every re-read link in the redirect maps; failed: a dump that failed)"
         );
         let _ = writeln!(
             out,
@@ -142,7 +145,7 @@ mod tests {
         assert_eq!(s.subsystem_health().state, HealthState::Degraded);
         s.last_resync_error = Some("link dump: no reply within 30s".into());
         let m = s.subsystem_health().message.unwrap();
-        assert!(m.contains("the last re-read failed"), "{m}");
+        assert!(m.contains("not recovered yet"), "{m}");
         assert!(m.contains("no reply within 30s"), "{m}");
     }
 

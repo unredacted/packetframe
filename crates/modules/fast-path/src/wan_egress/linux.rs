@@ -40,7 +40,7 @@ pub enum WanEgressError {
     #[error("removed {removed} rules, then stopped: {first}")]
     Incomplete { removed: usize, first: String },
     #[error(
-        "no netlink reply within {}s; the pass was abandoned where it stood and is retried",
+        "no netlink reply within {}s; abandoned where it stood",
         .0.as_secs()
     )]
     TimedOut(Duration),
@@ -433,8 +433,12 @@ async fn retire_pass(shared: &Shared, memory: &mut PassMemory) -> Result<usize, 
             warn!(error = %e, "wan-egress: rule removal incomplete; retrying every pass");
         }
     }
+    // Retired is an observation (the removal finished): none remain. A
+    // removal that stopped leaves an unknown number.
+    let present = matches!(condition, Condition::Retired).then_some(0);
     *status = Status {
         condition,
+        present,
         last_converged: status.last_converged,
         ..Status::default()
     };
@@ -480,7 +484,7 @@ async fn run_pass(shared: &Shared) {
                 info!(rule = %r, "wan-egress: rule removed");
             }
             next.desired = report.desired;
-            next.present = report.present;
+            next.present = Some(report.present);
             match report.layout {
                 Err(why) => next.condition = Condition::Refused(why),
                 Ok(layout) => {
@@ -518,7 +522,7 @@ async fn run_pass(shared: &Shared) {
     if next.condition != prev.condition {
         match &next.condition {
             Condition::Converged => info!(
-                rules = next.present,
+                rules = ?next.present,
                 layout = ?next.layout,
                 "wan-egress: policy rules in place"
             ),

@@ -111,7 +111,12 @@ pub struct RedirectTargetWatcher {
     refresh_now: Arc<tokio::sync::Notify>,
     /// Written by the watcher thread, read by the status row.
     status: Arc<Mutex<WatchStatus>>,
+    /// Test hook, see [`Self::stall_reader`].
+    stall: tokio::sync::mpsc::UnboundedSender<Stall>,
 }
+
+/// How long to block the watcher's thread, and where to say it has begun.
+type Stall = (Duration, std::sync::mpsc::SyncSender<()>);
 
 impl RedirectTargetWatcher {
     /// Spawn the watcher thread. `directives` are the module's, for
@@ -154,6 +159,7 @@ impl RedirectTargetWatcher {
         let wake = Arc::clone(&refresh_now);
         let status = Arc::new(Mutex::new(WatchStatus::default()));
         let theirs = Arc::clone(&status);
+        let (stall, stalls) = tokio::sync::mpsc::unbounded_channel();
         let thread = std::thread::Builder::new()
             .name("pf-redirect-watch".into())
             .spawn(move || {
@@ -167,7 +173,9 @@ impl RedirectTargetWatcher {
                         return;
                     }
                 };
-                rt.block_on(run(root, token, shared, wake, rx_ports, rcvbuf, theirs));
+                rt.block_on(run(
+                    root, token, shared, wake, rx_ports, rcvbuf, theirs, stalls,
+                ));
             })?;
         Ok(Self {
             shutdown,
@@ -175,7 +183,23 @@ impl RedirectTargetWatcher {
             directives,
             refresh_now,
             status,
+            stall,
         })
+    }
+
+    /// Test hook: block the watcher's thread for `d`, returning once the
+    /// block has begun. The thread also drives the subscription's socket,
+    /// so nothing reads it meanwhile, and link changes made inside the
+    /// window overrun a shrunk buffer deterministically. Panics if the
+    /// watcher is not running.
+    #[doc(hidden)]
+    pub fn stall_reader(&self, d: Duration) {
+        let (began, wait) = std::sync::mpsc::sync_channel(1);
+        self.stall
+            .send((d, began))
+            .expect("the watcher is not running");
+        wait.recv_timeout(Duration::from_secs(10))
+            .expect("the watcher did not take the stall");
     }
 
     /// A watcher whose thread could not be spawned. Nothing follows the
@@ -191,6 +215,7 @@ impl RedirectTargetWatcher {
                 stopped: Some(why),
                 ..WatchStatus::default()
             })),
+            stall: tokio::sync::mpsc::unbounded_channel().0,
         }
     }
 
@@ -470,6 +495,11 @@ struct Pending {
     resync: bool,
     /// A failed re-read is not retried before this.
     resync_not_before: Option<Instant>,
+    /// What the last completed re-read found qualifying, until every one
+    /// of them is in both redirect maps (or gone). Reading the table is
+    /// half of a recovery; the admissions it queues are the other half,
+    /// and they can be held (an untranslated VLAN) or fail (a map write).
+    recovering: Option<Vec<u32>>,
 }
 
 impl Pending {
@@ -530,15 +560,29 @@ async fn dump_links() -> Result<Vec<LinkMessage>, String> {
     }
 }
 
+/// The links a re-read found qualifying that are still not redirect
+/// targets: alive, and missing from either map.
+fn unrecovered(
+    recovering: &[u32],
+    in_devmap: &HashSet<u32>,
+    in_tc: &HashSet<u32>,
+    exists: impl Fn(u32) -> bool,
+) -> Vec<u32> {
+    recovering
+        .iter()
+        .copied()
+        .filter(|i| !(in_devmap.contains(i) && in_tc.contains(i)) && exists(*i))
+        .collect()
+}
+
 /// Re-read the link table after lost notifications (see the module
-/// docs). Returns how many links qualify (each queued; admission skips
+/// docs). Returns the links that qualify (each queued; admission skips
 /// what is already in) and how many were evicted.
-async fn resync(targets: &mut Targets, pending: &mut Pending) -> Result<(usize, usize), String> {
+async fn resync(targets: &mut Targets, pending: &mut Pending) -> Result<(Vec<u32>, usize), String> {
     let links = dump_links().await?;
     let known: HashSet<u32> = targets.in_devmap.union(&targets.in_tc).copied().collect();
     let plan = resync_plan(&links, &known);
-    let queued = plan.admit.len();
-    for ifindex in plan.admit {
+    for &ifindex in &plan.admit {
         if !pending.admit.contains(&ifindex) {
             pending.admit.push(ifindex);
         }
@@ -553,7 +597,7 @@ async fn resync(targets: &mut Targets, pending: &mut Pending) -> Result<(usize, 
             evicted += 1;
         }
     }
-    Ok((queued, evicted))
+    Ok((plan.admit, evicted))
 }
 
 /// The kernel dropped link notifications on the full buffer (netlink-
@@ -580,13 +624,14 @@ async fn run_resync(targets: &mut Targets, pending: &mut Pending, status: &Mutex
     let mut s = status.lock().unwrap_or_else(PoisonError::into_inner);
     match result {
         Ok((viable, evicted)) => {
-            s.resyncs_ok += 1;
-            s.last_resync_error = None;
             pending.resync_not_before = None;
             info!(
-                viable,
+                viable = viable.len(),
                 evicted, "redirect-target watcher: link table re-read after lost notifications"
             );
+            // Counted as a recovery only once the refresh that follows
+            // has admitted them ([`settle_recovery`]).
+            pending.recovering = Some(viable);
         }
         Err(e) => {
             s.resyncs_failed += 1;
@@ -596,7 +641,42 @@ async fn run_resync(targets: &mut Targets, pending: &mut Pending, status: &Mutex
             pending.resync_not_before = Some(Instant::now() + RESYNC_RETRY);
         }
     }
-    s.resync_pending = pending.resync;
+    s.resync_pending = pending.resync || pending.recovering.is_some();
+}
+
+/// After a refresh: is every link the last re-read found qualifying in
+/// both maps now? Then the recovery is complete and counted. If not, the
+/// stragglers are queued again and retried on the failed re-read's pace,
+/// and the status row keeps saying the maps are not current.
+fn settle_recovery(targets: &Targets, pending: &mut Pending, status: &Mutex<WatchStatus>) {
+    let Some(recovering) = pending.recovering.take() else {
+        return;
+    };
+    let left = unrecovered(
+        &recovering,
+        &targets.in_devmap,
+        &targets.in_tc,
+        ifindex_exists,
+    );
+    let mut s = status.lock().unwrap_or_else(PoisonError::into_inner);
+    if left.is_empty() {
+        s.resyncs_ok += 1;
+        s.last_resync_error = None;
+    } else {
+        for &ifindex in &left {
+            if !pending.admit.contains(&ifindex) {
+                pending.admit.push(ifindex);
+            }
+        }
+        s.last_resync_error = Some(format!(
+            "{} links from the re-read are not in the redirect maps yet (VLAN translation \
+             held or a map write failed)",
+            left.len()
+        ));
+        pending.due_by(Instant::now() + RESYNC_RETRY);
+        pending.recovering = Some(left);
+    }
+    s.resync_pending = pending.resync || pending.recovering.is_some();
 }
 
 /// Record why the watcher ended, for the status row, and log it.
@@ -611,6 +691,8 @@ fn stopped(status: &Mutex<WatchStatus>, why: String) {
         .stopped = Some(why);
 }
 
+// The thread's whole state arrives here once, from `start_with_rcvbuf`.
+#[allow(clippy::too_many_arguments)]
 async fn run(
     root: PathBuf,
     shutdown: CancellationToken,
@@ -619,6 +701,7 @@ async fn run(
     rx_ports: Vec<(String, u32)>,
     rcvbuf: usize,
     status: Arc<Mutex<WatchStatus>>,
+    mut stalls: tokio::sync::mpsc::UnboundedReceiver<Stall>,
 ) {
     // Subscribe BEFORE the reconcile so a link that changes during the
     // reconcile is replayed from the socket buffer afterwards instead
@@ -681,9 +764,20 @@ async fn run(
             },
             _ = async { tokio::time::sleep_until(due.unwrap_or_else(Instant::now)).await }, if due.is_some() => {
                 if pending.resync_due(Instant::now()) {
-                    run_resync(&mut targets, &mut pending, &status).await;
+                    // The one await here that can be long (a dump, up to
+                    // its 30 s bound): `detach` joins this thread before it
+                    // removes the pins, inside its budget.
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => {
+                            debug!("redirect-target watcher shutdown during a re-read");
+                            return;
+                        }
+                        _ = run_resync(&mut targets, &mut pending, &status) => {}
+                    }
                 }
                 refresh(&mut targets, &mut pending, &directives);
+                settle_recovery(&targets, &mut pending, &status);
                 if pending.resync {
                     // Owed but not yet retried (it failed, or is paced):
                     // keep the refresh coming round for it.
@@ -695,6 +789,12 @@ async fn run(
                 // A SIGHUP changed the directives; converge on them
                 // after whatever refresh may just have run.
                 pending.touch();
+            }
+            Some((d, began)) = stalls.recv() => {
+                // Test hook (`stall_reader`): block the whole thread, the
+                // subscription's socket reader with it.
+                let _ = began.send(());
+                std::thread::sleep(d);
             }
         }
     }
@@ -847,6 +947,20 @@ mod tests {
             }
         );
         assert_eq!(resync_plan(&[], &HashSet::new()), ResyncPlan::default());
+    }
+
+    /// A recovery is done only when what the re-read found qualifying is
+    /// in both maps: a link held out of either (an untranslated VLAN, a
+    /// failed insert) keeps it open; one deleted since does not.
+    #[test]
+    fn a_recovery_waits_for_both_maps() {
+        let devmap: HashSet<u32> = [7, 8].into();
+        let alive = |i: u32| i != 9;
+        let tc: HashSet<u32> = [7].into();
+        assert_eq!(unrecovered(&[7, 8, 9], &devmap, &tc, alive), vec![8]);
+        let tc: HashSet<u32> = [7, 8].into();
+        assert!(unrecovered(&[7, 8, 9], &devmap, &tc, alive).is_empty());
+        assert!(unrecovered(&[], &devmap, &tc, alive).is_empty());
     }
 
     /// A watcher that never ran is reported as stopped, not left out.

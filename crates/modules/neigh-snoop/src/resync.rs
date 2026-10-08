@@ -46,9 +46,13 @@ impl Resync {
                 .is_none_or(|t| now.saturating_duration_since(t) >= RESYNC_MIN_INTERVAL)
     }
 
-    /// A re-read is starting. It covers every loss reported until now; a
-    /// loss reported from here on happened (or may have happened) after
-    /// its dumps began, so it is owed a re-read of its own.
+    /// A re-read is starting. It covers every loss reported until now.
+    /// Completed, it also replaces the subscription, dropping the old one
+    /// with all it still held — including messages queued before a loss,
+    /// which replayed after the dumps would undo them — so a loss reported
+    /// from here on comes from the fresh subscription, may postdate the
+    /// dumps, and is owed a re-read of its own. A failed one leaves the
+    /// old subscription and is owed again ([`Self::finish`]).
     pub fn start(&mut self, now: Instant) {
         self.last_attempt = Some(now);
         self.pending = false;

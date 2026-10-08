@@ -35,8 +35,6 @@ use std::time::{Duration, Instant, SystemTime};
 use futures::StreamExt;
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::RouteNetlinkMessage;
-use rtnetlink::sys::AsyncSocket;
-use rtnetlink::{new_multicast_connection, MulticastGroup};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -297,6 +295,9 @@ struct Engine {
     requests: Requests,
     /// Lost multicast notifications and the re-reads that make them good.
     resync: Resync,
+    /// What each subscription asks for as its receive buffer; a re-read
+    /// opens a fresh one ([`Self::resync`]).
+    multicast_rcvbuf: usize,
     frame_tx: mpsc::Sender<EngineMsg>,
     install_tx: mpsc::Sender<InstallJob>,
     persist_tx: mpsc::Sender<PersistJob>,
@@ -548,22 +549,8 @@ impl Engine {
         // 2. Subscribe BEFORE dumping: events raised during the dumps
         //    queue on the socket and replay through the loop, and every
         //    handler is last-write-wins, so nothing is lost in between.
-        //    Route groups are deliberately absent (1M-route churn).
-        let groups = [
-            MulticastGroup::Link,
-            MulticastGroup::Neigh,
-            MulticastGroup::Ipv4Ifaddr,
-            MulticastGroup::Ipv6Ifaddr,
-        ];
-        let (mut mconn, _mhandle, messages) = new_multicast_connection(&groups)
+        let messages = netlink::subscribe(multicast_rcvbuf)
             .map_err(|e| format!("netlink multicast subscription: {e}"))?;
-        // Not fatal: the default buffer still works, and an overrun is
-        // recovered from either way; a bigger one just overruns less.
-        match netlink::raise_rcvbuf(mconn.socket_mut().socket_mut(), multicast_rcvbuf) {
-            Ok(granted) => debug!(granted, "netlink multicast receive buffer"),
-            Err(e) => warn!(error = %e, "could not raise the netlink multicast receive buffer"),
-        }
-        tokio::spawn(mconn);
         let requests = Requests::new().map_err(|e| format!("netlink unicast connection: {e}"))?;
         let install_requests =
             Requests::new().map_err(|e| format!("netlink unicast connection (installer): {e}"))?;
@@ -577,6 +564,7 @@ impl Engine {
             mirror: KernelMirror::default(),
             requests,
             resync: Resync::default(),
+            multicast_rcvbuf,
             frame_tx,
             install_tx,
             persist_tx,
@@ -751,12 +739,37 @@ impl Engine {
     /// shows our MAC in a usable state; one the dump does not show stays
     /// in flight, for its echo or its confirmation window, as before.
     ///
-    /// A bridge whose rows the kernel dropped or changed unheard is
-    /// re-seeded, as a bring-up would be: a bounce whose down *and* up
-    /// were both lost flushed its neighbours with no event left to say
-    /// so, and on a fabric that drops our broadcasts nothing else puts
-    /// them back until each participant happens to speak again.
-    async fn resync(&mut self) -> Result<(), String> {
+    /// A bridge any of whose rows changed unheard — dropped, changed, or
+    /// appeared — is re-seeded, as a bring-up would be: a bounce whose
+    /// down *and* up were both lost flushed its neighbours with no event
+    /// left to say so, a row that appeared unheard may be a learned
+    /// address the kernel holds FAILED or with another MAC, and on a
+    /// fabric that drops our broadcasts nothing else repairs either until
+    /// each participant happens to speak again. The seed's install
+    /// decision is what spares rows that are already usable, and it
+    /// never overrides a MAC the kernel has confirmed.
+    ///
+    /// The re-read opens a fresh subscription *before* its dumps and
+    /// returns it, for the caller to swap in and drop the old one. After
+    /// an overflow the kernel reports ENOBUFS first and then delivers what
+    /// was queued before the loss, so the old socket can still hold
+    /// messages older than the ones it dropped; replayed after the dumps
+    /// they would undo them (a NEWNEIGH older than a lost DELNEIGH puts a
+    /// flushed entry back as resolved, for good). Everything the old
+    /// socket still holds predates the dumps, and everything since the
+    /// new subscription began is on the new one.
+    ///
+    /// A dump taken during churn can skip a live entry (dumps resume by
+    /// position, and a deletion ahead of the cursor moves an entry back
+    /// past it), so absence is confirmed before it is acted on: a
+    /// configured bridge missing from the link dump is gone only if its
+    /// name no longer resolves, and a row is dropped from the mirror only
+    /// if neither of two dumps holds it. A row deleted between the two is
+    /// kept until its delete, which the fresh subscription carries,
+    /// replays after the swap.
+    async fn resync(&mut self) -> Result<Messages, String> {
+        let messages = netlink::subscribe(self.multicast_rcvbuf)
+            .map_err(|e| format!("fresh netlink subscription: {e}"))?;
         let links = self.dump_links().await?;
         for bi in 0..self.bridges.len() {
             let name = self.bridges[bi].cfg.name.clone();
@@ -765,11 +778,13 @@ impl Engine {
                 .find(|l| l.name.as_deref() == Some(name.as_str()))
             {
                 Some(l) => self.on_link(l.clone()).await,
-                None => {
-                    if let Some(ifindex) = self.bridges[bi].ifindex {
-                        self.on_link_gone(ifindex);
+                None => match (self.bridges[bi].ifindex, netlink::ifindex_of(&name)) {
+                    (Some(ifindex), None) => self.on_link_gone(ifindex),
+                    (Some(_), Some(_)) => {
+                        debug!(bridge = %name, "bridge missing from the link dump but present; kept");
                     }
-                }
+                    (None, _) => {}
+                },
             }
         }
         let tracked: Vec<(usize, u32)> = self
@@ -779,10 +794,18 @@ impl Engine {
             .filter_map(|(bi, b)| b.ifindex.map(|ifi| (bi, ifi)))
             .collect();
         if tracked.is_empty() {
-            return Ok(());
+            return Ok(messages);
         }
-        let addrs = self.dump_addrs().await?;
-        let neighs = self.dump_neighs().await?;
+        let mut addrs = self.dump_addrs().await?;
+        addrs.extend(self.dump_addrs().await?);
+        let mut neighs: HashMap<(u32, IpAddr), MirrorEntry> = HashMap::new();
+        for (ifindex, ip, e) in self.dump_neighs().await? {
+            neighs.insert((ifindex, ip), e);
+        }
+        // The later dump wins where both hold a row.
+        for (ifindex, ip, e) in self.dump_neighs().await? {
+            neighs.insert((ifindex, ip), e);
+        }
         for (bi, ifindex) in tracked {
             self.bridges[bi].own_addrs = addrs
                 .iter()
@@ -793,8 +816,8 @@ impl Engine {
                 ifindex,
                 neighs
                     .iter()
-                    .filter(|(i, _, _)| *i == ifindex)
-                    .map(|(_, ip, e)| (*ip, *e)),
+                    .filter(|((i, _), _)| *i == ifindex)
+                    .map(|((_, ip), e)| (*ip, *e)),
             );
             // Only a usable entry holding our MAC confirms: an install
             // still queued can find the kernel holding that MAC in FAILED,
@@ -825,11 +848,11 @@ impl Engine {
                     "neighbour mirror re-read after lost notifications"
                 );
             }
-            if b.up && (delta.removed > 0 || delta.changed > 0) {
+            if b.up && !delta.is_empty() {
                 self.seed(bi, Instant::now());
             }
         }
-        Ok(())
+        Ok(messages)
     }
 
     fn publish_coverage_params(&self) {
@@ -866,8 +889,20 @@ impl Engine {
                     self.shutdown();
                     return;
                 }
+                // The two handlers that await netlink race the cancel:
+                // a dump in flight (bounded, but at 30 s) must not keep
+                // detach past its budget, nor the final persist on the
+                // way out from running. Cut short, the loop comes round
+                // to the cancel arm above.
                 next = messages.next() => match next {
-                    Some((pkt, _)) => self.on_netlink(pkt).await,
+                    Some((pkt, _)) => {
+                        let cancel = self.cancel.clone();
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {}
+                            _ = self.on_netlink(pkt) => {}
+                        }
+                    }
                     None => {
                         warn!("netlink multicast stream closed; neigh-snoop engine stopping");
                         self.fail_terminal("netlink multicast stream closed; engine stopped");
@@ -885,7 +920,21 @@ impl Engine {
                     }
                 }
                 _ = install_tick.tick() => self.install_one(),
-                _ = housekeeping.tick() => self.housekeeping().await,
+                _ = housekeeping.tick() => {
+                    let cancel = self.cancel.clone();
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {}
+                        fresh = self.housekeeping() => {
+                            // A completed re-read's subscription replaces
+                            // the old one, and whatever the old one still
+                            // held goes with it (see `resync`).
+                            if let Some(fresh) = fresh {
+                                messages = fresh;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1587,17 +1636,25 @@ impl Engine {
 
     // --- housekeeping ----------------------------------------------------
 
-    async fn housekeeping(&mut self) {
+    /// Returns the fresh subscription of a re-read that completed, for the
+    /// run loop to swap in.
+    async fn housekeeping(&mut self) -> Option<Messages> {
+        let mut fresh = None;
         // First, so an install whose echo was lost is confirmed from the
         // re-read before the expiry below calls it unconfirmed.
         if self.resync.due(Instant::now()) {
             self.resync.start(Instant::now());
-            let result = self.resync().await;
-            match &result {
-                Ok(()) => info!("netlink re-read complete; kernel mirror current"),
-                Err(e) => warn!(error = %e, "netlink re-read failed; retrying"),
+            match self.resync().await {
+                Ok(messages) => {
+                    info!("netlink re-read complete; kernel mirror current");
+                    fresh = Some(messages);
+                    self.resync.finish(Ok(()));
+                }
+                Err(e) => {
+                    warn!(error = %e, "netlink re-read failed; retrying");
+                    self.resync.finish(Err(e));
+                }
             }
-            self.resync.finish(result);
         }
         let now = Instant::now();
         self.ticks += 1;
@@ -1669,6 +1726,7 @@ impl Engine {
                 );
             }
         }
+        fresh
     }
 
     fn request_persist(&mut self, bi: usize, now: Instant) {

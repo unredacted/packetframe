@@ -304,17 +304,21 @@ session has never been up from their side).
   (paced to one every 5 s), the neighbour mirror can hold flushed
   entries as resolved: coverage reads too high, the gate keeps them as
   participants, and a re-seed skips them. The re-read replaces the
-  mirror's rows and re-seeds a bridge whose neighbours vanished or
-  changed unheard (`seed_total{outcome="requested"}` moves), since a
-  bounce whose down and up were both lost leaves no other trigger. The
-  row clears on its own when the re-read lands; "the last re-read
-  failed" names the dump that did not answer, and it is retried.
+  mirror's rows and re-seeds a bridge any of whose neighbour rows
+  vanished, changed or appeared unheard (`seed_total{outcome="requested"}`
+  moves), since a bounce whose down and up were both lost, or an entry
+  the kernel failed while nobody listened, leaves no other trigger; the
+  seed still never overrides a MAC the kernel has confirmed. The row
+  clears on its own when the re-read lands; "the last re-read failed"
+  names the dump that did not answer, and it is retried.
   `netlink_overruns_total` climbing steadily outside such events means
   the engine cannot keep up at all.
-- **`install_total{outcome="unconfirmed"}` with a WARN
-  `neighbour install unanswered`**: the kernel never answered the write
-  (30 s); it may still have landed, so it is counted only by whether
-  its echo arrives. The installer moves to a fresh connection.
+- **WARN `neighbour install unanswered`**: the kernel never answered the
+  write within 30 s. It may still have landed, so it is not counted as
+  failed: by then its 5 s confirmation window has long closed, and it
+  counted `install_total{outcome="confirmed"}` if its echo arrived in
+  that window and `unconfirmed` if not. The installer moves to a fresh
+  connection.
 - **`evictions` non-zero**: raise `table-max`.
 - **Persisted table ignored at start ("file is for bridge …")**: a
   JSON file was copied between bridges; delete it.
@@ -438,9 +442,18 @@ reaches new hosts, alongside `vppctl show errors | grep -i glean`.
   engine's dumps, the installer's writes and the coverage sampler's
   dumps each go on a unicast connection of their own. Every request is
   bounded (30 s; a coverage sample 120 s), and a connection whose
-  request went unanswered is replaced, because netlink-proto would
-  otherwise wait on that reply forever and the kernel refuses a new
-  dump on a socket with one still running.
+  request did not end in a clean reply (unanswered, refused, or cut off)
+  is not used again, because netlink-proto would otherwise wait on a lost
+  reply forever and the kernel refuses every later dump on a socket with
+  one still running.
+- A re-read after lost notifications opens a fresh subscription before
+  its dumps and replaces the old one with it once they are applied:
+  after an overflow the kernel still delivers what it had queued before
+  the loss, and replayed after the dumps those older messages would undo
+  them. Because a dump taken during churn can skip a live entry, a
+  bridge missing from the link dump is treated as gone only if its name
+  no longer resolves, and a neighbour row leaves the mirror only if two
+  consecutive dumps both lack it.
 - For IPv4 the kernel itself updates an *existing* neighbour entry from
   any ARP packet whose sender it already knows (one-second lock time),
   even a third-party request. The snooper's never-override rule

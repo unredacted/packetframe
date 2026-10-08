@@ -905,6 +905,140 @@ fn neighbours_flushed_unheard_are_re_read_and_re_seeded() {
     rig.stop();
 }
 
+/// `RTM_NEWNEIGH` setting each `(addr, mac)` STALE on `ifindex`, all in
+/// one `sendmsg`: the kernel applies them in one pass and emits every
+/// notification back to back, which a shrunk buffer cannot keep up with.
+/// (STALE because an entry created straight into FAILED or INCOMPLETE
+/// emits no notification at all.)
+fn neigh_stale_in_one_request(ifindex: u32, entries: &[(Ipv4Addr, [u8; 6])]) {
+    use netlink_packet_core::{NetlinkMessage, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST};
+    use netlink_packet_route::neighbour::{
+        NeighbourAddress, NeighbourAttribute, NeighbourMessage, NeighbourState,
+    };
+    use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+    use rtnetlink::sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
+
+    let mut sock = Socket::new(NETLINK_ROUTE).expect("netlink socket");
+    sock.bind_auto().expect("netlink bind");
+    sock.connect(&SocketAddr::new(0, 0))
+        .expect("netlink connect");
+    let mut buf = Vec::new();
+    for (seq, (a, mac)) in entries.iter().enumerate() {
+        let mut m = NeighbourMessage::default();
+        m.header.family = AddressFamily::Inet;
+        m.header.ifindex = ifindex;
+        m.header.state = NeighbourState::Stale;
+        m.attributes
+            .push(NeighbourAttribute::Destination(NeighbourAddress::Inet(*a)));
+        m.attributes
+            .push(NeighbourAttribute::LinkLayerAddress(mac.to_vec()));
+        let mut nl = NetlinkMessage::from(RouteNetlinkMessage::NewNeighbour(m));
+        nl.header.flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE;
+        nl.header.sequence_number = seq as u32 + 1;
+        nl.finalize();
+        let start = buf.len();
+        buf.resize(start + (nl.header.length as usize).next_multiple_of(4), 0);
+        nl.serialize(&mut buf[start..]);
+    }
+    let sent = sock.send(&buf, 0).expect("netlink send");
+    assert_eq!(sent, buf.len(), "one datagram, every request");
+}
+
+/// A neighbour row that appears unheard is acted on too. Every learned
+/// address is deleted with the engine listening (so the mirror holds no
+/// row for any of them), then one request puts them all back STALE with
+/// another MAC. Most of those notifications are lost to the shrunk
+/// buffer, so the re-read is the first the mirror hears of them: rows
+/// that *appeared*, none dropped or changed. They are repaired only if
+/// the re-read re-seeds on that; no frame arrives to repair them
+/// otherwise. A STALE entry holding another MAC is replaced only outside
+/// the 30 s holddown since our last install of it, so the test waits it
+/// out first.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn rows_that_appear_unheard_are_repaired() {
+    const N: u8 = 40;
+    let rig = Rig::start_with(Some(1));
+    let addr = |i: u8| v4(100 + i);
+    let mac = |i: u8| [0x02, 0, 0, 0, 0x02, i];
+    let other = |i: u8| [0x02, 0, 0, 0, 0x03, i];
+    for i in 0..N {
+        rig.inject(&arp_request(mac(i), mac(i), addr(i), v4(200)));
+    }
+    let learned = Instant::now();
+    wait_for(
+        Duration::from_secs(15),
+        "every learned address resolved in the mirror",
+        || {
+            let s = rig.snapshot();
+            let c = s.bridges[0].participant_coverage;
+            (c.total == u64::from(N) && c.resolved == u64::from(N)).then(|| format!("{s:?}"))
+        },
+    );
+
+    // One delete per request, paced, so every RTM_DELNEIGH is heard.
+    for i in 0..N {
+        ns_run(
+            &rig.names.netns,
+            &[
+                "ip",
+                "neigh",
+                "del",
+                &addr(i).to_string(),
+                "dev",
+                &rig.names.veth_a,
+            ],
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    wait_for(
+        Duration::from_secs(15),
+        "the deletes heard: no row and nothing owed",
+        || {
+            let s = rig.snapshot();
+            (s.bridges[0].participant_coverage.resolved == 0 && !s.netlink.resync_pending)
+                .then(|| format!("{s:?}"))
+        },
+    );
+    assert!(
+        neigh_table(&rig.names.netns, &rig.names.veth_a)
+            .lines()
+            .all(|l| (0..N).all(|i| !l.starts_with(&format!("{} ", addr(i))))),
+        "precondition: the kernel holds none of them"
+    );
+    // Out of the holddown (`DEFAULT_HOLDDOWN`, 30 s from the learn's
+    // installs), with margin.
+    let holddown_over = learned + Duration::from_secs(32);
+    std::thread::sleep(holddown_over.saturating_duration_since(Instant::now()));
+    let before = rig.snapshot();
+    assert!(!before.netlink.resync_pending, "{:?}", before.netlink);
+
+    let a_ifindex = if_nametoindex(&rig.names.veth_a);
+    let entries: Vec<(Ipv4Addr, [u8; 6])> = (0..N).map(|i| (addr(i), other(i))).collect();
+    neigh_stale_in_one_request(a_ifindex, &entries);
+    // The premise: the burst overflowed the buffer, so some of the rows
+    // reach the mirror only through the re-read.
+    rig.wait_counter("an overrun reported for the burst", |s| {
+        s.netlink.overruns > before.netlink.overruns
+    });
+    wait_for(
+        Duration::from_secs(15),
+        "every learned address re-seeded STALE with its learned MAC",
+        || {
+            let table = neigh_table(&rig.names.netns, &rig.names.veth_a);
+            let repaired = (0..N).all(|i| {
+                table.lines().any(|l| {
+                    l.starts_with(&format!("{} ", addr(i)))
+                        && l.contains(&mac_str(mac(i)))
+                        && l.contains("STALE")
+                })
+            });
+            repaired.then_some(table)
+        },
+    );
+    rig.stop();
+}
+
 // --- FRR gate + route-server coverage, against a stateful fake vtysh ---
 
 /// A `vtysh` stand-in that keeps the two prefix-lists in files, logs
