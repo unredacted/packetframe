@@ -82,6 +82,13 @@ Indicators that the PacketFrame FIB path is working:
   and not regaining it — see the triage entry below.
 - `packetframe status` shows `nexthops (incomplete)` and `nexthops
   (failed)` at or near zero once the table has converged.
+- The fast-path `neigh-resolver` row is healthy and its `last ok` age is a
+  few seconds; an idle resolver still makes progress every second.
+  `restarts 0` is the norm. Overruns, each matched by a resync, are not
+  faults: they are notifications the kernel dropped and the resolver
+  recovered. See the triage entry
+  [nexthops stuck `incomplete` while the kernel neighbour is
+  REACHABLE](#symptom-nexthops-stuck-incomplete-while-the-kernel-neighbour-is-reachable).
 - `pass_not_for_us` holds steady as a share of matched traffic. It
   counts allowlisted frames whose destination MAC is not one the router
   receives on at the ingress port: host-to-host frames the kernel is
@@ -423,6 +430,12 @@ Alongside the existing counter family, the textfile exporter emits:
 - `packetframe_nexthops_max`: configured NEXTHOPS capacity.
 - `packetframe_ecmp_groups_active`, `packetframe_ecmp_groups_max`.
 - `packetframe_fib_default_hash_mode`: 3/4/5-tuple.
+- `packetframe_fib_neigh_resolver_*`: the neighbour resolver's overruns,
+  resyncs, request timeouts and restarts (counters), whether a resolver
+  loop is running, its progress age, and how long it has been waiting on
+  the programmer (gauges). See the triage entry
+  [nexthops stuck `incomplete` while the kernel neighbour is
+  REACHABLE](#symptom-nexthops-stuck-incomplete-while-the-kernel-neighbour-is-reachable).
 
 Example alerts:
 
@@ -434,6 +447,15 @@ sum(packetframe_nexthops{state=~"resolved|incomplete|failed|stale"})
 
 # Nexthops whose traffic is on the kernel path.
 sum(packetframe_nexthops{state=~"incomplete|failed"}) > 0
+
+# The neighbour resolver is stuck, or not running at all. A wait on the
+# programmer also stops its progress, and is not its fault.
+(packetframe_fib_neigh_resolver_progress_age_seconds > 30
+  and packetframe_fib_neigh_resolver_programmer_wait_seconds == 0)
+  or packetframe_fib_neigh_resolver_running == 0
+
+# The daemon had to restart its neighbour resolver.
+increase(packetframe_fib_neigh_resolver_restarts_total[1h]) > 0
 
 # Unexpected forwarding-mode transition.
 changes(packetframe_fib_forwarding_mode{mode="packetframe-fib"}[5m]) > 0
@@ -1659,6 +1681,108 @@ journalctl -u packetframe | grep "router's own address (local)"
 
 vpp-offload counts the same routes as kernel-delivered, not unresolvable
 (see the vpp-offload runbook, "Kernel-delivered routes").
+
+### Symptom: nexthops stuck `incomplete` while the kernel neighbour is REACHABLE
+
+What it means: the kernel has resolved the nexthops, but the neighbour
+resolver is not passing that on, so the FIB holds them `incomplete` and
+every packet routed through them takes the kernel path. This is not the
+re-probe problem in the previous entry: there, the *kernel* has lost the
+neighbour. Here `ip neigh show <nexthop-ip> dev <device>` says REACHABLE
+(or STALE, PERMANENT) on the device the nexthop forwards out of, and the
+FIB still says `incomplete`.
+
+The fingerprint, from 2026-10-07 (a configuration apply toggled a member
+port and an IX bridge to flush routes, and the kernel flushed every
+neighbour on them):
+
+- `fib_no_neigh` (the `pass_no_neigh` rate) is close to the whole
+  matched rate, and `fwd_ok` is flat. Softirq load is high on every core
+  as the kernel path takes everything.
+- `packetframe status` shows a handful of `nexthops (resolved)` against
+  hundreds `incomplete`.
+- No `neighbour resolver stats` line in the journal for minutes; it is
+  normally logged every 10 s.
+- vpp-offload counts its routes as unresolvable ("no neighbour: the
+  kernel has not resolved it"), from the same source.
+- `/proc/net/netlink`: the resolver's multicast socket (protocol `0`,
+  groups `00000005`, which is RTNLGRP_LINK and RTNLGRP_NEIGH) shows a
+  large `Drops` count. The kernel dropped notifications on its full
+  receive buffer.
+
+How it happened, and what changed. The resolver's multicast socket
+overflowed during the neighbour flush. Its own requests (route lookups,
+neighbour kicks, read-backs) went over that same socket with no timeout.
+The kernel dropped one request's reply along with the notifications, the
+loop waited for it forever, and nothing noticed. The daemon now:
+
+- **Sends requests over a separate socket, and bounds each one**: 5 s for
+  a request, 10 s for a dump. A request that times out leaves its nexthop
+  to the programmer's next re-probe. Its socket is retired, and no new
+  one opens until the kernel has let go of the old one (a request blocked
+  on `rtnl_lock` holds a worker thread until the lock is released).
+- **Resyncs after an overrun.** When notifications are lost, it re-reads
+  the links, the neighbours and the bridge FDB about a second later (at
+  most one resync every 5 s) and announces what changed. Its multicast
+  receive buffer is also raised to 16 MiB, which makes overruns rarer.
+- **Restarts a stuck resolver itself.** A loop that exits with an error,
+  or makes no progress for 30 s outside a wait on the FIB programmer, is
+  dropped and replaced, with restarts backing off from 1 s to 60 s. The
+  new loop re-reads the kernel and announces what the old one missed.
+  After every resync and restart, the programmer re-probes every
+  unresolved nexthop at once instead of waiting out its backoff.
+
+**Read the `neigh-resolver` row in `packetframe status`.** It is present
+whenever the PacketFrame FIB control plane runs, and its `last ok` age is
+the loop's progress age; an idle loop still makes progress every second.
+
+| Row reads | Meaning |
+|---|---|
+| healthy, `running (incarnation N); last progress Ns ago; overruns …` | Working. Non-zero overruns with an equal number of resyncs are history. |
+| **unhealthy**, `no progress for …` | The loop is stuck right now. The supervisor restarts it after 30 s. During a long kernel `rtnl_lock` hold the whole control-plane runtime can stall, and this reads unhealthy until the lock is released, without a restart. |
+| **unhealthy**, `NOT RUNNING: the resolver <cause>; restart #N in …` | Between a failure and its restart. The cause names the error or the stall. |
+| degraded, `restarted … ago (restart #N): the previous loop …` | Recovered by a restart in the last 10 minutes. The text says why the old loop was replaced. |
+| degraded, `… notifications were lost … ago (socket overrun); a resync is pending` (or `the resync failed (…) and is retried`) | An overrun is not yet answered. A failed resync is retried every 5 s. |
+| degraded, `waiting … for the FibProgrammer to accept its events` | The **programmer** is not draining, for example during a route-ledger seed or a full-table load. Restarting the resolver cannot help, so it is not restarted. If this lasts, the programmer is the problem. |
+| degraded, `the request socket was retired … ago and the kernel still holds it` | A request timed out and its socket is blocked in the kernel, typically on `rtnl_lock`. Proactive probes are skipped until it is released, and the programmer re-probes later. |
+
+The same numbers, as textfile metrics:
+
+```
+packetframe_fib_neigh_resolver_overruns_total{module="fast-path"}
+packetframe_fib_neigh_resolver_resyncs_total{module="fast-path"}
+packetframe_fib_neigh_resolver_resync_failures_total{module="fast-path"}
+packetframe_fib_neigh_resolver_request_timeouts_total{module="fast-path"}
+packetframe_fib_neigh_resolver_probes_skipped_total{module="fast-path"}
+packetframe_fib_neigh_resolver_restarts_total{module="fast-path"}
+packetframe_fib_neigh_resolver_running{module="fast-path"}                  # 0 between a failure and its restart
+packetframe_fib_neigh_resolver_progress_age_seconds{module="fast-path"}     # above 30 while not waiting on the programmer: stuck
+packetframe_fib_neigh_resolver_programmer_wait_seconds{module="fast-path"}  # 0 unless the programmer is not draining
+```
+
+Check:
+
+```sh
+sudo packetframe status | grep -A3 neigh-resolver
+sudo packetframe events --module fast-path --since 1h   # neigh_resolver_restarted, module_health
+journalctl -u packetframe --since -1h | grep -E 'neighbour resolver (stats|stopped)|notifications lost|resynced|request timed out|probe skipped'
+cat /proc/net/netlink    # protocol 0, groups 00000005: the Drops column
+```
+
+Every restart logs `neighbour resolver stopped working; restarting it`
+at error, with the cause, and records a `neigh_resolver_restarted` event
+(`cause`: `stalled` with `silent_ms`, `failed` with the error in
+`detail`, or `returned`). The `neighbour resolver stats` line now carries
+`incarnation`, `overruns`, `resyncs`, `resync_failures`,
+`request_timeouts`, `probes_skipped` and `restarts`.
+
+If the restart count keeps climbing (`restart #N` with N rising, and the
+row unhealthy between restarts), the resolver cannot get going at all.
+The cause in the row names the error: a socket that cannot be opened, or
+a multicast stream that keeps closing. A daemon restart is the last
+resort, and the event log keeps the history for the bug report. A daemon
+restart is also the remedy on a build older than this fix: before it,
+the resolver hung in silence and only a restart recovered it.
 
 ### Symptom: `pass_not_in_devmap` climbs
 

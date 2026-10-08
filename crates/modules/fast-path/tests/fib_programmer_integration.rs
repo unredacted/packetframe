@@ -2877,6 +2877,43 @@ fn lost_nexthop_is_reprobed_until_it_resolves() {
     );
 }
 
+/// After the neighbour resolver re-reads the kernel — a resync after an
+/// overrun, or a restarted resolver (2026-10-07) — the nexthops the
+/// programmer still holds unresolved are asked about again at once, not
+/// when a backoff that may have reached a minute says so.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_reprobe_nudge_asks_again_now_instead_of_at_the_backoff() {
+    let (h, _sink, mut resolves) = ProgrammerHarness::with_sink_and_resolver();
+    let nh = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 24));
+    h.run(async { h.handle.register_nexthop(nh).await })
+        .expect("register_nexthop");
+
+    // Nothing answers, so the backoff climbs: the allocation's request,
+    // then re-probes 1, 2 and 4 s apart. Wait for the fourth request
+    // rather than for a fixed time, so the next one is known to be a full
+    // 8 s backoff away however slow the guest is.
+    let mut early = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while early.len() < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fixture must back off before the nudge: {early:?}"
+        );
+        early.extend(h.drain_resolves(&mut resolves, Duration::from_millis(250)));
+    }
+    assert!(early.iter().all(|ip| *ip == nh), "{early:?}");
+
+    // The nudge brings the next request forward to the next tick, well
+    // inside the 8 s backoff still to run.
+    assert!(h.handle.reprobe_unresolved_now(), "nudge queued");
+    let nudged = h.drain_resolves(&mut resolves, Duration::from_millis(1800));
+    assert!(
+        !nudged.is_empty() && nudged.iter().all(|ip| *ip == nh),
+        "a nudged re-probe must fire on the next tick (got {nudged:?})"
+    );
+}
+
 /// A freed slot and a live nexthop the kernel gave up on both carry
 /// `state = FAILED`; `family` is what tells them apart, and the shared
 /// classifier is what `status`, the exporter and `fib dump` all read.
