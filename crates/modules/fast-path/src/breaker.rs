@@ -59,7 +59,24 @@ pub fn write_trip_flag(
         spec.drop_ratio,
         spec.threshold,
     );
-    std::fs::write(path, body)
+    write_flag(&path, body.as_bytes())
+}
+
+// The daemon writing this is root and `state-dir` may be writable by
+// someone who is not. `fs::write` truncated whatever a symlink at the
+// flag's name pointed at, and followed one at any component of the
+// path; on Linux the flag goes through `packetframe_common::statefile`'s
+// no-follow directory walk instead, as the module's records do, so a
+// link at the name is replaced and one in the path fails the write. The
+// non-Linux arm exists for the macOS dev loop only.
+#[cfg(target_os = "linux")]
+fn write_flag(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    packetframe_common::statefile::write_atomic(path, contents)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_flag(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, contents)
 }
 
 /// What the sampler observed, minus I/O on STATS itself.
@@ -227,5 +244,64 @@ mod tests {
         let _ = b.sample(&stats(100, 0));
         // Drops happen but no matched traffic since prime.
         assert!(matches!(b.sample(&stats(100, 10)), Decision::NoData));
+    }
+
+    /// A symlink at the flag's name is replaced, not written through; one
+    /// at the temp name or at any component of `state-dir` fails the
+    /// write, and nothing is written where it points. `fs::write`
+    /// truncated the target of the first and wrote through the others.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_trip_flag_is_not_written_through_a_symlink() {
+        let base = std::env::temp_dir().join(format!("pf-breaker-flag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let state = base.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let victim = base.join("victim");
+        std::fs::write(&victim, "do not truncate me").unwrap();
+        let write = |dir: &Path| write_trip_flag(dir, 0.5, 50, 100, &spec(0.01, 3));
+
+        let flag = trip_flag_path(&state);
+        std::os::unix::fs::symlink(&victim, &flag).unwrap();
+        write(&state).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not truncate me"
+        );
+        let meta = std::fs::symlink_metadata(&flag).unwrap();
+        assert!(meta.file_type().is_file(), "the link was not replaced");
+        assert!(std::fs::read_to_string(&flag)
+            .unwrap()
+            .starts_with(&format!("module: {MODULE_NAME}\n")));
+
+        let tmp = flag.with_extension("flag.tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        assert!(
+            write(&state).is_err(),
+            "wrote through the link at the temp name"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not truncate me"
+        );
+
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        for dir in [link.clone(), link.join("state")] {
+            let err = write(&dir).expect_err("wrote through the link in the path");
+            assert!(
+                err.to_string().contains("a symlink here is refused"),
+                "{}: {err}",
+                dir.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&real).unwrap().count(),
+            0,
+            "something was made or written through the link"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

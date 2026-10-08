@@ -93,14 +93,53 @@ pub fn to_json(table: &LearnedTable, ifname: &str, now: SystemTime) -> String {
 }
 
 /// Write-then-rename, creating the directory on first use. Mirrors
-/// the guard's `tc_links::save`.
+/// the guard's `tc_links::save`: through [`write_record`], so a symlink
+/// at `<bridge>.json.tmp` or at any component of the persist directory
+/// fails the save instead of choosing where this root daemon writes,
+/// and a directory the save creates is never group- or world-writable
+/// whatever the umask.
 pub fn save(path: &Path, json: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    write_record(path, json.as_bytes()).map_err(|e| {
+        // Only the temp file's create can collide: something that is not
+        // a stale regular file is at the temp name. Name it, since the
+        // engine reports this error without the path.
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            let tmp = path.with_extension("json.tmp");
+            std::io::Error::new(e.kind(), format!("{}: {e}", tmp.display()))
+        } else {
+            e
+        }
+    })
+}
+
+// The daemon writing these is root and the persist directory may be
+// writable by someone who is not, so on Linux the writes and the probe's
+// unlink go through `packetframe_common::statefile`'s no-follow
+// directory walk, as fast-path's records do. The non-Linux arms exist
+// for the macOS dev loop's unit tests only.
+#[cfg(target_os = "linux")]
+fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    packetframe_common::statefile::write_atomic(path, contents)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
+    std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_record(path: &Path) -> std::io::Result<()> {
+    packetframe_common::statefile::remove_state_record(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_record(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
 }
 
 /// Read and validate a file, dropping entries older than `max_age`.
@@ -196,12 +235,16 @@ pub fn summarize(path: &Path, now: SystemTime) -> Option<(usize, Duration)> {
 
 /// Refuse a persist directory the daemon could not write to, at load
 /// time rather than at the first debounced save minutes later.
+///
+/// The probe is written, renamed and removed the way [`save`] writes,
+/// so a directory no save could write into fails it, a symlink anywhere
+/// in the path included, and a missing directory is made as a save would
+/// make it. The feasibility probe calls this too, for a directory that
+/// exists, so its verdict is the load's.
 pub fn ensure_dir_writable(dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let probe = dir.join(format!(".probe-{}", std::process::id()));
-    std::fs::write(&probe, b"").map_err(|e| format!("write probe in {}: {e}", dir.display()))?;
-    std::fs::remove_file(&probe).map_err(|e| format!("remove probe in {}: {e}", dir.display()))?;
-    Ok(())
+    write_record(&probe, b"").map_err(|e| format!("write probe in {}: {e}", dir.display()))?;
+    remove_record(&probe).map_err(|e| format!("remove probe in {}: {e}", dir.display()))
 }
 
 #[cfg(test)]
@@ -430,5 +473,79 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         assert!(ensure_dir_writable(&file).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink at the temp name fails the save, naming the temp file,
+    /// and nothing is written through it or renamed into place. By
+    /// pathname, `fs::write` truncated the link's target and the rename
+    /// then moved the link itself to `<bridge>.json`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn save_refuses_a_symlink_at_the_temp_name() {
+        let dir = scratch();
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "do not truncate me").unwrap();
+        let path = file_path(&dir, "br0");
+        let tmp = path.with_extension("json.tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        let err = save(&path, "{}").expect_err("a symlink at the temp name");
+        assert!(
+            err.to_string().contains(&tmp.display().to_string()),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not truncate me"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "something was renamed into place"
+        );
+
+        std::fs::remove_file(&tmp).unwrap();
+        save(&path, "{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink at any component of the persist directory fails both
+    /// the save and the load-time probe, and nothing is made or written
+    /// where it points. By pathname, `create_dir_all` and the writes
+    /// followed an intermediate link, and the probe passed through one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn save_and_the_probe_refuse_a_symlink_in_the_dir_path() {
+        let base = scratch();
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        for dir in [link.join("cache"), link.join("a").join("b"), link.clone()] {
+            let Err(err) = save(&file_path(&dir, "br0"), "{}") else {
+                panic!("saved through the link at {}", dir.display());
+            };
+            assert!(
+                err.to_string().contains("a symlink here is refused"),
+                "{}: {err}",
+                dir.display()
+            );
+            let Err(err) = ensure_dir_writable(&dir) else {
+                panic!("probed through the link at {}", dir.display());
+            };
+            assert!(
+                err.contains("a symlink here is refused"),
+                "{}: {err}",
+                dir.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&real).unwrap().count(),
+            0,
+            "something was made or written through the link"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

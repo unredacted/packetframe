@@ -394,7 +394,12 @@ pub fn publish(state_dir: &Path, modules: Vec<ModuleEntry>) -> Result<(), String
         event_log: packetframe_common::events::status(),
     };
     let body = serde_json::to_vec_pretty(&snapshot).map_err(|e| format!("serialise: {e}"))?;
-    std::fs::create_dir_all(state_dir).map_err(|e| format!("create state dir: {e}"))?;
+    // No `create_dir_all` first: on Linux `atomic::write` makes a missing
+    // `state-dir` itself, through the no-follow walk it writes through,
+    // and never writable by group or others. The pathname create in
+    // front of it followed a symlink anywhere in the path, creating
+    // directories wherever it pointed, and left their modes to the
+    // umask.
     crate::atomic::write(&Snapshot::path_in(state_dir), &body)
         .map_err(|e| format!("write {}: {e}", Snapshot::path_in(state_dir).display()))
 }
@@ -457,6 +462,7 @@ mod tests {
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("pf-health-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -903,5 +909,68 @@ mod tests {
             "one copy, however many polls have run"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A symlink at the temp name fails the publish, and nothing is
+    /// written through it or renamed into place. (`atomic::write` already
+    /// refused this before the `create_dir_all` in front of it went; this
+    /// pins it for the snapshot.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publish_refuses_a_symlink_at_the_temp_name() {
+        let dir = tmpdir("tmp-link");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "do not truncate me").unwrap();
+        let tmp = dir.join(format!("{HEALTH_FILE_NAME}.tmp"));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        assert!(
+            publish(&dir, Vec::new()).is_err(),
+            "published through the link"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not truncate me"
+        );
+        assert!(
+            std::fs::symlink_metadata(Snapshot::path_in(&dir)).is_err(),
+            "something was renamed into place"
+        );
+
+        std::fs::remove_file(&tmp).unwrap();
+        publish(&dir, Vec::new()).unwrap();
+        assert!(load(&dir).unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A symlink at any component of `state-dir` fails the publish
+    /// before anything is made where it points. The `create_dir_all` in
+    /// front of `atomic::write` followed it and created the missing
+    /// directories in the link's target; only the write was refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publish_creates_nothing_through_a_symlink_in_the_state_dir_path() {
+        let base = tmpdir("dir-link");
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        for state_dir in [link.join("state"), link.join("a").join("b"), link.clone()] {
+            let Err(err) = publish(&state_dir, Vec::new()) else {
+                panic!("published through the link at {}", state_dir.display());
+            };
+            assert!(
+                err.contains("a symlink here is refused"),
+                "{}: {err}",
+                state_dir.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&real).unwrap().count(),
+            0,
+            "something was made or written through the link"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
