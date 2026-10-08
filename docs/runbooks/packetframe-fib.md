@@ -984,6 +984,8 @@ in force:
 | degraded, `priorities ... below main are taken` | Fewer than two free priorities within 100 of `main`; nothing written or changed | `ip rule show` to see what fills the band |
 | degraded, `a second unconditional lookup main at S follows the one at F` | Skipping the first `main` would only reach the second; nothing written or changed | Usually a provisioning pass caught half-way; if it persists, find which one the platform meant to keep |
 | degraded, `repair failing: X of Y rules in place; ...` | A dump or write failed. Writes stop at the first failed stage (anchor, then keep, then goto), and nothing old is removed until every new rule is in, so a partial pass never leaves a goto without its keep rules | The error names the rule and the netlink error; it retries every pass |
+| degraded, `repair failing: ...; no netlink reply within 30s; abandoned where it stood` | The kernel never answered a request in the pass (a reply it could not allocate is never sent). Without the bound the pass would wait forever, stopping every later pass and every reload's. Writes go out in stage order, so a pass cut short leaves a safe prefix of them | It retries every pass; a run of these means the box is starved of memory or RTNL |
+| degraded, `repair failing: an unknown number of Y rules in place; ...` | The pass never saw the rules (the dump failed or went unanswered), so how many are in place is not known; the `present` gauge is absent until a pass sees them | As above |
 | degraded, `removed from the config, but its rules could not all be removed` | A reload dropped the directive and the removal did not finish | It retries every pass and on the next reload; `packetframe detach` also removes them |
 
 **udapi-server will not start and logs `neither table nor goto is
@@ -1854,12 +1856,53 @@ bridge egress short-circuits) *before* admitting the new link, so a
 recreated `switch0.N` is redirected through its parent with the tag,
 never to the virtual device itself.
 
+The kernel drops link notifications the watcher's receive buffer has no
+room for (a burst of link changes while softirq load keeps the thread
+from draining) and says so only once, as an overrun. None of them is
+resent, so the watcher re-reads the whole link table instead: every
+qualifying link is admitted as its notification would have admitted it,
+and every ifindex the maps hold that the kernel no longer knows is
+evicted. The re-read subscribes afresh before its dump and reads on from
+that subscription once it has been applied: what the old one still held
+predates the loss, and replayed after the dump it could undo it (a
+delete queued before the loss evicting a link the dump just admitted at
+a reused ifindex).
+
 Check:
 
+- `packetframe status`, the fast-path `redirect-watch` row: healthy
+  `following the link table` is the normal state (with a count of
+  overruns, if any, each made good by a re-read). Degraded `link
+  notifications lost (N overruns)` means the maps are not known to be
+  current yet: the re-read runs a quarter second after the burst of link
+  events settles, and the recovery is done once its links have been read
+  and offered to the maps. Until then `not recovered yet (retrying)` says
+  why (the dump failed, or the link topology could not be read to apply
+  it); a failed dump is retried every 5 s. Links that qualify but are not
+  in the maps are a separate fact, shown whatever the overrun history,
+  in two forms:
+  - Degraded `N qualifying links are not in the redirect maps: the maps
+    are full`: an insert was refused with `E2BIG`. The maps hold 64 links
+    each. Each such link is warned about once (`redirect target refused:
+    the maps are full`) and offered again as soon as an eviction makes
+    room — a link deleted, or a reload — not on a timer.
+  - Degraded `N qualifying links could not be inserted into the redirect
+    maps (<error>)`: any other failure, such as a transient `ENOMEM`
+    from the devmap's atomic allocation. It is retried every 5 s and
+    warned when first seen or when its errno changes
+    (`redirect target insert failed`).
+
+  Either way their traffic takes the kernel path meanwhile.
+  Degraded `stopped (...)` means the watcher is gone and SIGHUP is
+  again the only refresh — `systemctl reload packetframe` reconciles
+  immediately; only a restart brings the watcher back. Metrics:
+  `packetframe_redirect_watch_running`,
+  `packetframe_redirect_watch_overruns_total`,
+  `packetframe_redirect_watch_resyncs_total{outcome="ok|failed"}`,
+  `packetframe_redirect_watch_unadmitted_links{reason="map_full|insert_failing"}`.
 - `journalctl -u packetframe | grep 'redirect-target'`: the watcher
   logs `live (RTNLGRP_LINK)` at start and every add/remove; a line
-  saying it stopped means SIGHUP is again the only refresh —
-  `systemctl reload packetframe` reconciles immediately.
+  saying it stopped means SIGHUP is again the only refresh, as above.
 - `bpftool map dump pinned /sys/fs/bpf/packetframe/fast-path/maps/REDIRECT_DEVMAP`
   against `ip -br link`: every up Ethernet-type ifindex should be a key.
 - `packetframe fib lookup <dst>` for an affected destination: the

@@ -849,6 +849,8 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         ));
     }
 
+    crate::vrrp::check_attach_set(cfg)?;
+
     // Refuse startup when pins from a prior invocation survive.
     // SPEC.md §8.5 "exit without detach" leaves pins in bpffs after
     // SIGTERM; they are not adopted, so the operator must run
@@ -2092,11 +2094,16 @@ pub fn attach(
         xdp_ports(state),
     ) {
         Ok(w) => state.redirect_watch = Some(w),
-        Err(e) => warn!(
-            error = %e,
-            "redirect-target watcher thread could not be spawned; REDIRECT_DEVMAP refreshes \
-             only on SIGHUP"
-        ),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "redirect-target watcher thread could not be spawned; REDIRECT_DEVMAP refreshes \
+                 only on SIGHUP"
+            );
+            state.redirect_watch = Some(crate::redirect_watch::RedirectTargetWatcher::not_started(
+                format!("thread could not be spawned: {e}"),
+            ));
+        }
     }
 
     // The route ledger a clean stop left, consumed in every mode (see
