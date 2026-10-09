@@ -38,10 +38,15 @@ fn row(name: impl Into<String>, state: HealthState, message: String) -> Subsyste
     }
 }
 
+/// Whether the worker is ticking: neither panicked nor stalled.
+pub fn worker_up(heartbeat_age: Duration, panicked: Option<&str>) -> bool {
+    panicked.is_none() && heartbeat_age <= STALL_AFTER
+}
+
 /// `panicked`: why the worker panicked, if it did; it has stopped the
 /// samplers, and nothing is exported until a restart.
 pub fn health(p: &Published, heartbeat_age: Duration, panicked: Option<&str>) -> HealthReport {
-    let stalled = panicked.is_some() || heartbeat_age > STALL_AFTER;
+    let stalled = !worker_up(heartbeat_age, panicked);
     let mut rows = Vec::new();
     if let Some(why) = panicked {
         rows.push(row(
@@ -185,7 +190,10 @@ pub fn health(p: &Published, heartbeat_age: Duration, panicked: Option<&str>) ->
 }
 
 /// Prometheus text, every name under `packetframe_flow_export_`.
-pub fn metrics(p: &Published, out: &mut String) {
+/// `worker_up`: the worker is ticking, neither stalled nor panicked; the
+/// snapshot it last published says nothing about now when it is not, so
+/// coverage and the VPP sampler's health then read 0.
+pub fn metrics(p: &Published, out: &mut String, worker_up: bool) {
     let mut counter = |name: &str, help: &str, rows: &[(String, u64)]| {
         let _ = writeln!(out, "# HELP packetframe_flow_export_{name} {help}");
         let _ = writeln!(out, "# TYPE packetframe_flow_export_{name} counter");
@@ -254,7 +262,7 @@ pub fn metrics(p: &Published, out: &mut String) {
             "packetframe_flow_export_coverage{{iface=\"{}\",path=\"{}\"}} {}",
             escape(&r.name),
             r.path.name(),
-            r.state.level()
+            if worker_up { r.state.level() } else { 0 }
         );
     }
     if let Some(v) = &p.vpp {
@@ -270,10 +278,15 @@ pub fn metrics(p: &Published, out: &mut String) {
         let _ = writeln!(
             out,
             "packetframe_flow_export_vpp_sampler_healthy {}",
-            u8::from(v.coverage.is_healthy())
+            u8::from(worker_up && v.coverage.is_healthy())
         );
     }
     for (name, help, v) in [
+        (
+            "worker_up",
+            "1 while the export worker ticks; 0 once it stalls or panics",
+            u64::from(worker_up),
+        ),
         ("rate", "the sampling rate, 1 in N", u64::from(p.rate)),
         (
             "over_budget",
@@ -341,6 +354,26 @@ mod tests {
         }
     }
 
+    /// A worker that stopped published its last snapshot long ago: what it
+    /// said then is not what is true now.
+    #[test]
+    fn a_stopped_worker_reads_as_covering_nothing() {
+        let mut p = published();
+        p.vpp = Some(vpp(Coverage::Healthy, "sampling as configured"));
+        let mut out = String::new();
+        metrics(&p, &mut out, false);
+        for line in [
+            "packetframe_flow_export_worker_up 0",
+            "packetframe_flow_export_coverage{iface=\"eth0\",path=\"xdp\"} 0",
+            "packetframe_flow_export_vpp_sampler_healthy 0",
+        ] {
+            assert!(out.contains(line), "missing {line}:\n{out}");
+        }
+        assert!(!worker_up(Duration::ZERO, Some("boom")));
+        assert!(!worker_up(STALL_AFTER + Duration::from_millis(1), None));
+        assert!(worker_up(STALL_AFTER, None));
+    }
+
     #[test]
     fn a_panicked_worker_says_why_and_uncovers_everything() {
         let h = health(&published(), Duration::ZERO, Some("index out of bounds"));
@@ -394,7 +427,7 @@ mod tests {
             "{m}"
         );
         let mut out = String::new();
-        metrics(&p, &mut out);
+        metrics(&p, &mut out, true);
         assert!(
             out.contains("packetframe_flow_export_vpp_sampler_healthy 1")
                 && out.contains("coverage{iface=\"eth3\",path=\"vpp\"} 0"),
@@ -486,7 +519,7 @@ mod tests {
         p.ports[0].name = "a\\b\"c\nd".into();
         p.collectors[0].name = "f\"nm".into();
         let mut out = String::new();
-        metrics(&p, &mut out);
+        metrics(&p, &mut out, true);
         assert!(
             out.contains("coverage{iface=\"a\\\\b\\\"c\\nd\",path=\"xdp\"} 3"),
             "{out}"
@@ -497,7 +530,7 @@ mod tests {
         );
         assert_eq!(out.lines().count(), {
             let mut plain = String::new();
-            metrics(&published(), &mut plain);
+            metrics(&published(), &mut plain, true);
             plain.lines().count()
         });
     }
@@ -505,7 +538,7 @@ mod tests {
     #[test]
     fn metrics_name_every_series() {
         let mut out = String::new();
-        metrics(&published(), &mut out);
+        metrics(&published(), &mut out, true);
         for line in [
             "packetframe_flow_export_samples_total{path=\"xdp\"} 14",
             "packetframe_flow_export_samples_total{path=\"tc\"} 0",
@@ -513,6 +546,7 @@ mod tests {
             "packetframe_flow_export_coverage{iface=\"eth1\",path=\"xdp\"} 1",
             "packetframe_flow_export_rate 1000",
             "packetframe_flow_export_over_budget 0",
+            "packetframe_flow_export_worker_up 1",
         ] {
             assert!(out.contains(line), "missing {line}:\n{out}");
         }

@@ -585,13 +585,19 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
                 s.vpp = s.vpp.wrapping_add(n);
             }
         }
-        self.vpp_window_lost += t.lost;
+        // A sample that cannot be read is lost to the collectors as surely
+        // as one a full ring dropped: VPP's lanes and its next sample's
+        // drops count both.
+        let lost = t.lost + t.unmapped;
+        self.vpp_window_lost += lost;
         self.p.vpp_lost_total += t.lost;
         self.p.unmapped_total += t.unmapped;
-        self.vpp_pending_drops = self.vpp_pending_drops.wrapping_add(t.lost as u32);
+        self.vpp_pending_drops = self.vpp_pending_drops.wrapping_add(lost as u32);
         for s in t.samples {
             let Some(src) = self.sources.get_mut(&s.ifindex) else {
                 self.p.unmapped_total += 1;
+                self.vpp_window_lost += 1;
+                self.vpp_pending_drops = self.vpp_pending_drops.wrapping_add(1);
                 continue;
             };
             src.sequence = src.sequence.wrapping_add(1);
@@ -1334,6 +1340,26 @@ mod tests {
             (9, 7),
             "VPP's carries it"
         );
+    }
+
+    #[test]
+    fn vpp_samples_that_cannot_be_read_degrade_vpp_lanes() {
+        let (mut r, plugin) = vpp_rig();
+        r.w.tick(r.t0);
+        plugin.borrow_mut().status = Some(applied(1, 1, 2));
+        let t = r.t0 + VPP_STARTUP_GRACE;
+        r.w.tick(t);
+        // An index generation 1's binding does not know.
+        plugin.borrow_mut().queued = vec![sample(1, 99); 3];
+        r.w.tick(t + TICK);
+        r.w.tick(t + WINDOW);
+        let p = r.shared.snapshot();
+        assert_eq!(p.unmapped_total, 3);
+        assert!(matches!(
+            lane(&p, "eth9", Path::Vpp).state,
+            State::Degraded(_)
+        ));
+        assert_eq!(lane(&p, "eth0", Path::Xdp).state, State::Covered);
     }
 
     #[test]

@@ -222,6 +222,9 @@ pub struct VppSide<D> {
     seeded: bool,
     started_ns: u64,
     window_lost: u64,
+    /// Samples no binding could read in the window: lost to the
+    /// collectors as surely as a full ring's.
+    window_unmapped: u64,
     window_traffic: bool,
     health: VppHealth,
     buf: Vec<Sample>,
@@ -248,6 +251,7 @@ impl<D: VppDir> VppSide<D> {
             seeded: false,
             started_ns: now_realtime_ns,
             window_lost: 0,
+            window_unmapped: 0,
             window_traffic: false,
             health: VppHealth::unavailable("the sampler directory has not been looked at yet"),
             buf: Vec::new(),
@@ -266,6 +270,7 @@ impl<D: VppDir> VppSide<D> {
     /// A coverage window ended.
     pub fn end_window(&mut self) {
         self.window_lost = 0;
+        self.window_unmapped = 0;
         self.window_traffic = false;
     }
 
@@ -371,15 +376,26 @@ impl<D: VppDir> VppSide<D> {
                 .flatten()
                 .max()
                 .unwrap_or(0);
-                let d = Desired {
-                    generation: newest + 1,
-                    rate,
-                    header_bytes,
-                    classes: Class::Ingress.bit(),
-                    interfaces: names.clone(),
+                let written = match newest.checked_add(1) {
+                    // Only a hand-written generation gets here; the
+                    // plugin's status keeps it until VPP restarts.
+                    None => Err(format!(
+                        "generation {newest} is in sight and none can follow it: VPP's \
+                         sampler needs a restart with no desired.conf"
+                    )),
+                    Some(generation) => {
+                        let d = Desired {
+                            generation,
+                            rate,
+                            header_bytes,
+                            classes: Class::Ingress.bit(),
+                            interfaces: names.clone(),
+                        };
+                        self.dir.write(&d).map(|()| d)
+                    }
                 };
-                match self.dir.write(&d) {
-                    Ok(()) => {
+                match written {
+                    Ok(d) => {
                         self.bindings.insert(
                             d.generation,
                             Binding {
@@ -489,6 +505,7 @@ impl<D: VppDir> VppSide<D> {
         }
 
         self.window_lost += t.lost;
+        self.window_unmapped += t.unmapped;
         self.window_traffic |= !t.pools.is_empty();
         self.health = self.judge(&look);
         t
@@ -539,6 +556,21 @@ impl<D: VppDir> VppSide<D> {
                     .sum(),
                 capacity: look.capacity,
             })
+        };
+        // A sampler that samples as asked still covers nothing whose
+        // samples cannot be read: say so, unless something worse is wrong.
+        let (coverage, why) = if coverage.is_healthy() && self.window_unmapped > 0 {
+            (
+                Coverage::Degraded,
+                format!(
+                    "{} samples could not be read: their VPP process's ports are not \
+                     published, its epoch is not known to be its, or their generation \
+                     is not one this module wrote",
+                    self.window_unmapped
+                ),
+            )
+        } else {
+            (coverage, why)
         };
         VppHealth {
             coverage,
@@ -772,7 +804,14 @@ pub(crate) mod tests {
             BTreeMap::from([(4, 3000), (5, 500)]),
             "an epoch that began after the module: all of it is new"
         );
-        assert_eq!(r.side.health().coverage, Coverage::Healthy);
+        assert_eq!(
+            r.side.health().coverage,
+            Coverage::Degraded,
+            "the unknown index's sample is lost"
+        );
+        r.side.end_window();
+        r.side.tick(r.t0 + 2 * crate::worker::TICK, 1000, 128);
+        assert!(r.side.health().coverage.is_healthy(), "a window without");
     }
 
     #[test]
@@ -896,6 +935,39 @@ pub(crate) mod tests {
         r.side
             .tick(r.t0 + RETRY + 3 * crate::worker::TICK, 1000, 128);
         assert!(r.side.health().coverage.is_healthy());
+    }
+
+    /// Samples that cannot be read are lost to the collectors: a process
+    /// whose mappings cannot be read leaves every one unmapped, and the
+    /// sampler is not healthy for it.
+    #[test]
+    fn samples_that_cannot_be_read_degrade_the_sampler() {
+        let mut r = rig();
+        r.plugin.borrow_mut().mappers.clear();
+        r.side.tick(r.t0, 1000, 128);
+        r.plugin.borrow_mut().status = Some(applied(1, 1, 2));
+        r.plugin.borrow_mut().queued = vec![sample(1, 1), sample(1, 2)];
+        let t = r.side.tick(r.t0 + crate::worker::TICK, 1000, 128);
+        assert_eq!(t.unmapped, 2);
+        assert_eq!(r.side.health().coverage, Coverage::Degraded);
+        assert!(r.side.health().why.contains("2 samples could not be read"));
+        r.side.end_window();
+        r.side.tick(r.t0 + 2 * crate::worker::TICK, 1000, 128);
+        assert!(r.side.health().coverage.is_healthy(), "none in this window");
+    }
+
+    #[test]
+    fn a_generation_with_none_after_it_is_reported_not_wrapped() {
+        let mut r = rig();
+        r.plugin.borrow_mut().status = Some(applied(u64::MAX, 1, 2));
+        r.side.tick(r.t0, 1000, 128);
+        assert!(r.plugin.borrow().desired.is_none());
+        assert_eq!(r.side.health().coverage, Coverage::Unavailable);
+        assert!(
+            r.side.health().why.contains("none can follow it"),
+            "{}",
+            r.side.health().why
+        );
     }
 
     #[test]

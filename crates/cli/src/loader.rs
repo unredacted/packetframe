@@ -391,15 +391,14 @@ fn degrade_on_start_failure(
     name: &str,
     stage: &str,
     err: &dyn std::fmt::Display,
-    state_dir: &Path,
-    bpffs_root: &Path,
+    persisted: Persisted<'_>,
     #[cfg(feature = "vpp-offload")] feed: Option<&packetframe_vpp_offload::feed::RouteFeed>,
 ) -> Result<crate::health::NotAttached, String> {
     tracing::error!(module = %name, stage, error = %err, "module failed to come up");
     if let Err(e) = module.detach() {
         tracing::error!(module = %name, error = %e, "release after a failed start also failed");
     }
-    let residual = match release_persisted(name, state_dir, bpffs_root) {
+    let residual = match release_persisted(name, persisted) {
         Ok(()) => None,
         Err(why) if REPORT_RESIDUAL.contains(&name) => {
             tracing::error!(
@@ -447,23 +446,33 @@ fn degrade_on_start_failure(
     })
 }
 
+/// Where a degrading module's persisted state lives, for its standalone
+/// release.
+#[cfg(all(target_os = "linux", feature = "fast-path"))]
+#[derive(Clone, Copy)]
+struct Persisted<'a> {
+    state_dir: &'a Path,
+    bpffs_root: &'a Path,
+    /// VPP's sampler directory, when vpp-offload is configured:
+    /// flow-export's VPP sampling is its only then, and a lab sampler's
+    /// `desired.conf` there otherwise is none of its business.
+    vpp_sampler_dir: Option<&'a Path>,
+}
+
 /// A degrading module's standalone release from its persisted state —
 /// the same routine `packetframe detach` runs for it.
 ///
 /// A module on `DEGRADE_ON_START_FAILURE` with no arm here cannot prove
 /// what it left behind is gone, so it is refused rather than degraded.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
-fn release_persisted(name: &str, state_dir: &Path, bpffs_root: &Path) -> Result<(), String> {
+fn release_persisted(name: &str, p: Persisted<'_>) -> Result<(), String> {
     match name {
         #[cfg(feature = "vpp-offload")]
-        "vpp-offload" => detach_vpp_offload(state_dir),
+        "vpp-offload" => detach_vpp_offload(p.state_dir),
         #[cfg(feature = "flow-export")]
-        "flow-export" => packetframe_flow_export::release_sampler(
-            bpffs_root,
-            Some(Path::new(packetframe_flow_export::VPP_SAMPLER_DIR)),
-        ),
+        "flow-export" => packetframe_flow_export::release_sampler(p.bpffs_root, p.vpp_sampler_dir),
         other => {
-            let _ = (state_dir, bpffs_root);
+            let _ = (p.state_dir, p.bpffs_root, p.vpp_sampler_dir);
             Err(format!(
                 "{other} has no standalone release, so nothing it persisted can be proven gone"
             ))
@@ -698,6 +707,15 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             }
         };
     }
+    // flow-export samples VPP only beside a vpp-offload section.
+    #[cfg(feature = "flow-export")]
+    let vpp_sampler_dir = config
+        .modules
+        .iter()
+        .any(|m| m.name == "vpp-offload")
+        .then(|| Path::new(packetframe_flow_export::VPP_SAMPLER_DIR));
+    #[cfg(not(feature = "flow-export"))]
+    let vpp_sampler_dir: Option<&Path> = None;
     // A degrading module's failure: run on without it, or — when what it
     // persisted cannot be released — abort exactly as any other module's
     // failure does.
@@ -708,8 +726,11 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 &$name,
                 $stage,
                 &$err,
-                &config.global.state_dir,
-                &config.global.bpffs_root,
+                Persisted {
+                    state_dir: &config.global.state_dir,
+                    bpffs_root: &config.global.bpffs_root,
+                    vpp_sampler_dir,
+                },
                 #[cfg(feature = "vpp-offload")]
                 feed.as_deref(),
             ) {
@@ -2114,11 +2135,13 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     // packets for a reader that is gone (a fast-path teardown above
     // removes it outright), and VPP's `desired.conf`, removed so the
     // plugin stops (an unmount of the sampler directory takes it too).
+    // VPP's only in vpp-offload's scope: a scoped detach without it
+    // leaves a lab sampler's file alone.
     #[cfg(feature = "flow-export")]
     if all || config_has_flow_export {
         if let Err(e) = packetframe_flow_export::release_sampler(
             &bpffs_root,
-            Some(Path::new(packetframe_flow_export::VPP_SAMPLER_DIR)),
+            (all || config_has_vpp).then(|| Path::new(packetframe_flow_export::VPP_SAMPLER_DIR)),
         ) {
             errors.push(format!("flow-export: {e}"));
         }

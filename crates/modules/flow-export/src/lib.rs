@@ -151,7 +151,9 @@ impl Module for FlowExportModule {
     fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
         #[cfg(target_os = "linux")]
         if let Some(r) = &self.running {
-            report::metrics(&r.shared.snapshot(), out.out);
+            let age = r.shared.heartbeat_age(std::time::Instant::now());
+            let up = report::worker_up(age, r.shared.panicked().as_deref());
+            report::metrics(&r.shared.snapshot(), out.out, up);
         }
         #[cfg(not(target_os = "linux"))]
         let _ = out;
