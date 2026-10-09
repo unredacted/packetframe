@@ -17,7 +17,7 @@ use aya::programs::Xdp;
 use aya::Ebpf;
 use packetframe_common::config::Config;
 use packetframe_common::module::{
-    HealthCtx, HealthState, LoaderCtx, MetricsWriter, Module, ModuleConfig,
+    HealthCtx, HealthReport, HealthState, LoaderCtx, MetricsWriter, Module, ModuleConfig,
 };
 use packetframe_fast_path::registry::{self, AttachmentRecord, HookTypeRecord, RegistryFile};
 use packetframe_fast_path::sample::SampleCfg;
@@ -167,6 +167,20 @@ fn word(d: &[u8], at: usize) -> u32 {
     u32::from_be_bytes(d[at..at + 4].try_into().unwrap())
 }
 
+/// The module's health once its worker has published a `row`: a tick
+/// sends its datagrams before it publishes, so a collector can hold a
+/// tick's samples before the status shows them.
+fn health_with(m: &FlowExportModule, row: &str) -> HealthReport {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let h = m.health_check(&HealthCtx::new()).unwrap();
+        if h.subsystems.iter().any(|r| r.name == row) || Instant::now() > deadline {
+            return h;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn sample_cfg(s: &Scratch) -> SampleCfg {
     let md = MapData::from_pin(pin::map_path(&s.root, "SAMPLE_CFG")).unwrap();
     let a: Array<MapData, SampleCfg> = Array::try_from(Map::Array(md)).unwrap();
@@ -260,9 +274,9 @@ fn samples_from_the_xdp_program_reach_a_collector_as_sflow() {
     }
     assert!(samples >= 100, "{samples} samples in {datagrams} datagrams");
 
-    let h = m.health_check(&HealthCtx::new()).unwrap();
+    let h = health_with(&m, "xdp");
     let row = |n: &str| h.subsystems.iter().find(|r| r.name == n).cloned();
-    let xdp = row("xdp").expect("an xdp row");
+    let xdp = row("xdp").unwrap_or_else(|| panic!("no xdp row: {h:#?}"));
     assert!(
         xdp.message.unwrap().starts_with("lo starting"),
         "inside the startup grace"
@@ -318,7 +332,7 @@ fn without_fast_paths_maps_the_attach_fails_and_release_is_a_no_op() {
     .unwrap();
     let e = m.attach(&mc).expect_err("no maps to sample through");
     assert!(e.to_string().contains("SAMPLES"), "{e}");
-    packetframe_flow_export::release_sampler(&s.root).unwrap();
+    packetframe_flow_export::release_sampler(&s.root, None).unwrap();
     m.detach().unwrap();
 }
 
@@ -459,4 +473,211 @@ fn a_reload_to_a_denser_rate_swaps_the_rings_and_loses_nothing() {
         "{by_rate:?}"
     );
     m.detach().unwrap();
+}
+
+/// This process's start (field 22 of `/proc/self/stat`), so it can stand
+/// in for VPP: it maps the epoch file it creates, as VPP would.
+fn own_start_ticks() -> u64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let after = &stat[stat.rfind(')').unwrap() + 1..];
+    after.split_whitespace().nth(19).unwrap().parse().unwrap()
+}
+
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+fn realtime_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+/// VPP's path end to end, the plugin played by this test: flow-export
+/// claims a real sampler tmpfs, asks for the VPP port vpp-offload
+/// published, reads the samples the "plugin" writes through that
+/// process's binding, sends them as `lo`'s, and removes `desired.conf`
+/// when it stops.
+#[test]
+#[ignore = "needs root: CAP_BPF, bpffs and a tmpfs mount"]
+fn vpp_samples_reach_a_collector_through_the_plugins_rings() {
+    use packetframe_common::sampler_ports::{
+        SampledPort, VppInstance, VppPortsSnapshot, VppSamplerPorts,
+    };
+    use packetframe_sampler_shm::desired::Desired;
+    use packetframe_sampler_shm::fs::{create_epoch, mount_tmpfs, publish_current, unmount};
+    use packetframe_sampler_shm::layout::Layout;
+    use packetframe_sampler_shm::ring::{RingWriter, SampleMeta};
+    use packetframe_sampler_shm::status::{Interface, State, Status, StatusWriter};
+    use packetframe_sampler_shm::Class;
+
+    if !FAST_PATH_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("vpp");
+    let _bpf = fast_path(&s);
+    register_lo(&s);
+    let dir = std::env::temp_dir().join(format!("pftestfe-vpp-sampler-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    mount_tmpfs(&dir, 8 << 20).expect("mount the sampler tmpfs");
+    struct Unmount(PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            let _ = unmount(&self.0);
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+    let _unmount = Unmount(dir.clone());
+
+    // The plugin's epoch, mapped by this process.
+    let layout = Layout::new(1, 64, 256).unwrap();
+    let epoch = 0x5eed_0000_0000_0001;
+    let file = create_epoch(&dir, &layout, epoch, realtime_ns(), monotonic_ns(), "test").unwrap();
+    publish_current(&dir, epoch, &layout).unwrap();
+    let status = StatusWriter::new(layout.status(file.words()));
+    let ring = RingWriter::new(&layout, file.words(), 0);
+
+    let ports = std::sync::Arc::new(VppSamplerPorts::new());
+    ports.publish(VppPortsSnapshot {
+        instance: VppInstance {
+            pid: std::process::id() as i32,
+            start_ticks: own_start_ticks(),
+            boot_id: None,
+        },
+        ports: vec![SampledPort {
+            port: "lo".into(),
+            ifindex: Some(1),
+            vpp_name: "loop0".into(),
+            sw_if_index: 5,
+        }],
+    });
+
+    let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+    collector
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let config = Config::parse(&format!(
+        "module fast-path\n  attach lo generic\nmodule flow-export\n  source-address 127.0.0.1\n  \
+         sample-rate 100\n  header-bytes 64\n  collector t sflow {}\n",
+        collector.local_addr().unwrap()
+    ))
+    .unwrap();
+    let section = config
+        .modules
+        .iter()
+        .find(|m| m.name == "flow-export")
+        .unwrap();
+    let mc = ModuleConfig::new(section, &config.global);
+    let mut m = FlowExportModule::new();
+    m.set_vpp(ports, dir.clone());
+    m.load(
+        &mc,
+        &LoaderCtx {
+            bpffs_root: &s.root,
+            state_dir: &s.state,
+        },
+    )
+    .unwrap();
+    m.attach(&mc).expect("attach");
+
+    // The plugin: apply what flow-export asks, beat, sample.
+    let frame = frame();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut applied, mut pushed, mut received) = (0u64, 0u64, Vec::new());
+    let mut buf = [0u8; 2048];
+    while Instant::now() < deadline && received.len() < 20 {
+        status.beat(monotonic_ns());
+        if let Some(d) = std::fs::read_to_string(dir.join("desired.conf"))
+            .ok()
+            .and_then(|t| Desired::parse(&t).ok())
+        {
+            if d.generation != applied {
+                assert_eq!(d.interfaces, vec!["loop0"]);
+                assert_eq!((d.rate, d.header_bytes), (100, 64));
+                applied = d.generation;
+                status.publish(&Status {
+                    state: State::Enabled,
+                    applied_generation: applied,
+                    rate: d.rate,
+                    header_bytes: d.header_bytes,
+                    classes: Class::Ingress.bit(),
+                    changed_ns: realtime_ns(),
+                    interfaces: vec![Interface {
+                        name: "loop0".into(),
+                        sw_if_index: Some(5),
+                        pool_index: 0,
+                        unresolved_since_ns: 0,
+                    }],
+                    ..Status::default()
+                });
+            }
+        }
+        if applied > 0 && pushed < 20 {
+            ring.add_pool(0, Class::Ingress, 100);
+            let meta = SampleMeta {
+                generation: applied,
+                time_ns: realtime_ns(),
+                sw_if_index: 5,
+                class: Class::Ingress,
+                pool_index: 0,
+                rate: 100,
+                frame_len: frame.len() as u32,
+            };
+            assert!(ring.push(&meta, &frame[..64]));
+            pushed += 1;
+        }
+        if let Ok(n) = collector.recv(&mut buf) {
+            let d = &buf[..n];
+            let mut f = 28;
+            for _ in 0..word(d, 24) {
+                received.push((
+                    word(d, f + 8),
+                    word(d, f + 12),
+                    word(d, f + 16),
+                    word(d, f + 20),
+                ));
+                f += 8 + word(d, f + 4) as usize;
+            }
+        }
+    }
+    assert_eq!(applied, 1, "one generation asked for, and applied");
+    assert_eq!(received.len(), 20, "{received:?}");
+    for (i, &(seq, source, rate, _)) in received.iter().enumerate() {
+        assert_eq!(
+            (seq, source, rate),
+            (i as u32 + 1, 1, 100),
+            "lo's, in sequence"
+        );
+    }
+    // VPP's pool, from the plugin's count: it only grows, and holds most
+    // of what was counted (a tick may read it before the last add).
+    let pools: Vec<u32> = received.iter().map(|r| r.3).collect();
+    assert!(pools.windows(2).all(|w| w[0] <= w[1]), "{pools:?}");
+    assert!(pools[19] >= 1000, "{pools:?}");
+    let h = health_with(&m, "vpp");
+    let vpp = h
+        .subsystems
+        .iter()
+        .find(|r| r.name == "vpp")
+        .expect("a vpp row");
+    let msg = vpp.message.clone().unwrap();
+    assert!(
+        (msg.contains("sampler healthy") || msg.contains("sampler zero-traffic"))
+            && msg.contains("lo starting"),
+        "{msg}"
+    );
+
+    m.detach().unwrap();
+    assert!(
+        !dir.join("desired.conf").exists(),
+        "the plugin stops with the module"
+    );
+    assert_eq!(sample_cfg(&s).rate_generation as u32, 0);
+    drop(file);
 }

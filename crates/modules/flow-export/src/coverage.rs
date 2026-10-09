@@ -70,6 +70,7 @@ pub struct Window {
 #[derive(Debug, Clone)]
 pub struct PortCoverage {
     since: Instant,
+    grace: Duration,
     clean_run: u32,
     heavy_run: u32,
     state: State,
@@ -77,8 +78,14 @@ pub struct PortCoverage {
 
 impl PortCoverage {
     pub fn new(now: Instant) -> Self {
+        Self::with_grace(now, STARTUP_GRACE)
+    }
+
+    /// Starting for `grace` rather than [`STARTUP_GRACE`].
+    pub fn with_grace(now: Instant, grace: Duration) -> Self {
         Self {
             since: now,
+            grace,
             clean_run: 0,
             heavy_run: 0,
             state: State::Starting,
@@ -91,7 +98,7 @@ impl PortCoverage {
 
     /// Judge a window that ended at `now`.
     pub fn judge(&mut self, now: Instant, w: Window) -> &State {
-        let starting = now.saturating_duration_since(self.since) < STARTUP_GRACE;
+        let starting = now.saturating_duration_since(self.since) < self.grace;
         let silent = w.samples == 0
             && w.lost == 0
             && w.packets >= SILENT_GAPS.saturating_mul(u64::from(w.rate.max(1)));

@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use packetframe_common::module::{HealthReport, HealthState, SubsystemHealth};
 
+use packetframe_sampler_shm::coverage::Coverage;
+
 use crate::coverage::State;
-use crate::worker::{Hook, Published};
+use crate::worker::{Path, Published};
 
 /// A worker that has not ticked for this long has stopped: nothing is
 /// exported, and every port is uncovered.
@@ -36,10 +38,26 @@ fn row(name: impl Into<String>, state: HealthState, message: String) -> Subsyste
     }
 }
 
-pub fn health(p: &Published, heartbeat_age: Duration) -> HealthReport {
-    let stalled = heartbeat_age > STALL_AFTER;
+/// Whether the worker is ticking: neither panicked nor stalled.
+pub fn worker_up(heartbeat_age: Duration, panicked: Option<&str>) -> bool {
+    panicked.is_none() && heartbeat_age <= STALL_AFTER
+}
+
+/// `panicked`: why the worker panicked, if it did; it has stopped the
+/// samplers, and nothing is exported until a restart.
+pub fn health(p: &Published, heartbeat_age: Duration, panicked: Option<&str>) -> HealthReport {
+    let stalled = !worker_up(heartbeat_age, panicked);
     let mut rows = Vec::new();
-    if stalled {
+    if let Some(why) = panicked {
+        rows.push(row(
+            "worker",
+            HealthState::Unhealthy,
+            format!(
+                "the export worker panicked ({why}): sampling is stopped and nothing is \
+                 exported; restart the daemon to resume"
+            ),
+        ));
+    } else if stalled {
         rows.push(row(
             "worker",
             HealthState::Unhealthy,
@@ -82,13 +100,37 @@ pub fn health(p: &Published, heartbeat_age: Duration) -> HealthReport {
         ),
     });
 
-    for hook in [Hook::Xdp, Hook::Tc] {
-        let ports: Vec<_> = p.ports.iter().filter(|r| r.hook == hook).collect();
-        if ports.is_empty() {
-            continue;
-        }
+    for path in Path::ALL {
+        let ports: Vec<_> = p.ports.iter().filter(|r| r.path == path).collect();
         let mut worst = HealthState::Healthy;
         let mut parts = Vec::new();
+        if path == Path::Vpp {
+            let Some(v) = &p.vpp else { continue };
+            let epoch = v
+                .epoch
+                .map_or_else(String::new, |e| format!("; epoch {e:016x}"));
+            let generations = match (v.applied, v.written) {
+                (Some(a), Some(w)) => format!(", generation {a} applied of {w} asked"),
+                (None, Some(w)) => format!(", generation {w} asked"),
+                _ => String::new(),
+            };
+            parts.push(format!(
+                "sampler {}: {}{epoch}{generations}",
+                v.coverage.name(),
+                v.why
+            ));
+            // The plugin's own state bounds the row, whatever its ports
+            // show: a port still in its startup grace is no evidence the
+            // sampler works.
+            if !v.coverage.is_healthy() {
+                worst = match v.coverage {
+                    Coverage::Incompatible => HealthState::Unhealthy,
+                    _ => HealthState::Degraded,
+                };
+            }
+        } else if ports.is_empty() {
+            continue;
+        }
         for r in &ports {
             let (state, label) = if stalled {
                 (
@@ -106,7 +148,7 @@ pub fn health(p: &Published, heartbeat_age: Duration) -> HealthReport {
             worst = worst.worse_of(state);
             parts.push(format!("{} {label} ({} samples)", r.name, r.samples));
         }
-        rows.push(row(hook.name(), worst, parts.join("; ")));
+        rows.push(row(path.name(), worst, parts.join("; ")));
     }
     if let Some(e) = &p.ports_error {
         rows.push(row(
@@ -148,7 +190,10 @@ pub fn health(p: &Published, heartbeat_age: Duration) -> HealthReport {
 }
 
 /// Prometheus text, every name under `packetframe_flow_export_`.
-pub fn metrics(p: &Published, out: &mut String) {
+/// `worker_up`: the worker is ticking, neither stalled nor panicked; the
+/// snapshot it last published says nothing about now when it is not, so
+/// coverage and the VPP sampler's health then read 0.
+pub fn metrics(p: &Published, out: &mut String, worker_up: bool) {
     let mut counter = |name: &str, help: &str, rows: &[(String, u64)]| {
         let _ = writeln!(out, "# HELP packetframe_flow_export_{name} {help}");
         let _ = writeln!(out, "# TYPE packetframe_flow_export_{name} counter");
@@ -159,16 +204,12 @@ pub fn metrics(p: &Published, out: &mut String) {
     counter(
         "samples_total",
         "samples exported, by path",
-        &[Hook::Xdp, Hook::Tc]
+        &Path::ALL
             .iter()
-            .map(|h| {
+            .map(|path| {
                 (
-                    format!("{{path=\"{}\"}}", h.name()),
-                    p.ports
-                        .iter()
-                        .filter(|r| r.hook == *h)
-                        .map(|r| r.samples)
-                        .sum(),
+                    format!("{{path=\"{}\"}}", path.name()),
+                    p.samples_total.get(path).copied().unwrap_or(0),
                 )
             })
             .collect::<Vec<_>>(),
@@ -178,6 +219,7 @@ pub fn metrics(p: &Published, out: &mut String) {
         "samples selected but never exported, by where they were lost",
         &[
             ("{where=\"sampler\"}".into(), p.lost_total),
+            ("{where=\"vpp\"}".into(), p.vpp_lost_total),
             ("{where=\"unmapped\"}".into(), p.unmapped_total),
             ("{where=\"undecodable\"}".into(), p.undecodable_total),
             ("{where=\"unencodable\"}".into(), p.unencodable_total),
@@ -219,11 +261,32 @@ pub fn metrics(p: &Published, out: &mut String) {
             out,
             "packetframe_flow_export_coverage{{iface=\"{}\",path=\"{}\"}} {}",
             escape(&r.name),
-            r.hook.name(),
-            r.state.level()
+            r.path.name(),
+            if worker_up { r.state.level() } else { 0 }
+        );
+    }
+    if let Some(v) = &p.vpp {
+        let _ = writeln!(
+            out,
+            "# HELP packetframe_flow_export_vpp_sampler_healthy 1 while VPP's sampler \
+             samples as asked and loses nothing"
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE packetframe_flow_export_vpp_sampler_healthy gauge"
+        );
+        let _ = writeln!(
+            out,
+            "packetframe_flow_export_vpp_sampler_healthy {}",
+            u8::from(worker_up && v.coverage.is_healthy())
         );
     }
     for (name, help, v) in [
+        (
+            "worker_up",
+            "1 while the export worker ticks; 0 once it stalls or panics",
+            u64::from(worker_up),
+        ),
         ("rate", "the sampling rate, 1 in N", u64::from(p.rate)),
         (
             "over_budget",
@@ -252,7 +315,7 @@ mod tests {
                 PortReport {
                     name: "eth0".into(),
                     ifindex: 2,
-                    hook: Hook::Xdp,
+                    path: Path::Xdp,
                     state: State::Covered,
                     samples: 10,
                     pool: 10_000,
@@ -260,7 +323,7 @@ mod tests {
                 PortReport {
                     name: "eth1".into(),
                     ifindex: 3,
-                    hook: Hook::Xdp,
+                    path: Path::Xdp,
                     state: State::Degraded("2 samples lost in the last 5 s".into()),
                     samples: 4,
                     pool: 4_000,
@@ -275,13 +338,111 @@ mod tests {
                 budget_drops: 0,
                 failing: None,
             }],
+            samples_total: [(Path::Xdp, 14)].into(),
             ..Published::default()
         }
     }
 
+    fn vpp(coverage: Coverage, why: &str) -> crate::vpp::VppHealth {
+        crate::vpp::VppHealth {
+            coverage,
+            why: why.into(),
+            epoch: Some(7),
+            applied: Some(3),
+            written: Some(3),
+            missing: Default::default(),
+        }
+    }
+
+    /// A worker that stopped published its last snapshot long ago: what it
+    /// said then is not what is true now.
+    #[test]
+    fn a_stopped_worker_reads_as_covering_nothing() {
+        let mut p = published();
+        p.vpp = Some(vpp(Coverage::Healthy, "sampling as configured"));
+        let mut out = String::new();
+        metrics(&p, &mut out, false);
+        for line in [
+            "packetframe_flow_export_worker_up 0",
+            "packetframe_flow_export_coverage{iface=\"eth0\",path=\"xdp\"} 0",
+            "packetframe_flow_export_vpp_sampler_healthy 0",
+        ] {
+            assert!(out.contains(line), "missing {line}:\n{out}");
+        }
+        assert!(!worker_up(Duration::ZERO, Some("boom")));
+        assert!(!worker_up(STALL_AFTER + Duration::from_millis(1), None));
+        assert!(worker_up(STALL_AFTER, None));
+    }
+
+    #[test]
+    fn a_panicked_worker_says_why_and_uncovers_everything() {
+        let h = health(&published(), Duration::ZERO, Some("index out of bounds"));
+        let w = h.subsystems.iter().find(|r| r.name == "worker").unwrap();
+        assert_eq!(w.state, HealthState::Unhealthy);
+        assert!(
+            w.message
+                .as_deref()
+                .unwrap()
+                .contains("panicked (index out of bounds)"),
+            "{:?}",
+            w.message
+        );
+        let xdp = h.subsystems.iter().find(|r| r.name == "xdp").unwrap();
+        assert_eq!(xdp.state, HealthState::Unhealthy);
+    }
+
+    #[test]
+    fn the_vpp_row_shows_the_sampler_with_or_without_ports() {
+        let mut p = published();
+        p.ports.truncate(1);
+        let vpp_row = |p: &Published| {
+            health(p, Duration::ZERO, None)
+                .subsystems
+                .into_iter()
+                .find(|r| r.name == "vpp")
+        };
+        assert!(vpp_row(&p).is_none(), "no vpp-offload, no row");
+        p.vpp = Some(vpp(Coverage::Unavailable, "no VPP ports attached yet"));
+        let r = vpp_row(&p).unwrap();
+        assert_eq!(r.state, HealthState::Degraded);
+        assert!(r
+            .message
+            .unwrap()
+            .contains("sampler unavailable: no VPP ports"));
+        p.vpp = Some(vpp(Coverage::Healthy, "sampling as configured"));
+        p.ports.push(PortReport {
+            name: "eth3".into(),
+            ifindex: 5,
+            path: Path::Vpp,
+            state: State::Uncovered("VPP has no interface octeon1/0".into()),
+            samples: 0,
+            pool: 0,
+        });
+        let r = vpp_row(&p).unwrap();
+        assert_eq!(r.state, HealthState::Unhealthy);
+        let m = r.message.unwrap();
+        assert!(
+            m.contains("epoch 0000000000000007, generation 3 applied of 3 asked")
+                && m.contains("eth3 uncovered"),
+            "{m}"
+        );
+        let mut out = String::new();
+        metrics(&p, &mut out, true);
+        assert!(
+            out.contains("packetframe_flow_export_vpp_sampler_healthy 1")
+                && out.contains("coverage{iface=\"eth3\",path=\"vpp\"} 0"),
+            "{out}"
+        );
+        // A port in its startup grace does not make a broken sampler's row
+        // healthy.
+        p.ports.last_mut().unwrap().state = State::Starting;
+        p.vpp = Some(vpp(Coverage::Unavailable, "heartbeat 2000 ms old"));
+        assert_eq!(vpp_row(&p).unwrap().state, HealthState::Degraded);
+    }
+
     #[test]
     fn a_path_reads_as_its_worst_port_and_names_each() {
-        let h = health(&published(), Duration::ZERO);
+        let h = health(&published(), Duration::ZERO, None);
         let xdp = h.subsystems.iter().find(|r| r.name == "xdp").unwrap();
         assert_eq!(xdp.state, HealthState::Degraded);
         let m = xdp.message.as_deref().unwrap();
@@ -308,7 +469,7 @@ mod tests {
 
     #[test]
     fn a_stalled_worker_uncovers_everything() {
-        let h = health(&published(), STALL_AFTER + Duration::from_millis(1));
+        let h = health(&published(), STALL_AFTER + Duration::from_millis(1), None);
         assert_eq!(h.overall, HealthState::Unhealthy);
         assert!(h.subsystems.iter().any(|r| r.name == "worker"));
         let xdp = h.subsystems.iter().find(|r| r.name == "xdp").unwrap();
@@ -322,7 +483,7 @@ mod tests {
         p.over_budget = true;
         p.rate = 100;
         p.collectors[0].failing = Some("Network is unreachable".into());
-        let h = health(&p, Duration::ZERO);
+        let h = health(&p, Duration::ZERO, None);
         let s = h.subsystems.iter().find(|r| r.name == "sampling").unwrap();
         assert_eq!(s.state, HealthState::Degraded);
         assert!(s.message.as_deref().unwrap().contains("over budget"));
@@ -339,7 +500,7 @@ mod tests {
         let mut p = published();
         p.source_error =
             Some("a reload to 1:100 with 128 header bytes could not be applied: no".into());
-        let h = health(&p, Duration::ZERO);
+        let h = health(&p, Duration::ZERO, None);
         let s = h.subsystems.iter().find(|r| r.name == "sampling").unwrap();
         assert_eq!(s.state, HealthState::Degraded);
         assert!(
@@ -358,7 +519,7 @@ mod tests {
         p.ports[0].name = "a\\b\"c\nd".into();
         p.collectors[0].name = "f\"nm".into();
         let mut out = String::new();
-        metrics(&p, &mut out);
+        metrics(&p, &mut out, true);
         assert!(
             out.contains("coverage{iface=\"a\\\\b\\\"c\\nd\",path=\"xdp\"} 3"),
             "{out}"
@@ -369,7 +530,7 @@ mod tests {
         );
         assert_eq!(out.lines().count(), {
             let mut plain = String::new();
-            metrics(&published(), &mut plain);
+            metrics(&published(), &mut plain, true);
             plain.lines().count()
         });
     }
@@ -377,7 +538,7 @@ mod tests {
     #[test]
     fn metrics_name_every_series() {
         let mut out = String::new();
-        metrics(&published(), &mut out);
+        metrics(&published(), &mut out, true);
         for line in [
             "packetframe_flow_export_samples_total{path=\"xdp\"} 14",
             "packetframe_flow_export_samples_total{path=\"tc\"} 0",
@@ -385,6 +546,7 @@ mod tests {
             "packetframe_flow_export_coverage{iface=\"eth1\",path=\"xdp\"} 1",
             "packetframe_flow_export_rate 1000",
             "packetframe_flow_export_over_budget 0",
+            "packetframe_flow_export_worker_up 1",
         ] {
             assert!(out.contains(line), "missing {line}:\n{out}");
         }

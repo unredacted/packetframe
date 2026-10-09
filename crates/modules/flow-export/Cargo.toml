@@ -18,6 +18,7 @@ path = "src/lib.rs"
 packetframe-common.workspace = true
 packetframe-flow-encode.workspace = true
 packetframe-fast-path.workspace = true
+packetframe-sampler-shm.workspace = true
 tracing.workspace = true
 libc.workspace = true
 

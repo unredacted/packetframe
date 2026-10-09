@@ -785,6 +785,7 @@ dependencies = [
  "packetframe-common",
  "packetframe-fast-path",
  "packetframe-flow-encode",
+ "packetframe-sampler-shm",
  "tracing",
 ]
 

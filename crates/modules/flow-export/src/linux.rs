@@ -7,17 +7,21 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use aya::maps::{Array, Map, MapData};
 use packetframe_common::module::HookType;
+use packetframe_common::sampler_ports::VppSamplerPorts;
 use packetframe_fast_path::sample::SampleCfg;
 use packetframe_fast_path::sample_rings::SampleRings;
 use packetframe_fast_path::{pin, registry};
 
 use crate::cfg::FlowExportConfig;
-use crate::worker::{Hook, Leftover, Port, Ports, SampleSource, Shared, Worker, TICK};
+use crate::vpp::VppSide;
+use crate::vpp_live::{self, LiveVppDir};
+use crate::worker::{self, Leftover, Path as Lane, Port, Ports, SampleSource, Shared, Worker};
 use crate::THREAD_NAME;
 
 /// The busiest a single CPU forwards, for sizing its ring.
@@ -42,13 +46,21 @@ fn open_cfg(bpffs_root: &Path) -> Result<Array<MapData, SampleCfg>, String> {
     Array::try_from(Map::Array(md)).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-pub fn release_sampler(bpffs_root: &Path) -> Result<(), String> {
-    if !pin::map_path(bpffs_root, "SAMPLE_CFG").exists() {
-        return Ok(());
+pub fn release_sampler(bpffs_root: &Path, vpp_dir: Option<&Path>) -> Result<(), String> {
+    let fast = if pin::map_path(bpffs_root, "SAMPLE_CFG").exists() {
+        open_cfg(bpffs_root).and_then(|mut c| {
+            c.set(0, SampleCfg::default(), 0)
+                .map_err(|e| format!("SAMPLE_CFG: {e}"))
+        })
+    } else {
+        Ok(())
+    };
+    let vpp = vpp_dir.map_or(Ok(()), vpp_live::release);
+    match (fast, vpp) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        (Err(a), Err(b)) => Err(format!("{a}; {b}")),
     }
-    open_cfg(bpffs_root)?
-        .set(0, SampleCfg::default(), 0)
-        .map_err(|e| format!("SAMPLE_CFG: {e}"))
 }
 
 struct LiveSource {
@@ -140,7 +152,7 @@ impl SampleSource for LiveSource {
         let mut lost = 0;
         if let Some((at, old)) = &mut self.retired {
             lost += old.drain(|_, e| f(e));
-            if at.elapsed() >= TICK {
+            if at.elapsed() >= worker::TICK {
                 self.retired = None;
             }
         }
@@ -175,9 +187,9 @@ impl Ports for LivePorts {
             .attachments
             .into_iter()
             .filter_map(|a| {
-                let hook = match HookType::from(a.hook) {
-                    HookType::NativeXdp | HookType::GenericXdp => Hook::Xdp,
-                    HookType::TcIngress => Hook::Tc,
+                let path = match HookType::from(a.hook) {
+                    HookType::NativeXdp | HookType::GenericXdp => Lane::Xdp,
+                    HookType::TcIngress => Lane::Tc,
                     HookType::TcEgress => return None,
                 };
                 let name = std::ffi::CString::new(a.iface.as_str()).ok()?;
@@ -186,7 +198,7 @@ impl Ports for LivePorts {
                 (ifindex != 0).then_some(Port {
                     name: a.iface,
                     ifindex,
-                    hook,
+                    path,
                 })
             })
             .collect())
@@ -209,6 +221,7 @@ pub struct Running {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     bpffs_root: PathBuf,
+    vpp_dir: Option<PathBuf>,
 }
 
 impl Running {
@@ -216,6 +229,7 @@ impl Running {
         cfg: FlowExportConfig,
         bpffs_root: &Path,
         state_dir: &Path,
+        vpp: Option<(Arc<VppSamplerPorts>, PathBuf)>,
     ) -> Result<Self, String> {
         let epoch = Instant::now();
         let shared = Shared::new(epoch);
@@ -229,26 +243,35 @@ impl Running {
         let ports = LivePorts {
             state_dir: state_dir.to_owned(),
         };
-        let mut worker = Worker::new(cfg, source, ports, socket, shared.clone(), epoch)?;
+        let worker = Worker::new(cfg, source, ports, socket, shared.clone(), epoch)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
+        let vpp_dir = vpp.as_ref().map(|(_, d)| d.clone());
+        let (bpffs, dir) = (bpffs_root.to_owned(), vpp_dir.clone());
+        // A worker that panicked stops nothing itself.
+        let after_panic = move || {
+            if let Err(e) = release_sampler(&bpffs, dir.as_deref()) {
+                tracing::error!(error = %e, "flow-export: stopping the samplers after a panic failed");
+            }
+        };
         let thread = std::thread::Builder::new()
             .name(THREAD_NAME.into())
             .spawn(move || {
                 // Placed with the control plane whenever it starts.
                 packetframe_common::placement::join();
-                let mut next = Instant::now();
-                while !stopping.load(Ordering::Relaxed) {
-                    worker.tick(Instant::now());
-                    next += TICK;
-                    let now = Instant::now();
-                    match next.checked_duration_since(now) {
-                        Some(d) => std::thread::sleep(d),
-                        None => next = now,
+                match vpp {
+                    // The sampler directory's mappings never leave this
+                    // thread.
+                    Some((ports, dir)) => {
+                        let side = VppSide::new(
+                            LiveVppDir::new(&dir),
+                            ports,
+                            Instant::now(),
+                            vpp_live::now_realtime_ns(),
+                        );
+                        worker::run(worker.with_vpp(side), &stopping, after_panic);
                     }
-                }
-                if let Err(e) = worker.stop() {
-                    tracing::warn!(error = %e, "flow-export: stopping the sampler failed");
+                    None => worker::run(worker, &stopping, after_panic),
                 }
             })
             .map_err(|e| format!("spawn {THREAD_NAME}: {e}"))?;
@@ -257,6 +280,7 @@ impl Running {
             stop,
             thread: Some(thread),
             bpffs_root: bpffs_root.to_owned(),
+            vpp_dir,
         })
     }
 
@@ -277,7 +301,7 @@ impl Running {
                 tracing::warn!("flow-export: the worker did not stop within its deadline");
             }
         }
-        release_sampler(&self.bpffs_root)
+        release_sampler(&self.bpffs_root, self.vpp_dir.as_deref())
     }
 }
 
