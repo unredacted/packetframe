@@ -44,6 +44,7 @@ updates:
       - "/crates/modules/fast-path/bpf"
       - "/crates/modules/guard/bpf"
       - "/crates/modules/probe/bpf"
+      - "/crates/modules/flow-export/bpf"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 3

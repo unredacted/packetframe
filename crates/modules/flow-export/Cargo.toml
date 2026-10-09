@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 description = "PacketFrame flow-export module: sampled packets from PacketFrame's forwarding paths to sFlow collectors"
 
+build = "build.rs"
+
 [lib]
 path = "src/lib.rs"
 
@@ -19,6 +21,9 @@ packetframe-common.workspace = true
 packetframe-flow-encode.workspace = true
 packetframe-fast-path.workspace = true
 packetframe-sampler-shm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 libc.workspace = true
 

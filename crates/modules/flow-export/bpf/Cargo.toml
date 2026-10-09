@@ -1,0 +1,37 @@
+[package]
+name = "packetframe-flow-export-bpf"
+version = "0.0.1"
+edition = "2021"
+# The BPF crate builds on the nightly pinned in rust-toolchain.toml here;
+# this documents the stable floor, as the guard's BPF crate does.
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+publish = false
+
+# Its own workspace root, so the nested `cargo build` from the parent's
+# build.rs does not walk up into the outer workspace. Mirror of the guard
+# BPF crate's manifest; when one is updated, the other likely needs the
+# same change.
+[workspace]
+
+[[bin]]
+name = "kernel-sample"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "=0.2.1"
+
+[profile.release]
+# BPF programs pass the verifier in release mode only.
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+overflow-checks = false
+
+[profile.dev]
+opt-level = 3
+panic = "abort"
+debug = false
+overflow-checks = false

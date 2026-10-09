@@ -89,8 +89,9 @@ jobs:
             ~/.cargo/git/db/
             crates/modules/fast-path/bpf/target/
             crates/modules/guard/bpf/target/
+            crates/modules/flow-export/bpf/target/
             crates/modules/probe/bpf/target/
-          key: ${{ runner.os }}-hwtest-bpf-${{ hashFiles('crates/modules/fast-path/bpf/**', 'crates/modules/guard/bpf/**', 'crates/modules/probe/bpf/**') }}
+          key: ${{ runner.os }}-hwtest-bpf-${{ hashFiles('crates/modules/fast-path/bpf/**', 'crates/modules/guard/bpf/**', 'crates/modules/probe/bpf/**', 'crates/modules/flow-export/bpf/**') }}
 
       - name: Install bpf-linker
         run: |
@@ -131,6 +132,7 @@ jobs:
           build_one crates/modules/fast-path/bpf fast-path fast-path.bpf.o
           build_one crates/modules/guard/bpf     guard     guard.bpf.o
           build_one crates/modules/probe/bpf     probe     probe.bpf.o
+          build_one crates/modules/flow-export/bpf kernel-sample kernel-sample.bpf.o
           ls -la dist/*.bpf.o
 
       - uses: actions/upload-artifact@v7
@@ -140,6 +142,7 @@ jobs:
             dist/fast-path.bpf.o
             dist/guard.bpf.o
             dist/probe.bpf.o
+            dist/kernel-sample.bpf.o
           retention-days: 14
           if-no-files-found: error
 
@@ -247,13 +250,15 @@ jobs:
           FAST="$(pwd)/prebuilt-bpf/fast-path.bpf.o"
           GUARD="$(pwd)/prebuilt-bpf/guard.bpf.o"
           PROBE="$(pwd)/prebuilt-bpf/probe.bpf.o"
+          KSAMPLE="$(pwd)/prebuilt-bpf/kernel-sample.bpf.o"
           head -c 4 "${FAST}"  | od -An -c | grep -q 'E   L   F'
           head -c 4 "${GUARD}" | od -An -c | grep -q 'E   L   F'
           head -c 4 "${PROBE}" | od -An -c | grep -q 'E   L   F'
+          head -c 4 "${KSAMPLE}" | od -An -c | grep -q 'E   L   F'
           # Cross.toml's passthrough list doesn't cover these, so forward
           # them with explicit -e, using the container's mount point for
           # the workspace (/project). Same approach as release.yml.
-          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o -e PACKETFRAME_GUARD_BPF_OBJ_PATH=/project/prebuilt-bpf/guard.bpf.o -e PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o" >> "${GITHUB_ENV}"
+          echo "CROSS_CONTAINER_OPTS=-e PACKETFRAME_BPF_OBJ_PATH=/project/prebuilt-bpf/fast-path.bpf.o -e PACKETFRAME_GUARD_BPF_OBJ_PATH=/project/prebuilt-bpf/guard.bpf.o -e PACKETFRAME_PROBE_BPF_OBJ_PATH=/project/prebuilt-bpf/probe.bpf.o -e PACKETFRAME_FLOW_EXPORT_BPF_OBJ_PATH=/project/prebuilt-bpf/kernel-sample.bpf.o" >> "${GITHUB_ENV}"
 
       # `--tests` is the point of this job and is NOT covered by
       # ci.yml's cross matrix (which builds `--release --workspace`

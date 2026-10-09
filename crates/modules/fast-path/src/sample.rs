@@ -37,6 +37,9 @@ pub const RECORD_LEN: usize = 40;
 pub enum Path {
     Xdp,
     Tc,
+    /// flow-export's kernel sampler (tc ingress on an interface no
+    /// fast-path program is on), which writes this same record.
+    Kernel,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -100,6 +103,7 @@ pub fn parse(event: &[u8]) -> Result<Sample<'_>, ParseError> {
     let path = match meta & 0xff {
         1 => Path::Xdp,
         2 => Path::Tc,
+        3 => Path::Kernel,
         p => return Err(ParseError::Path(p)),
     };
     let disposition = match (meta >> 8) & 0xff {
@@ -198,8 +202,13 @@ mod tests {
     fn malformed_events_are_refused() {
         assert_eq!(parse(&[0; 39]), Err(ParseError::Short(39)));
         assert_eq!(
-            parse(&event([0, 0, 0, 0, 0, 0, 3, 0], 0, &[])),
-            Err(ParseError::Path(3))
+            parse(&event([0, 0, 0, 0, 0, 0, 4, 0], 0, &[])),
+            Err(ParseError::Path(4))
+        );
+        assert_eq!(
+            parse(&event([0, 0, 0, 0, 0, 0, 3, 0], 0, &[])).map(|s| s.path),
+            Ok(Path::Kernel),
+            "flow-export's kernel sampler"
         );
         assert_eq!(
             parse(&event([0, 0, 0, 0, 0, 0, 1 | 3 << 8, 0], 0, &[])),

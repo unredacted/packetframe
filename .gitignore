@@ -47,6 +47,7 @@ $RECYCLE.BIN/
 crates/modules/fast-path/bpf/target/
 crates/modules/guard/bpf/target/
 crates/modules/probe/bpf/target/
+crates/modules/flow-export/bpf/target/
 crates/vpp-plugins/pf-sampler/target/
 
 # Locally downloaded hwtest/release bundles. CI writes this path too,

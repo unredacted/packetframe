@@ -52,16 +52,19 @@ pub enum Path {
     Xdp,
     Tc,
     Vpp,
+    /// flow-export's kernel sampler, on a `kernel-sample` interface.
+    Kernel,
 }
 
 impl Path {
-    pub const ALL: [Path; 3] = [Path::Xdp, Path::Tc, Path::Vpp];
+    pub const ALL: [Path; 4] = [Path::Xdp, Path::Tc, Path::Vpp, Path::Kernel];
 
     pub fn name(self) -> &'static str {
         match self {
             Path::Xdp => "xdp",
             Path::Tc => "tc",
             Path::Vpp => "vpp",
+            Path::Kernel => "kernel",
         }
     }
 }
@@ -297,7 +300,7 @@ impl Source {
     fn lane_pool(&self, path: Path) -> u64 {
         match path {
             Path::Vpp => self.vpp,
-            Path::Xdp | Path::Tc => self.kernel.total(),
+            Path::Xdp | Path::Tc | Path::Kernel => self.kernel.total(),
         }
     }
 }
@@ -550,6 +553,7 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
             let domain = match r.path {
                 Path::Vpp => Domain::Vpp,
                 Path::Xdp | Path::Tc => Domain::FastPath,
+                Path::Kernel => Domain::Kernel,
             };
             batches.entry(domain).or_default().push(Sampled {
                 packet,
@@ -751,7 +755,7 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
                         now,
                         match path {
                             Path::Vpp => VPP_STARTUP_GRACE,
-                            Path::Xdp | Path::Tc => crate::coverage::STARTUP_GRACE,
+                            Path::Xdp | Path::Tc | Path::Kernel => crate::coverage::STARTUP_GRACE,
                         },
                     ),
                     vpp_name,
@@ -853,7 +857,7 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
             for (path, lane) in s.lanes.iter_mut() {
                 let pool = match path {
                     Path::Vpp => vpp,
-                    Path::Xdp | Path::Tc => kernel,
+                    Path::Xdp | Path::Tc | Path::Kernel => kernel,
                 };
                 lane.coverage.judge(
                     now,
@@ -861,7 +865,7 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
                         samples: lane.window_samples,
                         lost: match path {
                             Path::Vpp => self.vpp_window_lost,
-                            Path::Xdp | Path::Tc => self.window_lost,
+                            Path::Xdp | Path::Tc | Path::Kernel => self.window_lost,
                         },
                         packets: pool.saturating_sub(lane.window_base),
                         rate: self.cfg.rate,
@@ -896,7 +900,7 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
                     path: *path,
                     state: match path {
                         Path::Vpp => held_to(lane.coverage.state(), vpp, lane.vpp_name.as_deref()),
-                        Path::Xdp | Path::Tc => lane.coverage.state().clone(),
+                        Path::Xdp | Path::Tc | Path::Kernel => lane.coverage.state().clone(),
                     },
                     samples: lane.samples,
                     pool: s.lane_pool(*path),
@@ -1019,6 +1023,7 @@ fn ingest(
     let path = match s.path {
         sample::Path::Xdp => Path::Xdp,
         sample::Path::Tc => Path::Tc,
+        sample::Path::Kernel => Path::Kernel,
     };
     src.sequence = src.sequence.wrapping_add(1);
     src.drops = src.drops.wrapping_add(std::mem::take(pending));
@@ -1230,6 +1235,7 @@ mod tests {
             }],
             cache: flows::Limits::default(),
             local: Vec::new(),
+            kernel: Vec::new(),
         }
     }
 

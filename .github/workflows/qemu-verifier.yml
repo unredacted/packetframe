@@ -75,8 +75,9 @@ jobs:
             target/
             crates/modules/fast-path/bpf/target/
             crates/modules/guard/bpf/target/
+            crates/modules/flow-export/bpf/target/
             crates/modules/probe/bpf/target/
-          key: ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml', 'crates/modules/guard/bpf/Cargo.toml', 'crates/modules/probe/bpf/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml', 'crates/modules/guard/bpf/Cargo.toml', 'crates/modules/probe/bpf/Cargo.toml', 'crates/modules/flow-export/bpf/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-
             ${{ runner.os }}-cargo-qemu-

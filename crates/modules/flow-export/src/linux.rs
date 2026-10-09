@@ -18,6 +18,7 @@ use packetframe_fast_path::sample_rings::SampleRings;
 use packetframe_fast_path::{pin, registry};
 
 use crate::cfg::FlowExportConfig;
+use crate::kernel;
 use crate::vpp::VppSide;
 use crate::vpp_live::{self, LiveVppDir};
 use crate::worker::{self, Leftover, Path as Lane, Port, Ports, SampleSource, Shared, Worker};
@@ -45,7 +46,11 @@ fn open_cfg(bpffs_root: &Path) -> Result<Array<MapData, SampleCfg>, String> {
     Array::try_from(Map::Array(md)).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-pub fn release_sampler(bpffs_root: &Path, vpp_dir: Option<&Path>) -> Result<(), String> {
+pub fn release_sampler(
+    bpffs_root: &Path,
+    state_dir: &Path,
+    vpp_dir: Option<&Path>,
+) -> Result<(), String> {
     let fast = if pin::map_path(bpffs_root, "SAMPLE_CFG").exists() {
         open_cfg(bpffs_root).and_then(|mut c| {
             c.set(0, SampleCfg::default(), 0)
@@ -54,15 +59,27 @@ pub fn release_sampler(bpffs_root: &Path, vpp_dir: Option<&Path>) -> Result<(), 
     } else {
         Ok(())
     };
+    let kernel = kernel::detach_from_state_dir(state_dir).map(|_| ());
     let vpp = vpp_dir.map_or(Ok(()), vpp_live::release);
-    match (fast, vpp) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
-        (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+    let errors: Vec<String> = [fast, kernel, vpp]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
+/// A sampler's programs' count of samples they could not output.
+type LossCounter = Box<dyn FnMut() -> Option<u64> + Send>;
+
+/// One sampler's configuration map and rings: fast-path's, or the
+/// kernel sampler's.
 struct LiveSource {
+    /// The configuration map's name, for errors.
+    cfg_name: &'static str,
     cfg: Array<MapData, SampleCfg>,
     samples: MapData,
     rings: Option<SampleRings>,
@@ -72,38 +89,72 @@ struct LiveSource {
     retired: Option<(Instant, SampleRings)>,
     pages: usize,
     cpus: Vec<u32>,
-    bpffs_root: PathBuf,
-    emit_failed_at: usize,
+    loss: LossCounter,
 }
 
 impl LiveSource {
-    fn open(bpffs_root: &Path) -> Result<Self, String> {
+    /// fast-path's sampler, through its pinned maps.
+    fn fast_path(bpffs_root: &Path) -> Result<Self, String> {
         let samples_path = pin::map_path(bpffs_root, "SAMPLES");
         let samples = MapData::from_pin(&samples_path)
             .map_err(|e| format!("{}: {e}", samples_path.display()))?;
-        let cpus = aya::util::online_cpus().map_err(|(what, e)| format!("{what}: {e}"))?;
-        let emit_failed_at = packetframe_fast_path::metrics::COUNTER_NAMES
+        let at = packetframe_fast_path::metrics::COUNTER_NAMES
             .iter()
             .position(|n| *n == "sample_emit_failed")
             .ok_or("fast-path has no sample_emit_failed counter")?;
+        let root = bpffs_root.to_owned();
         Ok(Self {
+            cfg_name: "SAMPLE_CFG",
             cfg: open_cfg(bpffs_root)?,
             samples,
             rings: None,
             retired: None,
             pages: 0,
-            cpus,
-            bpffs_root: bpffs_root.to_owned(),
-            emit_failed_at,
+            cpus: online_cpus()?,
+            loss: Box::new(move || {
+                packetframe_fast_path::stats_from_pin(&root)
+                    .ok()
+                    .and_then(|v| v.get(at).copied())
+            }),
         })
     }
+
+    /// The kernel sampler, through the maps its attach took.
+    fn kernel(k: kernel::KernelSampler) -> Result<Self, String> {
+        let kernel::KernelSampler {
+            ebpf,
+            cfg,
+            samples,
+            state,
+            ..
+        } = k;
+        Ok(Self {
+            cfg_name: "KSAMPLE_CFG",
+            cfg,
+            samples,
+            rings: None,
+            retired: None,
+            pages: 0,
+            cpus: online_cpus()?,
+            loss: Box::new(move || {
+                // The object whose program the filters hold lives as long
+                // as this source.
+                let _ = &ebpf;
+                kernel::emit_failed(&state)
+            }),
+        })
+    }
+}
+
+fn online_cpus() -> Result<Vec<u32>, String> {
+    aya::util::online_cpus().map_err(|(what, e)| format!("{what}: {e}"))
 }
 
 impl SampleSource for LiveSource {
     fn configure(&mut self, cfg: SampleCfg) -> Result<(), String> {
         self.cfg
             .set(0, cfg, 0)
-            .map_err(|e| format!("SAMPLE_CFG: {e}"))
+            .map_err(|e| format!("{}: {e}", self.cfg_name))
     }
 
     fn ensure_capacity(&mut self, rate: u32, left: &mut Leftover) -> Result<(), String> {
@@ -162,14 +213,51 @@ impl SampleSource for LiveSource {
     }
 
     fn emit_failed(&mut self) -> Option<u64> {
-        packetframe_fast_path::stats_from_pin(&self.bpffs_root)
-            .ok()
-            .and_then(|v| v.get(self.emit_failed_at).copied())
+        (self.loss)()
+    }
+}
+
+/// fast-path's sampler and, with `kernel-sample` lines, the kernel
+/// sampler, driven as one: the same configuration, generation and rate,
+/// and their rings drained together.
+struct Sources {
+    fast: LiveSource,
+    kernel: Option<LiveSource>,
+}
+
+impl SampleSource for Sources {
+    fn configure(&mut self, cfg: SampleCfg) -> Result<(), String> {
+        let fast = self.fast.configure(cfg);
+        let kernel = self.kernel.as_mut().map_or(Ok(()), |k| k.configure(cfg));
+        fast.and(kernel)
+    }
+
+    fn ensure_capacity(&mut self, rate: u32, left: &mut Leftover) -> Result<(), String> {
+        let fast = self.fast.ensure_capacity(rate, left);
+        let kernel = self
+            .kernel
+            .as_mut()
+            .map_or(Ok(()), |k| k.ensure_capacity(rate, left));
+        fast.and(kernel)
+    }
+
+    fn drain(&mut self, f: &mut dyn FnMut(&[u8])) -> u64 {
+        self.fast.drain(f) + self.kernel.as_mut().map_or(0, |k| k.drain(f))
+    }
+
+    fn emit_failed(&mut self) -> Option<u64> {
+        let fast = self.fast.emit_failed()?;
+        match &mut self.kernel {
+            Some(k) => Some(fast + k.emit_failed()?),
+            None => Some(fast),
+        }
     }
 }
 
 struct LivePorts {
     state_dir: PathBuf,
+    /// The kernel sampler's interfaces, as attached.
+    kernel: Vec<(String, u32)>,
 }
 
 impl Ports for LivePorts {
@@ -182,7 +270,7 @@ impl Ports for LivePorts {
                 self.state_dir.display()
             ));
         };
-        Ok(reg
+        let mut ports: Vec<Port> = reg
             .attachments
             .into_iter()
             .filter_map(|a| {
@@ -200,7 +288,13 @@ impl Ports for LivePorts {
                     path,
                 })
             })
-            .collect())
+            .collect();
+        ports.extend(self.kernel.iter().map(|(name, ifindex)| Port {
+            name: name.clone(),
+            ifindex: *ifindex,
+            path: Lane::Kernel,
+        }));
+        Ok(ports)
     }
 
     fn rx_packets(&mut self, port: &Port) -> Option<u64> {
@@ -220,6 +314,7 @@ pub struct Running {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     bpffs_root: PathBuf,
+    state_dir: PathBuf,
     vpp_dir: Option<PathBuf>,
 }
 
@@ -239,25 +334,45 @@ impl Running {
         let epoch = Instant::now();
         let mut shared = Shared::new(epoch);
         shared.coverage = coverage;
-        let source = LiveSource::open(bpffs_root)?;
+        let fast = LiveSource::fast_path(bpffs_root)?;
         let socket = UdpSocket::bind((cfg.source, 0))
             .map_err(|e| format!("a socket at source-address {}: {e}", cfg.source))?;
         // A full socket buffer drops a datagram, never stalls the worker.
         socket
             .set_nonblocking(true)
             .map_err(|e| format!("socket: {e}"))?;
+        // The kernel sampler last: everything after it that fails takes
+        // its filters back down.
+        let (kernel_source, kernel_ports) = if cfg.kernel.is_empty() {
+            (None, Vec::new())
+        } else {
+            let sampled = sampled_ports(state_dir, vpp.as_ref().map(|(p, _)| p.as_ref()));
+            let k = kernel::attach(state_dir, &cfg.kernel, &sampled)?;
+            let attached = k.attached.clone();
+            (Some(LiveSource::kernel(k)?), attached)
+        };
         let ports = LivePorts {
             state_dir: state_dir.to_owned(),
+            kernel: kernel_ports,
         };
-        let worker = Worker::new(cfg, source, ports, socket, shared.clone(), epoch)?
-            .with_privacy(asn, local_default);
+        let source = Sources {
+            fast,
+            kernel: kernel_source,
+        };
+        let worker = match Worker::new(cfg, source, ports, socket, shared.clone(), epoch) {
+            Ok(w) => w.with_privacy(asn, local_default),
+            Err(e) => {
+                let _ = kernel::detach_from_state_dir(state_dir);
+                return Err(e);
+            }
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let vpp_dir = vpp.as_ref().map(|(_, d)| d.clone());
-        let (bpffs, dir) = (bpffs_root.to_owned(), vpp_dir.clone());
+        let (bpffs, state, dir) = (bpffs_root.to_owned(), state_dir.to_owned(), vpp_dir.clone());
         // A worker that panicked stops nothing itself.
         let after_panic = move || {
-            if let Err(e) = release_sampler(&bpffs, dir.as_deref()) {
+            if let Err(e) = release_sampler(&bpffs, &state, dir.as_deref()) {
                 tracing::error!(error = %e, "flow-export: stopping the samplers after a panic failed");
             }
         };
@@ -287,6 +402,7 @@ impl Running {
             stop,
             thread: Some(thread),
             bpffs_root: bpffs_root.to_owned(),
+            state_dir: state_dir.to_owned(),
             vpp_dir,
         })
     }
@@ -308,8 +424,25 @@ impl Running {
                 tracing::warn!("flow-export: the worker did not stop within its deadline");
             }
         }
-        release_sampler(&self.bpffs_root, self.vpp_dir.as_deref())
+        release_sampler(&self.bpffs_root, &self.state_dir, self.vpp_dir.as_deref())
     }
+}
+
+/// The ports fast-path's programs and VPP sample: a device stacked on one
+/// is not the kernel sampler's to sample.
+fn sampled_ports(
+    state_dir: &Path,
+    vpp: Option<&packetframe_common::sampler_ports::VppSamplerPorts>,
+) -> Vec<String> {
+    let mut out: Vec<String> = registry::load(state_dir)
+        .ok()
+        .flatten()
+        .map(|r| r.attachments.into_iter().map(|a| a.iface).collect())
+        .unwrap_or_default();
+    if let Some(s) = vpp.and_then(|v| v.current()) {
+        out.extend(s.ports.iter().map(|p| p.port.clone()));
+    }
+    out
 }
 
 #[cfg(test)]
