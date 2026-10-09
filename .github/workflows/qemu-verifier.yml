@@ -5,25 +5,17 @@ name: QEMU verifier
 # BPF_PROG_TEST_RUN_XDP_LIVE; the host CI job already covers whichever
 # kernel ubuntu-latest runners ship with, so this matrix targets
 # explicit EFG-parity + a modern LTS).
+#
+# Called by ci.yml once its `build` job has packed the test binaries:
+# nothing compiles here, the guest runs that build's binaries.
 
 on:
-  pull_request:
-  push:
-    branches: [main]
-
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: short
-  # Pin versions so adding a matrix dimension doesn't drift toolchains.
-  RUST_NIGHTLY: "nightly-2026-04-14"
-  BPF_LINKER_VERSION: "0.10.3"
+  workflow_call:
 
 jobs:
   qemu:
     name: qemu (kernel ${{ matrix.kernel_tag }})
     runs-on: ubuntu-latest
-    env:
-      PACKETFRAME_BPF_REQUIRED: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -32,62 +24,38 @@ jobs:
         # vary per version) from the directory listing.
         kernel_tag: ["v5.15", "v6.6"]
     steps:
+      # For the runner script and the package directories the binaries
+      # run from. The guest sees this tree through virtme-ng's --pwd.
       - uses: actions/checkout@v7
 
-      # GitHub's `ubuntu-latest` runners ship with ~14 GB free after
-      # the preinstalled toolchains (CodeQL, Android SDK, .NET, etc.).
-      # Adding the Option F tokio/rtnetlink/futures dep graph pushes
-      # target/ past that during debug-profile linking and we get
-      # "ld: signal 7 (Bus error)" / "No space left on device".
-      # Dropping the hosted-tool caches we don't use recovers ~20 GB,
-      # which is plenty of headroom. Standard
-      # jlumbroso/free-disk-space-style idiom, inlined to avoid
-      # pulling a non-first-party action.
-      - name: Free disk space on runner
+      - uses: actions/download-artifact@v8
+        with:
+          name: privileged-tests
+
+      - name: Unpack test binaries
+        run: tar --zstd -xf privileged-tests.tar.zst
+
+      # Hosted ubuntu-latest runners expose /dev/kvm, root-only by
+      # default; this udev rule opens it to the job user that runs QEMU.
+      # Until 2026-10 this job ran the guest under TCG (software
+      # emulation, `--disable-kvm`) on the belief that runners had no
+      # KVM, at ~10 minutes a leg. A runner without a usable /dev/kvm
+      # falls back to TCG with a warning: slower, same coverage.
+      - name: Enable KVM
         run: |
           set -eux
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost
-          sudo docker system prune -af 2>/dev/null || true
-          sudo apt-get clean
-          df -h /
-
-      - uses: ./.github/actions/rust-stable-pin
-
-      - name: Install Rust stable + nightly (for BPF)
-        run: |
-          rustup install ${RUST_STABLE} --profile minimal
-          rustup default ${RUST_STABLE}
-          rustup install ${RUST_NIGHTLY} --profile minimal
-          rustup component add --toolchain ${RUST_NIGHTLY} rust-src llvm-tools-preview
-
-      - name: Cache cargo + BPF target
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-            crates/modules/fast-path/bpf/target/
-            crates/modules/guard/bpf/target/
-            crates/modules/flow-export/bpf/target/
-            crates/modules/probe/bpf/target/
-          key: ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml', 'crates/modules/guard/bpf/Cargo.toml', 'crates/modules/probe/bpf/Cargo.toml', 'crates/modules/flow-export/bpf/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-qemu-${{ matrix.kernel_tag }}-
-            ${{ runner.os }}-cargo-qemu-
-            ${{ runner.os }}-cargo-check-
-
-      - name: Install bpf-linker
-        run: |
-          if ! command -v bpf-linker >/dev/null 2>&1 || \
-             [ "$(bpf-linker --version 2>/dev/null | awk '{print $2}')" != "${BPF_LINKER_VERSION}" ]; then
-            cargo install --locked --force bpf-linker --version ${BPF_LINKER_VERSION}
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+            sudo udevadm settle
+          fi
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "VM_ACCEL=" >> "${GITHUB_ENV}"
+          else
+            echo "::warning::/dev/kvm is not usable on this runner; the guest runs under TCG emulation, several times slower"
+            echo "VM_ACCEL=--disable-kvm" >> "${GITHUB_ENV}"
           fi
 
       - name: Install QEMU + virtme-ng
@@ -242,48 +210,32 @@ jobs:
           path: ~/.cache/pf-qemu-kernel
           key: ${{ steps.kernel-cache.outputs.cache-primary-key }}
 
-      - name: Build integration tests
-        run: |
-          # Build so the test binaries are ready to exec inside the VM.
-          # `--no-run` produces the ELFs without executing them on the
-          # host kernel.
-          cargo test -p packetframe-fast-path --tests --no-run
-          cargo test -p packetframe-guard --tests --no-run
-          cargo test -p packetframe-neigh-snoop --tests --no-run
-          cargo test -p packetframe-flow-export --tests --no-run
-          cargo test -p packetframe-probe --tests --no-run
-          cargo test -p packetframe-vpp-offload --test drift_netns --no-run
-
       - name: Run integration tests in QEMU
-        # Two full attempts must fit (see retry policy below). One
-        # attempt is ~6-14 minutes under TCG, by runner speed: over the
-        # single-attempt successes since #315 (~30 per leg, measured
-        # 2026-10-07) p50 11, p90 13, slowest 13.1 (5.15) and 13.8
-        # (6.6). Rarely the guest rebuilds every dependency rather than
-        # the usual two crates: 16.8 on 5.15, before #315 added ~1. Two
-        # of those fit in 40.
+        # Two full attempts must fit (see retry policy below), including
+        # under the TCG fallback. Under TCG, with an in-guest cargo build
+        # this job no longer does, one attempt was 6-14 minutes; KVM with
+        # prebuilt binaries is a few.
         timeout-minutes: 40
         run: |
           set -eux
           # Pass the installed vmlinuz path (not the .deb). virtme-ng
           # discovers matching modules at /lib/modules/$VER on the host
           # and packages them into its generated initramfs.
-          # virtme-init starts the script with HOME=/ and `/` is RO
-          # (only the listed overlay paths are writable). Point
-          # HOME/CARGO_HOME/RUSTUP_HOME at the /home overlay so rustup
-          # can write its state without going read-only.
-          # --memory 8192 (1024 → 4096 → 6144 → here): virtme-ng sizes the
-          # in-VM tmpfs against RAM, and the in-VM incremental relink
-          # of the test binaries is what fills it. 4 GB (~2 GB tmpfs)
-          # was sized for the Option F dep graph; the v0.2.8 fib-cache
-          # branch's grown fast-path test set pushed the subsequent
-          # probe-crate relink over the edge — `ld terminated with
-          # signal 7 [Bus error]` twice in a row on the 6.6 leg, at
-          # the same link. 6 GB ⇒ ~3 GB tmpfs restores the margin;
-          # hosted runners have 16 GB, so TCG + 6 GB guest is fine.
-          # The 2026-09 test growth put the same probe relink over
-          # ~3 GB again, on both legs of every PR: 8 GB => ~4 GB
-          # tmpfs, still leaving the 16 GB host half.
+          #
+          # The guest command is a single line of plain words: virtme-ng
+          # joins everything after `--` with spaces and does not re-quote
+          # it, so a quoted `bash -c '...'` is split apart (that is how
+          # `set -e` was lost and only the last cargo's exit counted, from
+          # 2026-04 to 2026-10). The runner script runs every binary and
+          # owns the exit status. The guest does not inherit this
+          # environment, hence `env`.
+          #
+          # --memory 8192: virtme-ng sizes the guest's tmpfs overlays
+          # against RAM, and 1 → 8 GB was the in-guest relink filling
+          # them (ENOSPC, `ld` bus errors). Nothing compiles in the guest
+          # now; the size stays as headroom for what the tests write, and
+          # guest RAM is only backed on the host as it is touched.
+          #
           # PACKETFRAME_BENCH_SKIP=1: skip the fast-path bench tests
           # outright. bpf_test_run executes uninterruptibly, and under
           # TCG a bench stalls a vCPU past the soft-lockup watchdog;
@@ -292,10 +244,10 @@ jobs:
           # PACKETFRAME_BENCH_QUICK capping (per-syscall repeat in
           # #82, then a ~400-execution total budget) still flaked on
           # slow 5.15 runners (PR #206, PR #207) — runner speed varies
-          # too much for any fixed budget. Bench numbers under TCG are
-          # meaningless anyway; the benches still run full-mode in
-          # ci.yml's native sudo step and on routers via the
-          # hardware-artifacts bundle.
+          # too much for any fixed budget, and the TCG fallback keeps
+          # that live. Bench numbers in a VM are meaningless anyway; the
+          # benches' sanity asserts run in ci.yml's `privileged` job and
+          # the full benches on routers via the hardware-artifacts bundle.
           #
           # watchdog_thresh=60 (default 10, softlockup fires at 2x+2s):
           # belt-and-braces for the remaining fixture tests — any
@@ -306,15 +258,16 @@ jobs:
               --run "${KERNEL_IMG}" \
               --pwd \
               --memory 8192 \
-              --disable-kvm \
+              ${VM_ACCEL:+"${VM_ACCEL}"} \
               --append "watchdog_thresh=60" \
               --verbose \
-              -- bash -c 'set -eux; export HOME=/home/runner; export CARGO_HOME="${HOME}/.cargo"; export RUSTUP_HOME="${HOME}/.rustup"; export PATH="${CARGO_HOME}/bin:${PATH}"; export PACKETFRAME_BENCH_SKIP=1; uname -a; which cargo; cargo test -p packetframe-fast-path --tests -- --ignored --nocapture; cargo test -p packetframe-guard --tests -- --ignored --nocapture; cargo test -p packetframe-neigh-snoop --tests -- --ignored --nocapture; cargo test -p packetframe-flow-export --tests -- --ignored --nocapture; cargo test -p packetframe-probe --tests -- --ignored --nocapture; cargo test -p packetframe-vpp-offload --test drift_netns -- --ignored --nocapture'
+              -- env PACKETFRAME_BENCH_SKIP=1 RUST_BACKTRACE=short \
+                .github/scripts/privileged-tests.sh run vm
           }
           # Retry policy: virtme-ng propagates the guest command's exit
-          # status, so a genuine test failure arrives as cargo's 101
-          # and fails immediately — no retry. Exit 255 means the VM
-          # died. Usually that is before the guest script ever ran
+          # status, so a genuine test failure arrives as the runner
+          # script's 1 and fails immediately — no retry. Exit 255 means
+          # the VM died. Usually that is before the guest script ever ran
           # (observed on hosted runners as a TCG boot hang: dmesg stops
           # mid PCI enumeration ~20s in, zero test output; PR #69's
           # v6.6 job), which is runner noise, not a signal about the
