@@ -493,6 +493,26 @@ pub struct VppProbeInputs {
     pub section: Vec<ModuleDirective>,
 }
 
+/// What flow-export's probes need: its `source-address`, and whether
+/// VPP's sampler is in play (a vpp-offload section beside it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowExportProbeInputs {
+    pub source: Option<std::net::IpAddr>,
+    pub vpp: bool,
+}
+
+/// `None` without a flow-export section.
+pub fn flow_export_probe_inputs_from_config(config: &Config) -> Option<FlowExportProbeInputs> {
+    let section = config.modules.iter().find(|m| m.name == "flow-export")?;
+    Some(FlowExportProbeInputs {
+        source: section.directives.iter().find_map(|d| match d {
+            ModuleDirective::FlowSourceAddress { addr, .. } => Some(*addr),
+            _ => None,
+        }),
+        vpp: config.modules.iter().any(|m| m.name == "vpp-offload"),
+    })
+}
+
 /// Everything `probe_and_render` needs from the config, in one named
 /// place. This was a 12-element tuple built in `main`, destructured
 /// positionally: four of the fields are `Vec<String>` and two more are
@@ -510,6 +530,7 @@ pub struct FeasibilityInputs {
     /// completeness authority. `None` for `birdc` or `none`, which have
     /// no preconditions worth a subprocess.
     pub frr_authority: Option<(Option<PathBuf>, Vec<std::net::IpAddr>)>,
+    pub flow_export: Option<FlowExportProbeInputs>,
 }
 
 impl Default for FeasibilityInputs {
@@ -526,6 +547,7 @@ impl Default for FeasibilityInputs {
             vpp: VppProbeInputs::default(),
             snoop: NeighSnoopProbeInputs::default(),
             frr_authority: None,
+            flow_export: None,
         }
     }
 }
@@ -552,6 +574,7 @@ impl FeasibilityInputs {
             },
             snoop: neigh_snoop_probe_inputs_from_config(config),
             frr_authority: frr_authority_from_config(config),
+            flow_export: flow_export_probe_inputs_from_config(config),
         }
     }
 }
@@ -565,6 +588,7 @@ pub fn probe_and_render(inputs: &FeasibilityInputs, human: bool) -> Rendered {
         vpp,
         snoop,
         frr_authority,
+        flow_export,
     } = inputs;
     let mut report = run_probes(bpffs_root);
 
@@ -658,6 +682,16 @@ pub fn probe_and_render(inputs: &FeasibilityInputs, human: bool) -> Rendered {
             report.capabilities.push(cap);
         }
     }
+    // flow-export probes: only when the config declares the module. All
+    // non-required: its failure to start degrades, never aborts.
+    #[cfg(feature = "flow-export")]
+    if let Some(f) = flow_export {
+        for cap in packetframe_flow_export::feasibility::run_feasibility_probes(f.source, f.vpp) {
+            report.capabilities.push(cap);
+        }
+    }
+    #[cfg(not(feature = "flow-export"))]
+    let _ = flow_export;
     // The boot-sysctl audit is advisory in the general set — a large
     // `vm.nr_hugepages` is the operator's business on a box that runs
     // no VPP. On a box whose config declares `module vpp-offload` it
@@ -1148,6 +1182,9 @@ module neigh-snoop
   bridge ns0
   persist-dir /var/lib/pf-test/snoop
   frr-gate v4 pf-v4 v6 pf-v6
+module flow-export
+  source-address 192.0.2.7
+  collector c sflow 192.0.2.8:6343
 ";
 
     /// Every field of `FeasibilityInputs` carries what its own
@@ -1181,6 +1218,17 @@ module neigh-snoop
         assert_eq!(inputs.snoop.bridges, snoop.bridges);
         assert_eq!(inputs.snoop.persist_dir, snoop.persist_dir);
         assert_eq!(inputs.snoop.gate_lists, snoop.gate_lists);
+        assert_eq!(
+            inputs.flow_export,
+            Some(FlowExportProbeInputs {
+                source: Some("192.0.2.7".parse().unwrap()),
+                vpp: true,
+            })
+        );
+        assert_eq!(
+            inputs.flow_export,
+            flow_export_probe_inputs_from_config(&config)
+        );
     }
 
     /// The assertions above only discriminate a swap if the fields
@@ -1231,6 +1279,7 @@ module neigh-snoop
         assert!(inputs.vpp.steer_exempts.is_empty());
         assert!(inputs.snoop.bridges.is_empty());
         assert!(inputs.snoop.gate_lists.is_none());
+        assert!(inputs.flow_export.is_none());
     }
 
     // A struct literal, not a match over CapabilityStatus: this helper

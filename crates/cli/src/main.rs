@@ -16,6 +16,8 @@ mod events_cli;
 mod feasibility;
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
 mod fib_cli;
+#[cfg(feature = "flow-export")]
+mod flow_export_cli;
 #[cfg(feature = "dev-tools")]
 mod flow_synth;
 #[cfg(feature = "fast-path")]
@@ -177,6 +179,13 @@ enum Command {
     /// Low-rate by design; built only with the `dev-tools` feature.
     #[cfg(feature = "dev-tools")]
     FlowSynth(flow_synth::FlowSynthArgs),
+    /// Flow export: what its collectors need to know that its datagrams
+    /// do not carry, such as the interfaces its ifIndexes name.
+    #[cfg(feature = "flow-export")]
+    FlowExport {
+        #[command(subcommand)]
+        op: flow_export_cli::FlowExportOp,
+    },
     /// The VPP sampler (flow export, lab tooling): its coverage and
     /// counters, its samples, and the desired.conf it samples by.
     #[cfg(all(target_os = "linux", feature = "vpp-offload"))]
@@ -400,6 +409,8 @@ fn main() -> ExitCode {
         Command::Fib { op } => fib_cli::run(op),
         #[cfg(feature = "dev-tools")]
         Command::FlowSynth(args) => flow_synth::run(args),
+        #[cfg(feature = "flow-export")]
+        Command::FlowExport { op } => flow_export_cli::run(op),
         #[cfg(all(target_os = "linux", feature = "vpp-offload"))]
         Command::Sampler { op } => sampler_cli::run(op),
         #[cfg(feature = "probe")]

@@ -19,6 +19,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use packetframe_common::flow_coverage::{
+    CollectorSubmission, CoverageSnapshot, FlowCoverage, PathCoverage, PathState, Receipt,
+};
 use packetframe_fast_path::sample::{self, Disposition, SampleCfg};
 use packetframe_sampler_shm::coverage::Coverage;
 
@@ -167,8 +170,8 @@ pub struct CollectorReport {
 }
 
 /// The handles the module keeps: a reload to apply, the snapshot, the
-/// heartbeat (milliseconds since `epoch`), and why the worker panicked,
-/// if it did.
+/// heartbeat (milliseconds since `epoch`), why the worker panicked, if it
+/// did, and the coverage published for consumers outside the module.
 #[derive(Clone)]
 pub struct Shared {
     pub epoch: Instant,
@@ -176,6 +179,7 @@ pub struct Shared {
     pub published: Arc<Mutex<Published>>,
     pub reload: Arc<Mutex<Option<Reload>>>,
     pub panicked: Arc<Mutex<Option<String>>>,
+    pub coverage: Arc<FlowCoverage>,
 }
 
 impl Shared {
@@ -186,6 +190,7 @@ impl Shared {
             published: Arc::default(),
             reload: Arc::default(),
             panicked: Arc::default(),
+            coverage: Arc::default(),
         }
     }
 
@@ -693,11 +698,50 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
                 failing: c.failing(now),
             })
             .collect();
+        self.shared.coverage.publish(coverage_of(&self.p, now));
         *self
             .shared
             .published
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = self.p.clone();
+    }
+}
+
+/// What the published snapshot vouches for, as consumers outside the
+/// module read it.
+fn coverage_of(p: &Published, now: Instant) -> CoverageSnapshot {
+    CoverageSnapshot {
+        taken: now,
+        rate: p.rate,
+        paths: p
+            .ports
+            .iter()
+            .map(|r| PathCoverage {
+                port: r.name.clone(),
+                ifindex: r.ifindex,
+                path: r.path.name(),
+                state: match &r.state {
+                    State::Starting => PathState::Starting,
+                    State::Covered => PathState::Covered,
+                    State::Degraded(why) => PathState::Degraded(why.clone()),
+                    State::Uncovered(why) => PathState::Uncovered(why.clone()),
+                },
+                samples: r.samples,
+                pool: r.pool,
+            })
+            .collect(),
+        collectors: p
+            .collectors
+            .iter()
+            .map(|c| CollectorSubmission {
+                name: c.name.clone(),
+                addr: c.addr,
+                kind: c.kind,
+                datagrams: c.datagrams,
+                failing: c.failing.clone(),
+                receipt: Receipt::Unverified,
+            })
+            .collect(),
     }
 }
 
@@ -804,6 +848,8 @@ pub fn run<S, P, T, V>(
             tracing::warn!(error = %e, "flow-export: stopping the samplers failed");
         }
     }));
+    // Stopped either way: nothing it published holds any longer.
+    shared.coverage.withdraw();
     if let Err(payload) = r {
         let why = payload
             .downcast_ref::<&str>()
@@ -1278,6 +1324,15 @@ mod tests {
             (p.samples_total[&Path::Xdp], p.samples_total[&Path::Vpp]),
             (1, 1)
         );
+        // As a consumer outside the module reads it.
+        let c = r.shared.coverage.current(r.t0 + PORTS_EVERY).unwrap();
+        let eth9 = c.paths.iter().find(|p| p.port == "eth9").unwrap();
+        assert_eq!(
+            (eth9.path, &eth9.state, eth9.ifindex),
+            ("vpp", &PathState::Starting, 9)
+        );
+        assert_eq!(c.collectors[0].receipt, Receipt::Unverified);
+        assert_eq!(c.collectors[0].datagrams, 1);
         assert_eq!(lane(&p, "eth0", Path::Vpp).pool, 2_000);
         assert_eq!(lane(&p, "eth0", Path::Xdp).pool, 5_000);
         assert_eq!(lane(&p, "eth9", Path::Vpp).state, State::Starting);
@@ -1379,9 +1434,16 @@ mod tests {
         let r = rig(1000);
         *r.src.panics.borrow_mut() = true;
         let released = std::cell::Cell::new(false);
+        r.shared
+            .coverage
+            .publish(coverage_of(&Published::default(), r.t0));
         run(r.w, &AtomicBool::new(false), || released.set(true));
         assert!(released.get(), "the samplers stopped after the panic");
         assert_eq!(r.shared.panicked().as_deref(), Some("ring fault"));
+        assert!(
+            r.shared.coverage.current(r.t0).is_none(),
+            "it vouches for nothing now"
+        );
     }
 
     #[test]
