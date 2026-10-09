@@ -45,10 +45,19 @@ pub(crate) struct ActiveState {
     pub bpffs_root: PathBuf,
     pub state_dir: PathBuf,
     pub config: GuardConfig,
-    /// `(iface, ifindex, mac)` per successful attach, in config order.
-    /// The MAC is the attach-time snapshot foreign-src enforces — a
-    /// deliberate restart-only value.
-    pub attached: Vec<(String, u32, [u8; 6])>,
+    /// One per successful attach, in config order.
+    pub attached: Vec<Attached>,
+}
+
+pub(crate) struct Attached {
+    pub iface: String,
+    pub ifindex: u32,
+    /// The attach-time snapshot foreign-src enforces — a deliberate
+    /// restart-only value.
+    pub mac: [u8; 6],
+    /// The filter's kernel-assigned `(priority, handle)`, as recorded.
+    pub priority: u16,
+    pub handle: u32,
 }
 
 /// `Module::load`: embed sanity, no-adoption pin refusal, ELF +
@@ -198,7 +207,13 @@ fn attach_all(state: &mut ActiveState, settle_time: Duration) -> ModuleResult<()
                 format!("persist tc links: {e}; {rollback}"),
             ));
         }
-        state.attached.push((iface.clone(), ifindex, mac));
+        state.attached.push(Attached {
+            iface: iface.clone(),
+            ifindex,
+            mac,
+            priority,
+            handle,
+        });
         info!(
             iface,
             ifindex, priority, handle, "guard egress filter attached"
@@ -219,7 +234,13 @@ pub(crate) fn reconfigure(state: &mut ActiveState, new: GuardConfig) -> ModuleRe
         .config
         .restart_only_delta(&new)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("module guard: {e}")))?;
-    for (iface, ifindex, mac) in &state.attached {
+    for Attached {
+        iface,
+        ifindex,
+        mac,
+        ..
+    } in &state.attached
+    {
         // restart_only_delta guarantees the interface sets match.
         let rules = new
             .interfaces
@@ -299,38 +320,40 @@ pub fn detach_from_state_dir(state_dir: &Path, bpffs_root: &Path) -> ModuleResul
     }
 }
 
-/// `Module::health_check`: one row per attached interface (an iface
-/// that vanished took its qdisc-lifetime filter with it), plus one
-/// informational counters row.
+/// `Module::health_check`: one row per attached interface (see
+/// [`attach_row`]), plus one informational counters row.
 ///
-/// Deliberately does NOT probe filter presence via
+/// Filter presence is read with a netlink dump
+/// (`packetframe_common::tc_filter`), never via
 /// `SchedClassifierLink::attached()` — dropping the constructed link
-/// DETACHES the filter. Presence is asserted indirectly (record +
-/// iface + config entry); a read-only netlink filter dump is future
-/// work.
+/// DETACHES the filter.
 pub(crate) fn health(state: &ActiveState) -> HealthReport {
+    use packetframe_common::tc_filter::{bpf_program_id_at, ClsactHook};
     let mut overall = HealthState::Healthy;
     let mut subsystems = Vec::new();
-    for (iface, ifindex, _) in &state.attached {
-        // Compare ifindex, not mere name existence: a deleted-and-
-        // recreated device keeps its name but took the qdisc-lifetime
-        // filter with it — a name-only check would report green while
-        // enforcement is silently absent (review finding, PR #205).
-        let (hs, message) = match ifindex_of(iface) {
-            Err(_) => (
-                HealthState::Degraded,
-                Some("interface vanished; its egress filter died with it".to_string()),
-            ),
-            Ok(current) if current != *ifindex => (
-                HealthState::Degraded,
-                Some(format!(
-                    "interface recreated (ifindex {ifindex} → {current}); the egress \
-                     filter died with the old device — restart (stop, `packetframe \
-                     detach`, start) to re-attach"
-                )),
-            ),
-            Ok(_) => (HealthState::Healthy, None),
-        };
+    // What a filter must run to be ours: this load's id. Detach, run
+    // without the program, can only go by its name.
+    let prog_id = match state.ebpf.program(pin::PROGRAM_NAME) {
+        Some(p) => p
+            .info()
+            .map(|i| i.id())
+            .map_err(|e| format!("guard_egress program info: {e}")),
+        None => Err("guard_egress missing post-load".to_string()),
+    };
+    for a in &state.attached {
+        let iface = &a.iface;
+        let (hs, message) = attach_row(
+            iface,
+            a.ifindex,
+            name_of(a.ifindex),
+            || {
+                let id = prog_id.as_ref().map_err(Clone::clone)?;
+                bpf_program_id_at(a.ifindex, ClsactHook::Egress, a.priority, a.handle)
+                    .map(|found| found == Some(*id))
+                    .map_err(|e| e.to_string())
+            },
+            || ifindex_of(iface).ok(),
+        );
         overall = overall.worse_of(hs);
         subsystems.push(SubsystemHealth {
             name: format!("attach:{iface}"),
@@ -356,6 +379,85 @@ pub(crate) fn health(state: &ActiveState) -> HealthReport {
     HealthReport {
         overall,
         subsystems,
+    }
+}
+
+/// One `attach:<iface>` row. `now` is what the device with the attach-
+/// time ifindex is called now (`name_of`), as `tc_detach_one` finds it:
+/// a name-only check misreads both a deleted-and-recreated device, which
+/// keeps the name but not the qdisc-lifetime filter (review finding,
+/// PR #205), and a renamed one, which keeps the filter but not the name.
+/// A device holding the ifindex is still not proof the filter runs (an
+/// index can be handed out again: `ip link add … index`, a netns move;
+/// or the filter deleted by hand), so `filter` reads it. `by_name`, the
+/// configured name's ifindex now, only words the row.
+fn attach_row(
+    iface: &str,
+    ifindex: u32,
+    now: std::io::Result<Option<String>>,
+    filter: impl FnOnce() -> Result<bool, String>,
+    by_name: impl FnOnce() -> Option<u32>,
+) -> (HealthState, Option<String>) {
+    // Not Healthy, which would vouch for a filter nothing was read about.
+    let cannot_tell = |why: String| {
+        (
+            HealthState::Degraded,
+            Some(format!(
+                "cannot tell whether the egress filter still runs: {why}"
+            )),
+        )
+    };
+    let name = match now {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return (
+                HealthState::Degraded,
+                Some(match by_name() {
+                    Some(current) => format!(
+                        "interface recreated (ifindex {ifindex} → {current}); the egress \
+                         filter died with the old device — restart (stop, `packetframe \
+                         detach`, start) to re-attach"
+                    ),
+                    None => "interface vanished; its egress filter died with it".to_string(),
+                }),
+            )
+        }
+        Err(e) => return cannot_tell(format!("find ifindex {ifindex}: {e}")),
+    };
+    match filter() {
+        Err(e) => cannot_tell(format!("list {name}'s egress filters: {e}")),
+        Ok(false) => {
+            let on = if name == iface {
+                name
+            } else {
+                format!("{name} (ifindex {ifindex}, {iface} at attach)")
+            };
+            (
+                HealthState::Degraded,
+                Some(format!(
+                    "no guard egress filter on {on}: removed, or the device replaced \
+                     under the same ifindex — restart (stop, `packetframe detach`, \
+                     start) to re-attach"
+                )),
+            )
+        }
+        Ok(true) if name == iface => (HealthState::Healthy, None),
+        // Enforcing, so not Unhealthy; but attach goes by the configured
+        // name, so a restart would not put the filter back here.
+        Ok(true) => {
+            let restart = match by_name() {
+                Some(other) => format!("would attach the new {iface} (ifindex {other}) instead"),
+                None => format!("would fail to attach {iface}: no device has that name"),
+            };
+            (
+                HealthState::Degraded,
+                Some(format!(
+                    "renamed to {name} since attach: its egress filter still enforces \
+                     there, but a restart {restart} — rename it back, or update the \
+                     config and restart"
+                )),
+            )
+        }
     }
 }
 
@@ -685,13 +787,135 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ifindex_of, name_of, parse_mac};
+    use super::{attach_row, ifindex_of, name_of, parse_mac};
+    use packetframe_common::module::HealthState;
 
     #[test]
     fn a_device_is_named_by_its_ifindex() {
         let lo = ifindex_of("lo").unwrap();
         assert_eq!(name_of(lo).unwrap().as_deref(), Some("lo"));
         assert_eq!(name_of(u32::MAX).unwrap(), None);
+    }
+
+    fn degraded(row: (HealthState, Option<String>)) -> String {
+        assert_eq!(row.0, HealthState::Degraded, "{:?}", row.1);
+        row.1.expect("a Degraded row says why")
+    }
+
+    fn present() -> Result<bool, String> {
+        Ok(true)
+    }
+
+    fn absent() -> Result<bool, String> {
+        Ok(false)
+    }
+
+    #[test]
+    fn the_attach_row_finds_the_device_by_ifindex() {
+        let row = attach_row("br0", 7, Ok(Some("br0".into())), present, || unreachable!());
+        assert_eq!(row, (HealthState::Healthy, None));
+
+        let gone = degraded(attach_row("br0", 7, Ok(None), || unreachable!(), || None));
+        assert!(gone.contains("vanished"), "{gone}");
+        let recreated = degraded(attach_row(
+            "br0",
+            7,
+            Ok(None),
+            || unreachable!(),
+            || Some(9),
+        ));
+        assert!(
+            recreated.contains("recreated (ifindex 7 → 9)"),
+            "{recreated}"
+        );
+    }
+
+    /// Still enforcing under the new name, so not "vanished" (the row
+    /// before ifindex lookup), nor "recreated" when another device took
+    /// the old name; not Healthy either, as a restart attaches by name.
+    #[test]
+    fn a_renamed_device_reads_as_enforcing_under_a_name_the_config_lacks() {
+        let alone = degraded(attach_row(
+            "br0",
+            7,
+            Ok(Some("br0x".into())),
+            present,
+            || None,
+        ));
+        assert!(
+            alone.contains("renamed to br0x") && alone.contains("still enforces"),
+            "{alone}"
+        );
+        assert!(alone.contains("would fail to attach br0"), "{alone}");
+
+        let replaced = degraded(attach_row(
+            "br0",
+            7,
+            Ok(Some("br0x".into())),
+            present,
+            || Some(9),
+        ));
+        assert!(replaced.contains("still enforces"), "{replaced}");
+        assert!(replaced.contains("new br0 (ifindex 9)"), "{replaced}");
+        assert!(!replaced.contains("recreated"), "{replaced}");
+    }
+
+    /// A device holding the ifindex is not proof of ours: an index given
+    /// out again (`ip link add … index`, a netns move) or a filter
+    /// deleted by hand reads as no filter, never "still enforces".
+    #[test]
+    fn an_occupied_ifindex_without_our_filter_is_not_enforcing() {
+        let reused = degraded(attach_row(
+            "br0",
+            7,
+            Ok(Some("veth9".into())),
+            absent,
+            || None,
+        ));
+        assert!(
+            reused.contains("no guard egress filter on veth9 (ifindex 7, br0 at attach)"),
+            "{reused}"
+        );
+        assert!(!reused.contains("still enforces"), "{reused}");
+
+        let deleted = degraded(attach_row(
+            "br0",
+            7,
+            Ok(Some("br0".into())),
+            absent,
+            || unreachable!(),
+        ));
+        assert!(
+            deleted.contains("no guard egress filter on br0:"),
+            "{deleted}"
+        );
+    }
+
+    /// A failed lookup says nothing about the device, nor a failed dump
+    /// about the filter: neither gone nor vouched for.
+    #[test]
+    fn a_failed_lookup_is_neither_gone_nor_healthy() {
+        let failed = degraded(attach_row(
+            "br0",
+            7,
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            || unreachable!(),
+            || unreachable!(),
+        ));
+        assert!(failed.contains("cannot tell"), "{failed}");
+        assert!(!failed.contains("vanished"), "{failed}");
+
+        let undumped = degraded(attach_row(
+            "br0",
+            7,
+            Ok(Some("br0".into())),
+            || Err("netlink recv: timed out".into()),
+            || unreachable!(),
+        ));
+        assert!(
+            undumped.contains("cannot tell") && undumped.contains("list br0's egress filters"),
+            "{undumped}"
+        );
     }
 
     #[test]

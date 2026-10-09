@@ -34,6 +34,28 @@ pub fn bpf_program_at(
     priority: u16,
     handle: u32,
 ) -> io::Result<Option<String>> {
+    Ok(slot(ifindex, hook, priority, handle)?.and_then(|s| s.name))
+}
+
+/// The id of the BPF program in that slot, `Ok(None)` as for
+/// [`bpf_program_at`]. For a caller that holds the program: an id names
+/// one loaded program, where a name is shared by every load of the ELF.
+pub fn bpf_program_id_at(
+    ifindex: u32,
+    hook: ClsactHook,
+    priority: u16,
+    handle: u32,
+) -> io::Result<Option<u32>> {
+    Ok(slot(ifindex, hook, priority, handle)?.and_then(|s| s.id))
+}
+
+/// What the eBPF program in a slot reports of itself.
+struct Slot {
+    name: Option<String>,
+    id: Option<u32>,
+}
+
+fn slot(ifindex: u32, hook: ClsactHook, priority: u16, handle: u32) -> io::Result<Option<Slot>> {
     use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_REQUEST};
     use netlink_packet_route::tc::{TcAttribute, TcFilterBpfOption, TcHandle, TcMessage, TcOption};
     use netlink_packet_route::RouteNetlinkMessage;
@@ -86,13 +108,20 @@ pub fn bpf_program_at(
                 {
                     let mut chain = 0;
                     let mut name = None;
+                    let mut id = None;
                     for attr in &m.attributes {
                         match attr {
                             TcAttribute::Chain(c) => chain = *c,
                             TcAttribute::Options(opts) => {
                                 for opt in opts {
-                                    if let TcOption::Bpf(TcFilterBpfOption::ProgName(n)) = opt {
-                                        name = Some(n.clone());
+                                    match opt {
+                                        TcOption::Bpf(TcFilterBpfOption::ProgName(n)) => {
+                                            name = Some(n.clone());
+                                        }
+                                        TcOption::Bpf(TcFilterBpfOption::ProgId(i)) => {
+                                            id = Some(*i);
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -100,7 +129,7 @@ pub fn bpf_program_at(
                         }
                     }
                     if chain == 0 {
-                        found = name;
+                        found = Some(Slot { name, id });
                     }
                 }
                 _ => {}
@@ -150,6 +179,7 @@ mod tests {
         assert_ne!(lo, 0);
         for hook in [ClsactHook::Ingress, ClsactHook::Egress] {
             assert_eq!(bpf_program_at(lo, hook, 49152, 1).unwrap(), None);
+            assert_eq!(bpf_program_id_at(lo, hook, 49152, 1).unwrap(), None);
         }
         assert_eq!(
             bpf_program_at(i32::MAX as u32, ClsactHook::Ingress, 49152, 1).unwrap(),

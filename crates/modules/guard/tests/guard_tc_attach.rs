@@ -7,7 +7,8 @@
 //! filter landing where `tc filter show ... egress` can see it,
 //! `guard-tc-links.json` persistence, out-of-process detach clearing
 //! the filter while **leaving clsact in place**, the vanished-iface
-//! teardown branch, and a renamed device found by its ifindex.
+//! teardown branch, and a renamed device found by its ifindex, by
+//! detach and by health.
 //!
 //! NOT in the hardware-artifacts SAFE suite: it creates interfaces.
 
@@ -430,5 +431,232 @@ fn detach_spares_a_device_given_a_recorded_ifindex() {
          survive: {shown}"
     );
     assert!(tc_links::load(&state_dir).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+const BPFFS: &str = "/sys/fs/bpf";
+const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
+
+/// Once per process, and never over a bpffs already there (it may hold
+/// live pins). Mirror of flow-export's end_to_end `ensure_bpffs`.
+fn ensure_bpffs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let c = std::ffi::CString::new(BPFFS).unwrap();
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        #[allow(clippy::unnecessary_cast)] // f_type's width differs across libcs
+        let mounted =
+            unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 && st.f_type as i64 == BPF_FS_MAGIC;
+        if !mounted {
+            run(&["mount", "-t", "bpf", "bpf", BPFFS]);
+        }
+    });
+}
+
+/// A `GuardModule` loaded and attached to `iface` (lldp drop), through
+/// the loader's own path.
+fn attached_guard(
+    iface: &str,
+    bpffs_root: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> packetframe_guard::GuardModule {
+    use packetframe_common::config::{Config, GlobalConfig};
+    use packetframe_common::module::{LoaderCtx, Module, ModuleConfig};
+
+    let config = Config::parse(&format!(
+        "module guard\n  interface {iface}\n  lldp {iface} drop\n"
+    ))
+    .expect("config parses");
+    let global = GlobalConfig::default();
+    let cfg = ModuleConfig::new(&config.modules[0], &global);
+    let mut m = packetframe_guard::GuardModule::new();
+    m.load(
+        &cfg,
+        &LoaderCtx {
+            bpffs_root,
+            state_dir,
+        },
+    )
+    .expect("load");
+    m.attach(&cfg).expect("attach");
+    m
+}
+
+/// `iface`'s `attach:` health row: state and message.
+fn health_row(
+    m: &packetframe_guard::GuardModule,
+    iface: &str,
+) -> (packetframe_common::module::HealthState, String) {
+    use packetframe_common::module::{HealthCtx, Module};
+    let row = m
+        .health_check(&HealthCtx::new())
+        .expect("health")
+        .subsystems
+        .into_iter()
+        .find(|s| s.name == format!("attach:{iface}"))
+        .expect("one row per configured interface");
+    (row.state, row.message.unwrap_or_default())
+}
+
+/// Removes the devices and the test's bpffs root, whatever the outcome.
+struct HealthCleanup {
+    devs: &'static [&'static str],
+    bpffs_root: std::path::PathBuf,
+}
+
+impl Drop for HealthCleanup {
+    fn drop(&mut self) {
+        for dev in self.devs {
+            let _ = Command::new("ip").args(["link", "del", dev]).status();
+        }
+        let _ = std::fs::remove_dir_all(&self.bpffs_root);
+    }
+}
+
+/// Health finds the device by its ifindex, as detach does. Renamed, the
+/// filter still enforces under the new name, so the row says that, not
+/// "vanished"; nor "recreated" once another device takes the old name.
+/// Then the filter deleted by hand: the row says so, not "still
+/// enforces".
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test -p packetframe-guard --tests -- --ignored`"]
+fn health_follows_a_renamed_device() {
+    use packetframe_common::module::{HealthState, Module};
+
+    if !packetframe_guard::GUARD_BPF_AVAILABLE {
+        eprintln!("BPF stub in effect (no rustup); skipping guard tc attach test.");
+        return;
+    }
+    const HL_A: &str = "pf-ghl0";
+    const HL_B: &str = "pf-ghl1";
+    const HL_C: &str = "pf-ghl2";
+    const RENAMED: &str = "pf-ghl0r";
+    ensure_bpffs();
+    let state_dir = state_dir("health");
+    let bpffs_root =
+        std::path::Path::new(BPFFS).join(format!("pf-guard-health-{}", std::process::id()));
+    let _cleanup = HealthCleanup {
+        devs: &[HL_A, RENAMED],
+        bpffs_root: bpffs_root.clone(),
+    };
+    for dev in [HL_A, RENAMED] {
+        let _ = Command::new("ip").args(["link", "del", dev]).status();
+    }
+
+    run(&[
+        "ip", "link", "add", HL_A, "type", "veth", "peer", "name", HL_B,
+    ]);
+    let mut m = attached_guard(HL_A, &bpffs_root, &state_dir);
+    assert_eq!(health_row(&m, HL_A), (HealthState::Healthy, String::new()));
+
+    run(&["ip", "link", "set", HL_A, "name", RENAMED]);
+    let shown = capture(&["tc", "filter", "show", "dev", RENAMED, "egress"]);
+    assert!(shown.contains("guard_egress"), "still enforcing: {shown}");
+    let (state, msg) = health_row(&m, HL_A);
+    assert_eq!(state, HealthState::Degraded, "{msg}");
+    assert!(
+        msg.contains(&format!("renamed to {RENAMED}")) && msg.contains("still enforces"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(&format!("would fail to attach {HL_A}")),
+        "{msg}"
+    );
+
+    run(&[
+        "ip", "link", "add", HL_A, "type", "veth", "peer", "name", HL_C,
+    ]);
+    let (state, msg) = health_row(&m, HL_A);
+    assert_eq!(state, HealthState::Degraded, "{msg}");
+    assert!(msg.contains(&format!("renamed to {RENAMED}")), "{msg}");
+    assert!(!msg.contains("recreated"), "{msg}");
+
+    run(&["tc", "filter", "del", "dev", RENAMED, "egress"]);
+    let (state, msg) = health_row(&m, HL_A);
+    assert_eq!(state, HealthState::Degraded, "{msg}");
+    assert!(
+        msg.contains(&format!("no guard egress filter on {RENAMED}")),
+        "{msg}"
+    );
+    assert!(!msg.contains("still enforces"), "{msg}");
+
+    m.detach().expect("detach");
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// The ifindex handed out again to an unrelated device (here explicitly,
+/// `ip link add … index`; a netns move does the same) is not a rename:
+/// the original filter died with its device. The row must not say
+/// "still enforces", even with another program's egress filter on the
+/// replacement, likely at the same auto-allocated (priority, handle).
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test -p packetframe-guard --tests -- --ignored`"]
+fn health_does_not_take_a_reused_ifindex_for_a_rename() {
+    use packetframe_common::module::{HealthState, Module};
+
+    if !packetframe_guard::GUARD_BPF_AVAILABLE {
+        eprintln!("BPF stub in effect (no rustup); skipping guard tc attach test.");
+        return;
+    }
+    const RU_A: &str = "pf-ghu0";
+    const RU_B: &str = "pf-ghu1";
+    const REUSER: &str = "pf-ghu9";
+    const REUSER_PEER: &str = "pf-ghu8";
+    ensure_bpffs();
+    let state_dir = state_dir("reuse");
+    let bpffs_root =
+        std::path::Path::new(BPFFS).join(format!("pf-guard-reuse-{}", std::process::id()));
+    let _cleanup = HealthCleanup {
+        devs: &[RU_A, REUSER],
+        bpffs_root: bpffs_root.clone(),
+    };
+    for dev in [RU_A, REUSER] {
+        let _ = Command::new("ip").args(["link", "del", dev]).status();
+    }
+
+    run(&[
+        "ip", "link", "add", RU_A, "type", "veth", "peer", "name", RU_B,
+    ]);
+    let mut m = attached_guard(RU_A, &bpffs_root, &state_dir);
+    let index = ifindex_of(RU_A);
+    assert_eq!(health_row(&m, RU_A), (HealthState::Healthy, String::new()));
+
+    run(&["ip", "link", "del", RU_A]);
+    let index_arg = index.to_string();
+    run(&[
+        "ip",
+        "link",
+        "add",
+        REUSER,
+        "index",
+        &index_arg,
+        "type",
+        "veth",
+        "peer",
+        "name",
+        REUSER_PEER,
+    ]);
+    assert_eq!(
+        ifindex_of(REUSER),
+        index,
+        "the ifindex was handed out again"
+    );
+    let mut other = loaded_guard();
+    tc_attach_egress(&mut other, REUSER).expect("another program's filter");
+    drop(other);
+
+    let (state, msg) = health_row(&m, RU_A);
+    assert_eq!(state, HealthState::Degraded, "{msg}");
+    assert!(
+        msg.contains(&format!(
+            "no guard egress filter on {REUSER} (ifindex {index}, {RU_A} at attach)"
+        )),
+        "{msg}"
+    );
+    assert!(!msg.contains("still enforces"), "{msg}");
+
+    // Gone before detach, so detach has nothing to find under the index.
+    run(&["ip", "link", "del", REUSER]);
+    m.detach().expect("detach");
     let _ = std::fs::remove_dir_all(&state_dir);
 }

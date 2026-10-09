@@ -159,6 +159,23 @@ possible outcome.) Monitor mode never produces it.
   vanished"**: the device was deleted; qdisc-lifetime filters die with
   their device, nothing is leaked. Restart after the interface is
   back.
+- **`attach:<iface>` Degraded, "renamed to `<new>` since attach"**:
+  the row finds the device by its attach-time ifindex and reads its
+  egress filters: ours is there, enforcing under the new name. But
+  attach goes by the configured name, so a restart would not put it
+  back there. Rename the device back, or update the config and restart
+  (SIGHUP refuses an interface change); detach removes the filter
+  under its new name either way.
+- **`attach:<iface>` Degraded, "no guard egress filter on `<dev>`"**:
+  a device holds the attach-time ifindex but not our filter (matched by
+  priority, handle and program id). Either it was deleted by hand, or
+  the original device went and its ifindex was handed out again (an
+  explicit `ip link add … index`, a netns move). Nothing on `<dev>` is
+  ours; restart to re-attach.
+- **`attach:<iface>` Degraded, "cannot tell whether the egress filter
+  still runs"**: the ifindex lookup or the filter dump failed (the
+  error is in the row). That says nothing about the device or the
+  filter; check with `tc filter show dev <iface> egress`.
 - **Startup refuses with "existing pins"**: prior invocation's state;
   run the standard recovery (below). Pins are never adopted in place.
 
