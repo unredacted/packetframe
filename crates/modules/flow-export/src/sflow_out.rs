@@ -27,6 +27,13 @@ pub struct Ready {
     pub output_if: u32,
     pub frame_length: u32,
     pub header: Vec<u8>,
+    /// For the IPFIX flow cache, which sFlow has no field for: the path
+    /// the sample came by, and the sampler generation it was drawn under.
+    pub path: crate::worker::Path,
+    pub generation: u64,
+    /// How long before the worker read it the packet was sampled, by its
+    /// sampler's clock: when the flow cache counts it.
+    pub age_ms: u64,
 }
 
 /// The frame a sample stands for, as it was on the wire: an offloaded
@@ -181,6 +188,9 @@ mod tests {
             output_if: 0,
             frame_length: 1518,
             header: vec![0xab; 128],
+            path: crate::worker::Path::Xdp,
+            generation: 1,
+            age_ms: 0,
         }
     }
 

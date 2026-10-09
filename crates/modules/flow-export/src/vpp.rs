@@ -150,6 +150,10 @@ struct PoolTrack {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VppSample {
     pub ifindex: u32,
+    /// The `desired.conf` generation it was drawn under.
+    pub generation: u64,
+    /// When the plugin sampled it, in realtime nanoseconds.
+    pub time_ns: u64,
     pub rate: u32,
     pub frame_len: u32,
     pub header: Vec<u8>,
@@ -167,6 +171,9 @@ pub struct Taken {
     pub lost: u64,
     /// Samples no binding could read.
     pub unmapped: u64,
+    /// The realtime clock as the tick read it, before the drain: the
+    /// samples' times are on it.
+    pub now_realtime_ns: u64,
 }
 
 /// The plugin as a whole: the `vpp` row, and what every VPP lane is held
@@ -324,6 +331,7 @@ impl<D: VppDir> VppSide<D> {
             self.seeded = false;
         }
         let look = self.dir.look();
+        t.now_realtime_ns = look.now_realtime_ns;
         let first = self.base.is_none();
         if first && look.epoch.is_some() {
             self.fresh |= look.created_ns >= self.started_ns;
@@ -444,6 +452,8 @@ impl<D: VppDir> VppSide<D> {
             match ifindex {
                 Some(&ifindex) => t.samples.push(VppSample {
                     ifindex,
+                    generation: s.meta.generation,
+                    time_ns: s.meta.time_ns,
                     rate: s.meta.rate,
                     frame_len: s.meta.frame_len,
                     header: s.header,

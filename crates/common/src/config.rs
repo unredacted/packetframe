@@ -860,13 +860,26 @@ pub enum ModuleDirective {
         bytes: u32,
         line: usize,
     },
-    /// `collector <name> sflow <ip>:<port> [kind stats|ddos]` — a
-    /// collector and what it is for. Hot.
+    /// `collector <name> sflow|ipfix <ip>:<port> [kind stats|ddos]` — a
+    /// collector, the format it takes, and what it is for. `kind ddos`
+    /// takes sFlow only. Hot.
     FlowCollector {
         name: String,
         format: CollectorFormat,
         addr: std::net::SocketAddr,
         kind: CollectorKind,
+        line: usize,
+    },
+    /// `flow-cache [entries <n>] [active <s>] [inactive <s>]` — the IPFIX
+    /// flow cache: flows held per observation domain (the oldest is
+    /// exported to make room), and how long after a flow's first and last
+    /// packet it is exported. Defaults [`FLOW_CACHE_ENTRIES_DEFAULT`],
+    /// [`FLOW_ACTIVE_TIMEOUT_DEFAULT`], [`FLOW_INACTIVE_TIMEOUT_DEFAULT`].
+    /// Hot.
+    FlowCache {
+        entries: usize,
+        active: Duration,
+        inactive: Duration,
         line: usize,
     },
 }
@@ -877,6 +890,18 @@ pub enum ModuleDirective {
 pub enum CollectorFormat {
     /// sFlow v5 flow samples with raw packet headers.
     Sflow,
+    /// IPFIX flow records (RFC 7011), each observation domain's rate in a
+    /// selector options record.
+    Ipfix,
+}
+
+impl CollectorFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sflow => "sflow",
+            Self::Ipfix => "ipfix",
+        }
+    }
 }
 
 /// What a flow collector is for: it decides which formats and privacy
@@ -1960,6 +1985,13 @@ pub const FLOW_DEFAULT_HEADER_BYTES: u32 = 128;
 /// more than the VPP sampler's slot carries.
 pub const FLOW_HEADER_BYTES_RANGE: (u32, u32) = (64, 256);
 pub const FLOW_MAX_COLLECTORS: usize = 8;
+/// The IPFIX flow cache: flows per observation domain, and its bounds.
+pub const FLOW_CACHE_ENTRIES_DEFAULT: usize = 65_536;
+pub const FLOW_CACHE_ENTRIES_RANGE: (usize, usize) = (1024, 1 << 20);
+pub const FLOW_ACTIVE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
+pub const FLOW_INACTIVE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(15);
+/// Either timeout, in seconds.
+pub const FLOW_TIMEOUT_RANGE_S: (u64, u64) = (1, 3600);
 
 impl Config {
     /// Parse a config from a file path.
@@ -3261,7 +3293,7 @@ impl Config {
             message: format!("module flow-export: {msg}"),
         };
         let mut source: Option<(IpAddr, usize)> = None;
-        let (mut rate_line, mut header_line) = (None, None);
+        let (mut rate_line, mut header_line, mut cache_line) = (None, None, None);
         let mut collectors: Vec<(&str, std::net::SocketAddr, usize)> = Vec::new();
         for d in &self.modules[pos].directives {
             match d {
@@ -3290,9 +3322,34 @@ impl Config {
                         ));
                     }
                 }
+                ModuleDirective::FlowCache { line, .. } => {
+                    if let Some(prev) = cache_line.replace(*line) {
+                        return Err(err(
+                            *line,
+                            format!("`flow-cache` given twice (first on line {prev})"),
+                        ));
+                    }
+                }
                 ModuleDirective::FlowCollector {
-                    name, addr, line, ..
+                    name,
+                    addr,
+                    line,
+                    format,
+                    kind,
                 } => {
+                    // FastNetMon's detection timing is qualified on sFlow
+                    // alone: a flow record arrives only once its flow
+                    // times out, against a 5 s detection window.
+                    if *kind == CollectorKind::Ddos && *format != CollectorFormat::Sflow {
+                        return Err(err(
+                            *line,
+                            format!(
+                                "collector `{name}`: `kind ddos` takes sflow only; flow records \
+                                 are batched until a flow times out, which attack detection \
+                                 has not been qualified against"
+                            ),
+                        ));
+                    }
                     if let Some((_, _, prev)) = collectors.iter().find(|(n, _, _)| n == name) {
                         return Err(err(
                             *line,
@@ -4742,6 +4799,7 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             Ok(ModuleDirective::FlowHeaderBytes { bytes, line })
         }),
         "collector" => parse_flow_collector(line, rest),
+        "flow-cache" => parse_flow_cache(line, rest),
         other => Err(ConfigError::parse(
             line,
             format!("unknown directive `{other}` in module section"),
@@ -4749,9 +4807,69 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
     }
 }
 
-const COLLECTOR_USAGE: &str = "collector takes: <name> sflow <ip>:<port> [kind stats|ddos]";
+const COLLECTOR_USAGE: &str = "collector takes: <name> sflow|ipfix <ip>:<port> [kind stats|ddos]";
 
-/// `collector <name> sflow <ip>:<port> [kind stats|ddos]`.
+const FLOW_CACHE_USAGE: &str = "flow-cache takes: [entries <n>] [active <s>] [inactive <s>]";
+
+/// `flow-cache [entries <n>] [active <s>] [inactive <s>]`, at least one.
+fn parse_flow_cache<'a>(
+    line: usize,
+    rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    let toks: Vec<&str> = rest.collect();
+    let usage = |why: String| ConfigError::parse(line, format!("{why}; {FLOW_CACHE_USAGE}"));
+    if toks.is_empty() || !toks.len().is_multiple_of(2) {
+        return Err(usage("flow-cache takes key-value pairs".into()));
+    }
+    let (mut entries, mut active, mut inactive) = (None, None, None);
+    for pair in toks.chunks(2) {
+        let (key, value) = (pair[0], pair[1]);
+        let n: u64 = value
+            .parse()
+            .map_err(|_| usage(format!("`{value}` is not a whole number")))?;
+        let (lo, hi) = FLOW_TIMEOUT_RANGE_S;
+        let secs = |what: &str| {
+            if (lo..=hi).contains(&n) {
+                Ok(Duration::from_secs(n))
+            } else {
+                Err(usage(format!("{what} must be {lo} to {hi} seconds")))
+            }
+        };
+        let slot = match key {
+            "entries" => {
+                let (lo, hi) = FLOW_CACHE_ENTRIES_RANGE;
+                let n = usize::try_from(n).unwrap_or(usize::MAX);
+                if !(lo..=hi).contains(&n) {
+                    return Err(usage(format!("entries must be {lo} to {hi}")));
+                }
+                entries.replace(n).is_some()
+            }
+            "active" => active.replace(secs("active")?).is_some(),
+            "inactive" => inactive.replace(secs("inactive")?).is_some(),
+            other => return Err(usage(format!("unknown key `{other}`"))),
+        };
+        if slot {
+            return Err(usage(format!("`{key}` given twice")));
+        }
+    }
+    let active = active.unwrap_or(FLOW_ACTIVE_TIMEOUT_DEFAULT);
+    let inactive = inactive.unwrap_or(FLOW_INACTIVE_TIMEOUT_DEFAULT);
+    if inactive > active {
+        return Err(usage(format!(
+            "inactive ({} s) cannot exceed active ({} s): a flow is exported by then anyway",
+            inactive.as_secs(),
+            active.as_secs()
+        )));
+    }
+    Ok(ModuleDirective::FlowCache {
+        entries: entries.unwrap_or(FLOW_CACHE_ENTRIES_DEFAULT),
+        active,
+        inactive,
+        line,
+    })
+}
+
+/// `collector <name> sflow|ipfix <ip>:<port> [kind stats|ddos]`.
 fn parse_flow_collector<'a>(
     line: usize,
     rest: impl Iterator<Item = &'a str>,
@@ -4775,7 +4893,7 @@ fn parse_flow_collector<'a>(
     }
     let format = match *format {
         "sflow" => CollectorFormat::Sflow,
-        "ipfix" => return Err(usage("IPFIX export is not available yet; use sflow".into())),
+        "ipfix" => CollectorFormat::Ipfix,
         other => return Err(usage(format!("unknown format `{other}`"))),
     };
     let addr: std::net::SocketAddr = addr.parse().map_err(|_| {
@@ -10184,7 +10302,6 @@ module fast-path
             ("header-bytes 257", "between 64 and 256"),
             ("source-address 0.0.0.0", "cannot be an exporter"),
             ("source-address host", "not an IP address"),
-            ("collector c ipfix 198.51.100.1:4739", "not available yet"),
             ("collector c netflow 198.51.100.1:2055", "unknown format"),
             ("collector c sflow 198.51.100.1", "is not an <ip>:<port>"),
             ("collector c sflow 198.51.100.1:0", "cannot be a collector"),
@@ -10267,6 +10384,48 @@ module fast-path
             .validate_flow_export()
             .unwrap_err();
         assert!(format!("{e}").contains("must come before"), "{e}");
+        // IPFIX is for statistics only, and the cache's settings are sane.
+        let src = "  source-address 192.0.2.1\n";
+        let refuse = |body: &str, why: &str| {
+            let e = Config::parse(&format!("{head}{src}{body}"))
+                .and_then(|c| c.validate_flow_export())
+                .unwrap_err();
+            assert!(format!("{e}").contains(why), "{body}: {e}");
+        };
+        refuse(
+            "  collector f ipfix 198.51.100.1:4739 kind ddos\n",
+            "`kind ddos` takes sflow only",
+        );
+        refuse("  flow-cache\n", "key-value pairs");
+        refuse("  flow-cache entries 10\n", "entries must be");
+        refuse(
+            "  flow-cache active 10 inactive 20\n",
+            "cannot exceed active",
+        );
+        refuse("  flow-cache active 0\n", "active must be");
+        refuse("  flow-cache entries 2048 entries 4096\n", "given twice");
+        refuse(
+            "  flow-cache active 60\n  flow-cache inactive 15\n  collector a ipfix 198.51.100.1:4739\n",
+            "`flow-cache` given twice",
+        );
+        let ok = Config::parse(&format!(
+            "{head}{src}  flow-cache entries 4096 inactive 5\n  collector a ipfix [2001:db8::1]:4739\n"
+        ))
+        .unwrap();
+        ok.validate_flow_export().unwrap_err(); // the family: a v6 collector, a v4 source
+        let ok = Config::parse(&format!(
+            "{head}{src}  flow-cache entries 4096 inactive 5\n  collector a ipfix 198.51.100.1:4739\n"
+        ))
+        .unwrap();
+        ok.validate_flow_export().unwrap();
+        assert!(ok.modules[1]
+            .directives
+            .contains(&ModuleDirective::FlowCache {
+                entries: 4096,
+                active: FLOW_ACTIVE_TIMEOUT_DEFAULT,
+                inactive: Duration::from_secs(5),
+                line: 5,
+            }));
         // vpp-offload, when present, is before it too.
         let fp = "module fast-path\n  attach eth0 generic\n";
         let after = format!("{fp}{alone}module vpp-offload\n");
