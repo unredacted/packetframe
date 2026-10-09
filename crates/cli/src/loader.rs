@@ -339,6 +339,10 @@ mod degrade_policy_tests {
             packetframe_flow_export::VPP_SAMPLER_DIR
         );
         assert_eq!(
+            packetframe_vpp_offload::bringup::DEFAULT_VPP_BINARY,
+            packetframe_flow_export::feasibility::DEFAULT_VPP_BINARY
+        );
+        assert_eq!(
             std::path::Path::new(packetframe_flow_export::feasibility::PLUGIN_PATH).parent(),
             Some(std::path::Path::new(
                 packetframe_vpp_offload::sampler::PLUGIN_DIR

@@ -50,6 +50,11 @@ pub const MODULE_NAME: &str = "flow-export";
 /// it.
 pub const THREAD_NAME: &str = "pf-flow-export";
 
+/// Every interface fast-path may redirect to, so every output ifindex a
+/// sample can carry: `(name, ifindex)`.
+#[cfg(target_os = "linux")]
+pub use packetframe_fast_path::enumerate_redirect_targets as redirect_targets;
+
 /// VPP's sampler directory, where vpp-offload prepares it
 /// (`packetframe_sampler_shm::fs::DEFAULT_DIR`).
 pub const VPP_SAMPLER_DIR: &str = "/run/packetframe/vpp/sampler";

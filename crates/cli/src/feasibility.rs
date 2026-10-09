@@ -495,10 +495,12 @@ pub struct VppProbeInputs {
 
 /// What flow-export's probes need: its `source-address`, and whether
 /// VPP's sampler is in play (a vpp-offload section beside it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowExportProbeInputs {
     pub source: Option<std::net::IpAddr>,
     pub vpp: bool,
+    /// vpp-offload's `vpp-binary`, which is the VPP that runs.
+    pub vpp_binary: Option<String>,
 }
 
 /// `None` without a flow-export section.
@@ -510,6 +512,7 @@ pub fn flow_export_probe_inputs_from_config(config: &Config) -> Option<FlowExpor
             _ => None,
         }),
         vpp: config.modules.iter().any(|m| m.name == "vpp-offload"),
+        vpp_binary: vpp_binary_from_config(config),
     })
 }
 
@@ -686,7 +689,11 @@ pub fn probe_and_render(inputs: &FeasibilityInputs, human: bool) -> Rendered {
     // non-required: its failure to start degrades, never aborts.
     #[cfg(feature = "flow-export")]
     if let Some(f) = flow_export {
-        for cap in packetframe_flow_export::feasibility::run_feasibility_probes(f.source, f.vpp) {
+        for cap in packetframe_flow_export::feasibility::run_feasibility_probes(
+            f.source,
+            f.vpp,
+            f.vpp_binary.as_deref(),
+        ) {
             report.capabilities.push(cap);
         }
     }
@@ -1223,6 +1230,7 @@ module flow-export
             Some(FlowExportProbeInputs {
                 source: Some("192.0.2.7".parse().unwrap()),
                 vpp: true,
+                vpp_binary: Some("/opt/vpp-test".into()),
             })
         );
         assert_eq!(

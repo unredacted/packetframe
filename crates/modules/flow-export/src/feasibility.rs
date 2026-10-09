@@ -18,18 +18,40 @@ pub const PLUGIN_PATH: &str = "/usr/lib/packetframe/vpp_plugins/pf_sampler_plugi
 /// The section VPP's loader reads a plugin's registration from.
 const REGISTRATION_SECTION: &str = ".vlib_plugin_registration";
 
+/// The VPP vpp-offload runs without a `vpp-binary`: the `vpp` package's.
+pub const DEFAULT_VPP_BINARY: &str = "/usr/bin/vpp";
+
 /// `source-address`: the module's flow-export section's. `vpp`: whether
-/// the config declares vpp-offload too, so VPP's sampler is in play.
-pub fn run_feasibility_probes(source: Option<IpAddr>, vpp: bool) -> Vec<Capability> {
+/// the config declares vpp-offload too, so VPP's sampler is in play, and
+/// its `vpp-binary` if it names one.
+pub fn run_feasibility_probes(
+    source: Option<IpAddr>,
+    vpp: bool,
+    vpp_binary: Option<&str>,
+) -> Vec<Capability> {
     #[cfg(target_os = "linux")]
     {
-        linux::run(source, vpp)
+        linux::run(source, vpp, vpp_binary)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (source, vpp);
+        let _ = (source, vpp, vpp_binary);
         Vec::new()
     }
+}
+
+/// The packages `dpkg-query -S` says own a path. A diversion line names
+/// no owner. Portable so it is tested everywhere; only Linux asks dpkg.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn owners(dpkg_s: &str) -> Vec<&str> {
+    dpkg_s
+        .lines()
+        .filter(|l| !l.starts_with("diversion "))
+        .filter_map(|l| l.split_once(": "))
+        .flat_map(|(packages, _)| packages.split(", "))
+        // `vpp:arm64` for a package of one architecture among several.
+        .map(|p| p.split(':').next().unwrap_or(p))
+        .collect()
 }
 
 /// A plugin's registration, as VPP's loader reads it: the version it
@@ -101,17 +123,18 @@ mod linux {
     use packetframe_common::probe::Capability;
     use packetframe_sampler_shm::fs::{check_dir, is_mount_point};
 
-    use super::{registration_versions, PLUGIN_PATH};
+    use super::{registration_versions, DEFAULT_VPP_BINARY, PLUGIN_PATH};
     use crate::VPP_SAMPLER_DIR;
 
-    pub fn run(source: Option<IpAddr>, vpp: bool) -> Vec<Capability> {
+    pub fn run(source: Option<IpAddr>, vpp: bool, vpp_binary: Option<&str>) -> Vec<Capability> {
         let mut caps = Vec::new();
         if let Some(addr) = source {
             caps.push(source_address(addr));
         }
         if vpp {
             caps.push(sampler_dir(Path::new(VPP_SAMPLER_DIR)));
-            caps.push(plugin(Path::new(PLUGIN_PATH), installed_vpp_version()));
+            let binary = vpp_binary.unwrap_or(DEFAULT_VPP_BINARY);
+            caps.push(plugin(Path::new(PLUGIN_PATH), version_of(binary)));
         }
         caps
     }
@@ -180,6 +203,25 @@ mod linux {
             },
             Err(e) => Capability::unknown(NAME, format!("{}: {e}", dir.display()), false),
         }
+    }
+
+    /// The version of the VPP at `binary`: the `vpp` package's, when the
+    /// binary is that package's. Of any other, nothing installed says.
+    fn version_of(binary: &str) -> Result<String, String> {
+        let real = std::fs::canonicalize(binary).map_err(|e| format!("{binary}: {e}"))?;
+        let out = std::process::Command::new("dpkg-query")
+            .arg("-S")
+            .arg(&real)
+            .output()
+            .map_err(|e| format!("dpkg-query: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || !super::owners(&text).contains(&"vpp") {
+            return Err(format!(
+                "the VPP that runs, {binary}, is not the `vpp` package's, so no installed \
+                 package's version is its"
+            ));
+        }
+        installed_vpp_version()
     }
 
     /// The installed `vpp` package's version, as dpkg has it.
@@ -274,6 +316,18 @@ mod tests {
         f.extend(header(1, names_at, names.len()));
         f.extend(header(11, reg_at, reg.len()));
         f
+    }
+
+    #[test]
+    fn a_binary_is_the_vpp_packages_only_when_dpkg_says_so() {
+        assert_eq!(owners("vpp: /usr/bin/vpp\n"), vec!["vpp"]);
+        assert_eq!(owners("vpp:arm64: /usr/bin/vpp\n"), vec!["vpp"]);
+        assert_eq!(
+            owners("vpp, vpp-dbg: /usr/bin/vpp\n"),
+            vec!["vpp", "vpp-dbg"]
+        );
+        assert!(owners("diversion by local from: /usr/bin/vpp\n").is_empty());
+        assert!(owners("").is_empty());
     }
 
     #[test]
