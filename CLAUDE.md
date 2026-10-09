@@ -19,7 +19,7 @@ PacketFrame is a modular eBPF data plane written in pure Rust (aya + aya-ebpf). 
 - `crates/vpp-plugins/`: the VPP sampler plugin. `pf-sampler-core` (workspace member) holds all its logic — selection, pool indices, the desired.conf → interfaces → status controller, the epoch-file driver — tested on any host; `pf-sampler` is the cdylib glue (node, features, barrier, process node, CLI), excluded from the workspace because it builds only against one VPP's headers, on `vpp-plugin` pinned to the unredacted fork by commit. CI's `sampler plugin (arm64, VPP)` job builds it in bullseye against the SOURCE.json release and runs it in a real VPP (`pf-sampler/ci/smoke.sh`)
 - `conf/example.conf`: reference config per SPEC.md §4.8
 - `docs/runbooks/packetframe-fib.md`: Option F operations runbook (healthy state, triage by symptom, cutover + rollback, Phase 4 config snippets)
-- `.github/workflows/`: `ci.yml` (fmt/clippy/test + 4× cross-build), `qemu-verifier.yml` (integration tests on 5.15 + 6.6 kernels), `release.yml` (tag-triggered tarballs), `hardware-artifacts.yml` (per-main-push aarch64 test-binary + CLI bundle for on-router runs)
+- `.github/workflows/`: `ci.yml` (fmt/clippy, one test build whose binaries the privileged native and qemu jobs run, 4× cross-build), `qemu-verifier.yml` (called by ci.yml: those binaries in 5.15 + 6.6 guests under KVM), `release.yml` (tag-triggered tarballs), `hardware-artifacts.yml` (per-main-push aarch64 test-binary + CLI bundle for on-router runs)
 - `crates/modules/vpp-offload/vpp-api/`: vendored `.api.json` (the binary-API wire format) + `SOURCE.json`, the manifest of the release they came from. There is deliberately no separate pin file — the module is generic over VPPs (CRC handshake at attach), every fetch pointer derives from SOURCE.json, and CI byte-binds the bundle to its release. VPP for UniFi gateways is built by github.com/unredacted/vpp-unifi; bump procedure in that directory's README.md. Installing the VPP deb on a router: follow vpp-unifi's README sequence exactly — the deb ships `/etc/sysctl.d/80-vpp.conf`, which `VPP_INSTALL_SKIP_SYSCTL=1` does NOT remove; left in place it re-applies at every boot (a 512 GiB hugepage request on the 64K-page fleet) and bricked the primary EFG on 2026-08-21. The install is not done until that file is deleted and verified gone
 
 ## Build & test
@@ -33,7 +33,7 @@ make lint          # cargo fmt --check + cargo clippy -D warnings
 make fmt           # cargo fmt
 ```
 
-CI runs all of the above plus cross-builds for `{aarch64,x86_64}-unknown-linux-{musl,gnu}` and a qemu-verifier matrix (kernels 5.15 + 6.6) that executes the sudo-gated integration tests (`fib_fixtures`, `fib_programmer_integration`, `fib_comparison`, `neigh_resolver_netns`, etc.) inside a VM.
+CI runs all of the above plus cross-builds for `{aarch64,x86_64}-unknown-linux-{musl,gnu}`, and the sudo-gated integration tests (`fib_fixtures`, `fib_programmer_integration`, `fib_comparison`, `neigh_resolver_netns`, etc.) natively and in a qemu-verifier matrix (kernels 5.15 + 6.6). Those run from binaries `build` compiles once, never cargo in the guest; what runs where is the table in `.github/scripts/privileged-tests.sh`, and a new privileged test package goes there.
 
 ## License
 
@@ -61,7 +61,7 @@ CI runs `cargo clippy --workspace --all-targets --all-features -- -D warnings`. 
 
 ## PR workflow
 
-One feature branch per slice. Commit messages explain **why**, not what the diff already shows. CI must be green before asking for review (nine jobs: fmt+clippy+test, four cross-builds, sampler-shm on arm64, the sampler plugin in VPP on arm64, two qemu kernels). Amending unreviewed commits and `git push --force-with-lease` on a feature branch is fine pre-review; force-push to `main` is never fine. For multi-phase work (e.g. the Option F rollout) the slicing lives in the plan file; keep PRs scoped to a single slice.
+One feature branch per slice. Commit messages explain **why**, not what the diff already shows. CI must be green before asking for review (eleven jobs: fmt+clippy, build+test, privileged tests native, four cross-builds, sampler-shm on arm64, the sampler plugin in VPP on arm64, two qemu kernels). Amending unreviewed commits and `git push --force-with-lease` on a feature branch is fine pre-review; force-push to `main` is never fine. For multi-phase work (e.g. the Option F rollout) the slicing lives in the plan file; keep PRs scoped to a single slice.
 
 ## What not to change casually
 

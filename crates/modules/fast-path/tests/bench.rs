@@ -70,9 +70,10 @@ const LO_IFINDEX: u32 = 1;
 /// TCG's per-execution cost varies enough across hosted runners that
 /// no fixed budget is both meaningful and safe. Benchmark numbers
 /// under emulation were never meaningful anyway, so qemu-verifier.yml
-/// sets this and skips the benches outright; their real homes are
-/// ci.yml's native-speed sudo step (full mode) and the
-/// hardware-artifacts bundle run on routers (`run-tests.sh bench`).
+/// sets this and skips the benches outright. ci.yml's native
+/// `privileged` job runs them in quick mode for their sanity asserts;
+/// the numbers come from the hardware-artifacts bundle run on routers
+/// (`run-tests.sh bench`).
 fn bench_skip() -> bool {
     if std::env::var_os("PACKETFRAME_BENCH_SKIP").is_some() {
         eprintln!("PACKETFRAME_BENCH_SKIP set; skipping bench.");

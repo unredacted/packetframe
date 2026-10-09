@@ -8,9 +8,22 @@ on:
 permissions:
   contents: read
 
+# A newer push to a PR supersedes the run in flight; every push to main
+# runs to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
+  # Keep the debug-profile target dir small: it is what the caches hold
+  # and what `build` ships to the privileged and qemu jobs. Incremental
+  # state is never reused by a fresh CI checkout, and full debuginfo is
+  # most of a test binary's size; line tables keep file:line in panics
+  # and backtraces. The release profile is untouched.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   # Pins for tools the Rust project itself publishes — GitHub runners
   # come with rustup pre-installed, so we manage toolchains and targets
   # via direct `rustup` commands rather than a third-party action. The
@@ -22,14 +35,13 @@ env:
   BPF_LINKER_VERSION: "0.10.3"
 
 jobs:
-  check:
-    name: fmt + clippy + test
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-latest
     env:
-      # Refuse to stub-fallback on BPF build failure. Without this, a
-      # broken BPF build silently produces an empty ELF and every
-      # verifier/attach integration test early-returns "BPF stub in
-      # effect" + reports `ok`, masking real regressions.
+      # Clippy runs the build scripts, and userspace code behind
+      # `cfg(packetframe_bpf_built)` is only linted when the BPF build
+      # really succeeded, so a stub fallback here would quietly lint less.
       PACKETFRAME_BPF_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v7
@@ -62,9 +74,9 @@ jobs:
             crates/modules/guard/bpf/target/
             crates/modules/flow-export/bpf/target/
             crates/modules/probe/bpf/target/
-          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml', 'crates/modules/guard/bpf/Cargo.toml', 'crates/modules/probe/bpf/Cargo.toml', 'crates/modules/flow-export/bpf/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml', 'crates/modules/guard/bpf/Cargo.toml', 'crates/modules/probe/bpf/Cargo.toml', 'crates/modules/flow-export/bpf/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-check-
+            ${{ runner.os }}-cargo-lint-
 
       - name: Install bpf-linker
         run: |
@@ -158,31 +170,132 @@ jobs:
             exit 1
           fi
 
+  # Compiles every test binary once. The privileged tests then run from
+  # that one build natively (`privileged`) and inside the 5.15 and 6.6
+  # guests (`qemu`), none of which needs a Rust toolchain; the list of
+  # what runs where is .github/scripts/privileged-tests.sh.
+  build:
+    name: build + test
+    runs-on: ubuntu-latest
+    outputs:
+      bundled: ${{ steps.bundle.outputs.bundled }}
+    env:
+      # Refuse to stub-fallback on BPF build failure. Without this, a
+      # broken BPF build silently produces an empty ELF and every
+      # verifier/attach integration test early-returns "BPF stub in
+      # effect" + reports `ok`, masking real regressions. The test
+      # binaries embed the ELF, so this also covers the jobs that run
+      # them.
+      PACKETFRAME_BPF_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/rust-stable-pin
+
+      - name: Install Rust (stable + nightly for BPF)
+        # No `rustup target add bpfel-unknown-none`: see `lint`.
+        run: |
+          rustup toolchain install ${{ env.RUST_STABLE }} --profile minimal
+          rustup default ${{ env.RUST_STABLE }}
+          rustup toolchain install ${{ env.RUST_NIGHTLY }} \
+            --profile minimal --component rust-src,llvm-tools-preview
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            crates/modules/fast-path/bpf/target/
+            crates/modules/guard/bpf/target/
+            crates/modules/flow-export/bpf/target/
+            crates/modules/probe/bpf/target/
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock', 'crates/modules/fast-path/bpf/Cargo.toml', 'crates/modules/guard/bpf/Cargo.toml', 'crates/modules/probe/bpf/Cargo.toml', 'crates/modules/flow-export/bpf/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      - name: Install bpf-linker
+        run: |
+          if ! command -v bpf-linker >/dev/null 2>&1 || \
+             [ "$(bpf-linker --version 2>/dev/null | awk '{print $2}')" != "${{ env.BPF_LINKER_VERSION }}" ]; then
+            cargo install --locked --force bpf-linker \
+              --version ${{ env.BPF_LINKER_VERSION }}
+          fi
+
+      - name: Build test binaries
+        id: bundle
+        # json-render-diagnostics: compiler errors still print as text;
+        # only the artifact list goes to the JSON the bundle reads.
+        run: |
+          set -euo pipefail
+          cargo test --workspace --no-run --message-format=json-render-diagnostics \
+            > "${RUNNER_TEMP}/cargo-test.json"
+          .github/scripts/privileged-tests.sh bundle \
+            "${RUNNER_TEMP}/cargo-test.json" privileged-tests.tar.zst
+          echo "bundled=true" >> "${GITHUB_OUTPUT}"
+
+      # Uploaded before the unprivileged tests run, so the privileged and
+      # qemu jobs start as soon as the build is done.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: privileged-tests
+          path: privileged-tests.tar.zst
+          # Already zstd; a re-run of a failed downstream job reuses it.
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
       - name: cargo test
         run: cargo test --workspace
 
-      - name: cargo test (BPF verifier + attach, sudo)
-        # Integration tests that load the BPF ELF into the kernel or
-        # attach it to an interface need CAP_BPF + CAP_NET_ADMIN. Run
-        # them all under sudo; `-E` preserves the cargo env so they
-        # reuse the prior step's build. All such tests are marked
-        # `#[ignore]` so the non-sudo `cargo test` above skips them.
+      # Every commit rebuilds these, so caching them only crowds the
+      # repository's 10 GB cache budget (outgrowing it evicted this
+      # job's cache on every run). Dependencies, build-script outputs
+      # and proc macros all have a dot in their names and stay.
+      - name: Drop test executables before the cache saves
+        run: find target/debug/deps -maxdepth 1 -type f -perm -u+x ! -name '*.*' -delete
+
+  # Both run whenever the binaries were packed, even if `build`'s own
+  # unprivileged tests then failed: one failure must not hide the others.
+  privileged:
+    name: privileged tests (native)
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.bundled == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      # For the runner script and the package directories the binaries
+      # run from; nothing here compiles.
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: privileged-tests
+
+      - name: Unpack test binaries
+        run: tar --zstd -xf privileged-tests.tar.zst
+
+      - name: privileged tests (BPF verifier + attach, netns, tmpfs; sudo)
+        # Integration tests that load the BPF ELF into the kernel, attach
+        # it to an interface or mount a tmpfs need CAP_BPF +
+        # CAP_NET_ADMIN, so they are all `#[ignore]`d for plain `cargo
+        # test` and run here as root, on the runner's own kernel.
         #
-        # Both the fast-path and probe modules have sudo-gated
-        # integration tests; list each so a future module without
-        # such tests doesn't fail this step with "no test matches".
-        run: |
-          sudo -E $(which cargo) test -p packetframe-fast-path --tests -- --ignored --nocapture
-          sudo -E $(which cargo) test -p packetframe-guard --tests -- --ignored --nocapture
-          sudo -E $(which cargo) test -p packetframe-neigh-snoop --tests -- --ignored --nocapture
-          sudo -E $(which cargo) test -p packetframe-flow-export --tests -- --ignored --nocapture
-          sudo -E $(which cargo) test -p packetframe-probe --tests -- --ignored --nocapture
-          sudo -E $(which cargo) test -p packetframe-sampler-shm --tests -- --ignored --nocapture
-          sudo -E $(which cargo) test -p packetframe-sampler-core --tests -- --ignored --nocapture
-          sudo -E $(which cargo) test -p packetframe-vpp-offload --test drift_netns -- --ignored --nocapture
-          # The sampler's tmpfs for real: mounted, marked, recorded, reused
-          # across a restart, released, and a crowded foreign mount refused.
-          sudo -E $(which cargo) test -p packetframe-vpp-offload --lib -- --ignored --exact sampler::tests::the_live_mount_round_trips --nocapture
+        # PACKETFRAME_BENCH_QUICK: the fast-path benches run their sanity
+        # asserts at a few hundred executions instead of 1M per bench
+        # (full mode cost CI 3 minutes a run). A shared runner's ns/pkt
+        # figures gate nothing; the full benches run on routers from the
+        # hardware-artifacts bundle (`run-tests.sh bench`).
+        env:
+          PACKETFRAME_BENCH_QUICK: "1"
+        run: sudo -E .github/scripts/privileged-tests.sh run native
+
+  qemu:
+    name: QEMU verifier
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.bundled == 'true' }}
+    uses: ./.github/workflows/qemu-verifier.yml
 
   sampler-shm-arm64:
     name: sampler-shm (arm64)
@@ -190,7 +303,8 @@ jobs:
     # processes, VPP and PacketFrame. A missing ordering shows on aarch64's
     # weaker memory model (the EFG's) long before x86's, so the
     # two-process stress run and the loom model checks run on arm64
-    # hardware. The `check` job runs the same tests, smaller, on x86_64.
+    # hardware. The `build` and `privileged` jobs run the same tests,
+    # smaller, on x86_64.
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
@@ -256,7 +370,7 @@ jobs:
     # Cross-build jobs are userspace-only smoke tests for each release
     # target triple. BPF bytecode is architecture-independent (it's BPF,
     # not native machine code), so building it four times inside `cross`
-    # containers would be wasted work. The `check` job above builds it
+    # containers would be wasted work. The `build` job above builds it
     # once; these jobs stub it out via PACKETFRAME_SKIP_BPF_BUILD=1.
     env:
       PACKETFRAME_SKIP_BPF_BUILD: "1"
@@ -292,7 +406,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
 
-      # `cross build` below covers lib + bins only, and the `check` job's
+      # `cross build` below covers lib + bins only, and the `lint` job's
       # clippy run sees just the host triple, so *test* code that doesn't
       # compile for a release target slipped through both. It bit us
       # twice: `libc::ioctl`'s request argument is `c_ulong` on glibc but
