@@ -12,7 +12,7 @@ build = "build.rs"
 path = "src/lib.rs"
 
 [dependencies]
-packetframe-common.workspace = true
+packetframe-common = { workspace = true, features = ["tc"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -24,11 +24,6 @@ libc.workspace = true
 # aya and have `attach`/`reconfigure` return NotImplemented.
 [target.'cfg(target_os = "linux")'.dependencies]
 aya.workspace = true
-# health's read-only tc filter dump (aya's own finder is crate-private).
-# The same message crates vpp-offload's blocking dumps use.
-netlink-packet-core.workspace = true
-netlink-packet-route.workspace = true
-netlink-sys = "0.9"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 aya.workspace = true

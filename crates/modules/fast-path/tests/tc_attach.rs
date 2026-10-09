@@ -364,3 +364,92 @@ fn tc_detach_follows_a_renamed_device() {
     );
     assert!(tc_links::load(&state_dir).expect("load").is_none());
 }
+
+/// A recorded ifindex now held by another device under another name,
+/// with a filter of its own in the recorded slot (classic BPF, which
+/// carries no program name): not ours, so detach leaves it and drops
+/// the record. `ip link add … index` hands the old index on, as a
+/// device moved into the namespace keeps its own when it is free.
+/// Mirror of guard's `detach_spares_a_device_given_a_recorded_ifindex`.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn tc_detach_spares_a_device_given_a_recorded_ifindex() {
+    if !FAST_PATH_BPF_AVAILABLE {
+        eprintln!("BPF stub in effect (no rustup); skipping tc attach test.");
+        return;
+    }
+    const RI_A: &str = "pf-tci0";
+    const RI_B: &str = "pf-tci1";
+    const OTHER_A: &str = "pf-tcx0";
+    const OTHER_B: &str = "pf-tcx1";
+    struct RiCleanup(std::path::PathBuf);
+    impl Drop for RiCleanup {
+        fn drop(&mut self) {
+            for dev in [RI_A, OTHER_A] {
+                let _ = Command::new("ip").args(["link", "del", dev]).status();
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let state_dir = std::env::temp_dir().join(format!("pf-tc-reindex-test-{}", std::process::id()));
+    let _cleanup = RiCleanup(state_dir.clone());
+    for dev in [RI_A, OTHER_A] {
+        let _ = Command::new("ip").args(["link", "del", dev]).status();
+    }
+
+    run(&[
+        "ip", "link", "add", RI_A, "type", "veth", "peer", "name", RI_B,
+    ]);
+    let ifindex = ifindex_of(RI_A);
+    let bytes = aligned_bpf_copy();
+    let mut bpf = aya::Ebpf::load(&bytes).expect("aya::Ebpf::load");
+    load_classifiers(&mut bpf);
+    let (priority, handle) = tc_attach_iface(&mut bpf, RI_A).expect("attach");
+    tc_links::save(
+        &state_dir,
+        &tc_links::TcLinksFile {
+            links: vec![tc_links::TcLinkRecord {
+                iface: RI_A.to_string(),
+                ifindex,
+                priority,
+                handle,
+            }],
+        },
+    )
+    .expect("tc-links.json save");
+    drop(bpf);
+    run(&["ip", "link", "del", RI_A]);
+
+    let index = ifindex.to_string();
+    run(&[
+        "ip", "link", "add", OTHER_A, "index", &index, "type", "veth", "peer", "name", OTHER_B,
+    ]);
+    assert_eq!(ifindex_of(OTHER_A), ifindex);
+    run(&["tc", "qdisc", "add", "dev", OTHER_A, "clsact"]);
+    run(&[
+        "tc",
+        "filter",
+        "add",
+        "dev",
+        OTHER_A,
+        "ingress",
+        "pref",
+        &priority.to_string(),
+        "handle",
+        &handle.to_string(),
+        "bpf",
+        "bytecode",
+        "1,6 0 0 0,",
+    ]);
+    assert!(tc_filter_listing(OTHER_A).contains("bpf"));
+
+    let cleared = tc_detach_from_state_dir(&state_dir).expect("not ours = cleared");
+    assert_eq!(cleared, 1);
+    let listing = tc_filter_listing(OTHER_A);
+    assert!(
+        listing.contains("bpf"),
+        "the filter in {OTHER_A}'s (prio {priority}, handle {handle}) is not ours and must \
+         survive, got:\n{listing}"
+    );
+    assert!(tc_links::load(&state_dir).expect("load").is_none());
+}

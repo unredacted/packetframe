@@ -191,8 +191,10 @@ as a last resort `tc filter del dev <iface> egress`.
 
 Each record carries its interface's attach-time ifindex, and detach
 finds the device by it: a bridge renamed since attach has its filter
-removed under the new name, and a device recreated under the old name
-(new ifindex) is never touched. Because the file names the filters a
+removed under the new name (only if the recorded `(priority, handle)`
+there still holds `guard_egress`, since an ifindex can be handed to
+another device), and a device recreated under the old name (new
+ifindex) is never touched. Because the file names the filters a
 root detach removes, it is read only when no other account could have
 written it, on the same checks as
 [`vpp-offload.json`](vpp-offload.md#attach-or-detach-refuses-refusing-vpp-offloadjson-),

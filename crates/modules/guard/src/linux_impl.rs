@@ -324,13 +324,15 @@ pub fn detach_from_state_dir(state_dir: &Path, bpffs_root: &Path) -> ModuleResul
 /// [`attach_row`]), plus one informational counters row.
 ///
 /// Filter presence is read with a netlink dump
-/// ([`egress_filter_present`]), never via
+/// (`packetframe_common::tc_filter`), never via
 /// `SchedClassifierLink::attached()` — dropping the constructed link
 /// DETACHES the filter.
 pub(crate) fn health(state: &ActiveState) -> HealthReport {
+    use packetframe_common::tc_filter::{bpf_program_id_at, ClsactHook};
     let mut overall = HealthState::Healthy;
     let mut subsystems = Vec::new();
-    // What a filter must run to be ours.
+    // What a filter must run to be ours: this load's id. Detach, run
+    // without the program, can only go by its name.
     let prog_id = match state.ebpf.program(pin::PROGRAM_NAME) {
         Some(p) => p
             .info()
@@ -346,7 +348,9 @@ pub(crate) fn health(state: &ActiveState) -> HealthReport {
             name_of(a.ifindex),
             || {
                 let id = prog_id.as_ref().map_err(Clone::clone)?;
-                egress_filter_present(a.ifindex, a.priority, a.handle, *id)
+                bpf_program_id_at(a.ifindex, ClsactHook::Egress, a.priority, a.handle)
+                    .map(|found| found == Some(*id))
+                    .map_err(|e| e.to_string())
             },
             || ifindex_of(iface).ok(),
         );
@@ -545,8 +549,12 @@ fn tc_detach_one(
     // a delete there could remove an unrelated filter on the
     // replacement whose (priority, handle) happens to match — the
     // first auto-allocated tuple is common (review finding, PR #205).
-    // The resolve-to-delete race is accepted: it requires the device to
-    // be renamed or recreated in that instant AND the tuple to collide.
+    // Under another name the ifindex alone vouches for the device, and
+    // an ifindex can be handed on (see `packetframe_common::tc_filter`),
+    // so there the slot must hold our own program before it is deleted
+    // (review finding, PR #343). The resolve-to-delete race is
+    // accepted: it requires the device to be renamed or recreated in
+    // that instant AND the tuple to collide.
     let current = match name_of(expected_ifindex) {
         Ok(Some(current)) => current,
         Ok(None) => {
@@ -563,12 +571,32 @@ fn tc_detach_one(
         }
     };
     if current != iface {
-        info!(
-            recorded = iface,
-            now = %current,
-            ifindex = expected_ifindex,
-            "iface renamed since attach; detaching its guard tc filter there"
-        );
+        use packetframe_common::tc_filter::{bpf_program_at, ClsactHook};
+        match bpf_program_at(expected_ifindex, ClsactHook::Egress, priority, handle) {
+            Ok(Some(prog)) if prog == pin::PROGRAM_NAME => info!(
+                recorded = iface,
+                now = %current,
+                ifindex = expected_ifindex,
+                "iface renamed since attach; detaching its guard tc filter there"
+            ),
+            Ok(found) => {
+                info!(
+                    recorded = iface,
+                    now = %current,
+                    ifindex = expected_ifindex,
+                    found = ?found,
+                    "the recorded ifindex names another device without our filter; \
+                     the recorded filter died with the old device"
+                );
+                return TcDetachOutcome::Cleared;
+            }
+            Err(e) => {
+                return TcDetachOutcome::Failed(format!(
+                    "guard tc detach on {iface} (now {current}): read its filter at \
+                     (prio {priority}, handle {handle}): {e}"
+                ))
+            }
+        }
     }
     let iface = current.as_str();
 
@@ -730,126 +758,6 @@ fn name_of(ifindex: u32) -> std::io::Result<Option<String>> {
     // SAFETY: NUL-terminated by the call above, within `buf`.
     let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
     Ok(Some(name.to_string_lossy().into_owned()))
-}
-
-/// Whether `ifindex`'s clsact egress hook holds the cls_bpf filter at
-/// `(priority, handle)` running program `prog_id`. A read-only
-/// RTM_GETTFILTER dump, as aya's crate-private
-/// `netlink_find_filter_with_name` does, matched by program id rather
-/// than name. No device or no clsact dumps empty: `false`.
-fn egress_filter_present(
-    ifindex: u32,
-    priority: u16,
-    handle: u32,
-    prog_id: u32,
-) -> Result<bool, String> {
-    use netlink_packet_core::{
-        NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_REQUEST,
-    };
-    use netlink_packet_route::tc::{TcAttribute, TcFilterBpfOption, TcHandle, TcMessage, TcOption};
-    use netlink_packet_route::RouteNetlinkMessage;
-    use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
-
-    let runs_ours = |attrs: &[TcAttribute]| {
-        attrs.iter().any(|a| match a {
-            TcAttribute::Options(opts) => opts.iter().any(
-                |o| matches!(o, TcOption::Bpf(TcFilterBpfOption::ProgId(id)) if *id == prog_id),
-            ),
-            _ => false,
-        })
-    };
-
-    let mut socket = Socket::new(NETLINK_ROUTE).map_err(|e| format!("netlink socket: {e}"))?;
-    bound_recv(&socket)?;
-    socket
-        .bind_auto()
-        .map_err(|e| format!("netlink bind: {e}"))?;
-    socket
-        .connect(&SocketAddr::new(0, 0))
-        .map_err(|e| format!("netlink connect: {e}"))?;
-
-    let mut tc = TcMessage::default();
-    tc.header.index = ifindex as i32;
-    tc.header.parent = TcHandle {
-        major: TcHandle::CLSACT.major,
-        minor: TcHandle::MIN_EGRESS,
-    };
-    let mut msg = NetlinkMessage::from(RouteNetlinkMessage::GetTrafficFilter(tc));
-    msg.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
-    msg.header.sequence_number = 1;
-    msg.finalize();
-    let mut send_buf = vec![0u8; msg.header.length as usize];
-    msg.serialize(&mut send_buf);
-    socket
-        .send(&send_buf, 0)
-        .map_err(|e| format!("netlink send: {e}"))?;
-
-    let mut found = false;
-    let mut recv_buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = socket
-            .recv(&mut &mut recv_buf[..], 0)
-            .map_err(|e| format!("netlink recv: {e}"))?;
-        let mut offset = 0usize;
-        while offset < n {
-            let pkt = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&recv_buf[offset..n])
-                .map_err(|e| format!("netlink parse: {e}"))?;
-            let len = pkt.header.length as usize;
-            if len == 0 {
-                break;
-            }
-            if pkt.header.flags & NLM_F_DUMP_INTR != 0 {
-                return Err("the kernel interrupted the dump (NLM_F_DUMP_INTR)".into());
-            }
-            match pkt.payload {
-                NetlinkPayload::Done(d) if d.code == 0 => return Ok(found),
-                NetlinkPayload::Done(d) => {
-                    return Err(format!(
-                        "dump ended with {}",
-                        std::io::Error::from_raw_os_error(-d.code)
-                    ))
-                }
-                NetlinkPayload::Error(e) => return Err(format!("netlink error: {e}")),
-                // tcm_info carries the priority in its upper half.
-                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewTrafficFilter(m)) => {
-                    found |= (m.header.info >> 16) as u16 == priority
-                        && u32::from(m.header.handle) == handle
-                        && runs_ours(&m.attributes);
-                }
-                _ => {}
-            }
-            offset += len;
-        }
-    }
-}
-
-/// A receive timeout on the dump's socket: a monitoring read must never
-/// be able to wedge health (vpp-offload's `fdb::bound_recv` rule). A
-/// filter dump is a few messages; a second is far past any real one.
-fn bound_recv(socket: &netlink_sys::Socket) -> Result<(), String> {
-    use std::os::fd::AsRawFd as _;
-    let tv = libc::timeval {
-        tv_sec: 1,
-        tv_usec: 0,
-    };
-    // SAFETY: `socket` owns the fd for the call, and `tv` is a
-    // `timeval` of exactly the length passed.
-    let ret = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            std::ptr::addr_of!(tv).cast(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        return Err(format!(
-            "netlink SO_RCVTIMEO: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
 }
 
 /// The interface's own MAC — the expected src for `foreign-src`.

@@ -271,7 +271,9 @@ tc filter del dev eth5 ingress
 
 Records in `tc-links.json` carry the attach-time ifindex, and detach
 finds the device by it rather than by name. An interface renamed since
-attach still holds its filter, which is removed under the new name. A
+attach still holds its filter, which is removed under the new name, but
+only if the recorded `(priority, handle)` there still holds
+`tc_fast_path`: an ifindex can be handed to another device. A
 deleted-and-recreated interface (same name, new ifindex) has its stale
 record dropped instead of losing whatever filter the replacement device
 now holds at the recorded `(priority, handle)`. Records written by

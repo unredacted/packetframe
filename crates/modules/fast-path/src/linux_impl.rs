@@ -2967,9 +2967,13 @@ fn tc_detach_one(
     // a delete there could remove an unrelated filter on the
     // replacement whose (priority, handle) happens to match — the
     // first auto-allocated tuple is common (review finding, guard
-    // PR #205; mirror of guard's tc_detach_one). The resolve-to-delete
-    // race is accepted: it requires the device to be renamed or
-    // recreated in that instant AND the tuple to collide.
+    // PR #205; mirror of guard's tc_detach_one). Under another name the
+    // ifindex alone vouches for the device, and an ifindex can be
+    // handed on (see `packetframe_common::tc_filter`), so there the
+    // slot must hold our own program before it is deleted (review
+    // finding, PR #343). The resolve-to-delete race is accepted: it
+    // requires the device to be renamed or recreated in that instant
+    // AND the tuple to collide.
     // expected_ifindex == 0 is a record from a pre-ifindex build (see
     // TcLinkRecord); no attach-time ifindex to find the device by, so
     // fall through to the name-resolved delete those builds did.
@@ -2992,12 +2996,32 @@ fn tc_detach_one(
             }
         };
         if current != iface {
-            info!(
-                recorded = iface,
-                now = %current,
-                ifindex = expected_ifindex,
-                "iface renamed since attach; detaching its tc filter there"
-            );
+            use packetframe_common::tc_filter::{bpf_program_at, ClsactHook};
+            match bpf_program_at(expected_ifindex, ClsactHook::Ingress, priority, handle) {
+                Ok(Some(prog)) if prog == TC_FAST_PATH_PROGRAM_NAME => info!(
+                    recorded = iface,
+                    now = %current,
+                    ifindex = expected_ifindex,
+                    "iface renamed since attach; detaching its tc filter there"
+                ),
+                Ok(found) => {
+                    info!(
+                        recorded = iface,
+                        now = %current,
+                        ifindex = expected_ifindex,
+                        found = ?found,
+                        "the recorded ifindex names another device without our filter; \
+                         the recorded filter died with the old device"
+                    );
+                    return TcDetachOutcome::Cleared;
+                }
+                Err(e) => {
+                    return TcDetachOutcome::Failed(format!(
+                        "tc detach on {iface} (now {current}): read its filter at \
+                         (prio {priority}, handle {handle}): {e}"
+                    ))
+                }
+            }
         }
         current
     };

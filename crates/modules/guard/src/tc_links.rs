@@ -154,7 +154,20 @@ fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 fn read_record(path: &Path) -> Result<Option<Vec<u8>>, TcLinksError> {
     use packetframe_common::statefile::{read_owned_no_follow, OwnedReadError};
+    // The no-follow walk reports a symlink as an I/O error: ELOOP at the
+    // file, ENOTDIR at a directory on the way (as it does a plain file
+    // there). Either is as much a planted record as a foreign owner:
+    // refused, with the way out.
+    let not_followed =
+        [libc::ELOOP, libc::ENOTDIR].map(|e| std::io::Error::from_raw_os_error(e).kind());
     read_owned_no_follow(path, MAX_LINKS_BYTES).map_err(|e| match e {
+        OwnedReadError::Io(e) if not_followed.contains(&e.kind()) => TcLinksError::Refused {
+            path: path.to_owned(),
+            why: match e.raw_os_error() {
+                Some(libc::ELOOP) => "it is a symlink, which is refused".into(),
+                _ => e.to_string(),
+            },
+        },
         OwnedReadError::Io(source) => TcLinksError::Io {
             path: path.to_owned(),
             source,
@@ -286,7 +299,9 @@ mod tests {
     }
 
     /// A record another account could have planted is not read: not
-    /// through a symlink, and not when the file is writable by others.
+    /// through a symlink, at the file or a directory on the way, and not
+    /// when the file is writable by others. Each is a `Refused`, whose
+    /// message carries the way out.
     #[cfg(target_os = "linux")]
     #[test]
     fn load_refuses_a_record_it_cannot_trust() {
@@ -295,11 +310,26 @@ mod tests {
         let elsewhere = dir.join("elsewhere.json");
         std::fs::write(&elsewhere, serde_json::to_vec(&sample()).unwrap()).unwrap();
         std::os::unix::fs::symlink(&elsewhere, file_path(&dir)).unwrap();
-        assert!(
-            matches!(load(&dir), Err(TcLinksError::Io { .. })),
-            "read through a symlink"
-        );
+        match load(&dir) {
+            Err(TcLinksError::Refused { why, .. }) => {
+                assert!(why.contains("it is a symlink"), "{why}")
+            }
+            other => panic!("read through a symlink: {other:?}"),
+        }
         std::fs::remove_file(file_path(&dir)).unwrap();
+
+        // A symlink at a directory on the way is refused the same way.
+        let real = dir.join("real");
+        std::fs::create_dir(&real).unwrap();
+        save(&real, &sample()).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        match load(&link) {
+            Err(TcLinksError::Refused { why, .. }) => {
+                assert!(why.contains("a symlink here is refused"), "{why}")
+            }
+            other => panic!("read through a symlinked state-dir: {other:?}"),
+        }
 
         save(&dir, &sample()).unwrap();
         std::fs::set_permissions(file_path(&dir), std::fs::Permissions::from_mode(0o666)).unwrap();
