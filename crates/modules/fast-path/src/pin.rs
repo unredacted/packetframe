@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use crate::MODULE_NAME;
 
 /// Every §4.5 map that gets pinned. Order is not significant.
-pub const MAP_NAMES: [&str; 28] = [
+pub const MAP_NAMES: [&str; 27] = [
     "ALLOW_V4",
     "ALLOW_V6",
     "CFG",
@@ -70,12 +70,11 @@ pub const MAP_NAMES: [&str; 28] = [
     // Destination MACs each attached port receives on; the watcher opens
     // it by pin to follow MAC changes.
     "RX_MACS",
-    // flow-export's sampler: the configuration it writes, the perf rings
-    // it reads, and the record staging. Present whether or not flow-export
-    // runs; with it absent the rate stays 0.
+    // flow-export's sampler: the configuration it writes and the ring it
+    // reads. Present whether or not flow-export runs; with it absent the
+    // rate stays 0.
     "SAMPLE_CFG",
     "SAMPLES",
-    "SAMPLE_SCRATCH",
 ];
 
 /// The pinned maps the redirect-target watcher opens

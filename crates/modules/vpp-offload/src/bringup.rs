@@ -519,6 +519,9 @@ fn irq_sample(conflicts: &[cores::IrqConflict]) -> String {
 /// On any failure after acquisition, everything acquired is released
 /// before returning — a failed attach must leave the box as it found it,
 /// or say precisely what it could not hand back.
+///
+/// `sampler_ports` is flow export's handle, `Some` when it is configured:
+/// VPP's sampler is then its to drive (`crate::sampler`).
 #[allow(clippy::too_many_arguments)]
 pub fn bring_up(
     cfg: &VppOffloadConfig,
@@ -845,6 +848,9 @@ pub fn bring_up(
         &paths.sys.sampler_dir,
         startup_conf::thread_count(sizing.workers) as usize,
         &paths.sys.state_dir,
+        // Flow export, configured, takes over a `desired.conf` left
+        // behind.
+        sampler_ports.is_some(),
     );
     #[cfg(not(target_os = "linux"))]
     let sampler_dir = crate::sampler::SamplerDir::Unavailable("Linux only".into());

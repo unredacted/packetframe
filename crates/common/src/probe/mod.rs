@@ -17,10 +17,10 @@ use serde::Serialize;
 use bpf::{
     call_helper, exit_insn, map_create, mov64_imm, probe_bpf_syscall, prog_load, BpfSyscallStatus,
     BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_DEVMAP_HASH, BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LPM_TRIE,
-    BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_PERF_EVENT_ARRAY, BPF_MAP_TYPE_RINGBUF,
-    BPF_PROG_TYPE_SCHED_CLS, BPF_PROG_TYPE_XDP, HELPER_FIB_LOOKUP, HELPER_MAP_DELETE_ELEM,
-    HELPER_MAP_LOOKUP_ELEM, HELPER_MAP_UPDATE_ELEM, HELPER_PERF_EVENT_OUTPUT, HELPER_REDIRECT_MAP,
-    HELPER_RINGBUF_OUTPUT, HELPER_RINGBUF_RESERVE, HELPER_RINGBUF_SUBMIT, HELPER_XDP_ADJUST_HEAD,
+    BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_RINGBUF, BPF_PROG_TYPE_SCHED_CLS, BPF_PROG_TYPE_XDP,
+    HELPER_FIB_LOOKUP, HELPER_MAP_DELETE_ELEM, HELPER_MAP_LOOKUP_ELEM, HELPER_MAP_UPDATE_ELEM,
+    HELPER_REDIRECT_MAP, HELPER_RINGBUF_OUTPUT, HELPER_RINGBUF_RESERVE, HELPER_RINGBUF_SUBMIT,
+    HELPER_XDP_ADJUST_HEAD,
 };
 
 /// Magic number identifying the bpffs filesystem. `statfs.f_type` equals
@@ -130,7 +130,7 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
     // verifier log. Any log substring matching "unknown func" /
     // "unrecognized bpf_func_id" / "invalid func" means the helper is not
     // compiled into this kernel.
-    let helper_probes: [(&str, i32); 10] = [
+    let helper_probes: [(&str, i32); 9] = [
         ("helper.bpf_map_lookup_elem", HELPER_MAP_LOOKUP_ELEM),
         ("helper.bpf_map_update_elem", HELPER_MAP_UPDATE_ELEM),
         ("helper.bpf_map_delete_elem", HELPER_MAP_DELETE_ELEM),
@@ -140,9 +140,6 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
         ("helper.bpf_ringbuf_output", HELPER_RINGBUF_OUTPUT),
         ("helper.bpf_ringbuf_reserve", HELPER_RINGBUF_RESERVE),
         ("helper.bpf_ringbuf_submit", HELPER_RINGBUF_SUBMIT),
-        // The sampler (flow export) is in fast-path's ELF, XDP and tc
-        // alike: the ELF does not load without it.
-        ("helper.bpf_perf_event_output", HELPER_PERF_EVENT_OUTPUT),
     ];
 
     let mut caps = vec![
@@ -156,7 +153,6 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
         probe_map_lpm_trie(),
         probe_map_devmap_hash(),
         probe_map_ringbuf(),
-        probe_map_perf_event_array(),
     ];
 
     caps.extend(
@@ -164,10 +160,12 @@ pub fn run_probes(bpffs_root: &Path) -> FeasibilityReport {
             .iter()
             .map(|(name, id)| probe_helper(name, *id, true)),
     );
+    // The sampler (flow export) is in fast-path's ELF, XDP and tc alike:
+    // the ELF does not load without its ring in both.
     caps.push(probe_helper_in(
-        "helper.bpf_perf_event_output.sched_cls",
+        "helper.bpf_ringbuf_reserve.sched_cls",
         BPF_PROG_TYPE_SCHED_CLS,
-        HELPER_PERF_EVENT_OUTPUT,
+        HELPER_RINGBUF_RESERVE,
         true,
     ));
 
@@ -519,19 +517,6 @@ fn probe_map_devmap_hash() -> Capability {
     map_probe(
         "map.devmap_hash",
         BPF_MAP_TYPE_DEVMAP_HASH,
-        4,
-        4,
-        1,
-        0,
-        true,
-    )
-}
-
-fn probe_map_perf_event_array() -> Capability {
-    // The sampler's SAMPLES map (flow export), in fast-path's ELF.
-    map_probe(
-        "map.perf_event_array",
-        BPF_MAP_TYPE_PERF_EVENT_ARRAY,
         4,
         4,
         1,

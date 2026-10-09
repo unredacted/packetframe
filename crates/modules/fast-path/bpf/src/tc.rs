@@ -135,13 +135,13 @@ fn sample_tc(ctx: &TcContext, stats: StatsPtr, disposition: u32, egress_ifindex:
         0
     };
     sample::emit(
-        ctx,
         stats,
         len,
         ifindex,
         egress_ifindex,
         sample::PATH_TC | disposition << 8 | u32::from(tagged) << 16,
         vlan,
+        |dst, want| sample::copy_skb(skb, dst, want),
     );
 }
 

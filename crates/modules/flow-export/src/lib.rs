@@ -3,7 +3,7 @@
 //!
 //! The samplers live where the packets are: fast-path's XDP and tc
 //! programs select packets (`bpf/src/sample.rs` there) and hand them over
-//! through per-CPU perf rings. This module turns them into datagrams for
+//! through a BPF ring buffer. This module turns them into datagrams for
 //! every configured collector, counts each port's pool from the kernel's
 //! own packet counter, and judges per port whether the samples still
 //! represent its traffic ([`coverage`]).

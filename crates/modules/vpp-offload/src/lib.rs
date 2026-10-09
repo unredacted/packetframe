@@ -1124,9 +1124,10 @@ pub struct VppOffloadModule {
     /// exists; see [`Self::set_completeness`].
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
     /// Each VPP process's attached ports, for flow export to read VPP's
-    /// samples by. One for the module's life, so a holder sees every
-    /// attach: see [`Self::sampler_ports`].
-    sampler_ports: std::sync::Arc<packetframe_common::sampler_ports::VppSamplerPorts>,
+    /// samples by: `Some` once flow export took VPP's sampler. One for
+    /// the module's life, so a holder sees every attach: see
+    /// [`Self::sampler_for_flow_export`].
+    sampler_ports: Option<std::sync::Arc<packetframe_common::sampler_ports::VppSamplerPorts>>,
     /// The feed's session-liveness handle, when the loader wired one;
     /// see [`Self::set_feed_session`].
     feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
@@ -1202,7 +1203,7 @@ impl VppOffloadModule {
         Self {
             allowlist: std::sync::Arc::new(SharedAllowlist::default()),
             completeness: None,
-            sampler_ports: Default::default(),
+            sampler_ports: None,
             feed_session: None,
             cfg: VppOffloadConfig::default(),
             state_dir: std::path::PathBuf::new(),
@@ -1260,12 +1261,19 @@ impl VppOffloadModule {
         self.local_routes = routes;
     }
 
-    /// Where this module publishes each VPP process's attached ports, for
-    /// flow export to interpret VPP's samples through.
-    pub fn sampler_ports(
-        &self,
+    /// Hand VPP's sampler to flow export, which the loader does when the
+    /// config has a flow-export section. The handle is where this module
+    /// publishes each VPP process's attached ports, for flow export to
+    /// interpret VPP's samples through; and a `desired.conf` a daemon that
+    /// died left behind is flow export's to take over, so attach leaves
+    /// it. Without flow export, attach removes it and the plugin stays
+    /// off (`sampler.rs`).
+    pub fn sampler_for_flow_export(
+        &mut self,
     ) -> std::sync::Arc<packetframe_common::sampler_ports::VppSamplerPorts> {
-        self.sampler_ports.clone()
+        self.sampler_ports
+            .get_or_insert_with(Default::default)
+            .clone()
     }
 
     /// Hand the module the route mirror's completeness handle.
@@ -1626,7 +1634,7 @@ impl Module for VppOffloadModule {
                 &allowlist,
                 self.completeness.clone(),
                 self.feed_session.clone(),
-                Some(self.sampler_ports.clone()),
+                self.sampler_ports.clone(),
                 &budget,
                 &self.local_routes,
             )

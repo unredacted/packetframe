@@ -4,8 +4,8 @@
 //! All non-required: a failure to start degrades this module and never
 //! stops forwarding, so a row here reads "this part of flow export will
 //! not work, and why", never "the host is infeasible". The sampler's
-//! kernel needs (`bpf_perf_event_output` in XDP and tc, the perf event
-//! array) are fast-path's own rows: its ELF carries the sampler.
+//! kernel needs (the BPF ring buffer, reserved in from XDP and tc) are
+//! fast-path's own rows: its ELF carries the sampler.
 
 use std::net::IpAddr;
 

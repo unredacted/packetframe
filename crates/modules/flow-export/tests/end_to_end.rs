@@ -399,13 +399,13 @@ fn stat(s: &Scratch, name: &str) -> u64 {
     packetframe_fast_path::stats_from_pin(&s.root).unwrap()[at]
 }
 
-/// A reload is applied by the time `reconfigure` returns, and one that
-/// needs larger rings swaps them without losing what the old ones held:
-/// every sample the program selected reaches the collector, at the rate
-/// it was drawn at.
+/// A reload is applied by the time `reconfigure` returns, and loses
+/// nothing: every sample the program selected reaches the collector, at
+/// the rate it was drawn at, those still in the ring when it lands
+/// included.
 #[test]
 #[ignore = "needs root: CAP_BPF and bpffs"]
-fn a_reload_to_a_denser_rate_swaps_the_rings_and_loses_nothing() {
+fn a_reload_to_a_denser_rate_loses_nothing() {
     if !FAST_PATH_BPF_AVAILABLE {
         return;
     }
@@ -445,8 +445,8 @@ fn a_reload_to_a_denser_rate_swaps_the_rings_and_loses_nothing() {
     .unwrap();
     m.attach(&mc).expect("attach");
 
-    // ~50 samples at 1:1000, most still in the rings when the reload
-    // replaces them.
+    // ~50 samples at 1:1000, most still in the ring when the reload
+    // lands.
     let pkt = frame();
     test_run(&bpf, &pkt, 50_000);
     let dense = conf(100);
@@ -475,7 +475,7 @@ fn a_reload_to_a_denser_rate_swaps_the_rings_and_loses_nothing() {
             f += 8 + word(d, f + 4) as usize;
         }
     }
-    assert_eq!(stat(&s, "sample_emit_failed"), 0, "no swap in flight");
+    assert_eq!(stat(&s, "sample_emit_failed"), 0, "the ring had room");
     assert_eq!(
         by_rate.values().sum::<u64>(),
         selected,
@@ -1094,7 +1094,7 @@ fn a_renamed_interfaces_filter_is_still_taken_down() {
 }
 
 /// A start with no `kernel-sample` still clears the filters a daemon
-/// that died left recorded: they would sample into rings no one reads.
+/// that died left recorded: they would sample into a ring no one reads.
 /// The first module stands in for that daemon, still running.
 #[test]
 #[ignore = "needs root: CAP_BPF, bpffs and veth"]

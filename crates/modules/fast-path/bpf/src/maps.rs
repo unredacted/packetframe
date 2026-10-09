@@ -9,9 +9,7 @@
 use aya_ebpf::{
     bindings::bpf_fib_lookup,
     macros::map,
-    maps::{
-        Array, DevMapHash, HashMap, LpmTrie, PerCpuArray, PerfEventArray, ProgramArray, RingBuf,
-    },
+    maps::{Array, DevMapHash, HashMap, LpmTrie, PerCpuArray, ProgramArray, RingBuf},
 };
 
 /// Runtime flags poked by userspace via the `cfg` map. `version` is a
@@ -274,11 +272,10 @@ pub enum StatIdx {
     /// selects. Rate 0 is sampling off. Hidden like `SampleCountdown`.
     SampleArmed = 52,
     /// Selected packets that reached an emission point: one per sample,
-    /// whatever became of its perf output.
+    /// whatever became of it.
     SampleSelected = 53,
-    /// Of `sample_selected`, the ones `bpf_perf_event_output` refused (no
-    /// reader on that CPU, or its buffer full): samples the reader never
-    /// saw.
+    /// Of `sample_selected`, the ones `SAMPLES` had no room for (the
+    /// reader is behind): samples the reader never saw.
     SampleEmitFailed = 54,
 }
 
@@ -961,9 +958,9 @@ pub struct SampleCfg {
     pub _pad: u32,
 }
 
-/// What each `SAMPLES` event begins with; the kernel appends
-/// `captured` packet bytes after it. 40 bytes in u32 words or wider, so
-/// every store is one register wide and none is zero-merge bait.
+/// What each `SAMPLES` record begins with; `captured` packet bytes
+/// follow it. 40 bytes in u32 words or wider, so every store is one
+/// register wide and none is zero-merge bait.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct SampleRecord {
@@ -992,14 +989,33 @@ const _: () = assert!(core::mem::size_of::<SampleRecord>() == 40);
 #[map]
 pub static SAMPLE_CFG: Array<SampleCfg> = Array::with_max_entries(1, 0);
 
-/// One perf ring per CPU, opened by flow-export. A CPU with no reader
-/// refuses output (`SampleEmitFailed`).
-#[map]
-pub static SAMPLES: PerfEventArray<SampleRecord> = PerfEventArray::new(0);
+/// Packet bytes a sample can carry: `header-bytes`' ceiling.
+pub const SAMPLE_BYTES_MAX: usize = 256;
 
-/// Per-CPU staging for the record: a stack copy would be memset bait.
+/// One `SAMPLES` record, reserved in the ring and filled in place: the
+/// record, then `rec.captured` packet bytes. A reservation is not zeroed,
+/// so the bytes past `captured` are what the ring last held there (an
+/// earlier sample's): readers take `captured` and no more.
+#[repr(C)]
+pub struct SampleEvent {
+    pub rec: SampleRecord,
+    pub bytes: [u8; SAMPLE_BYTES_MAX],
+}
+
+const _: () = assert!(core::mem::size_of::<SampleEvent>() == 296);
+
+/// 16 MiB, a power-of-two multiple of every page size (4K, 16K, 64K):
+/// about 55,000 samples, which at the 1:100 floor is 400 ms of ten
+/// million packets a second, against a reader that drains every 100 ms.
+const SAMPLE_RING_BYTES: u32 = 16 << 20;
+
+/// The samples, for flow-export: one ring every CPU reserves in. A BPF
+/// ring buffer rather than a perf event array, because on a kernel built
+/// without CONFIG_BPF_EVENTS (UniFi's) `bpf_perf_event_output` fails every
+/// call, while the ring buffer is BPF core. A full ring refuses the
+/// reservation, counted `SampleEmitFailed`.
 #[map]
-pub static SAMPLE_SCRATCH: PerCpuArray<SampleRecord> = PerCpuArray::with_max_entries(1, 0);
+pub static SAMPLES: RingBuf = RingBuf::with_byte_size(SAMPLE_RING_BYTES, 0);
 
 // --- Stat increment helpers ----------------------------------------------
 

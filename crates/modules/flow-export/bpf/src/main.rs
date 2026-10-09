@@ -6,24 +6,23 @@
 //! Selection and the record are fast-path's sampler's (its
 //! `bpf/src/sample.rs`), so flow export reads both the same way: a
 //! per-CPU countdown drawn uniformly from [1, 2N−1] with the generation
-//! and rate it was drawn at, a 40-byte record with the frame's leading
-//! bytes appended by the kernel, and an offloaded VLAN tag carried in the
-//! record. Path 3 marks the kernel sampler's.
+//! and rate it was drawn at, a 40-byte record followed by the frame's
+//! leading bytes in one ring-buffer reservation, and an offloaded VLAN
+//! tag carried in the record. Path 3 marks the kernel sampler's.
 //!
 //! Verifier discipline follows the fast-path crate: everything
-//! `#[inline(always)]`, scalars in and out, field-by-field stores into a
-//! per-CPU scratch record (no memset bait). One program, no tail call.
+//! `#[inline(always)]`, scalars in and out, field-by-field stores into the
+//! reservation (no memset bait). One program, no tail call.
 
 #![no_std]
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{BPF_F_CURRENT_CPU, TC_ACT_UNSPEC},
-    helpers::{bpf_get_prandom_u32, bpf_ktime_get_ns, bpf_perf_event_output},
+    bindings::{BPF_RB_NO_WAKEUP, TC_ACT_UNSPEC},
+    helpers::{bpf_get_prandom_u32, bpf_ktime_get_ns, bpf_skb_load_bytes},
     macros::{classifier, map},
-    maps::{Array, PerCpuArray, PerfEventArray},
+    maps::{Array, PerCpuArray, RingBuf},
     programs::TcContext,
-    EbpfContext,
 };
 
 /// fast-path's `SampleCfg`: written by flow-export alone.
@@ -56,6 +55,18 @@ pub struct SampleRecord {
 
 const _: () = assert!(core::mem::size_of::<SampleRecord>() == 40);
 
+/// fast-path's `SAMPLE_BYTES_MAX`.
+const SAMPLE_BYTES_MAX: usize = 256;
+
+/// fast-path's `SampleEvent`: the record, then `captured` packet bytes.
+#[repr(C)]
+pub struct SampleEvent {
+    pub rec: SampleRecord,
+    pub bytes: [u8; SAMPLE_BYTES_MAX],
+}
+
+const _: () = assert!(core::mem::size_of::<SampleEvent>() == 296);
+
 /// Per-CPU state: the countdown, what it was armed with, and the two
 /// counters flow export reads.
 const COUNTDOWN: usize = 0;
@@ -75,11 +86,11 @@ pub static KSAMPLE_CFG: Array<SampleCfg> = Array::with_max_entries(1, 0);
 #[map]
 pub static KSAMPLE_STATE: PerCpuArray<[u64; STATE_WORDS]> = PerCpuArray::with_max_entries(1, 0);
 
+/// The samples, as fast-path's `SAMPLES`: 4 MiB, a quarter of its ring,
+/// for interfaces the forwarding paths do not carry. A full ring refuses
+/// the reservation, counted `EMIT_FAILED`.
 #[map]
-pub static KSAMPLES: PerfEventArray<SampleRecord> = PerfEventArray::new(0);
-
-#[map]
-pub static KSAMPLE_SCRATCH: PerCpuArray<SampleRecord> = PerCpuArray::with_max_entries(1, 0);
+pub static KSAMPLES: RingBuf = RingBuf::with_byte_size(4 << 20, 0);
 
 type State = *mut [u64; STATE_WORDS];
 
@@ -140,7 +151,7 @@ fn emit(ctx: &TcContext, state: State) {
     let armed = unsafe { (*state)[ARMED] };
     let header_bytes = rearm(state);
     unsafe { (*state)[SELECTED] += 1 };
-    let Some(rec) = KSAMPLE_SCRATCH.get_ptr_mut(0) else {
+    let Some(mut entry) = KSAMPLES.reserve::<SampleEvent>(0) else {
         unsafe { (*state)[EMIT_FAILED] += 1 };
         return;
     };
@@ -160,10 +171,33 @@ fn emit(ctx: &TcContext, state: State) {
     } else {
         0
     };
-    let captured = if len < header_bytes { len } else { header_bytes };
-    // SAFETY: this CPU's scratch slot. Field by field: no aggregate store
-    // for LLVM to turn into memset.
+    let mut want = if len < header_bytes {
+        len
+    } else {
+        header_bytes
+    };
+    if want > SAMPLE_BYTES_MAX as u32 {
+        want = SAMPLE_BYTES_MAX as u32;
+    }
+    let ev = entry.as_mut_ptr();
+    // SAFETY: `ev` is the reservation, valid until submit; raw field
+    // pointers into memory not yet written, field by field (no aggregate
+    // store for LLVM to turn into memset).
     unsafe {
+        let captured = if want == 0 {
+            0
+        } else {
+            // In [1, 256] by construction, as the verifier needs of the
+            // size: fast-path's `sample::helper_len`.
+            let n = (opaque(want - 1) & (SAMPLE_BYTES_MAX as u32 - 1)) + 1;
+            let dst = core::ptr::addr_of_mut!((*ev).bytes) as *mut _;
+            if bpf_skb_load_bytes(skb as *const _, 0, dst, n) == 0 {
+                n
+            } else {
+                0
+            }
+        };
+        let rec = core::ptr::addr_of_mut!((*ev).rec);
         (*rec).ktime_ns = bpf_ktime_get_ns();
         (*rec).generation = (armed >> 32) as u32;
         (*rec).rate = armed as u32;
@@ -174,20 +208,16 @@ fn emit(ctx: &TcContext, state: State) {
         (*rec).meta = PATH_KERNEL | u32::from(tagged) << 16;
         (*rec).vlan = vlan;
     }
-    // The upper 32 bits of the flags (BPF_F_CTXLEN_MASK) append that many
-    // packet bytes; the raw helper, for its return code.
-    let rc = unsafe {
-        bpf_perf_event_output(
-            ctx.as_ptr(),
-            &KSAMPLES as *const _ as *mut core::ffi::c_void,
-            (u64::from(captured) << 32) | BPF_F_CURRENT_CPU as u64,
-            rec as *mut core::ffi::c_void,
-            core::mem::size_of::<SampleRecord>() as u64,
-        )
-    };
-    if rc != 0 {
-        unsafe { (*state)[EMIT_FAILED] += 1 };
-    }
+    entry.submit(BPF_RB_NO_WAKEUP as u64);
+}
+
+/// `v`, which LLVM can no longer relate to how it was computed: fast-path's
+/// `sample::opaque`.
+#[inline(always)]
+fn opaque<T: Copy>(v: T) -> T {
+    let slot = v;
+    // SAFETY: a local, read once.
+    unsafe { core::ptr::read_volatile(&slot) }
 }
 
 #[cfg(not(test))]

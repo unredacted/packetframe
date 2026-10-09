@@ -793,18 +793,16 @@ impl Harness {
         arr.set(0, cfg, 0).expect("SAMPLE_CFG set");
     }
 
-    /// Open a perf ring on every online CPU, as flow-export does. Until
-    /// this runs, every emission fails (`SampleEmitFailed`).
+    /// Read `SAMPLES` as flow-export does. Until it drains, the ring
+    /// fills, and a sample it has no room for is `SampleEmitFailed`.
     pub fn sample_tap(&mut self) -> SampleTap {
-        let map = self.bpf.map("SAMPLES").expect("SAMPLES map");
-        let aya::maps::Map::PerfEventArray(data) = map else {
-            panic!("SAMPLES is not a perf event array");
+        let map = self.bpf.take_map("SAMPLES").expect("SAMPLES map");
+        let aya::maps::Map::RingBuf(data) = map else {
+            panic!("SAMPLES is not a ring buffer");
         };
-        let cpus = aya::util::online_cpus().expect("online cpus");
-        let rings =
-            packetframe_fast_path::sample_rings::SampleRings::open(data.fd().as_fd(), &cpus, 16)
-                .expect("open sample rings");
-        SampleTap { rings }
+        let ring = packetframe_fast_path::sample_ring::SampleRing::new(data)
+            .expect("open the sample ring");
+        SampleTap { ring }
     }
 
     /// Empty slot 0 of `MUTATION_PROGS` or `TC_MUTATION_PROGS`, so the
@@ -817,22 +815,14 @@ impl Harness {
 }
 
 pub struct SampleTap {
-    rings: packetframe_fast_path::sample_rings::SampleRings,
+    ring: packetframe_fast_path::sample_ring::SampleRing,
 }
 
 impl SampleTap {
-    /// Every event emitted since the last drain, and the count the rings
-    /// lost.
-    pub fn drain(&mut self) -> (Vec<Vec<u8>>, u64) {
-        let mut events = Vec::new();
-        let lost = self.rings.drain(|_, e| events.push(e.to_vec()));
-        (events, lost)
-    }
-
-    /// Drain, asserting nothing was lost.
+    /// Every sample submitted since the last drain.
     pub fn events(&mut self) -> Vec<Vec<u8>> {
-        let (events, lost) = self.drain();
-        assert_eq!(lost, 0, "perf ring lost events");
+        let mut events = Vec::new();
+        self.ring.drain(&mut |e| events.push(e.to_vec()));
         events
     }
 }
