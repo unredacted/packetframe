@@ -310,6 +310,7 @@ impl Running {
                 tracing::error!(error = %e, "flow-export: stopping the samplers after a panic failed");
             }
         };
+        let record_dir = state_dir.to_owned();
         let thread = std::thread::Builder::new()
             .name(THREAD_NAME.into())
             .spawn(move || {
@@ -320,7 +321,7 @@ impl Running {
                     // thread.
                     Some((ports, dir)) => {
                         let side = VppSide::new(
-                            LiveVppDir::new(&dir),
+                            LiveVppDir::new(&dir, &record_dir),
                             ports,
                             Instant::now(),
                             vpp_live::now_realtime_ns(),

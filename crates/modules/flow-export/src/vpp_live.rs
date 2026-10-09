@@ -1,10 +1,12 @@
 //! VPP's sampler directory for real: `packetframe_sampler_shm`'s locks,
-//! follower and files, and `/proc` for which process maps an epoch.
+//! follower and files, `/proc` for which process maps an epoch, and the
+//! generation record in `state-dir`.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use packetframe_common::sampler_ports::VppInstance;
+use packetframe_common::statefile::{read_owned_no_follow, write_atomic as write_state};
 use packetframe_sampler_shm::coverage::NoStatus;
 use packetframe_sampler_shm::current::epoch_file_name;
 use packetframe_sampler_shm::desired::Desired;
@@ -13,19 +15,35 @@ use packetframe_sampler_shm::fs::{
     check_dir, clear_desired, write_atomic, Lock, CONSUMER_LOCK, DESIRED, DESIRED_LOCK,
 };
 use packetframe_sampler_shm::ring::{self, Drained, Sample};
+use serde::{Deserialize, Serialize};
 
 use crate::vpp::{EpochSwitch, Look, VppDir};
 
+/// In `state-dir`: one VPP process's newest generation, so the file
+/// names at most one and needs no cleanup.
+const GENERATION_RECORD: &str = "flow-export-vpp-generation.json";
+const MAX_RECORD_BYTES: u64 = 4096;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GenerationRecord {
+    pid: i32,
+    start_ticks: u64,
+    boot_id: Option<String>,
+    generation: u64,
+}
+
 pub struct LiveVppDir {
     dir: PathBuf,
+    record: PathBuf,
     lock: Option<Lock>,
     follower: Option<Follower>,
 }
 
 impl LiveVppDir {
-    pub fn new(dir: &Path) -> Self {
+    pub fn new(dir: &Path, state_dir: &Path) -> Self {
         Self {
             dir: dir.to_owned(),
+            record: state_dir.join(GENERATION_RECORD),
             lock: None,
             follower: None,
         }
@@ -140,6 +158,32 @@ impl VppDir for LiveVppDir {
         start_ticks(instance.pid) == Some(instance.start_ticks)
             && maps_file(instance.pid, &epoch_file_name(epoch))
     }
+
+    fn recorded(&mut self, instance: &VppInstance) -> Result<Option<u64>, String> {
+        let at = |e: &dyn std::fmt::Display| format!("{}: {e}", self.record.display());
+        let Some(raw) = read_owned_no_follow(&self.record, MAX_RECORD_BYTES).map_err(|e| at(&e))?
+        else {
+            return Ok(None);
+        };
+        let r: GenerationRecord = serde_json::from_slice(&raw).map_err(|e| at(&e))?;
+        let of = VppInstance {
+            pid: r.pid,
+            start_ticks: r.start_ticks,
+            boot_id: r.boot_id,
+        };
+        Ok((of == *instance).then_some(r.generation))
+    }
+
+    fn record(&mut self, instance: &VppInstance, generation: u64) -> Result<(), String> {
+        let r = GenerationRecord {
+            pid: instance.pid,
+            start_ticks: instance.start_ticks,
+            boot_id: instance.boot_id.clone(),
+            generation,
+        };
+        let json = serde_json::to_vec(&r).map_err(|e| e.to_string())?;
+        write_state(&self.record, &json).map_err(|e| format!("{}: {e}", self.record.display()))
+    }
 }
 
 /// Remove a `desired.conf` from a directory the plugin could use, under
@@ -221,7 +265,7 @@ mod tests {
         let epoch = random_epoch();
         let l = Layout::new(1, 8, 64).unwrap();
         let _m = create_epoch(&d, &l, epoch, 0, 0, "test").unwrap();
-        let mut dir = LiveVppDir::new(&d);
+        let mut dir = LiveVppDir::new(&d, &d);
         let us = VppInstance {
             pid: me,
             start_ticks: ticks,
@@ -249,7 +293,7 @@ mod tests {
         let l = Layout::new(2, 8, 64).unwrap();
         let m = create_epoch(&d, &l, 9, 1234, 0, "test").unwrap();
         publish_current(&d, 9, &l).unwrap();
-        let mut dir = LiveVppDir::new(&d);
+        let mut dir = LiveVppDir::new(&d, &d);
         dir.follower = Some(Follower::consumer(&d).unwrap());
         let sw = dir.refresh().unwrap();
         assert_eq!((sw.from, sw.to), (None, 9));
@@ -288,6 +332,33 @@ mod tests {
         dir.remove().unwrap();
         dir.remove().unwrap();
         assert_eq!(dir.look().desired_generation, None);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_generation_record_outlives_a_run_for_its_process_only() {
+        let d = std::env::temp_dir().join(format!("pf-flow-vpp-{}", random_epoch()));
+        let state = d.join("state");
+        let vpp = VppInstance {
+            pid: 10,
+            start_ticks: 100,
+            boot_id: Some("b".into()),
+        };
+        let mut dir = LiveVppDir::new(&d, &state);
+        assert_eq!(dir.recorded(&vpp), Ok(None), "no state-dir yet");
+        dir.record(&vpp, 3).unwrap();
+        let mut next_run = LiveVppDir::new(&d, &state);
+        assert_eq!(next_run.recorded(&vpp), Ok(Some(3)));
+        let restarted = VppInstance {
+            start_ticks: 101,
+            ..vpp.clone()
+        };
+        assert_eq!(next_run.recorded(&restarted), Ok(None));
+        next_run.record(&restarted, 1).unwrap();
+        assert_eq!(next_run.recorded(&vpp), Ok(None), "one process's at a time");
+
+        std::fs::write(state.join(GENERATION_RECORD), "x").unwrap();
+        assert!(next_run.recorded(&vpp).is_err());
         std::fs::remove_dir_all(&d).unwrap();
     }
 

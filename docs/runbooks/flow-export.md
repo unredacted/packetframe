@@ -244,6 +244,17 @@ fast-path accepts, never one it refused.
   the VPP process that wrote it. After a VPP restart, samples before
   the new port list is published are counted as unmapped, and
   degrade VPP coverage.
+- **Generations.** Each `desired.conf` generation is past every one
+  flow-export wrote for the running VPP, so `packetframe sampler status`
+  shows it rising across a restart that keeps VPP (`systemctl stop`,
+  `detach --keep-vpp`, `systemctl start`).
+  - The stop removes `desired.conf`, and the plugin then shows
+    generation 0. So the newest is kept in
+    `<state-dir>/flow-export-vpp-generation.json`, read only if this
+    daemon's own account could have written it.
+  - It counts only for the VPP process it names.
+  - If it can't be read or written, the log says so and sampling goes
+    on; the next restart may then repeat a generation.
 - **Installing the plugin.** The arm64 `.deb` installs it at
   `/usr/lib/packetframe/vpp_plugins/pf_sampler_plugin.so`, and the arm64
   gnu tarball carries it under `vpp_plugins/`. `packetframe feasibility`
