@@ -1021,3 +1021,107 @@ fn a_device_on_a_sampled_port_is_refused() {
     assert!(e.contains(&format!("sits on {}", veth.a)), "{e}");
     assert!(!s.state.join("flow-export-tc-links.json").exists());
 }
+
+/// Two `kernel-sample` interfaces, one stacked on the other: the upper
+/// one's packets crossed the lower one first. Refused, nothing attached.
+#[test]
+#[ignore = "needs root: CAP_BPF, bpffs and veth"]
+fn stacked_kernel_sample_interfaces_are_refused() {
+    if !FAST_PATH_BPF_AVAILABLE || !packetframe_flow_export::KERNEL_SAMPLE_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("kstack");
+    let _bpf = fast_path(&s);
+    register_lo(&s);
+    let veth = Veth::new("s");
+    let vlan = format!("{}.5", veth.a);
+    assert!(ip(&[
+        "link", "add", "link", &veth.a, "name", &vlan, "type", "vlan", "id", "5"
+    ]));
+    let e = kernel_module(
+        &s,
+        &format!(
+            "  kernel-sample {}\n  kernel-sample {vlan}\n  collector t sflow 127.0.0.1:6343\n",
+            veth.a
+        ),
+    )
+    .err()
+    .expect("refused");
+    assert!(e.contains(&format!("sits on {}", veth.a)), "{e}");
+    assert!(!s.state.join("flow-export-tc-links.json").exists());
+}
+
+fn ingress_filters(iface: &str) -> String {
+    let out = std::process::Command::new("tc")
+        .args(["filter", "show", "dev", iface, "ingress"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// An interface renamed while sampled keeps its filter under the new
+/// name: detach finds it by ifindex and takes it down, rather than
+/// dropping the record of a filter still running.
+#[test]
+#[ignore = "needs root: CAP_BPF, bpffs and veth"]
+fn a_renamed_interfaces_filter_is_still_taken_down() {
+    if !FAST_PATH_BPF_AVAILABLE || !packetframe_flow_export::KERNEL_SAMPLE_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("krename");
+    let _bpf = fast_path(&s);
+    register_lo(&s);
+    let veth = Veth::new("r");
+    let mut m = kernel_module(
+        &s,
+        &format!(
+            "  kernel-sample {}\n  collector t sflow 127.0.0.1:6343\n",
+            veth.b
+        ),
+    )
+    .expect("attach");
+    let renamed = "pfkrz";
+    assert!(ip(&["link", "set", &veth.b, "down"]));
+    assert!(ip(&["link", "set", &veth.b, "name", renamed]));
+    assert!(ingress_filters(renamed).contains("kernel_sample"));
+    m.detach().unwrap();
+    assert!(
+        !ingress_filters(renamed).contains("kernel_sample"),
+        "{}",
+        ingress_filters(renamed)
+    );
+    assert!(!s.state.join("flow-export-tc-links.json").exists());
+}
+
+/// A start with no `kernel-sample` still clears the filters a daemon
+/// that died left recorded: they would sample into rings no one reads.
+/// The first module stands in for that daemon, still running.
+#[test]
+#[ignore = "needs root: CAP_BPF, bpffs and veth"]
+fn a_start_without_kernel_samplers_clears_a_dead_daemons() {
+    if !FAST_PATH_BPF_AVAILABLE || !packetframe_flow_export::KERNEL_SAMPLE_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("kleft");
+    let _bpf = fast_path(&s);
+    register_lo(&s);
+    let veth = Veth::new("l");
+    let mut dead = kernel_module(
+        &s,
+        &format!(
+            "  kernel-sample {}\n  collector t sflow 127.0.0.1:6343\n",
+            veth.b
+        ),
+    )
+    .expect("attach");
+    assert!(ingress_filters(&veth.b).contains("kernel_sample"));
+    let mut next = kernel_module(&s, "  collector t sflow 127.0.0.1:6343\n").expect("attach");
+    assert!(
+        !ingress_filters(&veth.b).contains("kernel_sample"),
+        "{}",
+        ingress_filters(&veth.b)
+    );
+    assert!(!s.state.join("flow-export-tc-links.json").exists());
+    next.detach().unwrap();
+    dead.detach().unwrap();
+}

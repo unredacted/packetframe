@@ -1524,6 +1524,44 @@ fn the_winning_tiers_origin_is_published() {
     assert_eq!(at(), Some(64501), "the tier left");
     h.run(async { h.handle.apply_route_event(del(low)).await.unwrap() });
     assert_eq!(at(), None, "withdrawn");
+
+    // A more-specific route with no known origin (an aggregate's AS set)
+    // under a covering one with an origin: its traffic is not the
+    // cover's AS.
+    let cover = IpPrefix::V4 {
+        addr: [198, 51, 100, 0],
+        prefix_len: 22,
+    };
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: high,
+                prefix: cover,
+                nexthops: vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))],
+                path_id: Some(2),
+                local_pref: Some(100),
+                origin_asn: Some(64520),
+            })
+            .await
+            .unwrap();
+        h.handle
+            .apply_route_event(RouteEvent::Add {
+                peer_id: low,
+                prefix,
+                nexthops: vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))],
+                path_id: Some(1),
+                local_pref: Some(100),
+                origin_asn: None,
+            })
+            .await
+            .unwrap();
+    });
+    assert_eq!(at(), None, "the /24's origin is unknown");
+    assert_eq!(
+        table.lookup("198.51.101.7".parse().unwrap()),
+        Some(64520),
+        "outside the /24, the /22's"
+    );
 }
 
 /// Three advertisements: two at the top tier (LP 150) and one at a

@@ -35,7 +35,7 @@ use crate::sflow_out::{wire_frame, Exporter, Ready, FCS};
 use crate::vpp::{NoVpp, Taken, VppDir, VppHealth, VppSide};
 use packetframe_common::config::CollectorFormat;
 use packetframe_common::fib::asn::AsnTable;
-use packetframe_common::fib::{IpPrefix, SharedPrefixes};
+use packetframe_common::fib::IpPrefix;
 
 pub const TICK: Duration = Duration::from_millis(100);
 /// How often the port list and the pools are re-read.
@@ -106,6 +106,43 @@ pub trait SampleSource {
     /// The clock the events' `ktime_ns` is on (`bpf_ktime_get_ns`:
     /// CLOCK_MONOTONIC), read now.
     fn clock_ns(&self) -> u64;
+}
+
+/// Configure two samplers as one. A reload is both or neither: the one
+/// that took it is put back to its `before` when the other refuses, so
+/// the worker, keeping its old configuration, is not left with one path
+/// sampling at a rate and generation it never applied. Turning off (rate
+/// 0) is tried on both, whatever became of the other.
+pub fn configure_together(
+    first: &mut dyn SampleSource,
+    first_before: Option<SampleCfg>,
+    second: Option<(&mut dyn SampleSource, Option<SampleCfg>)>,
+    cfg: SampleCfg,
+) -> Result<(), String> {
+    fn put_back(s: &mut dyn SampleSource, before: Option<SampleCfg>, e: String) -> String {
+        match before.map(|c| s.configure(c)) {
+            Some(Ok(())) => e,
+            Some(Err(again)) => {
+                format!("{e}; and the sampler that took it could not be put back: {again}")
+            }
+            None => format!(
+                "{e}; and the sampler that took it keeps it (what it ran before is unknown)"
+            ),
+        }
+    }
+    let a = first.configure(cfg);
+    let Some((second, second_before)) = second else {
+        return a;
+    };
+    let b = second.configure(cfg);
+    let off = cfg.rate() == 0;
+    match (a, b) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(e)) if !off => Err(put_back(first, first_before, e)),
+        (Err(e), Ok(())) if !off => Err(put_back(second, second_before, e)),
+        (Err(x), Err(y)) => Err(format!("{x}; {y}")),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+    }
 }
 
 /// What replacing the rings left: the events the old ones held, and the
@@ -358,9 +395,6 @@ pub struct Worker<S, P, T, V = NoVpp> {
     flows: Option<Flows>,
     /// Origin ASes, when fast-path's route source publishes them.
     asn: Option<Arc<AsnTable>>,
-    /// fast-path's allowlist, the local prefixes when the section names
-    /// none.
-    local_default: Option<Arc<SharedPrefixes>>,
     /// The wall clock at `shared.epoch`, in Unix milliseconds: the times
     /// flow records carry.
     wall_epoch_ms: u64,
@@ -419,7 +453,6 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
         Ok(Self {
             flows,
             asn: None,
-            local_default: None,
             wall_epoch_ms,
             exporter: Exporter::new(cfg.source),
             cfg,
@@ -468,7 +501,6 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
             leftover: self.leftover,
             flows: self.flows,
             asn: self.asn,
-            local_default: self.local_default,
             wall_epoch_ms: self.wall_epoch_ms,
             p: self.p,
         }
@@ -476,15 +508,9 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
 }
 
 impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
-    /// Fill flow records' AS fields from `asn`, and take fast-path's
-    /// allowlist as the local prefixes when the section names none.
-    pub fn with_privacy(
-        mut self,
-        asn: Option<Arc<AsnTable>>,
-        local_default: Option<Arc<SharedPrefixes>>,
-    ) -> Self {
+    /// Fill flow records' AS fields from `asn`.
+    pub fn with_asn(mut self, asn: Option<Arc<AsnTable>>) -> Self {
         self.asn = asn;
-        self.local_default = local_default;
         self
     }
 
@@ -588,13 +614,11 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
         self.send_flows(now, at, RECORDS_PER_TICK, None);
     }
 
-    /// The local prefixes: the section's, else fast-path's allowlist.
+    /// The local prefixes: the section's, else fast-path's allowlist as
+    /// this configuration took it.
     fn local(&self) -> Vec<IpPrefix> {
         if self.cfg.local.is_empty() {
-            self.local_default
-                .as_ref()
-                .map(|h| h.get())
-                .unwrap_or_default()
+            self.cfg.local_default.clone()
         } else {
             self.cfg.local.clone()
         }
@@ -1307,6 +1331,7 @@ mod tests {
             cache: flows::Limits::default(),
             local: Vec::new(),
             kernel: Vec::new(),
+            local_default: Vec::new(),
         }
     }
 
@@ -1545,6 +1570,66 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("did not take the reload"), "{e}");
         assert!(shared.reload.lock().unwrap().is_none());
+    }
+
+    /// Two samplers configured as one: a reload one refuses puts the
+    /// other back; turning off is tried on both regardless.
+    #[test]
+    fn two_samplers_take_a_reload_both_or_neither() {
+        let before = SampleCfg::new(1000, 128, 1);
+        let new = SampleCfg::new(100, 128, 2);
+        let (mut fast, mut kernel) = (
+            FakeSource::default(),
+            FakeSource {
+                refuse: true,
+                ..FakeSource::default()
+            },
+        );
+        let e = configure_together(
+            &mut fast,
+            Some(before),
+            Some((&mut kernel, Some(before))),
+            new,
+        )
+        .unwrap_err();
+        assert!(e.contains("EPERM"), "{e}");
+        assert_eq!(*fast.cfgs.borrow(), vec![new, before], "put back");
+
+        // The other way about.
+        let (mut fast, mut kernel) = (
+            FakeSource {
+                refuse: true,
+                ..FakeSource::default()
+            },
+            FakeSource::default(),
+        );
+        configure_together(
+            &mut fast,
+            Some(before),
+            Some((&mut kernel, Some(before))),
+            new,
+        )
+        .unwrap_err();
+        assert_eq!(*kernel.cfgs.borrow(), vec![new, before]);
+
+        // Off: the one that can take it does, and stays off.
+        let off = SampleCfg::new(0, 128, 3);
+        let mut fast = FakeSource::default();
+        configure_together(
+            &mut fast,
+            Some(before),
+            Some((&mut kernel_refusing(), Some(before))),
+            off,
+        )
+        .unwrap_err();
+        assert_eq!(*fast.cfgs.borrow(), vec![off]);
+    }
+
+    fn kernel_refusing() -> FakeSource {
+        FakeSource {
+            refuse: true,
+            ..FakeSource::default()
+        }
     }
 
     #[test]
@@ -1962,6 +2047,33 @@ mod tests {
             "VPP first this time, though fast-path still has records"
         );
         assert_eq!(domains(&mut r), vec![Domain::FastPath.id()]);
+    }
+
+    /// The privacy profiles' local prefixes move only with a reload the
+    /// worker applied: the allowlist the module took then, unless the
+    /// section names its own.
+    #[test]
+    fn the_local_prefixes_are_the_configurations() {
+        let mut r = rig(1000);
+        r.w.tick(r.t0);
+        assert!(r.w.local().is_empty());
+        let allowlist = vec![IpPrefix::V4 {
+            addr: [203, 0, 113, 0],
+            prefix_len: 24,
+        }];
+        let mut c = cfg(1000);
+        c.local_default = allowlist.clone();
+        let _ = reload(&r.shared, c.clone());
+        r.w.tick(r.t0 + TICK);
+        assert_eq!(r.w.local(), allowlist);
+        let own = vec![IpPrefix::V4 {
+            addr: [192, 0, 2, 0],
+            prefix_len: 24,
+        }];
+        c.local = own.clone();
+        let _ = reload(&r.shared, c);
+        r.w.tick(r.t0 + 2 * TICK);
+        assert_eq!(r.w.local(), own, "the section's own win");
     }
 
     #[test]

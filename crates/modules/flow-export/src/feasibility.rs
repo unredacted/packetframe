@@ -145,7 +145,7 @@ mod linux {
         }
         for iface in i.kernel {
             let name = format!("flow-export.kernel-sample.{iface}");
-            caps.push(match crate::kernel::refusal(iface, i.sampled) {
+            caps.push(match crate::kernel::refusal(iface, i.sampled, i.kernel) {
                 None if crate::KERNEL_SAMPLE_BPF_AVAILABLE => Capability::pass(
                     name,
                     format!("{iface}: the kernel sampler can attach to its ingress"),

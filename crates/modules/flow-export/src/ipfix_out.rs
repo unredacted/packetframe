@@ -202,19 +202,25 @@ impl IpfixOut {
         });
         let mut pending: BTreeMap<u16, Vec<FlowRecord>> = BTreeMap::new();
         for item in items {
-            match item {
-                Export::Record(r) => {
-                    let (template, r) = shape(self.profile, r.clone(), privacy);
-                    pending.entry(template).or_default().push(r);
-                }
-                // What was counted at the old rate goes first, then the
-                // new rate with the next records.
-                Export::Rate(rate) => {
-                    self.flush(domain, &mut pending, now, export_s, out);
-                    let d = self.domains.get_mut(&domain).expect("inserted above");
-                    d.rate = *rate;
-                    d.next_announce = None;
-                }
+            // What was counted at the old rate goes first, then the new
+            // rate with the next records. A record names the rate it was
+            // counted at, so an exporter that missed the cache's marker
+            // (one a reload added after its domain began) still announces
+            // the right one, never 0.
+            let rate = match item {
+                Export::Record(r) => r.sampling_interval,
+                Export::Rate(rate) => *rate,
+            };
+            let d = self.domains.get_mut(&domain).expect("inserted above");
+            if rate != d.rate {
+                self.flush(domain, &mut pending, now, export_s, out);
+                let d = self.domains.get_mut(&domain).expect("inserted above");
+                d.rate = rate;
+                d.next_announce = None;
+            }
+            if let Export::Record(r) = item {
+                let (template, r) = shape(self.profile, r.clone(), privacy);
+                pending.entry(template).or_default().push(r);
             }
         }
         self.flush(domain, &mut pending, now, export_s, out);
@@ -411,6 +417,37 @@ mod tests {
         assert_eq!(ids, vec![TEMPLATE_V6], "announced once");
         assert_eq!(word32(&out[1], 8), 2, "the selector and the v4 record");
         assert_eq!((x.records, x.announcements), (2, 1));
+    }
+
+    /// An exporter a reload added after its domain began never saw the
+    /// cache's rate marker (another profile's exporter took it): it
+    /// announces the rate its records were counted at, not 0.
+    #[test]
+    fn an_exporter_added_later_announces_its_records_rate() {
+        let mut cache = FlowCache::new(Limits::default());
+        ingest(
+            &mut cache,
+            Domain::FastPath,
+            &[sampled("192.0.2.1", "198.51.100.2", 1, 1000, 1)],
+            at(0),
+        );
+        cache.expire(at(15_000), 100);
+        let records: Vec<Export> = cache
+            .take(Domain::FastPath, 10)
+            .into_iter()
+            .filter(|e| matches!(e, Export::Record(_)))
+            .collect();
+        let mut x = IpfixOut::new(CollectorProfile::Full);
+        let mut out = Vec::new();
+        x.encode(
+            Domain::FastPath,
+            &records,
+            &NONE,
+            Instant::now(),
+            0,
+            &mut out,
+        );
+        assert_eq!(sets(&out[0]).1, Some(1000));
     }
 
     #[test]

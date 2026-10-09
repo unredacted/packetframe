@@ -90,6 +90,9 @@ struct LiveSource {
     pages: usize,
     cpus: Vec<u32>,
     loss: LossCounter,
+    /// The configuration in the map, as last read or written: what a
+    /// reload the other sampler refused puts back.
+    applied: Option<SampleCfg>,
 }
 
 impl LiveSource {
@@ -103,9 +106,11 @@ impl LiveSource {
             .position(|n| *n == "sample_emit_failed")
             .ok_or("fast-path has no sample_emit_failed counter")?;
         let root = bpffs_root.to_owned();
+        let cfg = open_cfg(bpffs_root)?;
         Ok(Self {
             cfg_name: "SAMPLE_CFG",
-            cfg: open_cfg(bpffs_root)?,
+            applied: cfg.get(&0, 0).ok(),
+            cfg,
             samples,
             rings: None,
             retired: None,
@@ -130,6 +135,7 @@ impl LiveSource {
         } = k;
         Ok(Self {
             cfg_name: "KSAMPLE_CFG",
+            applied: cfg.get(&0, 0).ok(),
             cfg,
             samples,
             rings: None,
@@ -154,7 +160,9 @@ impl SampleSource for LiveSource {
     fn configure(&mut self, cfg: SampleCfg) -> Result<(), String> {
         self.cfg
             .set(0, cfg, 0)
-            .map_err(|e| format!("{}: {e}", self.cfg_name))
+            .map_err(|e| format!("{}: {e}", self.cfg_name))?;
+        self.applied = Some(cfg);
+        Ok(())
     }
 
     fn ensure_capacity(&mut self, rate: u32, left: &mut Leftover) -> Result<(), String> {
@@ -231,9 +239,12 @@ struct Sources {
 
 impl SampleSource for Sources {
     fn configure(&mut self, cfg: SampleCfg) -> Result<(), String> {
-        let fast = self.fast.configure(cfg);
-        let kernel = self.kernel.as_mut().map_or(Ok(()), |k| k.configure(cfg));
-        fast.and(kernel)
+        let fast_before = self.fast.applied;
+        let kernel = self.kernel.as_mut().map(|k| {
+            let before = k.applied;
+            (k as &mut dyn SampleSource, before)
+        });
+        worker::configure_together(&mut self.fast, fast_before, kernel, cfg)
     }
 
     fn ensure_capacity(&mut self, rate: u32, left: &mut Leftover) -> Result<(), String> {
@@ -334,12 +345,7 @@ impl Running {
         state_dir: &Path,
         handles: crate::Handles,
     ) -> Result<Self, String> {
-        let crate::Handles {
-            vpp,
-            coverage,
-            asn,
-            local_default,
-        } = handles;
+        let crate::Handles { vpp, coverage, asn } = handles;
         let epoch = Instant::now();
         let mut shared = Shared::new(epoch);
         shared.coverage = coverage;
@@ -353,6 +359,10 @@ impl Running {
         // The kernel sampler last: everything after it that fails takes
         // its filters back down.
         let (kernel_source, kernel_ports) = if cfg.kernel.is_empty() {
+            // None configured, but a daemon that died may have left some
+            // sampling into rings no one reads: `attach` clears them
+            // when there are, and so must this.
+            kernel::detach_from_state_dir(state_dir)?;
             (None, Vec::new())
         } else {
             let sampled = sampled_ports(state_dir, vpp.as_ref().map(|(p, _)| p.as_ref()));
@@ -369,7 +379,7 @@ impl Running {
             kernel: kernel_source,
         };
         let worker = match Worker::new(cfg, source, ports, socket, shared.clone(), epoch) {
-            Ok(w) => w.with_privacy(asn, local_default),
+            Ok(w) => w.with_asn(asn),
             Err(e) => {
                 let _ = kernel::detach_from_state_dir(state_dir);
                 return Err(e);
