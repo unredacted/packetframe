@@ -24,11 +24,21 @@ ipnet.workspace = true
 # dependency here would quietly undo that.
 tokio = { workspace = true, optional = true }
 
+# Only for `crate::tc_filter` (`tc` feature): one blocking RTM_GETTFILTER
+# dump, on the message crates fast-path's resolver decodes with.
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = { workspace = true, optional = true }
+netlink-packet-route = { workspace = true, optional = true }
+netlink-sys = { version = "0.9", optional = true }
+
 [features]
 default = []
 # `crate::frr`: one `vtysh` invoker for every module that shells out to
 # FRR. A feature rather than always-on so a consumer that wants only the
 # config parser or the probes does not link a process runtime.
 frr = ["dep:tokio"]
+# `crate::tc_filter`: what a clsact filter slot holds, for the modules
+# that tear down their own cls_bpf filters (fast-path, guard).
+tc = ["dep:netlink-packet-core", "dep:netlink-packet-route", "dep:netlink-sys"]
 
 [dev-dependencies]

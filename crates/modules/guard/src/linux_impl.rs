@@ -447,8 +447,12 @@ fn tc_detach_one(
     // a delete there could remove an unrelated filter on the
     // replacement whose (priority, handle) happens to match — the
     // first auto-allocated tuple is common (review finding, PR #205).
-    // The resolve-to-delete race is accepted: it requires the device to
-    // be renamed or recreated in that instant AND the tuple to collide.
+    // Under another name the ifindex alone vouches for the device, and
+    // an ifindex can be handed on (see `packetframe_common::tc_filter`),
+    // so there the slot must hold our own program before it is deleted
+    // (review finding, PR #343). The resolve-to-delete race is
+    // accepted: it requires the device to be renamed or recreated in
+    // that instant AND the tuple to collide.
     let current = match name_of(expected_ifindex) {
         Ok(Some(current)) => current,
         Ok(None) => {
@@ -465,12 +469,32 @@ fn tc_detach_one(
         }
     };
     if current != iface {
-        info!(
-            recorded = iface,
-            now = %current,
-            ifindex = expected_ifindex,
-            "iface renamed since attach; detaching its guard tc filter there"
-        );
+        use packetframe_common::tc_filter::{bpf_program_at, ClsactHook};
+        match bpf_program_at(expected_ifindex, ClsactHook::Egress, priority, handle) {
+            Ok(Some(prog)) if prog == pin::PROGRAM_NAME => info!(
+                recorded = iface,
+                now = %current,
+                ifindex = expected_ifindex,
+                "iface renamed since attach; detaching its guard tc filter there"
+            ),
+            Ok(found) => {
+                info!(
+                    recorded = iface,
+                    now = %current,
+                    ifindex = expected_ifindex,
+                    found = ?found,
+                    "the recorded ifindex names another device without our filter; \
+                     the recorded filter died with the old device"
+                );
+                return TcDetachOutcome::Cleared;
+            }
+            Err(e) => {
+                return TcDetachOutcome::Failed(format!(
+                    "guard tc detach on {iface} (now {current}): read its filter at \
+                     (prio {priority}, handle {handle}): {e}"
+                ))
+            }
+        }
     }
     let iface = current.as_str();
 
