@@ -31,6 +31,9 @@ pub struct Ready {
     /// the sample came by, and the sampler generation it was drawn under.
     pub path: crate::worker::Path,
     pub generation: u64,
+    /// How long before the worker read it the packet was sampled, by its
+    /// sampler's clock: when the flow cache counts it.
+    pub age_ms: u64,
 }
 
 /// The frame a sample stands for, as it was on the wire: an offloaded
@@ -187,6 +190,7 @@ mod tests {
             header: vec![0xab; 128],
             path: crate::worker::Path::Xdp,
             generation: 1,
+            age_ms: 0,
         }
     }
 

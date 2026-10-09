@@ -323,7 +323,14 @@ mod tests {
             rate,
             input_if: 3,
             output_if: 5,
+            at: at(0),
         }
+    }
+
+    /// `batch`, every sample observed at `now`.
+    fn ingest(c: &mut FlowCache, domain: Domain, batch: &[Sampled], now: Now) {
+        let batch: Vec<Sampled> = batch.iter().map(|s| Sampled { at: now, ..*s }).collect();
+        c.ingest(domain, &batch);
     }
 
     fn word16(d: &[u8], at: usize) -> u16 {
@@ -384,7 +391,8 @@ mod tests {
         let mut cache = FlowCache::new(Limits::default());
         let mut x = IpfixOut::new(CollectorProfile::Full);
         let t0 = Instant::now();
-        cache.ingest(
+        ingest(
+            &mut cache,
             Domain::FastPath,
             &[
                 sampled("192.0.2.1", "198.51.100.2", 443, 1000, 1),
@@ -409,12 +417,14 @@ mod tests {
     fn a_rate_change_is_announced_after_the_old_rates_records() {
         let mut cache = FlowCache::new(Limits::default());
         let mut x = IpfixOut::new(CollectorProfile::Full);
-        cache.ingest(
+        ingest(
+            &mut cache,
             Domain::Vpp,
             &[sampled("192.0.2.1", "198.51.100.2", 1, 1000, 1)],
             at(0),
         );
-        cache.ingest(
+        ingest(
+            &mut cache,
             Domain::Vpp,
             &[sampled("192.0.2.1", "198.51.100.2", 2, 100, 2)],
             at(100),
@@ -437,7 +447,8 @@ mod tests {
         let mut x = IpfixOut::new(CollectorProfile::Full);
         let t0 = Instant::now();
         let mut tick = |x: &mut IpfixOut, ms: u64, port: u16| {
-            cache.ingest(
+            ingest(
+                &mut cache,
                 Domain::FastPath,
                 &[sampled("192.0.2.1", "198.51.100.2", port, 1000, 1)],
                 at(ms),
@@ -461,7 +472,7 @@ mod tests {
         let batch: Vec<Sampled> = (0..500)
             .map(|p| sampled("192.0.2.1", "198.51.100.2", p, 1000, 1))
             .collect();
-        cache.ingest(Domain::FastPath, &batch, at(0));
+        ingest(&mut cache, Domain::FastPath, &batch, at(0));
         cache.expire(at(15_000), 1000);
         let out = encode_all(&mut cache, &mut x, &NONE, Instant::now());
         assert!(out.len() > 1);
@@ -588,7 +599,8 @@ mod tests {
     fn a_no_remote_message_uses_the_variant_templates() {
         let mut cache = FlowCache::new(Limits::default());
         let mut x = IpfixOut::new(CollectorProfile::NoRemote);
-        cache.ingest(
+        ingest(
+            &mut cache,
             Domain::FastPath,
             &[
                 sampled("198.51.100.1", "192.0.2.2", 1, 1000, 1),

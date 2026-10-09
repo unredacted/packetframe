@@ -166,6 +166,10 @@ impl SampleSource for LiveSource {
             .ok()
             .and_then(|v| v.get(self.emit_failed_at).copied())
     }
+
+    fn clock_ns(&self) -> u64 {
+        crate::vpp_live::monotonic_ns()
+    }
 }
 
 struct LivePorts {
