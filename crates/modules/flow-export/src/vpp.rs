@@ -16,6 +16,14 @@
 //! process's: the process maps the epoch file. Anything else is counted
 //! unmapped, never attributed to a port by guess.
 //!
+//! **Generations** are not reused within one VPP process: a sample a
+//! previous run left queued would be read through a binding this run made.
+//! Each is past every one in sight: the file's, the plugin's status, and
+//! this module's record of the newest it wrote for that process. The
+//! record is what outlives a stop, which removes the file, after which the
+//! plugin reports generation 0 (`pf-sampler-core`'s `control`). A record
+//! that cannot be read or written is logged, never a reason to stop.
+//!
 //! **Pools** are the plugin's per-interface packet counts, summed over
 //! its rings and attributed to a port by the name the status gives each
 //! pool index. An index that changes hands starts its count again
@@ -86,6 +94,11 @@ pub trait VppDir {
     fn drain(&mut self, out: &mut Vec<Sample>) -> Drained;
     /// Whether `instance` is the process that maps `epoch`'s file.
     fn maps_epoch(&mut self, instance: &VppInstance, epoch: u64) -> bool;
+    /// The newest generation recorded as written for `instance`.
+    fn recorded(&mut self, instance: &VppInstance) -> Result<Option<u64>, String>;
+    /// Record `generation` as written for `instance`, in place of any
+    /// other process's.
+    fn record(&mut self, instance: &VppInstance, generation: u64) -> Result<(), String>;
 }
 
 /// No VPP: the worker's sampler side when vpp-offload is not configured.
@@ -111,6 +124,12 @@ impl VppDir for NoVpp {
         match *self {}
     }
     fn maps_epoch(&mut self, _: &VppInstance, _: u64) -> bool {
+        match *self {}
+    }
+    fn recorded(&mut self, _: &VppInstance) -> Result<Option<u64>, String> {
+        match *self {}
+    }
+    fn record(&mut self, _: &VppInstance, _: u64) -> Result<(), String> {
         match *self {}
     }
 }
@@ -373,10 +392,15 @@ impl<D: VppDir> VppSide<D> {
                     || look.desired_generation != Some(w.generation)
             });
             if stale && now >= self.next_write {
+                let recorded = self.dir.recorded(&instance).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "flow-export: the VPP sampler's generation record could not be read");
+                    None
+                });
                 let newest = [
                     look.desired_generation,
                     status.map(|s| s.applied_generation),
                     status.map(|s| s.rejected_generation),
+                    recorded,
                     self.written.as_ref().map(|w| w.generation),
                     self.bindings.keys().next_back().copied(),
                 ]
@@ -385,8 +409,8 @@ impl<D: VppDir> VppSide<D> {
                 .max()
                 .unwrap_or(0);
                 let written = match newest.checked_add(1) {
-                    // Only a hand-written generation gets here; the
-                    // plugin's status keeps it until VPP restarts.
+                    // Only a hand-written generation gets here; a VPP
+                    // restart with no desired.conf puts none in sight.
                     None => Err(format!(
                         "generation {newest} is in sight and none can follow it: VPP's \
                          sampler needs a restart with no desired.conf"
@@ -404,6 +428,9 @@ impl<D: VppDir> VppSide<D> {
                 };
                 match written {
                     Ok(d) => {
+                        if let Err(e) = self.dir.record(&instance, d.generation) {
+                            tracing::warn!(error = %e, "flow-export: the VPP sampler's generation record could not be written");
+                        }
                         self.bindings.insert(
                             d.generation,
                             Binding {
@@ -621,6 +648,9 @@ pub(crate) mod tests {
         pub corrupt: u64,
         /// The processes found to map each epoch.
         pub mappers: BTreeMap<u64, i32>,
+        /// The module's generation record, which outlives its runs.
+        pub record: Option<(VppInstance, u64)>,
+        pub record_error: Option<String>,
     }
 
     #[derive(Clone, Default)]
@@ -675,6 +705,21 @@ pub(crate) mod tests {
         }
         fn maps_epoch(&mut self, instance: &VppInstance, epoch: u64) -> bool {
             self.0.borrow().mappers.get(&epoch) == Some(&instance.pid)
+        }
+        fn recorded(&mut self, instance: &VppInstance) -> Result<Option<u64>, String> {
+            let p = self.0.borrow();
+            Ok(p.record
+                .as_ref()
+                .filter(|(i, _)| i == instance)
+                .map(|&(_, g)| g))
+        }
+        fn record(&mut self, instance: &VppInstance, generation: u64) -> Result<(), String> {
+            let mut p = self.0.borrow_mut();
+            if let Some(e) = &p.record_error {
+                return Err(e.clone());
+            }
+            p.record = Some((instance.clone(), generation));
+            Ok(())
         }
     }
 
@@ -991,6 +1036,84 @@ pub(crate) mod tests {
         r.plugin.borrow_mut().write_error = None;
         r.side.tick(r.t0 + RETRY, 1000, 128);
         assert_eq!(r.plugin.borrow().desired.as_ref().unwrap().generation, 1);
+    }
+
+    /// The plugin once `desired.conf` is gone, as pf-sampler-core's
+    /// controller reports it: disabled, at generation 0.
+    fn no_config() -> Status {
+        Status {
+            state: State::Disabled,
+            reason: packetframe_sampler_shm::status::reason::NO_CONFIG,
+            ..Status::default()
+        }
+    }
+
+    /// A new daemon's side over the same plugin, its follower opening
+    /// `epoch` afresh.
+    fn restarted(r: &Rig, epoch: u64, at: Instant) -> VppSide<FakeDir> {
+        r.plugin.borrow_mut().switch = Some(EpochSwitch {
+            from: None,
+            to: epoch,
+            abandoned: 0,
+        });
+        VppSide::new(FakeDir(r.plugin.clone()), r.ports.clone(), at, NOW_NS)
+    }
+
+    /// `systemctl stop`, `detach --keep-vpp`, `systemctl start`: the stop
+    /// removes the file, the plugin then shows generation 0, and the new
+    /// daemon still writes past what the last one did.
+    #[test]
+    fn a_restart_that_keeps_vpp_continues_its_generations() {
+        let mut r = rig();
+        r.side.tick(r.t0, 1000, 128);
+        r.side.tick(r.t0 + RETRY, 500, 128);
+        r.side.tick(r.t0 + 2 * RETRY, 1000, 128);
+        r.plugin.borrow_mut().status = Some(applied(3, 1, 2));
+        r.side.tick(r.t0 + 3 * RETRY, 1000, 128);
+        assert_eq!(r.side.health().applied, Some(3));
+        r.side.stop().unwrap();
+        r.plugin.borrow_mut().status = Some(no_config());
+
+        let mut side = restarted(&r, 7, r.t0 + 4 * RETRY);
+        side.tick(r.t0 + 4 * RETRY, 1000, 128);
+        assert_eq!(
+            r.plugin.borrow().desired.as_ref().unwrap().generation,
+            4,
+            "past the 3 the last run wrote"
+        );
+    }
+
+    /// Another process's record is no floor: a VPP restart clears even a
+    /// generation none can follow.
+    #[test]
+    fn a_vpp_restarted_while_stopped_starts_its_generations_afresh() {
+        let mut r = rig();
+        r.side.tick(r.t0, 1000, 128);
+        r.side.tick(r.t0 + RETRY, 500, 128);
+        r.side.stop().unwrap();
+        {
+            let mut p = r.plugin.borrow_mut();
+            p.epoch = Some(8);
+            p.mappers.insert(8, 11);
+            p.status = Some(no_config());
+        }
+        r.ports.publish(snapshot(11, 2, 1));
+
+        let mut side = restarted(&r, 8, r.t0 + 2 * RETRY);
+        side.tick(r.t0 + 2 * RETRY, 1000, 128);
+        assert_eq!(r.plugin.borrow().desired.as_ref().unwrap().generation, 1);
+        assert_eq!(r.plugin.borrow().record, Some((instance(11), 1)));
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_written_does_not_stop_sampling() {
+        let mut r = rig();
+        r.plugin.borrow_mut().record_error = Some("EROFS".into());
+        r.side.tick(r.t0, 1000, 128);
+        assert_eq!(r.plugin.borrow().desired.as_ref().unwrap().generation, 1);
+        r.plugin.borrow_mut().status = Some(applied(1, 1, 2));
+        r.side.tick(r.t0 + crate::worker::TICK, 1000, 128);
+        assert!(r.side.health().coverage.is_healthy());
     }
 
     #[test]
