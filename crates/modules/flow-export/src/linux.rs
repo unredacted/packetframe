@@ -234,12 +234,7 @@ impl Running {
         state_dir: &Path,
         handles: crate::Handles,
     ) -> Result<Self, String> {
-        let crate::Handles {
-            vpp,
-            coverage,
-            asn,
-            local_default,
-        } = handles;
+        let crate::Handles { vpp, coverage, asn } = handles;
         let epoch = Instant::now();
         let mut shared = Shared::new(epoch);
         shared.coverage = coverage;
@@ -253,8 +248,7 @@ impl Running {
         let ports = LivePorts {
             state_dir: state_dir.to_owned(),
         };
-        let worker = Worker::new(cfg, source, ports, socket, shared.clone(), epoch)?
-            .with_privacy(asn, local_default);
+        let worker = Worker::new(cfg, source, ports, socket, shared.clone(), epoch)?.with_asn(asn);
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let vpp_dir = vpp.as_ref().map(|(_, d)| d.clone());

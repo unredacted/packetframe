@@ -35,7 +35,7 @@ use crate::sflow_out::{wire_frame, Exporter, Ready, FCS};
 use crate::vpp::{NoVpp, Taken, VppDir, VppHealth, VppSide};
 use packetframe_common::config::CollectorFormat;
 use packetframe_common::fib::asn::AsnTable;
-use packetframe_common::fib::{IpPrefix, SharedPrefixes};
+use packetframe_common::fib::IpPrefix;
 
 pub const TICK: Duration = Duration::from_millis(100);
 /// How often the port list and the pools are re-read.
@@ -355,9 +355,6 @@ pub struct Worker<S, P, T, V = NoVpp> {
     flows: Option<Flows>,
     /// Origin ASes, when fast-path's route source publishes them.
     asn: Option<Arc<AsnTable>>,
-    /// fast-path's allowlist, the local prefixes when the section names
-    /// none.
-    local_default: Option<Arc<SharedPrefixes>>,
     /// The wall clock at `shared.epoch`, in Unix milliseconds: the times
     /// flow records carry.
     wall_epoch_ms: u64,
@@ -416,7 +413,6 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
         Ok(Self {
             flows,
             asn: None,
-            local_default: None,
             wall_epoch_ms,
             exporter: Exporter::new(cfg.source),
             cfg,
@@ -465,7 +461,6 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
             leftover: self.leftover,
             flows: self.flows,
             asn: self.asn,
-            local_default: self.local_default,
             wall_epoch_ms: self.wall_epoch_ms,
             p: self.p,
         }
@@ -473,15 +468,9 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
 }
 
 impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
-    /// Fill flow records' AS fields from `asn`, and take fast-path's
-    /// allowlist as the local prefixes when the section names none.
-    pub fn with_privacy(
-        mut self,
-        asn: Option<Arc<AsnTable>>,
-        local_default: Option<Arc<SharedPrefixes>>,
-    ) -> Self {
+    /// Fill flow records' AS fields from `asn`.
+    pub fn with_asn(mut self, asn: Option<Arc<AsnTable>>) -> Self {
         self.asn = asn;
-        self.local_default = local_default;
         self
     }
 
@@ -584,13 +573,11 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
         self.send_flows(now, at, RECORDS_PER_TICK, None);
     }
 
-    /// The local prefixes: the section's, else fast-path's allowlist.
+    /// The local prefixes: the section's, else fast-path's allowlist as
+    /// this configuration took it.
     fn local(&self) -> Vec<IpPrefix> {
         if self.cfg.local.is_empty() {
-            self.local_default
-                .as_ref()
-                .map(|h| h.get())
-                .unwrap_or_default()
+            self.cfg.local_default.clone()
         } else {
             self.cfg.local.clone()
         }
@@ -1301,6 +1288,7 @@ mod tests {
             }],
             cache: flows::Limits::default(),
             local: Vec::new(),
+            local_default: Vec::new(),
         }
     }
 
@@ -1956,6 +1944,33 @@ mod tests {
             "VPP first this time, though fast-path still has records"
         );
         assert_eq!(domains(&mut r), vec![Domain::FastPath.id()]);
+    }
+
+    /// The privacy profiles' local prefixes move only with a reload the
+    /// worker applied: the allowlist the module took then, unless the
+    /// section names its own.
+    #[test]
+    fn the_local_prefixes_are_the_configurations() {
+        let mut r = rig(1000);
+        r.w.tick(r.t0);
+        assert!(r.w.local().is_empty());
+        let allowlist = vec![IpPrefix::V4 {
+            addr: [203, 0, 113, 0],
+            prefix_len: 24,
+        }];
+        let mut c = cfg(1000);
+        c.local_default = allowlist.clone();
+        let _ = reload(&r.shared, c.clone());
+        r.w.tick(r.t0 + TICK);
+        assert_eq!(r.w.local(), allowlist);
+        let own = vec![IpPrefix::V4 {
+            addr: [192, 0, 2, 0],
+            prefix_len: 24,
+        }];
+        c.local = own.clone();
+        let _ = reload(&r.shared, c);
+        r.w.tick(r.t0 + 2 * TICK);
+        assert_eq!(r.w.local(), own, "the section's own win");
     }
 
     #[test]

@@ -32,8 +32,11 @@ pub struct FlowExportConfig {
     pub collectors: Vec<Collector>,
     /// The IPFIX flow cache's bounds.
     pub cache: Limits,
-    /// `privacy-local-prefix`: empty means fast-path's allowlist.
+    /// `privacy-local-prefix`: empty means `local_default`.
     pub local: Vec<IpPrefix>,
+    /// fast-path's allowlist as the module took it at attach or reload,
+    /// not from the section.
+    pub local_default: Vec<IpPrefix>,
 }
 
 impl FlowExportConfig {
@@ -90,6 +93,7 @@ impl FlowExportConfig {
             collectors,
             cache,
             local,
+            local_default: Vec::new(),
         })
     }
 

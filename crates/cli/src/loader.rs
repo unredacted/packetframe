@@ -547,28 +547,15 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     ));
 
     // Origin ASes for flow export's IPFIX records, published by the
-    // FibProgrammer: built only when an IPFIX collector would carry them
-    // and fast-path learns routes from BGP or BMP, since a full table's
-    // worth costs tens of MB.
+    // FibProgrammer: built when flow export runs and fast-path learns
+    // routes from BGP or BMP. With or without an IPFIX collector yet,
+    // since a reload can add one (and `profile as-only` with it), and the
+    // programmer fills the table only as it programs routes: one built
+    // later would stay empty until each route changed.
     #[cfg(feature = "flow-export")]
-    let asn_table = {
-        let ipfix = config
-            .modules
-            .iter()
-            .filter(|m| m.name == "flow-export")
-            .flat_map(|m| &m.directives)
-            .any(|d| {
-                matches!(
-                    d,
-                    packetframe_common::config::ModuleDirective::FlowCollector {
-                        format: packetframe_common::config::CollectorFormat::Ipfix,
-                        ..
-                    }
-                )
-            });
-        (ipfix && config.has_asn_source())
-            .then(|| std::sync::Arc::new(packetframe_common::fib::asn::AsnTable::new()))
-    };
+    let asn_table = (config.modules.iter().any(|m| m.name == "flow-export")
+        && config.has_asn_source())
+    .then(|| std::sync::Arc::new(packetframe_common::fib::asn::AsnTable::new()));
 
     // How complete the route mirror is, published by the fast-path's
     // integrity checker and read by vpp-offload before it diverts
@@ -1361,6 +1348,14 @@ fn reconfigure_from_signal(
     // contain — so without this its `reconfigure` would re-derive the
     // steering plan from the allowlist as it was at startup, find it
     // unchanged, and report OK for a SIGHUP that changed nothing.
+    //
+    // Put back if fast-path refuses the reload (a restart-only change
+    // refuses it before any map is touched): the modules reconfigured
+    // after it must not act on prefixes it did not take. flow-export
+    // always is, and its privacy profiles keep these local addresses
+    // whole; vpp-offload's steering is when listed after it.
+    #[cfg(any(feature = "vpp-offload", feature = "flow-export"))]
+    let allowlist_before = allowlist.get();
     #[cfg(any(feature = "vpp-offload", feature = "flow-export"))]
     allowlist.publish(crate::feasibility::allowlist_from_config(&new_config));
 
@@ -1396,6 +1391,10 @@ fn reconfigure_from_signal(
                 tracing::warn!(module = %name, error = %e, "reconfigure failed");
                 reconfigure_failed(name, &e);
                 failures.push(format!("{name}: {e}"));
+                #[cfg(any(feature = "vpp-offload", feature = "flow-export"))]
+                if name == "fast-path" {
+                    allowlist.publish(allowlist_before.clone());
+                }
             }
         }
     }

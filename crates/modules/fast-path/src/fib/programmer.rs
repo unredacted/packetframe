@@ -2871,7 +2871,11 @@ impl FibProgrammer {
         // about the routes, and an origin that changed with no nexthop
         // change still has to reach flow export.
         if let Some(table) = &self.asn_table {
-            table.set(prefix, if desired_nhs.is_empty() { None } else { origin });
+            if desired_nhs.is_empty() {
+                table.remove(prefix);
+            } else {
+                table.set(prefix, origin);
+            }
         }
 
         // 2. Empty desired set: tear the prefix down.
