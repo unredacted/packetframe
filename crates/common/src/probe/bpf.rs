@@ -29,7 +29,6 @@ pub const BPF_PROG_TYPE_XDP: u32 = 6;
 // Map types we probe (SPEC.md §2.1)
 pub const BPF_MAP_TYPE_HASH: u32 = 1;
 pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
-pub const BPF_MAP_TYPE_PERF_EVENT_ARRAY: u32 = 4;
 pub const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
 pub const BPF_MAP_TYPE_LPM_TRIE: u32 = 11;
 pub const BPF_MAP_TYPE_DEVMAP_HASH: u32 = 25;
@@ -40,7 +39,6 @@ pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 pub const HELPER_MAP_LOOKUP_ELEM: i32 = 1;
 pub const HELPER_MAP_UPDATE_ELEM: i32 = 2;
 pub const HELPER_MAP_DELETE_ELEM: i32 = 3;
-pub const HELPER_PERF_EVENT_OUTPUT: i32 = 25;
 pub const HELPER_XDP_ADJUST_HEAD: i32 = 44;
 pub const HELPER_REDIRECT_MAP: i32 = 51;
 pub const HELPER_FIB_LOOKUP: i32 = 69;

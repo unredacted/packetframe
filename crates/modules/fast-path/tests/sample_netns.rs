@@ -1,6 +1,6 @@
 //! The flow-export sampler on real traffic: frames injected into a veth,
 //! seen by the fast path attached at the other end, read back from the
-//! perf rings. What TEST_RUN cannot show (`sample_fixtures.rs`): samples
+//! ring. What TEST_RUN cannot show (`sample_fixtures.rs`): samples
 //! from a live attach, and the tc hook's view of a tag the kernel has
 //! lifted into skb metadata.
 //!

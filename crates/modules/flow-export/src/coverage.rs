@@ -58,7 +58,7 @@ impl State {
 pub struct Window {
     /// Samples from this port delivered to the exporter.
     pub samples: u64,
-    /// Samples lost on this port's path (its rings are shared, so loss
+    /// Samples lost on this port's path (its ring is shared, so loss
     /// cannot be told apart by port).
     pub lost: u64,
     /// Packets the port counted.

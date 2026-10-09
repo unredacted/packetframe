@@ -175,14 +175,15 @@ fn sample_xdp(ctx: &XdpContext, stats: StatsPtr, disposition: u32, egress_ifinde
     if !sample::pending(stats) {
         return;
     }
+    let (start, end) = (ctx.data(), ctx.data_end());
     sample::emit(
-        ctx,
         stats,
-        (ctx.data_end() - ctx.data()) as u32,
+        (end - start) as u32,
         unsafe { (*ctx.ctx).ingress_ifindex },
         egress_ifindex,
         sample::PATH_XDP | disposition << 8,
         0,
+        |dst, want| sample::copy_frame(start, end, dst, want),
     );
 }
 

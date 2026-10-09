@@ -27,7 +27,7 @@ pub mod redirect_watch_status;
 pub mod registry;
 pub mod rx_macs;
 pub mod sample;
-pub mod sample_rings;
+pub mod sample_ring;
 pub mod softnet;
 pub mod tc_links;
 pub mod vrrp;

@@ -1,5 +1,5 @@
 //! Fixtures for the flow-export sampler inside the fast-path ELF
-//! (`bpf/src/sample.rs`), via `BPF_PROG_TEST_RUN` with the perf rings read
+//! (`bpf/src/sample.rs`), via `BPF_PROG_TEST_RUN` with the ring read
 //! back: what is selected, what each sample says, and that a packet is
 //! emitted exactly once however its forwarding ends.
 //!
@@ -453,22 +453,24 @@ fn drops_and_unparsed_frames_are_sampled_too() {
 
 #[test]
 #[ignore = "needs CAP_BPF + CAP_NET_ADMIN + CAP_SYS_ADMIN + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
-fn without_a_reader_each_sample_is_counted_failed() {
+fn a_full_ring_counts_each_sample_it_refuses() {
+    /// What 16 MiB holds: each entry is an 8-byte header and a 296-byte
+    /// `SampleEvent`.
+    const HOLDS: u32 = (16 << 20) / (8 + 296);
     on_one_cpu(|| {
-        let egress = enter_routed_netns();
-        for (hook, fib) in cases() {
-            let mut h = forwarding(fib, egress);
-            h.set_sample_cfg(1, HEADER_BYTES, 1);
-            for _ in 0..4 {
-                run(&h, hook, &routed(0));
-            }
-            // The first packet armed; three were samples nobody could take.
-            assert_eq!(h.stat(StatIdx::SampleSelected), 3, "{hook:?}/{fib:?}");
-            assert_eq!(h.stat(StatIdx::SampleEmitFailed), 3);
-            let mut tap = h.sample_tap();
-            run(&h, hook, &routed(0));
-            assert_eq!(tap.events().len(), 1);
-            assert_eq!(h.stat(StatIdx::SampleEmitFailed), 3);
-        }
+        let mut h = forwarding(Fib::Packetframe, enter_routed_netns());
+        let mut tap = every_packet(&mut h, Hook::Xdp, 1);
+        // Passed untouched, so every repeat is the same sample.
+        let pkt = unmatched();
+        h.run_timed(&pkt, HOLDS + 1000);
+        assert_eq!(h.stat(StatIdx::SampleSelected), u64::from(HOLDS) + 1000);
+        assert_eq!(h.stat(StatIdx::SampleEmitFailed), 1000);
+        let events = tap.events();
+        assert_eq!(events.len(), HOLDS as usize);
+        assert!(parse(&events).iter().all(|s| s.header == &pkt[..]));
+        // Drained: room again.
+        run(&h, Hook::Xdp, &pkt);
+        assert_eq!(tap.events().len(), 1);
+        assert_eq!(h.stat(StatIdx::SampleEmitFailed), 1000);
     });
 }

@@ -291,7 +291,7 @@ fn bench_sampling_overhead() {
             );
             a.push(ns_a);
             b.push(ns_b);
-            // Keep the rings from filling: a refused output is cheaper
+            // Keep the ring from filling: a refused reservation is cheaper
             // than a delivered one and would flatter the figure.
             if i % 50 == 49 {
                 samples += tap.events().len();

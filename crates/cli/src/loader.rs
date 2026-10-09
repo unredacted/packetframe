@@ -646,8 +646,8 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                     m.set_feed_session(h.clone());
                 }
                 #[cfg(feature = "flow-export")]
-                {
-                    vpp_sampler_ports = Some(m.sampler_ports());
+                if config.modules.iter().any(|s| s.name == "flow-export") {
+                    vpp_sampler_ports = Some(m.sampler_for_flow_export());
                 }
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }

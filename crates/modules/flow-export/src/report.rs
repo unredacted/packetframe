@@ -231,11 +231,6 @@ pub fn metrics(p: &Published, out: &mut String, worker_up: bool) {
             ("{where=\"unencodable\"}".into(), p.unencodable_total),
         ],
     );
-    counter(
-        "ring_lost_total",
-        "samples the perf rings reported lost (a subset of the sampler's loss)",
-        &[(String::new(), p.ring_lost_total)],
-    );
     let per_collector = |f: fn(&crate::worker::CollectorReport) -> u64| {
         p.collectors
             .iter()

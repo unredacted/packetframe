@@ -64,7 +64,8 @@ host:
 - `source-address` is this host's;
 - VPP's sampler directory and plugin;
 - each `kernel-sample` interface;
-- fast-path's `helper.bpf_perf_event_output` and `map.perf_event_array`.
+- fast-path's ring buffer rows: `map.ringbuf`, `helper.bpf_ringbuf_reserve`
+  and `helper.bpf_ringbuf_reserve.sched_cls`.
 
 ## Collectors
 
@@ -235,6 +236,10 @@ fast-path accepts, never one it refused.
     ("desired.lock is held"), as is `packetframe sampler watch` ("another
     consumer holds consumer.lock").
   - Use `packetframe sampler status`, which only looks.
+  - A `desired.conf` left by a daemon that died is flow-export's to take
+    over: vpp-offload's attach leaves it, so VPP keeps sampling until
+    flow-export writes its own. Without `module flow-export`, attach
+    removes it and the plugin stays off.
 - **Reading samples.** A sample is read only through the port list of
   the VPP process that wrote it. After a VPP restart, samples before
   the new port list is published are counted as unmapped, and
@@ -279,7 +284,7 @@ fast-path accepts, never one it refused.
 | `vpp: sampler unavailable: heartbeat … old` | VPP is down, or the plugin isn't loaded: check `packetframe feasibility`'s `flow-export.vpp.plugin` row, then `show plugins` in vppctl |
 | `vpp: … desired generation X, applied Y` | The plugin hasn't taken the newest `desired.conf` yet: transient after a reload or a VPP restart. If it lasts, the plugin isn't reading it. A refusal reads `desired.conf generation N refused (…, line L)` instead |
 | `vpp: sampler unavailable: sampler directory: …` | vpp-offload's `sampler-dir` row says why the tmpfs isn't usable |
-| `degraded: N samples lost in the last 5 s` | Rings filled faster than the worker drains them. Check the `rate`, and `samples_lost_total{where}` for where |
+| `degraded: N samples lost in the last 5 s` | A ring filled faster than the worker drains it: fast-path's (16 MiB) or the kernel sampler's (4 MiB), whose loss is `samples_lost_total{where="sampler"}`, or VPP's (`where="vpp"`). Check the `rate` |
 | collector `sends failing: …` | The send itself was refused: no route to the collector, or `source-address` gone from this host |
 | collector `datagrams dropped: the per-tick send budget was spent` | Bursts of more than 512 datagrams a tick. `send_budget_drops_total` counts them |
 | `worker: the export worker panicked` | Telemetry stopped and the samplers were turned off. The reason is in the row; restart the daemon |

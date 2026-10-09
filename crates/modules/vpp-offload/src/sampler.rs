@@ -22,9 +22,11 @@
 //! own check with room for three epochs beside whatever else it holds,
 //! and is never unmounted; PacketFrame never mounts over one.
 //!
-//! Attach also removes a `desired.conf` left behind: with no flow export
-//! configured to own it, the plugin stays off even in a reused directory
-//! or an adopted VPP.
+//! Attach also removes a `desired.conf` left behind when no flow export is
+//! configured to own it, so the plugin stays off even in a reused
+//! directory or an adopted VPP. With flow export configured, the file is
+//! its to take over (a daemon that died left it): it stays, and VPP keeps
+//! sampling until flow export writes its own.
 
 // The decision serves the Linux preparation only, but builds everywhere
 // so its tests run on any host.
@@ -343,9 +345,15 @@ fn remove_record(state_dir: &Path) -> io::Result<()> {
 
 /// [`prepare`] for real, keeping the record true: a mount whose token
 /// cannot be recorded is taken back down, since nothing would ever release
-/// it. Then removes a stale `desired.conf`.
+/// it. Then, unless `flow_export` is configured to take it over, removes a
+/// stale `desired.conf`.
 #[cfg(target_os = "linux")]
-pub(crate) fn prepare_recorded(dir: &Path, threads: usize, state_dir: &Path) -> SamplerDir {
+pub(crate) fn prepare_recorded(
+    dir: &Path,
+    threads: usize,
+    state_dir: &Path,
+    flow_export: bool,
+) -> SamplerDir {
     use packetframe_sampler_core::driver::{dir_budget, epoch_len};
     let need = match (dir_budget(threads), epoch_len(threads)) {
         (Ok(total), Ok(epoch)) => Need {
@@ -374,6 +382,9 @@ pub(crate) fn prepare_recorded(dir: &Path, threads: usize, state_dir: &Path) -> 
         }
     }
     if let SamplerDir::Ready { stale, .. } = &mut outcome {
+        if flow_export {
+            return outcome;
+        }
         *stale = match packetframe_sampler_shm::fs::clear_desired(dir) {
             Ok(Some(true)) => {
                 tracing::info!(
@@ -766,7 +777,7 @@ mod tests {
     fn the_live_mount_round_trips() {
         let base = state_dir("live");
         let (d, st) = (base.join("sampler"), base.join("state"));
-        let out = prepare_recorded(&d, 2, &st);
+        let out = prepare_recorded(&d, 2, &st, false);
         assert!(
             matches!(out, SamplerDir::Ready { owned: true, .. }),
             "{out:?}"
@@ -785,7 +796,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let out = prepare_recorded(&d, 2, &st);
+        let out = prepare_recorded(&d, 2, &st, false);
         assert!(
             matches!(
                 out,
@@ -798,8 +809,18 @@ mod tests {
             "{out:?}"
         );
         drop(held);
+        // Flow export configured: the file is its to take over.
         assert!(matches!(
-            prepare_recorded(&d, 2, &st),
+            prepare_recorded(&d, 2, &st, true),
+            SamplerDir::Ready {
+                owned: true,
+                stale: None,
+                ..
+            }
+        ));
+        assert!(d.join(packetframe_sampler_shm::fs::DESIRED).exists());
+        assert!(matches!(
+            prepare_recorded(&d, 2, &st, false),
             SamplerDir::Ready {
                 owned: true,
                 stale: None,
@@ -815,7 +836,7 @@ mod tests {
         let budget = packetframe_sampler_core::driver::dir_budget(2).unwrap();
         packetframe_sampler_shm::fs::mount_tmpfs(&d, budget).unwrap();
         std::fs::write(d.join("someone-elses"), vec![1u8; 1 << 20]).unwrap();
-        let out = prepare_recorded(&d, 2, &st);
+        let out = prepare_recorded(&d, 2, &st, false);
         assert!(
             matches!(out, SamplerDir::Unavailable(ref w) if w.contains("held by other files")),
             "{out:?}"

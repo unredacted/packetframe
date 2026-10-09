@@ -1,9 +1,8 @@
-//! The live pieces: fast-path's pinned sampler maps and perf rings, its
-//! port registry and sysfs counters, the collectors' socket, and the
-//! worker's thread.
+//! The live pieces: fast-path's pinned sampler maps and ring, its port
+//! registry and sysfs counters, the collectors' socket, and the worker's
+//! thread.
 
 use std::net::UdpSocket;
-use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,33 +13,15 @@ use std::time::{Duration, Instant};
 use aya::maps::{Array, Map, MapData};
 use packetframe_common::module::HookType;
 use packetframe_fast_path::sample::SampleCfg;
-use packetframe_fast_path::sample_rings::SampleRings;
+use packetframe_fast_path::sample_ring::SampleRing;
 use packetframe_fast_path::{pin, registry};
 
 use crate::cfg::FlowExportConfig;
 use crate::kernel;
 use crate::vpp::VppSide;
 use crate::vpp_live::{self, LiveVppDir};
-use crate::worker::{
-    self, Leftover, Link, Path as Lane, Port, Ports, SampleSource, Shared, Worker,
-};
+use crate::worker::{self, Link, Path as Lane, Port, Ports, SampleSource, Shared, Worker};
 use crate::THREAD_NAME;
-
-/// The busiest a single CPU forwards, for sizing its ring.
-const PEAK_PPS_PER_CPU: u64 = 2_000_000;
-/// How much a ring must hold: two worker ticks.
-const RING_HOLDS: Duration = Duration::from_millis(200);
-/// The largest event a sample makes: perf's header and size word, the
-/// record, the most bytes `header-bytes` allows, and padding.
-const EVENT_BYTES: u64 = 8 + 4 + 40 + 256 + 4;
-
-/// Ring pages per CPU for `rate`: a power of two.
-fn pages_for(rate: u32) -> usize {
-    let samples = PEAK_PPS_PER_CPU * RING_HOLDS.as_millis() as u64 / 1000 / u64::from(rate.max(1));
-    // SAFETY: no preconditions.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-    ((samples.max(1) * EVENT_BYTES).div_ceil(page) as usize).next_power_of_two()
-}
 
 fn open_cfg(bpffs_root: &Path) -> Result<Array<MapData, SampleCfg>, String> {
     let path = pin::map_path(bpffs_root, "SAMPLE_CFG");
@@ -77,20 +58,13 @@ pub fn release_sampler(
 /// A sampler's programs' count of samples they could not output.
 type LossCounter = Box<dyn FnMut() -> Option<u64> + Send>;
 
-/// One sampler's configuration map and rings: fast-path's, or the
-/// kernel sampler's.
+/// One sampler's configuration map and ring: fast-path's, or the kernel
+/// sampler's.
 struct LiveSource {
     /// The configuration map's name, for errors.
     cfg_name: &'static str,
     cfg: Array<MapData, SampleCfg>,
-    samples: MapData,
-    rings: Option<SampleRings>,
-    /// Rings a reload replaced, and when: drained with the new ones for a
-    /// tick more, for a program that found them in the map just before
-    /// they left it.
-    retired: Option<(Instant, SampleRings)>,
-    pages: usize,
-    cpus: Vec<u32>,
+    ring: SampleRing,
     loss: LossCounter,
     /// The configuration in the map, as last read or written: what a
     /// reload the other sampler refused puts back.
@@ -113,11 +87,8 @@ impl LiveSource {
             cfg_name: "SAMPLE_CFG",
             applied: cfg.get(&0, 0).ok(),
             cfg,
-            samples,
-            rings: None,
-            retired: None,
-            pages: 0,
-            cpus: online_cpus()?,
+            ring: SampleRing::new(samples)
+                .map_err(|e| format!("{}: {e}", samples_path.display()))?,
             loss: Box::new(move || {
                 packetframe_fast_path::stats_from_pin(&root)
                     .ok()
@@ -139,11 +110,7 @@ impl LiveSource {
             cfg_name: "KSAMPLE_CFG",
             applied: cfg.get(&0, 0).ok(),
             cfg,
-            samples,
-            rings: None,
-            retired: None,
-            pages: 0,
-            cpus: online_cpus()?,
+            ring: SampleRing::new(samples).map_err(|e| format!("KSAMPLES: {e}"))?,
             loss: Box::new(move || {
                 // The object whose program the filters hold lives as long
                 // as this source.
@@ -152,10 +119,6 @@ impl LiveSource {
             }),
         })
     }
-}
-
-fn online_cpus() -> Result<Vec<u32>, String> {
-    aya::util::online_cpus().map_err(|(what, e)| format!("{what}: {e}"))
 }
 
 impl SampleSource for LiveSource {
@@ -167,59 +130,8 @@ impl SampleSource for LiveSource {
         Ok(())
     }
 
-    fn ensure_capacity(&mut self, rate: u32, left: &mut Leftover) -> Result<(), String> {
-        let want = pages_for(rate);
-        if self.rings.is_some() && self.pages >= want {
-            return Ok(());
-        }
-        // Out of the map first: from then on a sample is either in the old
-        // rings, drained here, or a failed output the program counts.
-        if let Some((_, mut older)) = self.retired.take() {
-            left.lost += older.drain(|_, e| left.events.push(e.to_vec()));
-        }
-        if let Some(mut old) = self.rings.take() {
-            old.uninstall();
-            left.lost += old.drain(|_, e| left.events.push(e.to_vec()));
-            self.retired = Some((Instant::now(), old));
-        }
-        let fd = self.samples.fd().as_fd();
-        match SampleRings::open(fd, &self.cpus, want) {
-            Ok(r) => {
-                self.rings = Some(r);
-                self.pages = want;
-                Ok(())
-            }
-            Err(e) => {
-                let e = format!("perf rings ({want} pages per CPU): {e}");
-                // Rings of the size that worked, so export carries on at
-                // the rate the kernel still has.
-                if self.pages > 0 {
-                    match SampleRings::open(fd, &self.cpus, self.pages) {
-                        Ok(r) => self.rings = Some(r),
-                        Err(again) => {
-                            return Err(format!(
-                                "{e}; and the old ones could not be put back: {again}"
-                            ))
-                        }
-                    }
-                }
-                Err(e)
-            }
-        }
-    }
-
-    fn drain(&mut self, f: &mut dyn FnMut(&[u8])) -> u64 {
-        let mut lost = 0;
-        if let Some((at, old)) = &mut self.retired {
-            lost += old.drain(|_, e| f(e));
-            if at.elapsed() >= worker::TICK {
-                self.retired = None;
-            }
-        }
-        if let Some(r) = &mut self.rings {
-            lost += r.drain(|_, e| f(e));
-        }
-        lost
+    fn drain(&mut self, f: &mut dyn FnMut(&[u8])) {
+        self.ring.drain(f);
     }
 
     fn emit_failed(&mut self) -> Option<u64> {
@@ -249,17 +161,11 @@ impl SampleSource for Sources {
         worker::configure_together(&mut self.fast, fast_before, kernel, cfg)
     }
 
-    fn ensure_capacity(&mut self, rate: u32, left: &mut Leftover) -> Result<(), String> {
-        let fast = self.fast.ensure_capacity(rate, left);
-        let kernel = self
-            .kernel
-            .as_mut()
-            .map_or(Ok(()), |k| k.ensure_capacity(rate, left));
-        fast.and(kernel)
-    }
-
-    fn drain(&mut self, f: &mut dyn FnMut(&[u8])) -> u64 {
-        self.fast.drain(f) + self.kernel.as_mut().map_or(0, |k| k.drain(f))
+    fn drain(&mut self, f: &mut dyn FnMut(&[u8])) {
+        self.fast.drain(f);
+        if let Some(k) = &mut self.kernel {
+            k.drain(f);
+        }
     }
 
     fn emit_failed(&mut self) -> Option<u64> {
@@ -364,7 +270,7 @@ impl Running {
         // its filters back down.
         let (kernel_source, kernel_ports) = if cfg.kernel.is_empty() {
             // None configured, but a daemon that died may have left some
-            // sampling into rings no one reads: `attach` clears them
+            // sampling into a ring no one reads: `attach` clears them
             // when there are, and so must this.
             kernel::detach_from_state_dir(state_dir)?;
             (None, Vec::new())
@@ -471,20 +377,4 @@ fn sampled_ports(
         out.extend(s.ports.iter().map(|p| p.port.clone()));
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rings_hold_two_ticks_at_the_rate_and_are_a_power_of_two() {
-        let p = pages_for(1000);
-        assert!(p.is_power_of_two());
-        assert!(
-            pages_for(100) >= p * 8,
-            "ten times the rate, about ten times the ring"
-        );
-        assert!(pages_for(1 << 24).is_power_of_two());
-    }
 }

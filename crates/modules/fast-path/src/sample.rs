@@ -1,6 +1,6 @@
 //! The fast-path sampler's userspace contract (`bpf/src/sample.rs`): the
 //! `SAMPLE_CFG` value flow-export writes, and the record each `SAMPLES`
-//! perf event begins with.
+//! ring entry begins with.
 
 /// Layout mirror of `SampleCfg` in `bpf/src/maps.rs`: build it with
 /// [`SampleCfg::new`]. Rate 0 is off.
@@ -95,8 +95,8 @@ pub enum ParseError {
     },
 }
 
-/// Decode one `SAMPLES` event. The perf ring pads each event to 8 bytes,
-/// so the bytes past `captured` are not the packet's.
+/// Decode one `SAMPLES` entry. Each is a whole `SampleEvent`, its bytes
+/// past `captured` whatever the ring held there before: not the packet's.
 pub fn parse(event: &[u8]) -> Result<Sample<'_>, ParseError> {
     if event.len() < RECORD_LEN {
         return Err(ParseError::Short(event.len()));
@@ -170,7 +170,7 @@ mod tests {
             42,
             &[1, 2, 3, 4],
         );
-        e.extend_from_slice(&[0; 4]); // the ring's padding
+        e.extend_from_slice(&[0xee; 4]); // past `captured`: not the packet's
         let s = parse(&e).unwrap();
         assert_eq!(
             s,

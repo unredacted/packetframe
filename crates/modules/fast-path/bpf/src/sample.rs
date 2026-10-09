@@ -20,12 +20,11 @@
 //! of it stays in its own counters.
 
 use aya_ebpf::{
-    bindings::BPF_F_CURRENT_CPU,
-    helpers::{bpf_get_prandom_u32, bpf_ktime_get_ns, bpf_perf_event_output},
-    EbpfContext,
+    bindings::{__sk_buff, BPF_RB_NO_WAKEUP},
+    helpers::{bpf_get_prandom_u32, bpf_ktime_get_ns, bpf_skb_load_bytes},
 };
 
-use crate::maps::{bump, StatIdx, StatsPtr, SAMPLES, SAMPLE_CFG, SAMPLE_SCRATCH};
+use crate::maps::{bump, SampleEvent, StatIdx, StatsPtr, SAMPLES, SAMPLE_BYTES_MAX, SAMPLE_CFG};
 
 pub const PATH_XDP: u32 = 1;
 pub const PATH_TC: u32 = 2;
@@ -95,37 +94,45 @@ fn rearm(stats: StatsPtr) -> u32 {
     header_bytes
 }
 
-/// Emit the selected packet in hand. Callers check [`pending`] first, so
-/// the work of describing a packet is spent only on samples.
+/// Emit the selected packet in hand: reserve its record in `SAMPLES`,
+/// fill it in place, and submit it without a wakeup (the reader drains on
+/// a timer). `copy(dst, want)` puts up to `want` packet bytes at `dst`
+/// and says how many it did: each datapath reaches its packet its own
+/// way. Callers check [`pending`] first, so the work of describing a
+/// packet is spent only on samples.
 #[inline(always)]
-pub fn emit<C: EbpfContext>(
-    ctx: &C,
+pub fn emit(
     stats: StatsPtr,
     frame_len: u32,
     ingress_ifindex: u32,
     egress_ifindex: u32,
     meta: u32,
     vlan: u32,
+    copy: impl FnOnce(*mut u8, u32) -> u32,
 ) {
     // SAFETY: as in `tick`.
     let armed = unsafe { (*stats)[ARMED] };
     let header_bytes = rearm(stats);
     bump(stats, StatIdx::SampleSelected);
-    let rec = match SAMPLE_SCRATCH.get_ptr_mut(0) {
-        Some(r) => r,
-        None => {
-            bump(stats, StatIdx::SampleEmitFailed);
-            return;
-        }
+    let Some(mut entry) = SAMPLES.reserve::<SampleEvent>(0) else {
+        bump(stats, StatIdx::SampleEmitFailed);
+        return;
     };
-    let captured = if frame_len < header_bytes {
+    let mut want = if frame_len < header_bytes {
         frame_len
     } else {
         header_bytes
     };
-    // SAFETY: `rec` is this CPU's scratch slot, valid for the program run.
-    // Field by field: no aggregate store for LLVM to turn into memset.
+    if want > SAMPLE_BYTES_MAX as u32 {
+        want = SAMPLE_BYTES_MAX as u32;
+    }
+    let ev = entry.as_mut_ptr();
+    // SAFETY: `ev` is the reservation, valid and 8-aligned until submit.
+    // Raw field pointers, never references, into memory not yet written;
+    // field by field, so no aggregate store becomes a memset.
     unsafe {
+        let captured = copy(core::ptr::addr_of_mut!((*ev).bytes) as *mut u8, want);
+        let rec = core::ptr::addr_of_mut!((*ev).rec);
         (*rec).ktime_ns = bpf_ktime_get_ns();
         (*rec).generation = (armed >> 32) as u32;
         (*rec).rate = armed as u32;
@@ -136,19 +143,104 @@ pub fn emit<C: EbpfContext>(
         (*rec).meta = meta;
         (*rec).vlan = vlan;
     }
-    // The upper 32 bits of the flags (BPF_F_CTXLEN_MASK) ask the kernel to
-    // append that many bytes of the packet. The raw helper rather than
-    // `PerfEventArray::output`, which drops the return code.
-    let rc = unsafe {
-        bpf_perf_event_output(
-            ctx.as_ptr(),
-            &SAMPLES as *const _ as *mut core::ffi::c_void,
-            (u64::from(captured) << 32) | BPF_F_CURRENT_CPU as u64,
-            rec as *mut core::ffi::c_void,
-            core::mem::size_of::<crate::maps::SampleRecord>() as u64,
-        )
-    };
-    if rc != 0 {
-        bump(stats, StatIdx::SampleEmitFailed);
+    entry.submit(BPF_RB_NO_WAKEUP as u64);
+}
+
+/// Copy `want` (8 to [`SAMPLE_BYTES_MAX`]) bytes of an XDP frame spanning
+/// `[start, end)` to `dst`, eight at a time, every read bounds-checked
+/// for the verifier: 5.15 has no `bpf_xdp_load_bytes` (5.18), and generic
+/// XDP hands the program a linear frame. Returns the bytes copied, 0 for
+/// a `want` out of range (no frame is under 14 bytes, nor `header-bytes`
+/// under 64).
+///
+/// The bytes past the last whole word go as the word ending at `want`,
+/// which copies some again: a byte at a time needs a `p + 1 > end`
+/// check, which LLVM emits as `p >= end`, a compare the verifier gives
+/// too little range. That word's offset varies, so its pointer and offset
+/// pass through [`opaque`]: otherwise LLVM folds `start + (want - 8) + 8`
+/// into `start + want`, a pointer of another id than the one read, and
+/// the verifier cannot tie the check to the read.
+#[inline(always)]
+pub fn copy_frame(start: usize, end: usize, dst: *mut u8, want: u32) -> u32 {
+    const WORDS: usize = SAMPLE_BYTES_MAX / 8;
+    if !(8..=SAMPLE_BYTES_MAX as u32).contains(&want) {
+        return 0;
     }
+    let want = want as usize;
+    let mut i = 0;
+    while i < WORDS {
+        let off = i * 8;
+        if off + 8 > want {
+            break;
+        }
+        if start + off + 8 > end {
+            return off as u32;
+        }
+        // SAFETY: `start + off..start + off + 8` is inside the frame
+        // (checked above) and `dst + off + 8` inside the reservation's
+        // bytes (`off + 8` ≤ `want` ≤ 256).
+        unsafe { copy_word(start + off, dst.add(off)) };
+        i += 1;
+    }
+    if want % 8 != 0 {
+        // Bounded again past the barrier, for the verifier.
+        let off = opaque(want - 8);
+        if off > SAMPLE_BYTES_MAX - 8 {
+            return (i * 8) as u32;
+        }
+        let src = opaque(start + off);
+        if src + 8 > end {
+            return (i * 8) as u32;
+        }
+        // SAFETY: as above, for the word ending at `want`.
+        unsafe { copy_word(src, dst.add(off)) };
+    }
+    want as u32
+}
+
+/// # Safety
+/// `src..src + 8` and `dst..dst + 8` are valid.
+#[inline(always)]
+unsafe fn copy_word(src: usize, dst: *mut u8) {
+    core::ptr::write_unaligned(
+        dst as *mut u64,
+        core::ptr::read_unaligned(src as *const u64),
+    );
+}
+
+/// Copy `want` (at most [`SAMPLE_BYTES_MAX`]) bytes of the skb to `dst`
+/// with `bpf_skb_load_bytes`, which reaches past the linear head. Returns
+/// the bytes copied: 0 when the helper refused.
+#[inline(always)]
+pub fn copy_skb(skb: *mut __sk_buff, dst: *mut u8, want: u32) -> u32 {
+    if want == 0 || want > SAMPLE_BYTES_MAX as u32 {
+        return 0;
+    }
+    let len = helper_len(want);
+    // SAFETY: the program's own skb, and `dst` holds SAMPLE_BYTES_MAX bytes.
+    let rc = unsafe { bpf_skb_load_bytes(skb as *const _, 0, dst as *mut _, len) };
+    if rc == 0 {
+        len
+    } else {
+        0
+    }
+}
+
+/// `want` (1 to [`SAMPLE_BYTES_MAX`]) as a helper's size argument, which
+/// the verifier needs to see in [1, 256]. Built to be, since a compare
+/// does not show it: LLVM folds the two bounds into one compare and
+/// zero-extends after it, and 5.15 learns nothing from `!= 0`.
+#[inline(always)]
+fn helper_len(want: u32) -> u32 {
+    (opaque(want - 1) & (SAMPLE_BYTES_MAX as u32 - 1)) + 1
+}
+
+/// `v`, which LLVM can no longer relate to how it was computed: read back
+/// through a stack slot, which the verifier follows exactly (a packet
+/// pointer keeps its id). libbpf's `barrier_var`, without inline asm.
+#[inline(always)]
+fn opaque<T: Copy>(v: T) -> T {
+    let slot = v;
+    // SAFETY: a local, read once.
+    unsafe { core::ptr::read_volatile(&slot) }
 }

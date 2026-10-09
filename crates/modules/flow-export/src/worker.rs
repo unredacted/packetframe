@@ -96,23 +96,15 @@ pub enum Link {
     Ip,
 }
 
-/// fast-path's sampler: its configuration map and its rings.
+/// fast-path's sampler: its configuration map and its ring.
 pub trait SampleSource {
     /// Apply the sampler's configuration (rate 0 is off).
     fn configure(&mut self, cfg: SampleCfg) -> Result<(), String>;
-    /// Make the rings hold a few ticks of samples at `rate`. Their size
-    /// is also what bounds one tick's work: a drain takes what they hold,
-    /// and a burst beyond it is lost in them, which coverage reports.
-    ///
-    /// Rings being replaced leave the map first and are drained into
-    /// `left`, so no sample is lost uncounted: each is either in `left` or
-    /// a failed output the program counts. `left` is filled even when this
-    /// fails.
-    fn ensure_capacity(&mut self, rate: u32, left: &mut Leftover) -> Result<(), String>;
-    /// Hand every sample event published since the last drain to `f`;
-    /// return the samples the rings reported lost.
-    fn drain(&mut self, f: &mut dyn FnMut(&[u8])) -> u64;
-    /// The programs' cumulative count of samples they could not output
+    /// Hand every sample submitted since the last drain to `f`, up to what
+    /// the ring holds: the ring's size bounds one tick's work, and a burst
+    /// beyond it is refused a place in the ring, which the programs count.
+    fn drain(&mut self, f: &mut dyn FnMut(&[u8]));
+    /// The programs' cumulative count of samples the ring had no room for
     /// (STATS `sample_emit_failed`), when it can be read.
     fn emit_failed(&mut self) -> Option<u64>;
     /// The clock the events' `ktime_ns` is on (`bpf_ktime_get_ns`:
@@ -157,14 +149,6 @@ pub fn configure_together(
     }
 }
 
-/// What replacing the rings left: the events the old ones held, and the
-/// samples they reported lost.
-#[derive(Debug, Default)]
-pub struct Leftover {
-    pub events: Vec<Vec<u8>>,
-    pub lost: u64,
-}
-
 /// A reload for the worker to apply, and where it answers whether it did.
 pub struct Reload {
     pub cfg: FlowExportConfig,
@@ -196,10 +180,9 @@ pub struct Published {
     pub collectors: Vec<CollectorReport>,
     /// Samples exported, by path.
     pub samples_total: BTreeMap<Path, u64>,
-    /// Samples fast-path's programs could not output, or its rings
-    /// reported lost when that count cannot be read.
+    /// Samples fast-path's programs (and the kernel sampler's) found no
+    /// room for in their ring.
     pub lost_total: u64,
-    pub ring_lost_total: u64,
     /// Samples lost on the way from VPP's plugin: its rings full or
     /// unreadable, or left in an epoch that ended.
     pub vpp_lost_total: u64,
@@ -403,8 +386,6 @@ pub struct Worker<S, P, T, V = NoVpp> {
     /// fast-path's programs, and by VPP's plugin.
     pending_drops: u32,
     vpp_pending_drops: u32,
-    /// What the last ring replacement left, for the next tick to export.
-    leftover: Leftover,
     /// The IPFIX flow cache and its exporters, while a collector takes
     /// IPFIX.
     flows: Option<Flows>,
@@ -454,7 +435,6 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
         shared: Shared,
         now: Instant,
     ) -> Result<Self, String> {
-        source.ensure_capacity(cfg.rate, &mut Leftover::default())?;
         source.configure(SampleCfg::new(cfg.rate, cfg.header_bytes, 1))?;
         let collectors = cfg
             .collectors
@@ -487,7 +467,6 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
             last_emit_failed: None,
             pending_drops: 0,
             vpp_pending_drops: 0,
-            leftover: Leftover::default(),
             p: Published::default(),
         })
     }
@@ -513,7 +492,6 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
             last_emit_failed: self.last_emit_failed,
             pending_drops: self.pending_drops,
             vpp_pending_drops: self.vpp_pending_drops,
-            leftover: self.leftover,
             flows: self.flows,
             asn: self.asn,
             wall_epoch_ms: self.wall_epoch_ms,
@@ -755,11 +733,7 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
             let generation = self.generation + 1;
             let r = self
                 .source
-                .ensure_capacity(new.rate, &mut self.leftover)
-                .and_then(|()| {
-                    self.source
-                        .configure(SampleCfg::new(new.rate, new.header_bytes, generation))
-                });
+                .configure(SampleCfg::new(new.rate, new.header_bytes, generation));
             if let Err(e) = r {
                 let e = format!(
                     "a reload to 1:{} with {} header bytes could not be applied: {e}",
@@ -873,29 +847,20 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
 
     fn take_samples(&mut self) -> Vec<Ready> {
         let mut ready = Vec::new();
-        let left = std::mem::take(&mut self.leftover);
         let clock = self.source.clock_ns();
         let (sources, p, pending) = (&mut self.sources, &mut self.p, &mut self.pending_drops);
-        for e in &left.events {
-            ingest(e, clock, sources, p, pending, &mut ready);
-        }
-        let ring_lost = left.lost
-            + self
-                .source
-                .drain(&mut |e| ingest(e, clock, sources, p, pending, &mut ready));
-        self.p.ring_lost_total += ring_lost;
-        // The programs' own count covers both a full ring and a CPU with
-        // none; the rings' count is a full ring only, and the same
-        // samples. One or the other, never both. A tick it cannot be read
-        // ends its baseline: the next reading starts a new one rather than
-        // counting the gap's losses a second time.
-        let emit_failed = self.source.emit_failed();
-        let lost = match (emit_failed, self.last_emit_failed) {
-            (Some(now), Some(before)) => now.saturating_sub(before),
-            (Some(_), None) => 0,
-            (None, _) => ring_lost,
+        self.source
+            .drain(&mut |e| ingest(e, clock, sources, p, pending, &mut ready));
+        // The programs count each sample the ring had no room for. A tick
+        // the count cannot be read keeps the baseline: the next reading
+        // counts the gap's losses then.
+        let Some(emit_failed) = self.source.emit_failed() else {
+            return ready;
         };
-        self.last_emit_failed = emit_failed;
+        let lost = self
+            .last_emit_failed
+            .map_or(0, |before| emit_failed.saturating_sub(before));
+        self.last_emit_failed = Some(emit_failed);
         self.window_lost += lost;
         self.p.lost_total += lost;
         self.pending_drops = self.pending_drops.wrapping_add(lost as u32);
@@ -1233,13 +1198,10 @@ mod tests {
     struct FakeSource {
         cfgs: Rc<RefCell<Vec<SampleCfg>>>,
         events: Rc<RefCell<VecDeque<Vec<u8>>>>,
-        ring_lost: Rc<RefCell<u64>>,
         emit_failed: Rc<RefCell<Option<u64>>>,
         refuse: bool,
-        /// The next ring replacement fails.
-        capacity_fails: Rc<RefCell<bool>>,
-        /// What the replaced rings held.
-        held: Rc<RefCell<Vec<Vec<u8>>>>,
+        /// Configuring fails while set.
+        refusing: Rc<RefCell<bool>>,
         /// The next drain panics.
         panics: Rc<RefCell<bool>>,
         /// The programs' clock; the events are sampled at 7 ns.
@@ -1248,20 +1210,13 @@ mod tests {
 
     impl SampleSource for FakeSource {
         fn configure(&mut self, cfg: SampleCfg) -> Result<(), String> {
-            if self.refuse {
+            if self.refuse || *self.refusing.borrow() {
                 return Err("SAMPLE_CFG: EPERM".into());
             }
             self.cfgs.borrow_mut().push(cfg);
             Ok(())
         }
-        fn ensure_capacity(&mut self, _: u32, left: &mut Leftover) -> Result<(), String> {
-            left.events.append(&mut self.held.borrow_mut());
-            if *self.capacity_fails.borrow() {
-                return Err("perf rings: ENOMEM".into());
-            }
-            Ok(())
-        }
-        fn drain(&mut self, f: &mut dyn FnMut(&[u8])) -> u64 {
+        fn drain(&mut self, f: &mut dyn FnMut(&[u8])) {
             if *self.panics.borrow() {
                 panic!("ring fault");
             }
@@ -1269,7 +1224,6 @@ mod tests {
             while let Some(e) = q.pop_front() {
                 f(&e);
             }
-            std::mem::take(&mut *self.ring_lost.borrow_mut())
         }
         fn emit_failed(&mut self) -> Option<u64> {
             *self.emit_failed.borrow()
@@ -1395,11 +1349,9 @@ mod tests {
             FakeSource {
                 cfgs: src.cfgs.clone(),
                 events: src.events.clone(),
-                ring_lost: src.ring_lost.clone(),
                 emit_failed: src.emit_failed.clone(),
                 refuse: false,
-                capacity_fails: src.capacity_fails.clone(),
-                held: src.held.clone(),
+                refusing: src.refusing.clone(),
                 panics: src.panics.clone(),
                 clock_ns: src.clock_ns.clone(),
             },
@@ -1499,13 +1451,10 @@ mod tests {
         let mut r = rig(1000);
         *r.src.emit_failed.borrow_mut() = Some(10);
         r.w.tick(r.t0);
-        // The program failed 5 more outputs, and the ring reported 5 lost:
-        // the same samples.
+        // The ring had no room for 5 more.
         *r.src.emit_failed.borrow_mut() = Some(15);
-        *r.src.ring_lost.borrow_mut() = 5;
         r.w.tick(r.t0 + TICK);
-        let p = r.shared.snapshot();
-        assert_eq!((p.lost_total, p.ring_lost_total), (5, 5));
+        assert_eq!(r.shared.snapshot().lost_total, 5);
         r.w.tick(r.t0 + WINDOW);
         assert!(matches!(
             r.shared.snapshot().ports[0].state,
@@ -1522,11 +1471,11 @@ mod tests {
     fn a_reload_that_cannot_be_applied_changes_nothing_and_is_tried_again() {
         let mut r = rig(1000);
         r.w.tick(r.t0);
-        *r.src.capacity_fails.borrow_mut() = true;
+        *r.src.refusing.borrow_mut() = true;
         let answer = reload(&r.shared, cfg(100));
         r.w.tick(r.t0 + TICK);
         let e = answer.try_recv().unwrap().unwrap_err();
-        assert!(e.contains("1:100") && e.contains("ENOMEM"), "{e}");
+        assert!(e.contains("1:100") && e.contains("EPERM"), "{e}");
         let p = r.shared.snapshot();
         assert_eq!(
             (p.rate, p.generation),
@@ -1537,24 +1486,13 @@ mod tests {
         assert_eq!(r.src.cfgs.borrow().len(), 1, "SAMPLE_CFG untouched");
         // The same reload again, now that it can be applied: not mistaken
         // for the configuration already in place.
-        *r.src.capacity_fails.borrow_mut() = false;
+        *r.src.refusing.borrow_mut() = false;
         let answer = reload(&r.shared, cfg(100));
         r.w.tick(r.t0 + 2 * TICK);
         assert_eq!(answer.try_recv().unwrap(), Ok(()));
         let p = r.shared.snapshot();
         assert_eq!((p.rate, p.generation), (100, 2));
         assert!(p.source_error.is_none());
-    }
-
-    #[test]
-    fn samples_left_in_replaced_rings_are_exported() {
-        let mut r = rig(1000);
-        r.w.tick(r.t0);
-        r.src.held.borrow_mut().push(event(3, 0, 0, 1000, 1));
-        let _ = reload(&r.shared, cfg(100));
-        r.w.tick(r.t0 + TICK);
-        assert_eq!(r.shared.snapshot().samples_total[&Path::Xdp], 1);
-        assert_eq!(r.net.sent.borrow().len(), 1);
     }
 
     #[test]
@@ -1578,22 +1516,20 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_loss_counter_starts_a_new_baseline() {
+    fn an_unreadable_loss_counter_keeps_its_baseline() {
         let mut r = rig(1000);
         *r.src.emit_failed.borrow_mut() = Some(10);
         r.w.tick(r.t0);
-        // Unreadable for a tick: the rings' count stands in.
         *r.src.emit_failed.borrow_mut() = None;
-        *r.src.ring_lost.borrow_mut() = 3;
         r.w.tick(r.t0 + TICK);
-        // Readable again, having counted those 3 and 7 before: a new
-        // baseline, not 10 more.
+        assert_eq!(r.shared.snapshot().lost_total, 0);
+        // Readable again: the gap's losses are counted now, once.
         *r.src.emit_failed.borrow_mut() = Some(20);
         r.w.tick(r.t0 + 2 * TICK);
-        assert_eq!(r.shared.snapshot().lost_total, 3);
+        assert_eq!(r.shared.snapshot().lost_total, 10);
         *r.src.emit_failed.borrow_mut() = Some(21);
         r.w.tick(r.t0 + 3 * TICK);
-        assert_eq!(r.shared.snapshot().lost_total, 4);
+        assert_eq!(r.shared.snapshot().lost_total, 11);
     }
 
     #[test]

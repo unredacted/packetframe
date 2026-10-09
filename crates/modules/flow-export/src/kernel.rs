@@ -174,7 +174,7 @@ pub fn attach(
             return Err(format!("kernel-sample {iface}: {why}"));
         }
     }
-    // A daemon that died left its filters sampling into rings no one
+    // A daemon that died left its filters sampling into a ring no one
     // reads: gone before ours go on.
     detach_from_state_dir(state_dir)?;
     let mut ebpf = Ebpf::load(&aligned_kernel_sample_copy())
@@ -196,8 +196,8 @@ pub fn attach(
     let cfg = Array::try_from(take(&mut ebpf, "KSAMPLE_CFG")?)
         .map_err(|e| format!("KSAMPLE_CFG: {e}"))?;
     let samples = match take(&mut ebpf, "KSAMPLES")? {
-        Map::PerfEventArray(m) => m,
-        _ => return Err("KSAMPLES is not a perf event array".into()),
+        Map::RingBuf(m) => m,
+        _ => return Err("KSAMPLES is not a ring buffer".into()),
     };
     let state = PerCpuArray::try_from(take(&mut ebpf, "KSAMPLE_STATE")?)
         .map_err(|e| format!("KSAMPLE_STATE: {e}"))?;
