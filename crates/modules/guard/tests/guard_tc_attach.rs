@@ -7,7 +7,8 @@
 //! filter landing where `tc filter show ... egress` can see it,
 //! `guard-tc-links.json` persistence, out-of-process detach clearing
 //! the filter while **leaving clsact in place**, the vanished-iface
-//! teardown branch, and a renamed device found by its ifindex.
+//! teardown branch, and a renamed device found by its ifindex, by
+//! detach and by health.
 //!
 //! NOT in the hardware-artifacts SAFE suite: it creates interfaces.
 
@@ -341,5 +342,119 @@ fn detach_follows_a_renamed_device() {
         "the new {RN_A}'s filter (prio {p2}, handle {h2}) must survive: {shown}"
     );
     assert!(tc_links::load(&state_dir).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+const BPFFS: &str = "/sys/fs/bpf";
+const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
+
+/// Once per process, and never over a bpffs already there (it may hold
+/// live pins). Mirror of flow-export's end_to_end `ensure_bpffs`.
+fn ensure_bpffs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let c = std::ffi::CString::new(BPFFS).unwrap();
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        #[allow(clippy::unnecessary_cast)] // f_type's width differs across libcs
+        let mounted =
+            unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 && st.f_type as i64 == BPF_FS_MAGIC;
+        if !mounted {
+            run(&["mount", "-t", "bpf", "bpf", BPFFS]);
+        }
+    });
+}
+
+/// Health finds the device by its ifindex, as detach does. Renamed, the
+/// filter still enforces under the new name, so the row says that, not
+/// "vanished"; nor "recreated" once another device takes the old name.
+/// Driven through `GuardModule`, the loader's own path.
+#[test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test -p packetframe-guard --tests -- --ignored`"]
+fn health_follows_a_renamed_device() {
+    use packetframe_common::config::{Config, GlobalConfig};
+    use packetframe_common::module::{HealthCtx, HealthState, LoaderCtx, Module, ModuleConfig};
+    use packetframe_guard::GuardModule;
+
+    if !packetframe_guard::GUARD_BPF_AVAILABLE {
+        eprintln!("BPF stub in effect (no rustup); skipping guard tc attach test.");
+        return;
+    }
+    const HL_A: &str = "pf-ghl0";
+    const HL_B: &str = "pf-ghl1";
+    const HL_C: &str = "pf-ghl2";
+    const RENAMED: &str = "pf-ghl0r";
+    let bpffs_root =
+        std::path::Path::new(BPFFS).join(format!("pf-guard-health-{}", std::process::id()));
+    struct HlCleanup(std::path::PathBuf);
+    impl Drop for HlCleanup {
+        fn drop(&mut self) {
+            for dev in [HL_A, RENAMED] {
+                let _ = Command::new("ip").args(["link", "del", dev]).status();
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    ensure_bpffs();
+    let state_dir = state_dir("health");
+    let _cleanup = HlCleanup(bpffs_root.clone());
+    for dev in [HL_A, RENAMED] {
+        let _ = Command::new("ip").args(["link", "del", dev]).status();
+    }
+
+    run(&[
+        "ip", "link", "add", HL_A, "type", "veth", "peer", "name", HL_B,
+    ]);
+    let config = Config::parse(&format!(
+        "module guard\n  interface {HL_A}\n  lldp {HL_A} drop\n"
+    ))
+    .expect("config parses");
+    let global = GlobalConfig::default();
+    let cfg = ModuleConfig::new(&config.modules[0], &global);
+    let mut m = GuardModule::new();
+    m.load(
+        &cfg,
+        &LoaderCtx {
+            bpffs_root: &bpffs_root,
+            state_dir: &state_dir,
+        },
+    )
+    .expect("load");
+    m.attach(&cfg).expect("attach");
+    let row = |m: &GuardModule| {
+        let report = m.health_check(&HealthCtx::new()).expect("health");
+        let row = report
+            .subsystems
+            .into_iter()
+            .find(|s| s.name == format!("attach:{HL_A}"))
+            .expect("one row per configured interface");
+        (row.state, row.message.unwrap_or_default())
+    };
+    assert_eq!(row(&m), (HealthState::Healthy, String::new()));
+
+    run(&["ip", "link", "set", HL_A, "name", RENAMED]);
+    let shown = capture(&["tc", "filter", "show", "dev", RENAMED, "egress"]);
+    assert!(shown.contains("guard_egress"), "still enforcing: {shown}");
+    let (state, msg) = row(&m);
+    assert_eq!(state, HealthState::Degraded, "{msg}");
+    assert!(
+        msg.contains(&format!("renamed to {RENAMED}")) && msg.contains("still enforces"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(&format!("would fail to attach {HL_A}")),
+        "{msg}"
+    );
+
+    run(&[
+        "ip", "link", "add", HL_A, "type", "veth", "peer", "name", HL_C,
+    ]);
+    let (state, msg) = row(&m);
+    assert_eq!(state, HealthState::Degraded, "{msg}");
+    assert!(msg.contains(&format!("renamed to {RENAMED}")), "{msg}");
+    assert!(!msg.contains("recreated"), "{msg}");
+
+    m.detach().expect("detach finds the renamed device");
+    let shown = capture(&["tc", "filter", "show", "dev", RENAMED, "egress"]);
+    assert!(!shown.contains("guard_egress"), "taken down: {shown}");
     let _ = std::fs::remove_dir_all(&state_dir);
 }

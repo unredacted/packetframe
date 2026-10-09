@@ -299,38 +299,21 @@ pub fn detach_from_state_dir(state_dir: &Path, bpffs_root: &Path) -> ModuleResul
     }
 }
 
-/// `Module::health_check`: one row per attached interface (an iface
-/// that vanished took its qdisc-lifetime filter with it), plus one
-/// informational counters row.
+/// `Module::health_check`: one row per attached interface (see
+/// [`attach_row`]), plus one informational counters row.
 ///
 /// Deliberately does NOT probe filter presence via
 /// `SchedClassifierLink::attached()` — dropping the constructed link
 /// DETACHES the filter. Presence is asserted indirectly (record +
-/// iface + config entry); a read-only netlink filter dump is future
-/// work.
+/// device by ifindex + config entry); a read-only netlink filter dump
+/// is future work.
 pub(crate) fn health(state: &ActiveState) -> HealthReport {
     let mut overall = HealthState::Healthy;
     let mut subsystems = Vec::new();
     for (iface, ifindex, _) in &state.attached {
-        // Compare ifindex, not mere name existence: a deleted-and-
-        // recreated device keeps its name but took the qdisc-lifetime
-        // filter with it — a name-only check would report green while
-        // enforcement is silently absent (review finding, PR #205).
-        let (hs, message) = match ifindex_of(iface) {
-            Err(_) => (
-                HealthState::Degraded,
-                Some("interface vanished; its egress filter died with it".to_string()),
-            ),
-            Ok(current) if current != *ifindex => (
-                HealthState::Degraded,
-                Some(format!(
-                    "interface recreated (ifindex {ifindex} → {current}); the egress \
-                     filter died with the old device — restart (stop, `packetframe \
-                     detach`, start) to re-attach"
-                )),
-            ),
-            Ok(_) => (HealthState::Healthy, None),
-        };
+        let (hs, message) = attach_row(iface, *ifindex, name_of(*ifindex), || {
+            ifindex_of(iface).ok()
+        });
         overall = overall.worse_of(hs);
         subsystems.push(SubsystemHealth {
             name: format!("attach:{iface}"),
@@ -356,6 +339,59 @@ pub(crate) fn health(state: &ActiveState) -> HealthReport {
     HealthReport {
         overall,
         subsystems,
+    }
+}
+
+/// One `attach:<iface>` row. `now` is what the device with the attach-
+/// time ifindex is called now (`name_of`), as `tc_detach_one` finds it:
+/// a name-only check misreads both a deleted-and-recreated device, which
+/// keeps the name but not the qdisc-lifetime filter (review finding,
+/// PR #205), and a renamed one, which keeps the filter but not the name.
+/// `by_name`, the configured name's ifindex now, only words the row.
+fn attach_row(
+    iface: &str,
+    ifindex: u32,
+    now: std::io::Result<Option<String>>,
+    by_name: impl FnOnce() -> Option<u32>,
+) -> (HealthState, Option<String>) {
+    match now {
+        Ok(Some(name)) if name == iface => (HealthState::Healthy, None),
+        // Enforcing, so not Unhealthy; but attach goes by the configured
+        // name, so a restart would not put the filter back here.
+        Ok(Some(name)) => {
+            let restart = match by_name() {
+                Some(other) => format!("would attach the new {iface} (ifindex {other}) instead"),
+                None => format!("would fail to attach {iface}: no device has that name"),
+            };
+            (
+                HealthState::Degraded,
+                Some(format!(
+                    "renamed to {name} since attach: its egress filter still enforces \
+                     there, but a restart {restart} — rename it back, or update the \
+                     config and restart"
+                )),
+            )
+        }
+        Ok(None) => (
+            HealthState::Degraded,
+            Some(match by_name() {
+                Some(current) => format!(
+                    "interface recreated (ifindex {ifindex} → {current}); the egress \
+                     filter died with the old device — restart (stop, `packetframe \
+                     detach`, start) to re-attach"
+                ),
+                None => "interface vanished; its egress filter died with it".to_string(),
+            }),
+        ),
+        // Says nothing about the device, so nothing either way about
+        // its filter; not Healthy, which would vouch for it.
+        Err(e) => (
+            HealthState::Degraded,
+            Some(format!(
+                "cannot tell whether the egress filter still runs: find ifindex \
+                 {ifindex}: {e}"
+            )),
+        ),
     }
 }
 
@@ -661,13 +697,65 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ifindex_of, name_of, parse_mac};
+    use super::{attach_row, ifindex_of, name_of, parse_mac};
+    use packetframe_common::module::HealthState;
 
     #[test]
     fn a_device_is_named_by_its_ifindex() {
         let lo = ifindex_of("lo").unwrap();
         assert_eq!(name_of(lo).unwrap().as_deref(), Some("lo"));
         assert_eq!(name_of(u32::MAX).unwrap(), None);
+    }
+
+    fn degraded(row: (HealthState, Option<String>)) -> String {
+        assert_eq!(row.0, HealthState::Degraded, "{:?}", row.1);
+        row.1.expect("a Degraded row says why")
+    }
+
+    #[test]
+    fn the_attach_row_finds_the_device_by_ifindex() {
+        let row = attach_row("br0", 7, Ok(Some("br0".into())), || unreachable!());
+        assert_eq!(row, (HealthState::Healthy, None));
+
+        let gone = degraded(attach_row("br0", 7, Ok(None), || None));
+        assert!(gone.contains("vanished"), "{gone}");
+        let recreated = degraded(attach_row("br0", 7, Ok(None), || Some(9)));
+        assert!(
+            recreated.contains("recreated (ifindex 7 → 9)"),
+            "{recreated}"
+        );
+    }
+
+    /// Still enforcing under the new name, so not "vanished" (the row
+    /// before ifindex lookup), nor "recreated" when another device took
+    /// the old name; not Healthy either, as a restart attaches by name.
+    #[test]
+    fn a_renamed_device_reads_as_enforcing_under_a_name_the_config_lacks() {
+        let alone = degraded(attach_row("br0", 7, Ok(Some("br0x".into())), || None));
+        assert!(
+            alone.contains("renamed to br0x") && alone.contains("still enforces"),
+            "{alone}"
+        );
+        assert!(alone.contains("would fail to attach br0"), "{alone}");
+
+        let replaced = degraded(attach_row("br0", 7, Ok(Some("br0x".into())), || Some(9)));
+        assert!(replaced.contains("still enforces"), "{replaced}");
+        assert!(replaced.contains("new br0 (ifindex 9)"), "{replaced}");
+        assert!(!replaced.contains("recreated"), "{replaced}");
+    }
+
+    /// A failed lookup says nothing about the device: neither gone nor
+    /// vouched for.
+    #[test]
+    fn a_failed_lookup_is_neither_gone_nor_healthy() {
+        let failed = degraded(attach_row(
+            "br0",
+            7,
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            || unreachable!(),
+        ));
+        assert!(failed.contains("cannot tell"), "{failed}");
+        assert!(!failed.contains("vanished"), "{failed}");
     }
 
     #[test]
