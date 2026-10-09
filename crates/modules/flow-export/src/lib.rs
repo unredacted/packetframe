@@ -36,6 +36,8 @@ mod vpp_live;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use packetframe_common::fib::asn::AsnTable;
+use packetframe_common::fib::SharedPrefixes;
 use packetframe_common::flow_coverage::FlowCoverage;
 use packetframe_common::sampler_ports::VppSamplerPorts;
 
@@ -70,8 +72,18 @@ pub struct FlowExportModule {
     /// configured.
     vpp: Option<(Arc<VppSamplerPorts>, PathBuf)>,
     coverage: Arc<FlowCoverage>,
+    asn: Option<Arc<AsnTable>>,
+    local_default: Option<Arc<SharedPrefixes>>,
     #[cfg(target_os = "linux")]
     running: Option<linux::Running>,
+}
+
+/// What the module is handed from outside its section, for its worker.
+#[cfg(target_os = "linux")]
+pub(crate) struct Handles {
+    pub vpp: Option<(Arc<VppSamplerPorts>, PathBuf)>,
+    pub coverage: Arc<FlowCoverage>,
+    pub asn: Option<Arc<AsnTable>>,
 }
 
 impl FlowExportModule {
@@ -84,6 +96,30 @@ impl FlowExportModule {
     /// is the only place that sees both modules.
     pub fn set_vpp(&mut self, ports: Arc<VppSamplerPorts>, dir: PathBuf) {
         self.vpp = Some((ports, dir));
+    }
+
+    /// Fill flow records' AS fields from the origins fast-path's
+    /// programmer publishes. The loader builds the table when fast-path
+    /// has a route source.
+    pub fn set_asn_table(&mut self, table: Arc<AsnTable>) {
+        self.asn = Some(table);
+    }
+
+    /// fast-path's allowlist, as the loader keeps it current: the local
+    /// prefixes of the privacy profiles when the section names none.
+    /// Taken at attach and at each reconfigure, which runs after
+    /// fast-path's: a reload fast-path refused leaves it as it was.
+    pub fn set_local_default(&mut self, prefixes: Arc<SharedPrefixes>) {
+        self.local_default = Some(prefixes);
+    }
+
+    fn with_local_default(&self, mut c: FlowExportConfig) -> FlowExportConfig {
+        c.local_default = self
+            .local_default
+            .as_ref()
+            .map(|h| h.get())
+            .unwrap_or_default();
+        c
     }
 
     /// What this module vouches for, per port and path and per collector,
@@ -117,13 +153,17 @@ impl Module for FlowExportModule {
         let c = self
             .cfg
             .clone()
+            .map(|c| self.with_local_default(c))
             .ok_or_else(|| ModuleError::other(MODULE_NAME, "attach before load"))?;
         let running = linux::Running::start(
             c,
             &self.bpffs_root,
             &self.state_dir,
-            self.vpp.clone(),
-            self.coverage.clone(),
+            Handles {
+                vpp: self.vpp.clone(),
+                coverage: self.coverage.clone(),
+                asn: self.asn.clone(),
+            },
         )
         .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         self.running = Some(running);
@@ -138,6 +178,7 @@ impl Module for FlowExportModule {
 
     fn reconfigure(&mut self, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
         let new = FlowExportConfig::from_directives(&cfg.section.directives)
+            .map(|c| self.with_local_default(c))
             .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         if let Some(old) = &self.cfg {
             old.restart_only_delta(&new)

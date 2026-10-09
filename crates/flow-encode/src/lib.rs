@@ -121,6 +121,8 @@ pub enum Profile {
     Full,
     /// As `Full` without the source address.
     NoSource,
+    /// As `Full` without the destination address.
+    NoDestination,
     /// No addresses at all: AS numbers, ports and protocol only.
     AsOnly,
 }
@@ -145,6 +147,7 @@ pub fn flow_fields(family: Family, profile: Profile, sampling: SamplingSignal) -
     match profile {
         Profile::Full => f.extend([src, dst]),
         Profile::NoSource => f.push(dst),
+        Profile::NoDestination => f.push(src),
         Profile::AsOnly => {}
     }
     f.extend([
@@ -225,6 +228,9 @@ mod tests {
         let nosrc = flow_fields(Family::V4, Profile::NoSource, SamplingSignal::Options);
         assert!(!nosrc.contains(&Field::SrcIpv4) && nosrc.contains(&Field::DstIpv4));
         assert!(!nosrc.contains(&Field::SamplingInterval));
+
+        let nodst = flow_fields(Family::V4, Profile::NoDestination, SamplingSignal::Options);
+        assert!(nodst.contains(&Field::SrcIpv4) && !nodst.contains(&Field::DstIpv4));
 
         let asonly = flow_fields(Family::V6, Profile::AsOnly, SamplingSignal::InRecord);
         assert!(!asonly.iter().any(|f| matches!(

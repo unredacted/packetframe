@@ -5,9 +5,10 @@
 use std::net::{IpAddr, SocketAddr};
 
 use packetframe_common::config::{
-    CollectorFormat, CollectorKind, ModuleDirective, FLOW_BUDGET_RATE, FLOW_DEFAULT_HEADER_BYTES,
-    FLOW_DEFAULT_RATE,
+    CollectorFormat, CollectorKind, CollectorProfile, ModuleDirective, FLOW_BUDGET_RATE,
+    FLOW_DEFAULT_HEADER_BYTES, FLOW_DEFAULT_RATE,
 };
+use packetframe_common::fib::IpPrefix;
 
 use crate::flows::Limits;
 use packetframe_common::module::RESTART_SEQUENCE;
@@ -18,6 +19,7 @@ pub struct Collector {
     pub addr: SocketAddr,
     pub kind: CollectorKind,
     pub format: CollectorFormat,
+    pub profile: CollectorProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +32,11 @@ pub struct FlowExportConfig {
     pub collectors: Vec<Collector>,
     /// The IPFIX flow cache's bounds.
     pub cache: Limits,
+    /// `privacy-local-prefix`: empty means `local_default`.
+    pub local: Vec<IpPrefix>,
+    /// fast-path's allowlist as the module took it at attach or reload,
+    /// not from the section.
+    pub local_default: Vec<IpPrefix>,
 }
 
 impl FlowExportConfig {
@@ -39,6 +46,7 @@ impl FlowExportConfig {
         let mut header_bytes = FLOW_DEFAULT_HEADER_BYTES;
         let mut collectors = Vec::new();
         let mut cache = Limits::default();
+        let mut local = Vec::new();
         for d in directives {
             match d {
                 ModuleDirective::FlowSourceAddress { addr, .. } => source = Some(*addr),
@@ -49,13 +57,16 @@ impl FlowExportConfig {
                     addr,
                     kind,
                     format,
+                    profile,
                     ..
                 } => collectors.push(Collector {
                     name: name.clone(),
                     addr: *addr,
                     kind: *kind,
                     format: *format,
+                    profile: *profile,
                 }),
+                ModuleDirective::FlowLocalPrefix { prefix, .. } => local.push(*prefix),
                 ModuleDirective::FlowCache {
                     entries,
                     active,
@@ -81,7 +92,22 @@ impl FlowExportConfig {
             header_bytes,
             collectors,
             cache,
+            local,
+            local_default: Vec::new(),
         })
+    }
+
+    /// The privacy profiles IPFIX collectors take, each once.
+    pub fn ipfix_profiles(&self) -> Vec<CollectorProfile> {
+        let mut p: Vec<CollectorProfile> = self
+            .collectors
+            .iter()
+            .filter(|c| c.format == CollectorFormat::Ipfix)
+            .map(|c| c.profile)
+            .collect();
+        p.sort();
+        p.dedup();
+        p
     }
 
     /// Whether any collector takes IPFIX, so flows are cached at all.

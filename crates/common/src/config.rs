@@ -868,6 +868,14 @@ pub enum ModuleDirective {
         format: CollectorFormat,
         addr: std::net::SocketAddr,
         kind: CollectorKind,
+        profile: CollectorProfile,
+        line: usize,
+    },
+    /// `privacy-local-prefix <cidr>` — an address inside it is local, kept
+    /// whole by the privacy profiles that drop or truncate the others.
+    /// Repeatable; none given means fast-path's allowlist. Hot.
+    FlowLocalPrefix {
+        prefix: crate::fib::IpPrefix,
         line: usize,
     },
     /// `flow-cache [entries <n>] [active <s>] [inactive <s>]` — the IPFIX
@@ -893,6 +901,34 @@ pub enum CollectorFormat {
     /// IPFIX flow records (RFC 7011), each observation domain's rate in a
     /// selector options record.
     Ipfix,
+}
+
+/// What an IPFIX collector is told of the addresses in a flow. *Local*
+/// is inside `privacy-local-prefix` (fast-path's allowlist by default).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CollectorProfile {
+    /// Addresses as observed.
+    #[default]
+    Full,
+    /// Each address that is not local cut to its /24 (IPv4) or /48 (IPv6).
+    Truncate,
+    /// Only local addresses: a flow between two remote ones (transit)
+    /// carries neither.
+    NoRemote,
+    /// No addresses at all: the AS pair, ports and protocol.
+    AsOnly,
+}
+
+impl CollectorProfile {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Truncate => "truncate",
+            Self::NoRemote => "no-remote",
+            Self::AsOnly => "as-only",
+        }
+    }
 }
 
 impl CollectorFormat {
@@ -3269,6 +3305,27 @@ impl Config {
         Ok(())
     }
 
+    /// Whether fast-path learns routes from BGP or BMP, so flow export
+    /// can tell an address's origin AS.
+    pub fn has_asn_source(&self) -> bool {
+        self.modules
+            .iter()
+            .filter(|m| m.name == "fast-path")
+            .any(|m| {
+                let mode = m.directives.iter().find_map(|d| match d {
+                    ModuleDirective::ForwardingMode(f) => Some(*f),
+                    _ => None,
+                });
+                matches!(
+                    mode,
+                    Some(ForwardingMode::PacketframeFib | ForwardingMode::Compare)
+                ) && m
+                    .directives
+                    .iter()
+                    .any(|d| matches!(d, ModuleDirective::RouteSource(_)))
+            })
+    }
+
     /// flow-export-section validation. Pure config logic, so it runs
     /// everywhere `parse` does (startup, feasibility, SIGHUP; the call
     /// sites must stay in step or reload applies a config startup would
@@ -3336,7 +3393,31 @@ impl Config {
                     line,
                     format,
                     kind,
+                    profile,
                 } => {
+                    // A collector gets no export rather than a wider one
+                    // than its profile allows.
+                    if *format == CollectorFormat::Sflow && *profile != CollectorProfile::Full {
+                        return Err(err(
+                            *line,
+                            format!(
+                                "collector `{name}`: sflow carries packet headers as they were, \
+                                 so it takes `profile full` only; `profile {}` needs ipfix",
+                                profile.name()
+                            ),
+                        ));
+                    }
+                    if *profile == CollectorProfile::AsOnly && !self.has_asn_source() {
+                        return Err(err(
+                            *line,
+                            format!(
+                                "collector `{name}`: `profile as-only` exports AS numbers alone, \
+                                 and they come from fast-path's route source: it needs \
+                                 `forwarding-mode packetframe-fib` (or compare) and a \
+                                 `route-source bgp|bmp`"
+                            ),
+                        ));
+                    }
                     // FastNetMon's detection timing is qualified on sFlow
                     // alone: a flow record arrives only once its flow
                     // times out, against a 5 s detection window.
@@ -4800,6 +4881,22 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
         }),
         "collector" => parse_flow_collector(line, rest),
         "flow-cache" => parse_flow_cache(line, rest),
+        "privacy-local-prefix" => parse_single_arg(line, rest, "privacy-local-prefix", |t| {
+            let prefix = if t.contains(':') {
+                let p: Ipv6Prefix = t.parse()?;
+                crate::fib::IpPrefix::V6 {
+                    addr: p.addr.octets(),
+                    prefix_len: p.prefix_len,
+                }
+            } else {
+                let p: Ipv4Prefix = t.parse()?;
+                crate::fib::IpPrefix::V4 {
+                    addr: p.addr.octets(),
+                    prefix_len: p.prefix_len,
+                }
+            };
+            Ok(ModuleDirective::FlowLocalPrefix { prefix, line })
+        }),
         other => Err(ConfigError::parse(
             line,
             format!("unknown directive `{other}` in module section"),
@@ -4807,7 +4904,8 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
     }
 }
 
-const COLLECTOR_USAGE: &str = "collector takes: <name> sflow|ipfix <ip>:<port> [kind stats|ddos]";
+const COLLECTOR_USAGE: &str = "collector takes: <name> sflow|ipfix <ip>:<port> \
+     [kind stats|ddos] [profile full|truncate|no-remote|as-only]";
 
 const FLOW_CACHE_USAGE: &str = "flow-cache takes: [entries <n>] [active <s>] [inactive <s>]";
 
@@ -4904,18 +5002,38 @@ fn parse_flow_collector<'a>(
     if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
         return Err(usage(format!("`{addr}` cannot be a collector's address")));
     }
-    let kind = match tail {
-        [] => CollectorKind::Stats,
-        ["kind", "stats"] => CollectorKind::Stats,
-        ["kind", "ddos"] => CollectorKind::Ddos,
-        ["kind", other] => return Err(usage(format!("unknown kind `{other}`"))),
-        other => return Err(usage(format!("unexpected `{}`", other.join(" ")))),
-    };
+    let (mut kind, mut profile) = (None, None);
+    let mut rest = tail;
+    loop {
+        rest = match rest {
+            [] => break,
+            ["kind", value, more @ ..] if kind.is_none() => {
+                kind = Some(match *value {
+                    "stats" => CollectorKind::Stats,
+                    "ddos" => CollectorKind::Ddos,
+                    other => return Err(usage(format!("unknown kind `{other}`"))),
+                });
+                more
+            }
+            ["profile", value, more @ ..] if profile.is_none() => {
+                profile = Some(match *value {
+                    "full" => CollectorProfile::Full,
+                    "truncate" => CollectorProfile::Truncate,
+                    "no-remote" => CollectorProfile::NoRemote,
+                    "as-only" => CollectorProfile::AsOnly,
+                    other => return Err(usage(format!("unknown profile `{other}`"))),
+                });
+                more
+            }
+            other => return Err(usage(format!("unexpected `{}`", other.join(" ")))),
+        };
+    }
     Ok(ModuleDirective::FlowCollector {
         name: name.to_string(),
         format,
         addr,
-        kind,
+        kind: kind.unwrap_or(CollectorKind::Stats),
+        profile: profile.unwrap_or_default(),
         line,
     })
 }
@@ -10278,6 +10396,7 @@ module fast-path
             format: CollectorFormat::Sflow,
             addr: "198.51.100.10:6343".parse().unwrap(),
             kind: CollectorKind::Ddos,
+            profile: CollectorProfile::Full,
             line: 7
         }));
         assert!(fe.directives.contains(&ModuleDirective::FlowCollector {
@@ -10285,6 +10404,7 @@ module fast-path
             format: CollectorFormat::Sflow,
             addr: "198.51.100.11:6343".parse().unwrap(),
             kind: CollectorKind::Stats,
+            profile: CollectorProfile::Full,
             line: 8
         }));
         // IPv6 throughout.
@@ -10318,6 +10438,15 @@ module fast-path
                 "not a collector name",
             ),
             ("collector c sflow", "needs a name, a format and an address"),
+            (
+                "collector c ipfix 198.51.100.1:4739 profile blurry",
+                "unknown profile",
+            ),
+            (
+                "collector c ipfix 198.51.100.1:4739 profile full profile as-only",
+                "unexpected `profile as-only`",
+            ),
+            ("privacy-local-prefix 192.0.2.0", "prefix"),
         ] {
             let s = format!("module flow-export\n  {line}\n");
             let e = Config::parse(&s).expect_err(&s);
@@ -10426,6 +10555,42 @@ module fast-path
                 inactive: Duration::from_secs(5),
                 line: 5,
             }));
+        // Profiles: sFlow is full only, as-only needs an AS source.
+        refuse(
+            "  collector a sflow 198.51.100.1:6343 profile truncate\n",
+            "takes `profile full` only",
+        );
+        refuse(
+            "  collector a ipfix 198.51.100.1:4739 profile as-only\n",
+            "needs `forwarding-mode packetframe-fib`",
+        );
+        let with_bgp =
+            "module fast-path\n  attach eth0 generic\n  forwarding-mode packetframe-fib\n  \
+            route-source bgp 127.0.0.1:1179 local-as 64512 peer-as 64512\nmodule flow-export\n";
+        let c = Config::parse(&format!(
+            "{with_bgp}{src}  privacy-local-prefix 192.0.2.0/24\n  privacy-local-prefix 2001:db8::/32\n  \
+             collector a ipfix 198.51.100.1:4739 profile as-only\n  \
+             collector b ipfix 198.51.100.2:4739 kind stats profile no-remote\n"
+        ))
+        .unwrap();
+        c.validate_flow_export().unwrap();
+        assert!(c.has_asn_source());
+        let fe = &c.modules[1].directives;
+        assert!(fe.contains(&ModuleDirective::FlowLocalPrefix {
+            prefix: crate::fib::IpPrefix::V6 {
+                addr: "2001:db8::".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+                prefix_len: 32
+            },
+            line: 8
+        }));
+        assert!(fe.iter().any(|d| matches!(
+            d,
+            ModuleDirective::FlowCollector {
+                profile: CollectorProfile::NoRemote,
+                kind: CollectorKind::Stats,
+                ..
+            }
+        )));
         // vpp-offload, when present, is before it too.
         let fp = "module fast-path\n  attach eth0 generic\n";
         let after = format!("{fp}{alone}module vpp-offload\n");

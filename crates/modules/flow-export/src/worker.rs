@@ -29,11 +29,13 @@ use crate::cfg::FlowExportConfig;
 use crate::collector::{reconcile, send_all, send_until, CollectorState, Transport};
 use crate::coverage::{PortCoverage, State, Window, WINDOW};
 use crate::flows::{self, Domain, FlowCache, Now, Sampled};
-use crate::ipfix_out::IpfixOut;
+use crate::ipfix_out::{IpfixOut, Privacy, RECORDS_PER_TICK};
 use crate::pool::Accumulator;
 use crate::sflow_out::{wire_frame, Exporter, Ready, FCS};
 use crate::vpp::{NoVpp, Taken, VppDir, VppHealth, VppSide};
 use packetframe_common::config::CollectorFormat;
+use packetframe_common::fib::asn::AsnTable;
+use packetframe_common::fib::IpPrefix;
 
 pub const TICK: Duration = Duration::from_millis(100);
 /// How often the port list and the pools are re-read.
@@ -348,13 +350,36 @@ pub struct Worker<S, P, T, V = NoVpp> {
     vpp_pending_drops: u32,
     /// What the last ring replacement left, for the next tick to export.
     leftover: Leftover,
-    /// The IPFIX flow cache and its exporter, while a collector takes
+    /// The IPFIX flow cache and its exporters, while a collector takes
     /// IPFIX.
-    flows: Option<(FlowCache, IpfixOut)>,
+    flows: Option<Flows>,
+    /// Origin ASes, when fast-path's route source publishes them.
+    asn: Option<Arc<AsnTable>>,
     /// The wall clock at `shared.epoch`, in Unix milliseconds: the times
     /// flow records carry.
     wall_epoch_ms: u64,
     p: Published,
+}
+
+/// The flow cache, and an exporter for each privacy profile an IPFIX
+/// collector takes: one cache, so each profile sends the same flows.
+struct Flows {
+    cache: FlowCache,
+    outs: Vec<IpfixOut>,
+    /// Which pending domain a tick's budget goes to first, turn about: a
+    /// domain with a standing backlog cannot starve the others.
+    turn: usize,
+}
+
+impl Flows {
+    fn new(cfg: &FlowExportConfig) -> Option<Self> {
+        let profiles = cfg.ipfix_profiles();
+        (!profiles.is_empty()).then(|| Self {
+            cache: FlowCache::new(cfg.cache),
+            outs: profiles.into_iter().map(IpfixOut::new).collect(),
+            turn: 0,
+        })
+    }
 }
 
 fn wall_ms() -> u64 {
@@ -382,13 +407,12 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
             .cloned()
             .map(CollectorState::new)
             .collect();
-        let flows = cfg
-            .ipfix()
-            .then(|| (FlowCache::new(cfg.cache), IpfixOut::new()));
+        let flows = Flows::new(&cfg);
         let wall_epoch_ms = wall_ms()
             .saturating_sub(now.saturating_duration_since(shared.epoch).as_millis() as u64);
         Ok(Self {
             flows,
+            asn: None,
             wall_epoch_ms,
             exporter: Exporter::new(cfg.source),
             cfg,
@@ -436,6 +460,7 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
             vpp_pending_drops: self.vpp_pending_drops,
             leftover: self.leftover,
             flows: self.flows,
+            asn: self.asn,
             wall_epoch_ms: self.wall_epoch_ms,
             p: self.p,
         }
@@ -443,6 +468,12 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
 }
 
 impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
+    /// Fill flow records' AS fields from `asn`.
+    pub fn with_asn(mut self, asn: Option<Arc<AsnTable>>) -> Self {
+        self.asn = asn;
+        self
+    }
+
     pub fn tick(&mut self, now: Instant) {
         let reload = self
             .shared
@@ -486,7 +517,7 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
             send_all(
                 &self.transport,
                 &mut self.collectors,
-                CollectorFormat::Sflow,
+                |c| c.format == CollectorFormat::Sflow,
                 &datagrams,
                 now,
             );
@@ -504,9 +535,10 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
     /// The tick's samples into the flow cache, by observation domain;
     /// flows past a timeout out of it, as IPFIX for its collectors.
     fn export_ipfix(&mut self, ready: &[Ready], now: Instant) {
-        let Some((cache, out)) = &mut self.flows else {
+        let Some(flows) = &mut self.flows else {
             return;
         };
+        let cache = &mut flows.cache;
         let ms = now.saturating_duration_since(self.shared.epoch).as_millis() as u64;
         let at = Now {
             ms,
@@ -538,16 +570,76 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
             cache.ingest(*domain, batch);
         }
         cache.expire(at, EXPIRE_BUDGET);
-        let mut messages = Vec::new();
-        out.encode(cache, now, (at.wall_ms / 1000) as u32, &mut messages);
-        self.p.ipfix_messages_total += messages.len() as u64;
-        send_all(
-            &self.transport,
-            &mut self.collectors,
-            CollectorFormat::Ipfix,
-            &messages,
-            now,
-        );
+        self.send_flows(now, at, RECORDS_PER_TICK, None);
+    }
+
+    /// The local prefixes: the section's, else fast-path's allowlist as
+    /// this configuration took it.
+    fn local(&self) -> Vec<IpPrefix> {
+        if self.cfg.local.is_empty() {
+            self.cfg.local_default.clone()
+        } else {
+            self.cfg.local.clone()
+        }
+    }
+
+    /// Up to `max` of the cache's exports, through each profile's
+    /// exporter to that profile's collectors: within each collector's
+    /// per-tick budget, or with `until` (a stop), past it until then. The
+    /// datagrams a deadline left unsent.
+    fn send_flows(&mut self, now: Instant, at: Now, max: usize, until: Option<Instant>) -> usize {
+        let local = self.local();
+        let Some(flows) = &mut self.flows else {
+            return 0;
+        };
+        let privacy = Privacy {
+            local: &local,
+            asn: self.asn.as_deref(),
+        };
+        let mut pending = flows.cache.pending();
+        if !pending.is_empty() {
+            let n = pending.len();
+            pending.rotate_left(flows.turn % n);
+            flows.turn = flows.turn.wrapping_add(1);
+        }
+        let mut left = max;
+        let mut unsent = 0;
+        for domain in pending {
+            if left == 0 {
+                break;
+            }
+            let items = flows.cache.take(domain, left);
+            left -= items.len();
+            for out in &mut flows.outs {
+                let mut messages = Vec::new();
+                out.encode(
+                    domain,
+                    &items,
+                    &privacy,
+                    now,
+                    (at.wall_ms / 1000) as u32,
+                    &mut messages,
+                );
+                self.p.ipfix_messages_total += messages.len() as u64;
+                let profile = out.profile();
+                let to = |c: &crate::cfg::Collector| {
+                    c.format == CollectorFormat::Ipfix && c.profile == profile
+                };
+                match until {
+                    None => send_all(&self.transport, &mut self.collectors, to, &messages, now),
+                    Some(deadline) => {
+                        unsent += send_until(
+                            &self.transport,
+                            &mut self.collectors,
+                            to,
+                            &messages,
+                            deadline,
+                        )
+                    }
+                }
+            }
+        }
+        unsent
     }
 
     /// Stop sampling: fast-path's programs (rate 0) and VPP's plugin (its
@@ -557,25 +649,25 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
     /// worth of records at a time, so a full cache is never encoded at
     /// once.
     pub fn stop(&mut self) -> Result<(), String> {
-        if let Some((cache, out)) = &mut self.flows {
+        if let Some(flows) = &mut self.flows {
             let now = Instant::now();
             let deadline = now + STOP_FLUSH_WITHIN;
             let ms = now.saturating_duration_since(self.shared.epoch).as_millis() as u64;
-            let export_s = ((self.wall_epoch_ms + ms) / 1000) as u32;
-            cache.drain();
+            flows.cache.drain();
+            let at = Now {
+                ms,
+                wall_ms: self.wall_epoch_ms + ms,
+            };
             let mut unsent = 0;
-            while !cache.pending().is_empty() && Instant::now() < deadline {
-                let mut messages = Vec::new();
-                out.encode(cache, now, export_s, &mut messages);
-                unsent += send_until(
-                    &self.transport,
-                    &mut self.collectors,
-                    CollectorFormat::Ipfix,
-                    &messages,
-                    deadline,
-                );
+            while self
+                .flows
+                .as_ref()
+                .is_some_and(|f| !f.cache.pending().is_empty())
+                && Instant::now() < deadline
+            {
+                unsent += self.send_flows(now, at, RECORDS_PER_TICK, Some(deadline));
             }
-            let unencoded = cache.queued();
+            let unencoded = self.flows.as_ref().map_or(0, |f| f.cache.queued());
             if unsent > 0 || unencoded > 0 {
                 tracing::warn!(
                     unsent_messages = unsent,
@@ -627,19 +719,28 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
             self.generation = generation;
             self.p.source_error = None;
         }
-        let added_ipfix = new
-            .collectors
-            .iter()
-            .any(|c| c.format == CollectorFormat::Ipfix && !self.cfg.collectors.contains(c));
         match (&mut self.flows, new.ipfix()) {
-            (None, true) => self.flows = Some((FlowCache::new(new.cache), IpfixOut::new())),
+            (None, true) => self.flows = Flows::new(&new),
             // No one to send flows to: what the cache held goes with it.
             (Some(_), false) => self.flows = None,
-            (Some((cache, out)), true) => {
-                cache.set_limits(new.cache);
-                // A collector new to the export has seen no template.
-                if added_ipfix {
-                    out.reannounce();
+            (Some(flows), true) => {
+                flows.cache.set_limits(new.cache);
+                // A profile's exporter keeps its sequence numbers while it
+                // has a collector; a collector new to it has seen no
+                // template.
+                let profiles = new.ipfix_profiles();
+                flows.outs.retain(|o| profiles.contains(&o.profile()));
+                for p in profiles {
+                    let joined = new.collectors.iter().any(|c| {
+                        c.format == CollectorFormat::Ipfix
+                            && c.profile == p
+                            && !self.cfg.collectors.contains(c)
+                    });
+                    match flows.outs.iter_mut().find(|o| o.profile() == p) {
+                        Some(o) if joined => o.reannounce(),
+                        Some(_) => {}
+                        None => flows.outs.push(IpfixOut::new(p)),
+                    }
                 }
             }
             (None, false) => {}
@@ -847,11 +948,11 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
             })
             .collect();
         self.p.vpp = vpp;
-        self.p.flows = self.flows.as_ref().map(|(c, o)| FlowsReport {
-            active: c.active(),
-            counts: c.counts,
-            announcements: o.announcements,
-            records: o.records,
+        self.p.flows = self.flows.as_ref().map(|f| FlowsReport {
+            active: f.cache.active(),
+            counts: f.cache.counts,
+            announcements: f.outs.iter().map(|o| o.announcements).sum(),
+            records: f.outs.iter().map(|o| o.records).sum(),
         });
         self.p.collectors = self
             .collectors
@@ -1183,8 +1284,11 @@ mod tests {
                 addr: "198.51.100.10:6343".parse().unwrap(),
                 kind: CollectorKind::Ddos,
                 format: CollectorFormat::Sflow,
+                profile: Default::default(),
             }],
             cache: flows::Limits::default(),
+            local: Vec::new(),
+            local_default: Vec::new(),
         }
     }
 
@@ -1661,6 +1765,7 @@ mod tests {
             addr: "198.51.100.11:4739".parse().unwrap(),
             kind: CollectorKind::Stats,
             format: CollectorFormat::Ipfix,
+            profile: Default::default(),
         });
         c
     }
@@ -1744,7 +1849,7 @@ mod tests {
             .filter(|(to, _)| to.port() == 4739)
             .count();
         assert!(ipfix > crate::collector::SEND_BUDGET, "{ipfix} messages");
-        let (_, out) = r.w.flows.as_ref().unwrap();
+        let out = &r.w.flows.as_ref().unwrap().outs[0];
         assert_eq!(out.records, u64::from(flows));
         assert_eq!(r.w.collectors[1].datagrams, ipfix as u64);
         assert_eq!(r.w.collectors[1].budget_drops, 0);
@@ -1780,6 +1885,92 @@ mod tests {
             1,
             "15 s after it was taken, not after it was read"
         );
+    }
+
+    /// One domain's standing backlog cannot starve another's exports: a
+    /// tick's budget goes to the domains turn about.
+    #[test]
+    fn domains_take_the_send_budget_turn_about() {
+        let mut r = rig(1000);
+        let _ = reload(&r.shared, with_ipfix(cfg(1000)));
+        r.w.tick(r.t0);
+        let at = Now {
+            ms: 0,
+            wall_ms: 1_790_000_000_000,
+        };
+        {
+            let f = r.w.flows.as_mut().unwrap();
+            for domain in [Domain::FastPath, Domain::Vpp] {
+                let batch: Vec<Sampled> = (0..4u16)
+                    .map(|port| Sampled {
+                        packet: flows::Packet {
+                            src: "192.0.2.1".parse().unwrap(),
+                            dst: "198.51.100.2".parse().unwrap(),
+                            protocol: 6,
+                            src_port: 40000,
+                            dst_port: port,
+                            ip_len: 986,
+                        },
+                        generation: 1,
+                        rate: 1000,
+                        input_if: 3,
+                        output_if: 0,
+                        at,
+                    })
+                    .collect();
+                f.cache.ingest(domain, &batch);
+            }
+            f.cache.expire(
+                Now {
+                    ms: 15_000,
+                    wall_ms: at.wall_ms + 15_000,
+                },
+                100,
+            );
+        }
+        // Two exports a tick: the rate and one record.
+        let domains = |r: &mut Rig| {
+            let before = r.net.sent.borrow().len();
+            r.w.send_flows(r.t0, at, 2, None);
+            r.net.sent.borrow()[before..]
+                .iter()
+                .map(|(_, d)| word(d, 12))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(domains(&mut r), vec![Domain::FastPath.id()]);
+        assert_eq!(
+            domains(&mut r),
+            vec![Domain::Vpp.id()],
+            "VPP first this time, though fast-path still has records"
+        );
+        assert_eq!(domains(&mut r), vec![Domain::FastPath.id()]);
+    }
+
+    /// The privacy profiles' local prefixes move only with a reload the
+    /// worker applied: the allowlist the module took then, unless the
+    /// section names its own.
+    #[test]
+    fn the_local_prefixes_are_the_configurations() {
+        let mut r = rig(1000);
+        r.w.tick(r.t0);
+        assert!(r.w.local().is_empty());
+        let allowlist = vec![IpPrefix::V4 {
+            addr: [203, 0, 113, 0],
+            prefix_len: 24,
+        }];
+        let mut c = cfg(1000);
+        c.local_default = allowlist.clone();
+        let _ = reload(&r.shared, c.clone());
+        r.w.tick(r.t0 + TICK);
+        assert_eq!(r.w.local(), allowlist);
+        let own = vec![IpPrefix::V4 {
+            addr: [192, 0, 2, 0],
+            prefix_len: 24,
+        }];
+        c.local = own.clone();
+        let _ = reload(&r.shared, c);
+        r.w.tick(r.t0 + 2 * TICK);
+        assert_eq!(r.w.local(), own, "the section's own win");
     }
 
     #[test]

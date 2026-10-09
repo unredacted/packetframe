@@ -62,6 +62,15 @@ shipped; that work is part of 0.5.0.
     - `flow-cache [entries <n>] [active <s>] [inactive <s>]` (default 65536, 60 s, 15 s) bounds the cache. A full cache exports its oldest flow.
     - `kind ddos` takes sFlow only: flow records arrive when a flow times out, and attack detection has not been qualified against that.
     - Metrics: `flows_active`, `flows_exported_total{reason}`, `flows_dropped_total`, `ipfix_records_total`, `templates_sent_total`, and `samples_lost_total{where="flow_stale_rate"}`.
+  - **Privacy profiles and AS numbers for IPFIX collectors.**
+    - `profile` on an IPFIX `collector` decides what it is told of addresses. An address is *local* when it is inside `privacy-local-prefix`, which is repeatable and defaults to fast-path's allowlist.
+      - `full` (the default) sends addresses as observed.
+      - `truncate` cuts each non-local address to its /24 or /48.
+      - `no-remote` sends only local addresses, through templates that leave the others out. A transit flow carries no address.
+      - `as-only` sends no addresses.
+    - sFlow carries packet headers as they were, so it takes `profile full` only. A collector is refused rather than sent more than its profile allows.
+    - Every record carries the origin AS of its source and destination. The origin is the last AS of the route's path, from the same LOCAL_PREF tier the forwarding nexthops come from, or this network's own AS for a route with no path. It comes from fast-path's BGP or BMP route source, so it needs `forwarding-mode packetframe-fib` (or `compare`) and a `route-source`. Without one, the AS fields are 0 and `profile as-only` is refused.
+    - The origin table is built when flow-export runs and fast-path has a route source, so an IPFIX collector a reload adds gets AS numbers at once. A route whose origin is unknown (a path ending in an AS set, or one the ledger seeded at startup, until its session announces it again) reads 0, never the AS of a covering route.
   - **`packetframe flow-export interfaces`** prints every interface flow export's samples can name, by their ifIndex (the kernel's ifindex), for a collector with no SNMP to ask. That is every port it samples, plus every interface fast-path may redirect to, since a redirected sample names its egress interface as its output. By default the output is a static metadata provider for Akvorado's `outlet.yaml`, keyed by `source-address`, with each interface's name, the paths that sample it and its link speed. `--format table` is for reading. It reads the config and the kernel, so the daemon need not be running.
     - Akvorado requires a speed for every interface, and discards a flow naming an interface it has no metadata for. Where the kernel reports no speed (a link that is down, many virtual ones), pass `--speed <interface>=<Mbps>` or `--default-speed <Mbps>`; without either, the command refuses and names the interface. `--default-speed` also adds a catch-all entry for an interface that comes up later.
   - **`packetframe feasibility`** gains flow-export rows when the config declares the module, all advisory:

@@ -8,8 +8,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use packetframe_common::config::CollectorFormat;
-
 use crate::cfg::Collector;
 
 /// Datagrams each collector may be sent per worker tick (100 ms): ample
@@ -74,19 +72,19 @@ impl CollectorState {
     }
 }
 
-/// Send each datagram to every collector of `format`, within each one's
+/// Send each datagram to every collector `to` selects, within each one's
 /// budget.
 pub fn send_all(
     t: &dyn Transport,
     collectors: &mut [CollectorState],
-    format: CollectorFormat,
+    to: impl Fn(&Collector) -> bool,
     datagrams: &[Vec<u8>],
     now: Instant,
 ) {
     if datagrams.is_empty() {
         return;
     }
-    for c in collectors.iter_mut().filter(|c| c.cfg.format == format) {
+    for c in collectors.iter_mut().filter(|c| to(&c.cfg)) {
         for (i, d) in datagrams.iter().enumerate() {
             if i >= SEND_BUDGET {
                 c.budget_drops += (datagrams.len() - i) as u64;
@@ -107,7 +105,7 @@ pub fn send_all(
     }
 }
 
-/// Send every datagram to each collector of `format`, without the
+/// Send every datagram to each collector `to` selects, without the
 /// per-tick budget: the export is stopping, and what it holds goes now or
 /// not at all. A full socket buffer is waited out until `deadline`. The
 /// datagrams not sent to some collector by then are returned, and not
@@ -115,12 +113,12 @@ pub fn send_all(
 pub fn send_until(
     t: &dyn Transport,
     collectors: &mut [CollectorState],
-    format: CollectorFormat,
+    to: impl Fn(&Collector) -> bool,
     datagrams: &[Vec<u8>],
     deadline: Instant,
 ) -> usize {
     for (i, d) in datagrams.iter().enumerate() {
-        for c in collectors.iter_mut().filter(|c| c.cfg.format == format) {
+        for c in collectors.iter_mut().filter(|c| to(&c.cfg)) {
             loop {
                 let now = Instant::now();
                 match t.send_to(d, c.cfg.addr) {
@@ -187,7 +185,8 @@ mod tests {
             name: name.into(),
             addr: format!("198.51.100.1:{port}").parse().unwrap(),
             kind: CollectorKind::Stats,
-            format: CollectorFormat::Sflow,
+            format: packetframe_common::config::CollectorFormat::Sflow,
+            profile: Default::default(),
         }
     }
 
@@ -202,13 +201,7 @@ mod tests {
             sent: RefCell::new(Vec::new()),
         };
         let now = Instant::now();
-        send_all(
-            &t,
-            &mut cs,
-            CollectorFormat::Sflow,
-            &[vec![0; 10], vec![0; 10]],
-            now,
-        );
+        send_all(&t, &mut cs, |_| true, &[vec![0; 10], vec![0; 10]], now);
         assert_eq!((cs[0].datagrams, cs[0].send_errors), (2, 0));
         assert_eq!((cs[1].datagrams, cs[1].send_errors), (0, 2));
         assert!(cs[0].failing(now).is_none());
@@ -242,10 +235,7 @@ mod tests {
             sent: 0.into(),
         };
         let deadline = Instant::now() + Duration::from_secs(5);
-        assert_eq!(
-            send_until(&t, &mut cs, CollectorFormat::Sflow, &burst, deadline),
-            0
-        );
+        assert_eq!(send_until(&t, &mut cs, |_| true, &burst, deadline), 0);
         assert_eq!(t.sent.get(), burst.len());
         assert_eq!(cs[0].send_errors, 0, "a full buffer waited out is no error");
 
@@ -254,7 +244,7 @@ mod tests {
             blocked: u32::MAX.into(),
             sent: 0.into(),
         };
-        let unsent = send_until(&t, &mut cs, CollectorFormat::Sflow, &burst, Instant::now());
+        let unsent = send_until(&t, &mut cs, |_| true, &burst, Instant::now());
         assert_eq!(unsent, burst.len() - 1);
         assert_eq!(cs[0].send_errors, 1);
     }
@@ -268,19 +258,13 @@ mod tests {
         };
         let burst = vec![vec![0u8; 1]; SEND_BUDGET + 7];
         let now = Instant::now();
-        send_all(&t, &mut cs, CollectorFormat::Sflow, &burst, now);
+        send_all(&t, &mut cs, |_| true, &burst, now);
         assert_eq!(cs[0].datagrams, SEND_BUDGET as u64);
         assert_eq!(cs[0].budget_drops, 7);
         // Samples lost on the way out: failing, though every send it made
         // succeeded, until the drops are old news.
         assert!(cs[0].failing(now).unwrap().contains("budget"));
-        send_all(
-            &t,
-            &mut cs,
-            CollectorFormat::Sflow,
-            &[vec![0u8; 1]],
-            now + TICK_LATER,
-        );
+        send_all(&t, &mut cs, |_| true, &[vec![0u8; 1]], now + TICK_LATER);
         assert!(cs[0].failing(now + TICK_LATER).is_some());
         assert!(cs[0].failing(now + FAILING_FOR).is_none());
     }

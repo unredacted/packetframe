@@ -2465,6 +2465,7 @@ impl NetlinkNeighborResolver {
                     nexthops: vec![ip],
                     path_id: None,
                     local_pref: None,
+                    origin_asn: None,
                 };
                 if let Err(e) = self.apply_route(prog, add).await {
                     warn!(?ip, error = %e, "local-prefix seed RouteEvent::Add dispatch failed");
@@ -2775,6 +2776,7 @@ impl NetlinkNeighborResolver {
             nexthops: vec![IpAddr::V4(spec.nexthop)],
             path_id: None,
             local_pref: None,
+            origin_asn: None,
         };
         match self.apply_route(&prog, event).await {
             Ok(()) => {
@@ -2836,6 +2838,7 @@ impl NetlinkNeighborResolver {
             nexthops: vec![ip],
             path_id: None,
             local_pref: None,
+            origin_asn: None,
         };
         if let Err(e) = self.apply_route(&prog, add).await {
             warn!(?ip, error = %e, "local-prefix RouteEvent::Add dispatch failed");

@@ -741,6 +741,10 @@ struct RouteRecord {
 struct Advertisement {
     nexthops: Vec<IpAddr>,
     local_pref: Option<u32>,
+    /// The AS that originated it ([`RouteEvent::Add`]); `None` from a
+    /// non-BGP source, a path ending in a set, and a seeded advertisement
+    /// until its session announces it again (the ledger keeps no origin).
+    origin_asn: Option<u32>,
     /// Resync-reconcile bookkeeping: true when this advertisement
     /// was freshly Add'd (or refreshed) after the most recent
     /// Resync; false when it was inherited from a prior session and
@@ -885,6 +889,10 @@ pub struct FibProgrammer {
     /// union rather than the events that produced it, and why it cannot
     /// report failure back to this task.
     route_sink: Option<Arc<dyn ResolvedRouteSink>>,
+    /// Where each prefix's origin AS is published, when flow export
+    /// needs AS numbers. `None` otherwise, and the publishing site is an
+    /// `if let Some(..)`.
+    asn_table: Option<Arc<packetframe_common::fib::asn::AsnTable>>,
 
     // --- Destination cache (v0.2.8, default-off experiment) ---
     /// FIB_CACHE_CFG handle. `None` in harnesses that don't exercise
@@ -1121,6 +1129,7 @@ impl FibProgrammer {
                 reclaim_queue: VecDeque::new(),
                 recompute_owed: HashSet::new(),
                 route_sink: None,
+                asn_table: None,
                 cache_cfg,
                 cache_enabled: false,
                 cache_generation: 1,
@@ -1185,6 +1194,13 @@ impl FibProgrammer {
     /// full-table resync; it cannot get here.
     pub fn set_route_sink(&mut self, sink: Arc<dyn ResolvedRouteSink>) {
         self.route_sink = Some(sink);
+    }
+
+    /// Publish each prefix's origin AS through `table`. Same window as
+    /// [`Self::set_route_sink`]: a table attached mid-flight would lack
+    /// every origin programmed before it.
+    pub fn set_asn_table(&mut self, table: Arc<packetframe_common::fib::asn::AsnTable>) {
+        self.asn_table = Some(table);
     }
 
     /// Main event loop. Drains NeighEvents + Commands + the reclaim
@@ -1345,6 +1361,7 @@ impl FibProgrammer {
                 v.insert(Advertisement {
                     nexthops: a.nexthops,
                     local_pref: a.local_pref,
+                    origin_asn: None,
                     seen_this_session: false,
                 });
                 true
@@ -2479,9 +2496,10 @@ impl FibProgrammer {
                 nexthops,
                 path_id,
                 local_pref,
+                origin_asn,
             } => {
                 self.note_session_route(peer_id);
-                self.add_route(peer_id, prefix, nexthops, path_id, local_pref)
+                self.add_route(peer_id, prefix, nexthops, path_id, (local_pref, origin_asn))
             }
             RouteEvent::Del {
                 peer_id,
@@ -2516,19 +2534,20 @@ impl FibProgrammer {
         }
     }
 
+    /// `attrs`: the announcement's LOCAL_PREF and origin AS.
     fn add_route(
         &mut self,
         peer_id: PeerId,
         prefix: IpPrefix,
         nexthops: Vec<IpAddr>,
         path_id: Option<u32>,
-        local_pref: Option<u32>,
+        attrs: (Option<u32>, Option<u32>),
     ) -> Result<(), ProgrammerError> {
         if nexthops.is_empty() {
             // Defensive. An empty announce should arrive as Del.
             return Ok(());
         }
-        self.upsert_advertisement(peer_id, prefix, path_id, nexthops, local_pref);
+        self.upsert_advertisement(peer_id, prefix, path_id, nexthops, attrs);
         self.recompute_fib_entry(prefix)
     }
 
@@ -2702,12 +2721,13 @@ impl FibProgrammer {
         prefix: IpPrefix,
         path_id: Option<u32>,
         nexthops: Vec<IpAddr>,
-        local_pref: Option<u32>,
+        (local_pref, origin_asn): (Option<u32>, Option<u32>),
     ) {
         let key = (peer_id, path_id);
         let adv = Advertisement {
             nexthops,
             local_pref,
+            origin_asn,
             seen_this_session: true,
         };
         let rec = self.upsert_empty_record(prefix);
@@ -2821,7 +2841,10 @@ impl FibProgrammer {
         // aggregation: ECMP forms within a tier, not across tiers.
         // Advertisements with no `local_pref` are normalized to
         // DEFAULT_LOCAL_PREF (RFC 4271 §5.1.5).
-        let desired_nhs: Vec<IpAddr> = match self.lookup_mirror(&prefix) {
+        //
+        // The prefix's origin AS comes from the same tier: the first
+        // advertisement in it, in (peer, path) order, that names one.
+        let (desired_nhs, origin): (Vec<IpAddr>, Option<u32>) = match self.lookup_mirror(&prefix) {
             Some(rec) => {
                 let max_lp = rec
                     .advertisements
@@ -2830,6 +2853,7 @@ impl FibProgrammer {
                     .max()
                     .unwrap_or(DEFAULT_LOCAL_PREF);
                 let mut set: BTreeSet<IpAddr> = BTreeSet::new();
+                let mut origin = None;
                 for adv in rec.advertisements.values() {
                     if adv.local_pref.unwrap_or(DEFAULT_LOCAL_PREF) != max_lp {
                         continue;
@@ -2837,11 +2861,22 @@ impl FibProgrammer {
                     for nh in &adv.nexthops {
                         set.insert(*nh);
                     }
+                    origin = origin.or(adv.origin_asn);
                 }
-                set.into_iter().collect()
+                (set.into_iter().collect(), origin)
             }
-            None => Vec::new(),
+            None => (Vec::new(), None),
         };
+        // Published whatever becomes of the FIB write below: it is a fact
+        // about the routes, and an origin that changed with no nexthop
+        // change still has to reach flow export.
+        if let Some(table) = &self.asn_table {
+            if desired_nhs.is_empty() {
+                table.remove(prefix);
+            } else {
+                table.set(prefix, origin);
+            }
+        }
 
         // 2. Empty desired set: tear the prefix down.
         if desired_nhs.is_empty() {
