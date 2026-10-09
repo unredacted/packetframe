@@ -334,12 +334,7 @@ impl Running {
         state_dir: &Path,
         handles: crate::Handles,
     ) -> Result<Self, String> {
-        let crate::Handles {
-            vpp,
-            coverage,
-            asn,
-            local_default,
-        } = handles;
+        let crate::Handles { vpp, coverage, asn } = handles;
         let epoch = Instant::now();
         let mut shared = Shared::new(epoch);
         shared.coverage = coverage;
@@ -369,7 +364,7 @@ impl Running {
             kernel: kernel_source,
         };
         let worker = match Worker::new(cfg, source, ports, socket, shared.clone(), epoch) {
-            Ok(w) => w.with_privacy(asn, local_default),
+            Ok(w) => w.with_asn(asn),
             Err(e) => {
                 let _ = kernel::detach_from_state_dir(state_dir);
                 return Err(e);
