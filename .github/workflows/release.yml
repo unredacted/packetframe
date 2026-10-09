@@ -314,8 +314,11 @@ jobs:
       - name: Install cargo-deb
         if: contains(matrix.target, '-gnu')
         run: |
+          # $NF: 2.x prints the bare version ("2.7.0"; `$2` was empty, so
+          # the cached copy was reinstalled on every run), 3.x prefixes
+          # "cargo-deb ".
           if ! command -v cargo-deb >/dev/null 2>&1 || \
-             [ "$(cargo deb --version 2>/dev/null | awk '{print $2}')" != "2.7.0" ]; then
+             [ "$(cargo deb --version 2>/dev/null | awk '{print $NF}')" != "2.7.0" ]; then
             cargo install --locked --force cargo-deb --version 2.7.0
           fi
 

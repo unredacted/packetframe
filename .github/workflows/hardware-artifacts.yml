@@ -229,7 +229,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-hwtest-${{ inputs.target || 'aarch64-unknown-linux-gnu' }}-${{ hashFiles('**/Cargo.lock') }}
+          # Root Cargo.toml too: it holds the profiles, and a key that
+          # outlives a profile change never saves the new profile's deps.
+          key: ${{ runner.os }}-hwtest-${{ inputs.target || 'aarch64-unknown-linux-gnu' }}-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-hwtest-${{ inputs.target || 'aarch64-unknown-linux-gnu' }}-
 
@@ -266,15 +268,24 @@ jobs:
       # SIOCGIFHWADDR ioctl request type differs between glibc and musl
       # — so this job is also the gate that keeps the test tree
       # cross-buildable.
+      #
+      # Two profiles (see Cargo.toml): the test binaries on `hwtest`,
+      # and on `release` what ships or times userspace — the CLI that
+      # the .deb packages, and vpp_convergence_bench. Staging takes the
+      # bench from the release build (RELEASE_TESTS).
       - name: Cross-build test binaries + CLI
         run: |
           set -euo pipefail
-          cross build --release --target "${TARGET}" \
-            --tests --bins \
+          cross build --profile hwtest --target "${TARGET}" \
+            --tests \
             -p packetframe-fast-path -p packetframe-guard -p packetframe-probe \
             -p packetframe-neigh-snoop -p packetframe-cli -p packetframe-vpp-offload \
             -p packetframe-flow-export \
-            --message-format=json | tee build.json >/dev/null
+            --message-format=json > build-tests.json
+          cross build --release --target "${TARGET}" \
+            --bins -p packetframe-cli \
+            --test vpp_convergence_bench -p packetframe-vpp-offload \
+            --message-format=json > build-release.json
 
       - name: Stage bundle
         run: |
@@ -293,7 +304,7 @@ jobs:
 
               cargo ran inside cross's Docker container, which mounts the
               workspace at /project and the target dir at /target, so every
-              `executable` in build.json is a container path that does not
+              `executable` in the build JSON is a container path that does not
               exist out here. Map the two mount points back onto the
               workspace. A plain (non-cross) build reports host paths
               already and falls through unchanged.
@@ -303,20 +314,29 @@ jobs:
                       return os.path.join(cwd, rel + p[len(prefix):])
               return p
 
+          # Integration tests whose staged copy comes from the release
+          # build: the hwtest build compiles them too (`--tests` takes
+          # every test target), and that copy is skipped.
+          RELEASE_TESTS = {"vpp_convergence_bench"}
+
+          def artifacts(path):
+              for line in open(path):
+                  try:
+                      msg = json.loads(line)
+                  except Exception:
+                      continue
+                  if msg.get("reason") == "compiler-artifact" and msg.get("executable"):
+                      yield msg
+
           staged_tests, staged_bins = [], []
-          for line in open("build.json"):
-              try:
-                  msg = json.loads(line)
-              except Exception:
-                  continue
-              if msg.get("reason") != "compiler-artifact":
-                  continue
-              exe = msg.get("executable")
-              if not exe:
-                  continue
+          for build, msg in [("hwtest", m) for m in artifacts("build-tests.json")] + \
+                            [("release", m) for m in artifacts("build-release.json")]:
+              exe = msg["executable"]
               tgt = msg["target"]
               name = tgt["name"]
               kinds = tgt.get("kind", [])
+              if build == "hwtest" and name in RELEASE_TESTS and "test" in kinds:
+                  continue
               if msg.get("profile", {}).get("test"):
                   # A lib's or bin's own #[test] harness shares its
                   # target name with the library/binary itself; suffix so
@@ -341,9 +361,9 @@ jobs:
               os.chmod(dest, 0o755)
 
           if not staged_tests:
-              sys.exit("no test executables found in build.json")
+              sys.exit("no test executables found in build-tests.json")
           if "packetframe" not in staged_bins:
-              sys.exit("packetframe CLI binary missing from build.json")
+              sys.exit("packetframe CLI binary missing from build-release.json")
           # Named explicitly, because "it is in the workspace" is not why
           # a binary ends up here — the cross-build takes an explicit
           # `-p` list, and a test whose package is missing from it is
@@ -497,8 +517,11 @@ jobs:
         if: contains(inputs.target || 'aarch64-unknown-linux-gnu', '-gnu')
         run: |
           set -euo pipefail
+          # $NF: 2.x prints the bare version ("2.7.0"; `$2` was empty, so
+          # the cached copy was reinstalled on every run), 3.x prefixes
+          # "cargo-deb ".
           if ! command -v cargo-deb >/dev/null 2>&1 || \
-             [ "$(cargo deb --version 2>/dev/null | awk '{print $2}')" != "2.7.0" ]; then
+             [ "$(cargo deb --version 2>/dev/null | awk '{print $NF}')" != "2.7.0" ]; then
             cargo install --locked --force cargo-deb --version 2.7.0
           fi
           # --no-build: cross already produced the binary at

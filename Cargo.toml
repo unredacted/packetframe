@@ -124,3 +124,16 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# The hardware bundle's test binaries (hardware-artifacts.yml): release
+# optimisation without the shipped binary's whole-program link. Under
+# `release`, each of ~50 test binaries was its own single-codegen-unit
+# LTO link, 7 of the workflow's 9-14 minutes. What they measure on a
+# router is the BPF programs (bpf_prog_test_run reports kernel time) and
+# correctness, neither of which the userspace profile moves. The CLI and
+# its .deb, and vpp_convergence_bench (userspace programming time), still
+# build on `release`.
+[profile.hwtest]
+inherits = "release"
+lto = false
+codegen-units = 16
