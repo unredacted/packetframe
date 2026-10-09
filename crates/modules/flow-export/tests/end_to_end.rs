@@ -295,13 +295,26 @@ fn samples_from_the_xdp_program_reach_a_collector_as_sflow() {
         "{text}"
     );
 
-    // Detach stops the sampler.
+    // The same, as a consumer outside the module reads it.
+    let coverage = m.coverage();
+    let c = coverage
+        .current(Instant::now())
+        .expect("fresh while the worker runs");
+    assert!(
+        c.paths.iter().any(|p| p.port == "lo" && p.path == "xdp"),
+        "{:?}",
+        c.paths
+    );
+    assert_eq!(c.rate, 100);
+
+    // Detach stops the sampler, and the module vouches for nothing.
     m.detach().unwrap();
     assert_eq!(
         sample_cfg(&s).rate_generation as u32,
         0,
         "rate 0 after detach"
     );
+    assert!(coverage.current(Instant::now()).is_none());
 }
 
 /// Without fast-path's maps there is nothing to sample: the attach fails

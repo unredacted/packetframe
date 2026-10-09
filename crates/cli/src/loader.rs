@@ -329,13 +329,24 @@ mod degrade_policy_tests {
     /// on this list, because it is the fallback — a fast-path that
     /// failed to attach and a daemon that kept running would report a
     /// forwarding box that forwards nothing.
-    /// flow-export reads VPP's sampler where vpp-offload prepares it.
+    /// flow-export reads VPP's sampler where vpp-offload prepares it, and
+    /// looks for the plugin where vpp-offload has VPP load it from.
     #[cfg(all(feature = "vpp-offload", feature = "flow-export"))]
     #[test]
     fn both_modules_name_one_sampler_directory() {
         assert_eq!(
             packetframe_vpp_offload::acquire::SAMPLER_DIR,
             packetframe_flow_export::VPP_SAMPLER_DIR
+        );
+        assert_eq!(
+            packetframe_vpp_offload::bringup::DEFAULT_VPP_BINARY,
+            packetframe_flow_export::feasibility::DEFAULT_VPP_BINARY
+        );
+        assert_eq!(
+            std::path::Path::new(packetframe_flow_export::feasibility::PLUGIN_PATH).parent(),
+            Some(std::path::Path::new(
+                packetframe_vpp_offload::sampler::PLUGIN_DIR
+            ))
         );
     }
 

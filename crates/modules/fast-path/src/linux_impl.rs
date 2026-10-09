@@ -3542,7 +3542,7 @@ pub fn detach(state: &mut ActiveState, teardown: crate::wan_egress::Teardown) ->
 /// Callers of this must tolerate the returned set changing between
 /// invocations (new ifaces come up, old ones go down). Reconcile
 /// should re-enumerate on SIGHUP.
-pub(crate) fn enumerate_redirect_targets() -> Vec<(String, u32)> {
+pub fn enumerate_redirect_targets() -> Vec<(String, u32)> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
         return out;

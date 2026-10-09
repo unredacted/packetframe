@@ -19,6 +19,7 @@
 pub mod cfg;
 pub mod collector;
 pub mod coverage;
+pub mod feasibility;
 pub mod pool;
 pub mod report;
 pub mod sflow_out;
@@ -33,6 +34,7 @@ mod vpp_live;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use packetframe_common::flow_coverage::FlowCoverage;
 use packetframe_common::sampler_ports::VppSamplerPorts;
 
 use packetframe_common::module::{
@@ -48,6 +50,11 @@ pub const MODULE_NAME: &str = "flow-export";
 /// it.
 pub const THREAD_NAME: &str = "pf-flow-export";
 
+/// Every interface fast-path may redirect to, so every output ifindex a
+/// sample can carry: `(name, ifindex)`.
+#[cfg(target_os = "linux")]
+pub use packetframe_fast_path::enumerate_redirect_targets as redirect_targets;
+
 /// VPP's sampler directory, where vpp-offload prepares it
 /// (`packetframe_sampler_shm::fs::DEFAULT_DIR`).
 pub const VPP_SAMPLER_DIR: &str = "/run/packetframe/vpp/sampler";
@@ -60,6 +67,7 @@ pub struct FlowExportModule {
     /// vpp-offload's ports and its sampler directory, when it is
     /// configured.
     vpp: Option<(Arc<VppSamplerPorts>, PathBuf)>,
+    coverage: Arc<FlowCoverage>,
     #[cfg(target_os = "linux")]
     running: Option<linux::Running>,
 }
@@ -74,6 +82,13 @@ impl FlowExportModule {
     /// is the only place that sees both modules.
     pub fn set_vpp(&mut self, ports: Arc<VppSamplerPorts>, dir: PathBuf) {
         self.vpp = Some((ports, dir));
+    }
+
+    /// What this module vouches for, per port and path and per collector,
+    /// for a consumer that acts on telemetry: fresh while the worker
+    /// runs, nothing once it stops.
+    pub fn coverage(&self) -> Arc<FlowCoverage> {
+        self.coverage.clone()
     }
 }
 
@@ -101,8 +116,14 @@ impl Module for FlowExportModule {
             .cfg
             .clone()
             .ok_or_else(|| ModuleError::other(MODULE_NAME, "attach before load"))?;
-        let running = linux::Running::start(c, &self.bpffs_root, &self.state_dir, self.vpp.clone())
-            .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
+        let running = linux::Running::start(
+            c,
+            &self.bpffs_root,
+            &self.state_dir,
+            self.vpp.clone(),
+            self.coverage.clone(),
+        )
+        .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         self.running = Some(running);
         // Nothing of fast-path's registry is ours: the programs are its.
         Ok(Vec::new())

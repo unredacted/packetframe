@@ -13,6 +13,7 @@ pub mod config;
 pub mod ethtool;
 pub mod events;
 pub mod fib;
+pub mod flow_coverage;
 #[cfg(feature = "frr")]
 pub mod frr;
 pub mod module;

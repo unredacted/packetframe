@@ -12,6 +12,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use aya::maps::{Array, Map, MapData};
+use packetframe_common::flow_coverage::FlowCoverage;
 use packetframe_common::module::HookType;
 use packetframe_common::sampler_ports::VppSamplerPorts;
 use packetframe_fast_path::sample::SampleCfg;
@@ -230,9 +231,11 @@ impl Running {
         bpffs_root: &Path,
         state_dir: &Path,
         vpp: Option<(Arc<VppSamplerPorts>, PathBuf)>,
+        coverage: Arc<FlowCoverage>,
     ) -> Result<Self, String> {
         let epoch = Instant::now();
-        let shared = Shared::new(epoch);
+        let mut shared = Shared::new(epoch);
+        shared.coverage = coverage;
         let source = LiveSource::open(bpffs_root)?;
         let socket = UdpSocket::bind((cfg.source, 0))
             .map_err(|e| format!("a socket at source-address {}: {e}", cfg.source))?;

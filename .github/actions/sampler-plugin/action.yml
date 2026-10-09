@@ -91,6 +91,21 @@ runs:
         PF_SAMPLER_VERSION_REQUIRED=00.00-never CARGO_TARGET_DIR=target/refused \
           cargo build --release --locked
 
+    - name: Registration as `packetframe feasibility` reads it
+      shell: bash
+      # flow-export's `vpp.plugin` row takes the VPP version the plugin
+      # requires from bytes 65..129 of this section, and compares it with
+      # dpkg's version of `vpp`: both assumptions, against the real build.
+      run: |
+        set -eu
+        so=crates/vpp-plugins/pf-sampler/target/release/libpf_sampler.so
+        reg=$(mktemp)
+        objcopy -O binary --only-section=.vlib_plugin_registration "$so" "$reg"
+        required=$(dd if="$reg" bs=1 skip=65 count=64 status=none | tr -d '\0')
+        installed=$(dpkg-query -W -f='${Version}' vpp)
+        echo "the plugin requires vpp '$required'; dpkg has vpp '$installed'"
+        [ -n "$required" ] && [ "$required" = "$installed" ]
+
     - name: Smoke tool
       shell: bash
       run: cargo build --release --locked -p packetframe-sampler-core --example sampler-smoke
