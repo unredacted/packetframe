@@ -226,6 +226,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        // Closed whatever the umask: `load` refuses a directory others
+        // can write, which would hide what a test means to show.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
         d
     }
 
@@ -286,15 +290,23 @@ mod tests {
         let elsewhere = dir.join("elsewhere.json");
         std::fs::write(&elsewhere, serde_json::to_vec(&sample()).unwrap()).unwrap();
         std::os::unix::fs::symlink(&elsewhere, file_path(&dir)).unwrap();
-        assert!(load(&dir).is_err(), "read through a symlink");
+        assert!(
+            matches!(load(&dir), Err(TcLinksError::Io { .. })),
+            "read through a symlink"
+        );
         std::fs::remove_file(file_path(&dir)).unwrap();
 
         save(&dir, &sample()).unwrap();
         std::fs::set_permissions(file_path(&dir), std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(
-            matches!(load(&dir), Err(TcLinksError::Refused { .. })),
-            "a world-writable record"
-        );
+        // Refused for the file's mode, not for anything else about the
+        // directory.
+        match load(&dir) {
+            Err(TcLinksError::Refused { why, .. }) => assert!(
+                why.contains("tc-links.json is writable by group or others"),
+                "{why}"
+            ),
+            other => panic!("a world-writable record: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
