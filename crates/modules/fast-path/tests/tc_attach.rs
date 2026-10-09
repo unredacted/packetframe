@@ -13,7 +13,7 @@
 //! 2. **Out-of-process teardown works from the persisted record.**
 //!    `tc_detach_from_state_dir` reconstructs the filter purely from
 //!    tc-links.json `(iface, ifindex, priority, handle)` and detaches
-//!    it.
+//!    it, on whatever device the ifindex names now.
 //!
 //! Mirror of guard's tests/guard_tc_attach.rs (egress); when one is
 //! updated, the other likely needs the same change.
@@ -68,6 +68,19 @@ fn tc_filter_listing(iface: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// The classifier pair, loaded the way attach() does: tc_finalize first
+/// (its FD feeds the tail-call table).
+fn load_classifiers(bpf: &mut aya::Ebpf) {
+    for name in ["tc_finalize", "tc_fast_path"] {
+        let prog: &mut aya::programs::tc::SchedClassifier = bpf
+            .program_mut(name)
+            .unwrap_or_else(|| panic!("{name} present"))
+            .try_into()
+            .unwrap_or_else(|_| panic!("{name} is sched_cls"));
+        prog.load().expect("verifier accepts classifier");
+    }
+}
+
 #[test]
 #[ignore = "needs CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn tc_attach_persists_and_detaches_from_state_dir() {
@@ -90,18 +103,9 @@ fn tc_attach_persists_and_detaches_from_state_dir() {
         state_dir: state_dir.clone(),
     };
 
-    // Load the ELF and the classifier pair the same way attach() does:
-    // tc_finalize first (its FD feeds the tail-call table).
     let bytes = aligned_bpf_copy();
     let mut bpf = aya::Ebpf::load(&bytes).expect("aya::Ebpf::load");
-    for name in ["tc_finalize", "tc_fast_path"] {
-        let prog: &mut aya::programs::tc::SchedClassifier = bpf
-            .program_mut(name)
-            .unwrap_or_else(|| panic!("{name} present"))
-            .try_into()
-            .unwrap_or_else(|_| panic!("{name} is sched_cls"));
-        prog.load().expect("verifier accepts classifier");
-    }
+    load_classifiers(&mut bpf);
 
     // Production attach helper: clsact (tolerating pre-existing) +
     // netlink cls_bpf + forget, returning kernel-assigned identifiers.
@@ -155,8 +159,8 @@ fn tc_attach_persists_and_detaches_from_state_dir() {
 #[test]
 #[ignore = "needs CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
 fn tc_detach_clears_records_for_vanished_ifaces() {
-    // A recorded filter whose iface no longer exists died with the
-    // device (qdisc lifetime): teardown must classify it as cleared —
+    // A recorded filter whose device (by ifindex) no longer exists
+    // died with it (qdisc lifetime): teardown must classify it as cleared —
     // dropping the record and removing the file — rather than either
     // erroring out or, worse, retaining a dead record forever. The
     // opposite case (detach FAILS with the iface alive) retains the
@@ -227,17 +231,6 @@ fn tc_detach_spares_filters_on_a_recreated_device() {
     let _cleanup = ReCleanup(state_dir.clone());
     let _ = Command::new("ip").args(["link", "del", RE_A]).status();
 
-    let load_classifiers = |bpf: &mut aya::Ebpf| {
-        for name in ["tc_finalize", "tc_fast_path"] {
-            let prog: &mut aya::programs::tc::SchedClassifier = bpf
-                .program_mut(name)
-                .unwrap_or_else(|| panic!("{name} present"))
-                .try_into()
-                .unwrap_or_else(|_| panic!("{name} is sched_cls"));
-            prog.load().expect("verifier accepts classifier");
-        }
-    };
-
     // Original device: attach, record (with its ifindex), then delete
     // the device — the filter dies with it, the record goes stale.
     run(&[
@@ -284,4 +277,179 @@ fn tc_detach_spares_filters_on_a_recreated_device() {
         "the replacement device's filter (prio {p2}, handle {h2}) must survive a \
          stale-record detach, got:\n{listing}"
     );
+}
+
+/// A device renamed since attach still holds its filter, under the new
+/// name: detach finds it by the recorded ifindex and takes it down,
+/// rather than dropping the record of a filter still running. A device
+/// made under the OLD name meanwhile, with a filter of its own (likely
+/// on the same auto-allocated tuple), is never touched.
+/// Mirror of guard's `detach_follows_a_renamed_device`.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn tc_detach_follows_a_renamed_device() {
+    if !FAST_PATH_BPF_AVAILABLE {
+        eprintln!("BPF stub in effect (no rustup); skipping tc attach test.");
+        return;
+    }
+    const RN_A: &str = "pf-tcn0";
+    const RN_B: &str = "pf-tcn1";
+    const RN_C: &str = "pf-tcn2";
+    const RENAMED: &str = "pf-tcn0r";
+    // Own iface pairs + state dir so this can run concurrently with the
+    // other tests in this binary.
+    struct RnCleanup(std::path::PathBuf);
+    impl Drop for RnCleanup {
+        fn drop(&mut self) {
+            for dev in [RN_A, RENAMED] {
+                let _ = Command::new("ip").args(["link", "del", dev]).status();
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let state_dir = std::env::temp_dir().join(format!("pf-tc-rename-test-{}", std::process::id()));
+    let _cleanup = RnCleanup(state_dir.clone());
+    for dev in [RN_A, RENAMED] {
+        let _ = Command::new("ip").args(["link", "del", dev]).status();
+    }
+
+    run(&[
+        "ip", "link", "add", RN_A, "type", "veth", "peer", "name", RN_B,
+    ]);
+    let bytes = aligned_bpf_copy();
+    let mut bpf = aya::Ebpf::load(&bytes).expect("aya::Ebpf::load");
+    load_classifiers(&mut bpf);
+    let (priority, handle) = tc_attach_iface(&mut bpf, RN_A).expect("attach");
+    tc_links::save(
+        &state_dir,
+        &tc_links::TcLinksFile {
+            links: vec![tc_links::TcLinkRecord {
+                iface: RN_A.to_string(),
+                ifindex: ifindex_of(RN_A),
+                priority,
+                handle,
+            }],
+        },
+    )
+    .expect("tc-links.json save");
+    drop(bpf);
+
+    // A fresh veth is down, so it can take a new name; the filter moves
+    // with the device.
+    run(&["ip", "link", "set", RN_A, "name", RENAMED]);
+    let listing = tc_filter_listing(RENAMED);
+    assert!(
+        listing.contains("bpf"),
+        "the filter must stay on the renamed device, got:\n{listing}"
+    );
+    run(&[
+        "ip", "link", "add", RN_A, "type", "veth", "peer", "name", RN_C,
+    ]);
+    let mut bpf2 = aya::Ebpf::load(&bytes).expect("aya::Ebpf::load 2");
+    load_classifiers(&mut bpf2);
+    let (p2, h2) = tc_attach_iface(&mut bpf2, RN_A).expect("attach on the new device");
+    drop(bpf2);
+
+    let cleared = tc_detach_from_state_dir(&state_dir).expect("renamed = detached");
+    assert_eq!(cleared, 1);
+    let listing = tc_filter_listing(RENAMED);
+    assert!(
+        !listing.contains("bpf"),
+        "the renamed device's filter must be taken down, got:\n{listing}"
+    );
+    let listing = tc_filter_listing(RN_A);
+    assert!(
+        listing.contains("bpf"),
+        "the new {RN_A}'s filter (prio {p2}, handle {h2}) must survive, got:\n{listing}"
+    );
+    assert!(tc_links::load(&state_dir).expect("load").is_none());
+}
+
+/// A recorded ifindex now held by another device under another name,
+/// with a filter of its own in the recorded slot (classic BPF, which
+/// carries no program name): not ours, so detach leaves it and drops
+/// the record. `ip link add … index` hands the old index on, as a
+/// device moved into the namespace keeps its own when it is free.
+/// Mirror of guard's `detach_spares_a_device_given_a_recorded_ifindex`.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn tc_detach_spares_a_device_given_a_recorded_ifindex() {
+    if !FAST_PATH_BPF_AVAILABLE {
+        eprintln!("BPF stub in effect (no rustup); skipping tc attach test.");
+        return;
+    }
+    const RI_A: &str = "pf-tci0";
+    const RI_B: &str = "pf-tci1";
+    const OTHER_A: &str = "pf-tcx0";
+    const OTHER_B: &str = "pf-tcx1";
+    struct RiCleanup(std::path::PathBuf);
+    impl Drop for RiCleanup {
+        fn drop(&mut self) {
+            for dev in [RI_A, OTHER_A] {
+                let _ = Command::new("ip").args(["link", "del", dev]).status();
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let state_dir = std::env::temp_dir().join(format!("pf-tc-reindex-test-{}", std::process::id()));
+    let _cleanup = RiCleanup(state_dir.clone());
+    for dev in [RI_A, OTHER_A] {
+        let _ = Command::new("ip").args(["link", "del", dev]).status();
+    }
+
+    run(&[
+        "ip", "link", "add", RI_A, "type", "veth", "peer", "name", RI_B,
+    ]);
+    let ifindex = ifindex_of(RI_A);
+    let bytes = aligned_bpf_copy();
+    let mut bpf = aya::Ebpf::load(&bytes).expect("aya::Ebpf::load");
+    load_classifiers(&mut bpf);
+    let (priority, handle) = tc_attach_iface(&mut bpf, RI_A).expect("attach");
+    tc_links::save(
+        &state_dir,
+        &tc_links::TcLinksFile {
+            links: vec![tc_links::TcLinkRecord {
+                iface: RI_A.to_string(),
+                ifindex,
+                priority,
+                handle,
+            }],
+        },
+    )
+    .expect("tc-links.json save");
+    drop(bpf);
+    run(&["ip", "link", "del", RI_A]);
+
+    let index = ifindex.to_string();
+    run(&[
+        "ip", "link", "add", OTHER_A, "index", &index, "type", "veth", "peer", "name", OTHER_B,
+    ]);
+    assert_eq!(ifindex_of(OTHER_A), ifindex);
+    run(&["tc", "qdisc", "add", "dev", OTHER_A, "clsact"]);
+    run(&[
+        "tc",
+        "filter",
+        "add",
+        "dev",
+        OTHER_A,
+        "ingress",
+        "pref",
+        &priority.to_string(),
+        "handle",
+        &handle.to_string(),
+        "bpf",
+        "bytecode",
+        "1,6 0 0 0,",
+    ]);
+    assert!(tc_filter_listing(OTHER_A).contains("bpf"));
+
+    let cleared = tc_detach_from_state_dir(&state_dir).expect("not ours = cleared");
+    assert_eq!(cleared, 1);
+    let listing = tc_filter_listing(OTHER_A);
+    assert!(
+        listing.contains("bpf"),
+        "the filter in {OTHER_A}'s (prio {priority}, handle {handle}) is not ours and must \
+         survive, got:\n{listing}"
+    );
+    assert!(tc_links::load(&state_dir).expect("load").is_none());
 }

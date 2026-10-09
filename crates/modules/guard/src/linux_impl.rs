@@ -440,30 +440,63 @@ fn tc_detach_one(
     use aya::programs::tc::{SchedClassifierLink, TcAttachType, TcError};
     use aya::programs::{Link as _, ProgramError};
 
-    // A same-name device with a DIFFERENT ifindex is a recreated
-    // device: the recorded filter died with the original (qdisc
-    // lifetime), and `SchedClassifierLink::attached` resolves by name,
-    // so deleting here could remove an unrelated filter on the
+    // The device is found by its ifindex, not its name. Renamed, it
+    // still holds the filter, under its new name. Gone, the filter went
+    // with its qdisc. A device recreated under the old name has another
+    // ifindex, and `SchedClassifierLink::attached` resolves by name, so
+    // a delete there could remove an unrelated filter on the
     // replacement whose (priority, handle) happens to match — the
     // first auto-allocated tuple is common (review finding, PR #205).
-    // The check-to-delete race is accepted: it requires the device to
-    // be recreated in that instant AND the tuple to collide.
-    match ifindex_of(iface) {
-        Err(_) => {
-            info!(iface, "iface gone; guard tc filter died with it");
-            return TcDetachOutcome::Cleared;
-        }
-        Ok(current) if current != expected_ifindex => {
+    // Under another name the ifindex alone vouches for the device, and
+    // an ifindex can be handed on (see `packetframe_common::tc_filter`),
+    // so there the slot must hold our own program before it is deleted
+    // (review finding, PR #343). The resolve-to-delete race is
+    // accepted: it requires the device to be renamed or recreated in
+    // that instant AND the tuple to collide.
+    let current = match name_of(expected_ifindex) {
+        Ok(Some(current)) => current,
+        Ok(None) => {
             info!(
                 iface,
-                expected_ifindex,
-                current,
-                "iface recreated; the recorded filter died with the old device"
+                expected_ifindex, "iface gone; guard tc filter died with it"
             );
             return TcDetachOutcome::Cleared;
         }
-        Ok(_) => {}
+        Err(e) => {
+            return TcDetachOutcome::Failed(format!(
+                "guard tc detach on {iface}: find ifindex {expected_ifindex}: {e}"
+            ))
+        }
+    };
+    if current != iface {
+        use packetframe_common::tc_filter::{bpf_program_at, ClsactHook};
+        match bpf_program_at(expected_ifindex, ClsactHook::Egress, priority, handle) {
+            Ok(Some(prog)) if prog == pin::PROGRAM_NAME => info!(
+                recorded = iface,
+                now = %current,
+                ifindex = expected_ifindex,
+                "iface renamed since attach; detaching its guard tc filter there"
+            ),
+            Ok(found) => {
+                info!(
+                    recorded = iface,
+                    now = %current,
+                    ifindex = expected_ifindex,
+                    found = ?found,
+                    "the recorded ifindex names another device without our filter; \
+                     the recorded filter died with the old device"
+                );
+                return TcDetachOutcome::Cleared;
+            }
+            Err(e) => {
+                return TcDetachOutcome::Failed(format!(
+                    "guard tc detach on {iface} (now {current}): read its filter at \
+                     (prio {priority}, handle {handle}): {e}"
+                ))
+            }
+        }
     }
+    let iface = current.as_str();
 
     // `attached()` only resolves the ifindex; failure means the iface
     // is gone, and qdisc-lifetime filters go with their device.
@@ -605,6 +638,26 @@ fn ifindex_of(iface: &str) -> ModuleResult<u32> {
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("parse {path} (`{raw}`): {e}")))
 }
 
+/// The name the device with `ifindex` has now. Wraps
+/// `libc::if_indextoname`: `Ok(None)` only when no device has it
+/// (ENXIO, the kernel's ENODEV as POSIX names it), `Err` when the lookup
+/// itself failed (no socket, say), which says nothing about the device.
+fn name_of(ifindex: u32) -> std::io::Result<Option<String>> {
+    let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
+    // SAFETY: a buffer of IF_NAMESIZE, which the call NUL-terminates.
+    let p = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr()) };
+    if p.is_null() {
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENXIO) | Some(libc::ENODEV) => Ok(None),
+            _ => Err(e),
+        };
+    }
+    // SAFETY: NUL-terminated by the call above, within `buf`.
+    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    Ok(Some(name.to_string_lossy().into_owned()))
+}
+
 /// The interface's own MAC — the expected src for `foreign-src`.
 /// sysfs, not SIOCGIFHWADDR: attach runs in the init netns where
 /// sysfs is authoritative, and this avoids the glibc/musl ioctl-type
@@ -632,7 +685,14 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_mac;
+    use super::{ifindex_of, name_of, parse_mac};
+
+    #[test]
+    fn a_device_is_named_by_its_ifindex() {
+        let lo = ifindex_of("lo").unwrap();
+        assert_eq!(name_of(lo).unwrap().as_deref(), Some("lo"));
+        assert_eq!(name_of(u32::MAX).unwrap(), None);
+    }
 
     #[test]
     fn mac_parses_and_refuses() {

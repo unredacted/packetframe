@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 # `frr` brings the shared `vtysh` invoker the FRR completeness
 # authority runs on; see `fib::frr_authority`.
-packetframe-common = { workspace = true, features = ["frr"] }
+packetframe-common = { workspace = true, features = ["frr", "tc"] }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

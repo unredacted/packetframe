@@ -269,15 +269,27 @@ tc filter del dev eth5 ingress
 
 (The clsact qdisc itself is harmless to leave in place.)
 
-Records in `tc-links.json` carry the attach-time ifindex; detach uses
-it to recognize a deleted-and-recreated interface (same name, new
-ifindex) and skip the stale record instead of deleting whatever filter
-the replacement device now holds at the recorded `(priority, handle)`.
-Records written by builds that predate the field load with ifindex 0
-and detach by name alone (the old behavior) — no `detach --all` is
-required before upgrading, but if you want the protection on an
-already-attached debugging interface, re-attach it once on the new
-build so the record is rewritten with its ifindex.
+Records in `tc-links.json` carry the attach-time ifindex, and detach
+finds the device by it rather than by name. An interface renamed since
+attach still holds its filter, which is removed under the new name, but
+only if the recorded `(priority, handle)` there still holds
+`tc_fast_path`: an ifindex can be handed to another device. A
+deleted-and-recreated interface (same name, new ifindex) has its stale
+record dropped instead of losing whatever filter the replacement device
+now holds at the recorded `(priority, handle)`. Records written by
+builds that predate the field load with ifindex 0 and detach by name
+alone (the old behavior) — no `detach --all` is required before
+upgrading, but if you want the protection on an already-attached
+debugging interface, re-attach it once on the new build so the record
+is rewritten with its ifindex.
+
+Because it names the filters a root detach removes, `tc-links.json` is
+read only when no other account could have written it, on the same
+checks as
+[`vpp-offload.json`](vpp-offload.md#attach-or-detach-refuses-refusing-vpp-offloadjson-),
+and only up to 1 MiB. A refusal fails `detach` with a message naming
+the check. Remove the filters with `tc filter del dev <iface> ingress`,
+then the file.
 
 Failure posture mirrors XDP: SIGTERM leaves filters attached
 (§8.5 parity — the filter holds its own program reference); a circuit
