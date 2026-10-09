@@ -22,6 +22,11 @@ impl SampleCfg {
             _pad: 0,
         }
     }
+
+    /// 1 in this many; 0 is off.
+    pub fn rate(&self) -> u32 {
+        self.rate_generation as u32
+    }
 }
 
 const _: () = assert!(std::mem::size_of::<SampleCfg>() == 16);

@@ -58,6 +58,19 @@ fn ifindex_of(iface: &str) -> Option<u32> {
     (i != 0).then_some(i)
 }
 
+/// The name the device with `ifindex` has now.
+fn name_of(ifindex: u32) -> Option<String> {
+    let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
+    // SAFETY: a buffer of IF_NAMESIZE, which the call NUL-terminates.
+    let p = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr()) };
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: NUL-terminated by the call above, within `buf`.
+    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    Some(name.to_string_lossy().into_owned())
+}
+
 /// The devices `iface` sits on (`lower_*` in sysfs), and theirs, a few
 /// levels down: a VLAN on a bond on a port.
 fn lowers(iface: &str, depth: u32) -> Vec<String> {
@@ -78,10 +91,12 @@ fn lowers(iface: &str, depth: u32) -> Vec<String> {
 }
 
 /// Why `iface` may not be sampled by the kernel sampler, if it may not.
-/// `sampled`: the ports fast-path's programs or VPP sample. A packet is
-/// sampled once, where it is first seen: a device stacked on a sampled
-/// port would see those packets a second time.
-pub fn refusal(iface: &str, sampled: &[String]) -> Option<String> {
+/// `sampled`: the ports fast-path's programs or VPP sample, and `kernel`
+/// every `kernel-sample` interface (`iface` among them or not). A packet
+/// is sampled once, where it is first seen: a device stacked on a sampled
+/// port, or on another kernel-sampled one, would see those packets a
+/// second time.
+pub fn refusal(iface: &str, sampled: &[String], kernel: &[String]) -> Option<String> {
     let base = Path::new("/sys/class/net").join(iface);
     if !base.exists() {
         return Some(format!("{iface} does not exist"));
@@ -93,7 +108,10 @@ pub fn refusal(iface: &str, sampled: &[String]) -> Option<String> {
     if flags & libc::IFF_LOOPBACK as u32 != 0 {
         return Some(format!("{iface} is a loopback"));
     }
-    if let Some(port) = lowers(iface, 4).into_iter().find(|l| sampled.contains(l)) {
+    if let Some(port) = lowers(iface, 4)
+        .into_iter()
+        .find(|l| sampled.contains(l) || (l != iface && kernel.contains(l)))
+    {
         return Some(format!(
             "{iface} sits on {port}, whose packets are sampled already"
         ));
@@ -115,7 +133,7 @@ pub fn attach(
         );
     }
     for iface in ifaces {
-        if let Some(why) = refusal(iface, sampled) {
+        if let Some(why) = refusal(iface, sampled, ifaces) {
             return Err(format!("kernel-sample {iface}: {why}"));
         }
     }
@@ -271,14 +289,23 @@ fn tc_detach_one(
 ) -> Result<(), String> {
     use aya::programs::tc::{SchedClassifierLink, TcAttachType, TcError};
     use aya::programs::{Link as _, ProgramError};
-    // A same-name device with another ifindex was recreated: the recorded
-    // filter died with the old one, and a delete by name could take an
-    // unrelated filter with a colliding (priority, handle).
-    match ifindex_of(iface) {
-        None => return Ok(()),
-        Some(i) if i != expected_ifindex => return Ok(()),
-        Some(_) => {}
+    // The device is found by its ifindex, not its name. Renamed, it still
+    // holds the filter, under its new name. Gone, the filter went with its
+    // qdisc. A device recreated under the old name has another ifindex,
+    // and a delete by name there could take an unrelated filter with a
+    // colliding (priority, handle).
+    let Some(current) = name_of(expected_ifindex) else {
+        return Ok(());
+    };
+    if current != iface {
+        info!(
+            recorded = iface,
+            now = %current,
+            ifindex = expected_ifindex,
+            "kernel sampler's interface was renamed; detaching it there"
+        );
     }
+    let iface = current.as_str();
     let Ok(link) = SchedClassifierLink::attached(iface, TcAttachType::Ingress, priority, handle)
     else {
         return Ok(());
@@ -306,9 +333,16 @@ mod tests {
 
     #[test]
     fn the_loopback_and_missing_devices_are_refused() {
-        assert!(refusal("lo", &[]).unwrap().contains("loopback"));
-        assert!(refusal("pf-no-such-dev0", &[])
+        assert!(refusal("lo", &[], &[]).unwrap().contains("loopback"));
+        assert!(refusal("pf-no-such-dev0", &[], &[])
             .unwrap()
             .contains("does not exist"));
+    }
+
+    #[test]
+    fn a_device_is_named_by_its_ifindex() {
+        let lo = ifindex_of("lo").unwrap();
+        assert_eq!(name_of(lo).as_deref(), Some("lo"));
+        assert_eq!(name_of(u32::MAX), None);
     }
 }

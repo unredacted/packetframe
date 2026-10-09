@@ -108,6 +108,43 @@ pub trait SampleSource {
     fn clock_ns(&self) -> u64;
 }
 
+/// Configure two samplers as one. A reload is both or neither: the one
+/// that took it is put back to its `before` when the other refuses, so
+/// the worker, keeping its old configuration, is not left with one path
+/// sampling at a rate and generation it never applied. Turning off (rate
+/// 0) is tried on both, whatever became of the other.
+pub fn configure_together(
+    first: &mut dyn SampleSource,
+    first_before: Option<SampleCfg>,
+    second: Option<(&mut dyn SampleSource, Option<SampleCfg>)>,
+    cfg: SampleCfg,
+) -> Result<(), String> {
+    fn put_back(s: &mut dyn SampleSource, before: Option<SampleCfg>, e: String) -> String {
+        match before.map(|c| s.configure(c)) {
+            Some(Ok(())) => e,
+            Some(Err(again)) => {
+                format!("{e}; and the sampler that took it could not be put back: {again}")
+            }
+            None => format!(
+                "{e}; and the sampler that took it keeps it (what it ran before is unknown)"
+            ),
+        }
+    }
+    let a = first.configure(cfg);
+    let Some((second, second_before)) = second else {
+        return a;
+    };
+    let b = second.configure(cfg);
+    let off = cfg.rate() == 0;
+    match (a, b) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(e)) if !off => Err(put_back(first, first_before, e)),
+        (Err(e), Ok(())) if !off => Err(put_back(second, second_before, e)),
+        (Err(x), Err(y)) => Err(format!("{x}; {y}")),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+    }
+}
+
 /// What replacing the rings left: the events the old ones held, and the
 /// samples they reported lost.
 #[derive(Debug, Default)]
@@ -1533,6 +1570,66 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("did not take the reload"), "{e}");
         assert!(shared.reload.lock().unwrap().is_none());
+    }
+
+    /// Two samplers configured as one: a reload one refuses puts the
+    /// other back; turning off is tried on both regardless.
+    #[test]
+    fn two_samplers_take_a_reload_both_or_neither() {
+        let before = SampleCfg::new(1000, 128, 1);
+        let new = SampleCfg::new(100, 128, 2);
+        let (mut fast, mut kernel) = (
+            FakeSource::default(),
+            FakeSource {
+                refuse: true,
+                ..FakeSource::default()
+            },
+        );
+        let e = configure_together(
+            &mut fast,
+            Some(before),
+            Some((&mut kernel, Some(before))),
+            new,
+        )
+        .unwrap_err();
+        assert!(e.contains("EPERM"), "{e}");
+        assert_eq!(*fast.cfgs.borrow(), vec![new, before], "put back");
+
+        // The other way about.
+        let (mut fast, mut kernel) = (
+            FakeSource {
+                refuse: true,
+                ..FakeSource::default()
+            },
+            FakeSource::default(),
+        );
+        configure_together(
+            &mut fast,
+            Some(before),
+            Some((&mut kernel, Some(before))),
+            new,
+        )
+        .unwrap_err();
+        assert_eq!(*kernel.cfgs.borrow(), vec![new, before]);
+
+        // Off: the one that can take it does, and stays off.
+        let off = SampleCfg::new(0, 128, 3);
+        let mut fast = FakeSource::default();
+        configure_together(
+            &mut fast,
+            Some(before),
+            Some((&mut kernel_refusing(), Some(before))),
+            off,
+        )
+        .unwrap_err();
+        assert_eq!(*fast.cfgs.borrow(), vec![off]);
+    }
+
+    fn kernel_refusing() -> FakeSource {
+        FakeSource {
+            refuse: true,
+            ..FakeSource::default()
+        }
     }
 
     #[test]

@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const TC_LINKS_FILENAME: &str = "flow-export-tc-links.json";
+/// Far past any record of a host's interfaces: a bound on what is read.
+const MAX_LINKS_BYTES: u64 = 1 << 20;
 
 #[derive(Debug, Error)]
 pub enum TcLinksError {
@@ -34,6 +36,12 @@ pub enum TcLinksError {
         #[source]
         source: serde_json::Error,
     },
+
+    /// Not read: another account could have written it, or it is past
+    /// [`MAX_LINKS_BYTES`]. Its contents decide which filters root
+    /// removes.
+    #[error("refusing {path:?}: {why}; remove the filters with `tc filter del dev <iface> ingress`, then the file")]
+    Refused { path: PathBuf, why: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,14 +96,15 @@ pub fn save(state_dir: &Path, file: &TcLinksFile) -> Result<(), TcLinksError> {
 }
 
 /// `Ok(None)` when the file doesn't exist (no tc attaches recorded).
+/// Read only if this daemon's own uid could have put it there, as
+/// [`read_record`] says: a planted record would name the filters a root
+/// detach removes.
 pub fn load(state_dir: &Path) -> Result<Option<TcLinksFile>, TcLinksError> {
     let path = file_path(state_dir);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(TcLinksError::Io { path, source }),
+    let Some(raw) = read_record(&path)? else {
+        return Ok(None);
     };
-    serde_json::from_str(&raw)
+    serde_json::from_slice(&raw)
         .map(Some)
         .map_err(|source| TcLinksError::Json { path, source })
 }
@@ -128,6 +137,37 @@ fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
+}
+
+/// Through [`packetframe_common::statefile::read_owned_no_follow`]: no
+/// symlink at any component, owner and mode checked on the open
+/// descriptors, a FIFO refused rather than waited on, at most
+/// [`MAX_LINKS_BYTES`].
+#[cfg(target_os = "linux")]
+fn read_record(path: &Path) -> Result<Option<Vec<u8>>, TcLinksError> {
+    use packetframe_common::statefile::{read_owned_no_follow, OwnedReadError};
+    read_owned_no_follow(path, MAX_LINKS_BYTES).map_err(|e| match e {
+        OwnedReadError::Io(source) => TcLinksError::Io {
+            path: path.to_owned(),
+            source,
+        },
+        e => TcLinksError::Refused {
+            path: path.to_owned(),
+            why: e.to_string(),
+        },
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_record(path: &Path) -> Result<Option<Vec<u8>>, TcLinksError> {
+    match std::fs::read(path) {
+        Ok(r) => Ok(Some(r)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(TcLinksError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -233,6 +273,28 @@ mod tests {
         std::fs::remove_file(&tmp).unwrap();
         save(&dir, &sample()).unwrap();
         assert_eq!(load(&dir).unwrap().unwrap().links[0].ifindex, 42);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record another account could have planted is not read: not
+    /// through a symlink, and not when the file is writable by others.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn load_refuses_a_record_it_cannot_trust() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("untrusted");
+        let elsewhere = dir.join("elsewhere.json");
+        std::fs::write(&elsewhere, serde_json::to_vec(&sample()).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, file_path(&dir)).unwrap();
+        assert!(load(&dir).is_err(), "read through a symlink");
+        std::fs::remove_file(file_path(&dir)).unwrap();
+
+        save(&dir, &sample()).unwrap();
+        std::fs::set_permissions(file_path(&dir), std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(
+            matches!(load(&dir), Err(TcLinksError::Refused { .. })),
+            "a world-writable record"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -507,6 +507,20 @@ pub struct FlowExportProbeInputs {
 }
 
 /// `None` without a flow-export section.
+/// flow-export's `kernel-sample` interfaces, in config order.
+pub fn kernel_sample_ifaces_from_config(config: &Config) -> Vec<String> {
+    config
+        .modules
+        .iter()
+        .filter(|m| m.name == "flow-export")
+        .flat_map(|m| &m.directives)
+        .filter_map(|d| match d {
+            ModuleDirective::FlowKernelSample { iface, .. } => Some(iface.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn flow_export_probe_inputs_from_config(config: &Config) -> Option<FlowExportProbeInputs> {
     let section = config.modules.iter().find(|m| m.name == "flow-export")?;
     Some(FlowExportProbeInputs {
@@ -516,14 +530,7 @@ pub fn flow_export_probe_inputs_from_config(config: &Config) -> Option<FlowExpor
         }),
         vpp: config.modules.iter().any(|m| m.name == "vpp-offload"),
         vpp_binary: vpp_binary_from_config(config),
-        kernel: section
-            .directives
-            .iter()
-            .filter_map(|d| match d {
-                ModuleDirective::FlowKernelSample { iface, .. } => Some(iface.clone()),
-                _ => None,
-            })
-            .collect(),
+        kernel: kernel_sample_ifaces_from_config(config),
         sampled: attach_ifaces_from_config(config)
             .into_iter()
             .chain(vpp_ports_from_config(config))
