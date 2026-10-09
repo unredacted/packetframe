@@ -257,17 +257,25 @@ fn bench_allowlist_miss() {
     eprintln!("bench_allowlist_miss: {ns} ns/pkt (median of {calls} x {repeat})");
 }
 
-/// The flow-export sampler's cost on the forward path: sampling off
-/// against 1:1000, the rate the 5% worker budget is qualified at. Two
+/// The flow-export sampler's cost on the forward path: what a sample
+/// costs, and what that comes to at 1:1000, the rate the 5% worker budget
+/// is qualified at. Measured at 1:10 against sampling off, because at
+/// 1:1000 the samples add a fraction of a percent, which run-to-run noise
+/// on the EFG (±4%) swamps, while at 1:10 they add tens of percent. The
+/// projection takes a sample to cost the same at either rate. Two
 /// harnesses, one per setting, whose runs interleave so host drift lands
 /// on both; a trimmed mean of the per-call figures, since each is a whole
 /// number of ns and a median would round the difference away.
 ///
-/// Prints the overhead; `PACKETFRAME_BENCH_SAMPLING_GATE=1` fails it
+/// Prints both; `PACKETFRAME_BENCH_SAMPLING_GATE=1` fails a projection
 /// above 2% (opt-in, like the baseline gate: not for shared runners).
 #[test]
 #[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test --test bench -- --ignored --nocapture`"]
 fn bench_sampling_overhead() {
+    /// The measured rate.
+    const DENSE: u32 = 10;
+    /// The rate the projection is for.
+    const QUALIFIED: f64 = 1000.0;
     if bench_skip() {
         return;
     }
@@ -276,7 +284,7 @@ fn bench_sampling_overhead() {
         let off = packetframe_fib_harness();
         let mut on = packetframe_fib_harness();
         let mut tap = on.sample_tap();
-        on.set_sample_cfg(1000, 128, 1);
+        on.set_sample_cfg(DENSE, 128, 1);
         let pkt = fwd_packet(TCP_FLAG_ACK);
 
         let (repeat, calls) = bench_params(FWD_REPEAT, FWD_CALLS);
@@ -291,8 +299,9 @@ fn bench_sampling_overhead() {
             );
             a.push(ns_a);
             b.push(ns_b);
-            // Keep the ring from filling: a refused reservation is cheaper
-            // than a delivered one and would flatter the figure.
+            // Keep the ring from filling (50 calls are about 1,000
+            // samples): a refused reservation is cheaper than a delivered
+            // one and would flatter the figure.
             if i % 50 == 49 {
                 samples += tap.events().len();
             }
@@ -302,16 +311,22 @@ fn bench_sampling_overhead() {
         assert_eq!(on.stat(StatIdx::FwdOk), executed);
         assert_eq!(on.stat(StatIdx::SampleEmitFailed), 0);
         assert_eq!(on.stat(StatIdx::SampleSelected), samples as u64);
-        assert!(samples > 0 || executed < 1000, "no samples at 1:1000");
+        assert!(samples > 0, "no samples at 1:{DENSE}");
 
         let (off_ns, on_ns) = (trimmed_mean(a), trimmed_mean(b));
-        let overhead = (on_ns / off_ns - 1.0) * 100.0;
+        // What the samples added, over the samples that added it.
+        let per_sample = (on_ns - off_ns) * executed as f64 / samples as f64;
+        let projected = per_sample / QUALIFIED / off_ns * 100.0;
         eprintln!(
-            "bench_sampling_overhead: off {off_ns:.2} ns/pkt, 1:1000 {on_ns:.2} ns/pkt \
-             ({overhead:+.2}%), {samples} samples of {executed}"
+            "bench_sampling_overhead: off {off_ns:.2} ns/pkt, 1:{DENSE} {on_ns:.2} ns/pkt, \
+             {per_sample:.0} ns a sample, so 1:1000 costs {projected:+.2}% (projected); \
+             {samples} samples of {executed}"
         );
         if std::env::var_os("PACKETFRAME_BENCH_SAMPLING_GATE").is_some() {
-            assert!(overhead <= 2.0, "sampling at 1:1000 costs {overhead:.2}%");
+            assert!(
+                projected <= 2.0,
+                "sampling at 1:1000 costs {projected:.2}% (projected)"
+            );
         }
     });
 }
