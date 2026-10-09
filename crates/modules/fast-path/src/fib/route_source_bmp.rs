@@ -837,6 +837,7 @@ impl BmpStation {
                                 // the FibProgrammer LP-tier filter sees the
                                 // same value bird's best-path used.
                                 local_pref: elem.local_pref,
+                                origin_asn: crate::fib::route_source_bgp::origin_asn(&elem),
                             }
                         }
                         ElemType::WITHDRAW => RouteEvent::Del {

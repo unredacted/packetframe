@@ -818,23 +818,10 @@ fn reload_collateral(old: &VppOffloadConfig, new: &VppOffloadConfig) -> String {
 /// carried, and that is not a copy of this: it is what the loop holds, and
 /// a reload compares a plan freshly derived from this handle against it.
 /// The allowlist itself is still never snapshotted.
-#[derive(Debug, Default)]
-pub struct SharedAllowlist(std::sync::RwLock<Vec<packetframe_common::fib::IpPrefix>>);
-
-impl SharedAllowlist {
-    pub fn new(prefixes: Vec<packetframe_common::fib::IpPrefix>) -> Self {
-        Self(std::sync::RwLock::new(prefixes))
-    }
-
-    /// Replace the whole list. The loader is the only writer.
-    pub fn publish(&self, prefixes: Vec<packetframe_common::fib::IpPrefix>) {
-        *self.0.write().expect("allowlist lock") = prefixes;
-    }
-
-    pub fn get(&self) -> Vec<packetframe_common::fib::IpPrefix> {
-        self.0.read().expect("allowlist lock").clone()
-    }
-}
+///
+/// flow-export reads the same object, for the local prefixes its privacy
+/// profiles keep addresses inside of.
+pub use packetframe_common::fib::SharedPrefixes as SharedAllowlist;
 
 /// Which interfaces `attach` should ask for their ntuple table.
 ///

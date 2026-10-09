@@ -541,10 +541,34 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     // republishes into it from the SAME derivation the startup path
     // uses, which is what makes "vpp-offload steers exactly what
     // fast-path allows" survive a reconfigure — see `SharedAllowlist`.
-    #[cfg(feature = "vpp-offload")]
-    let allowlist = std::sync::Arc::new(packetframe_vpp_offload::SharedAllowlist::new(
+    #[cfg(any(feature = "vpp-offload", feature = "flow-export"))]
+    let allowlist = std::sync::Arc::new(packetframe_common::fib::SharedPrefixes::new(
         crate::feasibility::allowlist_from_config(&config),
     ));
+
+    // Origin ASes for flow export's IPFIX records, published by the
+    // FibProgrammer: built only when an IPFIX collector would carry them
+    // and fast-path learns routes from BGP or BMP, since a full table's
+    // worth costs tens of MB.
+    #[cfg(feature = "flow-export")]
+    let asn_table = {
+        let ipfix = config
+            .modules
+            .iter()
+            .filter(|m| m.name == "flow-export")
+            .flat_map(|m| &m.directives)
+            .any(|d| {
+                matches!(
+                    d,
+                    packetframe_common::config::ModuleDirective::FlowCollector {
+                        format: packetframe_common::config::CollectorFormat::Ipfix,
+                        ..
+                    }
+                )
+            });
+        (ipfix && config.has_asn_source())
+            .then(|| std::sync::Arc::new(packetframe_common::fib::asn::AsnTable::new()))
+    };
 
     // How complete the route mirror is, published by the fast-path's
     // integrity checker and read by vpp-offload before it diverts
@@ -598,6 +622,10 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 #[cfg(feature = "vpp-offload")]
                 if let Some(h) = &feed_session {
                     m.set_feed_session(h.clone());
+                }
+                #[cfg(feature = "flow-export")]
+                if let Some(t) = &asn_table {
+                    m.set_asn_table(t.clone());
                 }
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
@@ -658,7 +686,6 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 // Reads fast-path's pinned sampler maps and port registry
                 // at attach, and VPP's sampler through what vpp-offload
                 // prepared at its: `validate_flow_export` put both first.
-                #[allow(unused_mut)]
                 let mut m = packetframe_flow_export::FlowExportModule::new();
                 #[cfg(feature = "vpp-offload")]
                 if let Some(h) = &vpp_sampler_ports {
@@ -666,6 +693,12 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                         h.clone(),
                         PathBuf::from(packetframe_flow_export::VPP_SAMPLER_DIR),
                     );
+                }
+                // The privacy profiles' local prefixes default to
+                // fast-path's allowlist, kept current across SIGHUPs.
+                m.set_local_default(allowlist.clone());
+                if let Some(t) = &asn_table {
+                    m.set_asn_table(t.clone());
                 }
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
@@ -934,7 +967,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
         &mut modules,
         &not_attached,
         &module_gauges,
-        #[cfg(feature = "vpp-offload")]
+        #[cfg(any(feature = "vpp-offload", feature = "flow-export"))]
         &allowlist,
     )
     .map_err(RunError::Runtime)?;
@@ -1173,7 +1206,8 @@ fn drive_signal_loop(
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
     not_attached: &[crate::health::NotAttached],
     module_gauges: &crate::metrics::ModuleGauges,
-    #[cfg(feature = "vpp-offload")] allowlist: &packetframe_vpp_offload::SharedAllowlist,
+    #[cfg(any(feature = "vpp-offload", feature = "flow-export"))]
+    allowlist: &packetframe_common::fib::SharedPrefixes,
 ) -> Result<Termination, String> {
     use signal_hook::{
         consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1},
@@ -1199,7 +1233,7 @@ fn drive_signal_loop(
                         modules,
                         not_attached,
                         module_gauges,
-                        #[cfg(feature = "vpp-offload")]
+                        #[cfg(any(feature = "vpp-offload", feature = "flow-export"))]
                         allowlist,
                     );
                     // Only when it actually published: a rejected
@@ -1244,7 +1278,8 @@ fn reconfigure_from_signal(
     modules: &mut [(String, Box<dyn packetframe_common::module::Module>)],
     not_attached: &[crate::health::NotAttached],
     module_gauges: &std::sync::Mutex<String>,
-    #[cfg(feature = "vpp-offload")] allowlist: &packetframe_vpp_offload::SharedAllowlist,
+    #[cfg(any(feature = "vpp-offload", feature = "flow-export"))]
+    allowlist: &packetframe_common::fib::SharedPrefixes,
 ) -> Published {
     use packetframe_common::module::ModuleConfig;
 
@@ -1326,7 +1361,7 @@ fn reconfigure_from_signal(
     // contain — so without this its `reconfigure` would re-derive the
     // steering plan from the allowlist as it was at startup, find it
     // unchanged, and report OK for a SIGHUP that changed nothing.
-    #[cfg(feature = "vpp-offload")]
+    #[cfg(any(feature = "vpp-offload", feature = "flow-export"))]
     allowlist.publish(crate::feasibility::allowlist_from_config(&new_config));
 
     let mut failures: Vec<String> = Vec::new();

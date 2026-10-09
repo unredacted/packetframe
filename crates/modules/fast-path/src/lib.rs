@@ -115,6 +115,10 @@ pub struct FastPathModule {
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
     #[cfg(target_os = "linux")]
     feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
+    /// Where the FibProgrammer publishes origin ASes, for flow export.
+    /// Same window as `route_sink`: set before attach, consumed there.
+    #[cfg(target_os = "linux")]
+    asn_table: Option<std::sync::Arc<packetframe_common::fib::asn::AsnTable>>,
     /// Interfaces the neigh-snoop module declared `ix-mode`: the
     /// resolver never issues its proactive neighbour kick for nexthops
     /// egressing them. Names, not ifindexes. Present on every platform
@@ -191,6 +195,13 @@ impl FastPathModule {
         self.feed_session = Some(handle);
     }
 
+    /// Publish each prefix's origin AS through `table`, for flow export's
+    /// AS fields. Same constraint and caller as [`Self::set_route_sink`].
+    #[cfg(target_os = "linux")]
+    pub fn set_asn_table(&mut self, table: std::sync::Arc<packetframe_common::fib::asn::AsnTable>) {
+        self.asn_table = Some(table);
+    }
+
     /// Snapshot of the current attach set for status reporting.
     /// Non-Linux always returns an empty list (no attach occurred).
     #[cfg(target_os = "linux")]
@@ -264,6 +275,7 @@ impl Module for FastPathModule {
             self.completeness.clone(),
             self.feed_session.clone(),
             self.ix_mode_ifaces.clone(),
+            self.asn_table.clone(),
         )
     }
 

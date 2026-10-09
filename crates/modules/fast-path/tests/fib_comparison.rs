@@ -368,6 +368,7 @@ fn synthetic_rib_programs_and_resolves_as_expected() {
                     nexthops: nhs.clone(),
                     path_id: None,
                     local_pref: None,
+                    origin_asn: None,
                 })
                 .await
         })

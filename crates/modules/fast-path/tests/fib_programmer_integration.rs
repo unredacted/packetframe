@@ -243,6 +243,11 @@ struct ProgrammerHarness {
 
 impl ProgrammerHarness {
     fn new() -> Self {
+        Self::with_asn(None)
+    }
+
+    /// `new()`, publishing origin ASes through `asn` when it is `Some`.
+    fn with_asn(asn: Option<Arc<packetframe_common::fib::asn::AsnTable>>) -> Self {
         let pins = PinDirs::setup();
         let ebpf = load_and_pin(&pins);
 
@@ -258,7 +263,7 @@ impl ProgrammerHarness {
 
         let shutdown = CancellationToken::new();
         let (_events_tx, events_rx) = tokio::sync::mpsc::channel(16);
-        let (programmer, handle) = FibProgrammer::new(
+        let (mut programmer, handle) = FibProgrammer::new(
             nexthops,
             fib_v4,
             fib_v6,
@@ -266,6 +271,9 @@ impl ProgrammerHarness {
             events_rx,
             shutdown.clone(),
         );
+        if let Some(table) = asn {
+            programmer.set_asn_table(table);
+        }
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -615,6 +623,7 @@ fn add_single_nexthop_route_writes_fib_v4() {
                 nexthops: vec![nh],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
     })
@@ -655,6 +664,7 @@ fn add_multi_nexthop_route_allocates_ecmp_group() {
                 nexthops: nhs.clone(),
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
     })
@@ -703,6 +713,7 @@ fn del_removes_fib_entry() {
                 nexthops: vec![nh],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
     })
@@ -750,6 +761,7 @@ fn peer_down_withdraws_all_peer_routes() {
                     nexthops: vec![nh],
                     path_id: None,
                     local_pref: None,
+                    origin_asn: None,
                 })
                 .await
                 .expect("apply Add");
@@ -801,6 +813,7 @@ fn add_single_nexthop_route_writes_fib_v6() {
                 nexthops: vec![nh],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
     })
@@ -843,6 +856,7 @@ fn local_prefix6_slash128_self_nexthop_round_trips() {
                 nexthops: vec![IpAddr::V6(host)],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
     })
@@ -866,6 +880,7 @@ fn local_prefix6_slash128_self_nexthop_round_trips() {
                 nexthops: vec![IpAddr::V6(host)],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
     })
@@ -920,6 +935,7 @@ fn peer_down_withdraws_both_families_under_one_local_arp_peer_id() {
                     nexthops: vec![IpAddr::V4(Ipv4Addr::from(octets))],
                     path_id: None,
                     local_pref: None,
+                    origin_asn: None,
                 })
                 .await
                 .expect("apply v4 Add");
@@ -936,6 +952,7 @@ fn peer_down_withdraws_both_families_under_one_local_arp_peer_id() {
                     nexthops: vec![IpAddr::V6(a)],
                     path_id: None,
                     local_pref: None,
+                    origin_asn: None,
                 })
                 .await
                 .expect("apply v6 Add");
@@ -995,6 +1012,7 @@ fn nexthop_pool_is_shared_across_families() {
                     nexthops: vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, i))],
                     path_id: None,
                     local_pref: None,
+                    origin_asn: None,
                 })
                 .await
                 .expect("v4 Add");
@@ -1009,6 +1027,7 @@ fn nexthop_pool_is_shared_across_families() {
                     nexthops: vec![IpAddr::V6(a)],
                     path_id: None,
                     local_pref: None,
+                    origin_asn: None,
                 })
                 .await
                 .expect("v6 Add");
@@ -1057,6 +1076,7 @@ fn ecmp_groups_dedup_by_signature() {
                     nexthops: nhs.clone(),
                     path_id: None,
                     local_pref: None,
+                    origin_asn: None,
                 })
                 .await
                 .expect("apply Add");
@@ -1102,6 +1122,7 @@ fn add_path_two_paths_one_prefix_yields_ecmp() {
                 nexthops: vec![nh_a],
                 path_id: Some(1),
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply Add path 1");
@@ -1112,6 +1133,7 @@ fn add_path_two_paths_one_prefix_yields_ecmp() {
                 nexthops: vec![nh_b],
                 path_id: Some(2),
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply Add path 2");
@@ -1149,6 +1171,7 @@ fn add_path_withdrawal_collapses_to_single_nh() {
                 nexthops: vec![nh_a],
                 path_id: Some(1),
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply Add A");
@@ -1159,6 +1182,7 @@ fn add_path_withdrawal_collapses_to_single_nh() {
                 nexthops: vec![nh_b],
                 path_id: Some(2),
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply Add B");
@@ -1216,6 +1240,7 @@ fn add_path_two_peers_two_paths_merge() {
                 nexthops: vec![nh_a],
                 path_id: Some(1),
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply Add peer_a");
@@ -1226,6 +1251,7 @@ fn add_path_two_peers_two_paths_merge() {
                 nexthops: vec![nh_b],
                 path_id: Some(1),
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply Add peer_b");
@@ -1269,6 +1295,7 @@ fn add_path_peer_down_clears_all_paths_for_peer() {
                     nexthops: vec![nh],
                     path_id,
                     local_pref: None,
+                    origin_asn: None,
                 })
                 .await
                 .expect("apply Add peer_a");
@@ -1280,6 +1307,7 @@ fn add_path_peer_down_clears_all_paths_for_peer() {
                 nexthops: vec![nh_b],
                 path_id: Some(1),
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply Add peer_b");
@@ -1335,6 +1363,7 @@ fn non_add_path_session_still_replaces() {
                 nexthops: vec![nh_first],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply first Add");
@@ -1345,6 +1374,7 @@ fn non_add_path_session_still_replaces() {
                 nexthops: vec![nh_second],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply second Add");
@@ -1413,6 +1443,7 @@ fn add_path_higher_lp_tier_wins_over_lower() {
                 nexthops: vec![nh_ix],
                 path_id: Some(1),
                 local_pref: Some(150),
+                origin_asn: None,
             })
             .await
             .expect("apply IX-tier Add");
@@ -1423,6 +1454,7 @@ fn add_path_higher_lp_tier_wins_over_lower() {
                 nexthops: vec![nh_transit],
                 path_id: Some(1),
                 local_pref: Some(100),
+                origin_asn: None,
             })
             .await
             .expect("apply transit-tier Add");
@@ -1440,6 +1472,58 @@ fn add_path_higher_lp_tier_wins_over_lower() {
         entry.state, NH_STATE_INCOMPLETE,
         "single-NH installed (LP filter selected the IX path)"
     );
+}
+
+/// Each prefix's origin AS reaches flow export's table from the tier
+/// its nexthops come from, follows a change of origin alone, and goes
+/// with the prefix.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn the_winning_tiers_origin_is_published() {
+    let table = Arc::new(packetframe_common::fib::asn::AsnTable::new());
+    let h = ProgrammerHarness::with_asn(Some(table.clone()));
+    let prefix = IpPrefix::V4 {
+        addr: [198, 51, 100, 0],
+        prefix_len: 24,
+    };
+    let (high, low) = (PeerId(0xa001), PeerId(0xa002));
+    let add = |peer, last: u8, lp, origin| RouteEvent::Add {
+        peer_id: peer,
+        prefix,
+        nexthops: vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))],
+        path_id: Some(1),
+        local_pref: Some(lp),
+        origin_asn: Some(origin),
+    };
+    let del = |peer| RouteEvent::Del {
+        peer_id: peer,
+        prefix,
+        path_id: Some(1),
+    };
+    let at = || table.lookup("198.51.100.7".parse().unwrap());
+    h.run(async {
+        h.handle
+            .apply_route_event(add(low, 2, 100, 64501))
+            .await
+            .unwrap();
+        h.handle
+            .apply_route_event(add(high, 1, 150, 64500))
+            .await
+            .unwrap();
+    });
+    assert_eq!(at(), Some(64500), "the higher tier's");
+    // The same nexthop, a new origin: no FIB change, but a new AS.
+    h.run(async {
+        h.handle
+            .apply_route_event(add(high, 1, 150, 64510))
+            .await
+            .unwrap();
+    });
+    assert_eq!(at(), Some(64510));
+    h.run(async { h.handle.apply_route_event(del(high)).await.unwrap() });
+    assert_eq!(at(), Some(64501), "the tier left");
+    h.run(async { h.handle.apply_route_event(del(low)).await.unwrap() });
+    assert_eq!(at(), None, "withdrawn");
 }
 
 /// Three advertisements: two at the top tier (LP 150) and one at a
@@ -1474,6 +1558,7 @@ fn add_path_ecmp_within_top_lp_tier() {
                     nexthops: vec![nh],
                     path_id: Some(1),
                     local_pref: Some(lp),
+                    origin_asn: None,
                 })
                 .await
                 .expect("apply Add");
@@ -1519,6 +1604,7 @@ fn add_path_lp_demotion_promotes_lower_tier_on_top_tier_withdrawal() {
                 nexthops: vec![nh_ix],
                 path_id: Some(1),
                 local_pref: Some(150),
+                origin_asn: None,
             })
             .await
             .expect("apply IX Add");
@@ -1529,6 +1615,7 @@ fn add_path_lp_demotion_promotes_lower_tier_on_top_tier_withdrawal() {
                 nexthops: vec![nh_transit],
                 path_id: Some(1),
                 local_pref: Some(100),
+                origin_asn: None,
             })
             .await
             .expect("apply transit Add");
@@ -1587,6 +1674,7 @@ fn add_path_lp_none_treated_as_default_100() {
                 nexthops: vec![nh_explicit],
                 path_id: None,
                 local_pref: Some(100),
+                origin_asn: None,
             })
             .await
             .expect("apply explicit-100 Add");
@@ -1597,6 +1685,7 @@ fn add_path_lp_none_treated_as_default_100() {
                 nexthops: vec![nh_implicit],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply None-LP Add");
@@ -1632,6 +1721,7 @@ fn fib_cache_generation_semantics() {
         nexthops: vec![nh],
         path_id: None,
         local_pref: None,
+        origin_asn: None,
     };
     // Awaited no-op used as an ordering barrier behind the
     // fire-and-forget toggle command (the loop is single-threaded, so
@@ -1782,6 +1872,7 @@ fn the_sink_is_told_the_resolved_union_not_the_advertisements() {
                 nexthops: vec![loser],
                 path_id: None,
                 local_pref: Some(100),
+                origin_asn: None,
             })
             .await
             .expect("apply low-pref Add");
@@ -1792,6 +1883,7 @@ fn the_sink_is_told_the_resolved_union_not_the_advertisements() {
                 nexthops: vec![winner],
                 path_id: None,
                 local_pref: Some(150),
+                origin_asn: None,
             })
             .await
             .expect("apply high-pref Add");
@@ -1843,6 +1935,7 @@ fn local_arp_routes_do_not_reach_the_sink_as_installs() {
                 nexthops: vec![host],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply local-arp Add");
@@ -1853,6 +1946,7 @@ fn local_arp_routes_do_not_reach_the_sink_as_installs() {
                 nexthops: vec![nh],
                 path_id: None,
                 local_pref: Some(100),
+                origin_asn: None,
             })
             .await
             .expect("apply BGP Add");
@@ -1911,6 +2005,7 @@ fn the_fallback_default_reaches_the_sink() {
                 nexthops: vec![upstream],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply fallback-default Add");
@@ -1989,6 +2084,7 @@ fn a_reconnect_gc_spares_the_fallback_default_and_local_prefix_routes() {
         nexthops: vec![nh],
         path_id: None,
         local_pref: None,
+        origin_asn: None,
     };
 
     // Startup: the resolver's seeds, then the first session's table.
@@ -2109,6 +2205,7 @@ fn every_way_a_prefix_stops_forwarding_reaches_the_sink() {
                     nexthops: vec![nh],
                     path_id: None,
                     local_pref: None,
+                    origin_asn: None,
                 })
                 .await
                 .expect("apply Add");
@@ -2185,6 +2282,7 @@ fn an_entry_already_gone_from_the_map_is_a_completed_withdrawal() {
                 nexthops: vec![nh],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply Add");
@@ -2263,6 +2361,7 @@ fn a_failed_gc_recompute_is_owed_until_it_reconciles() {
         nexthops,
         path_id: None,
         local_pref: None,
+        origin_asn: None,
     };
 
     // The target takes a group of its own first, so exhausting the pool
@@ -2417,6 +2516,7 @@ fn only_route_source_peers_count_as_session_routes() {
         nexthops: vec![nh],
         path_id: None,
         local_pref: None,
+        origin_asn: None,
     };
 
     h.run(async {
@@ -2507,6 +2607,7 @@ fn session_families_ignore_local_prefix_routes() {
                 nexthops: vec![nh6],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("local-prefix6 route");
@@ -2532,6 +2633,7 @@ fn session_families_ignore_local_prefix_routes() {
                 nexthops: vec![nh4],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("session v4 route");
@@ -2570,6 +2672,7 @@ fn an_unchanged_nexthop_set_is_announced_once() {
                     nexthops: vec![nh],
                     path_id: None,
                     local_pref: None,
+                    origin_asn: None,
                 })
                 .await
                 .expect("apply Add");
@@ -2672,6 +2775,7 @@ fn a_local_prefix6_host_reaches_the_sink_as_a_neighbour() {
                 nexthops: vec![host],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             })
             .await
             .expect("apply local-arp /128 Add");
@@ -3050,6 +3154,7 @@ mod ledger {
             nexthops: vec![nh],
             path_id: None,
             local_pref: Some(100),
+            origin_asn: None,
         }
     }
 
@@ -3335,6 +3440,7 @@ fn the_ledger_holds_route_source_advertisements_only() {
                 nexthops: vec![fallback_nh],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             },
             RouteEvent::Add {
                 peer_id: resolver,
@@ -3342,6 +3448,7 @@ fn the_ledger_holds_route_source_advertisements_only() {
                 nexthops: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200))],
                 path_id: None,
                 local_pref: None,
+                origin_asn: None,
             },
         ] {
             h.handle.apply_route_event(ev).await.expect("add");
@@ -3500,6 +3607,7 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
                 },
             ),
             integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::None,
+            asn_table: None,
         },
         ResolverPolicy::default(),
         std::collections::HashMap::new(),

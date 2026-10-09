@@ -712,10 +712,18 @@ fn ipfix_records_from_the_xdp_program_reach_a_collector() {
     collector
         .set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
+    // A second collector told only local addresses: the frame's source
+    // (192.0.2.10) is local, its destination (203.0.113.7) is not.
+    let private = UdpSocket::bind("127.0.0.1:0").unwrap();
+    private
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     let config = Config::parse(&format!(
         "module fast-path\n  attach lo generic\nmodule flow-export\n  source-address 127.0.0.1\n  \
-         sample-rate 100\n  flow-cache active 2 inactive 1\n  collector t ipfix {}\n",
-        collector.local_addr().unwrap()
+         sample-rate 100\n  flow-cache active 2 inactive 1\n  privacy-local-prefix 192.0.2.0/24\n  \
+         collector t ipfix {}\n  collector p ipfix {} profile no-remote\n",
+        collector.local_addr().unwrap(),
+        private.local_addr().unwrap()
     ))
     .unwrap();
     config.validate_flow_export().unwrap();
@@ -791,8 +799,28 @@ fn ipfix_records_from_the_xdp_program_reach_a_collector() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        text.contains("packetframe_flow_export_ipfix_records_total 1"),
-        "{text}"
+        text.contains("packetframe_flow_export_ipfix_records_total 2"),
+        "one record for each profile: {text}"
+    );
+    // The no-remote collector's record went through the template without
+    // a destination, and the remote address is nowhere in its message.
+    let n = private
+        .recv(&mut buf)
+        .expect("the no-remote collector's message");
+    let d = &buf[..n];
+    let mut at = 16;
+    let mut data_sets = Vec::new();
+    while at < d.len() {
+        let (id, len) = (half(d, at), usize::from(half(d, at + 2)));
+        if id >= 256 && id != 258 {
+            data_sets.push(id);
+        }
+        at += len;
+    }
+    assert_eq!(data_sets, vec![261], "no destination address");
+    assert!(
+        !d.windows(4).any(|w| w == [203, 0, 113, 7]),
+        "the remote address went out"
     );
     m.detach().unwrap();
 }

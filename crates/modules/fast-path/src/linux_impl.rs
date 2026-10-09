@@ -1745,6 +1745,7 @@ pub fn attach(
     completeness: Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
     feed_session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
     ix_mode_ifaces: Vec<String>,
+    asn_table: Option<std::sync::Arc<packetframe_common::fib::asn::AsnTable>>,
 ) -> ModuleResult<Vec<Attachment>> {
     // `anyip` preflight FIRST, before anything attaches or pins: the
     // refusals inside it (interface-owned address, directed
@@ -2318,6 +2319,7 @@ pub fn attach(
             crate::fib::controller::RouteFeed {
                 source: route_source,
                 integrity_authority,
+                asn_table,
             },
             crate::fib::controller::ResolverPolicy {
                 local_prefixes,

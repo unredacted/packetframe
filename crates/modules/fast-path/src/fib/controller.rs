@@ -290,6 +290,9 @@ pub struct RouteFeed {
     /// [`IntegrityAuthoritySpec`]; absent in config ⇒ `Birdc` default,
     /// resolved by the caller.
     pub integrity_authority: IntegrityAuthoritySpec,
+    /// Where the programmer publishes each prefix's origin AS, when flow
+    /// export needs AS numbers.
+    pub asn_table: Option<std::sync::Arc<packetframe_common::fib::asn::AsnTable>>,
 }
 
 /// The operator's instructions to the neighbour resolver: which
@@ -346,6 +349,7 @@ impl RouteController {
         let RouteFeed {
             source: route_source,
             integrity_authority,
+            asn_table,
         } = feed;
         let ResolverPolicy {
             local_prefixes,
@@ -403,6 +407,12 @@ impl RouteController {
         if let Some(sink) = route_sink {
             programmer.set_route_sink(sink);
             info!("second-tier route sink registered with the FibProgrammer");
+        }
+        // Same window: a table attached later would lack every origin
+        // programmed before it.
+        if let Some(table) = asn_table {
+            programmer.set_asn_table(table);
+            info!("origin-AS table registered with the FibProgrammer (flow export)");
         }
         // The seed, likewise before the programmer runs: it is applied
         // ahead of every route event, so the route source spawned below

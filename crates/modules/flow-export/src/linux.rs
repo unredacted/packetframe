@@ -12,9 +12,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use aya::maps::{Array, Map, MapData};
-use packetframe_common::flow_coverage::FlowCoverage;
 use packetframe_common::module::HookType;
-use packetframe_common::sampler_ports::VppSamplerPorts;
 use packetframe_fast_path::sample::SampleCfg;
 use packetframe_fast_path::sample_rings::SampleRings;
 use packetframe_fast_path::{pin, registry};
@@ -230,9 +228,14 @@ impl Running {
         cfg: FlowExportConfig,
         bpffs_root: &Path,
         state_dir: &Path,
-        vpp: Option<(Arc<VppSamplerPorts>, PathBuf)>,
-        coverage: Arc<FlowCoverage>,
+        handles: crate::Handles,
     ) -> Result<Self, String> {
+        let crate::Handles {
+            vpp,
+            coverage,
+            asn,
+            local_default,
+        } = handles;
         let epoch = Instant::now();
         let mut shared = Shared::new(epoch);
         shared.coverage = coverage;
@@ -246,7 +249,8 @@ impl Running {
         let ports = LivePorts {
             state_dir: state_dir.to_owned(),
         };
-        let worker = Worker::new(cfg, source, ports, socket, shared.clone(), epoch)?;
+        let worker = Worker::new(cfg, source, ports, socket, shared.clone(), epoch)?
+            .with_privacy(asn, local_default);
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let vpp_dir = vpp.as_ref().map(|(_, d)| d.clone());

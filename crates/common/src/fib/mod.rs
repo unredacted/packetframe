@@ -6,6 +6,8 @@
 //! fast-path module owns its own concrete impls under
 //! `crates/modules/fast-path/src/fib/`.
 
+pub mod asn;
+
 use std::net::IpAddr;
 
 // --- RouteSource ------------------------------------------------------
@@ -62,12 +64,20 @@ pub enum RouteEvent {
     /// transit at LP 100) survive ADD-PATH aggregation: ECMP forms
     /// within a tier, not across tiers. Missing local_pref is treated
     /// as RFC 4271's default of 100.
+    ///
+    /// `origin_asn` is the AS that originated the route: the last AS of
+    /// its AS_PATH when that names exactly one, the session's own AS for
+    /// a path with none (a route the local AS originates), `None` when the
+    /// source is not BGP or the path ends in a set. The FibProgrammer
+    /// publishes it, from the same tier as the nexthops, for flow
+    /// export's AS fields ([`asn::AsnTable`]).
     Add {
         peer_id: PeerId,
         prefix: IpPrefix,
         nexthops: Vec<IpAddr>,
         path_id: Option<u32>,
         local_pref: Option<u32>,
+        origin_asn: Option<u32>,
     },
     /// Route withdrawal. `path_id` matches the `Add` it pairs with;
     /// see [`RouteEvent::Add`] for semantics. `local_pref` is not part
@@ -907,10 +917,51 @@ mod peer_id_tests {
 
 /// Either v4 or v6 prefix with length. The address octets are
 /// stored in network order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum IpPrefix {
     V4 { addr: [u8; 4], prefix_len: u8 },
     V6 { addr: [u8; 16], prefix_len: u8 },
+}
+
+impl IpPrefix {
+    /// Whether `ip` is inside the prefix (never across families).
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self, ip) {
+            (IpPrefix::V4 { addr, prefix_len }, IpAddr::V4(a)) => {
+                let len = u32::from(*prefix_len).min(32);
+                let mask = u32::MAX.checked_shl(32 - len).unwrap_or(0);
+                u32::from_be_bytes(*addr) & mask == u32::from(a) & mask
+            }
+            (IpPrefix::V6 { addr, prefix_len }, IpAddr::V6(a)) => {
+                let len = u32::from(*prefix_len).min(128);
+                let mask = u128::MAX.checked_shl(128 - len).unwrap_or(0);
+                u128::from_be_bytes(*addr) & mask == u128::from(a) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A prefix list one module derives from the config and others read, as
+/// it is now: the loader publishes it at startup and again on every
+/// SIGHUP, from the same derivation, so its readers never hold one a
+/// reload left behind. fast-path's allowlist is the one.
+#[derive(Debug, Default)]
+pub struct SharedPrefixes(std::sync::RwLock<Vec<IpPrefix>>);
+
+impl SharedPrefixes {
+    pub fn new(prefixes: Vec<IpPrefix>) -> Self {
+        Self(std::sync::RwLock::new(prefixes))
+    }
+
+    /// Replace the whole list. The loader is the only writer.
+    pub fn publish(&self, prefixes: Vec<IpPrefix>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = prefixes;
+    }
+
+    pub fn get(&self) -> Vec<IpPrefix> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 /// Errors a `RouteSource` can surface. `recoverable` signals whether

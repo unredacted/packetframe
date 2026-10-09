@@ -1216,6 +1216,19 @@ fn asn_to_u32(asn: Asn) -> u32 {
 /// nexthop counter (`fib_no_neigh`) reflects reality, and
 /// integrity drift goes away. Phase B (`local-prefix` ARP-walk)
 /// turns those /24s into per-/32 fast-paths.
+/// The AS that originated an announced route ([`RouteEvent::Add`]'s
+/// `origin_asn`): the last AS of a path that ends naming one, the
+/// session's AS for a path with none (the local AS originated it, as for
+/// bird's direct and static exports over iBGP), and `None` for a path
+/// ending in a set of several. BMP's Loc-RIB elements carry the local AS
+/// as their peer AS, so the same reading holds there.
+pub(crate) fn origin_asn(elem: &bgpkit_parser::models::BgpElem) -> Option<u32> {
+    match &elem.as_path {
+        Some(p) if !p.is_empty() => p.get_origin_opt().map(|a| a.to_u32()),
+        _ => Some(elem.peer_asn.to_u32()),
+    }
+}
+
 fn elem_to_route_event(
     elem: &bgpkit_parser::models::BgpElem,
     peer_id: PeerId,
@@ -1240,6 +1253,7 @@ fn elem_to_route_event(
                 nexthops: vec![nh],
                 path_id,
                 local_pref,
+                origin_asn: origin_asn(elem),
             }
         }
         ElemType::WITHDRAW => RouteEvent::Del {
@@ -1698,6 +1712,35 @@ mod tests {
     }
 
     #[test]
+    fn the_origin_is_the_paths_last_as_or_the_sessions() {
+        use bgpkit_parser::models::{AsPath, AsPathSegment, Asn, ElemType};
+        let mut elem = make_test_elem(ElemType::ANNOUNCE, "198.51.100.0/24", None);
+        elem.peer_asn = Asn::from(64500u32);
+        assert_eq!(origin_asn(&elem), Some(64500), "no path: our own route");
+        elem.as_path = Some(AsPath::from_segments(vec![AsPathSegment::sequence([
+            64501u32, 64502, 64503,
+        ])]));
+        assert_eq!(origin_asn(&elem), Some(64503));
+        elem.as_path = Some(AsPath::from_segments(vec![
+            AsPathSegment::sequence([64501u32]),
+            AsPathSegment::set([64504u32, 64505]),
+        ]));
+        assert_eq!(
+            origin_asn(&elem),
+            None,
+            "an aggregate's set names no one origin"
+        );
+        let event = elem_to_route_event(&elem, PeerId(1), "127.0.0.1".parse().unwrap()).unwrap();
+        assert!(matches!(
+            event,
+            RouteEvent::Add {
+                origin_asn: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn elem_to_route_event_uses_fallback_when_next_hop_missing() {
         use bgpkit_parser::models::ElemType;
         use std::net::Ipv4Addr;
@@ -1713,6 +1756,7 @@ mod tests {
                 nexthops,
                 path_id: _,
                 local_pref: _,
+                origin_asn: _,
             } => {
                 assert_eq!(pid, peer_id);
                 assert!(matches!(
