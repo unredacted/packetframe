@@ -364,10 +364,12 @@ jobs:
           # operator to it for the boot-sysctl audit, and the whole
           # point of this bundle is that it works on a router with no
           # checkout. A safety procedure referenced but not shipped is
-          # not a procedure.
+          # not a procedure. flow-export.md for the same reason: its
+          # triage table is what a lab run reads its status rows against.
           cp docs/runbooks/tc-datapath.md \
              docs/runbooks/generic-mode-performance.md \
              docs/runbooks/vpp-offload.md \
+             docs/runbooks/flow-export.md \
              "dist/packetframe-hwtest-${TARGET}/"
 
           # VPP pointer, not payload. The vpp-offload module needs a VPP

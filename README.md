@@ -63,6 +63,16 @@ This module is for IX-facing bridges. It watches ARP and NDP traffic from a prom
 
 A tc-egress policer for IX-facing interfaces. It enforces GCRA rate limits on ARP and neighbour solicitations per target, and on a broadcast and multicast catch-all. It drops LLDP and frames with a foreign source MAC. Each class runs in `monitor` or enforce mode.
 
+### Flow export (`flow-export`, experimental)
+
+Samples one packet in N on every path PacketFrame runs, and sends the samples to flow collectors such as Akvorado and FastNetMon. The kernel's own NetFlow can't see these packets, because XDP redirects bypass conntrack and packet taps, and VPP-steered packets never reach Linux.
+
+- **Samplers.** fast-path's XDP and tc programs carry one, VPP gets one through a plugin PacketFrame ships, and `kernel-sample` adds a tc-ingress sampler to an interface only the kernel handles. Each packet is sampled once, by the first path that sees it.
+- **Formats.** sFlow v5 carries each sample's leading bytes. IPFIX carries flow records with origin AS numbers, and per-collector privacy profiles (`full`, `truncate`, `no-remote`, `as-only`).
+- **Coverage.** Each port and path reads covered, degraded or uncovered from samples lost and packets counted. A busy port that yields no samples is uncovered, not quiet. Collector rows report local submission only, never receipt.
+
+Telemetry failures never touch forwarding: a failure to start degrades the module and leaves the rest running.
+
 ### Probe (`packetframe probe`)
 
 Attaches a diagnostic XDP program and dumps the first bytes of sampled frames. Use it to see what a driver actually hands to XDP.
@@ -106,6 +116,7 @@ Later, the same router moved IPv6 into VPP alongside IPv4 (four steered ports, f
 | `neigh-snoop`, including `ix-mode` and `frr-gate` | Production |
 | `probe` | Production |
 | BMP station (`route-source bmp`) | Supported, not yet in production (no current Loc-RIB emitter) |
+| `flow-export`: sFlow v5 and IPFIX from the XDP, tc, VPP and kernel paths | Experimental. Tested in CI against real programs and a stand-in VPP; not yet run on a router |
 | `guard` | Experimental. Verifier behaviour on the reference vendor 5.15 kernel is unconfirmed, and frames that VPP originates bypass it |
 | tc-ingress datapath (`attach <iface> tc`) | Not recommended. Measured about 70% more CPU per packet than generic XDP |
 | `ddos` (SYN-flood and amplification filter), `sampler` (per-flow ring buffer) | Planned |
@@ -326,6 +337,7 @@ Runbooks, for running PacketFrame in production:
 | [vpp-offload](docs/runbooks/vpp-offload.md) | Rolling out VPP offload one port at a time, rolling back, what it costs |
 | [neigh-snoop](docs/runbooks/neigh-snoop.md) | Rolling out neighbour snooping, the FRR next-hop feed |
 | [guard](docs/runbooks/guard.md) | Moving guard from monitoring to enforcing |
+| [flow-export](docs/runbooks/flow-export.md) | Setting up Akvorado and FastNetMon, what sampling costs, reading coverage |
 | [reconfigure](docs/runbooks/reconfigure.md) | Which settings reload live and which need a restart |
 | [event-log](docs/runbooks/event-log.md) | The event log: where it lives, what it records |
 | [mss-clamp](docs/runbooks/mss-clamp.md) | Why fast-pathed TCP needs its own MSS clamping |
