@@ -694,3 +694,105 @@ fn vpp_samples_reach_a_collector_through_the_plugins_rings() {
     assert_eq!(sample_cfg(&s).rate_generation as u32, 0);
     drop(file);
 }
+
+/// IPFIX end to end: the XDP program's samples of one flow aggregate into
+/// one record, sent after the inactive timeout with the templates and the
+/// domain's rate in a selector options record, and counting every sample
+/// the program selected.
+#[test]
+#[ignore = "needs root: CAP_BPF and bpffs"]
+fn ipfix_records_from_the_xdp_program_reach_a_collector() {
+    if !FAST_PATH_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("ipfix");
+    let bpf = fast_path(&s);
+    register_lo(&s);
+    let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+    collector
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let config = Config::parse(&format!(
+        "module fast-path\n  attach lo generic\nmodule flow-export\n  source-address 127.0.0.1\n  \
+         sample-rate 100\n  flow-cache active 2 inactive 1\n  collector t ipfix {}\n",
+        collector.local_addr().unwrap()
+    ))
+    .unwrap();
+    config.validate_flow_export().unwrap();
+    let section = config
+        .modules
+        .iter()
+        .find(|m| m.name == "flow-export")
+        .unwrap();
+    let mc = ModuleConfig::new(section, &config.global);
+    let mut m = FlowExportModule::new();
+    m.load(
+        &mc,
+        &LoaderCtx {
+            bpffs_root: &s.root,
+            state_dir: &s.state,
+        },
+    )
+    .unwrap();
+    m.attach(&mc).expect("attach");
+    let pkt = frame();
+    test_run(&bpf, &pkt, 10_000);
+    let selected = stat(&s, "sample_selected");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut buf = [0u8; 2048];
+    let (mut packets, mut rate, mut octets) = (0u64, None, 0u64);
+    let half = |b: &[u8], at: usize| u16::from_be_bytes([b[at], b[at + 1]]);
+    let long = |b: &[u8], at: usize| u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
+    while Instant::now() < deadline && packets < selected {
+        let Ok(n) = collector.recv(&mut buf) else {
+            continue;
+        };
+        let d = &buf[..n];
+        assert_eq!(half(d, 0), 10, "IPFIX");
+        assert_eq!(word(d, 12), 2, "fast-path's observation domain");
+        let mut at = 16;
+        while at < d.len() {
+            let (id, len) = (half(d, at), usize::from(half(d, at + 2)));
+            match id {
+                // The selector: id (8), algorithm (2), then the interval.
+                258 => rate = Some(word(d, at + 4 + 8 + 2 + 4 + 4)),
+                // v4 records: octets (8), packets (8), protocol (1),
+                // addresses (8), ports (4), interfaces (8), AS (8), times
+                // (16): 61 bytes each.
+                256 => {
+                    let mut r = at + 4;
+                    while r + 61 <= at + len {
+                        octets += long(d, r);
+                        packets += long(d, r + 8);
+                        r += 61;
+                    }
+                }
+                _ => {}
+            }
+            at += len;
+        }
+    }
+    assert_eq!(rate, Some(100), "the rate, announced");
+    assert!(selected > 0);
+    assert_eq!(packets, selected, "every selected sample counted once");
+    let ip_len = u64::from(u16::from_be_bytes([pkt[16], pkt[17]]));
+    assert_eq!(octets, selected * ip_len, "IP-layer octets");
+    // The tick that sent it publishes after sending.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        text.clear();
+        m.sample_metrics(&mut MetricsWriter::new(&mut text, "flow-export"))
+            .unwrap();
+        if text.contains("packetframe_flow_export_ipfix_records_total 1") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        text.contains("packetframe_flow_export_ipfix_records_total 1"),
+        "{text}"
+    );
+    m.detach().unwrap();
+}

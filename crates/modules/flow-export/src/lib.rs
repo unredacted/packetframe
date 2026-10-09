@@ -20,6 +20,8 @@ pub mod cfg;
 pub mod collector;
 pub mod coverage;
 pub mod feasibility;
+pub mod flows;
+pub mod ipfix_out;
 pub mod pool;
 pub mod report;
 pub mod sflow_out;

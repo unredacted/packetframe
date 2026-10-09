@@ -167,15 +167,17 @@ pub fn health(p: &Published, heartbeat_age: Duration, panicked: Option<&str>) ->
             Some(why) => row(
                 format!("collector {}", c.name),
                 HealthState::Degraded,
-                format!("sflow to {} ({kind}): {why}", c.addr),
+                format!("{} to {} ({kind}): {why}", c.format.name(), c.addr),
             ),
             None => row(
                 format!("collector {}", c.name),
                 HealthState::Healthy,
                 format!(
-                    "sflow to {} ({kind}): {} datagrams submitted; receipt is the \
+                    "{} to {} ({kind}): {} datagrams submitted; receipt is the \
                      collector's to confirm",
-                    c.addr, c.datagrams
+                    c.format.name(),
+                    c.addr,
+                    c.datagrams
                 ),
             ),
         });
@@ -220,6 +222,10 @@ pub fn metrics(p: &Published, out: &mut String, worker_up: bool) {
         &[
             ("{where=\"sampler\"}".into(), p.lost_total),
             ("{where=\"vpp\"}".into(), p.vpp_lost_total),
+            (
+                "{where=\"flow_stale_rate\"}".into(),
+                p.flows.map_or(0, |f| f.counts.stale),
+            ),
             ("{where=\"unmapped\"}".into(), p.unmapped_total),
             ("{where=\"undecodable\"}".into(), p.undecodable_total),
             ("{where=\"unencodable\"}".into(), p.unencodable_total),
@@ -251,6 +257,39 @@ pub fn metrics(p: &Published, out: &mut String, worker_up: bool) {
         "datagrams not sent because a tick's budget was spent",
         &per_collector(|c| c.budget_drops),
     );
+    if let Some(f) = &p.flows {
+        let c = &f.counts;
+        counter(
+            "flows_exported_total",
+            "flow records exported, by why they left the cache",
+            &[
+                ("{reason=\"inactive\"}".into(), c.expired_inactive),
+                ("{reason=\"active\"}".into(), c.expired_active),
+                ("{reason=\"full\"}".into(), c.evicted_full),
+                ("{reason=\"rate_change\"}".into(), c.flushed),
+            ],
+        );
+        counter(
+            "flows_dropped_total",
+            "flow records lost because the export queue was full",
+            &[("{reason=\"queue\"}".into(), c.queue_dropped)],
+        );
+        counter(
+            "ipfix_records_total",
+            "IPFIX flow records encoded",
+            &[(String::new(), f.records)],
+        );
+        counter(
+            "templates_sent_total",
+            "IPFIX template and selector announcements",
+            &[(String::new(), f.announcements)],
+        );
+        counter(
+            "samples_not_ip_total",
+            "samples with no IP packet, so in sFlow only",
+            &[(String::new(), p.not_ip_total)],
+        );
+    }
     let _ = writeln!(
         out,
         "# HELP packetframe_flow_export_coverage per port: 3 covered, 2 starting, 1 degraded, 0 uncovered"
@@ -280,6 +319,14 @@ pub fn metrics(p: &Published, out: &mut String, worker_up: bool) {
             "packetframe_flow_export_vpp_sampler_healthy {}",
             u8::from(worker_up && v.coverage.is_healthy())
         );
+    }
+    if let Some(f) = &p.flows {
+        let _ = writeln!(
+            out,
+            "# HELP packetframe_flow_export_flows_active flows the IPFIX cache holds"
+        );
+        let _ = writeln!(out, "# TYPE packetframe_flow_export_flows_active gauge");
+        let _ = writeln!(out, "packetframe_flow_export_flows_active {}", f.active);
     }
     for (name, help, v) in [
         (
@@ -333,6 +380,7 @@ mod tests {
                 name: "fnm".into(),
                 addr: "198.51.100.10:6343".parse().unwrap(),
                 kind: CollectorKind::Ddos,
+                format: packetframe_common::config::CollectorFormat::Sflow,
                 datagrams: 3,
                 send_errors: 0,
                 budget_drops: 0,

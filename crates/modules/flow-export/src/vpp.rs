@@ -150,6 +150,8 @@ struct PoolTrack {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VppSample {
     pub ifindex: u32,
+    /// The `desired.conf` generation it was drawn under.
+    pub generation: u64,
     pub rate: u32,
     pub frame_len: u32,
     pub header: Vec<u8>,
@@ -444,6 +446,7 @@ impl<D: VppDir> VppSide<D> {
             match ifindex {
                 Some(&ifindex) => t.samples.push(VppSample {
                     ifindex,
+                    generation: s.meta.generation,
                     rate: s.meta.rate,
                     frame_len: s.meta.frame_len,
                     header: s.header,

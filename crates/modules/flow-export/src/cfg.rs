@@ -5,8 +5,11 @@
 use std::net::{IpAddr, SocketAddr};
 
 use packetframe_common::config::{
-    CollectorKind, ModuleDirective, FLOW_BUDGET_RATE, FLOW_DEFAULT_HEADER_BYTES, FLOW_DEFAULT_RATE,
+    CollectorFormat, CollectorKind, ModuleDirective, FLOW_BUDGET_RATE, FLOW_DEFAULT_HEADER_BYTES,
+    FLOW_DEFAULT_RATE,
 };
+
+use crate::flows::Limits;
 use packetframe_common::module::RESTART_SEQUENCE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +17,7 @@ pub struct Collector {
     pub name: String,
     pub addr: SocketAddr,
     pub kind: CollectorKind,
+    pub format: CollectorFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +28,8 @@ pub struct FlowExportConfig {
     pub rate: u32,
     pub header_bytes: u32,
     pub collectors: Vec<Collector>,
+    /// The IPFIX flow cache's bounds.
+    pub cache: Limits,
 }
 
 impl FlowExportConfig {
@@ -32,18 +38,36 @@ impl FlowExportConfig {
         let mut rate = FLOW_DEFAULT_RATE;
         let mut header_bytes = FLOW_DEFAULT_HEADER_BYTES;
         let mut collectors = Vec::new();
+        let mut cache = Limits::default();
         for d in directives {
             match d {
                 ModuleDirective::FlowSourceAddress { addr, .. } => source = Some(*addr),
                 ModuleDirective::FlowSampleRate { rate: r, .. } => rate = *r,
                 ModuleDirective::FlowHeaderBytes { bytes, .. } => header_bytes = *bytes,
                 ModuleDirective::FlowCollector {
-                    name, addr, kind, ..
+                    name,
+                    addr,
+                    kind,
+                    format,
+                    ..
                 } => collectors.push(Collector {
                     name: name.clone(),
                     addr: *addr,
                     kind: *kind,
+                    format: *format,
                 }),
+                ModuleDirective::FlowCache {
+                    entries,
+                    active,
+                    inactive,
+                    ..
+                } => {
+                    cache = Limits {
+                        entries: *entries,
+                        active: *active,
+                        inactive: *inactive,
+                    }
+                }
                 _ => {}
             }
         }
@@ -56,7 +80,15 @@ impl FlowExportConfig {
             rate,
             header_bytes,
             collectors,
+            cache,
         })
+    }
+
+    /// Whether any collector takes IPFIX, so flows are cached at all.
+    pub fn ipfix(&self) -> bool {
+        self.collectors
+            .iter()
+            .any(|c| c.format == CollectorFormat::Ipfix)
     }
 
     /// Denser than the rate the sampler's cost is qualified at.

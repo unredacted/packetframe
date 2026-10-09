@@ -8,6 +8,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use packetframe_common::config::CollectorFormat;
+
 use crate::cfg::Collector;
 
 /// Datagrams each collector may be sent per worker tick (100 ms): ample
@@ -72,14 +74,19 @@ impl CollectorState {
     }
 }
 
-/// Send each datagram to every collector, within each one's budget.
+/// Send each datagram to every collector of `format`, within each one's
+/// budget.
 pub fn send_all(
     t: &dyn Transport,
     collectors: &mut [CollectorState],
+    format: CollectorFormat,
     datagrams: &[Vec<u8>],
     now: Instant,
 ) {
-    for c in collectors.iter_mut() {
+    if datagrams.is_empty() {
+        return;
+    }
+    for c in collectors.iter_mut().filter(|c| c.cfg.format == format) {
         for (i, d) in datagrams.iter().enumerate() {
             if i >= SEND_BUDGET {
                 c.budget_drops += (datagrams.len() - i) as u64;
@@ -140,6 +147,7 @@ mod tests {
             name: name.into(),
             addr: format!("198.51.100.1:{port}").parse().unwrap(),
             kind: CollectorKind::Stats,
+            format: CollectorFormat::Sflow,
         }
     }
 
@@ -154,7 +162,13 @@ mod tests {
             sent: RefCell::new(Vec::new()),
         };
         let now = Instant::now();
-        send_all(&t, &mut cs, &[vec![0; 10], vec![0; 10]], now);
+        send_all(
+            &t,
+            &mut cs,
+            CollectorFormat::Sflow,
+            &[vec![0; 10], vec![0; 10]],
+            now,
+        );
         assert_eq!((cs[0].datagrams, cs[0].send_errors), (2, 0));
         assert_eq!((cs[1].datagrams, cs[1].send_errors), (0, 2));
         assert!(cs[0].failing(now).is_none());
@@ -171,13 +185,19 @@ mod tests {
         };
         let burst = vec![vec![0u8; 1]; SEND_BUDGET + 7];
         let now = Instant::now();
-        send_all(&t, &mut cs, &burst, now);
+        send_all(&t, &mut cs, CollectorFormat::Sflow, &burst, now);
         assert_eq!(cs[0].datagrams, SEND_BUDGET as u64);
         assert_eq!(cs[0].budget_drops, 7);
         // Samples lost on the way out: failing, though every send it made
         // succeeded, until the drops are old news.
         assert!(cs[0].failing(now).unwrap().contains("budget"));
-        send_all(&t, &mut cs, &[vec![0u8; 1]], now + TICK_LATER);
+        send_all(
+            &t,
+            &mut cs,
+            CollectorFormat::Sflow,
+            &[vec![0u8; 1]],
+            now + TICK_LATER,
+        );
         assert!(cs[0].failing(now + TICK_LATER).is_some());
         assert!(cs[0].failing(now + FAILING_FOR).is_none());
     }
