@@ -1,0 +1,13 @@
+[build]
+target = "bpfel-unknown-none"
+
+# `core` must be built from source for the BPF target. Requires nightly
+# (pinned in ../rust-toolchain.toml).
+[unstable]
+build-std = ["core"]
+
+[target.bpfel-unknown-none]
+# `bpf-linker` wraps LLVM's BPF backend; install via
+# `cargo install --locked bpf-linker@<version>`. CI does this in the
+# workflow; local dev is CI-only for BPF builds per the plan.
+linker = "bpf-linker"

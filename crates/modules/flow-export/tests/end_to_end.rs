@@ -345,7 +345,7 @@ fn without_fast_paths_maps_the_attach_fails_and_release_is_a_no_op() {
     .unwrap();
     let e = m.attach(&mc).expect_err("no maps to sample through");
     assert!(e.to_string().contains("SAMPLES"), "{e}");
-    packetframe_flow_export::release_sampler(&s.root, None).unwrap();
+    packetframe_flow_export::release_sampler(&s.root, &s.state, None).unwrap();
     m.detach().unwrap();
 }
 
@@ -823,4 +823,305 @@ fn ipfix_records_from_the_xdp_program_reach_a_collector() {
         "the remote address went out"
     );
     m.detach().unwrap();
+}
+
+fn ip(args: &[&str]) -> bool {
+    std::process::Command::new("ip")
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// A veth pair, removed on drop: frames sent out of `a` arrive at `b`'s
+/// ingress.
+struct Veth {
+    a: String,
+    b: String,
+}
+
+impl Veth {
+    fn new(tag: &str) -> Self {
+        let (a, b) = (format!("pfk{tag}a"), format!("pfk{tag}b"));
+        let _ = ip(&["link", "del", &a]);
+        assert!(ip(&["link", "add", &a, "type", "veth", "peer", "name", &b]));
+        assert!(ip(&["link", "set", &a, "up"]));
+        assert!(ip(&["link", "set", &b, "up"]));
+        Self { a, b }
+    }
+}
+
+impl Drop for Veth {
+    fn drop(&mut self) {
+        let _ = ip(&["link", "del", &self.a]);
+    }
+}
+
+fn ifindex(name: &str) -> u32 {
+    let c = std::ffi::CString::new(name).unwrap();
+    unsafe { libc::if_nametoindex(c.as_ptr()) }
+}
+
+/// Send `n` copies of `frame` out of `iface`, raw.
+fn send_raw(iface: &str, frame: &[u8], n: usize) {
+    unsafe {
+        let fd = libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW,
+            (libc::ETH_P_ALL as u16).to_be() as i32,
+        );
+        assert!(fd >= 0, "AF_PACKET: {}", std::io::Error::last_os_error());
+        let mut sll: libc::sockaddr_ll = std::mem::zeroed();
+        sll.sll_family = libc::AF_PACKET as u16;
+        sll.sll_ifindex = ifindex(iface) as i32;
+        sll.sll_halen = 6;
+        for _ in 0..n {
+            let rc = libc::sendto(
+                fd,
+                frame.as_ptr().cast(),
+                frame.len(),
+                0,
+                &sll as *const libc::sockaddr_ll as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_ll>() as u32,
+            );
+            assert!(rc >= 0, "sendto: {}", std::io::Error::last_os_error());
+        }
+        libc::close(fd);
+    }
+}
+
+fn kernel_module(s: &Scratch, body: &str) -> Result<FlowExportModule, String> {
+    let config = Config::parse(&format!(
+        "module fast-path\n  attach lo generic\nmodule flow-export\n  source-address 127.0.0.1\n{body}"
+    ))
+    .unwrap();
+    config.validate_flow_export().map_err(|e| e.to_string())?;
+    let section = config
+        .modules
+        .iter()
+        .find(|m| m.name == "flow-export")
+        .unwrap();
+    let mc = ModuleConfig::new(section, &config.global);
+    let mut m = FlowExportModule::new();
+    m.load(
+        &mc,
+        &LoaderCtx {
+            bpffs_root: &s.root,
+            state_dir: &s.state,
+        },
+    )
+    .unwrap();
+    m.attach(&mc).map_err(|e| e.to_string())?;
+    Ok(m)
+}
+
+/// The kernel sampler end to end: frames arriving at a `kernel-sample`
+/// interface's ingress reach a collector as that interface's samples, the
+/// `kernel` path covers it, and detach takes the filter down.
+#[test]
+#[ignore = "needs root: CAP_BPF, bpffs and veth"]
+fn the_kernel_sampler_samples_an_interface_no_other_path_sees() {
+    if !FAST_PATH_BPF_AVAILABLE || !packetframe_flow_export::KERNEL_SAMPLE_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("kernel");
+    let _bpf = fast_path(&s);
+    register_lo(&s);
+    let veth = Veth::new("k");
+    let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+    collector
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut m = kernel_module(
+        &s,
+        &format!(
+            "  sample-rate 100\n  header-bytes 64\n  kernel-sample {}\n  collector t sflow {}\n",
+            veth.b,
+            collector.local_addr().unwrap()
+        ),
+    )
+    .expect("attach");
+    let filters = || {
+        let out = std::process::Command::new("tc")
+            .args(["filter", "show", "dev", &veth.b, "ingress"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(filters().contains("kernel_sample"), "{}", filters());
+
+    send_raw(&veth.a, &frame(), 5_000);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (mut samples, mut buf) = (0u32, [0u8; 2048]);
+    let want = ifindex(&veth.b);
+    while Instant::now() < deadline && samples < 20 {
+        let Ok(n) = collector.recv(&mut buf) else {
+            continue;
+        };
+        let d = &buf[..n];
+        let mut f = 28;
+        for _ in 0..word(d, 24) {
+            assert_eq!(word(d, f + 12), want, "the kernel-sample interface's");
+            assert_eq!(word(d, f + 16), 100, "the rate it was drawn at");
+            f += 8 + word(d, f + 4) as usize;
+            samples += 1;
+        }
+    }
+    assert!(samples >= 20, "{samples} samples");
+    let h = health_with(&m, "kernel");
+    let row = h.subsystems.iter().find(|r| r.name == "kernel").unwrap();
+    assert!(
+        row.message
+            .clone()
+            .unwrap()
+            .starts_with(&format!("{} starting", veth.b)),
+        "{row:?}"
+    );
+
+    m.detach().unwrap();
+    assert!(!filters().contains("kernel_sample"), "{}", filters());
+    assert!(!s.state.join("flow-export-tc-links.json").exists());
+}
+
+/// A device stacked on a port fast-path samples would see those packets a
+/// second time: refused, and nothing left attached.
+#[test]
+#[ignore = "needs root: CAP_BPF, bpffs and veth"]
+fn a_device_on_a_sampled_port_is_refused() {
+    if !FAST_PATH_BPF_AVAILABLE || !packetframe_flow_export::KERNEL_SAMPLE_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("kupper");
+    let _bpf = fast_path(&s);
+    let veth = Veth::new("u");
+    let vlan = format!("{}.5", veth.a);
+    assert!(ip(&[
+        "link", "add", "link", &veth.a, "name", &vlan, "type", "vlan", "id", "5"
+    ]));
+    // fast-path samples the veth end the VLAN sits on.
+    registry::save(
+        &s.state,
+        &RegistryFile {
+            module: "fast-path".into(),
+            attachments: vec![AttachmentRecord {
+                iface: veth.a.clone(),
+                hook: HookTypeRecord::GenericXdp,
+                prog_id: 0,
+                pinned_path: PathBuf::new(),
+            }],
+        },
+    )
+    .unwrap();
+    let e = kernel_module(
+        &s,
+        &format!("  kernel-sample {vlan}\n  collector t sflow 127.0.0.1:6343\n"),
+    )
+    .err()
+    .expect("refused");
+    assert!(e.contains(&format!("sits on {}", veth.a)), "{e}");
+    assert!(!s.state.join("flow-export-tc-links.json").exists());
+}
+
+/// Two `kernel-sample` interfaces, one stacked on the other: the upper
+/// one's packets crossed the lower one first. Refused, nothing attached.
+#[test]
+#[ignore = "needs root: CAP_BPF, bpffs and veth"]
+fn stacked_kernel_sample_interfaces_are_refused() {
+    if !FAST_PATH_BPF_AVAILABLE || !packetframe_flow_export::KERNEL_SAMPLE_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("kstack");
+    let _bpf = fast_path(&s);
+    register_lo(&s);
+    let veth = Veth::new("s");
+    let vlan = format!("{}.5", veth.a);
+    assert!(ip(&[
+        "link", "add", "link", &veth.a, "name", &vlan, "type", "vlan", "id", "5"
+    ]));
+    let e = kernel_module(
+        &s,
+        &format!(
+            "  kernel-sample {}\n  kernel-sample {vlan}\n  collector t sflow 127.0.0.1:6343\n",
+            veth.a
+        ),
+    )
+    .err()
+    .expect("refused");
+    assert!(e.contains(&format!("sits on {}", veth.a)), "{e}");
+    assert!(!s.state.join("flow-export-tc-links.json").exists());
+}
+
+fn ingress_filters(iface: &str) -> String {
+    let out = std::process::Command::new("tc")
+        .args(["filter", "show", "dev", iface, "ingress"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// An interface renamed while sampled keeps its filter under the new
+/// name: detach finds it by ifindex and takes it down, rather than
+/// dropping the record of a filter still running.
+#[test]
+#[ignore = "needs root: CAP_BPF, bpffs and veth"]
+fn a_renamed_interfaces_filter_is_still_taken_down() {
+    if !FAST_PATH_BPF_AVAILABLE || !packetframe_flow_export::KERNEL_SAMPLE_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("krename");
+    let _bpf = fast_path(&s);
+    register_lo(&s);
+    let veth = Veth::new("r");
+    let mut m = kernel_module(
+        &s,
+        &format!(
+            "  kernel-sample {}\n  collector t sflow 127.0.0.1:6343\n",
+            veth.b
+        ),
+    )
+    .expect("attach");
+    let renamed = "pfkrz";
+    assert!(ip(&["link", "set", &veth.b, "down"]));
+    assert!(ip(&["link", "set", &veth.b, "name", renamed]));
+    assert!(ingress_filters(renamed).contains("kernel_sample"));
+    m.detach().unwrap();
+    assert!(
+        !ingress_filters(renamed).contains("kernel_sample"),
+        "{}",
+        ingress_filters(renamed)
+    );
+    assert!(!s.state.join("flow-export-tc-links.json").exists());
+}
+
+/// A start with no `kernel-sample` still clears the filters a daemon
+/// that died left recorded: they would sample into rings no one reads.
+/// The first module stands in for that daemon, still running.
+#[test]
+#[ignore = "needs root: CAP_BPF, bpffs and veth"]
+fn a_start_without_kernel_samplers_clears_a_dead_daemons() {
+    if !FAST_PATH_BPF_AVAILABLE || !packetframe_flow_export::KERNEL_SAMPLE_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("kleft");
+    let _bpf = fast_path(&s);
+    register_lo(&s);
+    let veth = Veth::new("l");
+    let mut dead = kernel_module(
+        &s,
+        &format!(
+            "  kernel-sample {}\n  collector t sflow 127.0.0.1:6343\n",
+            veth.b
+        ),
+    )
+    .expect("attach");
+    assert!(ingress_filters(&veth.b).contains("kernel_sample"));
+    let mut next = kernel_module(&s, "  collector t sflow 127.0.0.1:6343\n").expect("attach");
+    assert!(
+        !ingress_filters(&veth.b).contains("kernel_sample"),
+        "{}",
+        ingress_filters(&veth.b)
+    );
+    assert!(!s.state.join("flow-export-tc-links.json").exists());
+    next.detach().unwrap();
+    dead.detach().unwrap();
 }

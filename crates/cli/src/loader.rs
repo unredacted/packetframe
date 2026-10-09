@@ -481,7 +481,9 @@ fn release_persisted(name: &str, p: Persisted<'_>) -> Result<(), String> {
         #[cfg(feature = "vpp-offload")]
         "vpp-offload" => detach_vpp_offload(p.state_dir),
         #[cfg(feature = "flow-export")]
-        "flow-export" => packetframe_flow_export::release_sampler(p.bpffs_root, p.vpp_sampler_dir),
+        "flow-export" => {
+            packetframe_flow_export::release_sampler(p.bpffs_root, p.state_dir, p.vpp_sampler_dir)
+        }
         other => {
             let _ = (p.state_dir, p.bpffs_root, p.vpp_sampler_dir);
             Err(format!(
@@ -2186,6 +2188,7 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     if all || config_has_flow_export {
         if let Err(e) = packetframe_flow_export::release_sampler(
             &bpffs_root,
+            &state_dir,
             (all || config_has_vpp).then(|| Path::new(packetframe_flow_export::VPP_SAMPLER_DIR)),
         ) {
             errors.push(format!("flow-export: {e}"));

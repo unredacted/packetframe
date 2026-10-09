@@ -25,9 +25,13 @@ pub mod ipfix_out;
 pub mod pool;
 pub mod report;
 pub mod sflow_out;
+#[cfg(target_os = "linux")]
+pub(crate) mod tc_links;
 pub mod vpp;
 pub mod worker;
 
+#[cfg(target_os = "linux")]
+mod kernel;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -53,6 +57,19 @@ pub const MODULE_NAME: &str = "flow-export";
 /// The worker thread's name, as `placement::CONTROL_PLANE_THREADS` lists
 /// it.
 pub const THREAD_NAME: &str = "pf-flow-export";
+
+/// The kernel sampler's ELF (`bpf/`, `kernel_sample`), embedded at build
+/// time; empty when the BPF toolchain was not available (macOS dev
+/// loops), and then `kernel-sample` refuses to attach. Copy through
+/// [`aligned_kernel_sample_copy`] before loading.
+pub const KERNEL_SAMPLE_BPF: &[u8] = include_bytes!(env!("KERNEL_SAMPLE_BPF_OBJ"));
+
+pub const KERNEL_SAMPLE_BPF_AVAILABLE: bool = !KERNEL_SAMPLE_BPF.is_empty();
+
+/// A heap copy aligned for the ELF reader (`include_bytes!` is not).
+pub fn aligned_kernel_sample_copy() -> Vec<u8> {
+    KERNEL_SAMPLE_BPF.to_vec()
+}
 
 /// Every interface fast-path may redirect to, so every output ifindex a
 /// sample can carry: `(name, ifindex)`.
@@ -240,16 +257,25 @@ impl Module for FlowExportModule {
 
 /// Stop the samplers with no module running, as `detach --all` and the
 /// loader's release after a failed start do: fast-path's through its
-/// pinned configuration map (rate 0), if its maps are pinned at all, and
-/// VPP's by removing `desired.conf` from `vpp_dir`, if that is a
-/// directory the plugin could use.
+/// pinned configuration map (rate 0), if its maps are pinned at all; the
+/// kernel sampler by removing the filters `state_dir` records; and VPP's
+/// by removing `desired.conf` from `vpp_dir`, if that is a directory the
+/// plugin could use.
 #[cfg(target_os = "linux")]
-pub fn release_sampler(bpffs_root: &Path, vpp_dir: Option<&Path>) -> Result<(), String> {
-    linux::release_sampler(bpffs_root, vpp_dir)
+pub fn release_sampler(
+    bpffs_root: &Path,
+    state_dir: &Path,
+    vpp_dir: Option<&Path>,
+) -> Result<(), String> {
+    linux::release_sampler(bpffs_root, state_dir, vpp_dir)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn release_sampler(_bpffs_root: &Path, _vpp_dir: Option<&Path>) -> Result<(), String> {
+pub fn release_sampler(
+    _bpffs_root: &Path,
+    _state_dir: &Path,
+    _vpp_dir: Option<&Path>,
+) -> Result<(), String> {
     Ok(())
 }
 

@@ -34,6 +34,8 @@ pub struct FlowExportConfig {
     pub cache: Limits,
     /// `privacy-local-prefix`: empty means `local_default`.
     pub local: Vec<IpPrefix>,
+    /// `kernel-sample`: the kernel sampler's interfaces.
+    pub kernel: Vec<String>,
     /// fast-path's allowlist as the module took it at attach or reload,
     /// not from the section.
     pub local_default: Vec<IpPrefix>,
@@ -47,6 +49,7 @@ impl FlowExportConfig {
         let mut collectors = Vec::new();
         let mut cache = Limits::default();
         let mut local = Vec::new();
+        let mut kernel = Vec::new();
         for d in directives {
             match d {
                 ModuleDirective::FlowSourceAddress { addr, .. } => source = Some(*addr),
@@ -67,6 +70,7 @@ impl FlowExportConfig {
                     profile: *profile,
                 }),
                 ModuleDirective::FlowLocalPrefix { prefix, .. } => local.push(*prefix),
+                ModuleDirective::FlowKernelSample { iface, .. } => kernel.push(iface.clone()),
                 ModuleDirective::FlowCache {
                     entries,
                     active,
@@ -93,6 +97,7 @@ impl FlowExportConfig {
             collectors,
             cache,
             local,
+            kernel,
             local_default: Vec::new(),
         })
     }
@@ -130,6 +135,14 @@ impl FlowExportConfig {
                 "source-address {} → {} is restart-only (the exporter's identity to its \
                  collectors and its socket's address): {RESTART_SEQUENCE}",
                 self.source, new.source
+            ));
+        }
+        if self.kernel != new.kernel {
+            return Err(format!(
+                "kernel-sample [{}] → [{}] is restart-only (its filters are attached at \
+                 start): {RESTART_SEQUENCE}",
+                self.kernel.join(", "),
+                new.kernel.join(", ")
             ));
         }
         Ok(())
@@ -176,5 +189,13 @@ mod tests {
             .restart_only_delta(&c)
             .unwrap_err()
             .contains("restart-only"));
+        let k = parse(
+            "  source-address 192.0.2.1\n  kernel-sample eth7\n  collector a sflow 198.51.100.1:6343\n",
+        );
+        assert_eq!(k.kernel, vec!["eth7"]);
+        assert!(a
+            .restart_only_delta(&k)
+            .unwrap_err()
+            .contains("kernel-sample"));
     }
 }

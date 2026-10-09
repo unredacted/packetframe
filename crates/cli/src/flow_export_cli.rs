@@ -194,6 +194,9 @@ fn sampled(config: &Config) -> Vec<(String, Vec<&'static str>)> {
     for name in crate::feasibility::vpp_ports_from_config(config) {
         add(name, "VPP");
     }
+    for name in crate::feasibility::kernel_sample_ifaces_from_config(config) {
+        add(name, "kernel");
+    }
     out
 }
 
@@ -479,7 +482,8 @@ metadata:
         let config = Config::parse(
             "module fast-path\n  attach eth0 generic\n  attach eth3 generic\n\
              module vpp-offload\n  port eth3 cores 2 steer on\n  port eth9 cores 2 steer off\n\
-             module flow-export\n  source-address 192.0.2.1\n  collector c sflow 192.0.2.2:6343\n",
+             module flow-export\n  source-address 192.0.2.1\n  collector c sflow 192.0.2.2:6343\n\
+             \x20 kernel-sample tun0\n",
         )
         .unwrap();
         assert_eq!(
@@ -488,6 +492,7 @@ metadata:
                 ("eth0".to_string(), vec!["fast-path"]),
                 ("eth3".to_string(), vec!["fast-path", "VPP"]),
                 ("eth9".to_string(), vec!["VPP"]),
+                ("tun0".to_string(), vec!["kernel"]),
             ]
         );
         assert_eq!(source_address(&config), Some("192.0.2.1".parse().unwrap()));

@@ -21,21 +21,28 @@ const REGISTRATION_SECTION: &str = ".vlib_plugin_registration";
 /// The VPP vpp-offload runs without a `vpp-binary`: the `vpp` package's.
 pub const DEFAULT_VPP_BINARY: &str = "/usr/bin/vpp";
 
-/// `source-address`: the module's flow-export section's. `vpp`: whether
-/// the config declares vpp-offload too, so VPP's sampler is in play, and
-/// its `vpp-binary` if it names one.
-pub fn run_feasibility_probes(
-    source: Option<IpAddr>,
-    vpp: bool,
-    vpp_binary: Option<&str>,
-) -> Vec<Capability> {
+/// What the probes look at: the module's section, and what else samples.
+pub struct ProbeInputs<'a> {
+    /// `source-address`.
+    pub source: Option<IpAddr>,
+    /// Whether the config declares vpp-offload, so VPP's sampler is in
+    /// play, and its `vpp-binary` if it names one.
+    pub vpp: bool,
+    pub vpp_binary: Option<&'a str>,
+    /// `kernel-sample` interfaces, and the ports fast-path's programs and
+    /// VPP sample, which none of them may sit on.
+    pub kernel: &'a [String],
+    pub sampled: &'a [String],
+}
+
+pub fn run_feasibility_probes(inputs: &ProbeInputs<'_>) -> Vec<Capability> {
     #[cfg(target_os = "linux")]
     {
-        linux::run(source, vpp, vpp_binary)
+        linux::run(inputs)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (source, vpp, vpp_binary);
+        let _ = inputs;
         Vec::new()
     }
 }
@@ -126,15 +133,35 @@ mod linux {
     use super::{registration_versions, DEFAULT_VPP_BINARY, PLUGIN_PATH};
     use crate::VPP_SAMPLER_DIR;
 
-    pub fn run(source: Option<IpAddr>, vpp: bool, vpp_binary: Option<&str>) -> Vec<Capability> {
+    pub fn run(i: &super::ProbeInputs<'_>) -> Vec<Capability> {
         let mut caps = Vec::new();
-        if let Some(addr) = source {
+        if let Some(addr) = i.source {
             caps.push(source_address(addr));
         }
-        if vpp {
+        if i.vpp {
             caps.push(sampler_dir(Path::new(VPP_SAMPLER_DIR)));
-            let binary = vpp_binary.unwrap_or(DEFAULT_VPP_BINARY);
+            let binary = i.vpp_binary.unwrap_or(DEFAULT_VPP_BINARY);
             caps.push(plugin(Path::new(PLUGIN_PATH), version_of(binary)));
+        }
+        for iface in i.kernel {
+            let name = format!("flow-export.kernel-sample.{iface}");
+            caps.push(match crate::kernel::refusal(iface, i.sampled, i.kernel) {
+                None if crate::KERNEL_SAMPLE_BPF_AVAILABLE => Capability::pass(
+                    name,
+                    format!("{iface}: the kernel sampler can attach to its ingress"),
+                    false,
+                ),
+                None => Capability::fail(
+                    name,
+                    "this build carries no kernel sampler (built without the BPF toolchain)",
+                    false,
+                ),
+                Some(why) => Capability::fail(
+                    name,
+                    format!("{why}: attach will refuse it, and flow export degrade"),
+                    false,
+                ),
+            });
         }
         caps
     }

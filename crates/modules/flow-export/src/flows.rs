@@ -154,6 +154,8 @@ fn ipv6(ip: &[u8]) -> Option<Packet> {
 /// An IPFIX observation domain: where packets were observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Domain {
+    /// flow-export's kernel sampler.
+    Kernel = 1,
     /// fast-path's XDP and tc programs.
     FastPath = 2,
     /// VPP's sampler plugin.

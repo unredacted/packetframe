@@ -871,6 +871,13 @@ pub enum ModuleDirective {
         profile: CollectorProfile,
         line: usize,
     },
+    /// `kernel-sample <iface>` — sample an interface no fast-path program
+    /// or VPP is on, with flow-export's own tc-ingress sampler: traffic the
+    /// kernel forwards or receives there. Repeatable. **Restart-only**.
+    FlowKernelSample {
+        iface: String,
+        line: usize,
+    },
     /// `privacy-local-prefix <cidr>` — an address inside it is local, kept
     /// whole by the privacy profiles that drop or truncate the others.
     /// Repeatable; none given means fast-path's allowlist. Hot.
@@ -3305,6 +3312,32 @@ impl Config {
         Ok(())
     }
 
+    /// The interfaces fast-path's `attach` lines name.
+    fn fast_path_ifaces(&self) -> Vec<String> {
+        self.modules
+            .iter()
+            .filter(|m| m.name == "fast-path")
+            .flat_map(|m| &m.directives)
+            .filter_map(|d| match d {
+                ModuleDirective::Attach { iface, .. } => Some(iface.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The kernel ports vpp-offload's `port` lines name.
+    fn vpp_ports(&self) -> Vec<String> {
+        self.modules
+            .iter()
+            .filter(|m| m.name == "vpp-offload")
+            .flat_map(|m| &m.directives)
+            .filter_map(|d| match d {
+                ModuleDirective::VppPort { iface, .. } => Some(iface.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether fast-path learns routes from BGP or BMP, so flow export
     /// can tell an address's origin AS.
     pub fn has_asn_source(&self) -> bool {
@@ -3351,6 +3384,7 @@ impl Config {
         };
         let mut source: Option<(IpAddr, usize)> = None;
         let (mut rate_line, mut header_line, mut cache_line) = (None, None, None);
+        let mut kernel: Vec<(String, usize)> = Vec::new();
         let mut collectors: Vec<(&str, std::net::SocketAddr, usize)> = Vec::new();
         for d in &self.modules[pos].directives {
             match d {
@@ -3378,6 +3412,31 @@ impl Config {
                             format!("`header-bytes` given twice (first on line {prev})"),
                         ));
                     }
+                }
+                ModuleDirective::FlowKernelSample { iface, line } => {
+                    if let Some((_, prev)) = kernel.iter().find(|(i, _)| i == iface) {
+                        return Err(err(
+                            *line,
+                            format!("`kernel-sample {iface}` given twice (first on line {prev})"),
+                        ));
+                    }
+                    // Each packet is sampled once, by whatever sees it
+                    // first: fast-path's program, VPP, or this.
+                    let taken = if iface == "lo" {
+                        Some("the loopback carries no forwarded traffic")
+                    } else if iface == "pfpunt0" {
+                        Some("VPP's punt device: its packets were VPP's to sample")
+                    } else if self.fast_path_ifaces().contains(iface) {
+                        Some("fast-path's programs sample it already")
+                    } else if self.vpp_ports().contains(iface) {
+                        Some("VPP samples it already")
+                    } else {
+                        None
+                    };
+                    if let Some(why) = taken {
+                        return Err(err(*line, format!("`kernel-sample {iface}`: {why}")));
+                    }
+                    kernel.push((iface.clone(), *line));
                 }
                 ModuleDirective::FlowCache { line, .. } => {
                     if let Some(prev) = cache_line.replace(*line) {
@@ -4881,6 +4940,15 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
         }),
         "collector" => parse_flow_collector(line, rest),
         "flow-cache" => parse_flow_cache(line, rest),
+        "kernel-sample" => parse_single_arg(line, rest, "kernel-sample", |t| {
+            if t.is_empty() || t.len() > 15 || t.contains('/') {
+                return Err(format!("`{t}` is not an interface name"));
+            }
+            Ok(ModuleDirective::FlowKernelSample {
+                iface: t.to_string(),
+                line,
+            })
+        }),
         "privacy-local-prefix" => parse_single_arg(line, rest, "privacy-local-prefix", |t| {
             let prefix = if t.contains(':') {
                 let p: Ipv6Prefix = t.parse()?;
@@ -10591,6 +10659,33 @@ module fast-path
                 ..
             }
         )));
+        // kernel-sample: never a port another path samples.
+        let vpp = "module fast-path\n  attach eth0 generic\nmodule vpp-offload\n  \
+            port eth3 cores 2 steer on\nmodule flow-export\n";
+        for (iface, why) in [
+            ("lo", "loopback"),
+            ("pfpunt0", "punt device"),
+            ("eth0", "fast-path's programs"),
+            ("eth3", "VPP samples it"),
+        ] {
+            let e = Config::parse(&format!(
+                "{vpp}{src}  kernel-sample {iface}\n  collector a sflow 198.51.100.1:6343\n"
+            ))
+            .unwrap()
+            .validate_flow_export()
+            .unwrap_err();
+            assert!(format!("{e}").contains(why), "{iface}: {e}");
+        }
+        refuse(
+            "  kernel-sample eth7\n  kernel-sample eth7\n  collector a sflow 198.51.100.1:6343\n",
+            "given twice",
+        );
+        Config::parse(&format!(
+            "{vpp}{src}  kernel-sample eth7\n  collector a sflow 198.51.100.1:6343\n"
+        ))
+        .unwrap()
+        .validate_flow_export()
+        .unwrap();
         // vpp-offload, when present, is before it too.
         let fp = "module fast-path\n  attach eth0 generic\n";
         let after = format!("{fp}{alone}module vpp-offload\n");

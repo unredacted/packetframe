@@ -501,9 +501,26 @@ pub struct FlowExportProbeInputs {
     pub vpp: bool,
     /// vpp-offload's `vpp-binary`, which is the VPP that runs.
     pub vpp_binary: Option<String>,
+    /// `kernel-sample` interfaces, and the ports fast-path and VPP sample.
+    pub kernel: Vec<String>,
+    pub sampled: Vec<String>,
 }
 
 /// `None` without a flow-export section.
+/// flow-export's `kernel-sample` interfaces, in config order.
+pub fn kernel_sample_ifaces_from_config(config: &Config) -> Vec<String> {
+    config
+        .modules
+        .iter()
+        .filter(|m| m.name == "flow-export")
+        .flat_map(|m| &m.directives)
+        .filter_map(|d| match d {
+            ModuleDirective::FlowKernelSample { iface, .. } => Some(iface.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn flow_export_probe_inputs_from_config(config: &Config) -> Option<FlowExportProbeInputs> {
     let section = config.modules.iter().find(|m| m.name == "flow-export")?;
     Some(FlowExportProbeInputs {
@@ -513,6 +530,11 @@ pub fn flow_export_probe_inputs_from_config(config: &Config) -> Option<FlowExpor
         }),
         vpp: config.modules.iter().any(|m| m.name == "vpp-offload"),
         vpp_binary: vpp_binary_from_config(config),
+        kernel: kernel_sample_ifaces_from_config(config),
+        sampled: attach_ifaces_from_config(config)
+            .into_iter()
+            .chain(vpp_ports_from_config(config))
+            .collect(),
     })
 }
 
@@ -690,9 +712,13 @@ pub fn probe_and_render(inputs: &FeasibilityInputs, human: bool) -> Rendered {
     #[cfg(feature = "flow-export")]
     if let Some(f) = flow_export {
         for cap in packetframe_flow_export::feasibility::run_feasibility_probes(
-            f.source,
-            f.vpp,
-            f.vpp_binary.as_deref(),
+            &packetframe_flow_export::feasibility::ProbeInputs {
+                source: f.source,
+                vpp: f.vpp,
+                vpp_binary: f.vpp_binary.as_deref(),
+                kernel: &f.kernel,
+                sampled: &f.sampled,
+            },
         ) {
             report.capabilities.push(cap);
         }
@@ -1231,6 +1257,8 @@ module flow-export
                 source: Some("192.0.2.7".parse().unwrap()),
                 vpp: true,
                 vpp_binary: Some("/opt/vpp-test".into()),
+                kernel: Vec::new(),
+                sampled: vec!["fp0".into(), "fp1".into(), "vp0".into(), "vp1".into()],
             })
         );
         assert_eq!(

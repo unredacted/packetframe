@@ -786,6 +786,9 @@ dependencies = [
  "packetframe-fast-path",
  "packetframe-flow-encode",
  "packetframe-sampler-shm",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
