@@ -21,7 +21,9 @@ use crate::cfg::FlowExportConfig;
 use crate::kernel;
 use crate::vpp::VppSide;
 use crate::vpp_live::{self, LiveVppDir};
-use crate::worker::{self, Leftover, Path as Lane, Port, Ports, SampleSource, Shared, Worker};
+use crate::worker::{
+    self, Leftover, Link, Path as Lane, Port, Ports, SampleSource, Shared, Worker,
+};
 use crate::THREAD_NAME;
 
 /// The busiest a single CPU forwards, for sizing its ring.
@@ -276,8 +278,8 @@ impl SampleSource for Sources {
 
 struct LivePorts {
     state_dir: PathBuf,
-    /// The kernel sampler's interfaces, as attached.
-    kernel: Vec<(String, u32)>,
+    /// The kernel sampler's interfaces, as attached, and their links.
+    kernel: Vec<(String, u32, Link)>,
 }
 
 impl Ports for LivePorts {
@@ -306,13 +308,15 @@ impl Ports for LivePorts {
                     name: a.iface,
                     ifindex,
                     path,
+                    link: Link::Ethernet,
                 })
             })
             .collect();
-        ports.extend(self.kernel.iter().map(|(name, ifindex)| Port {
+        ports.extend(self.kernel.iter().map(|(name, ifindex, link)| Port {
             name: name.clone(),
             ifindex: *ifindex,
             path: Lane::Kernel,
+            link: *link,
         }));
         Ok(ports)
     }
@@ -367,7 +371,12 @@ impl Running {
         } else {
             let sampled = sampled_ports(state_dir, vpp.as_ref().map(|(p, _)| p.as_ref()));
             let k = kernel::attach(state_dir, &cfg.kernel, &sampled)?;
-            let attached = k.attached.clone();
+            // Each passed `refusal`, so its link type is one of these.
+            let attached = k
+                .attached
+                .iter()
+                .map(|(n, i)| (n.clone(), *i, kernel::link_of(n).unwrap_or_default()))
+                .collect();
             (Some(LiveSource::kernel(k)?), attached)
         };
         let ports = LivePorts {

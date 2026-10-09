@@ -1125,3 +1125,120 @@ fn a_start_without_kernel_samplers_clears_a_dead_daemons() {
     next.detach().unwrap();
     dead.detach().unwrap();
 }
+
+/// A TUN device, gone when dropped. `None` where the host has no
+/// `/dev/net/tun`.
+struct Tun {
+    fd: std::fs::File,
+    name: String,
+}
+
+impl Tun {
+    fn new(name: &str) -> Option<Self> {
+        let fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+            .ok()?;
+        #[repr(C)]
+        struct IfReq {
+            name: [u8; 16],
+            flags: libc::c_short,
+            _pad: [u8; 22],
+        }
+        let mut req = IfReq {
+            name: [0; 16],
+            flags: (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short,
+            _pad: [0; 22],
+        };
+        req.name[..name.len()].copy_from_slice(name.as_bytes());
+        // _IOW('T', 202, int)
+        const TUNSETIFF: u64 = 0x4004_54ca;
+        // SAFETY: an ifreq-shaped buffer the call reads and writes.
+        let rc = unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &mut req) };
+        if rc != 0 {
+            return None;
+        }
+        assert!(ip(&["link", "set", name, "up"]));
+        Some(Self {
+            fd,
+            name: name.into(),
+        })
+    }
+
+    /// Hand the kernel `packet` as received on this device.
+    fn receive(&self, packet: &[u8]) {
+        use std::io::Write as _;
+        (&self.fd).write_all(packet).unwrap();
+    }
+}
+
+/// A device with no link-layer header hands the kernel sampler packets
+/// that start at their IP header. Each reaches the collector framed as
+/// Ethernet (zero MACs, the IPv4 ethertype) around the packet, its length
+/// counting that header and no FCS, so a collector decodes it like any
+/// other.
+#[test]
+#[ignore = "needs root: CAP_BPF, bpffs and /dev/net/tun"]
+fn a_tunnels_samples_are_framed_for_the_collector() {
+    if !FAST_PATH_BPF_AVAILABLE || !packetframe_flow_export::KERNEL_SAMPLE_BPF_AVAILABLE {
+        return;
+    }
+    let s = Scratch::new("ktun");
+    let _bpf = fast_path(&s);
+    register_lo(&s);
+    let Some(tun) = Tun::new("pfktun0") else {
+        eprintln!("no /dev/net/tun here; skipping");
+        return;
+    };
+    let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+    collector
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut m = kernel_module(
+        &s,
+        &format!(
+            "  sample-rate 100\n  header-bytes 64\n  kernel-sample {}\n  collector t sflow {}\n",
+            tun.name,
+            collector.local_addr().unwrap()
+        ),
+    )
+    .expect("attach");
+
+    // IPv4 UDP, 192.0.2.7 -> 198.51.100.9, 100 octets in all.
+    let mut packet = vec![0x45, 0, 0, 100, 0, 0, 0, 0, 64, 17, 0, 0];
+    packet.extend_from_slice(&[192, 0, 2, 7, 198, 51, 100, 9]);
+    packet.extend_from_slice(&[0x9c, 0x40, 0x00, 0x35, 0x00, 80, 0, 0]);
+    packet.resize(100, 0);
+    for _ in 0..5_000 {
+        tun.receive(&packet);
+    }
+
+    let want = ifindex(&tun.name);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (mut samples, mut buf) = (0u32, [0u8; 2048]);
+    while Instant::now() < deadline && samples < 20 {
+        let Ok(n) = collector.recv(&mut buf) else {
+            continue;
+        };
+        let d = &buf[..n];
+        let mut f = 28;
+        for _ in 0..word(d, 24) {
+            assert_eq!(word(d, f + 12), want, "the tunnel's ifindex");
+            assert_eq!(word(d, f + 52), 100 + 14, "frame length");
+            assert_eq!(word(d, f + 56), 0, "stripped: no FCS");
+            let h = &d[f + 64..];
+            assert_eq!(&h[..12], &[0u8; 12], "zero MACs");
+            assert_eq!(&h[12..14], &[0x08, 0x00], "the IPv4 ethertype");
+            assert_eq!(
+                &h[14..34],
+                &packet[..20],
+                "then the packet, from its IP header"
+            );
+            f += 8 + word(d, f + 4) as usize;
+            samples += 1;
+        }
+    }
+    assert!(samples >= 20, "{samples} samples");
+    m.detach().unwrap();
+}

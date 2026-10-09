@@ -249,10 +249,18 @@ fast-path accepts, never one it refused.
 
 - **What it's for.** `kernel-sample <iface>` is for traffic only the
   kernel handles, such as a tunnel or a port with no fast-path program.
+- **Tunnels.** A device with no link-layer header (an IP tunnel such as
+  ipip, GRE or vti, WireGuard, TUN, PPP) hands the sampler packets that
+  start at their IP header. They go out behind an Ethernet header with
+  zero MACs and the packet's ethertype, so every collector decodes them.
+  sFlow's `frame_length` counts those 14 octets and no FCS (`stripped`
+  0). A sample there that is not IP is counted lost, in
+  `samples_lost_total{where="undecodable"}`.
 - **Refusals.** It is refused on fast-path ports, VPP ports, `pfpunt0`,
-  loopbacks, and any device stacked on a sampled port, another
-  `kernel-sample` interface included: a VLAN or bridge over it would see
-  those packets a second time.
+  loopbacks, link types that are neither Ethernet nor an IP device, and
+  any device stacked on a sampled port, another `kernel-sample`
+  interface included: a VLAN or bridge over it would see those packets
+  a second time.
 - **The filters.** They are recorded in
   `<state-dir>/flow-export-tc-links.json`, which is read only if this
   daemon's own account could have written it.
