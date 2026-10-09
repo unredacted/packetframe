@@ -162,16 +162,21 @@ fn nothing_is_sampled_until_flow_export_sets_a_rate() {
             assert_eq!(h.stat(StatIdx::SampleSelected), 0);
             assert_eq!(h.stat(StatIdx::SampleArmed), 0);
 
-            // Turned on, a CPU notices within its re-check interval (1024
-            // packets), arms on the next, and samples every one after.
+            // Turned on, a CPU notices within its re-check interval (64
+            // packets) wherever its countdown stood, arms on the next, and
+            // samples every one after. 500 more first leave a 1024-packet
+            // interval, the old one, far from its end.
+            h.run_timed(&unmatched(), 500);
             h.set_sample_cfg(1, HEADER_BYTES, 3);
-            let mut seen = 0;
-            for _ in 0..9 {
-                h.run_timed(&unmatched(), 250);
-                seen += tap.events().len();
+            let mut waited = 0;
+            while tap.events().is_empty() {
+                waited += 1;
+                assert!(waited <= 65, "{fib:?}: no sample within {waited} packets");
+                h.run(&unmatched());
             }
-            assert!((2250 - 1026..=2250).contains(&seen), "{fib:?}: {seen}");
-            assert_eq!(h.stat(StatIdx::SampleSelected), seen as u64);
+            h.run_timed(&unmatched(), 200);
+            assert_eq!(tap.events().len(), 200, "{fib:?}");
+            assert_eq!(h.stat(StatIdx::SampleSelected), 201);
         }
     });
 }

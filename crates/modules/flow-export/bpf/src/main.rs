@@ -77,8 +77,9 @@ pub const STATE_WORDS: usize = 4;
 
 pub const PATH_KERNEL: u32 = 3;
 
-/// Packets between re-reads of `KSAMPLE_CFG` while sampling is off.
-const RECHECK: u64 = 1024;
+/// Packets between re-reads of `KSAMPLE_CFG` while sampling is off:
+/// fast-path's `RECHECK`.
+const RECHECK: u64 = 64;
 
 #[map]
 pub static KSAMPLE_CFG: Array<SampleCfg> = Array::with_max_entries(1, 0);

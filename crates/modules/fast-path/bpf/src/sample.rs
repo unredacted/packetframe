@@ -36,8 +36,12 @@ pub const DISPOSITION_DROP: u32 = 1;
 pub const DISPOSITION_REDIRECT: u32 = 2;
 
 /// Packets between re-reads of `SAMPLE_CFG` while sampling is off: how
-/// long a CPU takes to notice it was turned on.
-const RECHECK: u64 = 1024;
+/// long a CPU takes to notice it was turned on, and so how many packets
+/// a port's pool counts that no sample could come from. Each re-read is
+/// an inlined array lookup, a few ns, paid whether or not flow export
+/// runs: at 64, well under 0.1 ns a packet. At 1024, a burst on a quiet
+/// port ran about 6% short of its count on the lab.
+const RECHECK: u64 = 64;
 
 const COUNTDOWN: usize = StatIdx::SampleCountdown as usize;
 const ARMED: usize = StatIdx::SampleArmed as usize;
