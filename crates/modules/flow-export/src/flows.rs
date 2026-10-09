@@ -127,6 +127,13 @@ fn ipv6(ip: &[u8]) -> Option<Packet> {
                 first_fragment = u16::from_be_bytes([e[2], e[3]]) >> 3 == 0;
                 at += 8;
             }
+            // Authentication: its length is in 4-octet units, less 2
+            // (RFC 4302 §2.2), and what it protects follows in the clear.
+            51 => {
+                let Some(e) = ip.get(at..at + 2) else { break };
+                next = e[0];
+                at += (usize::from(e[1]) + 2) * 4;
+            }
             _ => break,
         }
     }
@@ -198,6 +205,9 @@ pub struct Sampled {
     pub rate: u32,
     pub input_if: u32,
     pub output_if: u32,
+    /// When it was sampled, not when the worker read it: a backlog
+    /// drained late keeps its flows' times and timeouts.
+    pub at: Now,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +260,9 @@ pub struct FlowCache {
     limits: Limits,
     domains: BTreeMap<Domain, DomainCache>,
     next_id: u64,
+    /// Which domain expiry starts with, turn about, so one domain's
+    /// backlog cannot hold back another's timeouts.
+    turn: usize,
     pub counts: Counts,
 }
 
@@ -267,10 +280,14 @@ impl FlowCache {
             limits,
             domains: BTreeMap::new(),
             next_id: 0,
+            turn: 0,
             counts: Counts::default(),
         }
     }
 
+    /// A smaller `entries` is reached a little at a time, oldest flows
+    /// first, by [`Self::expire`] within its budget: never all at once,
+    /// which could overrun the smaller export queue in one tick.
     pub fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
     }
@@ -286,7 +303,7 @@ impl FlowCache {
     /// replaces the domain's: the flows at the rate before are queued for
     /// export ahead of the change. An older generation counts while its
     /// rate is still the domain's, and is stale once it is not.
-    pub fn ingest(&mut self, domain: Domain, batch: &[Sampled], now: Now) {
+    pub fn ingest(&mut self, domain: Domain, batch: &[Sampled]) {
         let mut generations: Vec<(u64, u32)> =
             batch.iter().map(|s| (s.generation, s.rate)).collect();
         generations.sort_unstable();
@@ -305,7 +322,7 @@ impl FlowCache {
                 }
             }
             for s in batch.iter().filter(of) {
-                self.count(domain, s, now);
+                self.count(domain, s);
             }
         }
     }
@@ -314,9 +331,10 @@ impl FlowCache {
         let cap = self.queue_cap();
         let d = self.domains.entry(domain).or_default();
         let keys: Vec<Key> = d.by_start.values().cloned().collect();
-        self.counts.flushed += keys.len() as u64;
         for k in keys {
-            Self::export(d, &k, d.rate, &mut self.counts, cap);
+            if Self::export(d, &k, d.rate, &mut self.counts, cap) {
+                self.counts.flushed += 1;
+            }
         }
         d.out.push_back(Export::Rate(rate));
         d.rate = rate;
@@ -328,7 +346,8 @@ impl FlowCache {
         2 * self.limits.entries.max(1)
     }
 
-    fn count(&mut self, domain: Domain, s: &Sampled, now: Now) {
+    fn count(&mut self, domain: Domain, s: &Sampled) {
+        let now = s.at;
         let entries = self.limits.entries.max(1);
         let cap = self.queue_cap();
         let id = self.next_id;
@@ -343,21 +362,31 @@ impl FlowCache {
             output_if: s.output_if,
         };
         if let Some(f) = d.flows.get_mut(&key) {
-            d.by_last.remove(&(f.last_ms, f.id));
             f.packets += 1;
             f.octets += u64::from(s.packet.ip_len);
-            f.end_wall_ms = now.wall_ms;
-            f.last_ms = now.ms;
-            d.by_last.insert((f.last_ms, f.id), key);
+            // Samples from different CPUs' rings arrive out of order.
+            if now.ms > f.last_ms {
+                d.by_last.remove(&(f.last_ms, f.id));
+                f.last_ms = now.ms;
+                f.end_wall_ms = now.wall_ms;
+                d.by_last.insert((f.last_ms, f.id), key.clone());
+            }
+            if now.ms < f.start_ms {
+                d.by_start.remove(&(f.start_ms, f.id));
+                f.start_ms = now.ms;
+                f.start_wall_ms = now.wall_ms;
+                d.by_start.insert((f.start_ms, f.id), key);
+            }
             return;
         }
-        while d.flows.len() >= entries {
-            let Some((_, oldest)) = d.by_start.first_key_value().map(|(k, v)| (*k, v.clone()))
-            else {
-                break;
-            };
-            Self::export(d, &oldest, d.rate, &mut self.counts, cap);
-            self.counts.evicted_full += 1;
+        // Room for one: a cache over a limit lowered by a reload is
+        // brought down by `expire`, a budget at a time.
+        if d.flows.len() >= entries {
+            if let Some(oldest) = d.by_start.first_key_value().map(|(_, v)| v.clone()) {
+                if Self::export(d, &oldest, d.rate, &mut self.counts, cap) {
+                    self.counts.evicted_full += 1;
+                }
+            }
         }
         self.next_id += 1;
         d.by_start.insert((now.ms, id), key.clone());
@@ -376,16 +405,18 @@ impl FlowCache {
         );
     }
 
-    /// Remove a flow and queue its record, if the queue has room.
-    fn export(d: &mut DomainCache, key: &Key, rate: u32, counts: &mut Counts, cap: usize) {
+    /// Remove a flow and queue its record, if the queue has room: whether
+    /// it did. A record with no room is counted dropped, and the caller
+    /// counts only what was queued, so no record reads as both.
+    fn export(d: &mut DomainCache, key: &Key, rate: u32, counts: &mut Counts, cap: usize) -> bool {
         let Some(f) = d.flows.remove(key) else {
-            return;
+            return false;
         };
         d.by_start.remove(&(f.start_ms, f.id));
         d.by_last.remove(&(f.last_ms, f.id));
         if d.out.len() >= cap {
             counts.queue_dropped += 1;
-            return;
+            return false;
         }
         d.out.push_back(Export::Record(FlowRecord {
             src: key.src,
@@ -403,6 +434,7 @@ impl FlowCache {
             end_ms: f.end_wall_ms,
             sampling_interval: rate,
         }));
+        true
     }
 
     /// Export every flow, timed out or not: the export is stopping.
@@ -417,13 +449,34 @@ impl FlowCache {
         }
     }
 
-    /// Export flows past a timeout, at most `budget` across domains.
+    /// Export flows past a timeout, and the oldest of a cache over its
+    /// limit, at most `budget` across domains.
     pub fn expire(&mut self, now: Now, budget: usize) {
         let active = self.limits.active.as_millis() as u64;
         let inactive = self.limits.inactive.as_millis() as u64;
+        let entries = self.limits.entries.max(1);
         let cap = self.queue_cap();
         let mut left = budget;
-        for d in self.domains.values_mut() {
+        let mut order: Vec<Domain> = self.domains.keys().copied().collect();
+        if !order.is_empty() {
+            let n = order.len();
+            order.rotate_left(self.turn % n);
+            self.turn = self.turn.wrapping_add(1);
+        }
+        for domain in order {
+            let Some(d) = self.domains.get_mut(&domain) else {
+                continue;
+            };
+            while left > 0 && d.flows.len() > entries {
+                let Some(oldest) = d.by_start.first_key_value().map(|(_, v)| v.clone()) else {
+                    break;
+                };
+                let rate = d.rate;
+                if Self::export(d, &oldest, rate, &mut self.counts, cap) {
+                    self.counts.evicted_full += 1;
+                }
+                left -= 1;
+            }
             while left > 0 {
                 let idle = d
                     .by_last
@@ -435,14 +488,19 @@ impl FlowCache {
                     .first_key_value()
                     .filter(|((start, _), _)| start + active <= now.ms)
                     .map(|(_, k)| k.clone());
-                let (key, count) = match (idle, old) {
-                    (Some(k), _) => (k, &mut self.counts.expired_inactive),
-                    (None, Some(k)) => (k, &mut self.counts.expired_active),
+                let (key, idle) = match (idle, old) {
+                    (Some(k), _) => (k, true),
+                    (None, Some(k)) => (k, false),
                     (None, None) => break,
                 };
-                *count += 1;
                 let rate = d.rate;
-                Self::export(d, &key, rate, &mut self.counts, cap);
+                if Self::export(d, &key, rate, &mut self.counts, cap) {
+                    if idle {
+                        self.counts.expired_inactive += 1;
+                    } else {
+                        self.counts.expired_active += 1;
+                    }
+                }
                 left -= 1;
             }
         }
@@ -455,6 +513,11 @@ impl FlowCache {
         };
         let n = d.out.len().min(max);
         d.out.drain(..n).collect()
+    }
+
+    /// Exports queued, across every domain.
+    pub fn queued(&self) -> usize {
+        self.domains.values().map(|d| d.out.len()).sum()
     }
 
     /// The domains with anything to export.
@@ -566,7 +629,14 @@ mod tests {
             rate,
             input_if: 3,
             output_if: 5,
+            at: at(0),
         }
+    }
+
+    /// `batch`, every sample observed at `now`.
+    fn ingest(c: &mut FlowCache, domain: Domain, batch: &[Sampled], now: Now) {
+        let batch: Vec<Sampled> = batch.iter().map(|s| Sampled { at: now, ..*s }).collect();
+        c.ingest(domain, &batch);
     }
 
     fn at(ms: u64) -> Now {
@@ -588,12 +658,13 @@ mod tests {
     #[test]
     fn packets_of_a_flow_aggregate_until_a_timeout() {
         let mut c = FlowCache::new(Limits::default());
-        c.ingest(
+        ingest(
+            &mut c,
             Domain::FastPath,
             &[sampled(443, 1000), sampled(443, 1000)],
             at(0),
         );
-        c.ingest(Domain::FastPath, &[sampled(443, 1000)], at(5_000));
+        ingest(&mut c, Domain::FastPath, &[sampled(443, 1000)], at(5_000));
         assert_eq!(c.active(), 1);
         assert_eq!(c.take(Domain::FastPath, 10), vec![Export::Rate(1000)]);
         c.expire(at(19_999), 100);
@@ -612,7 +683,7 @@ mod tests {
     fn a_busy_flow_is_exported_at_the_active_timeout() {
         let mut c = FlowCache::new(Limits::default());
         for s in 0..=60 {
-            c.ingest(Domain::Vpp, &[sampled(80, 1000)], at(s * 1000));
+            ingest(&mut c, Domain::Vpp, &[sampled(80, 1000)], at(s * 1000));
             c.expire(at(s * 1000), 100);
         }
         assert_eq!(c.counts.expired_active, 1);
@@ -627,7 +698,12 @@ mod tests {
             ..Limits::default()
         });
         for (i, port) in [1u16, 2, 3].into_iter().enumerate() {
-            c.ingest(Domain::FastPath, &[sampled(port, 1000)], at(i as u64));
+            ingest(
+                &mut c,
+                Domain::FastPath,
+                &[sampled(port, 1000)],
+                at(i as u64),
+            );
         }
         assert_eq!((c.active(), c.counts.evicted_full), (2, 1));
         let out = c.take(Domain::FastPath, 10);
@@ -640,8 +716,9 @@ mod tests {
     #[test]
     fn a_rate_change_exports_the_old_rates_flows_before_announcing_it() {
         let mut c = FlowCache::new(Limits::default());
-        c.ingest(Domain::FastPath, &[sampled(1, 1000)], at(0));
-        c.ingest(
+        ingest(&mut c, Domain::FastPath, &[sampled(1, 1000)], at(0));
+        ingest(
+            &mut c,
             Domain::FastPath,
             &[sampled(2, 100), sampled(1, 1000), sampled(2, 100)],
             at(100),
@@ -666,16 +743,16 @@ mod tests {
     #[test]
     fn a_late_sample_counts_at_its_rate_or_not_at_all() {
         let mut c = FlowCache::new(Limits::default());
-        c.ingest(Domain::Vpp, &[sampled_at(1, 1000, 1)], at(0));
+        ingest(&mut c, Domain::Vpp, &[sampled_at(1, 1000, 1)], at(0));
         // Generation 2 changed only the ports: generation 1's samples
         // still scale right.
-        c.ingest(Domain::Vpp, &[sampled_at(1, 1000, 2)], at(1));
-        c.ingest(Domain::Vpp, &[sampled_at(1, 1000, 1)], at(2));
+        ingest(&mut c, Domain::Vpp, &[sampled_at(1, 1000, 2)], at(1));
+        ingest(&mut c, Domain::Vpp, &[sampled_at(1, 1000, 1)], at(2));
         assert_eq!(c.active(), 1);
         assert_eq!(c.counts.stale, 0);
         // Generation 3 changed the rate; one of generation 2's arrives.
-        c.ingest(Domain::Vpp, &[sampled_at(2, 500, 3)], at(3));
-        c.ingest(Domain::Vpp, &[sampled_at(1, 1000, 2)], at(4));
+        ingest(&mut c, Domain::Vpp, &[sampled_at(2, 500, 3)], at(3));
+        ingest(&mut c, Domain::Vpp, &[sampled_at(1, 1000, 2)], at(4));
         assert_eq!(c.counts.stale, 1, "no options record says 1:1000 now");
         let out = c.take(Domain::Vpp, 10);
         assert_eq!(
@@ -690,12 +767,126 @@ mod tests {
     fn a_domain_exports_at_most_what_is_asked() {
         let mut c = FlowCache::new(Limits::default());
         let batch: Vec<Sampled> = (0..5).map(|p| sampled(p, 1000)).collect();
-        c.ingest(Domain::FastPath, &batch, at(0));
+        ingest(&mut c, Domain::FastPath, &batch, at(0));
         c.expire(at(15_000), 3);
         assert_eq!(c.active(), 2, "the budget bounds a tick's expiry");
         assert_eq!(c.take(Domain::FastPath, 2).len(), 2);
         assert_eq!(c.pending(), vec![Domain::FastPath]);
         assert_eq!(c.take(Domain::FastPath, 10).len(), 2);
         assert!(c.pending().is_empty());
+    }
+
+    /// AH protects what follows it in the clear: the flow is the TCP
+    /// connection inside, not every AH packet between two hosts.
+    #[test]
+    fn ipv6_past_an_authentication_header() {
+        let mut ip = vec![0x60, 0, 0, 0, 0, 0, 51 /* AH */, 64];
+        ip[4..6].copy_from_slice(&(24u16 + 20).to_be_bytes());
+        ip.extend_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        ip.extend_from_slice(&"2001:db8::2".parse::<Ipv6Addr>().unwrap().octets());
+        // Next header TCP, length 4: (4 + 2) * 4 = 24 octets with a
+        // 96-bit ICV.
+        ip.extend_from_slice(&[PROTO_TCP, 4, 0, 0]);
+        ip.extend_from_slice(&[0; 20]);
+        ip.extend_from_slice(&[0x9c, 0x40, 0x01, 0xbb]);
+        ip.extend_from_slice(&[0; 16]);
+        let p = parse(&frame(false, 0x86dd, &ip)).unwrap();
+        assert_eq!(
+            (p.protocol, p.src_port, p.dst_port),
+            (PROTO_TCP, 40000, 443)
+        );
+        assert_eq!(p.ip_len, 84);
+    }
+
+    /// Samples read late keep the time they were taken: a flow spans
+    /// what its samples saw, whatever order they arrive in, and times out
+    /// from its last packet, not from when the worker got to it.
+    #[test]
+    fn samples_count_at_the_time_they_were_taken() {
+        let mut c = FlowCache::new(Limits::default());
+        let batch = [
+            Sampled {
+                at: at(3_000),
+                ..sampled(443, 1000)
+            },
+            Sampled {
+                at: at(1_000),
+                ..sampled(443, 1000)
+            },
+            Sampled {
+                at: at(2_000),
+                ..sampled(443, 1000)
+            },
+        ];
+        c.ingest(Domain::FastPath, &batch);
+        c.expire(at(17_999), 100);
+        assert_eq!(c.active(), 1, "idle 14.999 s since the last sample");
+        c.expire(at(18_000), 100);
+        let out = c.take(Domain::FastPath, 10);
+        let r = records(&out)[0];
+        assert_eq!(r.start_ms, at(1_000).wall_ms, "the earliest, read second");
+        assert_eq!(r.end_ms, at(3_000).wall_ms);
+    }
+
+    /// A record the full queue drops is counted dropped, not also as
+    /// exported.
+    #[test]
+    fn a_record_the_queue_drops_is_not_counted_exported() {
+        let mut c = FlowCache::new(Limits {
+            entries: 1,
+            ..Limits::default()
+        });
+        // The queue holds two: the rate, then the first eviction.
+        for port in 1..=3 {
+            ingest(&mut c, Domain::FastPath, &[sampled(port, 1000)], at(0));
+        }
+        assert_eq!((c.counts.evicted_full, c.counts.queue_dropped), (1, 1));
+        assert_eq!(records(&c.take(Domain::FastPath, 10)).len(), 1);
+        c.expire(at(15_000), 100);
+        assert_eq!(c.counts.expired_inactive, 1, "room again");
+    }
+
+    /// A reload that lowers `entries` evicts the excess a budget at a
+    /// time, oldest first; a new flow meanwhile makes room for itself
+    /// alone.
+    #[test]
+    fn a_lowered_limit_is_reached_a_budget_at_a_time() {
+        let mut c = FlowCache::new(Limits::default());
+        let batch: Vec<Sampled> = (0..10).map(|p| sampled(p, 1000)).collect();
+        for (i, s) in batch.iter().enumerate() {
+            ingest(&mut c, Domain::FastPath, &[*s], at(i as u64));
+        }
+        c.set_limits(Limits {
+            entries: 4,
+            ..Limits::default()
+        });
+        ingest(&mut c, Domain::FastPath, &[sampled(99, 1000)], at(20));
+        assert_eq!((c.active(), c.counts.evicted_full), (10, 1));
+        c.expire(at(21), 3);
+        assert_eq!((c.active(), c.counts.evicted_full), (7, 4));
+        c.expire(at(22), 100);
+        assert_eq!((c.active(), c.counts.evicted_full), (4, 7));
+        let out = c.take(Domain::FastPath, 100);
+        let ports: Vec<u16> = records(&out).iter().map(|r| r.dst_port).collect();
+        assert_eq!(ports, (0..7).collect::<Vec<u16>>(), "oldest first");
+    }
+
+    /// One domain's backlog of timeouts cannot hold back another's.
+    #[test]
+    fn expiry_takes_the_domains_turn_about() {
+        let mut c = FlowCache::new(Limits::default());
+        for domain in [Domain::FastPath, Domain::Vpp] {
+            let batch: Vec<Sampled> = (0..3).map(|p| sampled(p, 1000)).collect();
+            ingest(&mut c, domain, &batch, at(0));
+        }
+        let records_of = |c: &mut FlowCache, d| records(&c.take(d, 10)).len();
+        c.expire(at(15_000), 2);
+        assert_eq!(records_of(&mut c, Domain::FastPath), 2);
+        c.expire(at(15_000), 2);
+        assert_eq!(
+            records_of(&mut c, Domain::Vpp),
+            2,
+            "VPP first, though fast-path has one left"
+        );
     }
 }

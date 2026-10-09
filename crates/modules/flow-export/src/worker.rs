@@ -26,7 +26,7 @@ use packetframe_fast_path::sample::{self, Disposition, SampleCfg};
 use packetframe_sampler_shm::coverage::Coverage;
 
 use crate::cfg::FlowExportConfig;
-use crate::collector::{reconcile, send_all, CollectorState, Transport};
+use crate::collector::{reconcile, send_all, send_until, CollectorState, Transport};
 use crate::coverage::{PortCoverage, State, Window, WINDOW};
 use crate::flows::{self, Domain, FlowCache, Now, Sampled};
 use crate::ipfix_out::IpfixOut;
@@ -43,6 +43,13 @@ pub const PORTS_EVERY: Duration = Duration::from_secs(1);
 pub const VPP_STARTUP_GRACE: Duration = Duration::from_secs(60);
 /// Flows the cache exports for a timeout in one tick, at most.
 pub const EXPIRE_BUDGET: usize = 4096;
+/// A sample is dated at most this far back. Further is no backlog (the
+/// worker counts as stalled after a second), but a step of the wall clock
+/// VPP's sample times are on, which must not date flows far back.
+pub const MAX_SAMPLE_AGE: Duration = Duration::from_secs(10);
+/// What stopping spends sending the flows still counting, within the
+/// second a module's detach has: the samplers are stopped after it.
+pub const STOP_FLUSH_WITHIN: Duration = Duration::from_millis(500);
 
 /// The path a port's samples come by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -91,6 +98,9 @@ pub trait SampleSource {
     /// The programs' cumulative count of samples they could not output
     /// (STATS `sample_emit_failed`), when it can be read.
     fn emit_failed(&mut self) -> Option<u64>;
+    /// The clock the events' `ktime_ns` is on (`bpf_ktime_get_ns`:
+    /// CLOCK_MONOTONIC), read now.
+    fn clock_ns(&self) -> u64;
 }
 
 /// What replacing the rings left: the events the old ones held, and the
@@ -518,10 +528,14 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
                 rate: r.rate,
                 input_if: r.source_if,
                 output_if: r.output_if,
+                at: Now {
+                    ms: at.ms.saturating_sub(r.age_ms),
+                    wall_ms: at.wall_ms.saturating_sub(r.age_ms),
+                },
             });
         }
         for (domain, batch) in &batches {
-            cache.ingest(*domain, batch, at);
+            cache.ingest(*domain, batch);
         }
         cache.expire(at, EXPIRE_BUDGET);
         let mut messages = Vec::new();
@@ -538,28 +552,37 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
 
     /// Stop sampling: fast-path's programs (rate 0) and VPP's plugin (its
     /// `desired.conf` removed), each tried whatever became of the other.
-    /// The flows still counting go to the IPFIX collectors first, within
-    /// one send budget.
+    /// The flows still counting go to the IPFIX collectors first, past the
+    /// per-tick send budget, for up to [`STOP_FLUSH_WITHIN`]: a tick's
+    /// worth of records at a time, so a full cache is never encoded at
+    /// once.
     pub fn stop(&mut self) -> Result<(), String> {
         if let Some((cache, out)) = &mut self.flows {
             let now = Instant::now();
+            let deadline = now + STOP_FLUSH_WITHIN;
             let ms = now.saturating_duration_since(self.shared.epoch).as_millis() as u64;
+            let export_s = ((self.wall_epoch_ms + ms) / 1000) as u32;
             cache.drain();
-            let mut messages = Vec::new();
-            out.encode_up_to(
-                cache,
-                now,
-                ((self.wall_epoch_ms + ms) / 1000) as u32,
-                &mut messages,
-                usize::MAX,
-            );
-            send_all(
-                &self.transport,
-                &mut self.collectors,
-                CollectorFormat::Ipfix,
-                &messages,
-                now,
-            );
+            let mut unsent = 0;
+            while !cache.pending().is_empty() && Instant::now() < deadline {
+                let mut messages = Vec::new();
+                out.encode(cache, now, export_s, &mut messages);
+                unsent += send_until(
+                    &self.transport,
+                    &mut self.collectors,
+                    CollectorFormat::Ipfix,
+                    &messages,
+                    deadline,
+                );
+            }
+            let unencoded = cache.queued();
+            if unsent > 0 || unencoded > 0 {
+                tracing::warn!(
+                    unsent_messages = unsent,
+                    unencoded_records = unencoded,
+                    "flow-export: stopping ran out of time to send every flow still counting"
+                );
+            }
         }
         let fast = self.source.configure(SampleCfg::new(
             0,
@@ -691,14 +714,15 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
     fn take_samples(&mut self) -> Vec<Ready> {
         let mut ready = Vec::new();
         let left = std::mem::take(&mut self.leftover);
+        let clock = self.source.clock_ns();
         let (sources, p, pending) = (&mut self.sources, &mut self.p, &mut self.pending_drops);
         for e in &left.events {
-            ingest(e, sources, p, pending, &mut ready);
+            ingest(e, clock, sources, p, pending, &mut ready);
         }
         let ring_lost = left.lost
             + self
                 .source
-                .drain(&mut |e| ingest(e, sources, p, pending, &mut ready));
+                .drain(&mut |e| ingest(e, clock, sources, p, pending, &mut ready));
         self.p.ring_lost_total += ring_lost;
         // The programs' own count covers both a full ring and a CPU with
         // none; the rings' count is a full ring only, and the same
@@ -761,6 +785,7 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
                 header: s.header,
                 path: Path::Vpp,
                 generation: s.generation,
+                age_ms: age_ms(t.now_realtime_ns, s.time_ns),
             });
         }
     }
@@ -914,10 +939,18 @@ fn held_to(lane: &State, vpp: Option<&VppHealth>, vpp_name: Option<&str>) -> Sta
     }
 }
 
+/// How long before `now_ns` a sample taken at `at_ns` on the same clock
+/// was, in milliseconds, within [`MAX_SAMPLE_AGE`].
+fn age_ms(now_ns: u64, at_ns: u64) -> u64 {
+    let age = Duration::from_nanos(now_ns.saturating_sub(at_ns)).min(MAX_SAMPLE_AGE);
+    age.as_millis() as u64
+}
+
 /// One fast-path sample event: its port's sequence, drops and window, and
-/// the sample as sFlow will carry it.
+/// the sample as sFlow will carry it. `clock_ns`: the programs' clock now.
 fn ingest(
     event: &[u8],
+    clock_ns: u64,
     sources: &mut BTreeMap<u32, Source>,
     p: &mut Published,
     pending: &mut u32,
@@ -960,6 +993,7 @@ fn ingest(
         header,
         path,
         generation: u64::from(s.generation),
+        age_ms: age_ms(clock_ns, s.ktime_ns),
     });
 }
 
@@ -1032,6 +1066,8 @@ mod tests {
         held: Rc<RefCell<Vec<Vec<u8>>>>,
         /// The next drain panics.
         panics: Rc<RefCell<bool>>,
+        /// The programs' clock; the events are sampled at 7 ns.
+        clock_ns: Rc<RefCell<u64>>,
     }
 
     impl SampleSource for FakeSource {
@@ -1061,6 +1097,9 @@ mod tests {
         }
         fn emit_failed(&mut self) -> Option<u64> {
             *self.emit_failed.borrow()
+        }
+        fn clock_ns(&self) -> u64 {
+            *self.clock_ns.borrow()
         }
     }
 
@@ -1181,6 +1220,7 @@ mod tests {
                 capacity_fails: src.capacity_fails.clone(),
                 held: src.held.clone(),
                 panics: src.panics.clone(),
+                clock_ns: src.clock_ns.clone(),
             },
             FakePorts {
                 list: ports.list.clone(),
@@ -1676,6 +1716,70 @@ mod tests {
         r.w.stop().unwrap();
         let sent = r.net.sent.borrow();
         assert_eq!(sent.last().unwrap().0.port(), 4739, "{sent:?}");
+    }
+
+    /// More flows than one tick's send budget carries all go out at a
+    /// stop: none is dropped by the budget as the worker exits.
+    #[test]
+    fn stopping_sends_every_flow_past_the_send_budget() {
+        let mut r = rig(1000);
+        let _ = reload(&r.shared, with_ipfix(cfg(1000)));
+        r.w.tick(r.t0);
+        let flows = 20_000u16;
+        r.src
+            .events
+            .borrow_mut()
+            .extend((0..flows).map(|port| ip_event(3, port, 1000, 1)));
+        r.w.tick(r.t0 + TICK);
+        assert_eq!(
+            r.shared.snapshot().flows.unwrap().active,
+            usize::from(flows)
+        );
+        r.w.stop().unwrap();
+        let ipfix = r
+            .net
+            .sent
+            .borrow()
+            .iter()
+            .filter(|(to, _)| to.port() == 4739)
+            .count();
+        assert!(ipfix > crate::collector::SEND_BUDGET, "{ipfix} messages");
+        let (_, out) = r.w.flows.as_ref().unwrap();
+        assert_eq!(out.records, u64::from(flows));
+        assert_eq!(r.w.collectors[1].datagrams, ipfix as u64);
+        assert_eq!(r.w.collectors[1].budget_drops, 0);
+    }
+
+    /// A sample the worker reads late counts at the time it was taken:
+    /// its flow times out from then.
+    #[test]
+    fn a_late_read_sample_keeps_its_time() {
+        let mut r = rig(1000);
+        let _ = reload(&r.shared, with_ipfix(cfg(1000)));
+        r.w.tick(r.t0);
+        // Read 3 s after the program took it (at 7 ns).
+        *r.src.clock_ns.borrow_mut() = 7 + 3_000_000_000;
+        r.src
+            .events
+            .borrow_mut()
+            .push_back(ip_event(3, 443, 1000, 1));
+        r.w.tick(r.t0 + Duration::from_secs(10));
+        let ipfix = |r: &Rig| {
+            r.net
+                .sent
+                .borrow()
+                .iter()
+                .filter(|(to, _)| to.port() == 4739)
+                .count()
+        };
+        r.w.tick(r.t0 + Duration::from_millis(21_900));
+        assert_eq!(ipfix(&r), 0, "idle 14.9 s since it was taken");
+        r.w.tick(r.t0 + Duration::from_secs(22));
+        assert_eq!(
+            ipfix(&r),
+            1,
+            "15 s after it was taken, not after it was read"
+        );
     }
 
     #[test]

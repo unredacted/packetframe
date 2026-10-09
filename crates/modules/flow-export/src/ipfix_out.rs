@@ -43,6 +43,9 @@ pub struct IpfixOut {
     v4: Vec<Field>,
     v6: Vec<Field>,
     domains: BTreeMap<Domain, DomainOut>,
+    /// Which pending domain a tick's budget goes to first, turn about: a
+    /// domain with a standing backlog cannot starve the others.
+    turn: usize,
     pub announcements: u64,
     pub records: u64,
     /// Records no message could hold (none, at these sizes).
@@ -61,6 +64,7 @@ impl IpfixOut {
             v4: flow_fields(Family::V4, Profile::Full, SamplingSignal::Options),
             v6: flow_fields(Family::V6, Profile::Full, SamplingSignal::Options),
             domains: BTreeMap::new(),
+            turn: 0,
             announcements: 0,
             records: 0,
             unencodable: 0,
@@ -96,7 +100,13 @@ impl IpfixOut {
         out: &mut Vec<Vec<u8>>,
         mut left: usize,
     ) {
-        for domain in cache.pending() {
+        let mut pending = cache.pending();
+        if !pending.is_empty() {
+            let n = pending.len();
+            pending.rotate_left(self.turn % n);
+            self.turn = self.turn.wrapping_add(1);
+        }
+        for domain in pending {
             if left == 0 {
                 break;
             }
@@ -238,7 +248,14 @@ mod tests {
             rate,
             input_if: 3,
             output_if: 5,
+            at: at(0),
         }
+    }
+
+    /// `batch`, every sample observed at `now`.
+    fn ingest(c: &mut FlowCache, domain: Domain, batch: &[Sampled], now: Now) {
+        let batch: Vec<Sampled> = batch.iter().map(|s| Sampled { at: now, ..*s }).collect();
+        c.ingest(domain, &batch);
     }
 
     fn word16(d: &[u8], at: usize) -> u16 {
@@ -281,7 +298,8 @@ mod tests {
         let mut cache = FlowCache::new(Limits::default());
         let mut x = IpfixOut::new();
         let t0 = Instant::now();
-        cache.ingest(
+        ingest(
+            &mut cache,
             Domain::FastPath,
             &[
                 sampled("198.51.100.2", 443, 1000, 1),
@@ -309,8 +327,18 @@ mod tests {
         let mut cache = FlowCache::new(Limits::default());
         let mut x = IpfixOut::new();
         let t0 = Instant::now();
-        cache.ingest(Domain::Vpp, &[sampled("198.51.100.2", 1, 1000, 1)], at(0));
-        cache.ingest(Domain::Vpp, &[sampled("198.51.100.2", 2, 100, 2)], at(100));
+        ingest(
+            &mut cache,
+            Domain::Vpp,
+            &[sampled("198.51.100.2", 1, 1000, 1)],
+            at(0),
+        );
+        ingest(
+            &mut cache,
+            Domain::Vpp,
+            &[sampled("198.51.100.2", 2, 100, 2)],
+            at(100),
+        );
         cache.expire(at(15_100), 100);
         let mut out = Vec::new();
         x.encode(&mut cache, t0, 0, &mut out);
@@ -330,7 +358,8 @@ mod tests {
         let mut x = IpfixOut::new();
         let t0 = Instant::now();
         let mut tick = |x: &mut IpfixOut, ms: u64, port: u16| {
-            cache.ingest(
+            ingest(
+                &mut cache,
                 Domain::FastPath,
                 &[sampled("198.51.100.2", port, 1000, 1)],
                 at(ms),
@@ -355,12 +384,39 @@ mod tests {
         let batch: Vec<Sampled> = (0..500)
             .map(|p| sampled("198.51.100.2", p, 1000, 1))
             .collect();
-        cache.ingest(Domain::FastPath, &batch, at(0));
+        ingest(&mut cache, Domain::FastPath, &batch, at(0));
         cache.expire(at(15_000), 1000);
         let mut out = Vec::new();
         x.encode(&mut cache, Instant::now(), 0, &mut out);
         assert!(out.len() > 1);
         assert!(out.iter().all(|d| d.len() <= MAX_DATAGRAM));
         assert_eq!(x.records, 500);
+    }
+
+    /// A domain with a standing backlog takes a tick's whole budget only
+    /// every other tick: the other domain goes first in between.
+    #[test]
+    fn domains_take_the_budget_turn_about() {
+        let mut cache = FlowCache::new(Limits::default());
+        let mut x = IpfixOut::new();
+        for domain in [Domain::FastPath, Domain::Vpp] {
+            let batch: Vec<Sampled> = (0..4)
+                .map(|p| sampled("198.51.100.2", p, 1000, 1))
+                .collect();
+            ingest(&mut cache, domain, &batch, at(0));
+        }
+        cache.expire(at(15_000), 100);
+        let domains = |x: &mut IpfixOut, cache: &mut FlowCache| {
+            let mut out = Vec::new();
+            x.encode_up_to(cache, Instant::now(), 0, &mut out, 2);
+            out.iter().map(|d| word32(d, 12)).collect::<Vec<_>>()
+        };
+        assert_eq!(domains(&mut x, &mut cache), vec![Domain::FastPath.id()]);
+        assert_eq!(
+            domains(&mut x, &mut cache),
+            vec![Domain::Vpp.id()],
+            "VPP first this time, though fast-path still has records"
+        );
+        assert_eq!(domains(&mut x, &mut cache), vec![Domain::FastPath.id()]);
     }
 }

@@ -107,6 +107,46 @@ pub fn send_all(
     }
 }
 
+/// Send every datagram to each collector of `format`, without the
+/// per-tick budget: the export is stopping, and what it holds goes now or
+/// not at all. A full socket buffer is waited out until `deadline`. The
+/// datagrams not sent to some collector by then are returned, and not
+/// tried.
+pub fn send_until(
+    t: &dyn Transport,
+    collectors: &mut [CollectorState],
+    format: CollectorFormat,
+    datagrams: &[Vec<u8>],
+    deadline: Instant,
+) -> usize {
+    for (i, d) in datagrams.iter().enumerate() {
+        for c in collectors.iter_mut().filter(|c| c.cfg.format == format) {
+            loop {
+                let now = Instant::now();
+                match t.send_to(d, c.cfg.addr) {
+                    Ok(_) => {
+                        c.datagrams += 1;
+                        c.last_ok = Some(now);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock && now < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(e) => {
+                        c.send_errors += 1;
+                        c.last_error = Some((now, e.to_string()));
+                    }
+                }
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            return datagrams.len() - i - 1;
+        }
+    }
+    0
+}
+
 /// Carry each collector's counters across a reload that keeps it (same
 /// name, address and kind); a new or changed one starts from zero.
 pub fn reconcile(old: Vec<CollectorState>, new: &[Collector]) -> Vec<CollectorState> {
@@ -174,6 +214,49 @@ mod tests {
         assert!(cs[0].failing(now).is_none());
         assert!(cs[1].failing(now).unwrap().contains("unreachable"));
         assert!(cs[1].failing(now + FAILING_FOR).is_none(), "old news");
+    }
+
+    /// A socket whose buffer is full for the first `blocked` sends.
+    struct Busy {
+        blocked: std::cell::Cell<u32>,
+        sent: std::cell::Cell<usize>,
+    }
+
+    impl Transport for Busy {
+        fn send_to(&self, buf: &[u8], _: SocketAddr) -> io::Result<usize> {
+            if self.blocked.get() > 0 {
+                self.blocked.set(self.blocked.get() - 1);
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.sent.set(self.sent.get() + 1);
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn stopping_sends_past_the_budget_and_waits_out_a_full_buffer() {
+        let mut cs = vec![CollectorState::new(c("a", 1))];
+        let burst = vec![vec![0u8; 1]; SEND_BUDGET + 7];
+        let t = Busy {
+            blocked: 3.into(),
+            sent: 0.into(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            send_until(&t, &mut cs, CollectorFormat::Sflow, &burst, deadline),
+            0
+        );
+        assert_eq!(t.sent.get(), burst.len());
+        assert_eq!(cs[0].send_errors, 0, "a full buffer waited out is no error");
+
+        // A buffer that stays full: the deadline ends the wait.
+        let t = Busy {
+            blocked: u32::MAX.into(),
+            sent: 0.into(),
+        };
+        let unsent = send_until(&t, &mut cs, CollectorFormat::Sflow, &burst, Instant::now());
+        assert_eq!(unsent, burst.len() - 1);
+        assert_eq!(cs[0].send_errors, 1);
     }
 
     #[test]
