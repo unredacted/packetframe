@@ -86,9 +86,10 @@ collector it is a new device.
     --default-speed 1000 > /tmp/akvorado-static.yaml
   ```
 
-  - The output lists every port flow export samples, and every interface
-    fast-path can redirect to: a redirected sample names its egress
-    interface as its output.
+  - The output lists every port flow export samples (fast-path's, VPP's
+    and the `kernel-sample` interfaces), and every interface fast-path
+    can redirect to: a redirected sample names its egress interface as
+    its output.
   - Akvorado requires a speed for each interface. Where the kernel
     reports none (a link that is down, many virtual ones), pass
     `--speed <iface>=<Mbps>` or `--default-speed`.
@@ -123,8 +124,14 @@ collector it is a new device.
   The XDP numbers on hardware are owed.
 - **A rate change is a reload,** and the samples carry the rate and
   generation they were drawn at, so nothing in flight is mislabelled.
-  - fast-path's sampler takes the change before the SIGHUP returns. A
-    change it cannot apply fails the reload and changes nothing.
+  - `packetframe reconfigure` returns once fast-path's sampler, and the
+    kernel sampler's, run the new values. A change either cannot take
+    fails the reload and leaves both as they were.
+  - `systemctl reload` only sends the SIGHUP and doesn't wait. Before
+    acting on the new rate, read the `sampling` row, which names the
+    generation that runs.
+  - A worker too busy to answer within a second fails the reload,
+    though it may have taken it: the `sampling` row says which.
   - VPP's plugin takes it from the next `desired.conf`, and the `vpp`
     row reads Degraded until it has.
   - IPFIX exports every flow counted at the old rate before it
@@ -163,11 +170,14 @@ degraded, 0 uncovered.
 
 Two more rules sit over those:
 
-- **VPP ports answer to the plugin.** Whatever its own samples show, a
-  VPP port is degraded while the plugin is, and uncovered while the
-  plugin is unavailable, disabled or incompatible, or its interface is
-  missing from VPP. The `vpp` row reads the plugin's state even while
-  its ports are starting.
+- **VPP ports answer to the plugin, after their grace.** Past its 60 s
+  startup grace, whatever its own samples show, a VPP port is degraded
+  while the plugin is, and uncovered while the plugin is unavailable,
+  disabled or incompatible, or its interface is missing from VPP.
+  During the grace the port and its gauge read starting, whatever the
+  plugin's state, since VPP's interfaces appear after it starts. The
+  `vpp` row reads the plugin's state throughout: it is what to watch
+  in the first minute.
 - **A stalled worker uncovers everything.** If the worker hasn't ticked
   for over 1 s, or it panicked, every port reads uncovered and the
   coverage gauges read 0.

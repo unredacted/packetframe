@@ -46,7 +46,7 @@ These directives can be added, removed, or changed under SIGHUP without re-attac
 | vpp-offload `steer`, per-port `direction`, `steer-direction`, `steer-exempt`, `v6-divert`, `steer-keep6` | NIC ntuple (MCAM) rules | applied as a steering reconcile, with no VPP restart and no resync; `packetframe reconfigure` reports whether the change took effect, was refused, or was withdrawn (see [vpp-offload.md](vpp-offload.md), "The canary ladder") |
 | vpp-offload `drift-accept6` | (none — drift-scan state) | applied at the next drift scan |
 | guard class rules (`arp-ns-ratelimit`, `bcast-mcast-ratelimit`, `lldp`, `foreign-src`: rates, burst, monitor↔enforce) | `GUARD_CFG` | no reattach; the module is experimental (see [guard.md](guard.md)) |
-| flow-export `sample-rate`, `header-bytes`, `collector`, `privacy-local-prefix`, `flow-cache` | `SAMPLE_CFG`, `KSAMPLE_CFG`; VPP's `desired.conf` | the reload returns once the export worker runs the new values, and fails, changing nothing, if it cannot. VPP's plugin follows from its next `desired.conf` (see [flow-export.md](flow-export.md#rate-and-cost)) |
+| flow-export `sample-rate`, `header-bytes`, `collector`, `privacy-local-prefix`, `flow-cache` | `SAMPLE_CFG`, `KSAMPLE_CFG`; VPP's `desired.conf` | `packetframe reconfigure` returns once the export worker runs the new values, fast-path's and the kernel sampler's both or neither, and fails, changing nothing, if it cannot; `systemctl reload` doesn't wait for that. VPP's plugin follows from its next `desired.conf` (see [flow-export.md](flow-export.md#rate-and-cost)) |
 
 `log-level` is the one entry here that touches no BPF map: it swaps the
 daemon's tracing filter in place. Raising to `debug` to watch a canary
