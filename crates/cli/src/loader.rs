@@ -329,6 +329,16 @@ mod degrade_policy_tests {
     /// on this list, because it is the fallback — a fast-path that
     /// failed to attach and a daemon that kept running would report a
     /// forwarding box that forwards nothing.
+    /// flow-export reads VPP's sampler where vpp-offload prepares it.
+    #[cfg(all(feature = "vpp-offload", feature = "flow-export"))]
+    #[test]
+    fn both_modules_name_one_sampler_directory() {
+        assert_eq!(
+            packetframe_vpp_offload::acquire::SAMPLER_DIR,
+            packetframe_flow_export::VPP_SAMPLER_DIR
+        );
+    }
+
     #[test]
     fn only_the_second_tier_degrades() {
         assert!(DEGRADE_ON_START_FAILURE.contains(&"vpp-offload"));
@@ -448,7 +458,10 @@ fn release_persisted(name: &str, state_dir: &Path, bpffs_root: &Path) -> Result<
         #[cfg(feature = "vpp-offload")]
         "vpp-offload" => detach_vpp_offload(state_dir),
         #[cfg(feature = "flow-export")]
-        "flow-export" => packetframe_flow_export::release_sampler(bpffs_root),
+        "flow-export" => packetframe_flow_export::release_sampler(
+            bpffs_root,
+            Some(Path::new(packetframe_flow_export::VPP_SAMPLER_DIR)),
+        ),
         other => {
             let _ = (state_dir, bpffs_root);
             Err(format!(
@@ -541,6 +554,10 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
     let ix_ifaces = crate::feasibility::neigh_snoop_ix_ifaces_from_config(&config);
 
     let mut modules: Vec<(String, Box<dyn Module>)> = Vec::new();
+    // vpp-offload's per-process port snapshots, for flow-export to read
+    // VPP's samples through: `validate_flow_export` put vpp-offload first.
+    #[cfg(all(feature = "vpp-offload", feature = "flow-export"))]
+    let mut vpp_sampler_ports = None;
     for section in &config.modules {
         match section.name.as_str() {
             "fast-path" => {
@@ -591,6 +608,10 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 if let Some(h) = &feed_session {
                     m.set_feed_session(h.clone());
                 }
+                #[cfg(feature = "flow-export")]
+                {
+                    vpp_sampler_ports = Some(m.sampler_ports());
+                }
                 modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
             #[cfg(feature = "guard")]
@@ -615,11 +636,18 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
             #[cfg(feature = "flow-export")]
             "flow-export" => {
                 // Reads fast-path's pinned sampler maps and port registry
-                // at attach: `validate_flow_export` put fast-path first.
-                modules.push((
-                    section.name.clone(),
-                    Box::new(packetframe_flow_export::FlowExportModule::new()) as Box<dyn Module>,
-                ));
+                // at attach, and VPP's sampler through what vpp-offload
+                // prepared at its: `validate_flow_export` put both first.
+                #[allow(unused_mut)]
+                let mut m = packetframe_flow_export::FlowExportModule::new();
+                #[cfg(feature = "vpp-offload")]
+                if let Some(h) = &vpp_sampler_ports {
+                    m.set_vpp(
+                        h.clone(),
+                        PathBuf::from(packetframe_flow_export::VPP_SAMPLER_DIR),
+                    );
+                }
+                modules.push((section.name.clone(), Box::new(m) as Box<dyn Module>));
             }
             other => {
                 return Err(RunError::Startup(format!(
@@ -2081,13 +2109,17 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     }
     #[cfg(not(feature = "guard"))]
     let _ = config_has_guard;
-    // flow-export holds nothing of its own: its sampler configuration is
-    // fast-path's map, zeroed here so no program keeps selecting packets
-    // for a reader that is gone (a fast-path teardown above removes it
-    // outright).
+    // flow-export holds nothing of its own: its sampler configurations
+    // are fast-path's map, zeroed here so no program keeps selecting
+    // packets for a reader that is gone (a fast-path teardown above
+    // removes it outright), and VPP's `desired.conf`, removed so the
+    // plugin stops (an unmount of the sampler directory takes it too).
     #[cfg(feature = "flow-export")]
     if all || config_has_flow_export {
-        if let Err(e) = packetframe_flow_export::release_sampler(&bpffs_root) {
+        if let Err(e) = packetframe_flow_export::release_sampler(
+            &bpffs_root,
+            Some(Path::new(packetframe_flow_export::VPP_SAMPLER_DIR)),
+        ) {
             errors.push(format!("flow-export: {e}"));
         }
     }

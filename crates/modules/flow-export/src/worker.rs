@@ -3,37 +3,55 @@
 //! datagrams, coverage, and the snapshot health and metrics read.
 //!
 //! Every outside effect goes through a trait ([`SampleSource`], [`Ports`],
-//! [`Transport`]), so the loop runs the same against fakes in the tests as
-//! against the fast-path maps, sysfs and a socket on a router.
+//! [`Transport`], [`VppDir`]), so the loop runs the same against fakes in
+//! the tests as against the fast-path maps, sysfs, VPP's sampler
+//! directory and a socket on a router.
+//!
+//! Each port is one sFlow data source, whichever paths sample it: one
+//! sequence, and one pool counting what every path could have sampled
+//! (rx_packets for its XDP or tc program, VPP's own count for the VPP
+//! path, disjoint because steered ingress never reaches the kernel's
+//! counter). Coverage is judged per path, a *lane*.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use packetframe_fast_path::sample::{self, Disposition, SampleCfg};
+use packetframe_sampler_shm::coverage::Coverage;
 
 use crate::cfg::FlowExportConfig;
 use crate::collector::{reconcile, send_all, CollectorState, Transport};
 use crate::coverage::{PortCoverage, State, Window, WINDOW};
 use crate::pool::Accumulator;
-use crate::sflow_out::{wire_frame, Exporter, Ready};
+use crate::sflow_out::{wire_frame, Exporter, Ready, FCS};
+use crate::vpp::{NoVpp, Taken, VppDir, VppHealth, VppSide};
 
 pub const TICK: Duration = Duration::from_millis(100);
 /// How often the port list and the pools are re-read.
 pub const PORTS_EVERY: Duration = Duration::from_secs(1);
+/// A VPP lane's startup grace: its interfaces appear only once VPP is up
+/// and vpp-offload has attached them.
+pub const VPP_STARTUP_GRACE: Duration = Duration::from_secs(60);
 
+/// The path a port's samples come by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Hook {
+pub enum Path {
     Xdp,
     Tc,
+    Vpp,
 }
 
-impl Hook {
+impl Path {
+    pub const ALL: [Path; 3] = [Path::Xdp, Path::Tc, Path::Vpp];
+
     pub fn name(self) -> &'static str {
         match self {
-            Hook::Xdp => "xdp",
-            Hook::Tc => "tc",
+            Path::Xdp => "xdp",
+            Path::Tc => "tc",
+            Path::Vpp => "vpp",
         }
     }
 }
@@ -43,7 +61,7 @@ impl Hook {
 pub struct Port {
     pub name: String,
     pub ifindex: u32,
-    pub hook: Hook,
+    pub path: Path,
 }
 
 /// fast-path's sampler: its configuration map and its rings.
@@ -101,14 +119,19 @@ pub struct Published {
     pub generation: u32,
     pub over_budget: bool,
     pub expanded: bool,
+    /// One per port and path.
     pub ports: Vec<PortReport>,
     pub collectors: Vec<CollectorReport>,
-    pub samples_total: u64,
-    /// Samples the programs could not output, or the rings reported lost
-    /// when that count cannot be read.
+    /// Samples exported, by path.
+    pub samples_total: BTreeMap<Path, u64>,
+    /// Samples fast-path's programs could not output, or its rings
+    /// reported lost when that count cannot be read.
     pub lost_total: u64,
     pub ring_lost_total: u64,
-    /// Samples from an interface not among fast-path's ports.
+    /// Samples lost on the way from VPP's plugin: its rings full or
+    /// unreadable, or left in an epoch that ended.
+    pub vpp_lost_total: u64,
+    /// Samples from an interface no port stands for.
     pub unmapped_total: u64,
     pub undecodable_total: u64,
     pub unencodable_total: u64,
@@ -117,15 +140,18 @@ pub struct Published {
     pub source_error: Option<String>,
     /// Why the port list could not be read, if so.
     pub ports_error: Option<String>,
+    /// VPP's sampler, when vpp-offload is configured.
+    pub vpp: Option<VppHealth>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PortReport {
     pub name: String,
     pub ifindex: u32,
-    pub hook: Hook,
+    pub path: Path,
     pub state: State,
     pub samples: u64,
+    /// What this path could have sampled on the port.
     pub pool: u64,
 }
 
@@ -140,14 +166,16 @@ pub struct CollectorReport {
     pub failing: Option<String>,
 }
 
-/// The handles the module keeps: a reload to apply, the snapshot, and
-/// the heartbeat (milliseconds since `epoch`).
+/// The handles the module keeps: a reload to apply, the snapshot, the
+/// heartbeat (milliseconds since `epoch`), and why the worker panicked,
+/// if it did.
 #[derive(Clone)]
 pub struct Shared {
     pub epoch: Instant,
     pub heartbeat_ms: Arc<AtomicU64>,
     pub published: Arc<Mutex<Published>>,
     pub reload: Arc<Mutex<Option<Reload>>>,
+    pub panicked: Arc<Mutex<Option<String>>>,
 }
 
 impl Shared {
@@ -157,6 +185,7 @@ impl Shared {
             heartbeat_ms: Arc::new(AtomicU64::new(0)),
             published: Arc::default(),
             reload: Arc::default(),
+            panicked: Arc::default(),
         }
     }
 
@@ -200,41 +229,95 @@ impl Shared {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+
+    /// Why the worker panicked, if it did.
+    pub fn panicked(&self) -> Option<String> {
+        self.panicked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
+/// A port as sFlow's data source.
 struct Source {
-    port: Port,
+    name: String,
     sequence: u32,
     drops: u32,
-    pool: Accumulator,
+    /// Its kernel `rx_packets`, read while a fast-path program is on it.
+    kernel: Accumulator,
+    /// What VPP's sampler counted on it.
+    vpp: u64,
+    lanes: BTreeMap<Path, Lane>,
+}
+
+impl Source {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            sequence: 0,
+            drops: 0,
+            kernel: Accumulator::default(),
+            vpp: 0,
+            lanes: BTreeMap::new(),
+        }
+    }
+
+    /// The sFlow pool: what every path could have sampled.
+    fn pool(&self) -> u64 {
+        self.kernel.total().wrapping_add(self.vpp)
+    }
+
+    fn lane_pool(&self, path: Path) -> u64 {
+        match path {
+            Path::Vpp => self.vpp,
+            Path::Xdp | Path::Tc => self.kernel.total(),
+        }
+    }
+}
+
+/// A lane a port should have: its path, and VPP's name for the port on
+/// a VPP lane.
+type LaneSpec = (Path, Option<String>);
+
+/// One path on one port: its coverage and its window.
+struct Lane {
     coverage: PortCoverage,
+    /// VPP's name for the port, on a VPP lane.
+    vpp_name: Option<String>,
     window_samples: u64,
-    window_pool: u64,
+    window_base: u64,
     samples: u64,
 }
 
-pub struct Worker<S, P, T> {
+pub struct Worker<S, P, T, V = NoVpp> {
     cfg: FlowExportConfig,
     generation: u32,
     source: S,
     ports: P,
     transport: T,
+    vpp: Option<VppSide<V>>,
     exporter: Exporter,
     collectors: Vec<CollectorState>,
+    /// fast-path's ports, as last read.
+    fast: Vec<Port>,
     sources: BTreeMap<u32, Source>,
     shared: Shared,
     next_ports: Instant,
     next_window: Instant,
     window_lost: u64,
+    vpp_window_lost: u64,
     last_emit_failed: Option<u64>,
-    /// Loss not yet carried by a sample, for the next one's `drops`.
+    /// Loss not yet carried by a sample, for the next one's `drops`: by
+    /// fast-path's programs, and by VPP's plugin.
     pending_drops: u32,
+    vpp_pending_drops: u32,
     /// What the last ring replacement left, for the next tick to export.
     leftover: Leftover,
     p: Published,
 }
 
-impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
+impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T, NoVpp> {
     /// Configure the sampler at generation 1: a failure here fails the
     /// attach.
     pub fn new(
@@ -260,19 +343,51 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
             source,
             ports,
             transport,
+            vpp: None,
             collectors,
+            fast: Vec::new(),
             sources: BTreeMap::new(),
             shared,
             next_ports: now,
             next_window: now + WINDOW,
             window_lost: 0,
+            vpp_window_lost: 0,
             last_emit_failed: None,
             pending_drops: 0,
+            vpp_pending_drops: 0,
             leftover: Leftover::default(),
             p: Published::default(),
         })
     }
 
+    /// Sample VPP's ports too, through its sampler plugin.
+    pub fn with_vpp<W: VppDir>(self, vpp: VppSide<W>) -> Worker<S, P, T, W> {
+        Worker {
+            cfg: self.cfg,
+            generation: self.generation,
+            source: self.source,
+            ports: self.ports,
+            transport: self.transport,
+            vpp: Some(vpp),
+            exporter: self.exporter,
+            collectors: self.collectors,
+            fast: self.fast,
+            sources: self.sources,
+            shared: self.shared,
+            next_ports: self.next_ports,
+            next_window: self.next_window,
+            window_lost: self.window_lost,
+            vpp_window_lost: self.vpp_window_lost,
+            last_emit_failed: self.last_emit_failed,
+            pending_drops: self.pending_drops,
+            vpp_pending_drops: self.vpp_pending_drops,
+            leftover: self.leftover,
+            p: self.p,
+        }
+    }
+}
+
+impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
     pub fn tick(&mut self, now: Instant) {
         let reload = self
             .shared
@@ -283,11 +398,26 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
         if let Some(Reload { cfg, done }) = reload {
             let _ = done.send(self.apply(now, cfg));
         }
-        if now >= self.next_ports {
+        let taken = self
+            .vpp
+            .as_mut()
+            .map(|v| v.tick(now, self.cfg.rate, self.cfg.header_bytes));
+        // A VPP port first seen is a lane at once, not a second later.
+        let new_vpp_port = self.vpp.as_ref().is_some_and(|v| {
+            v.ports().any(|p| {
+                self.sources
+                    .get(&p.ifindex)
+                    .is_none_or(|s| !s.lanes.contains_key(&Path::Vpp))
+            })
+        });
+        if now >= self.next_ports || new_vpp_port {
             self.refresh_ports(now);
             self.next_ports = now + PORTS_EVERY;
         }
-        let ready = self.take_samples();
+        let mut ready = self.take_samples();
+        if let Some(t) = taken {
+            self.take_vpp(t, &mut ready);
+        }
         if !ready.is_empty() {
             let mut datagrams = Vec::new();
             let uptime_ms = now.saturating_duration_since(self.shared.epoch).as_millis() as u32;
@@ -305,18 +435,27 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
         self.shared.heartbeat_ms.store(ms, Ordering::Relaxed);
     }
 
-    /// Stop sampling: rate 0. For detach, after the last tick.
+    /// Stop sampling: fast-path's programs (rate 0) and VPP's plugin (its
+    /// `desired.conf` removed), each tried whatever became of the other.
     pub fn stop(&mut self) -> Result<(), String> {
-        self.source.configure(SampleCfg::new(
+        let fast = self.source.configure(SampleCfg::new(
             0,
             self.cfg.header_bytes,
             self.generation + 1,
-        ))
+        ));
+        let vpp = self.vpp.as_mut().map_or(Ok(()), VppSide::stop);
+        match (fast, vpp) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+            (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+        }
     }
 
     /// Apply a reload, or none of it: on a failure the sampler, the
     /// collectors and what is published stay as they were, so the same
-    /// reload retried is tried again rather than taken as applied.
+    /// reload retried is tried again rather than taken as applied. VPP's
+    /// plugin takes the new rate from the next tick's `desired.conf`, and
+    /// its row says once it has.
     fn apply(&mut self, now: Instant, new: FlowExportConfig) -> Result<(), String> {
         if (new.rate, new.header_bytes) != (self.cfg.rate, self.cfg.header_bytes) {
             let generation = self.generation + 1;
@@ -351,30 +490,60 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
         match self.ports.ports() {
             Ok(list) => {
                 self.p.ports_error = None;
-                self.sources.retain(|i, s| {
-                    list.iter()
-                        .any(|p| p.ifindex == *i && p.name == s.port.name)
-                });
-                for port in list {
-                    self.sources.entry(port.ifindex).or_insert_with(|| Source {
-                        port,
-                        sequence: 0,
-                        drops: 0,
-                        pool: Accumulator::default(),
-                        coverage: PortCoverage::new(now),
-                        window_samples: 0,
-                        window_pool: 0,
-                        samples: 0,
-                    });
-                }
+                self.fast = list;
             }
             // The last list stands: an unreadable registry is not a port
             // that went away.
             Err(e) => self.p.ports_error = Some(e),
         }
-        for s in self.sources.values_mut() {
-            if let Some(rx) = self.ports.rx_packets(&s.port) {
-                s.pool.observe(rx);
+        // Each port's lanes: its fast-path program, and VPP when it is a
+        // VPP member port. A port whose name changed is another port.
+        let mut want: BTreeMap<u32, (String, Vec<LaneSpec>)> = BTreeMap::new();
+        for p in &self.fast {
+            want.entry(p.ifindex)
+                .or_insert_with(|| (p.name.clone(), Vec::new()))
+                .1
+                .push((p.path, None));
+        }
+        if let Some(v) = &self.vpp {
+            for p in v.ports() {
+                want.entry(p.ifindex)
+                    .or_insert_with(|| (p.port.clone(), Vec::new()))
+                    .1
+                    .push((Path::Vpp, Some(p.vpp_name.clone())));
+            }
+        }
+        self.sources
+            .retain(|i, s| want.get(i).is_some_and(|(name, _)| *name == s.name));
+        for (ifindex, (name, lanes)) in want {
+            let s = self
+                .sources
+                .entry(ifindex)
+                .or_insert_with(|| Source::new(name));
+            s.lanes
+                .retain(|path, _| lanes.iter().any(|(p, _)| p == path));
+            for (path, vpp_name) in lanes {
+                let base = s.lane_pool(path);
+                s.lanes.entry(path).or_insert_with(|| Lane {
+                    coverage: PortCoverage::with_grace(
+                        now,
+                        match path {
+                            Path::Vpp => VPP_STARTUP_GRACE,
+                            Path::Xdp | Path::Tc => crate::coverage::STARTUP_GRACE,
+                        },
+                    ),
+                    vpp_name,
+                    window_samples: 0,
+                    window_base: base,
+                    samples: 0,
+                });
+            }
+        }
+        for port in &self.fast {
+            if let Some(rx) = self.ports.rx_packets(port) {
+                if let Some(s) = self.sources.get_mut(&port.ifindex) {
+                    s.kernel.observe(rx);
+                }
             }
         }
     }
@@ -409,22 +578,74 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
         ready
     }
 
+    /// VPP's tick: its pools first, so its samples carry them.
+    fn take_vpp(&mut self, t: Taken, ready: &mut Vec<Ready>) {
+        for (ifindex, n) in t.pools {
+            if let Some(s) = self.sources.get_mut(&ifindex) {
+                s.vpp = s.vpp.wrapping_add(n);
+            }
+        }
+        self.vpp_window_lost += t.lost;
+        self.p.vpp_lost_total += t.lost;
+        self.p.unmapped_total += t.unmapped;
+        self.vpp_pending_drops = self.vpp_pending_drops.wrapping_add(t.lost as u32);
+        for s in t.samples {
+            let Some(src) = self.sources.get_mut(&s.ifindex) else {
+                self.p.unmapped_total += 1;
+                continue;
+            };
+            src.sequence = src.sequence.wrapping_add(1);
+            src.drops = src
+                .drops
+                .wrapping_add(std::mem::take(&mut self.vpp_pending_drops));
+            if let Some(l) = src.lanes.get_mut(&Path::Vpp) {
+                l.window_samples += 1;
+                l.samples += 1;
+            }
+            *self.p.samples_total.entry(Path::Vpp).or_default() += 1;
+            ready.push(Ready {
+                sequence: src.sequence,
+                source_if: s.ifindex,
+                rate: s.rate,
+                pool: src.pool() as u32,
+                drops: src.drops,
+                // VPP's sampler sees ingress; the output is not known.
+                output_if: 0,
+                frame_length: s.frame_len + FCS,
+                header: s.header,
+            });
+        }
+    }
+
     fn judge(&mut self, now: Instant) {
         for s in self.sources.values_mut() {
-            let packets = s.pool.total().saturating_sub(s.window_pool);
-            s.coverage.judge(
-                now,
-                Window {
-                    samples: s.window_samples,
-                    lost: self.window_lost,
-                    packets,
-                    rate: self.cfg.rate,
-                },
-            );
-            s.window_samples = 0;
-            s.window_pool = s.pool.total();
+            let (vpp, kernel) = (s.vpp, s.kernel.total());
+            for (path, lane) in s.lanes.iter_mut() {
+                let pool = match path {
+                    Path::Vpp => vpp,
+                    Path::Xdp | Path::Tc => kernel,
+                };
+                lane.coverage.judge(
+                    now,
+                    Window {
+                        samples: lane.window_samples,
+                        lost: match path {
+                            Path::Vpp => self.vpp_window_lost,
+                            Path::Xdp | Path::Tc => self.window_lost,
+                        },
+                        packets: pool.saturating_sub(lane.window_base),
+                        rate: self.cfg.rate,
+                    },
+                );
+                lane.window_samples = 0;
+                lane.window_base = pool;
+            }
         }
         self.window_lost = 0;
+        self.vpp_window_lost = 0;
+        if let Some(v) = &mut self.vpp {
+            v.end_window();
+        }
     }
 
     fn publish(&mut self, now: Instant) {
@@ -433,18 +654,26 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
         self.p.generation = self.generation;
         self.p.over_budget = self.cfg.over_budget();
         self.p.expanded = self.exporter.expanded();
+        let vpp = self.vpp.as_ref().map(|v| v.health().clone());
         self.p.ports = self
             .sources
-            .values()
-            .map(|s| PortReport {
-                name: s.port.name.clone(),
-                ifindex: s.port.ifindex,
-                hook: s.port.hook,
-                state: s.coverage.state().clone(),
-                samples: s.samples,
-                pool: s.pool.total(),
+            .iter()
+            .flat_map(|(ifindex, s)| {
+                let vpp = vpp.as_ref();
+                s.lanes.iter().map(move |(path, lane)| PortReport {
+                    name: s.name.clone(),
+                    ifindex: *ifindex,
+                    path: *path,
+                    state: match path {
+                        Path::Vpp => held_to(lane.coverage.state(), vpp, lane.vpp_name.as_deref()),
+                        Path::Xdp | Path::Tc => lane.coverage.state().clone(),
+                    },
+                    samples: lane.samples,
+                    pool: s.lane_pool(*path),
+                })
             })
             .collect();
+        self.p.vpp = vpp;
         self.p.collectors = self
             .collectors
             .iter()
@@ -466,8 +695,33 @@ impl<S: SampleSource, P: Ports, T: Transport> Worker<S, P, T> {
     }
 }
 
-/// One sample event: its port's sequence, drops and window, and the
-/// sample as sFlow will carry it.
+/// A VPP lane's state, held to what the plugin as a whole shows: a lane
+/// that saw nothing wrong in its own samples is still uncovered while the
+/// plugin is gone, or its interface missing from VPP.
+fn held_to(lane: &State, vpp: Option<&VppHealth>, vpp_name: Option<&str>) -> State {
+    let Some(h) = vpp else {
+        return lane.clone();
+    };
+    if *lane == State::Starting {
+        return State::Starting;
+    }
+    let held = match h.coverage {
+        Coverage::Healthy | Coverage::ZeroTraffic | Coverage::Partial => vpp_name
+            .filter(|n| h.missing.contains(*n))
+            .map(|n| State::Uncovered(format!("VPP has no interface {n}"))),
+        Coverage::Degraded => Some(State::Degraded(format!("VPP's sampler: {}", h.why))),
+        Coverage::Disabled | Coverage::Unavailable | Coverage::Incompatible => Some(
+            State::Uncovered(format!("VPP's sampler is {}: {}", h.coverage.name(), h.why)),
+        ),
+    };
+    match held {
+        Some(h) if h.level() < lane.level() => h,
+        _ => lane.clone(),
+    }
+}
+
+/// One fast-path sample event: its port's sequence, drops and window, and
+/// the sample as sFlow will carry it.
 fn ingest(
     event: &[u8],
     sources: &mut BTreeMap<u32, Source>,
@@ -486,17 +740,23 @@ fn ingest(
         p.unmapped_total += 1;
         return;
     };
+    let path = match s.path {
+        sample::Path::Xdp => Path::Xdp,
+        sample::Path::Tc => Path::Tc,
+    };
     src.sequence = src.sequence.wrapping_add(1);
     src.drops = src.drops.wrapping_add(std::mem::take(pending));
-    src.window_samples += 1;
-    src.samples += 1;
-    p.samples_total += 1;
+    if let Some(l) = src.lanes.get_mut(&path) {
+        l.window_samples += 1;
+        l.samples += 1;
+    }
+    *p.samples_total.entry(path).or_default() += 1;
     let (header, frame_length) = wire_frame(&s);
     ready.push(Ready {
         sequence: src.sequence,
         source_if: s.ingress_ifindex,
         rate: s.rate,
-        pool: src.pool.total() as u32,
+        pool: src.pool() as u32,
         drops: src.drops,
         output_if: match s.disposition {
             Disposition::Redirect => s.egress_ifindex,
@@ -505,6 +765,50 @@ fn ingest(
         frame_length,
         header,
     });
+}
+
+/// The worker thread's loop: a tick every [`TICK`] until `stop`, then the
+/// samplers stopped. A panic ends it the same way, except that a worker
+/// that panicked is not trusted to stop anything: it is dropped (its
+/// locks and rings with it), `after_panic` stops the samplers from
+/// outside, and the `worker` row says why.
+pub fn run<S, P, T, V>(
+    mut worker: Worker<S, P, T, V>,
+    stop: &AtomicBool,
+    after_panic: impl FnOnce(),
+) where
+    S: SampleSource,
+    P: Ports,
+    T: Transport,
+    V: VppDir,
+{
+    let shared = worker.shared.clone();
+    let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut next = Instant::now();
+        while !stop.load(Ordering::Relaxed) {
+            worker.tick(Instant::now());
+            next += TICK;
+            let now = Instant::now();
+            match next.checked_duration_since(now) {
+                Some(d) => std::thread::sleep(d),
+                None => next = now,
+            }
+        }
+        if let Err(e) = worker.stop() {
+            tracing::warn!(error = %e, "flow-export: stopping the samplers failed");
+        }
+    }));
+    if let Err(payload) = r {
+        let why = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic with no message".into());
+        tracing::error!(panic = %why, "flow-export: the export worker panicked; sampling is stopped");
+        *shared.panicked.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+        drop(worker);
+        after_panic();
+    }
 }
 
 #[cfg(test)]
@@ -528,6 +832,8 @@ mod tests {
         capacity_fails: Rc<RefCell<bool>>,
         /// What the replaced rings held.
         held: Rc<RefCell<Vec<Vec<u8>>>>,
+        /// The next drain panics.
+        panics: Rc<RefCell<bool>>,
     }
 
     impl SampleSource for FakeSource {
@@ -546,6 +852,9 @@ mod tests {
             Ok(())
         }
         fn drain(&mut self, f: &mut dyn FnMut(&[u8])) -> u64 {
+            if *self.panics.borrow() {
+                panic!("ring fault");
+            }
             let mut q = self.events.borrow_mut();
             while let Some(e) = q.pop_front() {
                 f(&e);
@@ -619,8 +928,8 @@ mod tests {
         }
     }
 
-    struct Rig {
-        w: Worker<FakeSource, FakePorts, FakeNet>,
+    struct Rig<V: VppDir = NoVpp> {
+        w: Worker<FakeSource, FakePorts, FakeNet, V>,
         src: FakeSource,
         ports: FakePorts,
         net: FakeNet,
@@ -635,7 +944,7 @@ mod tests {
         ports.list.borrow_mut().push(Port {
             name: "eth0".into(),
             ifindex: 3,
-            hook: Hook::Xdp,
+            path: Path::Xdp,
         });
         ports.rx.borrow_mut().insert(3, 1_000);
         let net = FakeNet::default();
@@ -650,6 +959,7 @@ mod tests {
                 refuse: false,
                 capacity_fails: src.capacity_fails.clone(),
                 held: src.held.clone(),
+                panics: src.panics.clone(),
             },
             FakePorts {
                 list: ports.list.clone(),
@@ -715,7 +1025,7 @@ mod tests {
         assert_eq!(word(d, s + 28), 3, "input");
         assert_eq!(word(d, s + 32), 9, "output: the redirect's egress");
         let p = r.shared.snapshot();
-        assert_eq!((p.samples_total, p.unmapped_total), (2, 1));
+        assert_eq!((p.samples_total[&Path::Xdp], p.unmapped_total), (2, 1));
         assert_eq!(p.ports[0].samples, 2);
         assert_eq!(p.collectors[0].datagrams, 1);
     }
@@ -801,7 +1111,7 @@ mod tests {
         r.src.held.borrow_mut().push(event(3, 0, 0, 1000, 1));
         let _ = reload(&r.shared, cfg(100));
         r.w.tick(r.t0 + TICK);
-        assert_eq!(r.shared.snapshot().samples_total, 1);
+        assert_eq!(r.shared.snapshot().samples_total[&Path::Xdp], 1);
         assert_eq!(r.net.sent.borrow().len(), 1);
     }
 
@@ -868,6 +1178,184 @@ mod tests {
             Instant::now(),
         );
         assert!(r.err().unwrap().contains("EPERM"));
+    }
+
+    use crate::vpp::tests::{applied, instance, rings, sample, FakeDir, Plugin, NOW_NS};
+    use crate::vpp::EpochSwitch;
+    use packetframe_common::sampler_ports::{SampledPort, VppPortsSnapshot, VppSamplerPorts};
+
+    /// `rig` with VPP up as pid 10 on epoch 7: eth0 (also fast-path's) is
+    /// its `octeon0/0`, index 1, and eth9 (VPP's alone) its `octeon1/0`,
+    /// index 2.
+    fn vpp_rig() -> (Rig<FakeDir>, Rc<RefCell<Plugin>>) {
+        let r = rig(1000);
+        let dir = FakeDir::default();
+        let plugin = dir.0.clone();
+        {
+            let mut p = plugin.borrow_mut();
+            p.switch = Some(EpochSwitch {
+                from: None,
+                to: 7,
+                abandoned: 0,
+            });
+            p.epoch = Some(7);
+            p.created_ns = NOW_NS;
+            p.mappers.insert(7, 10);
+            p.rings = rings(&[], 0);
+        }
+        let ports = Arc::new(VppSamplerPorts::new());
+        let port = |port: &str, ifindex, vpp_name: &str, sw_if_index| SampledPort {
+            port: port.into(),
+            ifindex: Some(ifindex),
+            vpp_name: vpp_name.into(),
+            sw_if_index,
+        };
+        ports.publish(VppPortsSnapshot {
+            instance: instance(10),
+            ports: vec![
+                port("eth0", 3, "octeon0/0", 1),
+                port("eth9", 9, "octeon1/0", 2),
+            ],
+        });
+        let side = VppSide::new(dir, ports, r.t0, NOW_NS - 1);
+        let rig = Rig {
+            w: r.w.with_vpp(side),
+            src: r.src,
+            ports: r.ports,
+            net: r.net,
+            shared: r.shared,
+            t0: r.t0,
+        };
+        (rig, plugin)
+    }
+
+    fn lane(p: &Published, name: &str, path: Path) -> PortReport {
+        p.ports
+            .iter()
+            .find(|r| r.name == name && r.path == path)
+            .unwrap_or_else(|| panic!("no {name} {path:?} in {:?}", p.ports))
+            .clone()
+    }
+
+    #[test]
+    fn a_vpp_ports_samples_join_its_xdp_data_source() {
+        let (mut r, plugin) = vpp_rig();
+        r.w.tick(r.t0);
+        assert_eq!(plugin.borrow().desired.as_ref().unwrap().generation, 1);
+        {
+            let mut p = plugin.borrow_mut();
+            p.status = Some(applied(1, 1, 2));
+            p.rings = rings(&[2000, 0], 0);
+            p.queued = vec![sample(1, 1)];
+        }
+        r.ports.rx.borrow_mut().insert(3, 6_000);
+        r.src.events.borrow_mut().push_back(event(3, 0, 0, 1000, 1));
+        r.w.tick(r.t0 + PORTS_EVERY);
+        let sent = r.net.sent.borrow();
+        let d = &sent[0].1;
+        assert_eq!(word(d, 24), 2);
+        let (a, b) = (28, 28 + 8 + word(d, 32) as usize);
+        assert_eq!(
+            (word(d, a + 8), word(d, a + 12), word(d, a + 20)),
+            (1, 3, 5_000),
+            "XDP's sample: sequence 1, eth0, the kernel's pool"
+        );
+        assert_eq!(
+            (word(d, b + 8), word(d, b + 12), word(d, b + 20)),
+            (2, 3, 7_000),
+            "VPP's: the same source's next sequence, and both paths' pool"
+        );
+        assert_eq!(word(d, b + 32), 0, "no output known");
+        assert_eq!(word(d, b + 40 + 12), 1504, "frame length counts the FCS");
+        let p = r.shared.snapshot();
+        assert_eq!(
+            (p.samples_total[&Path::Xdp], p.samples_total[&Path::Vpp]),
+            (1, 1)
+        );
+        assert_eq!(lane(&p, "eth0", Path::Vpp).pool, 2_000);
+        assert_eq!(lane(&p, "eth0", Path::Xdp).pool, 5_000);
+        assert_eq!(lane(&p, "eth9", Path::Vpp).state, State::Starting);
+        assert!(p
+            .ports
+            .iter()
+            .all(|l| !(l.name == "eth9" && l.path == Path::Xdp)));
+    }
+
+    #[test]
+    fn a_vpp_lane_answers_to_the_sampler_as_a_whole() {
+        let (mut r, plugin) = vpp_rig();
+        r.w.tick(r.t0);
+        plugin.borrow_mut().status = Some(applied(1, 1, 2));
+        r.w.tick(r.t0 + TICK);
+        assert!(r.shared.snapshot().vpp.unwrap().coverage.is_healthy());
+        // The plugin stopped beating; nothing on the ports looks wrong.
+        plugin.borrow_mut().heartbeat_age_ns = 2_000_000_000;
+        let t = r.t0 + VPP_STARTUP_GRACE + Duration::from_secs(1);
+        r.w.tick(t);
+        let p = r.shared.snapshot();
+        assert_eq!(lane(&p, "eth0", Path::Xdp).state, State::Covered);
+        let State::Uncovered(why) = lane(&p, "eth9", Path::Vpp).state else {
+            panic!("{:?}", lane(&p, "eth9", Path::Vpp));
+        };
+        assert!(why.contains("VPP's sampler is unavailable"), "{why}");
+        assert_eq!(p.vpp.unwrap().coverage, Coverage::Unavailable);
+    }
+
+    #[test]
+    fn vpp_loss_degrades_vpp_lanes_and_rides_the_next_vpp_sample() {
+        let (mut r, plugin) = vpp_rig();
+        r.w.tick(r.t0);
+        plugin.borrow_mut().status = Some(applied(1, 1, 2));
+        let t = r.t0 + VPP_STARTUP_GRACE;
+        r.w.tick(t);
+        assert!(r.shared.snapshot().vpp.unwrap().coverage.is_healthy());
+        plugin.borrow_mut().rings = rings(&[], 7);
+        r.w.tick(t + TICK);
+        r.w.tick(t + WINDOW);
+        let p = r.shared.snapshot();
+        assert_eq!(p.vpp_lost_total, 7);
+        assert!(matches!(
+            lane(&p, "eth9", Path::Vpp).state,
+            State::Degraded(_)
+        ));
+        assert_eq!(
+            lane(&p, "eth0", Path::Xdp).state,
+            State::Covered,
+            "fast-path lost nothing"
+        );
+        r.src.events.borrow_mut().push_back(event(3, 0, 0, 1000, 1));
+        plugin.borrow_mut().queued = vec![sample(1, 2)];
+        r.w.tick(t + WINDOW + TICK);
+        let d = &r.net.sent.borrow()[0].1;
+        let b = 28 + 8 + word(d, 32) as usize;
+        assert_eq!(word(d, 28 + 24), 0, "XDP's sample carries none of it");
+        assert_eq!(
+            (word(d, b + 12), word(d, b + 24)),
+            (9, 7),
+            "VPP's carries it"
+        );
+    }
+
+    #[test]
+    fn stopping_stops_both_samplers() {
+        let (mut r, plugin) = vpp_rig();
+        r.w.tick(r.t0);
+        r.w.stop().unwrap();
+        assert_eq!(
+            r.src.cfgs.borrow().last().unwrap().rate_generation as u32,
+            0
+        );
+        assert!(plugin.borrow().removed);
+    }
+
+    #[test]
+    fn a_worker_that_panics_stops_from_outside_and_says_why() {
+        let r = rig(1000);
+        *r.src.panics.borrow_mut() = true;
+        let released = std::cell::Cell::new(false);
+        run(r.w, &AtomicBool::new(false), || released.set(true));
+        assert!(released.get(), "the samplers stopped after the panic");
+        assert_eq!(r.shared.panicked().as_deref(), Some("ring fault"));
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub const MAX_DATAGRAM: usize = 1400;
 
 /// Octets a frame's FCS adds on the wire: sFlow's `frame_length` counts
 /// them and `stripped` says they are not in the header.
-const FCS: u32 = 4;
+pub const FCS: u32 = 4;
 
 /// A sample ready to encode: everything sFlow says about it, with the
 /// header as the wire carried it.

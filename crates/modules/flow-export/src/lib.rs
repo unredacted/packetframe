@@ -8,6 +8,10 @@
 //! own packet counter, and judges per port whether the samples still
 //! represent its traffic ([`coverage`]).
 //!
+//! VPP's sampler plugin does the same for the ports vpp-offload steers
+//! into VPP ([`vpp`]): this module owns its `desired.conf`, and reads its
+//! rings and per-interface counts through `packetframe_sampler_shm`.
+//!
 //! Telemetry never affects forwarding: a failure to start degrades this
 //! module and leaves the rest running (the loader's policy), and every
 //! failure after that is a status row, not an error the dataplane sees.
@@ -18,12 +22,18 @@ pub mod coverage;
 pub mod pool;
 pub mod report;
 pub mod sflow_out;
+pub mod vpp;
 pub mod worker;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod vpp_live;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use packetframe_common::sampler_ports::VppSamplerPorts;
 
 use packetframe_common::module::{
     Attachment, HealthCtx, HealthReport, HookUse, LoaderCtx, MetricsWriter, Module, ModuleConfig,
@@ -38,11 +48,18 @@ pub const MODULE_NAME: &str = "flow-export";
 /// it.
 pub const THREAD_NAME: &str = "pf-flow-export";
 
+/// VPP's sampler directory, where vpp-offload prepares it
+/// (`packetframe_sampler_shm::fs::DEFAULT_DIR`).
+pub const VPP_SAMPLER_DIR: &str = "/run/packetframe/vpp/sampler";
+
 #[derive(Default)]
 pub struct FlowExportModule {
     cfg: Option<FlowExportConfig>,
     bpffs_root: PathBuf,
     state_dir: PathBuf,
+    /// vpp-offload's ports and its sampler directory, when it is
+    /// configured.
+    vpp: Option<(Arc<VppSamplerPorts>, PathBuf)>,
     #[cfg(target_os = "linux")]
     running: Option<linux::Running>,
 }
@@ -50,6 +67,13 @@ pub struct FlowExportModule {
 impl FlowExportModule {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sample VPP's ports too: vpp-offload's per-process port snapshots,
+    /// and the directory it prepares for the sampler plugin. The loader
+    /// is the only place that sees both modules.
+    pub fn set_vpp(&mut self, ports: Arc<VppSamplerPorts>, dir: PathBuf) {
+        self.vpp = Some((ports, dir));
     }
 }
 
@@ -77,7 +101,7 @@ impl Module for FlowExportModule {
             .cfg
             .clone()
             .ok_or_else(|| ModuleError::other(MODULE_NAME, "attach before load"))?;
-        let running = linux::Running::start(c, &self.bpffs_root, &self.state_dir)
+        let running = linux::Running::start(c, &self.bpffs_root, &self.state_dir, self.vpp.clone())
             .map_err(|e| ModuleError::other(MODULE_NAME, e))?;
         self.running = Some(running);
         // Nothing of fast-path's registry is ours: the programs are its.
@@ -141,22 +165,25 @@ impl Module for FlowExportModule {
             return Ok(report::health(
                 &r.shared.snapshot(),
                 r.shared.heartbeat_age(now),
+                r.shared.panicked().as_deref(),
             ));
         }
         Ok(HealthReport::healthy())
     }
 }
 
-/// Stop fast-path's sampler through its pinned configuration map (rate
-/// 0), if fast-path's maps are pinned at all: what `detach --all` and the
-/// loader's release after a failed start run, with no module running.
+/// Stop the samplers with no module running, as `detach --all` and the
+/// loader's release after a failed start do: fast-path's through its
+/// pinned configuration map (rate 0), if its maps are pinned at all, and
+/// VPP's by removing `desired.conf` from `vpp_dir`, if that is a
+/// directory the plugin could use.
 #[cfg(target_os = "linux")]
-pub fn release_sampler(bpffs_root: &Path) -> Result<(), String> {
-    linux::release_sampler(bpffs_root)
+pub fn release_sampler(bpffs_root: &Path, vpp_dir: Option<&Path>) -> Result<(), String> {
+    linux::release_sampler(bpffs_root, vpp_dir)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn release_sampler(_bpffs_root: &Path) -> Result<(), String> {
+pub fn release_sampler(_bpffs_root: &Path, _vpp_dir: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
@@ -170,5 +197,11 @@ mod tests {
     fn the_worker_thread_is_placed_with_the_control_plane() {
         assert!(THREAD_NAME.len() <= 15);
         assert!(packetframe_common::placement::CONTROL_PLANE_THREADS.contains(&THREAD_NAME));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_vpp_sampler_directory_is_the_plugins_default() {
+        assert_eq!(VPP_SAMPLER_DIR, packetframe_sampler_shm::fs::DEFAULT_DIR);
     }
 }

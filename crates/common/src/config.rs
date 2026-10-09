@@ -3354,7 +3354,19 @@ impl Config {
                  in config order, and flow-export opens fast-path's maps"
                     .into(),
             )),
-            Some(_) => Ok(()),
+            // VPP's sampler directory is prepared, and a stale
+            // `desired.conf` cleared, by vpp-offload's attach; flow-export
+            // then owns the file.
+            Some(_) => match self.modules.iter().position(|m| m.name == "vpp-offload") {
+                Some(vo) if vo > pos => Err(err(
+                    0,
+                    "`module vpp-offload` must come before `module flow-export`: modules \
+                     attach in config order, and flow-export samples the ports vpp-offload \
+                     attaches through the sampler directory it prepares"
+                        .into(),
+                )),
+                _ => Ok(()),
+            },
         }
     }
 }
@@ -10255,6 +10267,21 @@ module fast-path
             .validate_flow_export()
             .unwrap_err();
         assert!(format!("{e}").contains("must come before"), "{e}");
+        // vpp-offload, when present, is before it too.
+        let fp = "module fast-path\n  attach eth0 generic\n";
+        let after = format!("{fp}{alone}module vpp-offload\n");
+        let e = Config::parse(&after)
+            .unwrap()
+            .validate_flow_export()
+            .unwrap_err();
+        assert!(
+            format!("{e}").contains("`module vpp-offload` must come before"),
+            "{e}"
+        );
+        Config::parse(&format!("{fp}module vpp-offload\n{alone}"))
+            .unwrap()
+            .validate_flow_export()
+            .unwrap();
         // More collectors than allowed.
         let mut many = format!("{head}  source-address 192.0.2.1\n");
         for i in 0..=FLOW_MAX_COLLECTORS {

@@ -2,7 +2,8 @@
 //!
 //! Every consumer of the sampler judges coverage the same way, from what
 //! it can observe: the status snapshot, the heartbeat's age, what
-//! `desired.conf` asks for, and whether packets were counted. The states
+//! `desired.conf` asks for, whether packets were counted, and whether
+//! samples were lost or are piling up unread. The states
 //! are deliberately pessimistic: nothing is called healthy that a reader
 //! cannot see is working, and a stopped plugin is never mistaken for a
 //! quiet network.
@@ -27,8 +28,9 @@ pub enum Coverage {
     /// Sampling, but a configured interface has been missing past the
     /// grace period.
     Partial,
-    /// Sampling under a configuration other than the one asked for: the
-    /// current `desired.conf` was refused, or not yet applied.
+    /// Sampling under a configuration other than the one asked for (the
+    /// current `desired.conf` was refused, or not yet applied), or losing
+    /// samples on the way to the reader.
     Degraded,
     /// The plugin is up and sampling nothing, by configuration.
     Disabled,
@@ -77,6 +79,13 @@ pub struct Observation<'a> {
     pub now_realtime_ns: u64,
     /// Whether any configured interface's packet count rose in the window.
     pub traffic: bool,
+    /// Samples lost in the window on the way to the reader: rings full,
+    /// slots corrupt or skipped, or left queued in an epoch that ended.
+    pub lost: u64,
+    /// Samples queued unread at the observation, and what the rings hold
+    /// in all.
+    pub backlog: u64,
+    pub capacity: u64,
 }
 
 /// The coverage an observation shows, and why.
@@ -133,6 +142,24 @@ pub fn assess(o: &Observation<'_>) -> (Coverage, String) {
             )
         }
         Some(_) => {}
+    }
+    if o.lost > 0 {
+        return (
+            Coverage::Degraded,
+            format!(
+                "{} samples lost on the way to the reader (rings full or unreadable)",
+                o.lost
+            ),
+        );
+    }
+    if o.capacity > 0 && o.backlog.saturating_mul(2) > o.capacity {
+        return (
+            Coverage::Degraded,
+            format!(
+                "{} of {} ring slots queued unread: the reader is falling behind",
+                o.backlog, o.capacity
+            ),
+        );
     }
     let missing: Vec<&str> = s
         .interfaces
@@ -191,6 +218,9 @@ mod tests {
             desired_generation: Some(4),
             now_realtime_ns: NOW,
             traffic: true,
+            lost: 0,
+            backlog: 0,
+            capacity: 8192,
         }
     }
 
@@ -278,6 +308,36 @@ mod tests {
         let mut s = status();
         s.state = State::Initializing;
         assert_eq!(judge(obs(&s)), Coverage::Unavailable);
+    }
+
+    /// Samples lost, or piling up unread, are never healthy coverage: the
+    /// sampler can be up and configured while its reader sees a fraction.
+    #[test]
+    fn loss_and_a_growing_backlog_degrade() {
+        let s = status();
+        let (c, why) = assess(&Observation { lost: 3, ..obs(&s) });
+        assert_eq!(c, Coverage::Degraded);
+        assert!(why.contains("3 samples lost"), "{why}");
+        assert_eq!(
+            judge(Observation {
+                backlog: 4096,
+                ..obs(&s)
+            }),
+            Coverage::Healthy,
+            "half full is still keeping up"
+        );
+        let (c, why) = assess(&Observation {
+            backlog: 4097,
+            ..obs(&s)
+        });
+        assert_eq!(c, Coverage::Degraded);
+        assert!(why.contains("falling behind"), "{why}");
+        // A refusal still says what it is, loss or not.
+        let mut r = status();
+        r.rejected_generation = 5;
+        r.rejected_reason = ErrorKind::Range.code();
+        let (_, why) = assess(&Observation { lost: 3, ..obs(&r) });
+        assert!(why.contains("refused"), "{why}");
     }
 
     #[test]

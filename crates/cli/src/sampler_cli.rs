@@ -157,7 +157,8 @@ fn ms(ns: u64) -> String {
 }
 
 /// Coverage as a reader sees it now. `traffic`: whether packets were
-/// counted over whatever window the caller judges.
+/// counted over whatever window the caller judges; `lost`: the samples
+/// lost on the way to the reader over it.
 struct Seen {
     coverage: Coverage,
     why: String,
@@ -165,13 +166,19 @@ struct Seen {
     heartbeat_age_ns: u64,
 }
 
-fn observe(f: &Follower, traffic: bool) -> Seen {
+fn observe(f: &Follower, traffic: bool, lost: u64) -> Seen {
+    let rings = f.opened().map(counters).unwrap_or_default();
     let base = |status, heartbeat_age_ns| Observation {
         status,
         heartbeat_age_ns,
         desired_generation: desired_generation(f.dir()),
         now_realtime_ns: realtime_ns(),
         traffic,
+        lost,
+        backlog: rings.iter().map(follow::queued).sum(),
+        capacity: f.opened().map_or(0, |o| {
+            (o.layout().workers as u64).saturating_mul(o.layout().slots as u64)
+        }),
     };
     let no_status = |incompatible, why| NoStatus { incompatible, why };
     let Some(o) = f.opened().filter(|_| !f.incompatible()) else {
@@ -208,6 +215,9 @@ fn ingress(c: &Counters, pool: usize) -> u64 {
     c.pool[pool][Class::Ingress.index()]
 }
 
+/// How long `status` watches the rings for loss.
+const STATUS_LOSS_WINDOW: Duration = Duration::from_millis(250);
+
 fn status(dir: &Path) -> ExitCode {
     let mut f = Follower::observer(dir);
     f.refresh();
@@ -216,15 +226,23 @@ fn status(dir: &Path) -> ExitCode {
         |(u, t)| format!("{} of {}", mib(u), mib(t)),
     );
     println!("directory {} (tmpfs {tmpfs})", dir.display());
-    // One look has no window to judge traffic over: the epoch's whole
-    // life is the window.
+    // Traffic is judged over the epoch's whole life; loss over a moment,
+    // so a burst long past does not read as losing samples now.
+    let before = f.opened().map(counters).unwrap_or_default();
+    std::thread::sleep(STATUS_LOSS_WINDOW);
     let c = f.opened().map(counters).unwrap_or_default();
     let traffic = c.iter().any(|c| c.pool.iter().flatten().any(|&n| n > 0));
-    let seen = observe(&f, traffic);
+    let lost = c
+        .iter()
+        .zip(&before)
+        .map(|(now, then)| now.dropped_full.saturating_sub(then.dropped_full))
+        .sum();
+    let seen = observe(&f, traffic, lost);
     println!(
-        "coverage {}: {} (traffic judged since the epoch began)",
+        "coverage {}: {} (traffic judged since the epoch began, loss over {} ms)",
         seen.coverage.name(),
-        seen.why
+        seen.why,
+        STATUS_LOSS_WINDOW.as_millis()
     );
     if let Some(o) = f.opened() {
         let h = &o.header;
@@ -565,7 +583,7 @@ fn report(
     written += c[2];
     full += c[3];
     let drained: u64 = w.drained.iter().sum::<u64>() + c[4];
-    let seen = observe(f, pool > 0);
+    let seen = observe(f, pool > 0, full + w.corrupt + w.skipped);
     let epoch = f
         .opened()
         .map_or("none".into(), |o| format!("{:016x}", o.header.epoch));
