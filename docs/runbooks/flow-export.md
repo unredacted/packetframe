@@ -185,7 +185,8 @@ collector results are always marked `receipt: unverified`.
 ## Privacy profiles and AS numbers (IPFIX)
 
 An address is local when inside `privacy-local-prefix`, which defaults
-to fast-path's `allow-prefix` lines.
+to fast-path's `allow-prefix` lines. The default changes with a reload
+fast-path accepts, never one it refused.
 
 | Profile | Sends |
 |---|---|
@@ -196,17 +197,25 @@ to fast-path's `allow-prefix` lines.
 
 - **sFlow takes `full` only.** It carries headers as they were. A
   collector is refused rather than sent more than its profile allows.
+- **The flow cache.** A flow is exported `inactive` seconds after its
+  last sampled packet, or `active` seconds after its first, timed from
+  when each packet was sampled rather than when it was read.
+  - A full cache exports its oldest flow. Lowering `entries` on a
+    reload exports the excess a few thousand flows a tick.
+  - A stop sends every flow still counting, for up to half a second;
+    what is left then is logged.
 - **AS numbers.** Every IPFIX record carries its addresses' origin ASes,
   from fast-path's BGP or BMP route source (`forwarding-mode
   packetframe-fib`, or `compare`, with a `route-source`).
   - The origin comes from the same LOCAL_PREF tier as the forwarding
     nexthops: the route's last AS, or the peer's (this network's own, on
-    an iBGP or Loc-RIB feed) for a route with no path. An aggregate whose
-    path ends in an AS set names no one origin, and reads 0.
+    an iBGP or Loc-RIB feed) for a route with no path.
+  - A route whose origin is unknown reads 0, never the AS of a covering
+    route: an aggregate whose path ends in an AS set, or a route seeded
+    from the ledger at startup until its session announces it again.
   - Without a route source, the AS fields are 0 and `as-only` is
-    refused.
-  - A route seeded from the ledger at startup has no origin until its
-    session announces it again.
+    refused. With one, an IPFIX collector a reload adds gets AS numbers
+    at once.
 
 ## VPP
 
@@ -231,12 +240,18 @@ to fast-path's `allow-prefix` lines.
 - **What it's for.** `kernel-sample <iface>` is for traffic only the
   kernel handles, such as a tunnel or a port with no fast-path program.
 - **Refusals.** It is refused on fast-path ports, VPP ports, `pfpunt0`,
-  loopbacks, and any device stacked on a sampled port: a VLAN or bridge
-  over it would see those packets a second time.
+  loopbacks, and any device stacked on a sampled port, another
+  `kernel-sample` interface included: a VLAN or bridge over it would see
+  those packets a second time.
 - **The filters.** They are recorded in
-  `<state-dir>/flow-export-tc-links.json`. Stopping the module, `packetframe
-  detach` and `detach --all` remove them, and a start removes any a
-  crashed daemon left. By hand: `tc filter del dev <iface> ingress`.
+  `<state-dir>/flow-export-tc-links.json`, which is read only if this
+  daemon's own account could have written it.
+  - Stopping the module, `packetframe detach` and `detach --all` remove
+    them. Each interface is found by its ifindex, so one renamed since
+    is not missed.
+  - A start removes any a daemon that died left, with or without
+    `kernel-sample` lines of its own.
+  - By hand: `tc filter del dev <iface> ingress`, then the file.
 
 ## Triage by symptom
 
