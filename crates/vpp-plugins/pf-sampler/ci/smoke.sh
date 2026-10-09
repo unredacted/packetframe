@@ -57,7 +57,14 @@ stop_vpp() {
   kill "$VPP_PID"; wait "$VPP_PID" || true; VPP_PID=
 }
 
-plugin_loaded() { vppctl show plugins | grep -q pf_sampler_plugin.so; }
+# Captured before the match: under pipefail, `vppctl ... | grep -q` fails
+# when grep exits at its match while vppctl is still writing (SIGPIPE),
+# reading as "not loaded" on a run where it was.
+plugin_loaded() {
+  local plugins
+  plugins=$(vppctl show plugins)
+  grep -q pf_sampler_plugin.so <<<"$plugins"
+}
 
 send() { # name packets: 64-byte frames (14 + 20 + 8 + 22 of payload)
   vppctl "packet-generator new { name $1 limit $2 rate 100000 size 64-64 worker 0 node ethernet-input interface pg0 data { IP4: 0200.0000.0001 -> 0200.0000.0002 UDP: 192.0.2.1 -> 198.51.100.1 UDP: 1024 -> 53 incrementing 22 } }"
