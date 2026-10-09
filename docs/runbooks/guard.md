@@ -172,6 +172,17 @@ filters from `guard-tc-links.json` and removes the pins under
 prove a filter is gone retains its record and errors — rerun it, or
 as a last resort `tc filter del dev <iface> egress`.
 
+Each record carries its interface's attach-time ifindex, and detach
+finds the device by it: a bridge renamed since attach has its filter
+removed under the new name, and a device recreated under the old name
+(new ifindex) is never touched. Because the file names the filters a
+root detach removes, it is read only when no other account could have
+written it, on the same checks as
+[`vpp-offload.json`](vpp-offload.md#attach-or-detach-refuses-refusing-vpp-offloadjson-),
+and only up to 1 MiB. A refusal fails `detach` (and guard's start) with
+a message naming the check; remove the filters with
+`tc filter del dev <iface> egress`, then the file.
+
 Manual state check:
 
 ```
