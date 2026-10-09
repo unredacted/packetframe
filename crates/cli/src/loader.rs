@@ -170,6 +170,9 @@ fn run_with(config: Config, config_path: &Path) -> Result<(), RunError> {
     config
         .validate_neigh_snoop()
         .map_err(|e| RunError::Startup(e.to_string()))?;
+    config
+        .validate_flow_export()
+        .map_err(|e| RunError::Startup(e.to_string()))?;
 
     // Fail fast if metrics-textfile can't be written, the exporter
     // would retry silently every 15s otherwise.
@@ -303,7 +306,19 @@ fn feed_wiring(names: &[&str]) -> Result<bool, String> {
 // test keeps running on the macOS dev loop (the pattern `health::poll`
 // uses for the same reason).
 #[cfg_attr(not(all(target_os = "linux", feature = "fast-path")), allow(dead_code))]
-const DEGRADE_ON_START_FAILURE: &[&str] = &["vpp-offload"];
+const DEGRADE_ON_START_FAILURE: &[&str] = &["vpp-offload", "flow-export"];
+
+/// Degrading modules whose leftovers cannot affect forwarding, so a
+/// release that fails is reported instead of aborting.
+///
+/// The abort above exists because vpp-offload's leftovers are traffic
+/// diverted into a VPP nothing supervises. flow-export's are a sampler
+/// configuration in fast-path's own map with no reader: the programs
+/// count samples they cannot output, and forward exactly as before.
+/// Aborting the dataplane over that would make telemetry a way to stop
+/// forwarding, the one thing it must never be.
+#[cfg_attr(not(all(target_os = "linux", feature = "fast-path")), allow(dead_code))]
+const REPORT_RESIDUAL: &[&str] = &["flow-export"];
 
 #[cfg(test)]
 mod degrade_policy_tests {
@@ -317,6 +332,13 @@ mod degrade_policy_tests {
     #[test]
     fn only_the_second_tier_degrades() {
         assert!(DEGRADE_ON_START_FAILURE.contains(&"vpp-offload"));
+        assert!(DEGRADE_ON_START_FAILURE.contains(&"flow-export"));
+        // A residual is reported only for a module whose leftovers cannot
+        // touch forwarding, and only one that degrades at all.
+        for m in super::REPORT_RESIDUAL {
+            assert!(DEGRADE_ON_START_FAILURE.contains(m), "{m}");
+        }
+        assert!(!super::REPORT_RESIDUAL.contains(&"vpp-offload"));
         assert!(
             !DEGRADE_ON_START_FAILURE.contains(&"fast-path"),
             "fast-path is the dataplane; its failure must abort, not degrade"
@@ -360,13 +382,26 @@ fn degrade_on_start_failure(
     stage: &str,
     err: &dyn std::fmt::Display,
     state_dir: &Path,
+    bpffs_root: &Path,
     #[cfg(feature = "vpp-offload")] feed: Option<&packetframe_vpp_offload::feed::RouteFeed>,
 ) -> Result<crate::health::NotAttached, String> {
     tracing::error!(module = %name, stage, error = %err, "module failed to come up");
     if let Err(e) = module.detach() {
         tracing::error!(module = %name, error = %e, "release after a failed start also failed");
     }
-    release_persisted(name, state_dir)?;
+    let residual = match release_persisted(name, state_dir, bpffs_root) {
+        Ok(()) => None,
+        Err(why) if REPORT_RESIDUAL.contains(&name) => {
+            tracing::error!(
+                module = %name,
+                error = %why,
+                "what it left could not be released; reporting it and running on, since it \
+                 cannot affect forwarding — `packetframe detach --all` clears it"
+            );
+            Some(why)
+        }
+        Err(why) => return Err(why),
+    };
     #[cfg(feature = "vpp-offload")]
     let metrics = if name == "vpp-offload" {
         if let Some(f) = feed {
@@ -392,7 +427,12 @@ fn degrade_on_start_failure(
         .emit();
     Ok(crate::health::NotAttached {
         module: name.to_string(),
-        reason: err.to_string(),
+        reason: match residual {
+            None => err.to_string(),
+            Some(why) => {
+                format!("{err}; left behind: {why} (`packetframe detach --all` clears it)")
+            }
+        },
         metrics,
     })
 }
@@ -403,12 +443,14 @@ fn degrade_on_start_failure(
 /// A module on `DEGRADE_ON_START_FAILURE` with no arm here cannot prove
 /// what it left behind is gone, so it is refused rather than degraded.
 #[cfg(all(target_os = "linux", feature = "fast-path"))]
-fn release_persisted(name: &str, state_dir: &Path) -> Result<(), String> {
+fn release_persisted(name: &str, state_dir: &Path, bpffs_root: &Path) -> Result<(), String> {
     match name {
         #[cfg(feature = "vpp-offload")]
         "vpp-offload" => detach_vpp_offload(state_dir),
+        #[cfg(feature = "flow-export")]
+        "flow-export" => packetframe_flow_export::release_sampler(bpffs_root),
         other => {
-            let _ = state_dir;
+            let _ = (state_dir, bpffs_root);
             Err(format!(
                 "{other} has no standalone release, so nothing it persisted can be proven gone"
             ))
@@ -570,6 +612,15 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                     Box::new(packetframe_neigh_snoop::NeighSnoopModule::new()) as Box<dyn Module>,
                 ));
             }
+            #[cfg(feature = "flow-export")]
+            "flow-export" => {
+                // Reads fast-path's pinned sampler maps and port registry
+                // at attach: `validate_flow_export` put fast-path first.
+                modules.push((
+                    section.name.clone(),
+                    Box::new(packetframe_flow_export::FlowExportModule::new()) as Box<dyn Module>,
+                ));
+            }
             other => {
                 return Err(RunError::Startup(format!(
                     "unknown module `{other}` in {}",
@@ -630,6 +681,7 @@ fn run_linux(config: Config, config_path: &Path) -> Result<(), RunError> {
                 $stage,
                 &$err,
                 &config.global.state_dir,
+                &config.global.bpffs_root,
                 #[cfg(feature = "vpp-offload")]
                 feed.as_deref(),
             ) {
@@ -1188,8 +1240,11 @@ fn reconfigure_from_signal(
         reconfigure_refused("validate", &e);
         return Published::No;
     }
-    // And the neigh-snoop section, for the same reason.
-    if let Err(e) = new_config.validate_neigh_snoop() {
+    // And the neigh-snoop and flow-export sections, for the same reason.
+    if let Err(e) = new_config
+        .validate_neigh_snoop()
+        .and_then(|()| new_config.validate_flow_export())
+    {
         tracing::error!(error = %e, "SIGHUP config is unsafe to apply; keeping current config");
         write_reconfigure_marker(&marker_path, &format!("ERR validate: {e}"));
         reconfigure_refused("validate", &e);
@@ -1808,12 +1863,14 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
         config_has_vpp,
         config_has_guard,
         config_has_neigh_snoop,
+        config_has_flow_export,
     ) = match parsed.clone() {
         Some(c) => {
             let has_fast_path = c.modules.iter().any(|m| m.name == "fast-path");
             let has_vpp = c.modules.iter().any(|m| m.name == "vpp-offload");
             let has_guard = c.modules.iter().any(|m| m.name == "guard");
             let has_neigh_snoop = c.modules.iter().any(|m| m.name == "neigh-snoop");
+            let has_flow_export = c.modules.iter().any(|m| m.name == "flow-export");
             (
                 c.global.bpffs_root,
                 c.global.state_dir,
@@ -1822,6 +1879,7 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
                 has_vpp,
                 has_guard,
                 has_neigh_snoop,
+                has_flow_export,
             )
         }
         // No config at all: nothing scopes the request. fast-path is
@@ -1832,6 +1890,7 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
             PathBuf::from(packetframe_common::config::DEFAULT_STATE_DIR),
             packetframe_common::config::DEFAULT_ATTACH_SETTLE_TIME,
             true,
+            false,
             false,
             false,
             false,
@@ -1917,7 +1976,12 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     // nothing can push. Not a CI configuration (clippy runs
     // `--all-features`), but a warning is a warning.
     #[cfg_attr(
-        not(any(feature = "fast-path", feature = "vpp-offload", feature = "guard")),
+        not(any(
+            feature = "fast-path",
+            feature = "vpp-offload",
+            feature = "guard",
+            feature = "flow-export"
+        )),
         allow(unused_mut)
     )]
     let mut errors: Vec<String> = Vec::new();
@@ -2017,7 +2081,24 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     }
     #[cfg(not(feature = "guard"))]
     let _ = config_has_guard;
-    #[cfg(not(any(feature = "vpp-offload", feature = "guard", feature = "neigh-snoop")))]
+    // flow-export holds nothing of its own: its sampler configuration is
+    // fast-path's map, zeroed here so no program keeps selecting packets
+    // for a reader that is gone (a fast-path teardown above removes it
+    // outright).
+    #[cfg(feature = "flow-export")]
+    if all || config_has_flow_export {
+        if let Err(e) = packetframe_flow_export::release_sampler(&bpffs_root) {
+            errors.push(format!("flow-export: {e}"));
+        }
+    }
+    #[cfg(not(feature = "flow-export"))]
+    let _ = config_has_flow_export;
+    #[cfg(not(any(
+        feature = "vpp-offload",
+        feature = "guard",
+        feature = "neigh-snoop",
+        feature = "flow-export"
+    )))]
     let _ = all;
 
     let result = if errors.is_empty() {

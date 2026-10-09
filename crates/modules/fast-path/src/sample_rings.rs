@@ -127,6 +127,10 @@ mod linux {
         map: OwnedFd,
         rings: Vec<Ring>,
         buf: Vec<u8>,
+        /// Whether the rings are still the map's: cleared by
+        /// [`SampleRings::uninstall`], so dropping does not delete entries
+        /// that may by then be someone else's.
+        installed: bool,
     }
 
     struct Ring {
@@ -167,6 +171,7 @@ mod linux {
                 map: samples.try_clone_to_owned()?,
                 rings: Vec::with_capacity(cpus.len()),
                 buf: Vec::new(),
+                installed: true,
             };
             for &cpu in cpus {
                 let ring = Ring::open(cpu, pages)?;
@@ -284,11 +289,24 @@ mod linux {
         }
     }
 
+    impl SampleRings {
+        /// Take the rings out of the map, keeping what they hold: samples
+        /// after this fail to output and are counted by the program
+        /// (`sample_emit_failed`), and a [`SampleRings::drain`] still reads
+        /// every sample published before it. For replacing the rings
+        /// without losing a sample unaccounted.
+        pub fn uninstall(&mut self) {
+            if std::mem::take(&mut self.installed) {
+                for r in &self.rings {
+                    let _ = map_elem(&self.map, BPF_MAP_DELETE_ELEM, r.cpu, None);
+                }
+            }
+        }
+    }
+
     impl Drop for SampleRings {
         fn drop(&mut self) {
-            for r in &self.rings {
-                let _ = map_elem(&self.map, BPF_MAP_DELETE_ELEM, r.cpu, None);
-            }
+            self.uninstall();
         }
     }
 

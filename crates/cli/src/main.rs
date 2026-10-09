@@ -436,6 +436,10 @@ fn run_feasibility(config: Option<PathBuf>, human: bool) -> ExitCode {
                     eprintln!("neigh-snoop config check failed: {e}");
                     return ExitCode::from(EXIT_STARTUP_ERROR);
                 }
+                if let Err(e) = c.validate_flow_export() {
+                    eprintln!("flow-export config check failed: {e}");
+                    return ExitCode::from(EXIT_STARTUP_ERROR);
+                }
                 feasibility::FeasibilityInputs::from_config(&c)
             }
             Err(e) => {

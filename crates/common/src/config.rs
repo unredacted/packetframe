@@ -836,6 +836,58 @@ pub enum ModuleDirective {
         interval: Duration,
         line: usize,
     },
+    // --- flow-export module (sampled packets to flow collectors).
+    // Shared directive namespace; these names are flow-export's. ---
+    /// `source-address <ip>` — the exporter's address: the sFlow agent
+    /// address in every datagram, and the source every collector sees
+    /// (collectors key exporters on it). Required. **Restart-only**.
+    FlowSourceAddress {
+        addr: IpAddr,
+        line: usize,
+    },
+    /// `sample-rate <n>` — one packet in `n` is sampled, on every path.
+    /// Default [`FLOW_DEFAULT_RATE`]; at least [`FLOW_MIN_RATE`]. Below
+    /// [`FLOW_BUDGET_RATE`] it is accepted and reported over budget: the
+    /// sampler's cost is qualified only at 1:1000 or sparser. Hot.
+    FlowSampleRate {
+        rate: u32,
+        line: usize,
+    },
+    /// `header-bytes <n>` — leading bytes of each sampled packet sent to
+    /// collectors, within [`FLOW_HEADER_BYTES_RANGE`]. Default
+    /// [`FLOW_DEFAULT_HEADER_BYTES`]. Hot.
+    FlowHeaderBytes {
+        bytes: u32,
+        line: usize,
+    },
+    /// `collector <name> sflow <ip>:<port> [kind stats|ddos]` — a
+    /// collector and what it is for. Hot.
+    FlowCollector {
+        name: String,
+        format: CollectorFormat,
+        addr: std::net::SocketAddr,
+        kind: CollectorKind,
+        line: usize,
+    },
+}
+
+/// What a flow collector receives.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CollectorFormat {
+    /// sFlow v5 flow samples with raw packet headers.
+    Sflow,
+}
+
+/// What a flow collector is for: it decides which formats and privacy
+/// profiles it may take.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CollectorKind {
+    /// Traffic statistics (Akvorado).
+    Stats,
+    /// Attack detection (FastNetMon).
+    Ddos,
 }
 
 /// One side of the [`ModuleDirective::MssClamp`] discriminator
@@ -1895,6 +1947,19 @@ pub const NEIGH_SNOOP_DEFAULT_COVERAGE_INTERVAL: Duration = Duration::from_secs(
 pub const NEIGH_SNOOP_DEFAULT_GATE_INTERVAL: Duration = Duration::from_secs(30);
 pub const NEIGH_SNOOP_DEFAULT_GATE_REMOVE_AFTER: Duration = Duration::from_secs(180);
 pub const NEIGH_SNOOP_DEFAULT_RS_COVERAGE_INTERVAL: Duration = Duration::from_secs(300);
+/// flow-export's default `sample-rate`, and the densest rate its worker
+/// budget is qualified at: denser is accepted and reported over budget.
+pub const FLOW_DEFAULT_RATE: u32 = 1000;
+pub const FLOW_BUDGET_RATE: u32 = 1000;
+/// The densest `sample-rate` accepted.
+pub const FLOW_MIN_RATE: u32 = 100;
+/// The sparsest: a gap the sampler draws stays inside a u32.
+pub const FLOW_MAX_RATE: u32 = 1 << 24;
+pub const FLOW_DEFAULT_HEADER_BYTES: u32 = 128;
+/// `header-bytes` bounds: enough for any L2/L3/L4 header stack, and no
+/// more than the VPP sampler's slot carries.
+pub const FLOW_HEADER_BYTES_RANGE: (u32, u32) = (64, 256);
+pub const FLOW_MAX_COLLECTORS: usize = 8;
 
 impl Config {
     /// Parse a config from a file path.
@@ -3170,6 +3235,127 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// flow-export-section validation. Pure config logic, so it runs
+    /// everywhere `parse` does (startup, feasibility, SIGHUP; the call
+    /// sites must stay in step or reload applies a config startup would
+    /// refuse).
+    ///
+    /// Rules:
+    /// - ≥1 `collector`: a section holding only other modules' directives
+    ///   parses, and must not load as an exporter with nowhere to send;
+    /// - exactly one `source-address`; `sample-rate` and `header-bytes` at
+    ///   most once each;
+    /// - collector names unique, no two collectors at one address, at most
+    ///   [`FLOW_MAX_COLLECTORS`], each in `source-address`'s family;
+    /// - a `module fast-path` section listed **before** this one: the
+    ///   samples come from fast-path's maps, which exist once it has
+    ///   attached, and modules attach in config order.
+    pub fn validate_flow_export(&self) -> Result<(), ConfigError> {
+        let Some(pos) = self.modules.iter().position(|m| m.name == "flow-export") else {
+            return Ok(());
+        };
+        let err = |line: usize, msg: String| ConfigError::Parse {
+            line,
+            message: format!("module flow-export: {msg}"),
+        };
+        let mut source: Option<(IpAddr, usize)> = None;
+        let (mut rate_line, mut header_line) = (None, None);
+        let mut collectors: Vec<(&str, std::net::SocketAddr, usize)> = Vec::new();
+        for d in &self.modules[pos].directives {
+            match d {
+                ModuleDirective::FlowSourceAddress { addr, line } => {
+                    if let Some((_, prev)) = source {
+                        return Err(err(
+                            *line,
+                            format!("`source-address` given twice (first on line {prev})"),
+                        ));
+                    }
+                    source = Some((*addr, *line));
+                }
+                ModuleDirective::FlowSampleRate { line, .. } => {
+                    if let Some(prev) = rate_line.replace(*line) {
+                        return Err(err(
+                            *line,
+                            format!("`sample-rate` given twice (first on line {prev})"),
+                        ));
+                    }
+                }
+                ModuleDirective::FlowHeaderBytes { line, .. } => {
+                    if let Some(prev) = header_line.replace(*line) {
+                        return Err(err(
+                            *line,
+                            format!("`header-bytes` given twice (first on line {prev})"),
+                        ));
+                    }
+                }
+                ModuleDirective::FlowCollector {
+                    name, addr, line, ..
+                } => {
+                    if let Some((_, _, prev)) = collectors.iter().find(|(n, _, _)| n == name) {
+                        return Err(err(
+                            *line,
+                            format!("collector `{name}` declared twice (first on line {prev})"),
+                        ));
+                    }
+                    if let Some((other, _, _)) = collectors.iter().find(|(_, a, _)| a == addr) {
+                        return Err(err(
+                            *line,
+                            format!("collectors `{other}` and `{name}` are both at {addr}"),
+                        ));
+                    }
+                    collectors.push((name, *addr, *line));
+                }
+                _ => {}
+            }
+        }
+        if collectors.is_empty() {
+            return Err(err(
+                0,
+                "section declares no `collector`; add `collector <name> sflow <ip>:<port>`, \
+                 or remove the section"
+                    .into(),
+            ));
+        }
+        if collectors.len() > FLOW_MAX_COLLECTORS {
+            return Err(err(
+                collectors[FLOW_MAX_COLLECTORS].2,
+                format!("at most {FLOW_MAX_COLLECTORS} collectors"),
+            ));
+        }
+        let Some((src, _)) = source else {
+            return Err(err(
+                0,
+                "`source-address <ip>` is required: it is the sFlow agent address and the \
+                 source every collector keys this exporter on"
+                    .into(),
+            ));
+        };
+        if let Some((name, addr, line)) = collectors
+            .iter()
+            .find(|(_, a, _)| a.is_ipv4() != src.is_ipv4())
+        {
+            return Err(err(
+                *line,
+                format!("collector `{name}` at {addr} is not in source-address {src}'s family"),
+            ));
+        }
+        // Checked last, so a malformed section reports its own problem
+        // first.
+        match self.modules.iter().position(|m| m.name == "fast-path") {
+            None => Err(err(
+                0,
+                "requires a `module fast-path` section: the samples come from its programs".into(),
+            )),
+            Some(fp) if fp > pos => Err(err(
+                0,
+                "`module fast-path` must come before `module flow-export`: modules attach \
+                 in config order, and flow-export opens fast-path's maps"
+                    .into(),
+            )),
+            Some(_) => Ok(()),
+        }
     }
 }
 
@@ -4517,11 +4703,91 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             let interval = parse_bounded_secs(line, t, "rs-coverage-interval", 5, 3600)?;
             Ok(ModuleDirective::SnoopRsCoverageInterval { interval, line })
         }),
+        "source-address" => parse_single_arg(line, rest, "source-address", |t| {
+            let addr: IpAddr = t
+                .parse()
+                .map_err(|_| format!("`{t}` is not an IP address"))?;
+            if addr.is_unspecified() || addr.is_multicast() {
+                return Err(format!("`{t}` cannot be an exporter's address"));
+            }
+            Ok(ModuleDirective::FlowSourceAddress { addr, line })
+        }),
+        "sample-rate" => parse_single_arg(line, rest, "sample-rate", |t| {
+            let rate: u32 = t.parse().map_err(|e| format!("bad integer `{t}`: {e}"))?;
+            if !(FLOW_MIN_RATE..=FLOW_MAX_RATE).contains(&rate) {
+                return Err(format!(
+                    "must be between {FLOW_MIN_RATE} and {FLOW_MAX_RATE} (1 in N packets)"
+                ));
+            }
+            Ok(ModuleDirective::FlowSampleRate { rate, line })
+        }),
+        "header-bytes" => parse_single_arg(line, rest, "header-bytes", |t| {
+            let bytes: u32 = t.parse().map_err(|e| format!("bad integer `{t}`: {e}"))?;
+            let (lo, hi) = FLOW_HEADER_BYTES_RANGE;
+            if !(lo..=hi).contains(&bytes) {
+                return Err(format!("must be between {lo} and {hi}"));
+            }
+            Ok(ModuleDirective::FlowHeaderBytes { bytes, line })
+        }),
+        "collector" => parse_flow_collector(line, rest),
         other => Err(ConfigError::parse(
             line,
             format!("unknown directive `{other}` in module section"),
         )),
     }
+}
+
+const COLLECTOR_USAGE: &str = "collector takes: <name> sflow <ip>:<port> [kind stats|ddos]";
+
+/// `collector <name> sflow <ip>:<port> [kind stats|ddos]`.
+fn parse_flow_collector<'a>(
+    line: usize,
+    rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    let toks: Vec<&str> = rest.collect();
+    let usage = |why: String| ConfigError::parse(line, format!("{why}; {COLLECTOR_USAGE}"));
+    let [name, format, addr, tail @ ..] = toks.as_slice() else {
+        return Err(usage(
+            "collector needs a name, a format and an address".into(),
+        ));
+    };
+    let name_ok = !name.is_empty()
+        && name.len() <= 32
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !name_ok {
+        return Err(usage(format!(
+            "`{name}` is not a collector name (letters, digits, `-`, `_`, at most 32)"
+        )));
+    }
+    let format = match *format {
+        "sflow" => CollectorFormat::Sflow,
+        "ipfix" => return Err(usage("IPFIX export is not available yet; use sflow".into())),
+        other => return Err(usage(format!("unknown format `{other}`"))),
+    };
+    let addr: std::net::SocketAddr = addr.parse().map_err(|_| {
+        usage(format!(
+            "`{addr}` is not an <ip>:<port> (an IPv6 address goes in brackets)"
+        ))
+    })?;
+    if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+        return Err(usage(format!("`{addr}` cannot be a collector's address")));
+    }
+    let kind = match tail {
+        [] => CollectorKind::Stats,
+        ["kind", "stats"] => CollectorKind::Stats,
+        ["kind", "ddos"] => CollectorKind::Ddos,
+        ["kind", other] => return Err(usage(format!("unknown kind `{other}`"))),
+        other => return Err(usage(format!("unexpected `{}`", other.join(" ")))),
+    };
+    Ok(ModuleDirective::FlowCollector {
+        name: name.to_string(),
+        format,
+        addr,
+        kind,
+        line,
+    })
 }
 
 const ARP_NS_RATELIMIT_USAGE: &str =
@@ -9854,6 +10120,154 @@ module fast-path
                 "for config `{s}`: error was `{e}`"
             );
         }
+    }
+
+    const FLOW_OK: &str = "module fast-path\n  attach eth0 generic\nmodule flow-export\n  \
+        source-address 192.0.2.1\n  sample-rate 2000\n  header-bytes 96\n  \
+        collector fnm sflow 198.51.100.10:6343 kind ddos\n  \
+        collector akv sflow 198.51.100.11:6343\n";
+
+    #[test]
+    fn flow_export_section_parses_reference_shape() {
+        let c = Config::parse(FLOW_OK).unwrap();
+        c.validate_flow_export().unwrap();
+        let fe = c.modules.iter().find(|m| m.name == "flow-export").unwrap();
+        assert!(fe.directives.contains(&ModuleDirective::FlowSourceAddress {
+            addr: "192.0.2.1".parse().unwrap(),
+            line: 4
+        }));
+        assert!(fe.directives.contains(&ModuleDirective::FlowSampleRate {
+            rate: 2000,
+            line: 5
+        }));
+        assert!(fe
+            .directives
+            .contains(&ModuleDirective::FlowHeaderBytes { bytes: 96, line: 6 }));
+        assert!(fe.directives.contains(&ModuleDirective::FlowCollector {
+            name: "fnm".into(),
+            format: CollectorFormat::Sflow,
+            addr: "198.51.100.10:6343".parse().unwrap(),
+            kind: CollectorKind::Ddos,
+            line: 7
+        }));
+        assert!(fe.directives.contains(&ModuleDirective::FlowCollector {
+            name: "akv".into(),
+            format: CollectorFormat::Sflow,
+            addr: "198.51.100.11:6343".parse().unwrap(),
+            kind: CollectorKind::Stats,
+            line: 8
+        }));
+        // IPv6 throughout.
+        let v6 = "module fast-path\n  attach eth0 generic\nmodule flow-export\n  \
+            source-address 2001:db8::1\n  collector c sflow [2001:db8::10]:6343\n";
+        Config::parse(v6).unwrap().validate_flow_export().unwrap();
+    }
+
+    #[test]
+    fn flow_export_grammar_refusals() {
+        for (line, want) in [
+            ("sample-rate 99", "between 100 and"),
+            ("sample-rate 16777217", "between 100 and"),
+            ("header-bytes 63", "between 64 and 256"),
+            ("header-bytes 257", "between 64 and 256"),
+            ("source-address 0.0.0.0", "cannot be an exporter"),
+            ("source-address host", "not an IP address"),
+            ("collector c ipfix 198.51.100.1:4739", "not available yet"),
+            ("collector c netflow 198.51.100.1:2055", "unknown format"),
+            ("collector c sflow 198.51.100.1", "is not an <ip>:<port>"),
+            ("collector c sflow 198.51.100.1:0", "cannot be a collector"),
+            (
+                "collector c sflow 198.51.100.1:6343 kind both",
+                "unknown kind",
+            ),
+            (
+                "collector c sflow 198.51.100.1:6343 extra",
+                "unexpected `extra`",
+            ),
+            (
+                "collector bad/name sflow 198.51.100.1:6343",
+                "not a collector name",
+            ),
+            ("collector c sflow", "needs a name, a format and an address"),
+        ] {
+            let s = format!("module flow-export\n  {line}\n");
+            let e = Config::parse(&s).expect_err(&s);
+            assert!(format!("{e}").contains(want), "for `{line}`: `{e}`");
+        }
+    }
+
+    #[test]
+    fn flow_export_validation_refusals() {
+        let head = "module fast-path\n  attach eth0 generic\nmodule flow-export\n";
+        for (body, want) in [
+            ("  source-address 192.0.2.1\n", "declares no `collector`"),
+            // Only another module's directives: still no collector.
+            ("  attach eth1 generic\n", "declares no `collector`"),
+            (
+                "  collector c sflow 198.51.100.1:6343\n",
+                "`source-address <ip>` is required",
+            ),
+            (
+                "  source-address 192.0.2.1\n  source-address 192.0.2.2\n  \
+                 collector c sflow 198.51.100.1:6343\n",
+                "`source-address` given twice",
+            ),
+            (
+                "  source-address 192.0.2.1\n  sample-rate 1000\n  sample-rate 2000\n  \
+                 collector c sflow 198.51.100.1:6343\n",
+                "`sample-rate` given twice",
+            ),
+            (
+                "  source-address 192.0.2.1\n  collector c sflow 198.51.100.1:6343\n  \
+                 collector c sflow 198.51.100.2:6343\n",
+                "collector `c` declared twice",
+            ),
+            (
+                "  source-address 192.0.2.1\n  collector a sflow 198.51.100.1:6343\n  \
+                 collector b sflow 198.51.100.1:6343\n",
+                "are both at",
+            ),
+            (
+                "  source-address 192.0.2.1\n  collector c sflow [2001:db8::1]:6343\n",
+                "not in source-address",
+            ),
+        ] {
+            let s = format!("{head}{body}");
+            let e = Config::parse(&s)
+                .unwrap()
+                .validate_flow_export()
+                .expect_err(&s);
+            assert!(format!("{e}").contains(want), "for `{body}`: `{e}`");
+        }
+        let alone = "module flow-export\n  source-address 192.0.2.1\n  \
+            collector c sflow 198.51.100.1:6343\n";
+        let e = Config::parse(alone)
+            .unwrap()
+            .validate_flow_export()
+            .unwrap_err();
+        assert!(
+            format!("{e}").contains("requires a `module fast-path` section"),
+            "{e}"
+        );
+        let first = format!("{alone}module fast-path\n  attach eth0 generic\n");
+        let e = Config::parse(&first)
+            .unwrap()
+            .validate_flow_export()
+            .unwrap_err();
+        assert!(format!("{e}").contains("must come before"), "{e}");
+        // More collectors than allowed.
+        let mut many = format!("{head}  source-address 192.0.2.1\n");
+        for i in 0..=FLOW_MAX_COLLECTORS {
+            many.push_str(&format!(
+                "  collector c{i} sflow 198.51.100.{}:6343\n",
+                i + 1
+            ));
+        }
+        let e = Config::parse(&many)
+            .unwrap()
+            .validate_flow_export()
+            .unwrap_err();
+        assert!(format!("{e}").contains("at most"), "{e}");
     }
 
     /// The interface count is capped at the BPF config map's capacity
