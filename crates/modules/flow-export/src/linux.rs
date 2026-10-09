@@ -215,6 +215,10 @@ impl SampleSource for LiveSource {
     fn emit_failed(&mut self) -> Option<u64> {
         (self.loss)()
     }
+
+    fn clock_ns(&self) -> u64 {
+        crate::vpp_live::monotonic_ns()
+    }
 }
 
 /// fast-path's sampler and, with `kernel-sample` lines, the kernel
@@ -251,6 +255,11 @@ impl SampleSource for Sources {
             Some(k) => Some(fast + k.emit_failed()?),
             None => Some(fast),
         }
+    }
+
+    /// Both programs stamp `bpf_ktime_get_ns`: one clock.
+    fn clock_ns(&self) -> u64 {
+        self.fast.clock_ns()
     }
 }
 

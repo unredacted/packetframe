@@ -187,8 +187,9 @@ fn realtime_ns() -> u64 {
         .map_or(0, |d| d.as_nanos() as u64)
 }
 
-/// CLOCK_MONOTONIC, the clock the plugin's heartbeat is in.
-fn monotonic_ns() -> u64 {
+/// CLOCK_MONOTONIC: the clock the plugin's heartbeat is in, and the one
+/// `bpf_ktime_get_ns` reads.
+pub(crate) fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
