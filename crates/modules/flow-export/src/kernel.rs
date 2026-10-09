@@ -58,17 +58,25 @@ fn ifindex_of(iface: &str) -> Option<u32> {
     (i != 0).then_some(i)
 }
 
-/// The name the device with `ifindex` has now.
-fn name_of(ifindex: u32) -> Option<String> {
+/// The name the device with `ifindex` has now: `Ok(None)` only when no
+/// device has it (ENXIO, the kernel's ENODEV as POSIX names it), `Err`
+/// when the lookup itself failed (no socket under fd exhaustion, say),
+/// which says nothing about the device. Mirror of fast-path's and
+/// guard's `name_of`.
+fn name_of(ifindex: u32) -> std::io::Result<Option<String>> {
     let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
     // SAFETY: a buffer of IF_NAMESIZE, which the call NUL-terminates.
     let p = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr()) };
     if p.is_null() {
-        return None;
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENXIO) | Some(libc::ENODEV) => Ok(None),
+            _ => Err(e),
+        };
     }
     // SAFETY: NUL-terminated by the call above, within `buf`.
     let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
-    Some(name.to_string_lossy().into_owned())
+    Ok(Some(name.to_string_lossy().into_owned()))
 }
 
 /// The devices `iface` sits on (`lower_*` in sysfs), and theirs, a few
@@ -293,9 +301,16 @@ fn tc_detach_one(
     // holds the filter, under its new name. Gone, the filter went with its
     // qdisc. A device recreated under the old name has another ifindex,
     // and a delete by name there could take an unrelated filter with a
-    // colliding (priority, handle).
-    let Some(current) = name_of(expected_ifindex) else {
-        return Ok(());
+    // colliding (priority, handle). A lookup that failed says neither, so
+    // the record is kept.
+    let current = match name_of(expected_ifindex) {
+        Ok(Some(current)) => current,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "tc detach on {iface}: find ifindex {expected_ifindex}: {e}"
+            ))
+        }
     };
     if current != iface {
         info!(
@@ -342,7 +357,7 @@ mod tests {
     #[test]
     fn a_device_is_named_by_its_ifindex() {
         let lo = ifindex_of("lo").unwrap();
-        assert_eq!(name_of(lo).as_deref(), Some("lo"));
-        assert_eq!(name_of(u32::MAX), None);
+        assert_eq!(name_of(lo).unwrap().as_deref(), Some("lo"));
+        assert_eq!(name_of(u32::MAX).unwrap(), None, "no such device");
     }
 }
