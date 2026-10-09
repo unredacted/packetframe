@@ -26,6 +26,9 @@ pub struct Ready {
     pub drops: u32,
     pub output_if: u32,
     pub frame_length: u32,
+    /// Octets `frame_length` counts that `header` does not start with:
+    /// an Ethernet frame's FCS, or none for one framed by [`ip_frame`].
+    pub stripped: u32,
     pub header: Vec<u8>,
     /// For the IPFIX flow cache, which sFlow has no field for: the path
     /// the sample came by, and the sampler generation it was drawn under.
@@ -54,6 +57,27 @@ pub fn wire_frame(s: &Sample<'_>) -> (Vec<u8>, u32) {
     }
     (header, frame_length)
 }
+
+/// The frame for a sample from a device with no link-layer header (an IP
+/// tunnel, WireGuard, TUN): the IP packet behind an Ethernet header with
+/// zero MACs and the packet's ethertype, so sFlow's raw header record
+/// (Ethernet) and the IPFIX flow cache read it like any other. Its length
+/// counts that header and no FCS, as `stripped` 0 says. `None` when the
+/// packet is not IP.
+pub fn ip_frame(s: &Sample<'_>) -> Option<(Vec<u8>, u32, u32)> {
+    let ethertype: u16 = match s.header.first()? >> 4 {
+        4 => 0x0800,
+        6 => 0x86dd,
+        _ => return None,
+    };
+    let mut header = Vec::with_capacity(ETH_HEADER + s.header.len());
+    header.extend_from_slice(&[0; 12]);
+    header.extend_from_slice(&ethertype.to_be_bytes());
+    header.extend_from_slice(s.header);
+    Some((header, s.frame_len + ETH_HEADER as u32, 0))
+}
+
+const ETH_HEADER: usize = 14;
 
 /// The sFlow agent: one per exporter, one sub-agent, its datagram
 /// sequence, and its encoding.
@@ -102,7 +126,7 @@ impl Exporter {
                 input_if: r.source_if,
                 output_if: r.output_if,
                 frame_length: r.frame_length,
-                stripped: FCS,
+                stripped: r.stripped,
                 header: &r.header,
             })
             .collect();
@@ -158,6 +182,26 @@ mod tests {
         }
     }
 
+    /// A tunnel's packet starts at its IP header: framed as Ethernet with
+    /// zero MACs and its version's ethertype, its length counting that
+    /// header and no FCS. Anything but IP is not framed.
+    #[test]
+    fn an_ip_devices_packet_is_framed_by_its_version() {
+        let v4 = [0x45, 0, 0, 60];
+        let (h, len, stripped) = ip_frame(&sample(&v4, None)).unwrap();
+        assert_eq!(&h[..12], &[0; 12]);
+        assert_eq!(&h[12..14], &[0x08, 0x00]);
+        assert_eq!(&h[14..], &v4);
+        assert_eq!((len, stripped), (60 + 14, 0));
+        let (h, _, _) = ip_frame(&sample(&[0x60, 0, 0, 0], None)).unwrap();
+        assert_eq!(&h[12..14], &[0x86, 0xdd]);
+        assert!(
+            ip_frame(&sample(&[0x02, 0, 0, 0], None)).is_none(),
+            "not IP"
+        );
+        assert!(ip_frame(&sample(&[], None)).is_none(), "nothing captured");
+    }
+
     #[test]
     fn an_offloaded_tag_goes_back_on_the_wire() {
         let frame: Vec<u8> = (0..20).collect();
@@ -187,6 +231,7 @@ mod tests {
             drops: 0,
             output_if: 0,
             frame_length: 1518,
+            stripped: FCS,
             header: vec![0xab; 128],
             path: crate::worker::Path::Xdp,
             generation: 1,

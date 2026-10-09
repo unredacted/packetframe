@@ -31,7 +31,7 @@ use crate::coverage::{PortCoverage, State, Window, WINDOW};
 use crate::flows::{self, Domain, FlowCache, Now, Sampled};
 use crate::ipfix_out::{IpfixOut, Privacy, RECORDS_PER_TICK};
 use crate::pool::Accumulator;
-use crate::sflow_out::{wire_frame, Exporter, Ready, FCS};
+use crate::sflow_out::{ip_frame, wire_frame, Exporter, Ready, FCS};
 use crate::vpp::{NoVpp, Taken, VppDir, VppHealth, VppSide};
 use packetframe_common::config::CollectorFormat;
 use packetframe_common::fib::asn::AsnTable;
@@ -76,12 +76,24 @@ impl Path {
     }
 }
 
-/// A fast-path port and the program on it.
+/// A sampled port and the program on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Port {
     pub name: String,
     pub ifindex: u32,
     pub path: Path,
+    pub link: Link,
+}
+
+/// Where a port's packets start, as its sampler copies them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Link {
+    /// At an Ethernet header: every fast-path port and VPP port.
+    #[default]
+    Ethernet,
+    /// At the IP header: a device with no link-layer header (an IP
+    /// tunnel, WireGuard, TUN, PPP), which only the kernel sampler takes.
+    Ip,
 }
 
 /// fast-path's sampler: its configuration map and its rings.
@@ -318,6 +330,8 @@ impl Shared {
 /// A port as sFlow's data source.
 struct Source {
     name: String,
+    /// How its samples are framed for the collectors.
+    link: Link,
     sequence: u32,
     drops: u32,
     /// Its kernel `rx_packets`, read while a fast-path program is on it.
@@ -331,6 +345,7 @@ impl Source {
     fn new(name: String) -> Self {
         Self {
             name,
+            link: Link::Ethernet,
             sequence: 0,
             drops: 0,
             kernel: Accumulator::default(),
@@ -845,6 +860,9 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
             }
         }
         for port in &self.fast {
+            if let Some(s) = self.sources.get_mut(&port.ifindex) {
+                s.link = port.link;
+            }
             if let Some(rx) = self.ports.rx_packets(port) {
                 if let Some(s) = self.sources.get_mut(&port.ifindex) {
                     s.kernel.observe(rx);
@@ -924,6 +942,7 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
                 // VPP's sampler sees ingress; the output is not known.
                 output_if: 0,
                 frame_length: s.frame_len + FCS,
+                stripped: FCS,
                 header: s.header,
                 path: Path::Vpp,
                 generation: s.generation,
@@ -1114,6 +1133,20 @@ fn ingest(
         sample::Path::Tc => Path::Tc,
         sample::Path::Kernel => Path::Kernel,
     };
+    // A sample that cannot be framed (not IP, on a device with no link
+    // header) is lost to the collectors, and the next sample's drops say
+    // so.
+    let Some((header, frame_length, stripped)) = (match src.link {
+        Link::Ethernet => {
+            let (header, frame_length) = wire_frame(&s);
+            Some((header, frame_length, FCS))
+        }
+        Link::Ip => ip_frame(&s),
+    }) else {
+        p.undecodable_total += 1;
+        *pending = pending.wrapping_add(1);
+        return;
+    };
     src.sequence = src.sequence.wrapping_add(1);
     src.drops = src.drops.wrapping_add(std::mem::take(pending));
     if let Some(l) = src.lanes.get_mut(&path) {
@@ -1121,7 +1154,6 @@ fn ingest(
         l.samples += 1;
     }
     *p.samples_total.entry(path).or_default() += 1;
-    let (header, frame_length) = wire_frame(&s);
     ready.push(Ready {
         sequence: src.sequence,
         source_if: s.ingress_ifindex,
@@ -1133,6 +1165,7 @@ fn ingest(
             _ => 0,
         },
         frame_length,
+        stripped,
         header,
         path,
         generation: u64::from(s.generation),
@@ -1352,6 +1385,7 @@ mod tests {
             name: "eth0".into(),
             ifindex: 3,
             path: Path::Xdp,
+            link: Link::Ethernet,
         });
         ports.rx.borrow_mut().insert(3, 1_000);
         let net = FakeNet::default();
@@ -2074,6 +2108,62 @@ mod tests {
         let _ = reload(&r.shared, c);
         r.w.tick(r.t0 + 2 * TICK);
         assert_eq!(r.w.local(), own, "the section's own win");
+    }
+
+    /// A device with no link-layer header (a tunnel) hands the kernel
+    /// sampler packets that start at their IP header: they go out framed
+    /// as Ethernet, to sFlow and the flow cache alike, and a sample there
+    /// that is not IP is lost rather than sent as garbage.
+    #[test]
+    fn samples_from_a_device_with_no_link_header_are_framed() {
+        let mut r = rig(1000);
+        r.ports.list.borrow_mut().push(Port {
+            name: "tun0".into(),
+            ifindex: 7,
+            path: Path::Kernel,
+            link: Link::Ip,
+        });
+        let _ = reload(&r.shared, with_ipfix(cfg(1000)));
+        r.w.tick(r.t0);
+        let mut ip = vec![0x45, 0, 0x03, 0xda, 0, 0, 0, 0, 64, 17, 0, 0];
+        ip.extend_from_slice(&[192, 0, 2, 7, 198, 51, 100, 9]);
+        ip.extend_from_slice(&40000u16.to_be_bytes());
+        ip.extend_from_slice(&53u16.to_be_bytes());
+        ip.resize(64, 0);
+        // As the kernel sampler writes it: path 3, a pass.
+        let kernel_event = |header: &[u8]| {
+            let mut e = 7u64.to_ne_bytes().to_vec();
+            for w in [1, 1000, 7, 0, 986, header.len() as u32, 3, 0] {
+                e.extend_from_slice(&w.to_ne_bytes());
+            }
+            e.extend_from_slice(header);
+            e
+        };
+        r.src
+            .events
+            .borrow_mut()
+            .extend([kernel_event(&ip), kernel_event(&[0x02; 64])]);
+        r.w.tick(r.t0 + TICK);
+        {
+            let sent = r.net.sent.borrow();
+            let d = &sent[0].1;
+            assert_eq!(word(d, 24), 1, "the one that is IP");
+            // The sample at 28; its raw header record at 28 + 40.
+            assert_eq!(
+                word(d, 28 + 52),
+                986 + 14,
+                "frame length: the header, no FCS"
+            );
+            assert_eq!(word(d, 28 + 56), 0, "stripped");
+            let h = &d[28 + 64..];
+            assert_eq!(
+                (&h[..12], &h[12..14], h[14]),
+                (&[0u8; 12][..], &[8u8, 0][..], 0x45)
+            );
+        }
+        let p = r.shared.snapshot();
+        assert_eq!(p.undecodable_total, 1);
+        assert_eq!((p.flows.unwrap().active, p.not_ip_total), (1, 0));
     }
 
     #[test]

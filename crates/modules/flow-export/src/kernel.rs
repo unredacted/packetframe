@@ -28,6 +28,7 @@ use packetframe_fast_path::sample::SampleCfg;
 use tracing::info;
 
 use crate::tc_links::{self, TcLinkRecord, TcLinksFile};
+use crate::worker::Link;
 use crate::{aligned_kernel_sample_copy, KERNEL_SAMPLE_BPF_AVAILABLE};
 
 pub const PROGRAM: &str = "kernel_sample";
@@ -98,6 +99,31 @@ fn lowers(iface: &str, depth: u32) -> Vec<String> {
     out
 }
 
+const ARPHRD_ETHER: u32 = 1;
+/// The link types (if_arp.h) whose packets reach tc ingress at their IP
+/// header: TUN and WireGuard (NONE), PPP, raw IP, ipip and vti (TUNNEL),
+/// ip6tnl and vti6 (TUNNEL6), sit, ipgre, ip6gre.
+const IP_LINKS: [u32; 8] = [65534, 512, 519, 768, 769, 776, 778, 823];
+
+/// Where `iface`'s packets start, by its link type; `Err` for a type
+/// whose samples could not be framed for the collectors.
+pub fn link_of(iface: &str) -> Result<Link, String> {
+    let raw = std::fs::read_to_string(Path::new("/sys/class/net").join(iface).join("type"))
+        .map_err(|e| format!("{iface}'s link type: {e}"))?;
+    let t: u32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{iface}'s link type reads `{}`", raw.trim()))?;
+    match t {
+        ARPHRD_ETHER => Ok(Link::Ethernet),
+        t if IP_LINKS.contains(&t) => Ok(Link::Ip),
+        t => Err(format!(
+            "{iface} is link type {t}, neither Ethernet nor an IP device: its samples could \
+             not be framed for a collector"
+        )),
+    }
+}
+
 /// Why `iface` may not be sampled by the kernel sampler, if it may not.
 /// `sampled`: the ports fast-path's programs or VPP sample, and `kernel`
 /// every `kernel-sample` interface (`iface` among them or not). A packet
@@ -115,6 +141,9 @@ pub fn refusal(iface: &str, sampled: &[String], kernel: &[String]) -> Option<Str
         .unwrap_or(0);
     if flags & libc::IFF_LOOPBACK as u32 != 0 {
         return Some(format!("{iface} is a loopback"));
+    }
+    if let Err(why) = link_of(iface) {
+        return Some(why);
     }
     if let Some(port) = lowers(iface, 4)
         .into_iter()
@@ -352,6 +381,13 @@ mod tests {
         assert!(refusal("pf-no-such-dev0", &[], &[])
             .unwrap()
             .contains("does not exist"));
+    }
+
+    #[test]
+    fn a_link_type_neither_ethernet_nor_ip_is_refused() {
+        let e = link_of("lo").unwrap_err();
+        assert!(e.contains("link type 772"), "{e}");
+        assert!(link_of("pf-no-such-dev0").is_err());
     }
 
     #[test]
