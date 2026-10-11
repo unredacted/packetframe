@@ -1,0 +1,20 @@
+# FastNetMon Community for PacketFrame's sFlow (`kind ddos`): a project of
+# its own, so it can move to another host without touching Akvorado.
+name: fastnetmon
+services:
+  fastnetmon:
+    # Pinned by digest. 1.2.9 has CVE-2026-92698, an out-of-bounds read
+    # from one crafted sFlow datagram: README.md says what limits it here,
+    # and to move to the first release with the fix (none yet).
+    image: ghcr.io/pavel-odintsov/fastnetmon-community:1.2.9@sha256:c154b5b5fd74286719c1c1b97d02157a559926b7749fb5afa958d5faccbd5a0e
+    restart: unless-stopped
+    mem_limit: 512m
+    ports:
+      - ${COLLECTOR_ADDR:?set COLLECTOR_ADDR in .env}:6343:6343/udp
+      # Its Prometheus counters, for this host only.
+      - 127.0.0.1:9209:9209/tcp
+    volumes:
+      - ./fastnetmon.conf:/etc/fastnetmon.conf:ro
+      - ./networks_list:/etc/networks_list:ro
+      - ./notify_about_attack.sh:/usr/local/bin/notify_about_attack.sh:ro
+      - ./log:/var/log/fnm

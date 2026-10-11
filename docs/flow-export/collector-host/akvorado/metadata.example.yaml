@@ -1,0 +1,31 @@
+# Replaces the `metadata:` section of the quickstart's config/outlet.yaml
+# (its SNMP provider: the routers answer no SNMP). One `exporters` entry
+# per router, keyed by that router's `source-address`; each entry is what
+# `packetframe flow-export interfaces --default-speed 1000` prints on that
+# router, from `name:` down.
+metadata:
+  providers:
+    - type: static
+      exporters:
+        "192.0.2.1":
+          name: "router-a"
+          default:
+            name: "unknown"
+            description: "not an interface PacketFrame reports"
+            speed: 1000
+          ifindexes:
+            3:
+              name: "eth1"
+              description: "PacketFrame fast-path"
+              speed: 10000
+        "192.0.2.2":
+          name: "router-b"
+          default:
+            name: "unknown"
+            description: "not an interface PacketFrame reports"
+            speed: 1000
+          ifindexes:
+            3:
+              name: "eth1"
+              description: "PacketFrame fast-path"
+              speed: 10000
