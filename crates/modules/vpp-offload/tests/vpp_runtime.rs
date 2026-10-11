@@ -6041,6 +6041,9 @@ mod steered_seeded {
     /// table as a resync begins its walk — when it discards the source's
     /// queued deltas, after the door's legs were read: the route source
     /// changing the mirror under a door that has already opened.
+    /// `learn_later` is a neighbour the source learned after the walk read
+    /// its neighbours: queued as a neighbour delta (which no walk
+    /// supersedes), and part of the neighbour table once handed over.
     pub struct Mirror {
         pub routes: Mutex<Vec<(IpPrefix, IpAddr)>>,
         pub walks: AtomicUsize,
@@ -6049,6 +6052,8 @@ mod steered_seeded {
         pub neighbour_reads: AtomicUsize,
         pub neighbours_for: AtomicUsize,
         pub replace_at_walk: Mutex<Option<Vec<(IpPrefix, IpAddr)>>>,
+        pub learn_later: Mutex<Option<(IpAddr, [u8; 6])>>,
+        pub learned: Mutex<Vec<(IpAddr, [u8; 6])>>,
         pub session: Arc<FeedSession>,
     }
     impl Mirror {
@@ -6061,6 +6066,8 @@ mod steered_seeded {
                 neighbour_reads: AtomicUsize::new(0),
                 neighbours_for: AtomicUsize::new(usize::MAX),
                 replace_at_walk: Mutex::new(None),
+                learn_later: Mutex::new(None),
+                learned: Mutex::new(Vec::new()),
                 session,
             })
         }
@@ -6094,6 +6101,14 @@ mod steered_seeded {
                 *self.0.routes.lock().unwrap() = table;
             }
         }
+        fn drain_changes(&self, _max: usize) -> packetframe_vpp_offload::engine::SourceChanges {
+            let mut changes = packetframe_vpp_offload::engine::SourceChanges::default();
+            if let Some((nh, mac)) = self.0.learn_later.lock().unwrap().take() {
+                self.0.learned.lock().unwrap().push((nh, mac));
+                changes.neighbours.push((nh, Some(("eth4".into(), mac))));
+            }
+            changes
+        }
         fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
             let read = self.0.neighbour_reads.fetch_add(1, Ordering::SeqCst);
             if !self.0.neighbours.load(Ordering::SeqCst)
@@ -6104,6 +6119,9 @@ mod steered_seeded {
             visit(fake_vpp::nh(), "eth4", MAC);
             visit(other_nh(), "eth4", [0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
             visit(nh6(), "eth4", [0x02, 0x00, 0x00, 0x00, 0x00, 0x06]);
+            for (nh, mac) in self.0.learned.lock().unwrap().iter() {
+                visit(*nh, "eth4", *mac);
+            }
         }
     }
 
@@ -7408,4 +7426,59 @@ fn a_full_table_counts_the_additions_its_unresolvable_replaces_make_room_for() {
         want,
         "the drain frees two slots and fills them: four changes"
     );
+}
+
+/// An addition is an addition whether or not its next hop resolves at the
+/// walk. Fifty routes the seed holds and VPP does not go through a next
+/// hop whose neighbour the source learns only after the walk has read its
+/// neighbours: the walk finds them unresolvable, but each upsert keeps its
+/// next hop, the neighbour's delta is not one a walk supersedes, and
+/// `apply_changes` hands it to the engine before the drain resolves the
+/// upserts — fifty routes installed on the steered VPP. Counted as
+/// additions, the door refuses, nothing is queued, and the quiet door
+/// lands the same fifty. Counted by whether they resolved at the walk,
+/// they passed the guard as nothing (review finding, PR #356).
+#[test]
+fn an_unresolved_addition_counts_though_its_neighbour_arrives_later() {
+    use steered_seeded::*;
+    let late = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
+    let vpp = table(200);
+    let mut mirror = vpp.clone();
+    mirror.extend((0..50).map(|i| {
+        (
+            IpPrefix::V4 {
+                addr: [198, 51, 100, 150 + i],
+                prefix_len: 32,
+            },
+            late,
+        )
+    }));
+    let mut d = Driver::new();
+    let (f, t0) = adopted("ss-learned-late", vpp, mirror, ALL, &mut d);
+    *f.mirror.learn_later.lock().unwrap() = Some((late, [0x02, 0x00, 0x00, 0x00, 0x00, 0x09]));
+    let (now, seen) = replay(&mut d, &f, t0, 200, |_| false);
+    assert_eq!(d.state(), State::AdoptedResyncing, "{seen:?}");
+    assert!(
+        preserved::route_ops(&f.fake.drain_events()).is_empty(),
+        "none of the fifty reaches the steered VPP"
+    );
+    let status = f.rt.status();
+    assert_eq!(status.pending_ops, 0, "and none was queued");
+    let refused = status
+        .seeded_door_refused
+        .expect("fifty additions are past two");
+    assert_eq!(
+        (refused.withdrawals, refused.replaces, refused.additions),
+        (0, 0, 50)
+    );
+
+    // Once the replay goes quiet, the quiet door lands them as it always
+    // did — the neighbour arrives, and all fifty install.
+    let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+    let adds = preserved::route_ops(&f.fake.drain_events())
+        .into_iter()
+        .filter(|(add, _)| *add)
+        .count();
+    assert_eq!(adds, 50, "the neighbour learned later installs every one");
 }

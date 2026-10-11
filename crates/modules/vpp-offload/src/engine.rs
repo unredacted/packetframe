@@ -458,10 +458,13 @@ impl ResyncPlan {
 /// What a resync plan does to one address family of VPP's table, counted
 /// against the routes VPP forwards on when it is made.
 ///
-/// Every upsert of the plan is a replace, an addition, or neither: an
-/// upsert of a prefix VPP does not hold whose next hops all resolve to
-/// nothing sends VPP nothing (the drain records it unresolvable), so it
-/// changes nothing VPP forwards.
+/// Every upsert of the plan is a replace or an addition, by whether the
+/// ledger records VPP holding the prefix — never by whether its next hops
+/// resolve during the walk. The upsert keeps its next hops, and the drain
+/// resolves them only when it reaches the route: a neighbour learned in
+/// between (its delta is not one a walk supersedes, and `apply_changes`
+/// applies it before the drain) turns an upsert that resolved to nothing
+/// at the walk into a route VPP installs (review finding, PR #356).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Disturbance {
     /// Prefixes VPP holds that the plan withdraws.
@@ -471,11 +474,10 @@ pub struct Disturbance {
     /// holds, or through none it can resolve now, which the drain then
     /// removes from VPP as unresolvable.
     pub replaces: u64,
-    /// Prefixes VPP does not hold that the plan sends through a next hop
-    /// that resolves now: routes VPP will forward on that it did not
-    /// before (one whose interface has no index yet is deferred, not
-    /// dropped, so it counts too). All of them, including any a table at
-    /// its high-water mark would withhold.
+    /// Prefixes the ledger does not record VPP holding that the plan
+    /// sends: routes VPP may forward on that it did not before. All of
+    /// them, whether their next hops resolve at the walk or not, and
+    /// including any a table at its high-water mark would withhold.
     pub additions: u64,
 }
 
@@ -4153,9 +4155,9 @@ impl ConvergenceEngine {
             }
             // A route VPP holds (or has been handed) through other paths,
             // or through none it can resolve now: the upsert replaces, or
-            // removes, one it forwards on. Otherwise it adds a route VPP
-            // will forward on — if any next hop resolves; one whose next
-            // hops all resolve to nothing sends VPP nothing.
+            // removes, one it forwards on. Otherwise it adds one, whether
+            // or not a next hop resolves at this moment: see
+            // [`Disturbance`].
             if matches!(
                 self.ledger.state_of(prefix),
                 Some(
@@ -4163,10 +4165,7 @@ impl ConvergenceEngine {
                 )
             ) {
                 plan.family_mut(&prefix).replaces += 1;
-            } else if nexthops
-                .iter()
-                .any(|nh| self.nexthops.resolve(nh).is_some())
-            {
+            } else {
                 plan.family_mut(&prefix).additions += 1;
             }
             ops.put(&mut self.pending, WalkOp::Upsert(prefix, nexthops.to_vec()));

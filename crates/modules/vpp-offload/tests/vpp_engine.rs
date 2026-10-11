@@ -625,8 +625,9 @@ fn adoption_withdraws_stale_routes_without_touching_vpps_own() {
 /// none, so nothing it adopts can read unchanged), one prefix of each
 /// kind: held through the same paths (unchanged), held through another
 /// next hop (a replace), held and no longer advertised (a withdrawal),
-/// new (an addition), and new through a next hop with no neighbour — an
-/// upsert that sends VPP nothing, so neither a replace nor an addition.
+/// new (an addition), and new through a next hop with no neighbour —
+/// an addition too: the upsert keeps its next hops, and a neighbour
+/// learned before the drain reaches it installs it.
 #[test]
 fn a_judged_resync_commits_only_the_plan_its_judge_saw() {
     use packetframe_vpp_offload::engine::Disturbance;
@@ -715,9 +716,9 @@ fn a_judged_resync_commits_only_the_plan_its_judge_saw() {
         Disturbance {
             withdrawals: 1,
             replaces: 1,
-            additions: 1,
+            additions: 2,
         },
-        "the unresolvable new route adds nothing VPP forwards on: {refused:?}"
+        "the unresolved new route is an addition all the same: {refused:?}"
     );
     assert_eq!(refused.v6, Disturbance::default());
     assert_eq!(engine.pending().len(), 0, "a refusal queues nothing");

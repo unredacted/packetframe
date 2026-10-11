@@ -1102,14 +1102,17 @@ clean stop: the fast-path's of the route mirror, vpp-offload's of what
 VPP acknowledged from that mirror. They differ only by what VPP had not
 received or acknowledged at that moment, which is churn-sized. Routes the
 previous process kept out of VPP do not count: a shadowed,
-kernel-delivered or link-local-only route is left out of the diff again,
-and a route whose next hop resolved to nothing then and still does adds
-nothing. A route the previous process withheld at the family's
-high-water mark does count as an addition: the drain withdraws a replaced
-route whose next hops resolve to nothing, freeing a slot an addition then
-takes, so the guard counts additions whole rather than estimate the
-room. Only a table already over its capacity has such routes; it is
-degraded anyway, and a refusal there costs the old wait. The replay's re-advertisement of an
+kernel-delivered or link-local-only route is left out of the diff again.
+Routes it left unresolvable or withheld do count, as additions: VPP's
+preserved ledger records only what VPP installed, and an unresolved
+route keeps its next hops, so a neighbour learned before the drain
+reaches it installs it on the steered VPP. Additions also count whole
+rather than against an estimate of the room left (the drain withdraws a
+replaced route whose next hops resolve to nothing, freeing a slot an
+addition then takes). On a healthy box these are a handful: `fib-synced`
+names every unresolvable route, and withheld ones exist only on a table
+over its capacity, degraded anyway. Where there are more, a refusal
+costs the old wait. The replay's re-advertisement of an
 unchanged route is no FIB write and no VPP delta (the fast-path's
 no-change shortcut), and the walk drops the deltas the seed queued. What
 the seed holds that the source dropped while the daemon was down leaves

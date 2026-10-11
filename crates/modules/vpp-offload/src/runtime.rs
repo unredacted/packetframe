@@ -1823,17 +1823,20 @@ impl std::fmt::Display for SeededDiffRefusal {
 /// acknowledged at that moment — churn-sized, the drain's backlog — and by
 /// routes the previous process kept out of VPP, none of which counts
 /// here: a shadowed, kernel-delivered or link-local-only route is left out
-/// of the walk's upserts as it was left out of VPP, and one that resolved
-/// to nothing then and still does adds nothing, so it is no addition
-/// ([`crate::engine::Disturbance::additions`]). One the previous process
-/// withheld at the family's high-water mark does count as an addition: the
-/// guard does not model the drain's capacity, because a room estimate
+/// of the walk's upserts as it was left out of VPP. Routes it left
+/// unresolvable or withheld do count, as additions: VPP's preserved ledger
+/// records only the routes VPP had installed, so the seeded ledger knows
+/// nothing of them ([`crate::engine::Disturbance::additions`]). Counting
+/// them is the safe reading, not an artefact of it. An unresolved upsert
+/// keeps its next hops, and a neighbour learned before the drain reaches
+/// it installs it on the steered VPP (review finding, PR #356); the guard
+/// does not model the drain's capacity either, because a room estimate
 /// undercounts (a replace whose next hops resolve to nothing is withdrawn
-/// by the drain, freeing a slot an addition then takes — review finding,
-/// PR #356). Only a table already over its capacity has such routes, and
-/// it is degraded and alarming anyway; a refusal there costs the old wait,
-/// and on the reference table the high-water mark sits far above the
-/// adopted size.
+/// by the drain, freeing a slot an addition then takes). On a healthy box
+/// they are a handful — the status row names every unresolvable route,
+/// and a withheld one exists only on a table over its capacity, degraded
+/// and alarming anyway. Where there are more, a refusal costs the old
+/// wait.
 /// Re-advertisements of unchanged routes are no change at all: the
 /// fast-path programmer's no-change shortcut makes an identical
 /// advertisement no FIB write and so no VPP delta, and the resync walk has
