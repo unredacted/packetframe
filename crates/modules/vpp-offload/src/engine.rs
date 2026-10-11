@@ -417,6 +417,13 @@ pub struct ResyncPlan {
     /// preserved-ledger adoption this is nearly the whole table — the
     /// point of preserving it; on a fresh resync it is zero.
     pub unchanged: u64,
+    /// Of `upserts`, the prefixes VPP is recorded holding (installed, or
+    /// handed to the transport) through other paths: a replace of a route
+    /// it forwards on now. The rest of `upserts` add a prefix it does not
+    /// hold. With `withdrawals`, what the diff takes away from or moves
+    /// under traffic already on VPP — which is what the steered seeded
+    /// diff's early door bounds (`runtime`'s `seeded_diff_refusal`).
+    pub replaces: u64,
     /// IPv6 source routes left out of VPP because every next hop is
     /// link-local (see [`ConvergenceEngine`]'s link-local refusal).
     pub link_local_refused: u64,
@@ -426,6 +433,15 @@ pub struct ResyncPlan {
     /// which used to report ~252k v6 "upserts" on a full-table box only
     /// for the drainer to discard each one.
     pub out_of_family: u64,
+}
+
+/// Whether a resync walk queues the diff it plans
+/// ([`ConvergenceEngine::begin_resync`]) or only counts it
+/// ([`ConvergenceEngine::preview_resync`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    Commit,
+    Preview,
 }
 
 /// What a verify pass concluded, and whether traffic may be diverted
@@ -3908,7 +3924,35 @@ impl ConvergenceEngine {
         // The ledger is rebuilt from here, so no verify has disproved the
         // one it becomes (`disproved`).
         self.disproved = false;
+        self.walk_resync(src, Walk::Commit)
+    }
 
+    /// The plan [`Self::begin_resync`] would queue now, with nothing
+    /// queued, nothing asked of VPP and no route delta discarded: the same
+    /// walk, through the same classification, minus every effect on the
+    /// pending map. For a caller that must judge a diff BEFORE it lands —
+    /// the steered seeded diff's early door, which refuses a diff that
+    /// would disturb more of a traffic-carrying VPP than two snapshots of
+    /// one stop can differ by (`runtime`'s `seeded_diff_refusal`).
+    ///
+    /// What it does change is what any walk refreshes about the kernel and
+    /// the mirror: the nexthop map, the FDB and bridge-port VLAN reads, and
+    /// the walk's own classification (shadowed, kernel-delivered and
+    /// link-local-refused prefixes, the kernel lookups' budget and
+    /// refusals). Those describe the world as it is now, the status rows
+    /// read them, and the next walk rebuilds every one of them from
+    /// scratch, so a preview that is not followed by a resync leaves them
+    /// truthful rather than stale. The ledger, the pending map, the phase
+    /// and the source's queued deltas are untouched.
+    pub fn preview_resync(&mut self, src: &dyn RouteSource) -> ResyncPlan {
+        self.walk_resync(src, Walk::Preview)
+    }
+
+    /// The resync walk, shared by [`Self::begin_resync`] (`Commit`) and
+    /// [`Self::preview_resync`] (`Preview`) so a preview counts exactly the
+    /// diff a resync would queue.
+    fn walk_resync(&mut self, src: &dyn RouteSource, walk: Walk) -> ResyncPlan {
+        let commit = walk == Walk::Commit;
         // Rebuild, not merge. An insert-only refresh leaves a nexthop the
         // source has stopped reporting mapped to its last known device,
         // so a route still naming it resolves as reachable through a
@@ -3960,8 +4004,11 @@ impl ConvergenceEngine {
         let families = self.drainer.families();
         // Immediately before the walk, never earlier: what is queued now
         // is what the walk supersedes, and anything written from here on
-        // stays a delta. See `RouteSource::discard_route_deltas`.
-        src.discard_route_deltas();
+        // stays a delta. See `RouteSource::discard_route_deltas`. Never
+        // for a preview: no walk that queues nothing supersedes anything.
+        if commit {
+            src.discard_route_deltas();
+        }
         src.for_each_route(&mut |prefix, nexthops| {
             // A family VPP does not carry never enters the diff — the
             // route-side twin of the neighbour filter
@@ -4005,20 +4052,40 @@ impl ConvergenceEngine {
             // with itself. Anything owed for it from before this walk is
             // an OLDER intent, and goes.
             if self.installed_unchanged(prefix, nexthops) {
-                self.pending.discard(prefix);
+                if commit {
+                    self.pending.discard(prefix);
+                }
                 plan.unchanged += 1;
                 return;
             }
-            self.pending.upsert(prefix, nexthops.to_vec());
+            // A route VPP holds (or has been handed) through other paths:
+            // the upsert replaces one it forwards on, where the rest add a
+            // prefix it does not hold.
+            if matches!(
+                self.ledger.state_of(prefix),
+                Some(
+                    crate::sink::RouteState::Installed | crate::sink::RouteState::Installing { .. }
+                )
+            ) {
+                plan.replaces += 1;
+            }
+            if commit {
+                self.pending.upsert(prefix, nexthops.to_vec());
+            }
             plan.upserts += 1;
         });
 
         let known: HashSet<IpPrefix> = self.ledger.known_prefixes().into_iter().collect();
         for prefix in &known {
             if !seen.contains(prefix) {
-                self.pending.withdraw(*prefix);
+                if commit {
+                    self.pending.withdraw(*prefix);
+                }
                 plan.withdrawals += 1;
             }
+        }
+        if !commit {
+            return plan;
         }
 
         // Drop leftovers from an aborted resync. Those prefixes live only

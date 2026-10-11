@@ -613,6 +613,118 @@ fn adoption_withdraws_stale_routes_without_touching_vpps_own() {
     );
 }
 
+/// A preview counts exactly the diff the resync then queues, and queues
+/// none of it: the steered seeded diff's guard judges the plan through
+/// this, before anything reaches a VPP that is carrying traffic, so a
+/// preview that measured a different diff — or that left work in the
+/// pending map, or discarded the source's queued deltas as only a real
+/// walk may — would be a guard on something other than what lands.
+///
+/// Over a ledger whose paths VPP acknowledged (a dump adoption records
+/// none, so nothing it adopts can read unchanged), one prefix of each
+/// kind: held through the same paths (unchanged), held through another
+/// next hop (a replace), held and no longer advertised (a withdrawal),
+/// and new (an addition: an upsert that is not a replace).
+#[test]
+fn a_preview_counts_the_resync_it_precedes_and_queues_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let other_nh = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+    let p = |a: [u8; 4], len| IpPrefix::V4 {
+        addr: a,
+        prefix_len: len,
+    };
+    struct Source {
+        routes: Vec<(IpPrefix, IpAddr)>,
+        other_nh: IpAddr,
+        discarded: AtomicUsize,
+    }
+    impl RouteSource for Source {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("nothing is handed back in this test")
+        }
+        fn route_count(&self) -> u64 {
+            self.routes.len() as u64
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for (prefix, via) in &self.routes {
+                visit(*prefix, &[*via]);
+            }
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(nh(), "eth4", MAC);
+            visit(self.other_nh, "eth4", [0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        }
+        fn discard_route_deltas(&self) {
+            self.discarded.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let source = |routes| Source {
+        routes,
+        other_nh,
+        discarded: AtomicUsize::new(0),
+    };
+    let fake = Fake::start("preview-resync");
+    let mut engine = engine_for(&fake);
+    assert!(engine.api_ready(), "handshake");
+    engine.attach_devices(AttachMode::Fresh).expect("attach");
+    // What VPP holds, acknowledged through these paths.
+    let before = source(vec![
+        (p([203, 0, 113, 0], 27), nh()),
+        (p([203, 0, 113, 32], 27), nh()),
+        (p([203, 0, 113, 64], 27), nh()),
+    ]);
+    let _ = engine.begin_resync(&before);
+    engine.program_neighbours(&before).expect("neighbours land");
+    drain_to_empty(&mut engine);
+    assert_eq!(engine.counts().installed, 3);
+    let _ = fake.drain_events();
+
+    let after = source(vec![
+        (p([203, 0, 113, 0], 27), nh()),
+        (p([203, 0, 113, 32], 27), other_nh),
+        (p([198, 51, 100, 128], 25), nh()),
+    ]);
+    let preview = engine.preview_resync(&after);
+    assert_eq!(
+        (
+            preview.unchanged,
+            preview.upserts,
+            preview.replaces,
+            preview.withdrawals
+        ),
+        (1, 2, 1, 1),
+        "{preview:?}"
+    );
+    assert_eq!(engine.pending().len(), 0, "a preview queues nothing");
+    assert_eq!(
+        after.discarded.load(Ordering::SeqCst),
+        0,
+        "and supersedes no delta: it queued nothing to supersede them with"
+    );
+
+    let plan = engine.begin_resync(&after);
+    assert_eq!(
+        plan, preview,
+        "the preview is the plan, not an estimate of it"
+    );
+    assert_eq!(
+        engine.pending().len() as u64,
+        plan.upserts + plan.withdrawals,
+        "the resync queues what both counted"
+    );
+    assert_eq!(after.discarded.load(Ordering::SeqCst), 1);
+    assert!(
+        !fake
+            .drain_events()
+            .iter()
+            .any(|e| matches!(e, Event::Route(_))),
+        "neither walk sends a route to VPP: the drain does"
+    );
+}
+
 /// The generated `Encode` and `Decode` must agree on a reply's
 /// geometry, proven by round-tripping a ping through the fake.
 ///
