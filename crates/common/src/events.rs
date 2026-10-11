@@ -146,6 +146,17 @@ pub mod kind {
     /// (`port`, `drops_per_second`, `queue0_share`, `dropping`).
     /// Rate-limited at the source.
     pub const KERNEL_PATH_DROPPING: &str = "kernel_path_dropping";
+    /// An adopted resync's deferred diff ran: `door` says what released
+    /// it (`quiet`, the route source loaded and quiet; `seeded`, the
+    /// seeded-mirror door), with `path`, `steered`, `routes` and what the
+    /// diff queued (`unchanged`, `upserts`, `replaces`, `withdrawals`).
+    pub const RESYNC_RELEASED: &str = "resync_released";
+    /// A steered seeded adoption's early diff door stayed shut because the
+    /// diff it previewed would withdraw or replace more of the adopted
+    /// table than two snapshots of one stop can differ by (`adopted`,
+    /// `withdrawals`, `replaces`, `allowance`); the diff waits for the
+    /// route source's replay to go quiet instead.
+    pub const SEEDED_DOOR_REFUSED: &str = "seeded_door_refused";
 
     // --- fast-path ---
     /// `wan-egress` put back policy rules that had disappeared from the

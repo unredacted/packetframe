@@ -982,7 +982,11 @@ impl Supervisor {
             // steered on is now known wrong, which is the one thing rule 1
             // exists to keep traffic out of — and the eBPF tier is loaded,
             // because the seeded diff ran only after the loaded-and-quiet
-            // release. `steered` clears on the acknowledgement as ever; a
+            // release, or after the seeded-mirror door, whose legs are the
+            // completeness authority counting complete the very mirror the
+            // eBPF tier forwards on (`runtime`'s
+            // `seeded_mirror_releases_diff`). `steered` clears on the
+            // acknowledgement as ever; a
             // refused removal leaves the rules in the NIC, so the
             // restarted resync sees them and takes the pre-dump deferral,
             // which re-asks through `FallbackSettled`. That is also why

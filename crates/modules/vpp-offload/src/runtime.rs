@@ -1192,6 +1192,12 @@ struct FallbackReading {
     live: bool,
     /// The completeness authority's current word is NO.
     veto: bool,
+    /// The seeded-mirror door's legs hold
+    /// ([`seeded_mirror_releases_diff`]), judged from the same session
+    /// observation as everything else here. Not a release by itself: the
+    /// stage decides what the door may open (`AwaitingSeededDiff` only
+    /// after its guard, `AwaitingFallback` only when handed over by it).
+    seeded_door: bool,
 }
 
 /// What a deferred adopted reconciliation is waiting for.
@@ -1258,6 +1264,24 @@ enum DeferredResync {
         /// the revocation below puts traffic back on the intact adopted
         /// FIB for it.
         settled_have: Option<u64>,
+        /// The steered seeded diff's early door handed this stage over: it
+        /// opened, and VPP's route counts then no longer matched the
+        /// preserved ledger (`AwaitingSeededDiff`). Set nowhere else.
+        ///
+        /// The same door then releases THIS stage, for as long as its legs
+        /// hold ([`FallbackReading::seeded_door`]), so the unsteer the dump
+        /// owes goes out at once — the release the door earned carries
+        /// over, as a quiet release always has — rather than after the
+        /// route source's replay goes quiet, minutes of traffic on a FIB
+        /// the seed is now known to misdescribe. What the door's legs
+        /// prove is what this stage asks of the fallback: the eBPF tier
+        /// forwards on the very mirror the authority just counted
+        /// complete, seeded before the route source connected. Nothing the
+        /// door releases here lands on traffic: the dump reads an idle VPP,
+        /// the diff that follows is #324's unsteered one, and a kept dump
+        /// that a revocation put traffic back over is left to the quiet
+        /// release.
+        seeded_door: bool,
     },
     /// An UNSTEERED adoption whose dump has already run — harmlessly,
     /// because with no rules installed nothing is on VPP for the
@@ -1275,7 +1299,25 @@ enum DeferredResync {
     /// diff against a loading source is ~all withdrawals (drill (d)). The
     /// floor is half the seeded table rather than a capacity fraction:
     /// here the adopted size IS known.
-    AwaitingSeededDiff { feed: FeedGate },
+    ///
+    /// A mirror the fast-path seeded from ITS route ledger has a second,
+    /// earlier door, the unsteered stage's one
+    /// ([`seeded_mirror_releases_diff`]), guarded here because this diff
+    /// lands on traffic: it opens only for a diff that disturbs no more
+    /// of VPP's table than two snapshots of one clean stop can differ by
+    /// ([`seeded_diff_refusal`]).
+    AwaitingSeededDiff {
+        feed: FeedGate,
+        /// The early door previewed its diff and refused it. Latched for
+        /// the rest of this deferral, which then waits for the replay to
+        /// go quiet as it always did. Not retried: what the preview
+        /// measured is a disagreement between the two snapshots that only
+        /// the replay corrects, the replay going quiet is what the other
+        /// door waits for anyway, and each retry would be another whole
+        /// walk of the mirror on the supervision thread. Reported by the
+        /// deferral's status row.
+        refused: Option<SeededDiffRefusal>,
+    },
 }
 
 impl DeferredResync {
@@ -1283,7 +1325,7 @@ impl DeferredResync {
         match self {
             DeferredResync::AwaitingFallback { feed, .. } => feed.gate.floor,
             DeferredResync::AwaitingDiff { gate, .. } => gate.floor,
-            DeferredResync::AwaitingSeededDiff { feed } => feed.gate.floor,
+            DeferredResync::AwaitingSeededDiff { feed, .. } => feed.gate.floor,
         }
     }
 
@@ -1292,8 +1334,17 @@ impl DeferredResync {
     fn feed(&self) -> Option<&FeedGate> {
         match self {
             DeferredResync::AwaitingFallback { feed, .. }
-            | DeferredResync::AwaitingSeededDiff { feed } => Some(feed),
+            | DeferredResync::AwaitingSeededDiff { feed, .. } => Some(feed),
             DeferredResync::AwaitingDiff { .. } => None,
+        }
+    }
+
+    /// Why the steered seeded diff's early door is shut for this
+    /// deferral, if its guard refused it.
+    fn seeded_door_refused(&self) -> Option<SeededDiffRefusal> {
+        match self {
+            DeferredResync::AwaitingSeededDiff { refused, .. } => *refused,
+            _ => None,
         }
     }
 }
@@ -1553,9 +1604,12 @@ impl std::fmt::Display for SteerHold {
     }
 }
 
-/// Whether an UNSTEERED adoption's resync diff may run against the mirror
-/// now, because the fast-path seeded it from its route ledger, rather
-/// than after the route source's replay has gone quiet.
+/// Whether an adopted resync diff may run against the mirror now, because
+/// the fast-path seeded it from its route ledger, rather than after the
+/// route source's replay has gone quiet: the seeded-mirror door. An
+/// UNSTEERED adoption (`AwaitingDiff`) takes it as it stands; a STEERED
+/// one (`AwaitingSeededDiff`), whose diff lands on traffic, takes it only
+/// past a guard on the diff itself ([`seeded_diff_refusal`]).
 ///
 /// **What the quiet protects, and against what.** The diff withdraws
 /// from VPP every route the mirror lacks, so it is only as good as the
@@ -1605,9 +1659,12 @@ impl std::fmt::Display for SteerHold {
 /// down reach VPP when the replay re-advertises them, as ordinary
 /// deltas, and routes it withdrew leave VPP when the route source's GC
 /// withdraws them from the mirror — exactly as on the eBPF tier, which
-/// forwards on the same seed. VPP carries no traffic at this stage
-/// either way; what the door changes is that verify, and with it the
-/// first steer, need not wait out the replay.
+/// forwards on the same seed. On an unsteered adoption VPP carries no
+/// traffic either way, and what the door changes is that verify, and
+/// with it the first steer, need not wait out the replay. On a steered
+/// one it changes what VPP forwards while the replay runs — see
+/// [`seeded_diff_refusal`] for why that is safe, and for the guard that
+/// keeps it so.
 fn seeded_mirror_releases_diff(
     liveness: Option<packetframe_common::fib::FeedLiveness>,
     authority: Option<bool>,
@@ -1624,6 +1681,137 @@ fn seeded_mirror_releases_diff(
 /// handed over before any route source can connect, so this is the first
 /// session after the seed.
 const FIRST_FEED_EPOCH: u64 = 1;
+
+/// The most of the adopted table a STEERED seeded diff may disturb — the
+/// prefixes it withdraws plus those it replaces
+/// ([`crate::engine::ResyncPlan::replaces`]) — and still take the early
+/// door: [`packetframe_common::fib::STEER_MAX_DRIFT`] of it, rounded down.
+///
+/// That fraction, because it draws the same line one step over. The
+/// authority counts a mirror within 1% of its source as converged since
+/// what that separates is a table still arriving (tens of percent short)
+/// from a converged one with churn on top. This asks whether the seed and
+/// VPP's preserved FIB differ by churn — what one clean stop's two
+/// snapshots can disagree by (below) — or by a table. The same constant
+/// rather than a second 1%, deliberately: both bounds are sized to the
+/// churn a converged table sees, so a deployment whose churn needs the
+/// authority's bound widened needs this one widened with it. Measured on
+/// the adopted table, the routes VPP forwards on now, and not floored: on a
+/// table small enough for 1% to round to a handful, the replay the door
+/// saves is a burst of a second or two (bgpd paces it at about 2,000
+/// routes a second), so refusing costs nothing there.
+fn seeded_diff_allowance(adopted: u64) -> u64 {
+    // f64 is exact for any table a FIB can hold (far below 2^53), and the
+    // product is truncated toward zero: the allowance never rounds up.
+    (adopted as f64 * packetframe_common::fib::STEER_MAX_DRIFT) as u64
+}
+
+/// The steered seeded diff's early door refused the diff it previewed:
+/// it would disturb more of the adopted table than
+/// `seeded_diff_allowance`. Latched for the deferral
+/// (`DeferredResync::AwaitingSeededDiff::refused`), reported by its status
+/// row and recorded as `seeded_door_refused`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeededDiffRefusal {
+    /// The adopted table: the routes the preserved ledger seeded.
+    pub adopted: u64,
+    /// Routes VPP forwards on that the diff would withdraw.
+    pub withdrawals: u64,
+    /// Routes VPP forwards on that the diff would replace: send through
+    /// other paths, or through none it can resolve, which the drain then
+    /// removes from VPP as unresolvable.
+    pub replaces: u64,
+    /// `seeded_diff_allowance` of `adopted`: 1% of it, rounded down.
+    pub allowance: u64,
+}
+
+impl std::fmt::Display for SeededDiffRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the early door for a mirror the fast-path seeded is shut for this restart: its diff \
+             would withdraw {} and replace {} of the {} routes VPP is forwarding on, more than \
+             the {} that two snapshots of one clean stop can differ by, so the two ledgers \
+             disagree and the diff waits for the route source's replay to go quiet instead",
+            self.withdrawals, self.replaces, self.adopted, self.allowance
+        )
+    }
+}
+
+/// Whether a STEERED seeded adoption's early diff must be refused, judged
+/// on the plan the diff would queue
+/// ([`crate::engine::ConvergenceEngine::preview_resync`]), before anything
+/// of it reaches VPP. `adopted` is the seeded table.
+///
+/// **What is different when the diff lands on traffic.** On an unsteered
+/// adoption the seeded door's legs ([`seeded_mirror_releases_diff`]) are
+/// enough: whatever the diff does, nothing is forwarding through VPP. A
+/// steered VPP is forwarding through every route the diff touches, so
+/// what matters is what the early diff does that the quiet one would not
+/// have. Against the diff after the replay, it differs only by what the
+/// replay had not yet re-advertised when it ran:
+/// - **additions** are no different: the seed's routes stay in the mirror
+///   until the route source's GC, so the diff after the replay adds them
+///   too. Not counted.
+/// - **withdrawals** of routes VPP holds, the seed lacks and the replay
+///   would have brought back: an early diff takes them out of VPP until
+///   the replay reaches them (minutes, on a full table), and their
+///   traffic falls to a less specific route meanwhile. Counted.
+/// - **replaces** of routes VPP holds through other paths than the seed
+///   resolves to now, where the replay would have said otherwise again:
+///   an early diff moves their traffic onto the seed's paths until it
+///   does. Counted — and so is a route whose next hop resolves to nothing
+///   at the walk, which the drain would remove from VPP as unresolvable.
+///
+/// **Why the diff is near-empty when the premise holds.** Both ledgers
+/// are snapshots taken at the same clean stop: the fast-path's of the
+/// route mirror, vpp-offload's of what VPP acknowledged from that same
+/// mirror. They can disagree only by what VPP had not been sent or had
+/// not acknowledged at that moment — churn-sized, the drain's backlog —
+/// and by routes VPP is never given (withheld, unresolvable, shadowed),
+/// which the previous process left out of VPP for the same reasons this
+/// walk does. Re-advertisements of unchanged routes are no change at
+/// all: the fast-path programmer's no-change shortcut makes an identical
+/// advertisement no FIB write and so no VPP delta, and the resync walk has
+/// already dropped the deltas the seed itself queued
+/// (`RouteSource::discard_route_deltas`). What the seed holds that the
+/// source dropped while the daemon was down is not this diff's to remove:
+/// it leaves VPP as an ordinary delta when the route source's
+/// InitiationComplete GC withdraws it from the mirror, as it leaves the
+/// eBPF tier. And the replay's real changes reach VPP as ordinary deltas
+/// the moment they arrive, where the quiet gate froze VPP's FIB (no deltas
+/// apply during a deferral) for the replay's whole length.
+///
+/// **Why it is guarded anyway.** That premise — one stop, two snapshots —
+/// is not something this module can establish. Consume-once makes it the
+/// ordinary case (each ledger is removed by the start that reads it, and
+/// vpp-offload's carries a token the same stop wrote into its state
+/// file), but nothing here can see the fast-path ledger's stop, a stop
+/// can write one ledger and not the other, and a start that ran without
+/// vpp-offload consumes the fast-path ledger while leaving VPP's. Nor is
+/// the snapshot the whole of the walk: it resolves every route through
+/// the neighbours the feed holds at that moment, seconds into the
+/// process, and a next hop the fast-path's resolver has not re-announced
+/// yet takes every route through it out of VPP. Rather than treat any of
+/// this as given, the door measures what it would mean: a diff that
+/// disturbs more than [`seeded_diff_allowance`] says the snapshots
+/// disagree by more than churn, and the early door is refused
+/// for the deferral — the diff waits for the replay to go quiet, exactly
+/// as it did before the door existed. Refusing costs time and never
+/// correctness, and that is the direction an unverifiable premise must
+/// fail in.
+fn seeded_diff_refusal(
+    plan: &crate::engine::ResyncPlan,
+    adopted: u64,
+) -> Option<SeededDiffRefusal> {
+    let allowance = seeded_diff_allowance(adopted);
+    (plan.withdrawals.saturating_add(plan.replaces) > allowance).then_some(SeededDiffRefusal {
+        adopted,
+        withdrawals: plan.withdrawals,
+        replaces: plan.replaces,
+        allowance,
+    })
+}
 
 /// The authority's CURRENT word, or `None` when no authority is
 /// configured: the cached verdict must still permit steering AND the
@@ -2519,6 +2707,10 @@ impl Runtime {
             drift_scope_stale: c.drift_scope_stale.clone(),
             drift_v6: c.drift_v6.clone(),
             preserved_fib: c.seeded.is_some(),
+            seeded_door_refused: c
+                .deferred_resync
+                .as_ref()
+                .and_then(DeferredResync::seeded_door_refused),
             authority: authority_posture(
                 c.completeness.is_some(),
                 c.deferred_resync
@@ -2759,6 +2951,10 @@ pub struct RuntimeStatus {
     /// its preserved route ledger and not yet verified by this one. See
     /// `Core::seeded` and `StatusSnapshot::preserved_fib`.
     pub preserved_fib: bool,
+    /// The steered seeded diff's early door refused the diff it previewed,
+    /// so this deferral waits for the replay to go quiet. See
+    /// [`SeededDiffRefusal`].
+    pub seeded_door_refused: Option<SeededDiffRefusal>,
     /// How many rules the ledger names that the NIC no longer holds, as
     /// of the last audit. See [`STEER_AUDIT_EVERY`].
     pub steer_missing: usize,
@@ -3583,7 +3779,25 @@ impl Core {
             released: !veto && ((view.released && live) || complete),
             live,
             veto,
+            // From the same liveness and authority words as the rest of
+            // this reading. Its own epoch rule (the FIRST session only) is
+            // stricter than `demoted`, which a GC can lift: a reconnect
+            // shuts the door for good, whatever this gate's baseline.
+            seeded_door: seeded_mirror_releases_diff(liveness, authority, have, feed.gate.floor),
         }
+    }
+
+    /// The seeded-mirror door's legs, read afresh: for a stage that has
+    /// just spent time (a preview walk of the whole mirror, a dump) since
+    /// the reading that opened it, and must not land a diff on legs that
+    /// held before that time and do not now.
+    fn seeded_door_open(&self, have: u64, floor: u64) -> bool {
+        seeded_mirror_releases_diff(
+            self.feed_session.as_ref().map(|f| f.liveness()),
+            authority_current(&self.completeness, have),
+            have,
+            floor,
+        )
     }
 
     /// Check the preserved ledger against VPP and seed the engine from it,
@@ -3693,6 +3907,39 @@ fn adoption_path(path: &'static str, routes: u64) {
     event_log::Event::info(crate::MODULE_NAME, event_kind::ADOPTION_PATH)
         .field("path", path)
         .field("routes", routes)
+        .emit();
+}
+
+/// The name a release's journal line and `resync_released` event give the
+/// door that opened it.
+fn door_name(seeded: bool) -> &'static str {
+    if seeded {
+        "seeded"
+    } else {
+        "quiet"
+    }
+}
+
+/// An adopted resync's deferred diff ran, for the event log: which door
+/// released it (`seeded`, the seeded-mirror door, or `quiet`: the route
+/// source loaded and quiet), on which adoption path, whether VPP was
+/// carrying traffic, and what the diff queued.
+fn resync_released(
+    seeded: bool,
+    path: &'static str,
+    steered: bool,
+    plan: &crate::engine::ResyncPlan,
+    have: u64,
+) {
+    event_log::Event::info(crate::MODULE_NAME, event_kind::RESYNC_RELEASED)
+        .field("door", door_name(seeded))
+        .field("path", path)
+        .field("steered", steered)
+        .field("routes", have)
+        .field("unchanged", plan.unchanged)
+        .field("upserts", plan.upserts)
+        .field("replaces", plan.replaces)
+        .field("withdrawals", plan.withdrawals)
         .emit();
 }
 
@@ -3965,11 +4212,26 @@ impl ObserveView {
                     mut restoring,
                     spoiled,
                     mut settled_have,
+                    seeded_door,
                 } => {
                     let r = c.read_fallback(now, &mut feed, have, seq, pulses, spoiled);
                     let want = feed.gate.floor;
                     let unsteered = c.steering.installed().is_empty();
-                    if !r.released {
+                    // Released by the seeded-mirror door alone, which this
+                    // stage honours only when that door handed it over
+                    // (see `seeded_door`), and never for a diff onto
+                    // traffic: it may ask for the unsteer, and release the
+                    // dump and the diff an idle VPP takes, but a dump kept
+                    // from a spoiled attempt while a revocation put the
+                    // traffic back is diffed only by the quiet release, as
+                    // before — that diff is not one the door's guard ever
+                    // counted.
+                    let door = !r.released
+                        && seeded_door
+                        && r.seeded_door
+                        && (unsteered || c.engine.ledger_is_empty());
+                    let released = r.released || door;
+                    if !released {
                         // Revocation AFTER the unsteer was acknowledged
                         // — the feed dropped in the window before the
                         // dump. The adopted FIB is still whole (nothing
@@ -4026,6 +4288,7 @@ impl ObserveView {
                             restoring,
                             spoiled,
                             settled_have,
+                            seeded_door,
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
@@ -4045,14 +4308,22 @@ impl ObserveView {
                             have,
                             adopted = routes,
                             steered = !unsteered,
+                            door = door_name(door),
                             upserts = plan.upserts,
                             out_of_family = plan.out_of_family,
                             withdrawals = plan.withdrawals,
-                            "route source loaded and quiet again; running the adopted resync \
-                             diff against the FIB an earlier dump already read — no second \
-                             dump (nothing has changed VPP's FIB since) and no unsteer (that \
-                             was only ever for the dump)"
+                            "{}; running the adopted resync diff against the FIB an earlier \
+                             dump already read — no second dump (nothing has changed VPP's \
+                             FIB since) and no unsteer (that was only ever for the dump)",
+                            if door {
+                                "the seeded-mirror door is open (the mirror the fast-path \
+                                 seeded, the route source streaming in its first session, the \
+                                 completeness authority agreeing)"
+                            } else {
+                                "route source loaded and quiet again"
+                            }
                         );
+                        resync_released(door, "readback-deferred", !unsteered, &plan, have);
                         engine
                             .program_neighbours(source.as_ref())
                             .map(|_| ())
@@ -4083,6 +4354,7 @@ impl ObserveView {
                             restoring,
                             spoiled,
                             settled_have,
+                            seeded_door,
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     } else {
@@ -4164,6 +4436,26 @@ impl ObserveView {
                         let dump_churn = seq_now
                             .saturating_sub(seq)
                             .max(pulses_now.saturating_sub(pulses));
+                        // Each release is re-judged on the far side of the
+                        // dump by what it rested on. The quiet one: the
+                        // churn budget above. The seeded-mirror door's
+                        // did not rest on quiet — a replay streams through
+                        // it by design — so churn during the dump does not
+                        // make it retroactively false; its legs, read
+                        // again now, are what has to still hold. The diff
+                        // that follows lands on an unsteered VPP, which is
+                        // exactly the unsteered seeded diff
+                        // (`AwaitingDiff`).
+                        let release_holds = if door {
+                            seeded_mirror_releases_diff(
+                                liveness_now,
+                                authority_current(completeness, have_now),
+                                have_now,
+                                want,
+                            )
+                        } else {
+                            dump_churn <= churn_budget
+                        };
                         // Both bounds, because each covers the other's
                         // small end: the absolute budget is 128
                         // mutations at the 64/s floor, which is noise
@@ -4171,8 +4463,7 @@ impl ObserveView {
                         // 100-route one (review finding). Half is the
                         // same fraction the diff-stage floor has always
                         // used for "the source still knows the table".
-                        let mirror_settled =
-                            have_now >= (have / 2).max(1) && dump_churn <= churn_budget;
+                        let mirror_settled = have_now >= (have / 2).max(1) && release_holds;
                         let authority_agrees =
                             authority_current(completeness, have_now) != Some(false);
                         if !live_now || !mirror_settled || !authority_agrees {
@@ -4200,6 +4491,7 @@ impl ObserveView {
                                 restoring: true,
                                 spoiled,
                                 settled_have,
+                                seeded_door,
                             });
                             return Ok(crate::driver::Drain::AwaitingSource { have, want });
                         }
@@ -4208,12 +4500,19 @@ impl ObserveView {
                             have,
                             adopted,
                             dump_secs = took.as_secs_f64(),
+                            door = door_name(door),
                             upserts = plan.upserts,
                             out_of_family = plan.out_of_family,
                             withdrawals = plan.withdrawals,
-                            "route source loaded and quiet and VPP unsteered; dumped its FIB \
-                             against no traffic and running the adopted resync diff"
+                            "{} and VPP unsteered; dumped its FIB against no traffic and \
+                             running the adopted resync diff",
+                            if door {
+                                "the seeded-mirror door is open"
+                            } else {
+                                "route source loaded and quiet"
+                            }
                         );
+                        resync_released(door, "readback-deferred", false, &plan, have);
                         engine
                             .program_neighbours(source.as_ref())
                             .map(|_| ())
@@ -4221,11 +4520,21 @@ impl ObserveView {
                         c.deferred_resync = None;
                     }
                 }
-                DeferredResync::AwaitingSeededDiff { mut feed } => {
+                DeferredResync::AwaitingSeededDiff { mut feed, refused } => {
                     let r = c.read_fallback(now, &mut feed, have, seq, pulses, 0);
                     let want = feed.gate.floor;
-                    if !r.released {
-                        c.deferred_resync = Some(DeferredResync::AwaitingSeededDiff { feed });
+                    // The early door, for a mirror the fast-path seeded
+                    // from its route ledger: see
+                    // `seeded_mirror_releases_diff` for when the replay's
+                    // quiet is not owed, and `seeded_diff_refusal` for
+                    // what more is owed when the diff lands on traffic.
+                    // Shut for good once that guard has refused it. The
+                    // gate was observed above all the same, so its quiet
+                    // clock is current whichever door opens.
+                    let early = !r.released && r.seeded_door && refused.is_none();
+                    if !r.released && !early {
+                        c.deferred_resync =
+                            Some(DeferredResync::AwaitingSeededDiff { feed, refused });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
                     // The seed was checked against VPP before the wait;
@@ -4233,9 +4542,12 @@ impl ObserveView {
                     // and a seed that no longer holds takes the dump path
                     // from here — through the pre-dump stage, handed THIS
                     // gate so the release already earned carries over and
-                    // the next tick asks for the unsteer at once. Traffic
-                    // is not steered into a FIB the seed misdescribes for
-                    // any longer than that request takes.
+                    // the next tick asks for the unsteer at once (an early
+                    // release carries over as its door: `seeded_door`).
+                    // Traffic is not steered into a FIB the seed
+                    // misdescribes for any longer than that request takes.
+                    // FIRST, ahead of the early door's guard below: a seed
+                    // that does not describe VPP has nothing to preview.
                     if !c.seed_still_holds()? {
                         c.deferred_resync = Some(DeferredResync::AwaitingFallback {
                             feed,
@@ -4243,21 +4555,94 @@ impl ObserveView {
                             restoring: false,
                             spoiled: 0,
                             settled_have: None,
+                            seeded_door: early,
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
+                    if early {
+                        // The guard: the diff this would land on a VPP
+                        // carrying traffic, counted before any of it is
+                        // queued (`seeded_diff_refusal`).
+                        let adopted = c.seeded.as_ref().map_or(0, |s| s.routes);
+                        let preview = {
+                            let Core { engine, source, .. } = &mut *c;
+                            engine.preview_resync(source.as_ref())
+                        };
+                        if let Some(why) = seeded_diff_refusal(&preview, adopted) {
+                            tracing::warn!(
+                                adopted,
+                                withdrawals = why.withdrawals,
+                                replaces = why.replaces,
+                                allowance = why.allowance,
+                                "{why}; VPP keeps forwarding its preserved FIB untouched, and \
+                                 steering stays up"
+                            );
+                            event_log::Event::warn(
+                                crate::MODULE_NAME,
+                                event_kind::SEEDED_DOOR_REFUSED,
+                            )
+                            .field("adopted", why.adopted)
+                            .field("withdrawals", why.withdrawals)
+                            .field("replaces", why.replaces)
+                            .field("allowance", why.allowance)
+                            .emit();
+                            c.deferred_resync = Some(DeferredResync::AwaitingSeededDiff {
+                                feed,
+                                refused: Some(why),
+                            });
+                            return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                        }
+                        // The legs again, read after the preview: it walked
+                        // the whole mirror, and the session or the
+                        // authority may have moved meanwhile. Legs that no
+                        // longer hold leave the deferral as it was — a
+                        // reconnect shuts the door for good on the next
+                        // tick (its epoch), anything else is re-judged
+                        // there. A flap during the walk below is no
+                        // different from one during the quiet door's: the
+                        // mirror survives a session loss intact, and what
+                        // the reconnect re-announces arrives as deltas.
+                        let have_now = c.source.route_count();
+                        if !c.seeded_door_open(have_now, want) {
+                            c.deferred_resync =
+                                Some(DeferredResync::AwaitingSeededDiff { feed, refused });
+                            return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                        }
+                    }
                     let Core { engine, source, .. } = &mut *c;
                     let plan = engine.begin_resync(source.as_ref());
-                    tracing::info!(
-                        have,
-                        unchanged = plan.unchanged,
-                        upserts = plan.upserts,
-                        out_of_family = plan.out_of_family,
-                        withdrawals = plan.withdrawals,
-                        "route source loaded and quiet; diffing it against the preserved \
-                         ledger while VPP keeps forwarding — no dump and no unsteer, and \
-                         only the differences go to VPP"
-                    );
+                    if early {
+                        tracing::info!(
+                            have,
+                            door = door_name(true),
+                            unchanged = plan.unchanged,
+                            upserts = plan.upserts,
+                            replaces = plan.replaces,
+                            out_of_family = plan.out_of_family,
+                            withdrawals = plan.withdrawals,
+                            "the route mirror was seeded from the fast-path route ledger, the \
+                             route source is streaming in its first session, the completeness \
+                             authority agrees with it, and the diff disturbs no more of VPP's \
+                             table than one clean stop's two snapshots can differ by: diffing \
+                             it against the preserved ledger now rather than after the replay \
+                             goes quiet, while VPP keeps forwarding — no dump and no unsteer; \
+                             the replay's changes follow as ordinary updates"
+                        );
+                    } else {
+                        tracing::info!(
+                            have,
+                            door = door_name(false),
+                            unchanged = plan.unchanged,
+                            upserts = plan.upserts,
+                            replaces = plan.replaces,
+                            out_of_family = plan.out_of_family,
+                            withdrawals = plan.withdrawals,
+                            "route source loaded and quiet; diffing it against the preserved \
+                             ledger while VPP keeps forwarding — no dump and no unsteer, and \
+                             only the differences go to VPP"
+                        );
+                    }
+                    resync_released(early, "preserved-ledger", true, &plan, have);
                     engine
                         .program_neighbours(source.as_ref())
                         .map(|_| ())
@@ -4288,13 +4673,7 @@ impl ObserveView {
                     // quiet is not owed. Observed every tick above all the
                     // same, so the rate baseline stays current if this
                     // door never opens.
-                    let seeded_release = !released
-                        && seeded_mirror_releases_diff(
-                            c.feed_session.as_ref().map(|f| f.liveness()),
-                            authority_current(&c.completeness, have),
-                            have,
-                            gate.floor,
-                        );
+                    let seeded_release = !released && c.seeded_door_open(have, gate.floor);
                     if !released && !seeded_release {
                         let want = gate.floor;
                         c.deferred_resync = Some(DeferredResync::AwaitingDiff { adopted, gate });
@@ -4339,17 +4718,29 @@ impl ObserveView {
                         // protect: diff now, as a fresh resync would.
                     }
                     {
+                        let path = if c.seeded.is_some() {
+                            "preserved-ledger"
+                        } else {
+                            "readback"
+                        };
                         let Core { engine, source, .. } = &mut *c;
                         let plan = engine.begin_resync(source.as_ref());
                         tracing::info!(
                             have,
                             adopted,
+                            door = door_name(seeded_release),
                             unchanged = plan.unchanged,
                             upserts = plan.upserts,
                             out_of_family = plan.out_of_family,
                             withdrawals = plan.withdrawals,
-                            "route source loaded and quiet; running the adopted resync diff"
+                            "{}",
+                            if seeded_release {
+                                "running the adopted resync diff through the seeded-mirror door"
+                            } else {
+                                "route source loaded and quiet; running the adopted resync diff"
+                            }
                         );
+                        resync_released(seeded_release, path, false, &plan, have);
                         engine
                             .program_neighbours(source.as_ref())
                             .map(|_| ())
@@ -4832,12 +5223,28 @@ impl Effects for EffectsView {
             let floor = (seeded / ADOPTED_SOURCE_FLOOR_DIVISOR).max(1);
             let seq = c.source.change_seq();
             let steered = !c.steering.installed().is_empty();
+            // The seeded-mirror door exists only where an authority can
+            // vouch for the seed, so only then is it worth naming.
+            let sooner = match (c.completeness.is_some(), steered) {
+                (false, _) => "",
+                (true, false) => {
+                    "; over a mirror the fast-path seeded from its route ledger it runs \
+                     sooner, once the route source streams and the completeness authority \
+                     attests the seed"
+                }
+                (true, true) => {
+                    "; over a mirror the fast-path seeded from its route ledger it runs \
+                     sooner, once the route source streams and the completeness authority \
+                     attests the seed, if the diff disturbs no more of VPP's table than one \
+                     clean stop's two snapshots can differ by"
+                }
+            };
             tracing::info!(
                 routes = seeded,
                 floor,
                 steered,
-                "adopted resync deferred until the route source is loaded and quiet; the \
-                 preserved FIB keeps forwarding untouched meanwhile{}",
+                "adopted resync deferred until the route source is loaded and quiet{sooner}; \
+                 the preserved FIB keeps forwarding untouched meanwhile{}",
                 if steered {
                     ", and steering stays up throughout"
                 } else {
@@ -4847,6 +5254,7 @@ impl Effects for EffectsView {
             c.deferred_resync = Some(if steered {
                 DeferredResync::AwaitingSeededDiff {
                     feed: FeedGate::new(floor, seq),
+                    refused: None,
                 }
             } else {
                 DeferredResync::AwaitingDiff {
@@ -4894,6 +5302,7 @@ impl Effects for EffectsView {
                 restoring: false,
                 spoiled: 0,
                 settled_have: None,
+                seeded_door: false,
             });
             return Ok(());
         }
@@ -5225,6 +5634,55 @@ mod tests {
             assert!(
                 !seeded_mirror_releases_diff(liveness, authority, have, 50),
                 "{why}"
+            );
+        }
+    }
+
+    /// The steered seeded diff's guard counts what lands on traffic VPP is
+    /// carrying — withdrawals and replaces, never additions — against 1%
+    /// of the adopted table, and refuses past it, not at it.
+    #[test]
+    fn the_seeded_diff_guard_counts_what_lands_on_traffic() {
+        use crate::engine::ResyncPlan;
+        let plan = |withdrawals, replaces, additions| ResyncPlan {
+            withdrawals,
+            replaces,
+            upserts: replaces + additions,
+            ..Default::default()
+        };
+        // At the allowance: two of two hundred.
+        assert_eq!(seeded_diff_allowance(200), 2);
+        assert_eq!(seeded_diff_refusal(&plan(1, 1, 0), 200), None);
+        assert_eq!(seeded_diff_refusal(&plan(2, 0, 0), 200), None);
+        // Additions are what the quiet door would add too.
+        assert_eq!(seeded_diff_refusal(&plan(0, 0, 10_000), 200), None);
+        // Past it, withdrawals and replaces together.
+        assert_eq!(
+            seeded_diff_refusal(&plan(2, 1, 5), 200),
+            Some(SeededDiffRefusal {
+                adopted: 200,
+                withdrawals: 2,
+                replaces: 1,
+                allowance: 2,
+            })
+        );
+        assert!(seeded_diff_refusal(&plan(3, 0, 0), 200).is_some());
+        assert!(seeded_diff_refusal(&plan(0, 3, 0), 200).is_some());
+        // A table whose 1% rounds to nothing takes the early door only
+        // with an undisturbed diff: its replay is a burst anyway.
+        assert_eq!(seeded_diff_allowance(99), 0);
+        assert!(seeded_diff_refusal(&plan(0, 0, 3), 6).is_none());
+        assert!(seeded_diff_refusal(&plan(1, 0, 0), 6).is_some());
+        // The reference table, and the invariant at every size: the
+        // authority's own drift bound of it, never rounded up.
+        assert_eq!(seeded_diff_allowance(1_350_000), 13_500);
+        let bound = packetframe_common::fib::STEER_MAX_DRIFT;
+        for adopted in (0..=50_000u64).chain([1_350_001, 2_000_000, u32::MAX as u64]) {
+            let a = seeded_diff_allowance(adopted);
+            let exact = adopted as f64 * bound;
+            assert!(
+                a as f64 <= exact && exact < (a + 1) as f64,
+                "{adopted} → {a}"
             );
         }
     }
