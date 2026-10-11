@@ -7,10 +7,6 @@ use packetframe_fast_path::sample::Sample;
 use packetframe_flow_encode::sflow::{self, Agent, Encoding, FlowSample, COMPACT_IF_LIMIT};
 use packetframe_flow_encode::EncodeError;
 
-/// Datagram size: inside a 1500-byte path with room for the IP and UDP
-/// headers, so no collector ever sees a fragment.
-pub const MAX_DATAGRAM: usize = 1400;
-
 /// Octets a frame's FCS adds on the wire: sFlow's `frame_length` counts
 /// them and `stripped` says they are not in the header.
 pub const FCS: u32 = 4;
@@ -102,11 +98,18 @@ impl Exporter {
         self.agent.encoding == Encoding::Expanded
     }
 
-    /// Encode `ready` into datagrams of at most [`MAX_DATAGRAM`] bytes,
-    /// appended to `out`. The first ifIndex past the compact encoding's
-    /// 24 bits moves the agent to the expanded one for good. Returns the
-    /// samples no datagram could hold (none, at these sizes).
-    pub fn encode(&mut self, ready: &[Ready], uptime_ms: u32, out: &mut Vec<Vec<u8>>) -> usize {
+    /// Encode `ready` into datagrams of at most `max` bytes (the module's
+    /// `datagram`), appended to `out`. The first ifIndex past the compact
+    /// encoding's 24 bits moves the agent to the expanded one for good.
+    /// Returns the samples no datagram could hold (none at the sizes
+    /// `path-mtu` allows).
+    pub fn encode(
+        &mut self,
+        ready: &[Ready],
+        uptime_ms: u32,
+        max: usize,
+        out: &mut Vec<Vec<u8>>,
+    ) -> usize {
         if self.agent.encoding == Encoding::Compact
             && ready
                 .iter()
@@ -133,15 +136,9 @@ impl Exporter {
         let mut rest = &samples[..];
         let mut unsent = 0;
         while !rest.is_empty() {
-            let mut buf = Vec::with_capacity(MAX_DATAGRAM);
-            match sflow::encode_datagram(
-                &mut buf,
-                &self.agent,
-                self.sequence,
-                uptime_ms,
-                rest,
-                MAX_DATAGRAM,
-            ) {
+            let mut buf = Vec::with_capacity(max);
+            match sflow::encode_datagram(&mut buf, &self.agent, self.sequence, uptime_ms, rest, max)
+            {
                 Ok(n) => {
                     self.sequence = self.sequence.wrapping_add(1);
                     out.push(buf);
@@ -165,6 +162,9 @@ impl Exporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use packetframe_common::config::{
+        FLOW_DATAGRAM_OVERHEAD, FLOW_DEFAULT_DATAGRAM, FLOW_HEADER_BYTES_RANGE, FLOW_PATH_MTU_RANGE,
+    };
     use packetframe_fast_path::sample::{Disposition, Path, Vlan};
 
     fn sample<'a>(header: &'a [u8], vlan: Option<Vlan>) -> Sample<'a> {
@@ -244,9 +244,9 @@ mod tests {
         let mut x = Exporter::new("192.0.2.1".parse().unwrap());
         let batch: Vec<Ready> = (0..40).map(|i| ready(i, 3)).collect();
         let mut out = Vec::new();
-        assert_eq!(x.encode(&batch, 5, &mut out), 0);
+        assert_eq!(x.encode(&batch, 5, FLOW_DEFAULT_DATAGRAM, &mut out), 0);
         assert!(out.len() > 1);
-        assert!(out.iter().all(|d| d.len() <= MAX_DATAGRAM));
+        assert!(out.iter().all(|d| d.len() <= FLOW_DEFAULT_DATAGRAM));
         // Each datagram's sequence (word 4 after the v4 agent address).
         let seqs: Vec<u32> = out
             .iter()
@@ -261,13 +261,37 @@ mod tests {
         assert_eq!(n, 40);
     }
 
+    /// `path-mtu`'s smallest still holds a sample of the most
+    /// `header-bytes` allows, in the expanded encoding with an IPv6 agent:
+    /// every sample goes, one datagram each at worst.
+    #[test]
+    fn the_smallest_path_mtu_holds_the_largest_sample() {
+        let max = (FLOW_PATH_MTU_RANGE.0 - FLOW_DATAGRAM_OVERHEAD) as usize;
+        let mut x = Exporter::new("2001:db8::1".parse().unwrap());
+        let big = |i| Ready {
+            header: vec![0xab; FLOW_HEADER_BYTES_RANGE.1 as usize],
+            ..ready(i, COMPACT_IF_LIMIT)
+        };
+        let batch: Vec<Ready> = (0..10).map(big).collect();
+        let mut out = Vec::new();
+        assert_eq!(x.encode(&batch, 5, max, &mut out), 0, "none unencodable");
+        assert!(x.expanded());
+        assert!(out.iter().all(|d| d.len() <= max));
+        assert!(out.len() >= 5, "{} datagrams", out.len());
+    }
+
     #[test]
     fn a_wide_ifindex_moves_the_agent_to_the_expanded_encoding() {
         let mut x = Exporter::new("192.0.2.1".parse().unwrap());
         let mut out = Vec::new();
-        x.encode(&[ready(0, 3)], 0, &mut out);
+        x.encode(&[ready(0, 3)], 0, FLOW_DEFAULT_DATAGRAM, &mut out);
         assert!(!x.expanded());
-        x.encode(&[ready(1, COMPACT_IF_LIMIT)], 0, &mut out);
+        x.encode(
+            &[ready(1, COMPACT_IF_LIMIT)],
+            0,
+            FLOW_DEFAULT_DATAGRAM,
+            &mut out,
+        );
         assert!(x.expanded());
         assert_eq!(out.len(), 2);
     }

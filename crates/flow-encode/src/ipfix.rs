@@ -52,6 +52,17 @@ const DATA_LINK_ETHERNET: u16 = 0x0001;
 const SET_TEMPLATE: u16 = 2;
 const SET_OPTIONS_TEMPLATE: u16 = 3;
 
+/// A message's bytes before its first set (RFC 7011 §3.1), and a set's
+/// before its records (§3.3.2); a set is padded to four bytes after them.
+pub const MESSAGE_HEADER_LEN: usize = 16;
+pub const SET_HEADER_LEN: usize = 4;
+pub const SET_PADDING_MAX: usize = 3;
+
+/// The bytes one record of `fields` takes in a data set.
+pub fn record_len(fields: &[Field]) -> usize {
+    fields.iter().map(|&f| usize::from(ie_and_len(f).1)).sum()
+}
+
 fn ie_and_len(f: Field) -> (u16, u16) {
     match f {
         Field::Octets => (ie::OCTET_DELTA_COUNT, 8),
