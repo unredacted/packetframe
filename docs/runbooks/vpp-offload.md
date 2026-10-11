@@ -1125,9 +1125,10 @@ walk also resolves every route through the neighbours the feed holds at
 that moment, seconds into the process: a next hop the fast-path's
 resolver has not re-announced yet would take every route through it out
 of VPP as unresolvable. So
-the early door counts the diff before any of it reaches VPP (the same
-walk as the resync, with nothing queued) and opens only if, **in each
-address family**, its withdrawals, replacements and additions together
+the early door judges the diff before any of it reaches VPP — the resync
+walk itself, its plan put to the guard before anything of it is queued,
+so the plan judged is the plan the drain gets — and opens only if, **in
+each address family**, its withdrawals, replacements and additions together
 are at most **1% of that family's routes VPP holds**. That is the drift
 bound the completeness authority uses for a converged mirror, and it
 draws the same line between churn and a missing table. Each family is
@@ -1153,10 +1154,15 @@ path. The early door's release carries over to it, as a quiet release
 always has: the unsteer goes out at once (the eBPF tier forwards on the
 mirror the authority just counted complete), the dump reads an idle VPP,
 and the unsteered diff, verify and re-steer follow, all while the replay
-streams. Then the diff is counted. The door's legs are read once more
-after the count (it walks the whole mirror), so a session that dropped
-meanwhile is never acted on. That reconnect shuts the door for good on
-the next tick.
+streams. The resync walk follows the count re-read directly, the same
+order as at the quiet release, and its plan is judged before any of it
+is queued. The door's legs are read once more when the walk is done (it
+reads the whole mirror), so a session that dropped meanwhile is never
+acted on; that reconnect shuts the door for good on the next tick. A
+refused walk queues nothing, and the route updates it superseded are
+not lost: none applies while the diff waits, and the walk that
+eventually runs (the quiet door's, or the dump path's) reads the mirror
+as it then is.
 
 **What still waits for quiet:** a mirror that loaded from empty, no
 `require-table-complete`, a route source that reconnected, a seed the

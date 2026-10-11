@@ -153,7 +153,7 @@ pub mod kind {
     /// `replaces`, `additions`, `withdrawals`).
     pub const RESYNC_RELEASED: &str = "resync_released";
     /// A steered seeded adoption's early diff door stayed shut because, in
-    /// one address family (`family`), the diff it previewed would
+    /// one address family (`family`), the diff its walk found would
     /// withdraw, replace or add more of that family's adopted table than
     /// two snapshots of one stop can differ by (`adopted`, `withdrawals`,
     /// `replaces`, `additions`, `allowance`); the diff waits for the route

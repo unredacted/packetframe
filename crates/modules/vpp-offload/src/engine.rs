@@ -479,13 +479,47 @@ pub struct Disturbance {
     pub additions: u64,
 }
 
-/// Whether a resync walk queues the diff it plans
-/// ([`ConvergenceEngine::begin_resync`]) or only counts it
-/// ([`ConvergenceEngine::preview_resync`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Walk {
-    Commit,
-    Preview,
+/// One op a resync walk owes the pending map.
+enum WalkOp {
+    /// An older intent for a prefix VPP already holds as the walk found
+    /// it ([`crate::sink::PendingMap::discard`]).
+    Discard(IpPrefix),
+    Upsert(IpPrefix, Vec<IpAddr>),
+    Withdraw(IpPrefix),
+}
+
+impl WalkOp {
+    fn apply(self, pending: &mut crate::sink::PendingMap) {
+        match self {
+            WalkOp::Discard(p) => pending.discard(p),
+            WalkOp::Upsert(p, nexthops) => pending.upsert(p, nexthops),
+            WalkOp::Withdraw(p) => pending.withdraw(p),
+        }
+    }
+}
+
+/// Where a resync walk's ops go: into the pending map as the walk finds
+/// them ([`ConvergenceEngine::begin_resync`]), or held until a judge has
+/// seen the finished plan ([`ConvergenceEngine::begin_resync_judged`]).
+/// Applied later in the order they were found, the held ops leave the
+/// pending map exactly as applying them at once would — nothing the walk
+/// classifies by reads the pending map.
+enum WalkOps {
+    Pending,
+    Held(Vec<WalkOp>),
+}
+
+impl WalkOps {
+    fn put(&mut self, pending: &mut crate::sink::PendingMap, op: WalkOp) {
+        match self {
+            WalkOps::Pending => op.apply(pending),
+            // A discard of a prefix the map owes nothing for is a no-op,
+            // and on a seeded table nearly every route is one: not held,
+            // or the held list is the whole table.
+            WalkOps::Held(_) if matches!(&op, WalkOp::Discard(p) if !pending.owes(*p)) => {}
+            WalkOps::Held(ops) => ops.push(op),
+        }
+    }
 }
 
 /// What a verify pass concluded, and whether traffic may be diverted
@@ -3964,39 +3998,57 @@ impl ConvergenceEngine {
     }
 
     pub fn begin_resync(&mut self, src: &dyn RouteSource) -> ResyncPlan {
-        self.phase = Some(Phase::Resync);
-        // The ledger is rebuilt from here, so no verify has disproved the
-        // one it becomes (`disproved`).
-        self.disproved = false;
-        self.walk_resync(src, Walk::Commit)
+        // With no judge, the walk always commits.
+        self.walk_resync(src, None).unwrap_or_else(|plan| plan)
     }
 
-    /// The plan [`Self::begin_resync`] would queue now, with nothing
-    /// queued, nothing asked of VPP and no route delta discarded: the same
-    /// walk, through the same classification, minus every effect on the
-    /// pending map. For a caller that must judge a diff BEFORE it lands —
-    /// the steered seeded diff's early door, which refuses a diff that
-    /// would disturb more of a traffic-carrying VPP than two snapshots of
-    /// one stop can differ by (`runtime`'s `seeded_diff_refusal`).
+    /// [`Self::begin_resync`], with the plan it found put to `judge` before
+    /// any of it is committed: `Ok` with the plan if the judge accepted it
+    /// and it was queued, `Err` with the plan if it refused and nothing
+    /// was.
     ///
-    /// What it does change is what any walk refreshes about the kernel and
-    /// the mirror: the nexthop map, the FDB and bridge-port VLAN reads, and
-    /// the walk's own classification (shadowed, kernel-delivered and
-    /// link-local-refused prefixes, the kernel lookups' budget and
-    /// refusals). Those describe the world as it is now, the status rows
-    /// read them, and the next walk rebuilds every one of them from
-    /// scratch, so a preview that is not followed by a resync leaves them
-    /// truthful rather than stale. The ledger, the pending map, the phase
-    /// and the source's queued deltas are untouched.
-    pub fn preview_resync(&mut self, src: &dyn RouteSource) -> ResyncPlan {
-        self.walk_resync(src, Walk::Preview)
+    /// ONE walk, judged and committed. For a caller that must bound a diff
+    /// before it lands — the steered seeded diff's early door
+    /// (`runtime`'s `seeded_diff_refusal`) — the plan the judge accepts is
+    /// the plan that reaches the drain. A judge reading one walk and a
+    /// second walk committing another was the first version, and the
+    /// route source mutates the mirror concurrently while it streams: a
+    /// route replaced at constant count, or a next hop lost between the
+    /// two, made the committed plan whatever it was, judged or not (review
+    /// finding, PR #356).
+    ///
+    /// On refusal: nothing reached the pending map, and the phase, the
+    /// ledger and its `disproved` mark are untouched. What the walk
+    /// refreshes about the kernel and the mirror (the nexthop map, the FDB
+    /// and bridge-port VLAN reads, the shadowed, kernel-delivered and
+    /// link-local-refused sets, the kernel lookups' budget and refusals)
+    /// stays refreshed: it describes the world as it is, the status rows
+    /// read it, and the next walk rebuilds it from scratch. And the
+    /// source's queued route deltas are gone, discarded immediately before
+    /// the walk as for every walk (`RouteSource::discard_route_deltas`):
+    /// a caller that refuses must not apply deltas until another full
+    /// walk has superseded them.
+    pub fn begin_resync_judged(
+        &mut self,
+        src: &dyn RouteSource,
+        judge: &mut dyn FnMut(&ResyncPlan) -> bool,
+    ) -> Result<ResyncPlan, ResyncPlan> {
+        self.walk_resync(src, Some(judge))
     }
 
-    /// The resync walk, shared by [`Self::begin_resync`] (`Commit`) and
-    /// [`Self::preview_resync`] (`Preview`) so a preview counts exactly the
-    /// diff a resync would queue.
-    fn walk_resync(&mut self, src: &dyn RouteSource, walk: Walk) -> ResyncPlan {
-        let commit = walk == Walk::Commit;
+    /// The resync walk behind [`Self::begin_resync`] and
+    /// [`Self::begin_resync_judged`]: classify, then commit — unless a
+    /// judge refuses the plan in between.
+    fn walk_resync(
+        &mut self,
+        src: &dyn RouteSource,
+        judge: Option<&mut dyn FnMut(&ResyncPlan) -> bool>,
+    ) -> Result<ResyncPlan, ResyncPlan> {
+        let mut ops = if judge.is_some() {
+            WalkOps::Held(Vec::new())
+        } else {
+            WalkOps::Pending
+        };
         // Rebuild, not merge. An insert-only refresh leaves a nexthop the
         // source has stopped reporting mapped to its last known device,
         // so a route still naming it resolves as reachable through a
@@ -4048,11 +4100,10 @@ impl ConvergenceEngine {
         let families = self.drainer.families();
         // Immediately before the walk, never earlier: what is queued now
         // is what the walk supersedes, and anything written from here on
-        // stays a delta. See `RouteSource::discard_route_deltas`. Never
-        // for a preview: no walk that queues nothing supersedes anything.
-        if commit {
-            src.discard_route_deltas();
-        }
+        // stays a delta. See `RouteSource::discard_route_deltas`. Judged
+        // walks too, refused or not: a refusing caller applies no delta
+        // until another full walk supersedes them (`begin_resync_judged`).
+        src.discard_route_deltas();
         src.for_each_route(&mut |prefix, nexthops| {
             // A family VPP does not carry never enters the diff — the
             // route-side twin of the neighbour filter
@@ -4096,9 +4147,7 @@ impl ConvergenceEngine {
             // with itself. Anything owed for it from before this walk is
             // an OLDER intent, and goes.
             if self.installed_unchanged(prefix, nexthops) {
-                if commit {
-                    self.pending.discard(prefix);
-                }
+                ops.put(&mut self.pending, WalkOp::Discard(prefix));
                 plan.unchanged += 1;
                 return;
             }
@@ -4120,24 +4169,32 @@ impl ConvergenceEngine {
             {
                 plan.family_mut(&prefix).additions += 1;
             }
-            if commit {
-                self.pending.upsert(prefix, nexthops.to_vec());
-            }
+            ops.put(&mut self.pending, WalkOp::Upsert(prefix, nexthops.to_vec()));
             plan.upserts += 1;
         });
 
         let known: HashSet<IpPrefix> = self.ledger.known_prefixes().into_iter().collect();
         for prefix in &known {
             if !seen.contains(prefix) {
-                if commit {
-                    self.pending.withdraw(*prefix);
-                }
+                ops.put(&mut self.pending, WalkOp::Withdraw(*prefix));
                 plan.withdrawals += 1;
                 plan.family_mut(prefix).withdrawals += 1;
             }
         }
-        if !commit {
-            return plan;
+        if let Some(judge) = judge {
+            if !judge(&plan) {
+                return Err(plan);
+            }
+        }
+
+        // The commit point. The ledger is rebuilt from here, so no verify
+        // has disproved the one it becomes (`disproved`).
+        self.phase = Some(Phase::Resync);
+        self.disproved = false;
+        if let WalkOps::Held(held) = ops {
+            for op in held {
+                op.apply(&mut self.pending);
+            }
         }
 
         // Drop leftovers from an aborted resync. Those prefixes live only
@@ -4167,7 +4224,7 @@ impl ConvergenceEngine {
                 "local-route shadowing suppressed mirror routes this resync"
             );
         }
-        plan
+        Ok(plan)
     }
 
     /// Whether VPP is recorded holding `prefix` through exactly the wire

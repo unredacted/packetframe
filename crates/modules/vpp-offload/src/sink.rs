@@ -890,6 +890,15 @@ impl PendingMap {
         self.withheld.remove(&k);
         self.rejected.remove(&k);
     }
+
+    /// Whether anything is owed for `prefix`, active or parked: whether
+    /// [`Self::discard`] would change anything.
+    pub fn owes(&self, prefix: IpPrefix) -> bool {
+        let k = PrefixKey::from(prefix);
+        self.ops.contains_key(&k)
+            || self.withheld.contains_key(&k)
+            || self.rejected.contains_key(&k)
+    }
 }
 
 /// One FIB path as VPP holds it — every attribute of it that decides

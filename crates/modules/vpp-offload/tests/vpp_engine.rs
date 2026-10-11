@@ -613,12 +613,13 @@ fn adoption_withdraws_stale_routes_without_touching_vpps_own() {
     );
 }
 
-/// A preview counts exactly the diff the resync then queues, and queues
-/// none of it: the steered seeded diff's guard judges the plan through
-/// this, before anything reaches a VPP that is carrying traffic, so a
-/// preview that measured a different diff — or that left work in the
-/// pending map, or discarded the source's queued deltas as only a real
-/// walk may — would be a guard on something other than what lands.
+/// A judged resync is ONE walk whose plan is put to the judge before any
+/// of it is queued: the steered seeded diff's guard judges the plan
+/// through this, and a plan judged on one walk and committed by another
+/// bounds nothing while the route source streams (review finding, PR
+/// #356). A refusal leaves the pending map empty, the phase as it was and
+/// the ledger untouched; an acceptance queues exactly what the judge saw.
+/// Both discard the source's queued route deltas, once, before the walk.
 ///
 /// Over a ledger whose paths VPP acknowledged (a dump adoption records
 /// none, so nothing it adopts can read unchanged), one prefix of each
@@ -627,7 +628,8 @@ fn adoption_withdraws_stale_routes_without_touching_vpps_own() {
 /// new (an addition), and new through a next hop with no neighbour — an
 /// upsert that sends VPP nothing, so neither a replace nor an addition.
 #[test]
-fn a_preview_counts_the_resync_it_precedes_and_queues_nothing() {
+fn a_judged_resync_commits_only_the_plan_its_judge_saw() {
+    use packetframe_vpp_offload::engine::Disturbance;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let other_nh = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
     let p = |a: [u8; 4], len| IpPrefix::V4 {
@@ -667,7 +669,7 @@ fn a_preview_counts_the_resync_it_precedes_and_queues_nothing() {
         other_nh,
         discarded: AtomicUsize::new(0),
     };
-    let fake = Fake::start("preview-resync");
+    let fake = Fake::start("judged-resync");
     let mut engine = engine_for(&fake);
     assert!(engine.api_ready(), "handshake");
     engine.attach_devices(AttachMode::Fresh).expect("attach");
@@ -681,6 +683,9 @@ fn a_preview_counts_the_resync_it_precedes_and_queues_nothing() {
     engine.program_neighbours(&before).expect("neighbours land");
     drain_to_empty(&mut engine);
     assert_eq!(engine.counts().installed, 3);
+    // Out of the resync phase, so a refusal's phase can be told apart.
+    engine.abort_convergence();
+    assert_eq!(engine.phase(), None);
     let _ = fake.drain_events();
 
     let after = source(vec![
@@ -692,43 +697,49 @@ fn a_preview_counts_the_resync_it_precedes_and_queues_nothing() {
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
         ),
     ]);
-    let preview = engine.preview_resync(&after);
+    let mut judged = Vec::new();
+    let refused = engine
+        .begin_resync_judged(&after, &mut |plan| {
+            judged.push(*plan);
+            false
+        })
+        .expect_err("the judge refused");
+    assert_eq!(judged, vec![refused], "the judge saw the plan it refused");
     assert_eq!(
-        (preview.unchanged, preview.upserts, preview.withdrawals),
+        (refused.unchanged, refused.upserts, refused.withdrawals),
         (1, 3, 1),
-        "{preview:?}"
+        "{refused:?}"
     );
     assert_eq!(
-        preview.v4,
-        packetframe_vpp_offload::engine::Disturbance {
+        refused.v4,
+        Disturbance {
             withdrawals: 1,
             replaces: 1,
             additions: 1,
         },
-        "the unresolvable new route adds nothing VPP forwards on: {preview:?}"
+        "the unresolvable new route adds nothing VPP forwards on: {refused:?}"
     );
-    assert_eq!(
-        preview.v6,
-        packetframe_vpp_offload::engine::Disturbance::default()
-    );
-    assert_eq!(engine.pending().len(), 0, "a preview queues nothing");
+    assert_eq!(refused.v6, Disturbance::default());
+    assert_eq!(engine.pending().len(), 0, "a refusal queues nothing");
+    assert_eq!(engine.phase(), None, "and leaves the phase as it was");
+    assert_eq!(engine.counts().installed, 3, "and the ledger untouched");
     assert_eq!(
         after.discarded.load(Ordering::SeqCst),
-        0,
-        "and supersedes no delta: it queued nothing to supersede them with"
+        1,
+        "the walk discarded the source's deltas before it began, as every walk does"
     );
 
-    let plan = engine.begin_resync(&after);
-    assert_eq!(
-        plan, preview,
-        "the preview is the plan, not an estimate of it"
-    );
+    let plan = engine
+        .begin_resync_judged(&after, &mut |plan| plan.v4.withdrawals <= 1)
+        .expect("the judge accepted");
+    assert_eq!(plan, refused, "the same mirror, the same plan");
     assert_eq!(
         engine.pending().len() as u64,
         plan.upserts + plan.withdrawals,
-        "the resync queues what both counted"
+        "an acceptance queues exactly what the judge saw"
     );
-    assert_eq!(after.discarded.load(Ordering::SeqCst), 1);
+    assert!(engine.phase().is_some(), "and starts the resync");
+    assert_eq!(after.discarded.load(Ordering::SeqCst), 2);
     assert!(
         !fake
             .drain_events()

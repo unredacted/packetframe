@@ -6034,13 +6034,21 @@ mod steered_seeded {
     /// test can tell the resync's walks (`walks`) from everything else.
     /// `flap_on_walk` drops and reconnects `session` the first time the
     /// mirror is walked after it is set: the session flapping while the
-    /// early door previews its diff. With `neighbours` cleared the feed
-    /// holds no neighbour at all: the resolver has not re-announced them.
+    /// early door walks. With `neighbours` cleared the feed holds no
+    /// neighbour at all: the resolver has not re-announced them; and only
+    /// the first `neighbours_for` reads of them see any (a next hop lost
+    /// after the walk read its neighbours). `replace_at_walk` becomes the
+    /// table as a resync begins its walk — when it discards the source's
+    /// queued deltas, after the door's legs were read: the route source
+    /// changing the mirror under a door that has already opened.
     pub struct Mirror {
         pub routes: Mutex<Vec<(IpPrefix, IpAddr)>>,
         pub walks: AtomicUsize,
         pub flap_on_walk: AtomicBool,
         pub neighbours: AtomicBool,
+        pub neighbour_reads: AtomicUsize,
+        pub neighbours_for: AtomicUsize,
+        pub replace_at_walk: Mutex<Option<Vec<(IpPrefix, IpAddr)>>>,
         pub session: Arc<FeedSession>,
     }
     impl Mirror {
@@ -6050,6 +6058,9 @@ mod steered_seeded {
                 walks: AtomicUsize::new(0),
                 flap_on_walk: AtomicBool::new(false),
                 neighbours: AtomicBool::new(true),
+                neighbour_reads: AtomicUsize::new(0),
+                neighbours_for: AtomicUsize::new(usize::MAX),
+                replace_at_walk: Mutex::new(None),
                 session,
             })
         }
@@ -6078,8 +6089,16 @@ mod steered_seeded {
                 visit(*p, &[*via]);
             }
         }
+        fn discard_route_deltas(&self) {
+            if let Some(table) = self.0.replace_at_walk.lock().unwrap().take() {
+                *self.0.routes.lock().unwrap() = table;
+            }
+        }
         fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
-            if !self.0.neighbours.load(Ordering::SeqCst) {
+            let read = self.0.neighbour_reads.fetch_add(1, Ordering::SeqCst);
+            if !self.0.neighbours.load(Ordering::SeqCst)
+                || read >= self.0.neighbours_for.load(Ordering::SeqCst)
+            {
                 return;
             }
             visit(fake_vpp::nh(), "eth4", MAC);
@@ -6604,7 +6623,7 @@ fn a_steered_seeded_diff_without_every_leg_waits_for_the_replay_to_go_quiet() {
         assert_eq!(
             f.mirror.walks.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "{name}: not even previewed"
+            "{name}: not even walked"
         );
 
         if name == "ss-disputed" {
@@ -6712,7 +6731,7 @@ fn a_steered_seeded_diff_beyond_the_allowance_waits_for_the_replay_to_go_quiet()
         assert_eq!(
             f.mirror.walks.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "{name}: previewed once, not every tick"
+            "{name}: walked once, not every tick"
         );
         let row = fib_row(&d, &f, now);
         assert!(
@@ -6734,22 +6753,23 @@ fn a_steered_seeded_diff_beyond_the_allowance_waits_for_the_replay_to_go_quiet()
     }
 }
 
-/// The session flaps while the early door previews its diff. The legs are
-/// read again after the preview, so the diff does not land on the
-/// strength of a session that is no longer the one that was attested;
-/// the reconnect then shuts the door for good, and the diff waits for the
-/// replay to go quiet.
+/// The session flaps while the early door walks. The legs are read again
+/// when the walk is done, before anything of it is queued, so the diff
+/// does not land on the strength of a session that is no longer the one
+/// that was attested — and a moved leg is not the guard's refusal, so
+/// nothing is latched. The reconnect then shuts the door for good, and
+/// the diff waits for the replay to go quiet.
 #[test]
-fn a_session_that_flaps_during_the_preview_shuts_the_door() {
+fn a_session_that_flaps_during_the_walk_shuts_the_door() {
     use std::sync::atomic::Ordering;
     use steered_seeded::*;
     let mut d = Driver::new();
-    let (f, t0) = adopted("ss-flap-preview", table(6), table(6), ALL, &mut d);
+    let (f, t0) = adopted("ss-flap-walk", table(6), table(6), ALL, &mut d);
     f.mirror.flap_on_walk.store(true, Ordering::SeqCst);
     let (now, seen) = replay(&mut d, &f, t0, 200, |_| false);
     assert!(
         f.mirror.walks.load(Ordering::SeqCst) >= 1 && !f.mirror.flap_on_walk.load(Ordering::SeqCst),
-        "the door opened and previewed its diff"
+        "the door opened and walked"
     );
     assert_eq!(
         f.session.liveness().epoch,
@@ -6761,6 +6781,8 @@ fn a_session_that_flaps_during_the_preview_shuts_the_door() {
         f.rt.status().resync_deferred.is_some(),
         "the diff did not run on legs that no longer held"
     );
+    assert_eq!(f.rt.status().pending_ops, 0, "and nothing of it was queued");
+    assert!(f.rt.status().seeded_door_refused.is_none());
     assert!(f.log.lock().unwrap().is_empty());
 
     let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
@@ -7226,6 +7248,90 @@ fn a_release_after_a_dump_records_the_mirror_the_walk_read() {
         released.contains(&Some(13)),
         "the release records the thirteen routes the walk read, not the six the tick \
          began with: {released:?}"
+    );
+}
+
+/// The guard judges the walk it commits. The door's legs are read, it
+/// opens, and as its walk begins the route source has replaced three of
+/// two hundred routes with three others: the count the legs saw is
+/// unchanged, the authority still agrees, and the plan the walk finds —
+/// three withdrawals and three additions — is past the bound. It is that
+/// plan the guard refuses, and nothing of it reaches the pending map or
+/// VPP; the quiet door lands it once the replay goes quiet. A plan judged
+/// on one walk and committed by another let exactly this through (review
+/// finding, PR #356).
+#[test]
+fn routes_replaced_as_the_walk_begins_are_judged_on_that_walk() {
+    use steered_seeded::*;
+    let vpp = table(200);
+    let mut replaced: Vec<_> = vpp[3..].to_vec();
+    replaced.extend((0..3).map(|i| {
+        (
+            IpPrefix::V4 {
+                addr: [198, 51, 100, 128 + i],
+                prefix_len: 32,
+            },
+            fake_vpp::nh(),
+        )
+    }));
+    let mut d = Driver::new();
+    let (f, t0) = adopted("ss-replaced", vpp.clone(), vpp.clone(), ALL, &mut d);
+    *f.mirror.replace_at_walk.lock().unwrap() = Some(replaced);
+    let (now, seen) = replay(&mut d, &f, t0, 200, |_| false);
+    assert_eq!(d.state(), State::AdoptedResyncing, "{seen:?}");
+    assert!(
+        preserved::route_ops(&f.fake.drain_events()).is_empty(),
+        "nothing of the plan lands on the steered VPP"
+    );
+    let status = f.rt.status();
+    assert_eq!(status.pending_ops, 0, "and none of it was queued");
+    let refused = status
+        .seeded_door_refused
+        .expect("the walk's own plan was refused");
+    assert_eq!(
+        (refused.withdrawals, refused.replaces, refused.additions),
+        (3, 0, 3)
+    );
+    assert_eq!(
+        f.mirror.walks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one walk, judged and refused"
+    );
+    assert!(f.log.lock().unwrap().is_empty());
+
+    let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+    assert_eq!(preserved::route_ops(&f.fake.drain_events()).len(), 6);
+}
+
+/// The plan the door commits is the one its walk found, and the walk reads
+/// the neighbours once. A next hop lost after that read is a change the
+/// route source reports later, not a reason to re-derive the plan: here
+/// every later read of the neighbours finds none, and the committed
+/// table — unchanged — stays in VPP. When a second walk committed what a
+/// first one had been judged on, the same loss between the two turned an
+/// approved unchanged table into two hundred withdrawals on the steered
+/// VPP (review finding, PR #356).
+#[test]
+fn a_next_hop_lost_after_the_walk_does_not_change_what_it_committed() {
+    use std::sync::atomic::Ordering;
+    use steered_seeded::*;
+    let mut d = Driver::new();
+    let (f, t0) = adopted("ss-lost-after", table(200), table(200), ALL, &mut d);
+    f.mirror.neighbours_for.store(1, Ordering::SeqCst);
+    let (_, seen) = replay(&mut d, &f, t0, 200, |_| false);
+    assert!(
+        f.rt.status().resync_deferred.is_none(),
+        "the door opened and its diff ran: {seen:?}"
+    );
+    let deletes: Vec<_> = preserved::route_ops(&f.fake.drain_events())
+        .into_iter()
+        .filter(|(add, _)| !add)
+        .collect();
+    assert!(
+        deletes.is_empty(),
+        "no route left the steered VPP: {} withdrawn",
+        deletes.len()
     );
 }
 

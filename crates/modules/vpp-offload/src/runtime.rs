@@ -1313,14 +1313,14 @@ enum DeferredResync {
     /// differ by ([`seeded_diff_refusal`]).
     AwaitingSeededDiff {
         feed: FeedGate,
-        /// The early door previewed its diff and refused it. Latched for
-        /// the rest of this deferral, which then waits for the replay to
-        /// go quiet as it always did. Not retried: what the preview
-        /// measured is a disagreement between the two snapshots that only
-        /// the replay corrects, the replay going quiet is what the other
-        /// door waits for anyway, and each retry would be another whole
-        /// walk of the mirror on the supervision thread. Reported by the
-        /// deferral's status row.
+        /// The early door's walk found a diff its guard refused, and
+        /// queued none of it. Latched for the rest of this deferral, which
+        /// then waits for the replay to go quiet as it always did. Not
+        /// retried: what the walk measured is a disagreement between the
+        /// two snapshots that only the replay corrects, the replay going
+        /// quiet is what the other door waits for anyway, and each retry
+        /// would be another whole walk of the mirror on the supervision
+        /// thread. Reported by the deferral's status row.
         refused: Option<SeededDiffRefusal>,
     },
 }
@@ -1737,7 +1737,7 @@ impl std::fmt::Display for IpFamily {
     }
 }
 
-/// The steered seeded diff's early door refused the diff it previewed:
+/// The steered seeded diff's early door refused the diff its walk found:
 /// in `family`, it would disturb more of the adopted table than
 /// `seeded_diff_allowance`. Latched for the deferral
 /// (`DeferredResync::AwaitingSeededDiff::refused`), reported by its status
@@ -1782,11 +1782,11 @@ impl std::fmt::Display for SeededDiffRefusal {
 }
 
 /// Whether a STEERED seeded adoption's early diff must be refused, judged
-/// on the plan the diff would queue
-/// ([`crate::engine::ConvergenceEngine::preview_resync`]), before anything
-/// of it reaches VPP, family by family: each against its own adopted
-/// table (`v4`, `v6`), so a large table of one family cannot cover a
-/// disagreement that replaces half of a small table of the other.
+/// on the plan its walk found and before any of it is queued
+/// ([`crate::engine::ConvergenceEngine::begin_resync_judged`]), family by
+/// family: each against its own adopted table (`v4`, `v6` routes), so a
+/// large table of one family cannot cover a disagreement that replaces
+/// half of a small table of the other.
 ///
 /// **What is different when the diff lands on traffic.** On an unsteered
 /// adoption the seeded door's legs ([`seeded_mirror_releases_diff`]) are
@@ -3026,8 +3026,8 @@ pub struct RuntimeStatus {
     /// its preserved route ledger and not yet verified by this one. See
     /// `Core::seeded` and `StatusSnapshot::preserved_fib`.
     pub preserved_fib: bool,
-    /// The steered seeded diff's early door refused the diff it previewed,
-    /// so this deferral waits for the replay to go quiet. See
+    /// The steered seeded diff's early door refused the diff its walk
+    /// found, so this deferral waits for the replay to go quiet. See
     /// [`SeededDiffRefusal`].
     pub seeded_door_refused: Option<SeededDiffRefusal>,
     /// How many rules the ledger names that the NIC no longer holds, as
@@ -3862,10 +3862,8 @@ impl Core {
         }
     }
 
-    /// The seeded-mirror door's legs, read afresh: for a stage that has
-    /// just spent time (a preview walk of the whole mirror, a dump) since
-    /// the reading that opened it, and must not land a diff on legs that
-    /// held before that time and do not now.
+    /// The seeded-mirror door's legs, read afresh, for a stage that judges
+    /// them outside `read_fallback` (`AwaitingDiff`).
     fn seeded_door_open(&self, have: u64, floor: u64) -> bool {
         seeded_mirror_releases_diff(
             self.feed_session.as_ref().map(|f| f.liveness()),
@@ -4634,8 +4632,11 @@ impl ObserveView {
                     // release carries over as its door: `seeded_door`).
                     // Traffic is not steered into a FIB the seed
                     // misdescribes for any longer than that request takes.
-                    // FIRST, ahead of the early door's guard below: a seed
-                    // that does not describe VPP has nothing to preview.
+                    //
+                    // Immediately before the walk, whichever door opened:
+                    // nothing that takes time sits between this check and
+                    // the walk below, so its window is the quiet door's
+                    // own (review finding, PR #356).
                     if !c.seed_still_holds()? {
                         c.deferred_resync = Some(DeferredResync::AwaitingFallback {
                             feed,
@@ -4647,68 +4648,117 @@ impl ObserveView {
                         });
                         return Ok(crate::driver::Drain::AwaitingSource { have, want });
                     }
-                    if early {
-                        // The guard: the diff this would land on a VPP
-                        // carrying traffic, counted before any of it is
-                        // queued (`seeded_diff_refusal`).
-                        let (v4, v6) = c
-                            .seeded
+                    let Core {
+                        engine,
+                        source,
+                        feed_session,
+                        completeness,
+                        seeded,
+                        ..
+                    } = &mut *c;
+                    let src: &dyn RouteSource = source.as_ref();
+                    // The mirror as the walk reads it: past a VPP round
+                    // trip.
+                    let have_now = src.route_count();
+                    let plan = if early {
+                        // ONE walk, judged before anything of it is
+                        // queued: the plan the guard measures is the plan
+                        // that reaches the drain (`begin_resync_judged`).
+                        // The route source mutates the mirror while it
+                        // streams, so a plan judged on one walk and
+                        // committed by another bounds nothing (review
+                        // finding, PR #356).
+                        let (v4, v6) = seeded
                             .as_ref()
                             .map_or((0, 0), |s| (s.routes_v4, s.routes_v6));
-                        let preview = {
-                            let Core { engine, source, .. } = &mut *c;
-                            engine.preview_resync(source.as_ref())
-                        };
-                        if let Some(why) = seeded_diff_refusal(&preview, v4, v6) {
-                            tracing::warn!(
-                                family = why.family.as_str(),
-                                adopted = why.adopted,
-                                withdrawals = why.withdrawals,
-                                replaces = why.replaces,
-                                additions = why.additions,
-                                allowance = why.allowance,
-                                "{why}; VPP keeps forwarding its preserved FIB untouched, and \
-                                 steering stays up"
-                            );
-                            event_log::Event::warn(
-                                crate::MODULE_NAME,
-                                event_kind::SEEDED_DOOR_REFUSED,
-                            )
-                            .field("family", why.family.as_str())
-                            .field("adopted", why.adopted)
-                            .field("withdrawals", why.withdrawals)
-                            .field("replaces", why.replaces)
-                            .field("additions", why.additions)
-                            .field("allowance", why.allowance)
-                            .emit();
-                            c.deferred_resync = Some(DeferredResync::AwaitingSeededDiff {
-                                feed,
-                                refused: Some(why),
-                            });
-                            return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                        let mut shut = None;
+                        let walked = engine.begin_resync_judged(src, &mut |plan| {
+                            // The legs, read again once the walk is done:
+                            // it read the whole mirror, and the session or
+                            // the authority may have moved meanwhile. A
+                            // flap after this point is no different from
+                            // one after the quiet door's walk: the mirror
+                            // survives a session loss intact, and what the
+                            // reconnect re-announces arrives as deltas.
+                            let have = src.route_count();
+                            if !seeded_mirror_releases_diff(
+                                feed_session.as_ref().map(|f| f.liveness()),
+                                authority_current(completeness, have),
+                                have,
+                                want,
+                            ) {
+                                shut = Some(None);
+                                return false;
+                            }
+                            if let Some(why) = seeded_diff_refusal(plan, v4, v6) {
+                                shut = Some(Some(why));
+                                return false;
+                            }
+                            true
+                        });
+                        match walked {
+                            Ok(plan) => plan,
+                            // Refused: nothing reached the pending map,
+                            // and the route deltas the walk discarded are
+                            // not lost. No delta applies while a deferral
+                            // holds: `apply_changes` has one caller, in
+                            // this function below the deferral block, and
+                            // every deferral that has not released returns
+                            // before it. And every way out of a deferral
+                            // runs a full walk first — the quiet door's
+                            // here, the dump path's in `AwaitingFallback`,
+                            // or `start_resync`'s once VPP is replaced —
+                            // which reads the mirror as it then is and
+                            // supersedes them.
+                            Err(_) => {
+                                let refused = match shut {
+                                    Some(Some(why)) => {
+                                        tracing::warn!(
+                                            family = why.family.as_str(),
+                                            adopted = why.adopted,
+                                            withdrawals = why.withdrawals,
+                                            replaces = why.replaces,
+                                            additions = why.additions,
+                                            allowance = why.allowance,
+                                            "{why}; VPP keeps forwarding its preserved FIB \
+                                             untouched, and steering stays up"
+                                        );
+                                        event_log::Event::warn(
+                                            crate::MODULE_NAME,
+                                            event_kind::SEEDED_DOOR_REFUSED,
+                                        )
+                                        .field("family", why.family.as_str())
+                                        .field("adopted", why.adopted)
+                                        .field("withdrawals", why.withdrawals)
+                                        .field("replaces", why.replaces)
+                                        .field("additions", why.additions)
+                                        .field("allowance", why.allowance)
+                                        .emit();
+                                        Some(why)
+                                    }
+                                    // The legs moved under the walk. Not
+                                    // latched: a reconnect shuts the door
+                                    // for good on the next tick (its
+                                    // epoch), anything else is judged
+                                    // again there.
+                                    _ => {
+                                        tracing::info!(
+                                            "the seeded-mirror door's legs no longer held when \
+                                             its walk finished (the feed session or the \
+                                             completeness authority moved); nothing was \
+                                             queued, and the door is judged again"
+                                        );
+                                        refused
+                                    }
+                                };
+                                c.deferred_resync =
+                                    Some(DeferredResync::AwaitingSeededDiff { feed, refused });
+                                return Ok(crate::driver::Drain::AwaitingSource { have, want });
+                            }
                         }
-                        // The legs again, read after the preview: it walked
-                        // the whole mirror, and the session or the
-                        // authority may have moved meanwhile. Legs that no
-                        // longer hold leave the deferral as it was — a
-                        // reconnect shuts the door for good on the next
-                        // tick (its epoch), anything else is re-judged
-                        // there. A flap during the walk below is no
-                        // different from one during the quiet door's: the
-                        // mirror survives a session loss intact, and what
-                        // the reconnect re-announces arrives as deltas.
-                        let have_now = c.source.route_count();
-                        if !c.seeded_door_open(have_now, want) {
-                            c.deferred_resync =
-                                Some(DeferredResync::AwaitingSeededDiff { feed, refused });
-                            return Ok(crate::driver::Drain::AwaitingSource { have, want });
-                        }
-                    }
-                    let Core { engine, source, .. } = &mut *c;
-                    // The mirror as the walk reads it: past a VPP round
-                    // trip, and on the early door a whole preview walk.
-                    let have_now = source.route_count();
-                    let plan = engine.begin_resync(source.as_ref());
+                    } else {
+                        engine.begin_resync(src)
+                    };
                     if early {
                         tracing::info!(
                             have = have_now,
@@ -4723,10 +4773,9 @@ impl ObserveView {
                              route source is streaming in its first session, the completeness \
                              authority agrees with it, and the diff disturbs no more of either \
                              family's table than one clean stop's two snapshots can differ by: \
-                             diffing \
-                             it against the preserved ledger now rather than after the replay \
-                             goes quiet, while VPP keeps forwarding — no dump and no unsteer; \
-                             the replay's changes follow as ordinary updates"
+                             diffing it against the preserved ledger now rather than after the \
+                             replay goes quiet, while VPP keeps forwarding — no dump and no \
+                             unsteer; the replay's changes follow as ordinary updates"
                         );
                     } else {
                         tracing::info!(
@@ -4745,7 +4794,7 @@ impl ObserveView {
                     }
                     resync_released(early, "preserved-ledger", true, &plan, have_now);
                     engine
-                        .program_neighbours(source.as_ref())
+                        .program_neighbours(src)
                         .map(|_| ())
                         .map_err(|e| step_error(engine, e))?;
                     c.deferred_resync = None;
