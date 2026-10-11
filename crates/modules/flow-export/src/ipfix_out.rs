@@ -22,11 +22,15 @@ use std::time::{Duration, Instant};
 use packetframe_common::config::CollectorProfile;
 use packetframe_common::fib::asn::AsnTable;
 use packetframe_common::fib::IpPrefix;
-use packetframe_flow_encode::ipfix::{Announce, Exporter, Selector, Template};
+use packetframe_flow_encode::ipfix::{
+    record_len, Announce, Exporter, Selector, Template, MESSAGE_HEADER_LEN, SET_HEADER_LEN,
+    SET_PADDING_MAX,
+};
 use packetframe_flow_encode::{
     flow_fields, EncodeError, Family, Field, FlowRecord, Profile, SamplingSignal,
 };
 
+use crate::collector::SEND_BUDGET;
 use crate::flows::{Domain, Export};
 
 pub const SELECTOR_TEMPLATE: u16 = 258;
@@ -34,9 +38,27 @@ pub const SELECTOR_TEMPLATE: u16 = 258;
 /// flow: a collector that restarted learns them within it
 /// (requirement 3).
 pub const ANNOUNCE_EVERY: Duration = Duration::from_secs(10);
-/// Records taken from the cache per tick, across domains: about what the
-/// send budget carries.
-pub const RECORDS_PER_TICK: usize = 8192;
+/// Messages of a collector's per-tick send budget kept back from records:
+/// for announcements, and the part-filled message each domain, template
+/// and rate change ends a tick with.
+const BUDGET_SLACK: usize = 64;
+
+const _: () = assert!(BUDGET_SLACK < SEND_BUDGET);
+
+/// Records taken from the cache per tick, across domains, for messages of
+/// at most `max` bytes: what the rest of the send budget carries of the
+/// largest record any template sends. More, and the budget drops messages
+/// whose records have already left the cache, which a rate change (every
+/// flow queued at once) makes certain.
+pub fn records_per_tick(max: usize) -> usize {
+    let largest = TEMPLATES
+        .iter()
+        .map(|(_, f, p)| record_len(&flow_fields(*f, *p, SamplingSignal::Options)))
+        .max()
+        .unwrap_or(1);
+    let room = max.saturating_sub(MESSAGE_HEADER_LEN + SET_HEADER_LEN + SET_PADDING_MAX);
+    (room / largest).max(1) * (SEND_BUDGET - BUDGET_SLACK)
+}
 
 /// Every template a profile can use, and its id.
 const TEMPLATES: [(u16, Family, Profile); 7] = [
@@ -403,7 +425,7 @@ mod tests {
     ) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         for d in cache.pending() {
-            let items = cache.take(d, RECORDS_PER_TICK);
+            let items = cache.take(d, records_per_tick(max));
             x.encode(d, &items, privacy, now, 0, max, &mut out);
         }
         out
@@ -533,6 +555,22 @@ mod tests {
         assert!(out.len() > 1);
         assert!(out.iter().all(|d| d.len() <= FLOW_DEFAULT_DATAGRAM));
         assert_eq!(x.records, 500);
+    }
+
+    /// The take is what the budget's messages carry of an IPv6 record, the
+    /// largest (85 bytes), less the slack.
+    #[test]
+    fn a_ticks_take_shrinks_with_the_datagram() {
+        let v6 = record_len(&flow_fields(
+            Family::V6,
+            Profile::Full,
+            SamplingSignal::Options,
+        ));
+        assert_eq!(v6, 85);
+        assert_eq!(records_per_tick(FLOW_DEFAULT_DATAGRAM), 16 * 448);
+        assert_eq!(records_per_tick(1232), 14 * 448);
+        let floor = (FLOW_PATH_MTU_RANGE.0 - FLOW_DATAGRAM_OVERHEAD) as usize;
+        assert_eq!(records_per_tick(floor), 5 * 448);
     }
 
     /// `path-mtu`'s smallest: the announcement and every record still go,

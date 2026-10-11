@@ -29,7 +29,7 @@ use crate::cfg::FlowExportConfig;
 use crate::collector::{reconcile, send_all, send_until, CollectorState, Transport};
 use crate::coverage::{PortCoverage, State, Window, WINDOW};
 use crate::flows::{self, Domain, FlowCache, Now, Sampled};
-use crate::ipfix_out::{IpfixOut, Privacy, RECORDS_PER_TICK};
+use crate::ipfix_out::{records_per_tick, IpfixOut, Privacy};
 use crate::pool::Accumulator;
 use crate::sflow_out::{ip_frame, wire_frame, Exporter, Ready, FCS};
 use crate::vpp::{NoVpp, Taken, VppDir, VppHealth, VppSide};
@@ -606,7 +606,8 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
             cache.ingest(*domain, batch);
         }
         cache.expire(at, EXPIRE_BUDGET);
-        self.send_flows(now, at, RECORDS_PER_TICK, None);
+        let take = records_per_tick(self.cfg.datagram);
+        self.send_flows(now, at, take, None);
     }
 
     /// The local prefixes: the section's, else fast-path's allowlist as
@@ -702,7 +703,8 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
                 .is_some_and(|f| !f.cache.pending().is_empty())
                 && Instant::now() < deadline
             {
-                unsent += self.send_flows(now, at, RECORDS_PER_TICK, Some(deadline));
+                let take = records_per_tick(self.cfg.datagram);
+                unsent += self.send_flows(now, at, take, Some(deadline));
             }
             let unencoded = self.flows.as_ref().map_or(0, |f| f.cache.queued());
             if unsent > 0 || unencoded > 0 {
@@ -1278,6 +1280,29 @@ mod tests {
         f.extend_from_slice(&40000u16.to_be_bytes());
         f.extend_from_slice(&dport.to_be_bytes());
         f.resize(64, 0);
+        event_with(ingress, 0, 0, rate, generation, &f)
+    }
+
+    /// [`ip_event`] for IPv6: its records are the largest a template
+    /// carries.
+    fn ip6_event(ingress: u32, dport: u16, rate: u32, generation: u32) -> Vec<u8> {
+        let mut f = vec![0x02; 12];
+        f.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0, 0x03, 0xc6, 6, 64]);
+        f.extend_from_slice(
+            &"2001:db8::7"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        f.extend_from_slice(
+            &"2001:db8::9"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        f.extend_from_slice(&40000u16.to_be_bytes());
+        f.extend_from_slice(&dport.to_be_bytes());
+        f.resize(96, 0);
         event_with(ingress, 0, 0, rate, generation, &f)
     }
 
@@ -1931,6 +1956,57 @@ mod tests {
         r.w.stop().unwrap();
         let sent = r.net.sent.borrow();
         assert_eq!(sent.last().unwrap().0.port(), 4739, "{sent:?}");
+    }
+
+    /// A tunnel's `path-mtu` makes messages smaller, so a tick takes fewer
+    /// records from the cache: what the send budget carries of the largest
+    /// (IPv6) record. A rate change queues every flow at once; each goes,
+    /// and the budget drops no message whose records already left the
+    /// cache.
+    #[test]
+    fn a_small_path_mtu_takes_no_more_records_than_the_budget_sends() {
+        for datagram in [packetframe_common::config::FLOW_DEFAULT_DATAGRAM, 1232] {
+            a_rate_change_backlog_goes_out_whole(datagram);
+        }
+    }
+
+    fn a_rate_change_backlog_goes_out_whole(datagram: usize) {
+        let mut r = rig(1000);
+        let c = FlowExportConfig {
+            datagram,
+            ..with_ipfix(cfg(1000))
+        };
+        let _ = reload(&r.shared, c);
+        r.w.tick(r.t0);
+        let flows = 20_000u16;
+        r.src
+            .events
+            .borrow_mut()
+            .extend((0..flows).map(|port| ip6_event(3, port, 1000, 1)));
+        r.w.tick(r.t0 + TICK);
+        assert_eq!(
+            r.shared.snapshot().flows.unwrap().active,
+            usize::from(flows)
+        );
+        // A sample at a new rate: all 20,000 are queued for export.
+        r.src
+            .events
+            .borrow_mut()
+            .push_back(ip6_event(3, 60_000, 500, 2));
+        let mut t = r.t0 + 2 * TICK;
+        for _ in 0..20 {
+            r.w.tick(t);
+            t += TICK;
+        }
+        let out = &r.w.flows.as_ref().unwrap().outs[0];
+        assert_eq!(out.records, u64::from(flows), "{datagram}");
+        assert_eq!(r.w.collectors[1].budget_drops, 0, "{datagram}");
+        assert!(r
+            .net
+            .sent
+            .borrow()
+            .iter()
+            .all(|(to, d)| to.port() != 4739 || d.len() <= datagram));
     }
 
     /// More flows than one tick's send budget carries all go out at a
