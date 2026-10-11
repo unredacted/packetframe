@@ -104,6 +104,8 @@ Kinds are stable: scripts and alerts may key on them.
 | `handback_ready` / `handback_held_back` | The IPv6 hand-back path changed readiness; the v6 half of steering follows it | `detail` |
 | `keep_queue0_fallback` | A port's driver refused an RSS-action keep rule or stored it without RSS, so that port's keeps deliver to PF queue 0. Once per port per daemon | `port`, `detail` (the driver's answer) |
 | `kernel_path_dropping` | A steered port's kernel path started dropping frames (`dropping: true`), or stopped (`false`). At most one `true` per port every ten minutes | `port`, `dropping`, `drops_per_second`, `queue0_share`, `keep_form` |
+| `resync_released` | An adopted resync's deferred diff ran. `door: quiet` when the route source loaded and went quiet; `door: seeded` when the [seeded-mirror door](vpp-offload.md#the-steered-diff-and-a-seeded-mirror) released it while the replay was still streaming | `door`, `path` (`preserved-ledger`, `readback`, `readback-deferred`), `steered`, `routes`, `unchanged`, `upserts`, `replaces`, `withdrawals` |
+| `seeded_door_refused` | A steered seeded adoption's early diff would withdraw or replace more than 1% of the routes VPP holds, so the two ledgers disagree and the diff waits for the replay to go quiet (warn). Once per restart | `adopted`, `withdrawals`, `replaces`, `allowance` |
 
 **fast-path**
 
@@ -123,7 +125,7 @@ Kinds are stable: scripts and alerts may key on them.
 | `events_dropped` | The queue was full; recorded ahead of the next event written | `count` |
 | `event_log_recovered` | Writes succeed again after a failure | `lost`, `error` |
 
-A restart reads as `route_ledger_preserved` and `ledger_preserved` (both written by the stopping daemon before it records its exit) → `process_stop` → `process_start` → `module_attached` … → `route_ledger_seeded` → `adoption_path` → `verify_passed` → `steering_up` (or `steering_restored`), then `route_ledger_reconciled` once the route source's replay finishes. A crash loop reads as a column of `process_start` / `process_stop` pairs.
+A restart reads as `route_ledger_preserved` and `ledger_preserved` (both written by the stopping daemon before it records its exit) → `process_stop` → `process_start` → `module_attached` … → `route_ledger_seeded` → `adoption_path` → `resync_released` (an adopted VPP's diff; `door: seeded` while the replay still streams) → `verify_passed` → `steering_up` (or `steering_restored`), then `route_ledger_reconciled` once the route source's replay finishes. A crash loop reads as a column of `process_start` / `process_stop` pairs.
 
 ## Rotation and size
 

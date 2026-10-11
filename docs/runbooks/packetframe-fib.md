@@ -1174,9 +1174,14 @@ daemon stopped. The age bound caps how far behind that can be.
   mirror](vpp-offload.md#the-unsteered-diff-and-a-seeded-mirror)). Verify
   follows and the port is `Ready`; the first steer is then the operator's
   `steer` flag, as always for a port that was not steered.
-- **vpp-offload, steered adopted VPP**: unchanged — it stays steered
-  through the restart on its own preserved ledger, and its diff waits
-  for the replay to go quiet, as before.
+- **vpp-offload, steered adopted VPP**: it stays steered through the
+  restart on its own preserved ledger, and its diff takes the same
+  seeded door, so verify and the re-assert steer no longer wait for the
+  replay either. Because that diff lands on traffic, it is counted first
+  and lands early only if it withdraws or replaces at most 1% of the
+  routes VPP holds. A bigger one waits for the replay to go quiet, as
+  before ([the steered diff and a seeded
+  mirror](vpp-offload.md#the-steered-diff-and-a-seeded-mirror)).
 
 ### What you see
 
