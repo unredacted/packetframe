@@ -20,7 +20,16 @@ This directory holds only what differs from upstream:
 
 Versions are the ones flow export was tested against
 ([collector evidence](../collectors.md)): Akvorado v2026.10.0 and FastNetMon
-1.2.9.
+1.2.9. Read FastNetMon's [security advisory](#fastnetmon-and-cve-2026-92698)
+before you deploy it.
+
+The commands below run from a directory of their own, `~/collectors`, and
+take the bundle from your checkout of this repository:
+
+```sh
+PF=~/packetframe        # your checkout of this repository
+mkdir -p ~/collectors
+```
 
 ## The host
 
@@ -39,7 +48,7 @@ Versions are the ones flow export was tested against
 - **Start order:** the collectors are published on this host's Tailscale
   address, which must exist when Docker starts them. Install the drop-in:
   ```sh
-  sudo install -D -m 0644 host/docker-after-tailscale.conf \
+  sudo install -D -m 0644 "$PF/docs/flow-export/collector-host/host/docker-after-tailscale.conf" \
     /etc/systemd/system/docker.service.d/after-tailscale.conf
   sudo systemctl daemon-reload
   ```
@@ -52,9 +61,9 @@ Versions are the ones flow export was tested against
 ## Akvorado
 
 ```sh
-mkdir akvorado && cd akvorado
+mkdir ~/collectors/akvorado && cd ~/collectors/akvorado
 curl -fsSL https://github.com/akvorado/akvorado/releases/download/v2026.10.0/docker-compose-quickstart.tar.gz | tar xz
-cp ../packetframe/docs/flow-export/collector-host/akvorado/docker-compose-local.yml docker/
+cp "$PF/docs/flow-export/collector-host/akvorado/docker-compose-local.yml" docker/
 echo "COLLECTOR_ADDR=$(tailscale ip -4)" >> .env
 ```
 
@@ -93,7 +102,7 @@ about 1.2 GB.
 ## FastNetMon
 
 ```sh
-cp -r ../packetframe/docs/flow-export/collector-host/fastnetmon . && cd fastnetmon
+cp -r "$PF/docs/flow-export/collector-host/fastnetmon" ~/collectors/ && cd ~/collectors/fastnetmon
 echo "COLLECTOR_ADDR=$(tailscale ip -4)" > .env
 ./setup.sh <each prefix you protect>
 ```
@@ -111,6 +120,27 @@ docker compose up -d
 silence as calm ([evidence](../collectors.md), and the lab again with
 PacketFrame's exporter). Mitigation must not rest on its ban alone. That is
 what PacketFrame's coverage handle is for.
+
+### FastNetMon and CVE-2026-92698
+
+FastNetMon up to 1.2.9 trusts an sFlow record's `header_size` as the bound
+for its packet parser ([GHSA-852r-3wcv-pjx2](https://github.com/pavel-odintsov/fastnetmon/security/advisories/GHSA-852r-3wcv-pjx2)).
+One crafted datagram reads out of bounds and can crash it.
+- **No release has the fix yet.** The fix is on master (commit `6871b738`,
+  2026-07-20). The `1.2.10` and `latest` images published since carry the
+  same 1.2.9 binary, without it.
+- **Here, only a router can reach it.** sFlow is published on the Tailscale
+  address only, and the tailnet policy admits only the routers. Tailscale
+  peers cannot be spoofed, so a crafted datagram has to come from a
+  compromised router.
+- **A crash is not permanent.** The restart policy brings FastNetMon back,
+  and PacketFrame's own sFlow never sets `header_size` past the bytes it
+  sends.
+- **Move to the first release with the fix.** The image is pinned by digest
+  so that is a deliberate change.
+
+NetFlow, which a related advisory covers (GHSA-ff5f-p5jw-8fq2), is off in this
+configuration.
 
 ## The routers
 
@@ -132,7 +162,7 @@ Here `198.51.100.10` stands for this host's Tailscale address.
 | Where | What to run | Expect |
 |---|---|---|
 | Router | `packetframe status` | each collector row `healthy`. That is submission: the router cannot see receipt |
-| Akvorado | `docker compose exec clickhouse clickhouse-client --query "SELECT ExporterAddress, count(), max(TimeReceived) FROM flows WHERE TimeReceived > now() - INTERVAL 5 MINUTE GROUP BY ExporterAddress"` | each router, by its `source-address` |
+| Akvorado, in `~/collectors/akvorado` | `docker compose exec clickhouse clickhouse-client --query "SELECT ExporterAddress, count(), max(TimeReceived) FROM flows WHERE TimeReceived > now() - INTERVAL 5 MINUTE GROUP BY ExporterAddress"` | each router, by its `source-address` |
 | FastNetMon | `curl -s 127.0.0.1:9209/metrics \| grep fastnetmon_sflow_raw_udp_packets_received` | rising |
 
 ## Moving FastNetMon later
