@@ -545,7 +545,9 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
             let mut datagrams = Vec::new();
             let uptime_ms = now.saturating_duration_since(self.shared.epoch).as_millis() as u32;
             self.p.unencodable_total +=
-                self.exporter.encode(&ready, uptime_ms, &mut datagrams) as u64;
+                self.exporter
+                    .encode(&ready, uptime_ms, self.cfg.datagram, &mut datagrams)
+                    as u64;
             self.p.datagrams_total += datagrams.len() as u64;
             send_all(
                 &self.transport,
@@ -652,6 +654,7 @@ impl<S: SampleSource, P: Ports, T: Transport, V: VppDir> Worker<S, P, T, V> {
                     &privacy,
                     now,
                     (at.wall_ms / 1000) as u32,
+                    self.cfg.datagram,
                     &mut messages,
                 );
                 self.p.ipfix_messages_total += messages.len() as u64;
@@ -1315,6 +1318,7 @@ mod tests {
                 format: CollectorFormat::Sflow,
                 profile: Default::default(),
             }],
+            datagram: packetframe_common::config::FLOW_DEFAULT_DATAGRAM,
             cache: flows::Limits::default(),
             local: Vec::new(),
             kernel: Vec::new(),
@@ -1385,6 +1389,39 @@ mod tests {
 
     fn word(d: &[u8], at: usize) -> u32 {
         u32::from_be_bytes(d[at..at + 4].try_into().unwrap())
+    }
+
+    /// A reload to a smaller `path-mtu` applies from the next tick: the
+    /// same samples go in more, smaller datagrams.
+    #[test]
+    fn a_reloaded_path_mtu_sizes_the_next_datagrams() {
+        let mut r = rig(1000);
+        r.w.tick(r.t0);
+        r.ports.rx.borrow_mut().insert(3, 6_000);
+        let mut t = r.t0 + PORTS_EVERY;
+        r.w.tick(t);
+        let mut sizes = Vec::new();
+        for datagram in [packetframe_common::config::FLOW_DEFAULT_DATAGRAM, 528] {
+            let c = FlowExportConfig {
+                datagram,
+                ..cfg(1000)
+            };
+            let answer = reload(&r.shared, c);
+            r.src
+                .events
+                .borrow_mut()
+                .extend((0..20).map(|_| event(3, 0, 0, 1000, 1)));
+            r.net.sent.borrow_mut().clear();
+            t += TICK;
+            r.w.tick(t);
+            assert_eq!(answer.try_recv().unwrap(), Ok(()));
+            let sent = r.net.sent.borrow();
+            assert!(sent.iter().all(|(_, d)| d.len() <= datagram), "{datagram}");
+            let samples: u32 = sent.iter().map(|(_, d)| word(d, 24)).sum();
+            assert_eq!(samples, 20, "{datagram}");
+            sizes.push(sent.len());
+        }
+        assert!(sizes[1] > sizes[0], "{sizes:?}");
     }
 
     #[test]

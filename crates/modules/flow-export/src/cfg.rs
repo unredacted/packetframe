@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use packetframe_common::config::{
     CollectorFormat, CollectorKind, CollectorProfile, ModuleDirective, FLOW_BUDGET_RATE,
-    FLOW_DEFAULT_HEADER_BYTES, FLOW_DEFAULT_RATE,
+    FLOW_DATAGRAM_OVERHEAD, FLOW_DEFAULT_DATAGRAM, FLOW_DEFAULT_HEADER_BYTES, FLOW_DEFAULT_RATE,
 };
 use packetframe_common::fib::IpPrefix;
 
@@ -30,6 +30,9 @@ pub struct FlowExportConfig {
     pub rate: u32,
     pub header_bytes: u32,
     pub collectors: Vec<Collector>,
+    /// The most bytes a datagram holds: what `path-mtu` leaves for them,
+    /// else [`FLOW_DEFAULT_DATAGRAM`].
+    pub datagram: usize,
     /// The IPFIX flow cache's bounds.
     pub cache: Limits,
     /// `privacy-local-prefix`: empty means `local_default`.
@@ -46,6 +49,7 @@ impl FlowExportConfig {
         let mut source = None;
         let mut rate = FLOW_DEFAULT_RATE;
         let mut header_bytes = FLOW_DEFAULT_HEADER_BYTES;
+        let mut datagram = FLOW_DEFAULT_DATAGRAM;
         let mut collectors = Vec::new();
         let mut cache = Limits::default();
         let mut local = Vec::new();
@@ -55,6 +59,9 @@ impl FlowExportConfig {
                 ModuleDirective::FlowSourceAddress { addr, .. } => source = Some(*addr),
                 ModuleDirective::FlowSampleRate { rate: r, .. } => rate = *r,
                 ModuleDirective::FlowHeaderBytes { bytes, .. } => header_bytes = *bytes,
+                ModuleDirective::FlowPathMtu { mtu, .. } => {
+                    datagram = (*mtu - FLOW_DATAGRAM_OVERHEAD) as usize
+                }
                 ModuleDirective::FlowCollector {
                     name,
                     addr,
@@ -95,6 +102,7 @@ impl FlowExportConfig {
             rate,
             header_bytes,
             collectors,
+            datagram,
             cache,
             local,
             kernel,
@@ -175,6 +183,11 @@ mod tests {
         assert_eq!((c.rate, c.header_bytes), (100, 64));
         assert!(c.over_budget());
         assert_eq!(c.collectors[0].kind, CollectorKind::Ddos);
+        assert_eq!(c.datagram, FLOW_DEFAULT_DATAGRAM, "no path-mtu");
+        let c = parse(
+            "  source-address 192.0.2.1\n  path-mtu 1280\n  collector a sflow 198.51.100.1:6343\n",
+        );
+        assert_eq!(c.datagram, 1232, "Tailscale's MTU, less IPv6 and UDP");
     }
 
     #[test]

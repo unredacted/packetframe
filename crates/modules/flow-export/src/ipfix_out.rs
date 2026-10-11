@@ -28,7 +28,6 @@ use packetframe_flow_encode::{
 };
 
 use crate::flows::{Domain, Export};
-use crate::sflow_out::MAX_DATAGRAM;
 
 pub const SELECTOR_TEMPLATE: u16 = 258;
 /// Templates and the selector, again at least this often while records
@@ -182,7 +181,9 @@ impl IpfixOut {
         }
     }
 
-    /// Messages for one domain's exports, in order, appended to `out`.
+    /// Messages of at most `max` bytes (the module's `datagram`) for one
+    /// domain's exports, in order, appended to `out`.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode(
         &mut self,
         domain: Domain,
@@ -190,6 +191,7 @@ impl IpfixOut {
         privacy: &Privacy<'_>,
         now: Instant,
         export_s: u32,
+        max: usize,
         out: &mut Vec<Vec<u8>>,
     ) {
         self.domains.entry(domain).or_insert_with(|| DomainOut {
@@ -213,7 +215,7 @@ impl IpfixOut {
             };
             let d = self.domains.get_mut(&domain).expect("inserted above");
             if rate != d.rate {
-                self.flush(domain, &mut pending, now, export_s, out);
+                self.flush(domain, &mut pending, now, export_s, max, out);
                 let d = self.domains.get_mut(&domain).expect("inserted above");
                 d.rate = rate;
                 d.next_announce = None;
@@ -223,7 +225,7 @@ impl IpfixOut {
                 pending.entry(template).or_default().push(r);
             }
         }
-        self.flush(domain, &mut pending, now, export_s, out);
+        self.flush(domain, &mut pending, now, export_s, max, out);
     }
 
     fn flush(
@@ -232,6 +234,7 @@ impl IpfixOut {
         pending: &mut BTreeMap<u16, Vec<FlowRecord>>,
         now: Instant,
         export_s: u32,
+        max: usize,
         out: &mut Vec<Vec<u8>>,
     ) {
         if pending.values().all(Vec::is_empty) {
@@ -265,10 +268,10 @@ impl IpfixOut {
                 } else {
                     Announce::default()
                 };
-                let mut buf = Vec::with_capacity(MAX_DATAGRAM);
+                let mut buf = Vec::with_capacity(max);
                 match d
                     .exporter
-                    .encode_flows(&mut buf, export_s, &a, template, rest, MAX_DATAGRAM)
+                    .encode_flows(&mut buf, export_s, &a, template, rest, max)
                 {
                     Ok(n) => {
                         if announce {
@@ -283,9 +286,9 @@ impl IpfixOut {
                     // The announcement and a record do not fit together:
                     // the announcement goes alone, then the records.
                     Err(EncodeError::TooLarge) if announce => {
-                        let mut alone = Vec::with_capacity(MAX_DATAGRAM);
+                        let mut alone = Vec::with_capacity(max);
                         if d.exporter
-                            .encode_flows(&mut alone, export_s, &a, template, &[], MAX_DATAGRAM)
+                            .encode_flows(&mut alone, export_s, &a, template, &[], max)
                             .is_ok()
                         {
                             out.push(alone);
@@ -311,6 +314,9 @@ impl IpfixOut {
 mod tests {
     use super::*;
     use crate::flows::{FlowCache, Limits, Now, Packet, Sampled};
+    use packetframe_common::config::{
+        FLOW_DATAGRAM_OVERHEAD, FLOW_DEFAULT_DATAGRAM, FLOW_PATH_MTU_RANGE,
+    };
 
     const TEMPLATE_V4: u16 = 256;
     const TEMPLATE_V6: u16 = 257;
@@ -384,10 +390,21 @@ mod tests {
         privacy: &Privacy<'_>,
         now: Instant,
     ) -> Vec<Vec<u8>> {
+        encode_all_within(cache, x, privacy, now, FLOW_DEFAULT_DATAGRAM)
+    }
+
+    /// [`encode_all`] into messages of at most `max` bytes.
+    fn encode_all_within(
+        cache: &mut FlowCache,
+        x: &mut IpfixOut,
+        privacy: &Privacy<'_>,
+        now: Instant,
+        max: usize,
+    ) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         for d in cache.pending() {
             let items = cache.take(d, RECORDS_PER_TICK);
-            x.encode(d, &items, privacy, now, 0, &mut out);
+            x.encode(d, &items, privacy, now, 0, max, &mut out);
         }
         out
     }
@@ -445,6 +462,7 @@ mod tests {
             &NONE,
             Instant::now(),
             0,
+            FLOW_DEFAULT_DATAGRAM,
             &mut out,
         );
         assert_eq!(sets(&out[0]).1, Some(1000));
@@ -513,8 +531,31 @@ mod tests {
         cache.expire(at(15_000), 1000);
         let out = encode_all(&mut cache, &mut x, &NONE, Instant::now());
         assert!(out.len() > 1);
-        assert!(out.iter().all(|d| d.len() <= MAX_DATAGRAM));
+        assert!(out.iter().all(|d| d.len() <= FLOW_DEFAULT_DATAGRAM));
         assert_eq!(x.records, 500);
+    }
+
+    /// `path-mtu`'s smallest: the announcement and every record still go,
+    /// in more messages, none larger.
+    #[test]
+    fn the_smallest_path_mtu_still_carries_every_record() {
+        let max = (FLOW_PATH_MTU_RANGE.0 - FLOW_DATAGRAM_OVERHEAD) as usize;
+        let batch: Vec<Sampled> = (0..500)
+            .map(|p| sampled("192.0.2.1", "198.51.100.2", p, 1000, 1))
+            .collect();
+        let mut counts = Vec::new();
+        for limit in [FLOW_DEFAULT_DATAGRAM, max] {
+            let mut cache = FlowCache::new(Limits::default());
+            let mut x = IpfixOut::new(CollectorProfile::Full);
+            ingest(&mut cache, Domain::FastPath, &batch, at(0));
+            cache.expire(at(15_000), 1000);
+            let out = encode_all_within(&mut cache, &mut x, &NONE, Instant::now(), limit);
+            assert!(out.iter().all(|d| d.len() <= limit), "{limit}");
+            assert_eq!(sets(&out[0]).1, Some(1000), "announced first");
+            assert_eq!((x.records, x.unencodable), (500, 0), "{limit}");
+            counts.push(out.len());
+        }
+        assert!(counts[1] > counts[0], "{counts:?}");
     }
 
     fn record(src: &str, dst: &str) -> FlowRecord {
