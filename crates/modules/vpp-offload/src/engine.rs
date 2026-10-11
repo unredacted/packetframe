@@ -417,13 +417,13 @@ pub struct ResyncPlan {
     /// preserved-ledger adoption this is nearly the whole table — the
     /// point of preserving it; on a fresh resync it is zero.
     pub unchanged: u64,
-    /// Of `upserts`, the prefixes VPP is recorded holding (installed, or
-    /// handed to the transport) through other paths: a replace of a route
-    /// it forwards on now. The rest of `upserts` add a prefix it does not
-    /// hold. With `withdrawals`, what the diff takes away from or moves
-    /// under traffic already on VPP — which is what the steered seeded
-    /// diff's early door bounds (`runtime`'s `seeded_diff_refusal`).
-    pub replaces: u64,
+    /// What the plan does to VPP's IPv4 table: withdrawals, replaces and
+    /// additions under the traffic VPP forwards ([`Disturbance`]). Per
+    /// family, because the steered seeded diff's early door bounds each
+    /// family against its own table (`runtime`'s `seeded_diff_refusal`).
+    pub v4: Disturbance,
+    /// The same for IPv6.
+    pub v6: Disturbance,
     /// IPv6 source routes left out of VPP because every next hop is
     /// link-local (see [`ConvergenceEngine`]'s link-local refusal).
     pub link_local_refused: u64,
@@ -433,6 +433,51 @@ pub struct ResyncPlan {
     /// which used to report ~252k v6 "upserts" on a full-table box only
     /// for the drainer to discard each one.
     pub out_of_family: u64,
+}
+
+impl ResyncPlan {
+    /// Prefixes VPP holds that the plan re-sends, both families.
+    pub fn replaces(&self) -> u64 {
+        self.v4.replaces + self.v6.replaces
+    }
+
+    /// Prefixes VPP does not hold that the plan sends through paths that
+    /// resolve, both families.
+    pub fn additions(&self) -> u64 {
+        self.v4.additions + self.v6.additions
+    }
+
+    fn family_mut(&mut self, prefix: &IpPrefix) -> &mut Disturbance {
+        match prefix {
+            IpPrefix::V4 { .. } => &mut self.v4,
+            IpPrefix::V6 { .. } => &mut self.v6,
+        }
+    }
+}
+
+/// What a resync plan does to one address family of VPP's table, counted
+/// against the routes VPP forwards on when it is made.
+///
+/// Every upsert of the plan is a replace, an addition, or neither: an
+/// upsert of a prefix VPP does not hold whose next hops all resolve to
+/// nothing sends VPP nothing (the drain records it unresolvable), so it
+/// changes nothing VPP forwards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Disturbance {
+    /// Prefixes VPP holds that the plan withdraws.
+    pub withdrawals: u64,
+    /// Prefixes VPP is recorded holding (installed, or handed to the
+    /// transport) that the plan re-sends: through other paths than VPP
+    /// holds, or through none it can resolve now, which the drain then
+    /// removes from VPP as unresolvable.
+    pub replaces: u64,
+    /// Prefixes VPP does not hold that the plan sends through a next hop
+    /// that resolves now: routes VPP will forward on that it did not
+    /// before (one whose interface has no index yet is deferred, not
+    /// dropped, so it counts too). A table at its high-water mark withholds
+    /// some of them; the plan counts them all, and a caller that cares
+    /// weighs that itself.
+    pub additions: u64,
 }
 
 /// Whether a resync walk queues the diff it plans
@@ -4058,16 +4103,23 @@ impl ConvergenceEngine {
                 plan.unchanged += 1;
                 return;
             }
-            // A route VPP holds (or has been handed) through other paths:
-            // the upsert replaces one it forwards on, where the rest add a
-            // prefix it does not hold.
+            // A route VPP holds (or has been handed) through other paths,
+            // or through none it can resolve now: the upsert replaces, or
+            // removes, one it forwards on. Otherwise it adds a route VPP
+            // will forward on — if any next hop resolves; one whose next
+            // hops all resolve to nothing sends VPP nothing.
             if matches!(
                 self.ledger.state_of(prefix),
                 Some(
                     crate::sink::RouteState::Installed | crate::sink::RouteState::Installing { .. }
                 )
             ) {
-                plan.replaces += 1;
+                plan.family_mut(&prefix).replaces += 1;
+            } else if nexthops
+                .iter()
+                .any(|nh| self.nexthops.resolve(nh).is_some())
+            {
+                plan.family_mut(&prefix).additions += 1;
             }
             if commit {
                 self.pending.upsert(prefix, nexthops.to_vec());
@@ -4082,6 +4134,7 @@ impl ConvergenceEngine {
                     self.pending.withdraw(*prefix);
                 }
                 plan.withdrawals += 1;
+                plan.family_mut(prefix).withdrawals += 1;
             }
         }
         if !commit {
@@ -4132,6 +4185,15 @@ impl ConvergenceEngine {
         let Some(via) = self.ledger.installed_via(prefix) else {
             return false;
         };
+        self.wire_paths(nexthops)
+            .is_some_and(|paths| self.ledger.find_paths(&path_set_of(&paths)) == Some(via))
+    }
+
+    /// The wire paths `nexthops` would be installed through right now, or
+    /// `None` when none resolves or an interface has no index yet. The
+    /// same resolution, encoding and cap the drainer applies, for
+    /// [`Self::installed_unchanged`] to compare with what VPP acknowledged.
+    fn wire_paths(&self, nexthops: &[IpAddr]) -> Option<Vec<FibPath>> {
         let resolved: Vec<ResolvedPath> = nexthops
             .iter()
             .filter_map(|nh| {
@@ -4142,13 +4204,11 @@ impl ConvergenceEngine {
             })
             .collect();
         if resolved.is_empty() {
-            return false;
+            return None;
         }
-        let Some(mut paths) = build_paths(&resolved, &self.port_index) else {
-            return false;
-        };
+        let mut paths = build_paths(&resolved, &self.port_index)?;
         cap_paths(&mut paths);
-        self.ledger.find_paths(&path_set_of(&paths)) == Some(via)
+        Some(paths)
     }
 
     /// Push one bounded batch. `Ok(true)` = nothing left pending.

@@ -149,13 +149,15 @@ pub mod kind {
     /// An adopted resync's deferred diff ran: `door` says what released
     /// it (`quiet`, the route source loaded and quiet; `seeded`, the
     /// seeded-mirror door), with `path`, `steered`, `routes` and what the
-    /// diff queued (`unchanged`, `upserts`, `replaces`, `withdrawals`).
+    /// diff queued (`unchanged`, `upserts`, `replaces`, `additions`,
+    /// `withdrawals`).
     pub const RESYNC_RELEASED: &str = "resync_released";
-    /// A steered seeded adoption's early diff door stayed shut because the
-    /// diff it previewed would withdraw or replace more of the adopted
-    /// table than two snapshots of one stop can differ by (`adopted`,
-    /// `withdrawals`, `replaces`, `allowance`); the diff waits for the
-    /// route source's replay to go quiet instead.
+    /// A steered seeded adoption's early diff door stayed shut because, in
+    /// one address family (`family`), the diff it previewed would
+    /// withdraw, replace or add more of that family's adopted table than
+    /// two snapshots of one stop can differ by (`adopted`, `withdrawals`,
+    /// `replaces`, `additions`, `allowance`); the diff waits for the route
+    /// source's replay to go quiet instead.
     pub const SEEDED_DOOR_REFUSED: &str = "seeded_door_refused";
 
     // --- fast-path ---

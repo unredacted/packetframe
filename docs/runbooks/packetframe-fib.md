@@ -1178,8 +1178,9 @@ daemon stopped. The age bound caps how far behind that can be.
   restart on its own preserved ledger, and its diff takes the same
   seeded door, so verify and the re-assert steer no longer wait for the
   replay either. Because that diff lands on traffic, it is counted first
-  and lands early only if it withdraws or replaces at most 1% of the
-  routes VPP holds. A bigger one waits for the replay to go quiet, as
+  and lands early only if, in each address family, it withdraws,
+  replaces or adds at most 1% of that family's routes VPP holds. A
+  bigger one waits for the replay to go quiet, as
   before ([the steered diff and a seeded
   mirror](vpp-offload.md#the-steered-diff-and-a-seeded-mirror)).
 

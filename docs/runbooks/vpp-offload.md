@@ -1076,12 +1076,9 @@ and the keep rules waited for the re-assert to move them to the RSS form.
 
 **What changes when the diff lands on traffic.** Here VPP is forwarding
 through every route the diff touches. Against the diff that would run
-after the replay, an early one differs only by what the replay has not
-re-advertised yet:
+after the replay, an early one differs by what the replay has not
+re-advertised yet, and by how long what it lands stays wrong:
 
-- *Additions* are the same either way. The seed's routes stay in the
-  mirror until the route source's GC, so the diff after the replay adds
-  them too.
 - *Withdrawals* of routes VPP holds that the seed lacks and the replay
   would bring back. An early diff takes them out of VPP until the
   replay reaches them, and their traffic follows a less specific route
@@ -1090,13 +1087,25 @@ re-advertised yet:
   resolves to now, where the replay would say otherwise again. An early
   diff moves their traffic onto the seed's paths until it does, and a
   route whose next hop resolves to nothing at the walk leaves VPP.
+- *Additions*, routes the seed holds that VPP does not. Both diffs add
+  them, but not for as long. A seeded route the source has dropped
+  leaves the mirror at the route source's GC, five quiet seconds after
+  the replay, and the quiet door's diff runs two quiet seconds after it,
+  so there such a route sits in VPP for seconds. The early door's leaves
+  it there for the whole replay, and a stale more-specific pulls traffic
+  off the less specific route VPP was using. The completeness authority
+  counts routes, not which ones, so it cannot tell two ledgers from
+  different stops that agree in size.
 
 **Why that is near nothing.** Both ledgers are snapshots from the same
 clean stop: the fast-path's of the route mirror, vpp-offload's of what
 VPP acknowledged from that mirror. They differ only by what VPP had not
-received or acknowledged at that moment, which is churn-sized, and by
-routes VPP is never given (withheld, unresolvable, shadowed), which this
-walk leaves out for the same reasons. The replay's re-advertisement of an
+received or acknowledged at that moment, which is churn-sized. Routes the
+previous process kept out of VPP do not count: a shadowed,
+kernel-delivered or link-local-only route is left out of the diff again,
+a route whose next hop resolved to nothing then and still does adds
+nothing, and a route withheld at the family's high-water mark is withheld
+again (only the additions VPP has room for count). The replay's re-advertisement of an
 unchanged route is no FIB write and no VPP delta (the fast-path's
 no-change shortcut), and the walk drops the deltas the seed queued. What
 the seed holds that the source dropped while the daemon was down leaves
@@ -1113,17 +1122,21 @@ that moment, seconds into the process: a next hop the fast-path's
 resolver has not re-announced yet would take every route through it out
 of VPP as unresolvable. So
 the early door counts the diff before any of it reaches VPP (the same
-walk as the resync, with nothing queued) and opens only if its
-withdrawals plus replacements are at most **1% of the routes VPP holds**.
-That is the drift bound the completeness authority uses for a converged
-mirror, and it draws the same line between churn and a missing table.
-Additions do not count. A bigger diff shuts the early door for the rest
-of the restart, and the diff waits for the replay to go quiet, as it
-always did. The journal warns
+walk as the resync, with nothing queued) and opens only if, **in each
+address family**, its withdrawals, replacements and additions together
+are at most **1% of that family's routes VPP holds**. That is the drift
+bound the completeness authority uses for a converged mirror, and it
+draws the same line between churn and a missing table. Each family is
+held to its own table, so 400k IPv6 routes cannot cover a diff that
+rewrites a small IPv4 table, or the reverse. A bigger diff in either
+family shuts the early door for the rest of the restart, and the diff
+waits for the replay to go quiet, as it always did. The journal warns
 `the early door for a mirror the fast-path seeded is shut for this
-restart: its diff would withdraw W and replace R of the N routes VPP is
-forwarding on, more than the A that two snapshots of one clean stop can
-differ by ...`, the event log records `seeded_door_refused`, and the
+restart: its IPv4 diff would withdraw W, replace R and add A routes
+against the N IPv4 routes VPP is forwarding on, more than the X that two
+snapshots of one clean stop can differ by ...` (naming IPv4 when both
+families are over), the event log records `seeded_door_refused` with
+its `family`, and the
 `fib-synced` deferral line ends with the same sentence. On a small
 table 1% rounds down to a handful (to none below 100 routes), so even a
 small disagreement refuses, and waiting there costs nothing: the replay
@@ -1149,7 +1162,7 @@ What you see on a steered restart that takes the door:
 
 ```
 adopted resync deferred until the route source is loaded and quiet; over a mirror the fast-path seeded ... it runs sooner ...
-the route mirror was seeded from the fast-path route ledger, the route source is streaming in its first session, the completeness authority agrees with it, and the diff disturbs no more of VPP's table than one clean stop's two snapshots can differ by: diffing it against the preserved ledger now ...   door=seeded
+the route mirror was seeded from the fast-path route ledger, the route source is streaming in its first session, the completeness authority agrees with it, and the diff disturbs no more of either family's table than one clean stop's two snapshots can differ by: diffing it against the preserved ledger now ...   door=seeded
 verify passed
 steering UP: allowlisted traffic is now diverted to VPP ...
 ```

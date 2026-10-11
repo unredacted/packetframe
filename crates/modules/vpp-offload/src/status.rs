@@ -5631,7 +5631,7 @@ mod tests {
     /// authority or the floor. Without a refusal the row is unchanged.
     #[test]
     fn a_refused_seeded_door_explains_the_wait_on_the_deferral_row() {
-        use crate::runtime::{AuthorityPosture, SeededDiffRefusal};
+        use crate::runtime::{AuthorityPosture, IpFamily, SeededDiffRefusal};
         let led = ledger_with(10, 0, 0);
         let row = |authority, have, refused| {
             let mut snap = snap_of(
@@ -5654,9 +5654,11 @@ mod tests {
                 .expect("a deferral always explains itself")
         };
         let refused = SeededDiffRefusal {
+            family: IpFamily::V6,
             adopted: 200,
             withdrawals: 3,
             replaces: 1,
+            additions: 2,
             allowance: 2,
         };
         for authority in [
@@ -5676,8 +5678,8 @@ mod tests {
                 assert!(
                     msg.starts_with(&plain)
                         && msg.contains(
-                            "would withdraw 3 and replace 1 of the 200 routes VPP is \
-                             forwarding on, more than the 2"
+                            "its IPv6 diff would withdraw 3, replace 1 and add 2 routes \
+                             against the 200 IPv6 routes VPP is forwarding on, more than the 2"
                         )
                         && msg.contains("waits for the route source's replay to go quiet"),
                     "{authority:?} {have}: {msg}"

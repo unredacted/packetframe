@@ -5983,6 +5983,29 @@ mod steered_seeded {
         IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2))
     }
 
+    /// The IPv6 next hop, behind the same port.
+    pub fn nh6() -> IpAddr {
+        IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 1,
+        ))
+    }
+
+    /// `n` IPv6 /64s from the documentation prefix, via [`nh6`].
+    pub fn table6(n: u16) -> Vec<(IpPrefix, IpAddr)> {
+        (0..n)
+            .map(|i| {
+                let [hi, lo] = i.to_be_bytes();
+                (
+                    IpPrefix::V6 {
+                        addr: [0x20, 0x01, 0x0d, 0xb8, 0, 1, hi, lo, 0, 0, 0, 0, 0, 0, 0, 0],
+                        prefix_len: 64,
+                    },
+                    nh6(),
+                )
+            })
+            .collect()
+    }
+
     /// `n` host routes from TEST-NET-3, via the fake's next hop.
     pub fn table(n: usize) -> Vec<(IpPrefix, IpAddr)> {
         assert!(n <= 256, "one /24 of host routes");
@@ -6061,12 +6084,14 @@ mod steered_seeded {
             }
             visit(fake_vpp::nh(), "eth4", MAC);
             visit(other_nh(), "eth4", [0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+            visit(nh6(), "eth4", [0x02, 0x00, 0x00, 0x00, 0x00, 0x06]);
         }
     }
 
     /// A runtime whose route capacity holds the largest table here whole.
     pub fn runtime_on(
         fake: &Fake,
+        families: FamilyPolicy,
         source: Box<dyn RouteSource>,
         steering: Box<dyn packetframe_vpp_offload::runtime::Steering>,
         store: Box<dyn packetframe_vpp_offload::runtime::IdentityStore>,
@@ -6085,7 +6110,7 @@ mod steered_seeded {
             }],
             vec!["eth4".into()],
             4096,
-            FamilyPolicy::V4Only,
+            families,
             packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
                 prefix_len: 32,
@@ -6110,12 +6135,17 @@ mod steered_seeded {
 
     /// Daemon A: converge `routes` onto the fake from nothing and stop the
     /// preserving way. Returns VPP's ledger as it left it.
-    pub fn daemon_a(fake: &Fake, routes: Vec<(IpPrefix, IpAddr)>) -> LedgerBody {
+    pub fn daemon_a(
+        fake: &Fake,
+        families: FamilyPolicy,
+        routes: Vec<(IpPrefix, IpAddr)>,
+    ) -> LedgerBody {
         let captured = Arc::new(Mutex::new(None));
         {
             let mirror = Mirror::new(routes, Arc::new(FeedSession::new()));
             let rt = runtime_on(
                 fake,
+                families,
                 Box::new(Shared(mirror)),
                 Box::new(SteeringUnavailable),
                 Box::new(CaptureStore(captured.clone())),
@@ -6194,6 +6224,18 @@ mod steered_seeded {
         legs: Legs,
         d: &mut Driver,
     ) -> (Fixture, Instant) {
+        adopted_in(FamilyPolicy::V4Only, name, vpp, mirror, legs, d)
+    }
+
+    /// [`adopted`], with the families VPP carries chosen.
+    pub fn adopted_in(
+        families: FamilyPolicy,
+        name: &str,
+        vpp: Vec<(IpPrefix, IpAddr)>,
+        mirror: Vec<(IpPrefix, IpAddr)>,
+        legs: Legs,
+        d: &mut Driver,
+    ) -> (Fixture, Instant) {
         let fake = Fake::start_behaving(
             name,
             Behaviour {
@@ -6201,7 +6243,7 @@ mod steered_seeded {
                 ..Default::default()
             },
         );
-        let body = daemon_a(&fake, vpp);
+        let body = daemon_a(&fake, families, vpp);
         let session = Arc::new(FeedSession::new());
         // Before the route source can connect, as the fast-path does.
         if legs.seeded {
@@ -6211,6 +6253,7 @@ mod steered_seeded {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let rt = runtime_on(
             &fake,
+            families,
             Box::new(Shared(mirror.clone())),
             Box::new(RecordingSteering {
                 rules: vec![("eth4".into(), 1)],
@@ -6331,10 +6374,12 @@ fn a_steered_seeded_restart_verifies_and_re_steers_while_the_replay_streams() {
 }
 
 /// The production feed, over a steered VPP: a seeded release sends VPP
-/// what changed and nothing it already holds, and — the point of not
-/// waiting — a route the route source changes AFTER the release reaches
-/// VPP as an ordinary update while the replay is still streaming, where
-/// the quiet gate froze VPP's FIB for the replay's whole length.
+/// nothing it already holds, and — the point of not waiting — a route the
+/// route source changes AFTER the release reaches VPP as an ordinary
+/// update while the replay is still streaming, where the quiet gate froze
+/// VPP's FIB for the replay's whole length. The seed is the stop's table
+/// exactly: on six routes, 1% is none, so any difference at the walk
+/// would shut the early door.
 #[test]
 fn a_steered_seeded_release_lets_changes_reach_vpp_during_the_replay() {
     use packetframe_common::fib::ResolvedRouteSink as _;
@@ -6354,14 +6399,10 @@ fn a_steered_seeded_release_lets_changes_reach_vpp_during_the_replay() {
     let body = seeded_mirror::daemon_a_on(&fake, &dev, table.clone());
 
     // The fast-path seed lands in the production feed before vpp-offload
-    // adopts: the stop's table, and one route the source gained since.
-    let gained = IpPrefix::V4 {
-        addr: [198, 51, 100, 64],
-        prefix_len: 26,
-    };
+    // adopts: the stop's table.
     let feed = Arc::new(RouteFeed::new());
     feed.neighbour_resolved(fake_vpp::nh(), MAC, ifindex);
-    for p in table.iter().copied().chain([gained]) {
+    for p in table.iter().copied() {
         feed.route_resolved(p, &[fake_vpp::nh()]);
     }
 
@@ -6396,8 +6437,8 @@ fn a_steered_seeded_release_lets_changes_reach_vpp_during_the_replay() {
     rt.set_steered(true);
     session.set_up(true);
     authority.record(AuthorityObservation::Clean(CompletenessReport {
-        authority_routes: 7,
-        mirror_routes: 7,
+        authority_routes: 6,
+        mirror_routes: 6,
         at: Instant::now(),
     }));
 
@@ -6414,10 +6455,10 @@ fn a_steered_seeded_release_lets_changes_reach_vpp_during_the_replay() {
     assert_eq!(f.log.lock().unwrap().as_slice(), &["steer"]);
     let events = f.fake.drain_events();
     assert_eq!(preserved::dumps(&events), 0, "VPP's FIB was never read");
-    assert_eq!(
-        preserved::route_ops(&events),
-        vec![(true, [198, 51, 100, 64])],
-        "the addition reached VPP, and nothing it already held was sent again"
+    assert!(
+        preserved::route_ops(&events).is_empty(),
+        "nothing VPP already held was sent again: {:?}",
+        preserved::route_ops(&events)
     );
     assert_eq!(feed.stats().pending, 0, "the seed's deltas were superseded");
 
@@ -6553,16 +6594,15 @@ fn a_steered_seeded_diff_without_every_leg_waits_for_the_replay_to_go_quiet() {
 }
 
 /// The guard, at its edge. Two hundred routes VPP forwards on allow a
-/// diff that disturbs two of them (1%): two withdrawn by the route
-/// source while the daemon was down — gone from both snapshots' sources
-/// but, the stop having caught VPP mid-drain, still in VPP — plus one
-/// addition, which never counts. That lands early, while the replay
+/// diff that disturbs two of them (1%): one the route source withdrew
+/// that the stop caught still in VPP, mid-drain, and one it added that
+/// VPP had not been sent yet. That lands early, while the replay
 /// streams.
 #[test]
 fn a_steered_seeded_diff_within_the_allowance_lands_while_the_replay_streams() {
     use steered_seeded::*;
     let vpp = table(200);
-    let mut mirror: Vec<_> = vpp[2..].to_vec();
+    let mut mirror: Vec<_> = vpp[1..].to_vec();
     mirror.push((
         IpPrefix::V4 {
             addr: [198, 51, 100, 128],
@@ -6574,23 +6614,23 @@ fn a_steered_seeded_diff_within_the_allowance_lands_while_the_replay_streams() {
     let (f, t0) = adopted("ss-within", vpp.clone(), mirror, ALL, &mut d);
     let (_, seen) = replay(&mut d, &f, t0, 400, |d| d.state() == State::Steered);
     assert_eq!(d.state(), State::Steered, "{seen:?}");
-    let mut want = vec![
-        (false, v4_of(vpp[0].0)),
-        (false, v4_of(vpp[1].0)),
-        (true, [198, 51, 100, 128]),
-    ];
+    let mut want = vec![(false, v4_of(vpp[0].0)), (true, [198, 51, 100, 128])];
     want.sort_unstable();
     assert_eq!(preserved::route_ops(&f.fake.drain_events()), want);
     assert_eq!(f.log.lock().unwrap().as_slice(), &["steer"]);
 }
 
 /// Past the edge the early door stays shut for the restart, for
-/// withdrawals or replaces alike: the two ledgers disagree by more than
-/// churn, so nothing of the diff lands while the replay streams. The
-/// status row says why; once the replay goes quiet, the quiet door
-/// releases the same diff as it always did.
+/// withdrawals, replaces or additions alike: the two ledgers disagree by
+/// more than churn, so nothing of the diff lands while the replay
+/// streams. Three additions count as much as three withdrawals: each is a
+/// route VPP did not forward on before, and an early one stays for the
+/// whole replay where the quiet door's would leave at the route source's
+/// GC. The status row says why; once the replay goes quiet, the quiet
+/// door releases the same diff as it always did.
 #[test]
 fn a_steered_seeded_diff_beyond_the_allowance_waits_for_the_replay_to_go_quiet() {
+    use packetframe_vpp_offload::runtime::IpFamily;
     use steered_seeded::*;
     let vpp = table(200);
     let withdrawn: Vec<_> = vpp[3..].to_vec();
@@ -6599,9 +6639,23 @@ fn a_steered_seeded_diff_beyond_the_allowance_waits_for_the_replay_to_go_quiet()
         .enumerate()
         .map(|(i, (p, via))| (*p, if i < 3 { other_nh() } else { *via }))
         .collect();
-    for (name, mirror, withdrawals, replaces) in [
-        ("ss-beyond-withdrawn", withdrawn, 3, 0),
-        ("ss-beyond-repathed", repathed, 0, 3),
+    let added: Vec<_> = vpp
+        .iter()
+        .copied()
+        .chain((0..3).map(|i| {
+            (
+                IpPrefix::V4 {
+                    addr: [198, 51, 100, 128 + i],
+                    prefix_len: 32,
+                },
+                fake_vpp::nh(),
+            )
+        }))
+        .collect();
+    for (name, mirror, withdrawals, replaces, additions) in [
+        ("ss-beyond-withdrawn", withdrawn, 3, 0, 0),
+        ("ss-beyond-repathed", repathed, 0, 3, 0),
+        ("ss-beyond-added", added, 0, 0, 3),
     ] {
         let mut d = Driver::new();
         let (f, t0) = adopted(name, vpp.clone(), mirror, ALL, &mut d);
@@ -6619,12 +6673,14 @@ fn a_steered_seeded_diff_beyond_the_allowance_waits_for_the_replay_to_go_quiet()
                 .unwrap_or_else(|| panic!("{name}: the refusal is reported"));
         assert_eq!(
             (
+                refused.family,
                 refused.adopted,
                 refused.withdrawals,
                 refused.replaces,
+                refused.additions,
                 refused.allowance
             ),
-            (200, withdrawals, replaces, 2),
+            (IpFamily::V4, 200, withdrawals, replaces, additions, 2),
             "{name}"
         );
         assert_eq!(
@@ -6753,7 +6809,10 @@ fn a_next_hop_not_yet_relearned_keeps_the_early_door_shut() {
         f.rt.status()
             .seeded_door_refused
             .expect("the door refused the diff it counted");
-    assert_eq!((refused.withdrawals, refused.replaces), (0, 6));
+    assert_eq!(
+        (refused.withdrawals, refused.replaces, refused.additions),
+        (0, 6, 0)
+    );
     assert!(
         preserved::route_ops(&f.fake.drain_events()).is_empty(),
         "no route left the steered VPP"
@@ -6832,7 +6891,7 @@ fn the_inherited_door_never_diffs_onto_traffic() {
             ..Default::default()
         },
     );
-    let body = daemon_a(&fake, table(6));
+    let body = daemon_a(&fake, FamilyPolicy::V4Only, table(6));
     // Daemon A's own adoption read the empty VPP.
     dumped.store(false, Ordering::SeqCst);
     let session = Arc::new(FeedSession::new());
@@ -6842,6 +6901,7 @@ fn the_inherited_door_never_diffs_onto_traffic() {
     let log: steered::Log = Arc::new(Mutex::new(Vec::new()));
     let rt = runtime_on(
         &fake,
+        FamilyPolicy::V4Only,
         Box::new(DisputeOnDump {
             inner: Shared(mirror.clone()),
             dumped,
@@ -6914,4 +6974,73 @@ fn the_inherited_door_never_diffs_onto_traffic() {
         preserved::route_ops(&f.fake.drain_events()).contains(&(false, [198, 51, 100, 0])),
         "the stranger is withdrawn"
     );
+}
+
+/// Each family against its own table. A dual-stack VPP forwards on a
+/// hundred IPv4 and two hundred IPv6 routes, and the restart's IPv4
+/// disagrees by three: within 1% of the three hundred together, three
+/// times IPv4's own bound of one. The door refuses, naming IPv4 — and the
+/// reverse, three IPv6 routes against a hundred-route IPv6 table hidden
+/// in two hundred IPv4 ones, names IPv6. Nothing of either diff lands
+/// while the replay streams.
+#[test]
+fn one_family_over_its_bound_shuts_the_door_whatever_the_other_holds() {
+    use packetframe_vpp_offload::runtime::IpFamily;
+    use steered_seeded::*;
+    let small_v4 = table(100);
+    let large_v6 = table6(200);
+    let large_v4 = table(200);
+    let small_v6 = table6(100);
+    for (name, vpp, mirror, family, adopted) in [
+        (
+            "ss-v4-in-v6",
+            small_v4
+                .iter()
+                .chain(&large_v6)
+                .copied()
+                .collect::<Vec<_>>(),
+            small_v4[3..]
+                .iter()
+                .chain(&large_v6)
+                .copied()
+                .collect::<Vec<_>>(),
+            IpFamily::V4,
+            100,
+        ),
+        (
+            "ss-v6-in-v4",
+            large_v4.iter().chain(&small_v6).copied().collect(),
+            large_v4.iter().chain(&small_v6[3..]).copied().collect(),
+            IpFamily::V6,
+            100,
+        ),
+    ] {
+        let mut d = Driver::new();
+        let (f, t0) = adopted_in(FamilyPolicy::Both, name, vpp, mirror, ALL, &mut d);
+        let (_, seen) = replay(&mut d, &f, t0, 200, |_| false);
+        assert_eq!(d.state(), State::AdoptedResyncing, "{name}: {seen:?}");
+        assert!(!seen.contains(&Event::VerifyPassed), "{name}: {seen:?}");
+        assert!(
+            f.fake
+                .drain_events()
+                .iter()
+                .all(|e| !matches!(e, fake_vpp::Event::Route(_))),
+            "{name}: nothing of the diff lands on the steered VPP"
+        );
+        assert!(f.log.lock().unwrap().is_empty(), "{name}");
+        let refused =
+            f.rt.status()
+                .seeded_door_refused
+                .unwrap_or_else(|| panic!("{name}: the refusal is reported"));
+        assert_eq!(
+            (
+                refused.family,
+                refused.adopted,
+                refused.withdrawals,
+                refused.allowance
+            ),
+            (family, adopted, 3, 1),
+            "{name}"
+        );
+    }
 }

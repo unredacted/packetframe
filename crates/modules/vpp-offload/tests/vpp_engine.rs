@@ -624,7 +624,8 @@ fn adoption_withdraws_stale_routes_without_touching_vpps_own() {
 /// none, so nothing it adopts can read unchanged), one prefix of each
 /// kind: held through the same paths (unchanged), held through another
 /// next hop (a replace), held and no longer advertised (a withdrawal),
-/// and new (an addition: an upsert that is not a replace).
+/// new (an addition), and new through a next hop with no neighbour — an
+/// upsert that sends VPP nothing, so neither a replace nor an addition.
 #[test]
 fn a_preview_counts_the_resync_it_precedes_and_queues_nothing() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -686,17 +687,29 @@ fn a_preview_counts_the_resync_it_precedes_and_queues_nothing() {
         (p([203, 0, 113, 0], 27), nh()),
         (p([203, 0, 113, 32], 27), other_nh),
         (p([198, 51, 100, 128], 25), nh()),
+        (
+            p([198, 51, 100, 64], 26),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+        ),
     ]);
     let preview = engine.preview_resync(&after);
     assert_eq!(
-        (
-            preview.unchanged,
-            preview.upserts,
-            preview.replaces,
-            preview.withdrawals
-        ),
-        (1, 2, 1, 1),
+        (preview.unchanged, preview.upserts, preview.withdrawals),
+        (1, 3, 1),
         "{preview:?}"
+    );
+    assert_eq!(
+        preview.v4,
+        packetframe_vpp_offload::engine::Disturbance {
+            withdrawals: 1,
+            replaces: 1,
+            additions: 1,
+        },
+        "the unresolvable new route adds nothing VPP forwards on: {preview:?}"
+    );
+    assert_eq!(
+        preview.v6,
+        packetframe_vpp_offload::engine::Disturbance::default()
     );
     assert_eq!(engine.pending().len(), 0, "a preview queues nothing");
     assert_eq!(
