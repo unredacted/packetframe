@@ -724,7 +724,7 @@ impl FeedSession {
     /// attested release trusted a pre-reconnect report against a
     /// mid-reannounce mirror).
     pub fn set_up(&self, up: bool) {
-        let _ = self.state.fetch_update(
+        self.state.update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
             |cur| {
@@ -736,12 +736,10 @@ impl FeedSession {
                     // A new epoch has not been reconciled by anything.
                     reconciled = false;
                 }
-                Some(
-                    (epoch << Self::EPOCH_SHIFT)
-                        | (cur & Self::MIRROR_SEEDED_BIT)
-                        | if reconciled { Self::RECONCILED_BIT } else { 0 }
-                        | u64::from(up),
-                )
+                (epoch << Self::EPOCH_SHIFT)
+                    | (cur & Self::MIRROR_SEEDED_BIT)
+                    | if reconciled { Self::RECONCILED_BIT } else { 0 }
+                    | u64::from(up)
             },
         );
     }
@@ -781,10 +779,10 @@ impl FeedSession {
     /// The same GC is what reconciles a ledger seed, so this also clears
     /// [`Self::MIRROR_SEEDED_BIT`].
     pub fn mark_reconciled(&self) {
-        let _ = self.state.fetch_update(
+        self.state.update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
-            |cur| Some((cur | Self::RECONCILED_BIT) & !Self::MIRROR_SEEDED_BIT),
+            |cur| (cur | Self::RECONCILED_BIT) & !Self::MIRROR_SEEDED_BIT,
         );
     }
 
