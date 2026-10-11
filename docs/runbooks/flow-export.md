@@ -51,6 +51,7 @@ module flow-export
   source-address 192.0.2.1                 # RESTART-ONLY; must be this host's
   sample-rate 1000                         # hot; 100..16777216, default 1000
   header-bytes 128                         # hot; 64..256
+  path-mtu 1280                            # hot; 576..9000; unset: 1400-byte datagrams
   # collectors: hot; at most 8, each in source-address's family
   collector fnm sflow 198.51.100.10:6343 kind ddos
   collector akv ipfix 198.51.100.11:4739 kind stats profile truncate
@@ -72,6 +73,23 @@ host:
 **Every collector:** `source-address` is the address it keys this
 exporter on. Keep it stable: changing it is a restart, and to the
 collector it is a new device.
+
+**Over a tunnel, set `path-mtu`.** Datagrams are 1,400 bytes by default,
+which fits any 1500-byte path. A tunnel's MTU is smaller (Tailscale's is
+1280, WireGuard's usually 1420), so they would leave fragmented, and one
+lost fragment loses the whole datagram. `path-mtu <bytes>` makes every
+datagram that MTU less 48 (IPv6 and UDP headers), so `path-mtu 1280`
+sends 1,232-byte datagrams. It is one value for every collector: they
+share the datagrams.
+
+Over Tailscale:
+- give the collector's Tailscale address in each `collector` line, and
+  this router's own as `source-address`;
+- the tailnet policy must allow this router to reach the collector's
+  UDP ports (tailscaled drops what it does not allow, silently);
+- a collector in Docker keeps the sender's address only with Docker's
+  default (iptables) port publishing: a userland proxy shows every
+  exporter as the bridge's gateway.
 
 ### Akvorado
 

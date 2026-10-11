@@ -860,6 +860,15 @@ pub enum ModuleDirective {
         bytes: u32,
         line: usize,
     },
+    /// `path-mtu <bytes>` — the MTU of the path to the collectors, within
+    /// [`FLOW_PATH_MTU_RANGE`]: every datagram fits it with room for IPv6
+    /// and UDP headers ([`FLOW_DATAGRAM_OVERHEAD`]), so a tunnel's smaller
+    /// MTU (Tailscale's is 1280) fragments none. Unset, datagrams are
+    /// [`FLOW_DEFAULT_DATAGRAM`] bytes, inside any 1500-byte path. Hot.
+    FlowPathMtu {
+        mtu: u32,
+        line: usize,
+    },
     /// `collector <name> sflow|ipfix <ip>:<port> [kind stats|ddos]` — a
     /// collector, the format it takes, and what it is for. `kind ddos`
     /// takes sFlow only. Hot.
@@ -2028,6 +2037,15 @@ pub const FLOW_DEFAULT_HEADER_BYTES: u32 = 128;
 /// more than the VPP sampler's slot carries.
 pub const FLOW_HEADER_BYTES_RANGE: (u32, u32) = (64, 256);
 pub const FLOW_MAX_COLLECTORS: usize = 8;
+/// A datagram's bytes with no `path-mtu`: inside a 1500-byte path with
+/// room for the IP and UDP headers.
+pub const FLOW_DEFAULT_DATAGRAM: usize = 1400;
+/// What a datagram leaves of `path-mtu` for the IP and UDP headers: IPv6's
+/// and UDP's, so either family fits.
+pub const FLOW_DATAGRAM_OVERHEAD: u32 = 48;
+/// `path-mtu` bounds: IPv4's minimum, which still holds a sample of the
+/// most `header-bytes` allows; and a jumbo frame.
+pub const FLOW_PATH_MTU_RANGE: (u32, u32) = (576, 9000);
 /// The IPFIX flow cache: flows per observation domain, and its bounds.
 pub const FLOW_CACHE_ENTRIES_DEFAULT: usize = 65_536;
 pub const FLOW_CACHE_ENTRIES_RANGE: (usize, usize) = (1024, 1 << 20);
@@ -3383,7 +3401,8 @@ impl Config {
             message: format!("module flow-export: {msg}"),
         };
         let mut source: Option<(IpAddr, usize)> = None;
-        let (mut rate_line, mut header_line, mut cache_line) = (None, None, None);
+        let (mut rate_line, mut header_line, mut cache_line, mut mtu_line) =
+            (None, None, None, None);
         let mut kernel: Vec<(String, usize)> = Vec::new();
         let mut collectors: Vec<(&str, std::net::SocketAddr, usize)> = Vec::new();
         for d in &self.modules[pos].directives {
@@ -3410,6 +3429,14 @@ impl Config {
                         return Err(err(
                             *line,
                             format!("`header-bytes` given twice (first on line {prev})"),
+                        ));
+                    }
+                }
+                ModuleDirective::FlowPathMtu { line, .. } => {
+                    if let Some(prev) = mtu_line.replace(*line) {
+                        return Err(err(
+                            *line,
+                            format!("`path-mtu` given twice (first on line {prev})"),
                         ));
                     }
                 }
@@ -4937,6 +4964,14 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 return Err(format!("must be between {lo} and {hi}"));
             }
             Ok(ModuleDirective::FlowHeaderBytes { bytes, line })
+        }),
+        "path-mtu" => parse_single_arg(line, rest, "path-mtu", |t| {
+            let mtu: u32 = t.parse().map_err(|e| format!("bad integer `{t}`: {e}"))?;
+            let (lo, hi) = FLOW_PATH_MTU_RANGE;
+            if !(lo..=hi).contains(&mtu) {
+                return Err(format!("must be between {lo} and {hi}"));
+            }
+            Ok(ModuleDirective::FlowPathMtu { mtu, line })
         }),
         "collector" => parse_flow_collector(line, rest),
         "flow-cache" => parse_flow_cache(line, rest),
@@ -10459,6 +10494,12 @@ module fast-path
         assert!(fe
             .directives
             .contains(&ModuleDirective::FlowHeaderBytes { bytes: 96, line: 6 }));
+        let tunnel = format!("{FLOW_OK}  path-mtu 1280\n");
+        let c = Config::parse(&tunnel).unwrap();
+        c.validate_flow_export().unwrap();
+        assert!(c.modules[1]
+            .directives
+            .contains(&ModuleDirective::FlowPathMtu { mtu: 1280, line: 9 }));
         assert!(fe.directives.contains(&ModuleDirective::FlowCollector {
             name: "fnm".into(),
             format: CollectorFormat::Sflow,
@@ -10488,6 +10529,9 @@ module fast-path
             ("sample-rate 16777217", "between 100 and"),
             ("header-bytes 63", "between 64 and 256"),
             ("header-bytes 257", "between 64 and 256"),
+            ("path-mtu 575", "between 576 and 9000"),
+            ("path-mtu 9001", "between 576 and 9000"),
+            ("path-mtu jumbo", "bad integer"),
             ("source-address 0.0.0.0", "cannot be an exporter"),
             ("source-address host", "not an IP address"),
             ("collector c netflow 198.51.100.1:2055", "unknown format"),
@@ -10601,6 +10645,10 @@ module fast-path
         );
         refuse("  flow-cache active 0\n", "active must be");
         refuse("  flow-cache entries 2048 entries 4096\n", "given twice");
+        refuse(
+            "  path-mtu 1280\n  path-mtu 1500\n  collector a sflow 198.51.100.1:6343\n",
+            "`path-mtu` given twice",
+        );
         refuse(
             "  flow-cache active 60\n  flow-cache inactive 15\n  collector a ipfix 198.51.100.1:4739\n",
             "`flow-cache` given twice",
