@@ -4397,9 +4397,12 @@ impl ObserveView {
                         // dump's barrier, and there is no dump.
                         let routes = c.engine.counts().installed;
                         let Core { engine, source, .. } = &mut *c;
+                        // The mirror as the walk reads it, for the journal
+                        // and the event: not the count this tick began with.
+                        let have_now = source.route_count();
                         let plan = engine.begin_resync(source.as_ref());
                         tracing::info!(
-                            have,
+                            have = have_now,
                             adopted = routes,
                             steered = !unsteered,
                             door = door_name(door),
@@ -4417,7 +4420,7 @@ impl ObserveView {
                                 "route source loaded and quiet again"
                             }
                         );
-                        resync_released(door, "readback-deferred", !unsteered, &plan, have);
+                        resync_released(door, "readback-deferred", !unsteered, &plan, have_now);
                         engine
                             .program_neighbours(source.as_ref())
                             .map(|_| ())
@@ -4590,8 +4593,11 @@ impl ObserveView {
                             return Ok(crate::driver::Drain::AwaitingSource { have, want });
                         }
                         let plan = engine.begin_resync(source.as_ref());
+                        // `have_now`, read after the dump: the replay the
+                        // seeded door lets stream can move the mirror
+                        // through a dump of seconds.
                         tracing::info!(
-                            have,
+                            have = have_now,
                             adopted,
                             dump_secs = took.as_secs_f64(),
                             door = door_name(door),
@@ -4606,7 +4612,7 @@ impl ObserveView {
                                 "route source loaded and quiet"
                             }
                         );
-                        resync_released(door, "readback-deferred", false, &plan, have);
+                        resync_released(door, "readback-deferred", false, &plan, have_now);
                         engine
                             .program_neighbours(source.as_ref())
                             .map(|_| ())
@@ -4719,10 +4725,13 @@ impl ObserveView {
                         }
                     }
                     let Core { engine, source, .. } = &mut *c;
+                    // The mirror as the walk reads it: past a VPP round
+                    // trip, and on the early door a whole preview walk.
+                    let have_now = source.route_count();
                     let plan = engine.begin_resync(source.as_ref());
                     if early {
                         tracing::info!(
-                            have,
+                            have = have_now,
                             door = door_name(true),
                             unchanged = plan.unchanged,
                             upserts = plan.upserts,
@@ -4741,7 +4750,7 @@ impl ObserveView {
                         );
                     } else {
                         tracing::info!(
-                            have,
+                            have = have_now,
                             door = door_name(false),
                             unchanged = plan.unchanged,
                             upserts = plan.upserts,
@@ -4754,7 +4763,7 @@ impl ObserveView {
                              only the differences go to VPP"
                         );
                     }
-                    resync_released(early, "preserved-ledger", true, &plan, have);
+                    resync_released(early, "preserved-ledger", true, &plan, have_now);
                     engine
                         .program_neighbours(source.as_ref())
                         .map(|_| ())
@@ -4836,9 +4845,12 @@ impl ObserveView {
                             "readback"
                         };
                         let Core { engine, source, .. } = &mut *c;
+                        // The mirror as the walk reads it: possibly past a
+                        // dump, when the seed was discarded.
+                        let have_now = source.route_count();
                         let plan = engine.begin_resync(source.as_ref());
                         tracing::info!(
-                            have,
+                            have = have_now,
                             adopted,
                             door = door_name(seeded_release),
                             unchanged = plan.unchanged,
@@ -4852,7 +4864,7 @@ impl ObserveView {
                                 "route source loaded and quiet; running the adopted resync diff"
                             }
                         );
-                        resync_released(seeded_release, path, false, &plan, have);
+                        resync_released(seeded_release, path, false, &plan, have_now);
                         engine
                             .program_neighbours(source.as_ref())
                             .map(|_| ())

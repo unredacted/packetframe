@@ -148,9 +148,9 @@ pub mod kind {
     pub const KERNEL_PATH_DROPPING: &str = "kernel_path_dropping";
     /// An adopted resync's deferred diff ran: `door` says what released
     /// it (`quiet`, the route source loaded and quiet; `seeded`, the
-    /// seeded-mirror door), with `path`, `steered`, `routes` and what the
-    /// diff queued (`unchanged`, `upserts`, `replaces`, `additions`,
-    /// `withdrawals`).
+    /// seeded-mirror door), with `path`, `steered`, `routes` (the mirror
+    /// the walk read) and what the diff queued (`unchanged`, `upserts`,
+    /// `replaces`, `additions`, `withdrawals`).
     pub const RESYNC_RELEASED: &str = "resync_released";
     /// A steered seeded adoption's early diff door stayed shut because, in
     /// one address family (`family`), the diff it previewed would

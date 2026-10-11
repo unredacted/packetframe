@@ -7044,3 +7044,161 @@ fn one_family_over_its_bound_shuts_the_door_whatever_the_other_holds() {
         );
     }
 }
+
+/// What a release records is the mirror the walk read, not the count the
+/// tick began with. On the dump path the early door hands over, the
+/// replay streams through a dump of seconds, so the two can differ by a
+/// lot: here the mirror grows from six routes to thirteen while VPP's FIB
+/// is read (the authority agreeing with each count in turn), and the
+/// `resync_released` event says thirteen.
+///
+/// The event log is the process's own, so this installs one for the
+/// test binary and looks for the one event only this scenario writes.
+#[test]
+fn a_release_after_a_dump_records_the_mirror_the_walk_read() {
+    use packetframe_common::events;
+    use packetframe_common::fib::{
+        AuthorityObservation, CompletenessReport, FeedSession, TableCompleteness,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use steered_seeded::*;
+
+    /// The routes the mirror gains, and the authority that then agrees.
+    type Growth = (Vec<(IpPrefix, IpAddr)>, Arc<TableCompleteness>);
+    /// The mirror, growing by `extra` routes (and the authority agreeing
+    /// with it) the first time it is counted after VPP's FIB was read.
+    struct GrowOnDump {
+        inner: Shared,
+        dumped: &'static AtomicBool,
+        grow: Mutex<Option<Growth>>,
+    }
+    impl RouteSource for GrowOnDump {
+        fn requeue(&self, changes: packetframe_vpp_offload::engine::SourceChanges) {
+            self.inner.requeue(changes)
+        }
+        fn route_count(&self) -> u64 {
+            if self.dumped.load(Ordering::SeqCst) {
+                if let Some((extra, authority)) = self.grow.lock().unwrap().take() {
+                    let mut routes = self.inner.0.routes.lock().unwrap();
+                    routes.extend(extra);
+                    let n = routes.len() as u64;
+                    authority.record(AuthorityObservation::Clean(CompletenessReport {
+                        authority_routes: n,
+                        mirror_routes: n,
+                        at: Instant::now(),
+                    }));
+                }
+            }
+            self.inner.route_count()
+        }
+        fn change_seq(&self) -> u64 {
+            self.inner.change_seq()
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            self.inner.for_each_route(visit)
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            self.inner.for_each_neighbour(visit)
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("pf-ss-events-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("event log dir");
+    let log_path = dir.join("events.log");
+    assert!(
+        events::install(log_path.clone(), events::DEFAULT_MAX_BYTES),
+        "no other test in this binary installs the event log"
+    );
+
+    let dumped: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let fake = Fake::start_behaving(
+        "ss-count",
+        Behaviour {
+            track_routes: true,
+            dumped: Some(dumped),
+            ..Default::default()
+        },
+    );
+    let body = daemon_a(&fake, FamilyPolicy::V4Only, table(6));
+    dumped.store(false, Ordering::SeqCst);
+    let session = Arc::new(FeedSession::new());
+    session.mark_mirror_seeded();
+    let mirror = Mirror::new(table(6), session.clone());
+    let authority = Arc::new(TableCompleteness::new());
+    let extra: Vec<_> = (0..7)
+        .map(|i| {
+            (
+                IpPrefix::V4 {
+                    addr: [198, 51, 100, 200 + i],
+                    prefix_len: 32,
+                },
+                fake_vpp::nh(),
+            )
+        })
+        .collect();
+    let log: steered::Log = Arc::new(Mutex::new(Vec::new()));
+    let rt = runtime_on(
+        &fake,
+        FamilyPolicy::V4Only,
+        Box::new(GrowOnDump {
+            inner: Shared(mirror.clone()),
+            dumped,
+            grow: Mutex::new(Some((extra, authority.clone()))),
+        }),
+        Box::new(steered::RecordingSteering {
+            rules: vec![("eth4".into(), 1)],
+            log: log.clone(),
+        }),
+        Box::new(NullStore),
+    );
+    rt.feed_session(session.clone());
+    rt.require_table_complete(authority.clone());
+    rt.seed_ledger(preserved::record(body));
+    handshake(&rt);
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+    // VPP's counts move before the source connects, so the early door
+    // hands the dump path over.
+    fake.routes.lock().unwrap().insert(
+        ([198, 51, 100, 0], 24),
+        vec![fake_vpp::table_path([192, 0, 2, 1], ASSIGNED_INDEX, 1)],
+    );
+    let _ = fake.drain_events();
+    session.set_up(true);
+    let f = Fixture {
+        fake,
+        rt,
+        log,
+        mirror,
+        session,
+        authority: Some(authority),
+    };
+    f.agree();
+    let (_, seen) = replay(&mut d, &f, t0, 400, |d| d.state() == State::Steered);
+    assert_eq!(d.state(), State::Steered, "{seen:?}");
+    assert_eq!(f.log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+
+    assert!(events::installed().expect("installed").flush(), "flushed");
+    let mut released = Vec::new();
+    events::read_each(&log_path, |r| {
+        if r.event == "resync_released"
+            && r.fields.get("path").and_then(|v| v.as_str()) == Some("readback-deferred")
+            && r.fields.get("door").and_then(|v| v.as_str()) == Some("seeded")
+        {
+            released.push(r.fields.get("routes").and_then(|v| v.as_u64()));
+        }
+    })
+    .expect("the event log reads");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        released.contains(&Some(13)),
+        "the release records the thirteen routes the walk read, not the six the tick \
+         began with: {released:?}"
+    );
+}
