@@ -1,0 +1,17 @@
+# FastNetMon Community for PacketFrame's sFlow (`kind ddos`): a project of
+# its own, so it can move to another host without touching Akvorado.
+name: fastnetmon
+services:
+  fastnetmon:
+    image: ghcr.io/pavel-odintsov/fastnetmon-community:1.2.9
+    restart: unless-stopped
+    mem_limit: 512m
+    ports:
+      - ${COLLECTOR_ADDR:?set COLLECTOR_ADDR in .env}:6343:6343/udp
+      # Its Prometheus counters, for this host only.
+      - 127.0.0.1:9209:9209/tcp
+    volumes:
+      - ./fastnetmon.conf:/etc/fastnetmon.conf:ro
+      - ./networks_list:/etc/networks_list:ro
+      - ./notify_about_attack.sh:/usr/local/bin/notify_about_attack.sh:ro
+      - ./log:/var/log/fnm

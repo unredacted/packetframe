@@ -69,6 +69,9 @@ host:
 
 ## Collectors
 
+A VM running both collectors, Akvorado for IPFIX and FastNetMon for sFlow,
+reached over Tailscale: [collector-host](../flow-export/collector-host/README.md).
+
 **Every collector:** `source-address` is the address it keys this
 exporter on. Keep it stable: changing it is a restart, and to the
 collector it is a new device.

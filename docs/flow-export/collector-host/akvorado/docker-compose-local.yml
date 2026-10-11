@@ -1,0 +1,34 @@
+# PacketFrame's collector host: Akvorado's release quickstart with the
+# changes ../README.md explains. Replaces the quickstart's own
+# docker/docker-compose-local.yml, which .env already loads last.
+#
+# COLLECTOR_ADDR (in .env) is the address the routers send to, this host's
+# Tailscale address: flows are published there only.
+services:
+  akvorado-inlet:
+    # IPFIX only: sFlow goes to FastNetMon, on this address's 6343.
+    ports: !override
+      - ${COLLECTOR_ADDR:?set COLLECTOR_ADDR in .env}:4739:4739/udp
+  akvorado-outlet:
+    # BMP: not used.
+    ports: !reset []
+  kafka-ui:
+    profiles: [disabled]
+  # Caps for an 8 GB host, leaving room for FastNetMon and the system.
+  clickhouse:
+    mem_limit: 4g
+  kafka:
+    mem_limit: 1536m
+    environment:
+      KAFKA_HEAP_OPTS: "-Xms768m -Xmx768m"
+  traefik:
+    ports: !override
+      # Private entrypoint (ClickHouse, configuration): this host only.
+      - 127.0.0.1:8080:8080/tcp
+      # The console, on the tailnet only, behind basic auth.
+      - ${COLLECTOR_ADDR:?set COLLECTOR_ADDR in .env}:8081:8081/tcp
+    environment:
+      TRAEFIK_ENTRYPOINTS_public_HTTP_MIDDLEWARES: compress@docker,auth@docker
+    labels:
+      # `htpasswd -nB <user>`, every `$` doubled: compose reads `$` itself.
+      - traefik.http.middlewares.auth.basicauth.users=REPLACE_WITH_HTPASSWD_LINE
