@@ -474,9 +474,8 @@ pub struct Disturbance {
     /// Prefixes VPP does not hold that the plan sends through a next hop
     /// that resolves now: routes VPP will forward on that it did not
     /// before (one whose interface has no index yet is deferred, not
-    /// dropped, so it counts too). A table at its high-water mark withholds
-    /// some of them; the plan counts them all, and a caller that cares
-    /// weighs that itself.
+    /// dropped, so it counts too). All of them, including any a table at
+    /// its high-water mark would withhold.
     pub additions: u64,
 }
 

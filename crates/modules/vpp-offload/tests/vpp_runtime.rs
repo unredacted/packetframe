@@ -6096,6 +6096,18 @@ mod steered_seeded {
         steering: Box<dyn packetframe_vpp_offload::runtime::Steering>,
         store: Box<dyn packetframe_vpp_offload::runtime::IdentityStore>,
     ) -> Runtime {
+        runtime_capped(fake, families, 4096, source, steering, store)
+    }
+
+    /// [`runtime_on`], with each family's high-water mark at `capacity`.
+    pub fn runtime_capped(
+        fake: &Fake,
+        families: FamilyPolicy,
+        capacity: u64,
+        source: Box<dyn RouteSource>,
+        steering: Box<dyn packetframe_vpp_offload::runtime::Steering>,
+        store: Box<dyn packetframe_vpp_offload::runtime::IdentityStore>,
+    ) -> Runtime {
         let engine = ConvergenceEngine::new(
             &fake.path,
             vec![PortAttach {
@@ -6109,7 +6121,7 @@ mod steered_seeded {
                 vlans: vec![],
             }],
             vec!["eth4".into()],
-            4096,
+            capacity,
             families,
             packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
@@ -6236,6 +6248,19 @@ mod steered_seeded {
         legs: Legs,
         d: &mut Driver,
     ) -> (Fixture, Instant) {
+        adopted_capped(families, 4096, name, vpp, mirror, legs, d)
+    }
+
+    /// [`adopted_in`], with daemon B's high-water mark at `capacity`.
+    pub fn adopted_capped(
+        families: FamilyPolicy,
+        capacity: u64,
+        name: &str,
+        vpp: Vec<(IpPrefix, IpAddr)>,
+        mirror: Vec<(IpPrefix, IpAddr)>,
+        legs: Legs,
+        d: &mut Driver,
+    ) -> (Fixture, Instant) {
         let fake = Fake::start_behaving(
             name,
             Behaviour {
@@ -6251,9 +6276,10 @@ mod steered_seeded {
         }
         let mirror = Mirror::new(mirror, session.clone());
         let log: Log = Arc::new(Mutex::new(Vec::new()));
-        let rt = runtime_on(
+        let rt = runtime_capped(
             &fake,
             families,
+            capacity,
             Box::new(Shared(mirror.clone())),
             Box::new(RecordingSteering {
                 rules: vec![("eth4".into(), 1)],
@@ -7200,5 +7226,80 @@ fn a_release_after_a_dump_records_the_mirror_the_walk_read() {
         released.contains(&Some(13)),
         "the release records the thirteen routes the walk read, not the six the tick \
          began with: {released:?}"
+    );
+}
+
+/// Every addition counts, whatever room the table has left. VPP holds two
+/// hundred routes at a high-water mark of two hundred, and the seed has
+/// two of them through a next hop no neighbour resolves plus two routes VPP
+/// lacks. Counting only the room the withdrawals leave, the additions
+/// looked withheld and the diff passed as two replaces. But the drain
+/// withdraws a replace whose next hops resolve to nothing, freeing its
+/// slot, and the two additions take them: four changes on a steered VPP
+/// that allows two (review finding, PR #356). Counted whole, the door
+/// refuses, and the quiet door lands exactly those four.
+#[test]
+fn a_full_table_counts_the_additions_its_unresolvable_replaces_make_room_for() {
+    use steered_seeded::*;
+    let vpp = table(200);
+    let unreachable = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
+    let mut mirror: Vec<_> = vpp
+        .iter()
+        .enumerate()
+        .map(|(i, (p, via))| (*p, if i >= 198 { unreachable } else { *via }))
+        .collect();
+    mirror.extend((0..2).map(|i| {
+        (
+            IpPrefix::V4 {
+                addr: [198, 51, 100, 128 + i],
+                prefix_len: 32,
+            },
+            fake_vpp::nh(),
+        )
+    }));
+    let mut d = Driver::new();
+    let (f, t0) = adopted_capped(
+        FamilyPolicy::V4Only,
+        200,
+        "ss-full",
+        vpp.clone(),
+        mirror,
+        ALL,
+        &mut d,
+    );
+    let (now, seen) = replay(&mut d, &f, t0, 200, |_| false);
+    assert_eq!(d.state(), State::AdoptedResyncing, "{seen:?}");
+    assert!(preserved::route_ops(&f.fake.drain_events()).is_empty());
+    let refused =
+        f.rt.status()
+            .seeded_door_refused
+            .expect("the door counted every addition");
+    assert_eq!(
+        (
+            refused.withdrawals,
+            refused.replaces,
+            refused.additions,
+            refused.allowance
+        ),
+        (0, 2, 2, 2)
+    );
+
+    // Two routes are left unresolvable, so verify is incomplete and the
+    // port settles in `Ready`: what matters here is what reached VPP.
+    let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| {
+        matches!(d.state(), State::Ready | State::Steered)
+    });
+    assert!(seen.contains(&Event::VerifyIncomplete), "{seen:?}");
+    let mut want = vec![
+        (false, v4_of(vpp[198].0)),
+        (false, v4_of(vpp[199].0)),
+        (true, [198, 51, 100, 128]),
+        (true, [198, 51, 100, 129]),
+    ];
+    want.sort_unstable();
+    assert_eq!(
+        preserved::route_ops(&f.fake.drain_events()),
+        want,
+        "the drain frees two slots and fills them: four changes"
     );
 }

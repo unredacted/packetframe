@@ -1737,15 +1737,6 @@ impl std::fmt::Display for IpFamily {
     }
 }
 
-/// One address family of the table a steered seeded diff is measured
-/// against: what the preserved ledger seeded, and the family's
-/// high-water mark ([`crate::sink::Capacity`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FamilyTable {
-    adopted: u64,
-    capacity: u64,
-}
-
 /// The steered seeded diff's early door refused the diff it previewed:
 /// in `family`, it would disturb more of the adopted table than
 /// `seeded_diff_allowance`. Latched for the deferral
@@ -1765,9 +1756,7 @@ pub struct SeededDiffRefusal {
     /// other paths, or through none it can resolve, which the drain then
     /// removes from VPP as unresolvable.
     pub replaces: u64,
-    /// Routes VPP does not hold that the diff would add and that VPP has
-    /// room for under the family's high-water mark (the rest would be
-    /// withheld and never reach it).
+    /// Routes VPP does not hold that the diff would add.
     pub additions: u64,
     /// `seeded_diff_allowance` of `adopted`: 1% of it, rounded down.
     pub allowance: u64,
@@ -1825,9 +1814,7 @@ impl std::fmt::Display for SeededDiffRefusal {
 ///   more-specific pulls traffic off the less specific route VPP was
 ///   forwarding it on, and the completeness authority counts prefixes, not
 ///   which ones, so two ledgers from different stops can agree in size
-///   while the seed holds routes VPP never had. Counted, as far as VPP has
-///   room for them: an addition the family's high-water mark withholds
-///   never reaches VPP.
+///   while the seed holds routes VPP never had. Counted, all of them.
 ///
 /// **Why the diff is near-empty when the premise holds.** Both ledgers
 /// are snapshots taken at the same clean stop: the fast-path's of the
@@ -1836,10 +1823,17 @@ impl std::fmt::Display for SeededDiffRefusal {
 /// acknowledged at that moment — churn-sized, the drain's backlog — and by
 /// routes the previous process kept out of VPP, none of which counts
 /// here: a shadowed, kernel-delivered or link-local-only route is left out
-/// of the walk's upserts as it was left out of VPP; one that resolved to
-/// nothing then and still does adds nothing, so it is no addition
-/// ([`crate::engine::Disturbance::additions`]); and one withheld at the
-/// family's high-water mark is withheld again, beyond the room counted.
+/// of the walk's upserts as it was left out of VPP, and one that resolved
+/// to nothing then and still does adds nothing, so it is no addition
+/// ([`crate::engine::Disturbance::additions`]). One the previous process
+/// withheld at the family's high-water mark does count as an addition: the
+/// guard does not model the drain's capacity, because a room estimate
+/// undercounts (a replace whose next hops resolve to nothing is withdrawn
+/// by the drain, freeing a slot an addition then takes — review finding,
+/// PR #356). Only a table already over its capacity has such routes, and
+/// it is degraded and alarming anyway; a refusal there costs the old wait,
+/// and on the reference table the high-water mark sits far above the
+/// adopted size.
 /// Re-advertisements of unchanged routes are no change at all: the
 /// fast-path programmer's no-change shortcut makes an identical
 /// advertisement no FIB write and so no VPP delta, and the resync walk has
@@ -1872,29 +1866,23 @@ impl std::fmt::Display for SeededDiffRefusal {
 /// must fail in.
 fn seeded_diff_refusal(
     plan: &crate::engine::ResyncPlan,
-    v4: FamilyTable,
-    v6: FamilyTable,
+    v4: u64,
+    v6: u64,
 ) -> Option<SeededDiffRefusal> {
     [(IpFamily::V4, plan.v4, v4), (IpFamily::V6, plan.v6, v6)]
         .into_iter()
-        .find_map(|(family, d, table)| {
-            let allowance = seeded_diff_allowance(table.adopted);
-            // The slots the family has left once the withdrawals free
-            // theirs; additions past them are withheld, not installed.
-            let room = table
-                .capacity
-                .saturating_sub(table.adopted.saturating_sub(d.withdrawals));
-            let additions = d.additions.min(room);
+        .find_map(|(family, d, adopted)| {
+            let allowance = seeded_diff_allowance(adopted);
             let disturbed = d
                 .withdrawals
                 .saturating_add(d.replaces)
-                .saturating_add(additions);
+                .saturating_add(d.additions);
             (disturbed > allowance).then_some(SeededDiffRefusal {
                 family,
-                adopted: table.adopted,
+                adopted,
                 withdrawals: d.withdrawals,
                 replaces: d.replaces,
-                additions,
+                additions: d.additions,
                 allowance,
             })
         })
@@ -4667,14 +4655,6 @@ impl ObserveView {
                             .seeded
                             .as_ref()
                             .map_or((0, 0), |s| (s.routes_v4, s.routes_v6));
-                        let v4 = FamilyTable {
-                            adopted: v4,
-                            capacity: c.engine.route_capacity(),
-                        };
-                        let v6 = FamilyTable {
-                            adopted: v6,
-                            capacity: c.engine.route_capacity_v6(),
-                        };
                         let preview = {
                             let Core { engine, source, .. } = &mut *c;
                             engine.preview_resync(source.as_ref())
@@ -5763,9 +5743,9 @@ mod tests {
     }
 
     /// The steered seeded diff's guard counts what lands on traffic VPP is
-    /// carrying — withdrawals, replaces and the additions VPP has room for
-    /// — against 1% of each family's own adopted table, and refuses past
-    /// it, not at it.
+    /// carrying — withdrawals, replaces and additions, all of them —
+    /// against 1% of each family's own adopted table, and refuses past it,
+    /// not at it.
     #[test]
     fn the_seeded_diff_guard_counts_what_lands_on_traffic() {
         use crate::engine::{Disturbance, ResyncPlan};
@@ -5780,25 +5760,17 @@ mod tests {
             v4,
             ..Default::default()
         };
-        let table = |adopted| FamilyTable {
-            adopted,
-            capacity: 1_000_000,
-        };
-        let none = table(0);
+        let none = 0;
         // At the allowance: two of two hundred.
         assert_eq!(seeded_diff_allowance(200), 2);
         for at in [d(1, 1, 0), d(2, 0, 0), d(0, 0, 2), d(0, 1, 1)] {
-            assert_eq!(
-                seeded_diff_refusal(&v4_only(at), table(200), none),
-                None,
-                "{at:?}"
-            );
+            assert_eq!(seeded_diff_refusal(&v4_only(at), 200, none), None, "{at:?}");
         }
         // Past it, withdrawals, replaces and additions together — an
         // addition is a route VPP did not forward on before, and an early
         // one stays for the whole replay.
         assert_eq!(
-            seeded_diff_refusal(&v4_only(d(1, 1, 1)), table(200), none),
+            seeded_diff_refusal(&v4_only(d(1, 1, 1)), 200, none),
             Some(SeededDiffRefusal {
                 family: IpFamily::V4,
                 adopted: 200,
@@ -5810,26 +5782,17 @@ mod tests {
         );
         for past in [d(3, 0, 0), d(0, 3, 0), d(0, 0, 3)] {
             assert!(
-                seeded_diff_refusal(&v4_only(past), table(200), none).is_some(),
+                seeded_diff_refusal(&v4_only(past), 200, none).is_some(),
                 "{past:?}"
             );
         }
-        // Additions a full table would withhold never reach VPP: only the
-        // room the withdrawals leave counts.
-        let full = FamilyTable {
-            adopted: 200,
-            capacity: 200,
-        };
-        assert_eq!(seeded_diff_refusal(&v4_only(d(0, 0, 50)), full, none), None);
+        // Additions count whole, whatever room the family has left: the
+        // guard does not model the drain's capacity, which frees a slot
+        // for every replace whose next hops resolve to nothing (review
+        // finding, PR #356).
         assert_eq!(
-            seeded_diff_refusal(&v4_only(d(1, 0, 50)), full, none).map(|r| r.additions),
-            None,
-            "one withdrawal frees one slot: 1 + 1 is within 2"
-        );
-        assert_eq!(
-            seeded_diff_refusal(&v4_only(d(2, 0, 50)), full, none).map(|r| r.additions),
-            Some(2),
-            "two free two: 2 + 2 is past it, and the refusal counts what fits"
+            seeded_diff_refusal(&v4_only(d(0, 1, 50)), 200, none).map(|r| r.additions),
+            Some(50)
         );
         // Each family against its own table. Three IPv4 withdrawals hidden
         // in a large IPv6 table: within 1% of both families together, far
@@ -5840,8 +5803,7 @@ mod tests {
             ..Default::default()
         };
         assert!(3 <= seeded_diff_allowance(100 + 400_000));
-        let r = seeded_diff_refusal(&mixed, table(100), table(400_000))
-            .expect("IPv4 is past its own bound");
+        let r = seeded_diff_refusal(&mixed, 100, 400_000).expect("IPv4 is past its own bound");
         assert_eq!((r.family, r.adopted, r.allowance), (IpFamily::V4, 100, 1));
         // And the reverse.
         let mixed = ResyncPlan {
@@ -5849,8 +5811,7 @@ mod tests {
             v6: d(3, 0, 0),
             ..Default::default()
         };
-        let r = seeded_diff_refusal(&mixed, table(400_000), table(100))
-            .expect("IPv6 is past its own bound");
+        let r = seeded_diff_refusal(&mixed, 400_000, 100).expect("IPv6 is past its own bound");
         assert_eq!((r.family, r.adopted, r.allowance), (IpFamily::V6, 100, 1));
         assert!(
             r.to_string().contains("its IPv6 diff would withdraw 3"),
@@ -5858,15 +5819,12 @@ mod tests {
         );
         // A family VPP does not carry adopts nothing and is disturbed by
         // nothing.
-        assert_eq!(
-            seeded_diff_refusal(&ResyncPlan::default(), table(6), none),
-            None
-        );
+        assert_eq!(seeded_diff_refusal(&ResyncPlan::default(), 6, none), None);
         // A table whose 1% rounds to nothing takes the early door only
         // with an undisturbed diff: its replay is a burst anyway.
         assert_eq!(seeded_diff_allowance(99), 0);
-        assert!(seeded_diff_refusal(&v4_only(d(0, 0, 0)), table(6), none).is_none());
-        assert!(seeded_diff_refusal(&v4_only(d(0, 0, 1)), table(6), none).is_some());
+        assert!(seeded_diff_refusal(&v4_only(d(0, 0, 0)), 6, none).is_none());
+        assert!(seeded_diff_refusal(&v4_only(d(0, 0, 1)), 6, none).is_some());
         // The reference table, and the invariant at every size: the
         // authority's own drift bound of it, never rounded up.
         assert_eq!(seeded_diff_allowance(1_350_000), 13_500);
