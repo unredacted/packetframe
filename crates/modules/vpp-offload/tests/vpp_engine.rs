@@ -4670,6 +4670,215 @@ fn a_route_via_the_router_the_kernel_carries_elsewhere_is_kernel_delivered() {
     );
 }
 
+/// The kernel the readdressing test needs: the router's addresses as its
+/// background read last saw them, swappable mid-test, and the kernel's
+/// connected route for the new IX LAN leaving through `br-ix`, a bridge
+/// member port `eth4` is enslaved to — one VPP can reach, so shape 3
+/// refuses it, as it did for the 2026-10-11 incident's bridge.
+struct Readdressed {
+    addrs: std::sync::Arc<std::sync::Mutex<packetframe_vpp_offload::topology::SelfNetworks>>,
+    fib: Vec<(IpPrefix, packetframe_vpp_offload::topology::FibMatch)>,
+}
+
+impl Topology for Readdressed {
+    fn classify(&self, dev: &str) -> Result<Option<DevKind>, String> {
+        // A bridge placement cannot use: reachable through any member
+        // port enslaved to it.
+        Ok((dev != "br-ix").then_some(DevKind::Plain))
+    }
+    fn fdb(&self) -> Result<FdbSnapshot, String> {
+        Ok(FdbSnapshot::default())
+    }
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        Ok(PortVlans::default())
+    }
+    fn master_of(&self, port: &str) -> Option<String> {
+        (port == "eth4").then(|| "br-ix".to_string())
+    }
+    fn bridge_l3(&self, _: &str, _: u16) -> Option<BridgeL3> {
+        None
+    }
+    fn fib_match(
+        &self,
+        prefix: IpPrefix,
+    ) -> Result<packetframe_vpp_offload::topology::FibMatch, String> {
+        Ok(self.fib.iter().find(|(p, _)| *p == prefix).map_or(
+            packetframe_vpp_offload::topology::FibMatch::NotExact,
+            |(_, m)| m.clone(),
+        ))
+    }
+    fn self_networks(
+        &self,
+    ) -> Option<Result<packetframe_vpp_offload::topology::SelfNetworks, String>> {
+        Some(Ok(self.addrs.lock().unwrap().clone()))
+    }
+}
+
+/// A live feed's mirror for the readdressing test: the routes the engine
+/// hands back (`requeue_via`, `requeue_within`) come out of the next
+/// delta batch, as the route feed's pending map would serve them.
+struct Requeueing {
+    routes: Vec<(IpPrefix, Vec<IpAddr>)>,
+    neighbours: Vec<(IpAddr, &'static str)>,
+    queued: std::sync::Mutex<Vec<(IpPrefix, Option<Vec<IpAddr>>)>>,
+}
+
+impl Requeueing {
+    fn queue_where(&self, hit: impl Fn(&IpPrefix, &[IpAddr]) -> bool) {
+        let mut q = self.queued.lock().unwrap();
+        for (p, nhs) in &self.routes {
+            if hit(p, nhs) && !q.iter().any(|(queued, _)| queued == p) {
+                q.push((*p, Some(nhs.clone())));
+            }
+        }
+    }
+}
+
+impl RouteSource for Requeueing {
+    fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+        unreachable!("no neighbour is applied here, so nothing comes back")
+    }
+    fn drain_changes(&self, _max: usize) -> packetframe_vpp_offload::engine::SourceChanges {
+        packetframe_vpp_offload::engine::SourceChanges {
+            routes: std::mem::take(&mut *self.queued.lock().unwrap()),
+            neighbours: Vec::new(),
+        }
+    }
+    fn requeue_via(&self, nexthops: &[IpAddr]) {
+        self.queue_where(|_, nhs| nhs.iter().any(|n| nexthops.contains(n)));
+    }
+    fn requeue_within(&self, nets: &[IpPrefix]) {
+        let inside = |net: &IpPrefix, p: &IpPrefix| match (*net, *p) {
+            (IpPrefix::V4 { prefix_len: n, .. }, IpPrefix::V4 { addr, prefix_len }) => {
+                n <= prefix_len && net.contains(IpAddr::from(addr))
+            }
+            (IpPrefix::V6 { prefix_len: n, .. }, IpPrefix::V6 { addr, prefix_len }) => {
+                n <= prefix_len && net.contains(IpAddr::from(addr))
+            }
+            _ => false,
+        };
+        self.queue_where(|p, _| nets.iter().any(|net| inside(net, p)));
+    }
+    fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+        for (p, nhs) in &self.routes {
+            visit(*p, nhs);
+        }
+    }
+    fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+        for (ip, dev) in &self.neighbours {
+            visit(*ip, dev, MAC);
+        }
+    }
+    fn route_count(&self) -> u64 {
+        self.routes.len() as u64
+    }
+    fn change_seq(&self) -> u64 {
+        0
+    }
+}
+
+/// A subnet the router is addressed on after attach — the 2026-10-11
+/// incident's new IX LAN, whose connected route the routing daemon
+/// redistributes with the router as next hop — stops being unresolvable
+/// at the next address refresh, without a restart: VPP is told to delete
+/// it, the unresolvable count drops to zero, its `steer-exempt` covers it,
+/// so the first-steer gate opens, and verify passes where it was
+/// incomplete. Removing the address sends the route back to the kernel's
+/// word: unresolvable again, and named for the port VPP can reach.
+#[test]
+fn a_subnet_addressed_after_attach_stops_being_unresolvable_without_a_restart() {
+    use packetframe_vpp_offload::topology::{FibMatch, SelfNetworks};
+    let own = IpAddr::V4(Ipv4Addr::from(OWN));
+    let lan = IpPrefix::V4 {
+        addr: [203, 0, 113, 0],
+        prefix_len: 24,
+    };
+    let transit = IpPrefix::V4 {
+        addr: [198, 51, 100, 128],
+        prefix_len: 25,
+    };
+    let at_attach = SelfNetworks::new([pfx(OWN, 30)], []);
+    let addrs = std::sync::Arc::new(std::sync::Mutex::new(at_attach.clone()));
+    let fake = Fake::start("readdressed");
+    let mut e = engine_for(&fake)
+        .with_self_networks([pfx(OWN, 30)])
+        .with_topology(Box::new(Readdressed {
+            addrs: addrs.clone(),
+            fib: vec![(
+                lan,
+                FibMatch::Unicast {
+                    oifs: vec!["br-ix".into()],
+                },
+            )],
+        }));
+    e.set_steer_exempts(vec![pfx([203, 0, 113, 0], 24)]);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let src = Requeueing {
+        routes: vec![(transit, vec![nh()]), (lan, vec![own])],
+        neighbours: vec![(nh(), "eth4")],
+        queued: Default::default(),
+    };
+    let plan = e.begin_resync(&src);
+    assert_eq!((plan.upserts, plan.kernel_delivered), (2, 0), "{plan:?}");
+    e.program_neighbours(&src).expect("neighbours");
+    drain_to_empty(&mut e);
+    assert_eq!((e.counts().installed, e.counts().unresolvable), (1, 1));
+    let named = e.unresolvable_named(false);
+    assert!(
+        named.len() == 1 && named[0].contains("sends this prefix out br-ix, which VPP can reach"),
+        "{named:?}"
+    );
+    assert!(e.counts().blocks_first_steer());
+    let v = e.run_verify().expect("verify");
+    assert!(v.outcome.awaits_clean_table(), "{}", v.outcome.summary());
+
+    // The LAN is addressed: 203.0.113.1/24 on the IX bridge.
+    *addrs.lock().unwrap() = SelfNetworks::new([pfx(OWN, 30), pfx([203, 0, 113, 1], 24)], []);
+    let _ = fake.drain_events();
+    assert!(e.refresh_self_networks(&src));
+    e.apply_changes(&src, 64).expect("deltas");
+    drain_to_empty(&mut e);
+    assert_eq!(
+        (e.counts().installed, e.counts().unresolvable),
+        (1, 0),
+        "{:?}",
+        e.unresolvable_named(false)
+    );
+    assert_eq!(e.kernel_delivered_routes(), 1);
+    assert_eq!(e.counts().unexempted_local, 0, "its steer-exempt covers it");
+    assert!(!e.counts().blocks_first_steer(), "{:?}", e.counts());
+    let events = fake.drain_events();
+    assert!(
+        events.iter().any(|ev| matches!(
+            ev,
+            Event::Route(r) if !r.is_add && (r.addr, r.len) == ([203, 0, 113, 0], 24)
+        )),
+        "the LAN withdrawn in case anything installed it: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev, Event::Route(r) if r.is_add)),
+        "and nothing installed: {events:?}"
+    );
+    let v = e.run_verify().expect("verify");
+    assert!(v.outcome.passed(), "{}", v.outcome.summary());
+
+    // Removed again (the bridge deleted): the kernel's word decides.
+    *addrs.lock().unwrap() = at_attach;
+    assert!(e.refresh_self_networks(&src));
+    e.apply_changes(&src, 64).expect("deltas");
+    drain_to_empty(&mut e);
+    assert_eq!((e.counts().installed, e.counts().unresolvable), (1, 1));
+    assert_eq!(e.kernel_delivered_routes(), 0);
+    let named = e.unresolvable_named(false);
+    assert!(
+        named.len() == 1 && named[0].contains("sends this prefix out br-ix, which VPP can reach"),
+        "{named:?}"
+    );
+}
+
 /// A genuinely unreachable next hop on a VPP port stays unresolvable, and
 /// health names it: the prefix, the next hop, the device the neighbour
 /// source reported, and why it does not reach VPP. The count alone sent

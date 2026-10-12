@@ -351,6 +351,31 @@ impl RouteSource for RouteFeed {
         }
     }
 
+    /// Every mirrored route inside any of `nets`, back into `pending` —
+    /// fill-if-absent, `seq` untouched, as [`Self::requeue_via`]. A range
+    /// of the ordered mirror per net, `(family, address, length)` being
+    /// the key order, so the walk is the routes inside it rather than the
+    /// table; it runs only when the router's own addresses change.
+    fn requeue_within(&self, nets: &[IpPrefix]) {
+        let mut g = self.lock();
+        if g.disconnected {
+            return;
+        }
+        let mut owed: Vec<(PrefixKey, SetId)> = Vec::new();
+        for net in nets {
+            let (first, last) = span(net);
+            owed.extend(
+                g.routes
+                    .range(PrefixKey::from(first)..=PrefixKey::from(last))
+                    .filter(|(k, _)| covers(net, &IpPrefix::from(**k)))
+                    .map(|(k, id)| (*k, *id)),
+            );
+        }
+        for (key, id) in owed {
+            g.pending.entry(key).or_insert(Some(id));
+        }
+    }
+
     fn requeue(&self, changes: SourceChanges) {
         let mut g = self.lock();
         for (nh, state) in changes.neighbours {
@@ -481,6 +506,9 @@ impl RouteSource for std::sync::Arc<RouteFeed> {
     fn requeue_via(&self, nexthops: &[IpAddr]) {
         (**self).requeue_via(nexthops)
     }
+    fn requeue_within(&self, nets: &[IpPrefix]) {
+        (**self).requeue_within(nets)
+    }
     fn discard_route_deltas(&self) {
         (**self).discard_route_deltas()
     }
@@ -507,6 +535,59 @@ impl RouteSource for std::sync::Arc<RouteFeed> {
     }
     fn change_seq(&self) -> u64 {
         (**self).change_seq()
+    }
+}
+
+/// The lowest and highest keys inside `net`: its network address at
+/// length 0, and its last address at the family's full length.
+fn span(net: &IpPrefix) -> (IpPrefix, IpPrefix) {
+    match *net {
+        IpPrefix::V4 { addr, prefix_len } => {
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(prefix_len.min(32)))
+                .unwrap_or(0);
+            let base = u32::from_be_bytes(addr) & mask;
+            (
+                IpPrefix::V4 {
+                    addr: base.to_be_bytes(),
+                    prefix_len: 0,
+                },
+                IpPrefix::V4 {
+                    addr: (base | !mask).to_be_bytes(),
+                    prefix_len: 32,
+                },
+            )
+        }
+        IpPrefix::V6 { addr, prefix_len } => {
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(prefix_len.min(128)))
+                .unwrap_or(0);
+            let base = u128::from_be_bytes(addr) & mask;
+            (
+                IpPrefix::V6 {
+                    addr: base.to_be_bytes(),
+                    prefix_len: 0,
+                },
+                IpPrefix::V6 {
+                    addr: (base | !mask).to_be_bytes(),
+                    prefix_len: 128,
+                },
+            )
+        }
+    }
+}
+
+/// Whether `net` covers all of `p`: the same family, no longer, and `p`'s
+/// address inside it.
+fn covers(net: &IpPrefix, p: &IpPrefix) -> bool {
+    match (*net, *p) {
+        (IpPrefix::V4 { prefix_len: n, .. }, IpPrefix::V4 { addr, prefix_len }) => {
+            n <= prefix_len && net.contains(IpAddr::from(addr))
+        }
+        (IpPrefix::V6 { prefix_len: n, .. }, IpPrefix::V6 { addr, prefix_len }) => {
+            n <= prefix_len && net.contains(IpAddr::from(addr))
+        }
+        _ => false,
     }
 }
 
@@ -854,6 +935,62 @@ mod tests {
             got,
             vec![(v4(192, 0), Some(vec![nh(1)])), (v4(192, 1), None)],
             "192.0 requeued; 192.1's newer withdrawal wins; 192.2/192.3 untouched"
+        );
+        assert_eq!(
+            f.change_seq(),
+            seq + 1,
+            "only the withdrawal is source activity"
+        );
+    }
+
+    /// The routes inside a subnet the router gained or lost come back to
+    /// be judged again — every one inside it, the subnet's own route
+    /// included, in either family, and nothing outside it — without
+    /// clobbering a newer queued change, and through the `Arc` the loader
+    /// actually boxes.
+    #[test]
+    fn requeue_within_queues_exactly_the_routes_inside_those_nets() {
+        let p = |a: [u8; 4], len: u8| IpPrefix::V4 {
+            addr: a,
+            prefix_len: len,
+        };
+        let p6 = |a: &str, len: u8| IpPrefix::V6 {
+            addr: a.parse::<std::net::Ipv6Addr>().unwrap().octets(),
+            prefix_len: len,
+        };
+        let f = std::sync::Arc::new(RouteFeed::new());
+        for prefix in [
+            p([203, 0, 113, 0], 24),
+            p([203, 0, 113, 128], 25),
+            p([203, 0, 113, 7], 32),
+            // Outside: the covering /16, a neighbour /24, the next /24.
+            p([203, 0, 0, 0], 16),
+            p([203, 0, 112, 0], 24),
+            p([203, 0, 114, 0], 24),
+            p6("2001:db8:1::", 64),
+            p6("2001:db8:1::1", 128),
+            p6("2001:db8:2::", 64),
+        ] {
+            f.route_resolved(prefix, &[nh(1)]);
+        }
+        let _ = f.drain_changes(64);
+        let seq = f.change_seq();
+
+        f.route_withdrawn(p([203, 0, 113, 128], 25));
+        let src: &dyn RouteSource = &f;
+        src.requeue_within(&[p([203, 0, 113, 0], 24), p6("2001:db8:1::", 64)]);
+        let mut got = f.drain_changes(64).routes;
+        got.sort_by_key(|(p, _)| crate::sink::PrefixKey::from(*p));
+        assert_eq!(
+            got,
+            vec![
+                (p([203, 0, 113, 0], 24), Some(vec![nh(1)])),
+                (p([203, 0, 113, 7], 32), Some(vec![nh(1)])),
+                (p([203, 0, 113, 128], 25), None),
+                (p6("2001:db8:1::", 64), Some(vec![nh(1)])),
+                (p6("2001:db8:1::1", 128), Some(vec![nh(1)])),
+            ],
+            "the /24 and everything inside it; the /25's newer withdrawal wins; nothing outside"
         );
         assert_eq!(
             f.change_seq(),

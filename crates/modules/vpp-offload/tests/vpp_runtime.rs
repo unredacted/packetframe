@@ -759,6 +759,172 @@ fn local_interface() -> (u32, String) {
     panic!("no usable interface at index 1..16");
 }
 
+/// The kernel for the readdressing test: the router's addresses as the
+/// background read last saw them, swappable mid-test, and every kernel
+/// route leaving through `br-ix`, a bridge the member port is enslaved to,
+/// which VPP can reach.
+struct Readdressed {
+    addrs: std::sync::Arc<std::sync::Mutex<packetframe_vpp_offload::topology::SelfNetworks>>,
+    port: String,
+}
+
+impl packetframe_vpp_offload::topology::Topology for Readdressed {
+    fn classify(
+        &self,
+        dev: &str,
+    ) -> Result<Option<packetframe_vpp_offload::topology::DevKind>, String> {
+        Ok((dev != "br-ix").then_some(packetframe_vpp_offload::topology::DevKind::Plain))
+    }
+    fn fdb(&self) -> Result<packetframe_vpp_offload::topology::FdbSnapshot, String> {
+        Ok(Default::default())
+    }
+    fn port_vlans(&self) -> Result<packetframe_vpp_offload::topology::PortVlans, String> {
+        Ok(Default::default())
+    }
+    fn master_of(&self, port: &str) -> Option<String> {
+        (port == self.port).then(|| "br-ix".to_string())
+    }
+    fn bridge_l3(&self, _: &str, _: u16) -> Option<packetframe_vpp_offload::topology::BridgeL3> {
+        None
+    }
+    fn fib_match(
+        &self,
+        _: IpPrefix,
+    ) -> Result<packetframe_vpp_offload::topology::FibMatch, String> {
+        Ok(packetframe_vpp_offload::topology::FibMatch::Unicast {
+            oifs: vec!["br-ix".into()],
+        })
+    }
+    fn self_networks(
+        &self,
+    ) -> Option<Result<packetframe_vpp_offload::topology::SelfNetworks, String>> {
+        Some(Ok(self.addrs.lock().unwrap().clone()))
+    }
+}
+
+/// The 2026-10-11 incident through the whole loop and the real route
+/// feed. A subnet addressed after convergence, whose connected route the
+/// feed carries via the router itself, read unresolvable for the life of
+/// the process: the verdict that parked the module in Ready stayed
+/// incomplete, and with it every retry of a held steer. Now the next
+/// address refresh takes it out of the unresolvable count, and the verdict
+/// re-runs on its own and passes, with no restart and no resync.
+#[test]
+fn a_subnet_addressed_while_running_clears_the_parked_verdict() {
+    use packetframe_common::fib::ResolvedRouteSink as _;
+    use packetframe_vpp_offload::driver::Observe as _;
+    use packetframe_vpp_offload::feed::RouteFeed;
+    use packetframe_vpp_offload::topology::SelfNetworks;
+    use std::sync::{Arc, Mutex};
+
+    let pfx = |a: [u8; 4], len: u8| packetframe_common::config::Ipv4Prefix {
+        addr: std::net::Ipv4Addr::from(a),
+        prefix_len: len,
+    };
+    let session = pfx([198, 51, 100, 9], 30);
+    let own = IpAddr::V4(session.addr);
+    let lan = IpPrefix::V4 {
+        addr: [203, 0, 113, 0],
+        prefix_len: 24,
+    };
+    let (ifindex, dev) = local_interface();
+    let fake = Fake::start("readdressed-loop");
+    let feed = Arc::new(RouteFeed::new());
+    feed.neighbour_resolved(fake_vpp::nh(), MAC, ifindex);
+    feed.route_resolved(
+        IpPrefix::V4 {
+            addr: [198, 51, 100, 128],
+            prefix_len: 25,
+        },
+        &[fake_vpp::nh()],
+    );
+    feed.route_resolved(lan, &[own]);
+    let addrs = Arc::new(Mutex::new(SelfNetworks::new([session], [])));
+
+    let mut engine = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: dev.clone(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            mtu: None,
+            vlans: vec![],
+        }],
+        vec![dev.clone()],
+        1_000_000,
+        FamilyPolicy::V4Only,
+        packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    )
+    .with_self_networks([session])
+    .with_topology(Box::new(Readdressed {
+        addrs: addrs.clone(),
+        port: dev,
+    }));
+    engine.set_steer_exempts(vec![pfx([203, 0, 113, 0], 24)]);
+    let rt = Runtime::new(
+        engine,
+        Box::new(feed.clone()),
+        Box::new(SteeringUnavailable),
+        Box::new(NullStore),
+        Box::new(NoResources),
+        "/usr/bin/vpp",
+        "/tmp/startup.conf",
+    );
+
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+    }
+    let (now, _) = run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+    let s = rt.status();
+    assert_eq!((s.counts.installed, s.counts.unresolvable), (1, 1));
+    assert!(
+        s.unresolvable_named.len() == 1
+            && s.unresolvable_named[0].contains("sends this prefix out br-ix, which VPP can reach"),
+        "{:?}",
+        s.unresolvable_named
+    );
+    assert!(
+        s.last_verify
+            .as_ref()
+            .is_some_and(|v| v.awaits_clean_table()),
+        "parked on an incomplete verdict: {:?}",
+        s.last_verify.map(|v| v.summary())
+    );
+
+    // The LAN is addressed. The refresh rides the bridge-table read,
+    // which is paced on the real clock.
+    *addrs.lock().unwrap() = SelfNetworks::new([session, pfx([203, 0, 113, 1], 24)], []);
+    std::thread::sleep(Duration::from_millis(2_100));
+    run_until(&mut d, &rt, now, |_| {
+        rt.status().last_verify.is_some_and(|v| v.passed())
+    });
+    let s = rt.status();
+    assert_eq!(
+        (
+            s.counts.installed,
+            s.counts.unresolvable,
+            s.kernel_delivered_routes
+        ),
+        (1, 0, 1),
+        "{:?}",
+        s.unresolvable_named
+    );
+    assert_eq!(d.state(), State::Ready, "no resync, no restart");
+}
+
 /// A refused neighbour must not cost the batch its route deltas — proved
 /// through the production seam, real `RouteFeed` included.
 ///

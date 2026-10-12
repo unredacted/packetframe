@@ -247,6 +247,17 @@ pub trait RouteSource {
     /// inherited a default and silently dropped work.
     fn requeue_via(&self, _nexthops: &[IpAddr]) {}
 
+    /// Queue every route whose prefix lies inside any of `nets` (equal to
+    /// one included) to be judged again.
+    ///
+    /// For the router's own subnets changing under a running daemon
+    /// ([`ConvergenceEngine::refresh_self_networks`]): whether a route is
+    /// kernel-delivered depends on them, nothing about the route changed,
+    /// and the source would never re-announce it. Fill-if-absent, and a
+    /// default no-op the delegating `Arc<RouteFeed>` forwards, exactly as
+    /// [`Self::requeue_via`].
+    fn requeue_within(&self, _nets: &[IpPrefix]) {}
+
     /// Drop every queued ROUTE delta, because a resync walk is about to
     /// read the whole mirror and supersedes them.
     ///
@@ -867,13 +878,19 @@ pub struct ConvergenceEngine {
     /// withdraws them. Survives reconnects: it describes the mirror,
     /// not the process.
     shadowed: HashSet<IpPrefix>,
-    /// The router's own addresses ([`Self::with_self_networks`]).
+    /// The router's own addresses ([`Self::with_self_networks`]), kept
+    /// current by [`Self::refresh_self_networks`].
     self_addrs: HashSet<IpAddr>,
     /// The router's connected subnets, one per address.
     self_nets: Vec<packetframe_common::config::Ipv4Prefix>,
     /// The router's connected IPv6 subnets, `(network, length)`, one per
     /// global address ([`Self::with_self_networks_v6`]).
     self_nets6: Vec<(std::net::Ipv6Addr, u8)>,
+    /// Why the latest re-read of the router's addresses failed, until one
+    /// succeeds: the three sets above are then the last good read's, and
+    /// the reason a route via the router is unresolvable says so
+    /// ([`Self::why_unresolved`]).
+    self_nets_error: Option<String>,
     /// Mirror prefixes left out of VPP as the router's own connected
     /// subnets ([`Self::kernel_delivered_route`]). Kept apart from
     /// `shadowed` (a `local-route` footprint) so each gauge says one
@@ -1146,6 +1163,7 @@ impl ConvergenceEngine {
             self_addrs: HashSet::new(),
             self_nets: Vec::new(),
             self_nets6: Vec::new(),
+            self_nets_error: None,
             kernel_delivered: HashSet::new(),
             fib_match_budget: 0,
             fib_match_spent: Duration::ZERO,
@@ -1418,20 +1436,16 @@ impl ConvergenceEngine {
 
     /// Declare the router's own IPv4 addresses with their prefix
     /// lengths, so the connected subnets its routing daemon redistributes
-    /// stay out of VPP ([`Self::kernel_delivered_route`]).
+    /// stay out of VPP ([`Self::kernel_delivered_route`]). The attach-time
+    /// read; a topology that reads the kernel's addresses replaces it as
+    /// they change ([`Self::refresh_self_networks`]).
     pub fn with_self_networks(
         mut self,
         nets: impl IntoIterator<Item = packetframe_common::config::Ipv4Prefix>,
     ) -> Self {
         for n in nets {
             self.self_addrs.insert(IpAddr::V4(n.addr));
-            let mask = u32::MAX
-                .checked_shl(32 - u32::from(n.prefix_len))
-                .unwrap_or(0);
-            self.self_nets.push(packetframe_common::config::Ipv4Prefix {
-                addr: std::net::Ipv4Addr::from(u32::from(n.addr) & mask),
-                prefix_len: n.prefix_len,
-            });
+            self.self_nets.push(v4_network(n));
         }
         self
     }
@@ -1452,15 +1466,162 @@ impl ConvergenceEngine {
     ) -> Self {
         for (addr, len) in nets {
             self.self_addrs.insert(IpAddr::V6(addr));
-            if addr.segments()[0] & 0xffc0 == 0xfe80 {
-                continue;
-            }
-            let len = len.min(128);
-            let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
-            self.self_nets6
-                .push((std::net::Ipv6Addr::from(u128::from(addr) & mask), len));
+            self.self_nets6.extend(v6_network(addr, len));
         }
         self
+    }
+
+    /// Take the router's own addresses from the kernel again
+    /// ([`crate::topology::Topology::self_networks`]) and hand back to the
+    /// source every route whose judgement they decide, to be judged again
+    /// on the delta path. Returns whether they changed.
+    ///
+    /// Without this the sets were the ones read at attach, for the life of
+    /// the process. A subnet addressed afterwards (a new IX LAN on a new
+    /// bridge) that the routing daemon redistributes with the router as
+    /// next hop fell to shape 3 of [`Self::kernel_delivered_route`], whose
+    /// kernel lookup finds the connected route out a bridge VPP can reach
+    /// and refuses it. The route read unresolvable until a restart:
+    /// `fib-synced` Degraded, every verify incomplete, and the first-steer
+    /// gate, which a held steer's retry also passes, refusing.
+    ///
+    /// Which routes: every route through an address that came or went
+    /// (shapes 1 and 3 need every next hop the router's), and every route
+    /// inside a subnet that came or went or naming such an address (shapes
+    /// 1 and 2), through [`RouteSource::requeue_via`] and
+    /// [`RouteSource::requeue_within`]. Nothing about the routes changed,
+    /// so the source would never re-announce them. [`Self::apply_changes`]
+    /// then judges each with the new sets either way: kernel-delivered
+    /// (and withdrawn), or back to resolution and the kernel's word. A
+    /// route inside the subnet through a real next hop goes out again
+    /// unchanged, one replace each; a router's subnet holds few.
+    ///
+    /// A failed read keeps the sets in force, since an unreadable table is
+    /// not evidence an address went, and is named in the reason a route
+    /// via the router is unresolvable until a read succeeds.
+    pub fn refresh_self_networks(&mut self, src: &dyn RouteSource) -> bool {
+        let Some(changed) = self.reread_self_networks() else {
+            return false;
+        };
+        src.requeue_via(&changed.addrs);
+        src.requeue_within(&changed.nets);
+        true
+    }
+
+    /// The half of [`Self::refresh_self_networks`] that reads and replaces
+    /// the sets: what changed, or `None` when nothing did, the topology
+    /// does not read addresses, or the read failed. IPv6 only under `v6
+    /// on`, as at bring-up.
+    fn reread_self_networks(&mut self) -> Option<SelfNetsChange> {
+        let read = match self.topology.self_networks()? {
+            Ok(read) => {
+                if let Some(was) = self.self_nets_error.take() {
+                    tracing::info!(was = %was, "the router's own addresses are readable again");
+                }
+                read
+            }
+            Err(e) => {
+                if self.self_nets_error.is_none() {
+                    tracing::warn!(
+                        error = %e,
+                        "the router's own addresses are unreadable; routes keep being judged \
+                         against the last good read"
+                    );
+                }
+                self.self_nets_error = Some(e);
+                return None;
+            }
+        };
+        let v6: &[(std::net::Ipv6Addr, u8)] = if self.drainer.families().carries_v6() {
+            &read.v6
+        } else {
+            &[]
+        };
+        let addrs: HashSet<IpAddr> = read
+            .v4
+            .iter()
+            .map(|n| IpAddr::V4(n.addr))
+            .chain(v6.iter().map(|(a, _)| IpAddr::V6(*a)))
+            .collect();
+        let mut nets: Vec<packetframe_common::config::Ipv4Prefix> =
+            read.v4.iter().map(|n| v4_network(*n)).collect();
+        nets.sort_unstable_by_key(|n| (u32::from(n.addr), n.prefix_len));
+        nets.dedup();
+        let mut nets6: Vec<(std::net::Ipv6Addr, u8)> = v6
+            .iter()
+            .filter_map(|(a, len)| v6_network(*a, *len))
+            .collect();
+        nets6.sort_unstable();
+        nets6.dedup();
+
+        let as_prefixes = |v4: &[packetframe_common::config::Ipv4Prefix],
+                           v6: &[(std::net::Ipv6Addr, u8)]|
+         -> HashSet<IpPrefix> {
+            v4.iter()
+                .map(|n| IpPrefix::V4 {
+                    addr: n.addr.octets(),
+                    prefix_len: n.prefix_len,
+                })
+                .chain(v6.iter().map(|(a, len)| IpPrefix::V6 {
+                    addr: a.octets(),
+                    prefix_len: *len,
+                }))
+                .collect()
+        };
+        let (old_nets, new_nets) = (
+            as_prefixes(&self.self_nets, &self.self_nets6),
+            as_prefixes(&nets, &nets6),
+        );
+        let mut changed_addrs: Vec<IpAddr> = self
+            .self_addrs
+            .symmetric_difference(&addrs)
+            .copied()
+            .collect();
+        changed_addrs.sort_unstable();
+        let mut changed_nets: Vec<IpPrefix> = old_nets
+            .symmetric_difference(&new_nets)
+            .copied()
+            .chain(changed_addrs.iter().map(|a| match *a {
+                IpAddr::V4(a) => IpPrefix::V4 {
+                    addr: a.octets(),
+                    prefix_len: 32,
+                },
+                IpAddr::V6(a) => IpPrefix::V6 {
+                    addr: a.octets(),
+                    prefix_len: 128,
+                },
+            }))
+            .collect();
+        if changed_nets.is_empty() {
+            // Every changed address adds its host prefix, so this is
+            // nothing changed at all.
+            return None;
+        }
+        changed_nets.sort_unstable_by_key(|p| crate::sink::PrefixKey::from(*p));
+        changed_nets.dedup();
+        let added: Vec<String> = addrs
+            .difference(&self.self_addrs)
+            .map(ToString::to_string)
+            .collect();
+        let removed: Vec<String> = self
+            .self_addrs
+            .difference(&addrs)
+            .map(ToString::to_string)
+            .collect();
+        let within: Vec<String> = changed_nets.iter().map(cidr).collect();
+        tracing::info!(
+            added = ?added,
+            removed = ?removed,
+            within = ?within,
+            "the router's own addresses changed; the routes they decide are judged again"
+        );
+        self.self_addrs = addrs;
+        self.self_nets = nets;
+        self.self_nets6 = nets6;
+        Some(SelfNetsChange {
+            addrs: changed_addrs,
+            nets: changed_nets,
+        })
     }
 
     /// The configured `steer-exempt` set. Replaced on every reload, from
@@ -1750,11 +1911,21 @@ impl ConvergenceEngine {
     /// address never admitted as a neighbour
     /// ([`Self::carries_neighbour`]) — then the mapping's.
     fn why_unresolved(&self, prefix: &IpPrefix, nh: &IpAddr) -> String {
+        // The subnets these judgements read may be stale, and a route via
+        // the router reads unresolvable exactly when a subnet it sits in
+        // is unknown.
+        let stale = self.self_nets_error.as_ref().map_or(String::new(), |e| {
+            format!(
+                "; the router's addresses could not be re-read ({e}), so a subnet addressed \
+                 since the last good read is not known"
+            )
+        });
         if self.self_addrs.contains(nh) && matches!(prefix, IpPrefix::V6 { .. }) {
-            return "the router's own address, which VPP has no adjacency for; the prefix is in no \
-                    subnet or address of the router, and IPv6 has no steer-exempt, so diverted \
-                    traffic for it would be dropped in VPP rather than left to the kernel"
-                .into();
+            return format!(
+                "the router's own address, which VPP has no adjacency for; the prefix is in no \
+                 subnet or address of the router, and IPv6 has no steer-exempt, so diverted \
+                 traffic for it would be dropped in VPP rather than left to the kernel{stale}"
+            );
         }
         if self.self_addrs.contains(nh) {
             // Which way the kernel answered, when it was asked: a route via
@@ -1762,7 +1933,7 @@ impl ConvergenceEngine {
             // ([`Self::kernel_delivered_route`]), so its absence is the
             // reason.
             return format!(
-                "the router's own address, which VPP has no adjacency for; {}",
+                "the router's own address, which VPP has no adjacency for; {}{stale}",
                 self.kernel_refused.get(prefix).map_or(
                     "the prefix is in no subnet or address of the router",
                     String::as_str
@@ -4072,6 +4243,9 @@ impl ConvergenceEngine {
         self.nexthops.forget_kinds();
         self.read_fdb();
         self.refresh_untagged();
+        // And the router's own addresses. Nothing is handed back to the
+        // source: the walk below judges every route against them.
+        self.reread_self_networks();
         // Carried families only, so an uncarried neighbour is never
         // mapped: no route can resolve through an adjacency that is
         // never programmed.
@@ -4782,6 +4956,38 @@ fn v6_covers(net: std::net::Ipv6Addr, len: u8, p: &IpPrefix) -> bool {
     u128::from_be_bytes(*addr) & mask == u128::from(net) & mask
 }
 
+/// What one re-read of the router's addresses changed
+/// ([`ConvergenceEngine::refresh_self_networks`]): the addresses that came
+/// or went, and the subnets that came or went with the host prefix of
+/// every such address.
+struct SelfNetsChange {
+    addrs: Vec<IpAddr>,
+    nets: Vec<IpPrefix>,
+}
+
+/// The subnet `n` (an address with its prefix length) sits in.
+fn v4_network(n: packetframe_common::config::Ipv4Prefix) -> packetframe_common::config::Ipv4Prefix {
+    let mask = u32::MAX
+        .checked_shl(32 - u32::from(n.prefix_len.min(32)))
+        .unwrap_or(0);
+    packetframe_common::config::Ipv4Prefix {
+        addr: std::net::Ipv4Addr::from(u32::from(n.addr) & mask),
+        prefix_len: n.prefix_len,
+    }
+}
+
+/// The subnet `addr/len` sits in, or `None` for a link-local address:
+/// `fe80::/64` is on every link and no routed prefix
+/// ([`ConvergenceEngine::with_self_networks_v6`]).
+fn v6_network(addr: std::net::Ipv6Addr, len: u8) -> Option<(std::net::Ipv6Addr, u8)> {
+    if addr.segments()[0] & 0xffc0 == 0xfe80 {
+        return None;
+    }
+    let len = len.min(128);
+    let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+    Some((std::net::Ipv6Addr::from(u128::from(addr) & mask), len))
+}
+
 /// Whether `net` covers all of `p`. An IPv6 `p` is never covered.
 fn v4_covers(net: &packetframe_common::config::Ipv4Prefix, p: &IpPrefix) -> bool {
     let IpPrefix::V4 { addr, prefix_len } = p else {
@@ -4846,6 +5052,10 @@ mod tests {
     }
 
     fn engine() -> ConvergenceEngine {
+        engine_carrying(FamilyPolicy::V4Only)
+    }
+
+    fn engine_carrying(families: FamilyPolicy) -> ConvergenceEngine {
         ConvergenceEngine::new(
             "/nonexistent/api.sock",
             vec![PortAttach {
@@ -4860,7 +5070,7 @@ mod tests {
             }],
             vec!["eth4".into()],
             1_000_000,
-            FamilyPolicy::V4Only,
+            families,
             packetframe_common::config::Ipv4Prefix {
                 addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
                 prefix_len: 32,
@@ -5890,5 +6100,353 @@ mod tests {
             vec![moved, unknown, new],
             "`same` owes nothing, stale op included"
         );
+    }
+
+    fn p4(a: u8, b: u8, c: u8, d: u8, len: u8) -> packetframe_common::config::Ipv4Prefix {
+        packetframe_common::config::Ipv4Prefix {
+            addr: Ipv4Addr::new(a, b, c, d),
+            prefix_len: len,
+        }
+    }
+
+    fn v6(addr: &str, len: u8) -> IpPrefix {
+        IpPrefix::V6 {
+            addr: addr.parse::<std::net::Ipv6Addr>().unwrap().octets(),
+            prefix_len: len,
+        }
+    }
+
+    type KernelAddrs =
+        std::rc::Rc<std::cell::RefCell<Result<crate::topology::SelfNetworks, String>>>;
+
+    /// The kernel as the self-network tests need it: the router's
+    /// addresses as the topology last read them, swappable mid-test, and
+    /// the kernel's own route for any prefix leaving through member port
+    /// `eth4`, which VPP reaches — as the new IX LAN's connected route out
+    /// its bridge did — so shape 3 refuses every route and only the
+    /// router's subnets decide.
+    struct Addressed(KernelAddrs);
+
+    impl crate::topology::Topology for Addressed {
+        fn classify(&self, _dev: &str) -> Result<Option<crate::topology::DevKind>, String> {
+            Ok(Some(crate::topology::DevKind::Plain))
+        }
+        fn fdb(&self) -> Result<crate::topology::FdbSnapshot, String> {
+            Ok(Default::default())
+        }
+        fn port_vlans(&self) -> Result<crate::topology::PortVlans, String> {
+            Ok(Default::default())
+        }
+        fn master_of(&self, _port: &str) -> Option<String> {
+            None
+        }
+        fn bridge_l3(&self, _bridge: &str, _vid: u16) -> Option<crate::topology::BridgeL3> {
+            None
+        }
+        fn fib_match(&self, _prefix: IpPrefix) -> Result<crate::topology::FibMatch, String> {
+            Ok(crate::topology::FibMatch::Unicast {
+                oifs: vec!["eth4".into()],
+            })
+        }
+        fn self_networks(&self) -> Option<Result<crate::topology::SelfNetworks, String>> {
+            Some(self.0.borrow().clone())
+        }
+    }
+
+    fn addressed(
+        v4: &[packetframe_common::config::Ipv4Prefix],
+        v6: &[(std::net::Ipv6Addr, u8)],
+    ) -> Result<crate::topology::SelfNetworks, String> {
+        Ok(crate::topology::SelfNetworks::new(
+            v4.iter().copied(),
+            v6.iter().copied(),
+        ))
+    }
+
+    /// A live feed as the self-network tests need it: what the engine
+    /// hands back through `requeue_via` and `requeue_within` comes out of
+    /// the next `drain_changes`, once per prefix as the feed's map would
+    /// have it, and what was asked is kept to assert on.
+    #[derive(Default)]
+    struct Feed {
+        routes: Vec<(IpPrefix, Vec<IpAddr>)>,
+        queued: std::cell::RefCell<Vec<RouteChange>>,
+        via: std::cell::RefCell<Vec<IpAddr>>,
+        within: std::cell::RefCell<Vec<IpPrefix>>,
+    }
+
+    impl Feed {
+        fn of(routes: Vec<(IpPrefix, Vec<IpAddr>)>) -> Self {
+            Self {
+                routes,
+                ..Self::default()
+            }
+        }
+
+        fn queue_where(&self, hit: impl Fn(&IpPrefix, &[IpAddr]) -> bool) {
+            let mut q = self.queued.borrow_mut();
+            for (p, nhs) in &self.routes {
+                if hit(p, nhs) && !q.iter().any(|(queued, _)| queued == p) {
+                    q.push((*p, Some(nhs.clone())));
+                }
+            }
+        }
+    }
+
+    impl RouteSource for Feed {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for (p, nhs) in &self.routes {
+                visit(*p, nhs);
+            }
+        }
+        fn for_each_neighbour(&self, _visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {}
+        fn drain_changes(&self, _max: usize) -> SourceChanges {
+            SourceChanges {
+                routes: std::mem::take(&mut *self.queued.borrow_mut()),
+                neighbours: Vec::new(),
+            }
+        }
+        fn requeue(&self, _: SourceChanges) {
+            unreachable!("no neighbour is applied here, so nothing comes back")
+        }
+        fn requeue_via(&self, nexthops: &[IpAddr]) {
+            self.via.borrow_mut().extend_from_slice(nexthops);
+            self.queue_where(|_, nhs| nhs.iter().any(|n| nexthops.contains(n)));
+        }
+        fn requeue_within(&self, nets: &[IpPrefix]) {
+            self.within.borrow_mut().extend_from_slice(nets);
+            let inside = |net: &IpPrefix, p: &IpPrefix| match (*net, *p) {
+                (IpPrefix::V4 { prefix_len: n, .. }, IpPrefix::V4 { addr, prefix_len }) => {
+                    n <= prefix_len && net.contains(IpAddr::from(addr))
+                }
+                (IpPrefix::V6 { prefix_len: n, .. }, IpPrefix::V6 { addr, prefix_len }) => {
+                    n <= prefix_len && net.contains(IpAddr::from(addr))
+                }
+                _ => false,
+            };
+            self.queue_where(|p, _| nets.iter().any(|net| inside(net, p)));
+        }
+        fn route_count(&self) -> u64 {
+            self.routes.len() as u64
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+
+    /// The router's session address, the next hop of everything it
+    /// originates, on a /30 toward the routing daemon.
+    const OWN: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 9);
+    /// An address the router gains after attach: a new IX LAN's.
+    const LAN_ADDR: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 1);
+
+    /// A subnet addressed after attach — a new IX LAN, whose connected
+    /// route the routing daemon redistributes with the router as next hop
+    /// — becomes kernel-delivered at the next refresh, without a restart.
+    /// Until then it is unresolvable and its name says the kernel sends it
+    /// out a port VPP can reach. The refresh hands back the routes the new
+    /// address and subnet decide, and only those, and the delta path
+    /// queues the withdrawal whose acknowledgement clears the unresolvable
+    /// entry (proved against the fake VPP in `tests/vpp_engine.rs`).
+    #[test]
+    fn an_address_added_after_attach_makes_its_subnet_kernel_delivered() {
+        let own = IpAddr::V4(OWN);
+        let lan = v4(203, 0, 113, 0, 24);
+        let transit = v4(198, 51, 100, 128, 25);
+        let kernel: KernelAddrs = std::rc::Rc::new(std::cell::RefCell::new(addressed(
+            &[p4(198, 51, 100, 9, 30)],
+            &[],
+        )));
+        let mut e = engine()
+            .with_self_networks([p4(198, 51, 100, 9, 30)])
+            .with_topology(Box::new(Addressed(kernel.clone())));
+        let src = Feed::of(vec![(lan, vec![own]), (transit, vec![nh(1)])]);
+
+        let plan = e.begin_resync(&src);
+        assert_eq!((plan.upserts, plan.kernel_delivered), (2, 0), "{plan:?}");
+        assert!(
+            e.why_unresolved(&lan, &own)
+                .contains("sends this prefix out eth4, which VPP can reach"),
+            "{}",
+            e.why_unresolved(&lan, &own)
+        );
+        // What the drain makes of it: no next hop reaches VPP.
+        let _ = e.pending.drain_batch(64);
+        e.ledger.classify_resolved(lan, 0);
+        e.ledger.note_unresolvable(lan, &[own]);
+        assert_eq!(e.counts().unresolvable, 1);
+
+        assert!(
+            !e.refresh_self_networks(&src),
+            "the kernel holds what attach read"
+        );
+        assert!(src.via.borrow().is_empty() && src.within.borrow().is_empty());
+
+        *kernel.borrow_mut() = addressed(&[p4(198, 51, 100, 9, 30), p4(203, 0, 113, 1, 24)], &[]);
+        assert!(e.refresh_self_networks(&src));
+        assert_eq!(*src.via.borrow(), vec![IpAddr::V4(LAN_ADDR)]);
+        assert_eq!(*src.within.borrow(), vec![lan, v4(203, 0, 113, 1, 32)]);
+        e.apply_changes(&src, 64).expect("deltas");
+        assert_eq!(e.kernel_delivered_routes(), 1);
+        assert_eq!(
+            e.pending.drain_batch(64),
+            vec![(lan, crate::sink::PendingOp::Withdraw)],
+            "the LAN withdrawn in case anything installed it, the transit route not handed back"
+        );
+        assert!(
+            !e.refresh_self_networks(&src),
+            "read again, nothing changed"
+        );
+    }
+
+    /// A resync judges against the addresses the kernel holds when it
+    /// starts, not the ones attach read: a process whose VPP restarted
+    /// after the router gained a subnet starts its walk from what is true.
+    #[test]
+    fn a_resync_judges_against_the_addresses_held_now() {
+        let own = IpAddr::V4(OWN);
+        let lan = v4(203, 0, 113, 0, 24);
+        let kernel: KernelAddrs = std::rc::Rc::new(std::cell::RefCell::new(addressed(
+            &[p4(198, 51, 100, 9, 30), p4(203, 0, 113, 1, 24)],
+            &[],
+        )));
+        let mut e = engine()
+            .with_self_networks([p4(198, 51, 100, 9, 30)])
+            .with_topology(Box::new(Addressed(kernel)));
+        let plan = e.begin_resync(&Feed::of(vec![(lan, vec![own])]));
+        assert_eq!((plan.upserts, plan.kernel_delivered), (0, 1), "{plan:?}");
+    }
+
+    /// The reverse: an address the router loses takes its subnet's routes
+    /// back to resolution and the kernel's word — here unresolvable again,
+    /// out a port VPP reaches — rather than leaving them kernel-delivered
+    /// for the life of the process.
+    #[test]
+    fn an_address_removed_sends_its_subnet_back_to_the_kernels_word() {
+        let own = IpAddr::V4(OWN);
+        let lan = v4(203, 0, 113, 0, 24);
+        let both = [p4(198, 51, 100, 9, 30), p4(203, 0, 113, 1, 24)];
+        let kernel: KernelAddrs = std::rc::Rc::new(std::cell::RefCell::new(addressed(&both, &[])));
+        let mut e = engine()
+            .with_self_networks(both)
+            .with_topology(Box::new(Addressed(kernel.clone())));
+        let src = Feed::of(vec![(lan, vec![own])]);
+        let plan = e.begin_resync(&src);
+        assert_eq!((plan.upserts, plan.kernel_delivered), (0, 1), "{plan:?}");
+
+        *kernel.borrow_mut() = addressed(&[p4(198, 51, 100, 9, 30)], &[]);
+        assert!(e.refresh_self_networks(&src));
+        assert_eq!(*src.via.borrow(), vec![IpAddr::V4(LAN_ADDR)]);
+        assert_eq!(*src.within.borrow(), vec![lan, v4(203, 0, 113, 1, 32)]);
+        e.apply_changes(&src, 64).expect("deltas");
+        assert_eq!(e.kernel_delivered_routes(), 0);
+        assert_eq!(
+            e.pending.drain_batch(64),
+            vec![(
+                lan,
+                crate::sink::PendingOp::Upsert {
+                    nexthops: vec![own]
+                }
+            )]
+        );
+        assert!(
+            e.why_unresolved(&lan, &own)
+                .contains("sends this prefix out eth4, which VPP can reach"),
+            "{}",
+            e.why_unresolved(&lan, &own)
+        );
+    }
+
+    /// A failed read is not every address gone: the last good sets stay in
+    /// force, for the delta path and a resync alike, and the reason a
+    /// route via the router reads unresolvable names the failure until a
+    /// read succeeds.
+    #[test]
+    fn a_failed_address_read_keeps_the_last_good_sets_and_says_so() {
+        let own = IpAddr::V4(OWN);
+        let lan = v4(203, 0, 113, 0, 24);
+        let elsewhere = v4(198, 51, 100, 128, 25);
+        let both = [p4(198, 51, 100, 9, 30), p4(203, 0, 113, 1, 24)];
+        let kernel: KernelAddrs = std::rc::Rc::new(std::cell::RefCell::new(addressed(&both, &[])));
+        let mut e = engine()
+            .with_self_networks(both)
+            .with_topology(Box::new(Addressed(kernel.clone())));
+        let src = Feed::of(vec![(lan, vec![own]), (elsewhere, vec![own])]);
+        e.begin_resync(&src);
+
+        *kernel.borrow_mut() = Err("getifaddrs: Cannot allocate memory".into());
+        assert!(!e.refresh_self_networks(&src));
+        assert!(src.via.borrow().is_empty() && src.within.borrow().is_empty());
+        let plan = e.begin_resync(&src);
+        assert_eq!((plan.upserts, plan.kernel_delivered), (1, 1), "{plan:?}");
+        assert!(
+            e.why_unresolved(&elsewhere, &own)
+                .contains("could not be re-read (getifaddrs: Cannot allocate memory)"),
+            "{}",
+            e.why_unresolved(&elsewhere, &own)
+        );
+
+        *kernel.borrow_mut() = addressed(&both, &[]);
+        assert!(!e.refresh_self_networks(&src), "readable again, unchanged");
+        assert!(
+            !e.why_unresolved(&elsewhere, &own)
+                .contains("could not be re-read"),
+            "{}",
+            e.why_unresolved(&elsewhere, &own)
+        );
+    }
+
+    /// IPv6 follows the same way under `v6 on` — a global subnet added
+    /// makes its connected route via the router's global address
+    /// kernel-delivered, and a link-local is the router's but never a
+    /// subnet — and not at all under `v6 off`, where no v6 route reaches
+    /// the engine for the sets to decide.
+    #[test]
+    fn the_v6_half_follows_under_v6_on_only() {
+        let own6: std::net::Ipv6Addr = "2001:db8::9".parse().unwrap();
+        let lan6_addr: std::net::Ipv6Addr = "2001:db8:113::1".parse().unwrap();
+        let ll: std::net::Ipv6Addr = "fe80::9".parse().unwrap();
+        let lan6 = v6("2001:db8:113::", 64);
+        let before = [(own6, 64), (ll, 64)];
+        let after = [(own6, 64), (ll, 64), (lan6_addr, 64)];
+        let src = Feed::of(vec![(lan6, vec![IpAddr::V6(own6)])]);
+
+        let kernel: KernelAddrs = std::rc::Rc::new(std::cell::RefCell::new(addressed(
+            &[p4(198, 51, 100, 9, 30)],
+            &before,
+        )));
+        let mut e = engine_carrying(FamilyPolicy::Both)
+            .with_self_networks([p4(198, 51, 100, 9, 30)])
+            .with_self_networks_v6(before)
+            .with_topology(Box::new(Addressed(kernel.clone())));
+        let plan = e.begin_resync(&src);
+        assert_eq!((plan.upserts, plan.kernel_delivered), (1, 0), "{plan:?}");
+        let _ = e.pending.drain_batch(64);
+        assert!(!e.refresh_self_networks(&src), "{:?}", src.within.borrow());
+
+        *kernel.borrow_mut() = addressed(&[p4(198, 51, 100, 9, 30)], &after);
+        assert!(e.refresh_self_networks(&src));
+        assert_eq!(*src.via.borrow(), vec![IpAddr::V6(lan6_addr)]);
+        assert_eq!(*src.within.borrow(), vec![lan6, v6("2001:db8:113::1", 128)]);
+        e.apply_changes(&src, 64).expect("deltas");
+        assert_eq!(e.kernel_delivered_routes(), 1);
+        assert_eq!(
+            e.pending.drain_batch(64),
+            vec![(lan6, crate::sink::PendingOp::Withdraw)]
+        );
+
+        // `v6 off`: the v6 addresses are not the engine's business.
+        let src = Feed::of(vec![(lan6, vec![IpAddr::V6(own6)])]);
+        let kernel: KernelAddrs = std::rc::Rc::new(std::cell::RefCell::new(addressed(
+            &[p4(198, 51, 100, 9, 30)],
+            &before,
+        )));
+        let mut e = engine()
+            .with_self_networks([p4(198, 51, 100, 9, 30)])
+            .with_topology(Box::new(Addressed(kernel.clone())));
+        assert!(!e.refresh_self_networks(&src));
+        *kernel.borrow_mut() = addressed(&[p4(198, 51, 100, 9, 30)], &after);
+        assert!(!e.refresh_self_networks(&src));
+        assert!(src.via.borrow().is_empty() && src.within.borrow().is_empty());
     }
 }

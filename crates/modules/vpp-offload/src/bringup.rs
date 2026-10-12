@@ -275,59 +275,7 @@ pub(crate) fn kernel_v4_addrs() -> Vec<(String, std::net::Ipv4Addr)> {
 /// Every IPv4 address the kernel holds, with its interface and prefix
 /// length. Degrades open like [`kernel_v4_addrs`].
 fn kernel_v4_ifaddrs() -> Vec<(String, packetframe_common::config::Ipv4Prefix)> {
-    let mut out = Vec::new();
-    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs allocates the list; freed below on every path
-    // that saw a zero return.
-    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
-        return out;
-    }
-    let mut cur = ifap;
-    while !cur.is_null() {
-        // SAFETY: walking the list getifaddrs returned, until null.
-        let ifa = unsafe { &*cur };
-        if !ifa.ifa_addr.is_null() {
-            // SAFETY: ifa_addr is non-null and points at a sockaddr for
-            // this entry; only read further when the family says INET.
-            let family = unsafe { i32::from((*ifa.ifa_addr).sa_family) };
-            if family == libc::AF_INET {
-                // SAFETY: AF_INET guarantees sockaddr_in layout.
-                let raw = unsafe {
-                    (*(ifa.ifa_addr as *const libc::sockaddr_in))
-                        .sin_addr
-                        .s_addr
-                };
-                let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
-                    .to_string_lossy()
-                    .into_owned();
-                // A missing netmask reads as a host route: the narrowest
-                // claim, never a wider subnet than the kernel stated.
-                let prefix_len = if ifa.ifa_netmask.is_null() {
-                    32
-                } else {
-                    // SAFETY: non-null, and an AF_INET entry's netmask
-                    // is a sockaddr_in.
-                    let mask = unsafe {
-                        (*(ifa.ifa_netmask as *const libc::sockaddr_in))
-                            .sin_addr
-                            .s_addr
-                    };
-                    u32::from_be(mask).count_ones() as u8
-                };
-                out.push((
-                    name,
-                    packetframe_common::config::Ipv4Prefix {
-                        addr: std::net::Ipv4Addr::from(u32::from_be(raw)),
-                        prefix_len,
-                    },
-                ));
-            }
-        }
-        cur = ifa.ifa_next;
-    }
-    // SAFETY: the list came from a successful getifaddrs.
-    unsafe { libc::freeifaddrs(ifap) };
-    out
+    kernel_ifaddrs().map(|a| a.v4).unwrap_or_default()
 }
 
 /// Every IPv6 address the kernel holds, with its interface and prefix
@@ -339,53 +287,106 @@ fn kernel_v4_ifaddrs() -> Vec<(String, packetframe_common::config::Ipv4Prefix)> 
 /// feasibility probe alike, where degrading open skips the check the way
 /// [`kernel_v4_addrs`] does for the v4 loopback.
 pub(crate) fn kernel_v6_ifaddrs() -> Vec<(String, std::net::Ipv6Addr, u8)> {
-    let mut out = Vec::new();
+    kernel_ifaddrs().map(|a| a.v6).unwrap_or_default()
+}
+
+/// The kernel's addresses, both families, from one `getifaddrs` walk.
+pub(crate) struct KernelIfaddrs {
+    pub v4: Vec<(String, packetframe_common::config::Ipv4Prefix)>,
+    pub v6: Vec<(String, std::net::Ipv6Addr, u8)>,
+}
+
+/// Every address the kernel holds, with its interface and prefix length,
+/// or why `getifaddrs` failed. The attach-time readers above degrade that
+/// failure open; the running daemon's re-read
+/// ([`crate::topology::Topology::self_networks`]) must not, because an
+/// empty table there would read as every address gone.
+pub(crate) fn kernel_ifaddrs() -> Result<KernelIfaddrs, String> {
+    let mut out = KernelIfaddrs {
+        v4: Vec::new(),
+        v6: Vec::new(),
+    };
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates the list; freed below on every path
     // that saw a zero return.
     if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
-        return out;
+        return Err(format!("getifaddrs: {}", std::io::Error::last_os_error()));
     }
     let mut cur = ifap;
     while !cur.is_null() {
         // SAFETY: walking the list getifaddrs returned, until null.
         let ifa = unsafe { &*cur };
-        if !ifa.ifa_addr.is_null() {
-            // SAFETY: ifa_addr is non-null and points at a sockaddr for
-            // this entry; only read further when the family says INET6.
-            let family = unsafe { i32::from((*ifa.ifa_addr).sa_family) };
-            if family == libc::AF_INET6 {
-                // SAFETY: AF_INET6 guarantees sockaddr_in6 layout.
-                let raw = unsafe {
-                    (*(ifa.ifa_addr as *const libc::sockaddr_in6))
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: ifa_addr is non-null and points at a sockaddr for this
+        // entry; only read further when the family says which.
+        let family = unsafe { i32::from((*ifa.ifa_addr).sa_family) };
+        if family != libc::AF_INET && family != libc::AF_INET6 {
+            continue;
+        }
+        // SAFETY: getifaddrs names every entry with a NUL-terminated
+        // string that lives as long as the list.
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        if family == libc::AF_INET {
+            // SAFETY: AF_INET guarantees sockaddr_in layout.
+            let raw = unsafe {
+                (*(ifa.ifa_addr as *const libc::sockaddr_in))
+                    .sin_addr
+                    .s_addr
+            };
+            // A missing netmask reads as a host route: the narrowest
+            // claim, never a wider subnet than the kernel stated.
+            let prefix_len = if ifa.ifa_netmask.is_null() {
+                32
+            } else {
+                // SAFETY: non-null, and an AF_INET entry's netmask is a
+                // sockaddr_in.
+                let mask = unsafe {
+                    (*(ifa.ifa_netmask as *const libc::sockaddr_in))
+                        .sin_addr
+                        .s_addr
+                };
+                u32::from_be(mask).count_ones() as u8
+            };
+            out.v4.push((
+                name,
+                packetframe_common::config::Ipv4Prefix {
+                    addr: std::net::Ipv4Addr::from(u32::from_be(raw)),
+                    prefix_len,
+                },
+            ));
+        } else {
+            // SAFETY: AF_INET6 guarantees sockaddr_in6 layout.
+            let raw = unsafe {
+                (*(ifa.ifa_addr as *const libc::sockaddr_in6))
+                    .sin6_addr
+                    .s6_addr
+            };
+            // A missing netmask reads as a host route, the narrowest
+            // claim — as for v4.
+            let prefix_len = if ifa.ifa_netmask.is_null() {
+                128
+            } else {
+                // SAFETY: non-null, and an AF_INET6 entry's netmask is a
+                // sockaddr_in6.
+                let mask = unsafe {
+                    (*(ifa.ifa_netmask as *const libc::sockaddr_in6))
                         .sin6_addr
                         .s6_addr
                 };
-                let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
-                    .to_string_lossy()
-                    .into_owned();
-                // A missing netmask reads as a host route, the narrowest
-                // claim — as for v4.
-                let prefix_len = if ifa.ifa_netmask.is_null() {
-                    128
-                } else {
-                    // SAFETY: non-null, and an AF_INET6 entry's netmask
-                    // is a sockaddr_in6.
-                    let mask = unsafe {
-                        (*(ifa.ifa_netmask as *const libc::sockaddr_in6))
-                            .sin6_addr
-                            .s6_addr
-                    };
-                    u128::from_be_bytes(mask).count_ones() as u8
-                };
-                out.push((name, std::net::Ipv6Addr::from(raw), prefix_len));
-            }
+                u128::from_be_bytes(mask).count_ones() as u8
+            };
+            out.v6
+                .push((name, std::net::Ipv6Addr::from(raw), prefix_len));
         }
-        cur = ifa.ifa_next;
     }
     // SAFETY: the list came from a successful getifaddrs.
     unsafe { libc::freeifaddrs(ifap) };
-    out
+    Ok(out)
 }
 
 fn hex_mac(m: &[u8; 6]) -> String {
@@ -1393,9 +1394,9 @@ fn finish(
     let local_routes = local_routes.to_vec();
     let trunk_ports = trunk_ports.to_vec();
     // The router's own addresses and subnets, for the connected routes
-    // its routing daemon redistributes with itself as next hop. Read at
-    // attach: a subnet added later reads as unresolvable, which blocks a
-    // first steer — loud, not silent.
+    // its routing daemon redistributes with itself as next hop. Read here
+    // for the first resync; the kernel topology re-reads them while the
+    // daemon runs and the engine follows (`refresh_self_networks`).
     let self_nets: Vec<packetframe_common::config::Ipv4Prefix> =
         kernel_v4_ifaddrs().into_iter().map(|(_, p)| p).collect();
     // IPv6's, read the same way, and only when VPP carries the family:
