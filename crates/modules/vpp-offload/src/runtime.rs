@@ -4388,6 +4388,11 @@ impl ObserveView {
         let placement_due = last_placement.is_none_or(|t| t.elapsed() >= PLACEMENT_EVERY);
         if placement_due {
             *last_placement = Some(std::time::Instant::now());
+            // And follow the router's own addresses on the same read
+            // cadence: an address added or removed re-queues the routes it
+            // decides, judged again in this same batch. Sends nothing to
+            // VPP itself, so it cannot fail.
+            engine.refresh_self_networks(source.as_ref());
             if let Err(e) = engine.refresh_placement(source.as_ref()) {
                 *last_drain_error = Some(e.to_string());
                 return Err(step_error(engine, e));

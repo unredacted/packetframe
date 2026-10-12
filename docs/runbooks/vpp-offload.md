@@ -1491,8 +1491,25 @@ route carries the router's address; the kernel sends those out member
 ports, so shape 3 refuses them and they stay unresolvable (loud, and
 blocking the first steer). A kernel entry for a different prefix, a
 blackhole or unreachable route, or an unreadable kernel also leaves a
-route unresolvable. The router's addresses are read at attach; the kernel
-lookup runs when the route is classified.
+route unresolvable. The kernel lookup runs when the route is classified.
+
+The router's addresses are read at attach and again every 2 seconds
+while the daemon runs. A change hands every route it could reclassify back
+to be judged again, with no restart and no resync: routes through an
+address that came or went, and routes inside a subnet that came or went.
+So a subnet addressed after start (a new IX LAN on a new bridge, its
+connected route redistributed with the router as next hop) turns
+kernel-delivered within a few seconds. Until then it reads unresolvable,
+`the kernel sends this prefix out <bridge>, which VPP can reach`. Once it
+is kernel-delivered, the verdict it held incomplete re-runs, and a held
+steer retries. A removed address sends its subnet's routes back to the
+kernel's word, two reads after it goes: one read without it is not
+trusted, because an address dump taken during churn can skip one. The
+journal names each change (`the router's own addresses changed; the routes
+they decide are judged again`, with the addresses and the prefixes
+re-judged). A read that fails keeps the last good addresses and says so
+in the name of every unresolvable route via the router. IPv6 addresses
+count only under `v6 on`.
 
 `packetframe_vpp_kernel_delivered_routes` counts them, and the
 `fib-synced` row prints the count beside the unresolvable one. A steady
@@ -1754,7 +1771,13 @@ Two things to get right in config:
   reports the connected route until a `local-route` (with its fast-path
   `local-prefix`) or a `steer-exempt` covers it. Gatewayed routes over
   the new VLAN are covered from the tripwire's next scan: it re-reads
-  which VLANs each member carries every time.
+  which VLANs each member carries every time. If the routing daemon
+  redistributes the subnet with the router as next hop, it is counted
+  kernel-delivered within seconds of the router being addressed on it,
+  not unresolvable ([kernel-delivered
+  routes](#kernel-delivered-routes-the-routers-own-never-unresolvable)),
+  and like every kernel-delivered prefix it needs its `steer-exempt`
+  before a first steer.
 - The FDB learns from frames the KERNEL sees. Steered frames go to the
   VF, so a host whose every frame is steered would eventually age out —
   in practice ARP, IPv6 and control traffic keep it fresh. The
@@ -3467,7 +3490,7 @@ reason is the mapping's own decision:
 | `VLAN N on P, which is not a VPP port` / `VLAN N is not declared on port P` | a VLAN device over a non-member, or a vid missing from `port … vlans` | the `port` line |
 | `bridge neighbour …` | the FDB has not placed it behind a member, or it is behind a non-member or a tagged VLAN with no BVI | see [bridge neighbours](#bridge-neighbours-placed-per-neighbour-from-the-fdb) |
 | `… and IPv6 has no steer-exempt, so diverted traffic for it would be dropped in VPP …` | a v6 route via the router outside its subnets and addresses; never left to the kernel (shape 3 is v4 only) | the feed, a `steer-keep6`, or dropping `v6-divert` |
-| `the router's own address, which VPP has no adjacency for; …` | every next hop is the router, and none of the kernel-delivered shapes held. The rest of the reason says how the kernel answered for exactly that prefix: `sends this prefix out <dev>, which VPP can reach` (a transit route under `next-hop-self`: the feed is wrong), `drops it (blackhole, unreachable or prohibit)` (an aggregate the router originates; VPP would send its traffic down a less-specific route, so it is not left to the kernel), `has no route of its own for exactly this prefix`, `could not be read`, or `was not asked` (the per-walk lookup budget was spent) | `ip route get <prefix-address> fibmatch` shows the same entry the module read |
+| `the router's own address, which VPP has no adjacency for; …` | every next hop is the router, and none of the kernel-delivered shapes held. The rest of the reason says how the kernel answered for exactly that prefix: `sends this prefix out <dev>, which VPP can reach` (a transit route under `next-hop-self`: the feed is wrong; or a subnet the router was addressed on in the last few seconds, which clears by itself, see [kernel-delivered routes](#kernel-delivered-routes-the-routers-own-never-unresolvable)), `drops it (blackhole, unreachable or prohibit)` (an aggregate the router originates; VPP would send its traffic down a less-specific route, so it is not left to the kernel), `has no route of its own for exactly this prefix`, `could not be read`, or `was not asked` (the per-walk lookup budget was spent). A trailing `the router's addresses could not be re-read (<error>)` means the 2-second address read is failing, so a subnet addressed since the last good read is not known yet | `ip route get <prefix-address> fibmatch` shows the same entry the module read; `ip -br addr` shows whether the router holds an address in the prefix |
 | `reachable now; …` | the neighbour arrived after the route was classified | nothing: it is re-programmed with the neighbour |
 
 `packetframe fib dump-v4 --unresolved` is **not** the place to look for

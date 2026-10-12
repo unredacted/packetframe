@@ -290,6 +290,71 @@ pub trait Topology {
     fn fib_match(&self, _prefix: packetframe_common::fib::IpPrefix) -> Result<FibMatch, String> {
         Err("no kernel FIB to consult".into())
     }
+    /// The router's own addresses as the kernel holds them now, so the
+    /// engine's kernel-delivered classification follows an address added
+    /// or removed while the daemon runs
+    /// ([`crate::engine::ConvergenceEngine::refresh_self_networks`]).
+    /// `None` from a topology that does not read the kernel's addresses,
+    /// which leaves the sets the engine was built with in force. `Err`
+    /// when the latest read failed, on the same terms as [`Self::fdb`].
+    fn self_networks(&self) -> Option<Result<SelfNetworks, String>> {
+        None
+    }
+}
+
+/// The router's own addresses, both families, each with its prefix
+/// length: the address as the kernel holds it, not its network. Sorted
+/// and deduplicated, so two reads of the same table compare equal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelfNetworks {
+    pub v4: Vec<packetframe_common::config::Ipv4Prefix>,
+    pub v6: Vec<(std::net::Ipv6Addr, u8)>,
+}
+
+impl SelfNetworks {
+    pub fn new(
+        v4: impl IntoIterator<Item = packetframe_common::config::Ipv4Prefix>,
+        v6: impl IntoIterator<Item = (std::net::Ipv6Addr, u8)>,
+    ) -> Self {
+        let mut v4: Vec<_> = v4.into_iter().collect();
+        v4.sort_unstable_by_key(|p| (u32::from(p.addr), p.prefix_len));
+        v4.dedup();
+        let mut v6: Vec<_> = v6.into_iter().collect();
+        v6.sort_unstable();
+        v6.dedup();
+        Self { v4, v6 }
+    }
+
+    /// Every address either read holds.
+    #[cfg(any(target_os = "linux", test))]
+    fn union(&self, other: &Self) -> Self {
+        Self::new(
+            self.v4.iter().chain(&other.v4).copied(),
+            self.v6.iter().chain(&other.v6).copied(),
+        )
+    }
+}
+
+/// What the refresh publishes after a read: the read joined with the last
+/// good one before it, so an address leaves only once two reads in a row
+/// lack it. A dump taken while addresses churn can skip a live entry, and
+/// one skipped address would otherwise send its connected routes back to
+/// unresolvable until the next read (the rule neigh-snoop applies to its
+/// neighbour rows since #332). A new address is published at once: a dump
+/// cannot invent one. A failed read publishes the failure and leaves
+/// `last_good` alone.
+#[cfg(any(target_os = "linux", test))]
+fn publish_self_networks(
+    read: Result<SelfNetworks, String>,
+    last_good: &mut Option<SelfNetworks>,
+) -> Result<SelfNetworks, String> {
+    let read = read?;
+    let published = match last_good.as_ref() {
+        Some(before) => read.union(before),
+        None => read.clone(),
+    };
+    *last_good = Some(read);
+    Ok(published)
 }
 
 /// What the kernel's FIB holds for one prefix, reduced to what the
@@ -336,48 +401,77 @@ impl Topology for NoTopology {
 }
 
 /// The live kernel. Classification reads `/proc/net/vlan/config` and the
-/// bridge sysfs per call (a few small files); the FDB comes from a
-/// background thread dumping it every [`FDB_REFRESH`], so the engine
-/// never waits on AF_BRIDGE netlink.
+/// bridge sysfs per call (a few small files); the FDB, the port VLANs and
+/// the router's own addresses come from a background thread reading them
+/// every [`FDB_REFRESH`], so the engine never waits on netlink for them.
 #[cfg(target_os = "linux")]
 pub struct KernelTopology {
     fdb: std::sync::Arc<std::sync::Mutex<Result<FdbSnapshot, String>>>,
     vlans: std::sync::Arc<std::sync::Mutex<Result<PortVlans, String>>>,
+    addrs: std::sync::Arc<std::sync::Mutex<Result<SelfNetworks, String>>>,
 }
 
-/// How often the background thread re-dumps the FDB.
+/// How often the background thread re-reads the FDB, the port VLANs and
+/// the router's own addresses.
 #[cfg(target_os = "linux")]
 pub const FDB_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(target_os = "linux")]
 impl KernelTopology {
-    /// Read the FDB and port VLANs once, here — at bring-up, before
-    /// supervision starts, so the first resync places neighbours from a
-    /// real table — then keep both fresh on a thread that ends when this
-    /// is dropped.
+    /// Read the FDB, port VLANs and the router's own addresses once,
+    /// here — at bring-up, before supervision starts, so the first resync
+    /// places neighbours from a real table — then keep all three fresh on
+    /// a thread that ends when this is dropped.
+    ///
+    /// The addresses are polled with the rest rather than followed through
+    /// an RTM_NEWADDR subscription: a full read every [`FDB_REFRESH`] is a
+    /// few dozen entries, and a poll has no notifications to lose, so no
+    /// overrun to recover from.
     pub fn start() -> Self {
         let fdb = std::sync::Arc::new(std::sync::Mutex::new(Self::read_fdb()));
         let vlans = std::sync::Arc::new(std::sync::Mutex::new(Self::read_vlans()));
-        let (wf, wv) = (
+        let mut last_addrs = None;
+        let addrs = std::sync::Arc::new(std::sync::Mutex::new(publish_self_networks(
+            Self::read_addrs(),
+            &mut last_addrs,
+        )));
+        let (wf, wv, wa) = (
             std::sync::Arc::downgrade(&fdb),
             std::sync::Arc::downgrade(&vlans),
+            std::sync::Arc::downgrade(&addrs),
         );
         let spawned = std::thread::Builder::new()
             .name("pf-vpp-fdb".into())
             .spawn(move || loop {
                 std::thread::sleep(FDB_REFRESH);
-                let (Some(fdb), Some(vlans)) = (wf.upgrade(), wv.upgrade()) else {
+                let (Some(fdb), Some(vlans), Some(addrs)) =
+                    (wf.upgrade(), wv.upgrade(), wa.upgrade())
+                else {
                     return;
                 };
                 let read = Self::read_fdb();
                 *fdb.lock().unwrap_or_else(|e| e.into_inner()) = read;
                 let read = Self::read_vlans();
                 *vlans.lock().unwrap_or_else(|e| e.into_inner()) = read;
+                let read = publish_self_networks(Self::read_addrs(), &mut last_addrs);
+                *addrs.lock().unwrap_or_else(|e| e.into_inner()) = read;
             });
         if let Err(e) = spawned {
-            tracing::warn!(error = %e, "bridge FDB refresh thread would not start; placement uses the bring-up read");
+            tracing::warn!(
+                error = %e,
+                "bridge FDB refresh thread would not start; placement and the router's own \
+                 addresses use the bring-up read"
+            );
         }
-        Self { fdb, vlans }
+        Self { fdb, vlans, addrs }
+    }
+
+    fn read_addrs() -> Result<SelfNetworks, String> {
+        let read = crate::bringup::kernel_ifaddrs()?;
+        Ok(SelfNetworks::new(
+            read.v4.into_iter().map(|(_, p)| p),
+            read.v6.into_iter().map(|(_, a, len)| (a, len)),
+        ))
     }
 
     fn read_vlans() -> Result<PortVlans, String> {
@@ -504,6 +598,10 @@ impl Topology for KernelTopology {
 
     fn fib_match(&self, prefix: packetframe_common::fib::IpPrefix) -> Result<FibMatch, String> {
         kernel_fib_match(prefix)
+    }
+
+    fn self_networks(&self) -> Option<Result<SelfNetworks, String>> {
+        Some(self.addrs.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 }
 
@@ -754,5 +852,48 @@ fe800000000000000000000000000002 0c 40 20 80 br3998
         let got = parse_if_inet6_global(text);
         assert!(got.contains("br3998"), "{got:?}");
         assert!(!got.contains("switch0.3998"), "link-local only: {got:?}");
+    }
+
+    /// A new address is published at the read that first holds it; one
+    /// that goes stays until a second read in a row lacks it, since a dump
+    /// taken during churn can skip a live entry. A failed read publishes
+    /// the failure and does not count as a read that lacked anything.
+    #[test]
+    fn an_address_leaves_only_once_two_reads_in_a_row_lack_it() {
+        let a = |last: u8, len: u8| packetframe_common::config::Ipv4Prefix {
+            addr: std::net::Ipv4Addr::new(192, 0, 2, last),
+            prefix_len: len,
+        };
+        let v6: (std::net::Ipv6Addr, u8) = ("2001:db8::1".parse().unwrap(), 64);
+        // A read, or what is published: the same shape.
+        let read = |v4: &[packetframe_common::config::Ipv4Prefix]| {
+            Ok(SelfNetworks::new(v4.iter().copied(), [v6]))
+        };
+        let want = read;
+        let mut last = None;
+        assert_eq!(
+            publish_self_networks(read(&[a(1, 30)]), &mut last),
+            want(&[a(1, 30)])
+        );
+        // Added: at once.
+        assert_eq!(
+            publish_self_networks(read(&[a(1, 30), a(129, 25)]), &mut last),
+            want(&[a(1, 30), a(129, 25)])
+        );
+        // Missing from one read: kept.
+        assert_eq!(
+            publish_self_networks(read(&[a(1, 30)]), &mut last),
+            want(&[a(1, 30), a(129, 25)])
+        );
+        // A failed read in between says so, and changes nothing after it.
+        assert_eq!(
+            publish_self_networks(Err("netlink recv: timed out".into()), &mut last),
+            Err("netlink recv: timed out".to_string())
+        );
+        // The second read in a row without it: gone.
+        assert_eq!(
+            publish_self_networks(read(&[a(1, 30)]), &mut last),
+            want(&[a(1, 30)])
+        );
     }
 }
