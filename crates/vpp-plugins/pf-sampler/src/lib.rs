@@ -583,7 +583,7 @@ const VERSION_REQUIRED: &str = match option_env!("PF_SAMPLER_VERSION_REQUIRED") 
 };
 
 vlib_plugin_register! {
-    version: "0.5.0",
+    version: "0.6.0",
     description: "PacketFrame sampler",
     version_required: VERSION_REQUIRED,
 }

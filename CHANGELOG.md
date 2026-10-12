@@ -16,16 +16,32 @@ notes are on the [releases page](https://github.com/unredacted/packetframe/relea
 Versions 0.2.8, 0.2.9 and 0.2.10, which some code comments cite, never
 shipped; that work is part of 0.5.0.
 
-## [0.6.0] - UNRELEASED
+## [0.6.0] - 2026-10-12
+
+The first release since 0.5.0 (2026-09-28). It adds the flow-export module (experimental) and fast-path's `wan-egress`, brings a restart on a full table down from minutes to seconds, and hardens vpp-offload, neigh-snoop and the route feed against the failures a production incident on 2026-10-07 exposed. A 0.5.0 config parses unchanged, but read **Upgrading from 0.5.0** before installing: an `attach` of keepalived's dedicated VRRP link is now refused, and the state directory's ownership rules are stricter.
 
 ### Upgrading from 0.5.0
+
+1. Install the 0.6.0 package or tarball. The running daemon is unaffected: the .deb runs no maintainer scripts.
+2. `systemctl daemon-reload`.
+3. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with **0.6.0**'s `detach` (plain `packetframe detach` without vpp-offload). It removes fast-path's pins, whose maps changed (see the sampler below), so no `detach --all` is needed, and VPP stays up and steered throughout, its FIB adopted from the route ledger 0.5.0's stop preserved.
+
+The first start after 0.5.0 loads the route mirror from the route source, because 0.5.0 writes no fast-path route ledger. On a full table that waits for the BGP replay (about 2.5 minutes for 1.35M routes on the reference deployment), with steering up throughout. Every restart after that seeds the mirror from the ledger.
 
 - **`forwarding-mode custom-fib` is now `forwarding-mode packetframe-fib`.** The old name still parses and logs a deprecation warning naming the line; it will be removed in a later release. Update your config at your next edit.
 - **Renamed metrics.** The counters `custom_fib_hit`, `custom_fib_miss` and `custom_fib_no_neigh` are now `fib_hit`, `fib_miss` and `fib_no_neigh`, so the textfile exports `packetframe_fib_hit_total` and so on. The mode label reads `packetframe_fib_forwarding_mode{mode="packetframe-fib"}`. Counter indices are unchanged. Update any alert or dashboard that matches the old names.
 - **vpp-offload refuses a state file another account could have written.** Attach, `packetframe detach --all` and `detach --keep-vpp` now refuse `<state-dir>/vpp-offload.json` unless it and `state-dir` are owned by root and closed to group and others, every directory above is root-owned and closed or sticky, and no part of the path is a symlink. The packaged default (`/var/lib/packetframe/state`) passes, and so does any `state-dir` where `packetframe reconfigure` works today: the pid file's reader already applies the same directory rules. Check any other before upgrading: [the check and the fix](docs/runbooks/vpp-offload.md#attach-or-detach-refuses-refusing-vpp-offloadjson-).
 - **fast-path and guard refuse a tc filter record another account could have written.** `packetframe detach` and `detach --all` now refuse `<state-dir>/tc-links.json` and `guard-tc-links.json` on the same ownership, mode and symlink rules as `vpp-offload.json` above, and guard's start refuses the same way when it checks for a leftover record. The packaged default passes. A refusal names the check that failed; remove the filters by hand (`tc filter del dev <iface> ingress` for fast-path, `egress` for guard), then the file.
-- **vpp-offload keep rules now use RSS.** The first steer after the upgrade rewrites a steered port's keeps in place; nothing to do. Before **downgrading** below 0.6.0, run this release's `packetframe detach --all`: an older daemon cannot recognise an RSS keep as its own, so its teardown would leave the keeps in the NIC.
+- **vpp-offload keep rules now use RSS.** The first steer after the upgrade rewrites a steered port's keeps in place; nothing to do. Before **downgrading** below 0.6.0, run this release's `packetframe detach --all`: an older daemon cannot recognise an RSS keep as its own, so its teardown would leave the keeps in the NIC. A keep-VPP downgrade (`systemctl stop`, this release's `detach --keep-vpp`, install the old package, `systemctl start`) keeps steering up instead, but leaves this release's RSS keeps beside the old daemon's queue-0 ones as unowned duplicates. They match the same traffic, so nothing changes for it, but they hold MCAM slots until a reboot or `ethtool -N <iface> delete <loc>` for each rule `ethtool -n <iface>` shows with an `RSS Context ID`.
 - **fast-path refuses to attach keepalived's dedicated VRRP link.** A config that `attach`es it no longer starts; the error names the line to remove. Routers without keepalived are unaffected. See the change below.
+
+### Highlights
+
+- **Flow export (experimental).** The new `flow-export` module sends sampled packets as sFlow v5 or IPFIX, with privacy profiles and origin AS numbers for IPFIX, to collectors such as Akvorado and FastNetMon. Samples come from the XDP and tc programs, from VPP's sampler plugin on steered ports, and from a kernel tc sampler on interfaces neither sees. Off until configured. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/flow-export.md)
+- **Restarts in seconds.** A clean stop saves the route mirror, and the next start seeds it before the route source connects. An adopted VPP, steered or not, then diffs against it once the completeness authority attests it, rather than after the BGP replay. Measured on the reference deployment (1.35M routes, four steered ports): 50 s from start to VPP verified and steering re-asserted, with no BGP session reset and no conntrack flush. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/vpp-offload.md#the-steered-diff-and-a-seeded-mirror)
+- **Exempt traffic spread over RSS.** vpp-offload's keep rules sent every exempt frame to queue 0, whose IRQ sits on CPU 0; on 2026-10-07 that held one core at 99% softirq while the others idled. Keeps are now RSS rules, with queue 0's IRQ placed when a driver will not take them, and a `kernel-path` status row. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/vpp-offload.md#rss-keeps-and-the-queue-0-fallback)
+- **`wan-egress`** sends private sources past a full-table `main` to the platform's own WAN policy and NAT. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/packetframe-fib.md#wan-egress)
+- **Recovering in place.** Lost netlink notifications are re-read instead of silently missed, the neighbour resolver is supervised and restarted, the BGP feed's keepalives no longer wait on route processing, and vpp-offload follows the router's own addresses while it runs.
 
 ### Changes
 
@@ -137,6 +153,30 @@ shipped; that work is part of 0.5.0.
 
   See [the first-steer hold](docs/runbooks/vpp-offload.md#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table).
 
+### Known limitations
+
+- flow-export is experimental. A `kind ddos` collector takes sFlow only, and attack-detection timing against FastNetMon has not been qualified.
+- IPv6 is steered by frame, not address: only TCP/UDP arriving on a VLAN listed in `v6-divert` is offloaded, so list every upstream VLAN. The allowlist does not scope what is diverted, and diverted IPv6 bypasses the kernel's forward-path netfilter. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/vpp-offload.md#v6-divert-steering))
+- VPP's own glean output (the ARP requests and neighbour solicitations it sends) bypasses guard, which polices kernel tc egress.
+- Native XDP is refused on rvu-nicpf interfaces on kernels without upstream commit 04f647c8e456 (Linux 6.8), including the reference vendor kernel, where native attach panics. Use `generic` or `auto`.
+- The .deb runs no maintainer scripts: run `systemctl daemon-reload` after every install.
+
+### Install and verify
+
+When upgrading, follow steps 1 to 3 above.
+
+```sh
+ARCH=$(dpkg --print-architecture)   # amd64 or arm64
+curl -LO "https://github.com/unredacted/packetframe/releases/download/v0.6.0/packetframe_0.6.0_${ARCH}.deb"
+curl -LO https://github.com/unredacted/packetframe/releases/download/v0.6.0/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+dpkg -i "packetframe_0.6.0_${ARCH}.deb" && systemctl daemon-reload
+```
+
+Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the `aarch64-unknown-linux-gnu` tarball and the arm64 .deb also carry the VPP sampler plugin.
+
+**Full changelog:** https://github.com/unredacted/packetframe/compare/v0.5.0...v0.6.0
+
 ## [0.5.0] - 2026-09-28
 
 The first release since 0.2.7 (2026-05-20). It adds three modules (vpp-offload, neigh-snoop, and guard, which is experimental) and a persistent event log. No directive was removed and a 0.2.7 config parses unchanged, but read **Upgrading from 0.2.7** before installing: the upgrade order matters, and one default changed.
@@ -246,4 +286,5 @@ Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below.
 
 **Full changelog:** https://github.com/unredacted/packetframe/compare/v0.2.7...v0.5.0
 
+[0.6.0]: https://github.com/unredacted/packetframe/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/unredacted/packetframe/compare/v0.2.7...v0.5.0
