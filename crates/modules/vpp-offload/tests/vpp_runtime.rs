@@ -6128,3 +6128,1523 @@ fn queued_neighbour_changes_hold_the_lever_and_not_the_re_run() {
     );
     assert!(log.lock().unwrap().is_empty());
 }
+
+/// A STEERED keep-vpp restart over a mirror the fast-path seeded from its
+/// route ledger, with VPP's preserved ledger accepted: VPP carries the
+/// traffic the whole time, and the diff lands on it.
+mod steered_seeded {
+    use super::preserved::{record, CaptureStore};
+    use super::steered::{Log, RecordingSteering};
+    use super::*;
+    use packetframe_common::fib::{
+        AuthorityObservation, CompletenessReport, FeedSession, TableCompleteness,
+    };
+    use packetframe_vpp_offload::ledger_record::LedgerBody;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// The second next hop, for a route the mirror holds through another
+    /// path than VPP does.
+    pub fn other_nh() -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2))
+    }
+
+    /// The IPv6 next hop, behind the same port.
+    pub fn nh6() -> IpAddr {
+        IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 1,
+        ))
+    }
+
+    /// `n` IPv6 /64s from the documentation prefix, via [`nh6`].
+    pub fn table6(n: u16) -> Vec<(IpPrefix, IpAddr)> {
+        (0..n)
+            .map(|i| {
+                let [hi, lo] = i.to_be_bytes();
+                (
+                    IpPrefix::V6 {
+                        addr: [0x20, 0x01, 0x0d, 0xb8, 0, 1, hi, lo, 0, 0, 0, 0, 0, 0, 0, 0],
+                        prefix_len: 64,
+                    },
+                    nh6(),
+                )
+            })
+            .collect()
+    }
+
+    /// `n` host routes from TEST-NET-3, via the fake's next hop.
+    pub fn table(n: usize) -> Vec<(IpPrefix, IpAddr)> {
+        assert!(n <= 256, "one /24 of host routes");
+        (0..n)
+            .map(|i| {
+                (
+                    IpPrefix::V4 {
+                        addr: [203, 0, 113, i as u8],
+                        prefix_len: 32,
+                    },
+                    fake_vpp::nh(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn v4_of(p: IpPrefix) -> [u8; 4] {
+        match p {
+            IpPrefix::V4 { addr, .. } => addr,
+            IpPrefix::V6 { .. } => unreachable!("a v4 table"),
+        }
+    }
+
+    /// A mirror whose routes carry their own next hop, both next hops
+    /// resolved behind the one port. Counting it never walks it, so a
+    /// test can tell the resync's walks (`walks`) from everything else.
+    /// `flap_on_walk` drops and reconnects `session` the first time the
+    /// mirror is walked after it is set: the session flapping while the
+    /// early door walks. With `neighbours` cleared the feed holds no
+    /// neighbour at all: the resolver has not re-announced them; and only
+    /// the first `neighbours_for` reads of them see any (a next hop lost
+    /// after the walk read its neighbours). `replace_at_walk` becomes the
+    /// table as a resync begins its walk — when it discards the source's
+    /// queued deltas, after the door's legs were read: the route source
+    /// changing the mirror under a door that has already opened.
+    /// `learn_later` is a neighbour the source learned after the walk read
+    /// its neighbours: queued as a neighbour delta (which no walk
+    /// supersedes), and part of the neighbour table once handed over.
+    pub struct Mirror {
+        pub routes: Mutex<Vec<(IpPrefix, IpAddr)>>,
+        pub walks: AtomicUsize,
+        pub flap_on_walk: AtomicBool,
+        pub neighbours: AtomicBool,
+        pub neighbour_reads: AtomicUsize,
+        pub neighbours_for: AtomicUsize,
+        pub replace_at_walk: Mutex<Option<Vec<(IpPrefix, IpAddr)>>>,
+        pub learn_later: Mutex<Option<(IpAddr, [u8; 6])>>,
+        pub learned: Mutex<Vec<(IpAddr, [u8; 6])>>,
+        pub session: Arc<FeedSession>,
+    }
+    impl Mirror {
+        pub fn new(routes: Vec<(IpPrefix, IpAddr)>, session: Arc<FeedSession>) -> Arc<Self> {
+            Arc::new(Self {
+                routes: Mutex::new(routes),
+                walks: AtomicUsize::new(0),
+                flap_on_walk: AtomicBool::new(false),
+                neighbours: AtomicBool::new(true),
+                neighbour_reads: AtomicUsize::new(0),
+                neighbours_for: AtomicUsize::new(usize::MAX),
+                replace_at_walk: Mutex::new(None),
+                learn_later: Mutex::new(None),
+                learned: Mutex::new(Vec::new()),
+                session,
+            })
+        }
+    }
+
+    /// The runtime's handle on a [`Mirror`] the test keeps too.
+    pub struct Shared(pub Arc<Mirror>);
+    impl RouteSource for Shared {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("this source hands nothing over, so nothing can come back")
+        }
+        fn route_count(&self) -> u64 {
+            self.0.routes.lock().unwrap().len() as u64
+        }
+        fn change_seq(&self) -> u64 {
+            self.route_count()
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            let m = &self.0;
+            m.walks.fetch_add(1, Ordering::SeqCst);
+            if m.flap_on_walk.swap(false, Ordering::SeqCst) {
+                m.session.set_up(false);
+                m.session.set_up(true);
+            }
+            for (p, via) in m.routes.lock().unwrap().iter() {
+                visit(*p, &[*via]);
+            }
+        }
+        fn discard_route_deltas(&self) {
+            if let Some(table) = self.0.replace_at_walk.lock().unwrap().take() {
+                *self.0.routes.lock().unwrap() = table;
+            }
+        }
+        fn drain_changes(&self, _max: usize) -> packetframe_vpp_offload::engine::SourceChanges {
+            let mut changes = packetframe_vpp_offload::engine::SourceChanges::default();
+            if let Some((nh, mac)) = self.0.learn_later.lock().unwrap().take() {
+                self.0.learned.lock().unwrap().push((nh, mac));
+                changes.neighbours.push((nh, Some(("eth4".into(), mac))));
+            }
+            changes
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            let read = self.0.neighbour_reads.fetch_add(1, Ordering::SeqCst);
+            if !self.0.neighbours.load(Ordering::SeqCst)
+                || read >= self.0.neighbours_for.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            visit(fake_vpp::nh(), "eth4", MAC);
+            visit(other_nh(), "eth4", [0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+            visit(nh6(), "eth4", [0x02, 0x00, 0x00, 0x00, 0x00, 0x06]);
+            for (nh, mac) in self.0.learned.lock().unwrap().iter() {
+                visit(*nh, "eth4", *mac);
+            }
+        }
+    }
+
+    /// A runtime whose route capacity holds the largest table here whole.
+    pub fn runtime_on(
+        fake: &Fake,
+        families: FamilyPolicy,
+        source: Box<dyn RouteSource>,
+        steering: Box<dyn packetframe_vpp_offload::runtime::Steering>,
+        store: Box<dyn packetframe_vpp_offload::runtime::IdentityStore>,
+    ) -> Runtime {
+        runtime_capped(fake, families, 4096, source, steering, store)
+    }
+
+    /// [`runtime_on`], with each family's high-water mark at `capacity`.
+    pub fn runtime_capped(
+        fake: &Fake,
+        families: FamilyPolicy,
+        capacity: u64,
+        source: Box<dyn RouteSource>,
+        steering: Box<dyn packetframe_vpp_offload::runtime::Steering>,
+        store: Box<dyn packetframe_vpp_offload::runtime::IdentityStore>,
+    ) -> Runtime {
+        let engine = ConvergenceEngine::new(
+            &fake.path,
+            vec![PortAttach {
+                port: "eth4".into(),
+                pci_addr: "0002:07:00.1".into(),
+                port_id: 0,
+                num_rx_queues: 1,
+                pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                accept_macs: vec![],
+                mtu: None,
+                vlans: vec![],
+            }],
+            vec!["eth4".into()],
+            capacity,
+            families,
+            packetframe_common::config::Ipv4Prefix {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                prefix_len: 32,
+            },
+        );
+        Runtime::new(
+            engine,
+            source,
+            steering,
+            store,
+            Box::new(NoResources),
+            "/usr/bin/vpp",
+            "/tmp/startup.conf",
+        )
+    }
+
+    pub fn handshake(rt: &Runtime) {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+
+    /// Daemon A: converge `routes` onto the fake from nothing and stop the
+    /// preserving way. Returns VPP's ledger as it left it.
+    pub fn daemon_a(
+        fake: &Fake,
+        families: FamilyPolicy,
+        routes: Vec<(IpPrefix, IpAddr)>,
+    ) -> LedgerBody {
+        let captured = Arc::new(Mutex::new(None));
+        {
+            let mirror = Mirror::new(routes, Arc::new(FeedSession::new()));
+            let rt = runtime_on(
+                fake,
+                families,
+                Box::new(Shared(mirror)),
+                Box::new(SteeringUnavailable),
+                Box::new(CaptureStore(captured.clone())),
+            );
+            handshake(&rt);
+            let mut d = Driver::new();
+            let t0 = Instant::now();
+            {
+                let (_, mut fx) = rt.views();
+                d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+            }
+            run_until(&mut d, &rt, t0, |d| d.state() == State::Ready);
+            rt.preserve(d.state())
+                .expect("a converged ledger preserves");
+        }
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the ledger was left");
+        let _ = fake.drain_events();
+        body
+    }
+
+    /// What the restart under test has of the seeded door's legs.
+    #[derive(Clone, Copy)]
+    pub struct Legs {
+        /// The fast-path seeded the mirror from its route ledger.
+        pub seeded: bool,
+        /// `require-table-complete on`.
+        pub authority: bool,
+        /// The route source has connected (and, with an authority, its
+        /// first agreeing report is in).
+        pub live: bool,
+    }
+
+    pub const ALL: Legs = Legs {
+        seeded: true,
+        authority: true,
+        live: true,
+    };
+
+    pub struct Fixture {
+        pub fake: Fake,
+        pub rt: Runtime,
+        pub log: Log,
+        pub mirror: Arc<Mirror>,
+        pub session: Arc<FeedSession>,
+        pub authority: Option<Arc<TableCompleteness>>,
+    }
+
+    impl Fixture {
+        /// The authority agrees with the mirror as it is now — what the
+        /// fast-path publishes once the route source's first route has
+        /// reached a seeded mirror.
+        pub fn agree(&self) {
+            let n = self.mirror.routes.lock().unwrap().len() as u64;
+            self.authority
+                .as_ref()
+                .expect("an authority is configured")
+                .record(AuthorityObservation::Clean(CompletenessReport {
+                    authority_routes: n,
+                    mirror_routes: n,
+                    at: Instant::now(),
+                }));
+        }
+    }
+
+    /// Daemon A converges `vpp` and preserves VPP's ledger; daemon B adopts
+    /// the still-steered VPP with that ledger accepted, over a mirror
+    /// holding `mirror`. Adopted, so the seeded diff is deferred.
+    pub fn adopted(
+        name: &str,
+        vpp: Vec<(IpPrefix, IpAddr)>,
+        mirror: Vec<(IpPrefix, IpAddr)>,
+        legs: Legs,
+        d: &mut Driver,
+    ) -> (Fixture, Instant) {
+        adopted_in(FamilyPolicy::V4Only, name, vpp, mirror, legs, d)
+    }
+
+    /// [`adopted`], with the families VPP carries chosen.
+    pub fn adopted_in(
+        families: FamilyPolicy,
+        name: &str,
+        vpp: Vec<(IpPrefix, IpAddr)>,
+        mirror: Vec<(IpPrefix, IpAddr)>,
+        legs: Legs,
+        d: &mut Driver,
+    ) -> (Fixture, Instant) {
+        adopted_capped(families, 4096, name, vpp, mirror, legs, d)
+    }
+
+    /// [`adopted_in`], with daemon B's high-water mark at `capacity`.
+    pub fn adopted_capped(
+        families: FamilyPolicy,
+        capacity: u64,
+        name: &str,
+        vpp: Vec<(IpPrefix, IpAddr)>,
+        mirror: Vec<(IpPrefix, IpAddr)>,
+        legs: Legs,
+        d: &mut Driver,
+    ) -> (Fixture, Instant) {
+        let fake = Fake::start_behaving(
+            name,
+            Behaviour {
+                track_routes: true,
+                ..Default::default()
+            },
+        );
+        let body = daemon_a(&fake, families, vpp);
+        let session = Arc::new(FeedSession::new());
+        // Before the route source can connect, as the fast-path does.
+        if legs.seeded {
+            session.mark_mirror_seeded();
+        }
+        let mirror = Mirror::new(mirror, session.clone());
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let rt = runtime_capped(
+            &fake,
+            families,
+            capacity,
+            Box::new(Shared(mirror.clone())),
+            Box::new(RecordingSteering {
+                rules: vec![("eth4".into(), 1)],
+                log: log.clone(),
+            }),
+            Box::new(NullStore),
+        );
+        rt.feed_session(session.clone());
+        let authority = legs.authority.then(|| {
+            let a = Arc::new(TableCompleteness::new());
+            rt.require_table_complete(a.clone());
+            a
+        });
+        rt.seed_ledger(record(body));
+        handshake(&rt);
+        let t0 = Instant::now();
+        {
+            let (_, mut fx) = rt.views();
+            d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+        }
+        rt.set_steered(true);
+        assert_eq!(d.state(), State::AdoptedResyncing);
+        assert!(
+            rt.status().preserved_fib,
+            "the preserved ledger was accepted"
+        );
+        assert!(
+            rt.status().resync_deferred.is_some(),
+            "and its diff deferred"
+        );
+        let f = Fixture {
+            fake,
+            rt,
+            log,
+            mirror,
+            session,
+            authority,
+        };
+        if legs.live {
+            f.session.set_up(true);
+            if f.authority.is_some() {
+                f.agree();
+            }
+        }
+        (f, t0)
+    }
+
+    /// Tick with the route source replaying its table — 200 elements a
+    /// tick, far above the quiet rate at any cadence, not one of them
+    /// moving the mirror — until `stop` or `ticks`.
+    pub fn replay(
+        d: &mut Driver,
+        f: &Fixture,
+        mut now: Instant,
+        ticks: usize,
+        stop: impl Fn(&Driver) -> bool,
+    ) -> (Instant, Vec<Event>) {
+        let (mut obs, mut fx) = f.rt.views();
+        let mut seen = Vec::new();
+        for _ in 0..ticks {
+            if stop(d) {
+                break;
+            }
+            f.session.pulse_n(200);
+            let t = d.tick(now, &mut obs, &mut fx);
+            seen.extend(t.events.clone());
+            for e in f.rt.take_pending() {
+                seen.extend(d.inject(now, e, &mut fx).events);
+            }
+            f.rt.set_steered(d.supervisor().is_steered());
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+        (now, seen)
+    }
+
+    /// The `fib-synced` row `packetframe status` would print now.
+    pub fn fib_row(d: &Driver, f: &Fixture, now: Instant) -> String {
+        let r = super::first_steer_hold::report(d, &f.rt, now);
+        super::first_steer_hold::row(&r, packetframe_vpp_offload::status::SUBSYS_FIB).1
+    }
+}
+
+/// The restart this exists for: a steered keep-vpp restart whose two
+/// ledgers — the fast-path's mirror and VPP's FIB, written by one clean
+/// stop — agree, and a route source replaying the whole table, every
+/// element identical to the seed. The diff runs, verify passes and the
+/// re-assert steer lands WHILE the replay streams: no unsteer, no dump,
+/// and nothing sent to VPP, because the two snapshots agree.
+#[test]
+fn a_steered_seeded_restart_verifies_and_re_steers_while_the_replay_streams() {
+    use steered_seeded::*;
+    let mut d = Driver::new();
+    let (f, t0) = adopted("ss-early", table(6), table(6), ALL, &mut d);
+    let (_, seen) = replay(&mut d, &f, t0, 400, |d| d.state() == State::Steered);
+    assert_eq!(
+        d.state(),
+        State::Steered,
+        "verify and the re-assert must not wait for the replay to go quiet: {seen:?}"
+    );
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+    assert!(!seen.contains(&Event::PreservedLedgerRejected), "{seen:?}");
+    assert_eq!(
+        f.log.lock().unwrap().as_slice(),
+        &["steer"],
+        "steering never came down — the one transition is the post-verify re-assert"
+    );
+    let events = f.fake.drain_events();
+    assert_eq!(preserved::dumps(&events), 0, "VPP's FIB was never read");
+    assert!(
+        preserved::route_ops(&events).is_empty(),
+        "one stop's two snapshots agree, so the diff sends VPP nothing"
+    );
+    assert!(f.rt.status().resync_deferred.is_none());
+    assert!(f.rt.status().seeded_door_refused.is_none());
+}
+
+/// The production feed, over a steered VPP: a seeded release sends VPP
+/// nothing it already holds, and — the point of not waiting — a route the
+/// route source changes AFTER the release reaches VPP as an ordinary
+/// update while the replay is still streaming, where the quiet gate froze
+/// VPP's FIB for the replay's whole length. The seed is the stop's table
+/// exactly: on six routes, 1% is none, so any difference at the walk
+/// would shut the early door.
+#[test]
+fn a_steered_seeded_release_lets_changes_reach_vpp_during_the_replay() {
+    use packetframe_common::fib::ResolvedRouteSink as _;
+    use packetframe_common::fib::{AuthorityObservation, CompletenessReport, TableCompleteness};
+    use packetframe_vpp_offload::feed::RouteFeed;
+    use std::sync::{Arc, Mutex};
+
+    let (ifindex, dev) = local_interface();
+    let fake = Fake::start_behaving(
+        "ss-feed",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let table = seeded_mirror::seed();
+    let body = seeded_mirror::daemon_a_on(&fake, &dev, table.clone());
+
+    // The fast-path seed lands in the production feed before vpp-offload
+    // adopts: the stop's table.
+    let feed = Arc::new(RouteFeed::new());
+    feed.neighbour_resolved(fake_vpp::nh(), MAC, ifindex);
+    for p in table.iter().copied() {
+        feed.route_resolved(p, &[fake_vpp::nh()]);
+    }
+
+    let log: steered::Log = Arc::new(Mutex::new(Vec::new()));
+    let rt = seeded_mirror::runtime_on(
+        &fake,
+        &dev,
+        Box::new(feed.clone()),
+        Box::new(steered::RecordingSteering {
+            rules: vec![("eth4".into(), 1)],
+            log: log.clone(),
+        }),
+        Box::new(NullStore),
+    );
+    let session = Arc::new(packetframe_common::fib::FeedSession::new());
+    session.mark_mirror_seeded();
+    rt.feed_session(session.clone());
+    let authority = Arc::new(TableCompleteness::new());
+    rt.require_table_complete(authority.clone());
+    rt.seed_ledger(preserved::record(body));
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+    session.set_up(true);
+    authority.record(AuthorityObservation::Clean(CompletenessReport {
+        authority_routes: 6,
+        mirror_routes: 6,
+        at: Instant::now(),
+    }));
+
+    let f = seeded_mirror::Fixture {
+        fake,
+        log,
+        rt,
+        session,
+        authority,
+    };
+    let (mut now, seen) =
+        seeded_mirror::replay(&mut d, &f, t0, 400, |d| d.state() == State::Steered);
+    assert_eq!(d.state(), State::Steered, "{seen:?}");
+    assert_eq!(f.log.lock().unwrap().as_slice(), &["steer"]);
+    let events = f.fake.drain_events();
+    assert_eq!(preserved::dumps(&events), 0, "VPP's FIB was never read");
+    assert!(
+        preserved::route_ops(&events).is_empty(),
+        "nothing VPP already held was sent again: {:?}",
+        preserved::route_ops(&events)
+    );
+    assert_eq!(feed.stats().pending, 0, "the seed's deltas were superseded");
+
+    // The replay is still streaming, and the route source changes a route
+    // and adds one.
+    let gone = table[0];
+    let late = IpPrefix::V4 {
+        addr: [198, 51, 100, 128],
+        prefix_len: 26,
+    };
+    feed.route_withdrawn(gone);
+    feed.route_resolved(late, &[fake_vpp::nh()]);
+    let mut ops = Vec::new();
+    {
+        let (mut obs, mut fx) = f.rt.views();
+        for _ in 0..64 {
+            f.session.pulse_n(200);
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in f.rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            ops.extend(preserved::route_ops(&f.fake.drain_events()));
+            if ops.len() >= 2 {
+                break;
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    ops.sort_unstable();
+    let IpPrefix::V4 { addr: gone, .. } = gone else {
+        unreachable!()
+    };
+    assert_eq!(
+        ops,
+        vec![(false, gone), (true, [198, 51, 100, 128])],
+        "changes after the release reach the steered VPP while the replay streams"
+    );
+    assert_eq!(d.state(), State::Steered);
+}
+
+/// Without every leg of the seeded door, a steered seeded diff waits for
+/// the replay to go quiet exactly as before, and then the quiet door
+/// releases it — steering up throughout, VPP untouched until then:
+/// - a mirror that was not seeded (it loads from empty, and only quiet
+///   says it has finished);
+/// - no completeness authority (nothing vouches for the seed);
+/// - an authority that does not agree with the mirror;
+/// - a route source that reconnected (the first session only);
+/// - a seed a route-source GC has already reconciled.
+#[test]
+fn a_steered_seeded_diff_without_every_leg_waits_for_the_replay_to_go_quiet() {
+    use packetframe_common::fib::{AuthorityObservation, CompletenessReport};
+    use steered_seeded::*;
+    /// A name, the legs the restart has, and what happens to them after
+    /// adoption.
+    type Case = (&'static str, Legs, fn(&Fixture));
+    let cases: [Case; 5] = [
+        (
+            "ss-unseeded",
+            Legs {
+                seeded: false,
+                ..ALL
+            },
+            |_| {},
+        ),
+        (
+            "ss-no-authority",
+            Legs {
+                authority: false,
+                ..ALL
+            },
+            |_| {},
+        ),
+        ("ss-disputed", ALL, |f| {
+            // The source holds twice what the mirror does.
+            f.authority
+                .as_ref()
+                .unwrap()
+                .record(AuthorityObservation::Clean(CompletenessReport {
+                    authority_routes: 12,
+                    mirror_routes: 6,
+                    at: Instant::now(),
+                }));
+        }),
+        ("ss-reconnected", ALL, |f| {
+            f.session.set_up(false);
+            f.session.set_up(true);
+            // Even a report taken since the reconnect.
+            f.agree();
+        }),
+        ("ss-reconciled", ALL, |f| {
+            f.session.mark_reconciled();
+        }),
+    ];
+    for (name, legs, then) in cases {
+        let mut d = Driver::new();
+        let (f, t0) = adopted(name, table(6), table(6), legs, &mut d);
+        then(&f);
+        let (now, seen) = replay(&mut d, &f, t0, 200, |_| false);
+        assert_eq!(d.state(), State::AdoptedResyncing, "{name}: {seen:?}");
+        assert!(
+            !seen.contains(&Event::SyncComplete) && !seen.contains(&Event::VerifyPassed),
+            "{name}: nothing may run while the stream is loud: {seen:?}"
+        );
+        assert!(f.rt.status().resync_deferred.is_some(), "{name}");
+        assert!(
+            f.log.lock().unwrap().is_empty(),
+            "{name}: and steering is untouched"
+        );
+        assert!(
+            preserved::route_ops(&f.fake.drain_events()).is_empty(),
+            "{name}: no route op reaches VPP"
+        );
+        assert_eq!(
+            f.mirror.walks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{name}: not even walked"
+        );
+
+        if name == "ss-disputed" {
+            // The dispute vetoes every door; once the authority agrees
+            // again, the quiet one releases it as ever.
+            f.agree();
+        }
+        let (_, seen) =
+            steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
+        assert!(seen.contains(&Event::VerifyPassed), "{name}: {seen:?}");
+        assert_eq!(f.log.lock().unwrap().as_slice(), &["steer"], "{name}");
+    }
+}
+
+/// The guard, at its edge. Two hundred routes VPP forwards on allow a
+/// diff that disturbs two of them (1%): one the route source withdrew
+/// that the stop caught still in VPP, mid-drain, and one it added that
+/// VPP had not been sent yet. That lands early, while the replay
+/// streams.
+#[test]
+fn a_steered_seeded_diff_within_the_allowance_lands_while_the_replay_streams() {
+    use steered_seeded::*;
+    let vpp = table(200);
+    let mut mirror: Vec<_> = vpp[1..].to_vec();
+    mirror.push((
+        IpPrefix::V4 {
+            addr: [198, 51, 100, 128],
+            prefix_len: 25,
+        },
+        fake_vpp::nh(),
+    ));
+    let mut d = Driver::new();
+    let (f, t0) = adopted("ss-within", vpp.clone(), mirror, ALL, &mut d);
+    let (_, seen) = replay(&mut d, &f, t0, 400, |d| d.state() == State::Steered);
+    assert_eq!(d.state(), State::Steered, "{seen:?}");
+    let mut want = vec![(false, v4_of(vpp[0].0)), (true, [198, 51, 100, 128])];
+    want.sort_unstable();
+    assert_eq!(preserved::route_ops(&f.fake.drain_events()), want);
+    assert_eq!(f.log.lock().unwrap().as_slice(), &["steer"]);
+}
+
+/// Past the edge the early door stays shut for the restart, for
+/// withdrawals, replaces or additions alike: the two ledgers disagree by
+/// more than churn, so nothing of the diff lands while the replay
+/// streams. Three additions count as much as three withdrawals: each is a
+/// route VPP did not forward on before, and an early one stays for the
+/// whole replay where the quiet door's would leave at the route source's
+/// GC. The status row says why; once the replay goes quiet, the quiet
+/// door releases the same diff as it always did.
+#[test]
+fn a_steered_seeded_diff_beyond_the_allowance_waits_for_the_replay_to_go_quiet() {
+    use packetframe_vpp_offload::runtime::IpFamily;
+    use steered_seeded::*;
+    let vpp = table(200);
+    let withdrawn: Vec<_> = vpp[3..].to_vec();
+    let repathed: Vec<_> = vpp
+        .iter()
+        .enumerate()
+        .map(|(i, (p, via))| (*p, if i < 3 { other_nh() } else { *via }))
+        .collect();
+    let added: Vec<_> = vpp
+        .iter()
+        .copied()
+        .chain((0..3).map(|i| {
+            (
+                IpPrefix::V4 {
+                    addr: [198, 51, 100, 128 + i],
+                    prefix_len: 32,
+                },
+                fake_vpp::nh(),
+            )
+        }))
+        .collect();
+    for (name, mirror, withdrawals, replaces, additions) in [
+        ("ss-beyond-withdrawn", withdrawn, 3, 0, 0),
+        ("ss-beyond-repathed", repathed, 0, 3, 0),
+        ("ss-beyond-added", added, 0, 0, 3),
+    ] {
+        let mut d = Driver::new();
+        let (f, t0) = adopted(name, vpp.clone(), mirror, ALL, &mut d);
+        let (now, seen) = replay(&mut d, &f, t0, 200, |_| false);
+        assert_eq!(d.state(), State::AdoptedResyncing, "{name}: {seen:?}");
+        assert!(!seen.contains(&Event::VerifyPassed), "{name}: {seen:?}");
+        assert!(
+            preserved::route_ops(&f.fake.drain_events()).is_empty(),
+            "{name}: nothing of the diff lands on the steered VPP"
+        );
+        assert!(f.log.lock().unwrap().is_empty(), "{name}");
+        let refused =
+            f.rt.status()
+                .seeded_door_refused
+                .unwrap_or_else(|| panic!("{name}: the refusal is reported"));
+        assert_eq!(
+            (
+                refused.family,
+                refused.adopted,
+                refused.withdrawals,
+                refused.replaces,
+                refused.additions,
+                refused.allowance
+            ),
+            (IpFamily::V4, 200, withdrawals, replaces, additions, 2),
+            "{name}"
+        );
+        assert_eq!(
+            f.mirror.walks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{name}: walked once, not every tick"
+        );
+        let row = fib_row(&d, &f, now);
+        assert!(
+            row.starts_with("resync deferred")
+                && row.contains("early door")
+                && row.contains("shut"),
+            "{name}: {row}"
+        );
+
+        let (_, seen) =
+            steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
+        assert!(seen.contains(&Event::VerifyPassed), "{name}: {seen:?}");
+        assert_eq!(f.log.lock().unwrap().as_slice(), &["steer"], "{name}");
+        assert_eq!(
+            preserved::route_ops(&f.fake.drain_events()).len(),
+            3,
+            "{name}: the quiet door lands the same diff"
+        );
+    }
+}
+
+/// The session flaps while the early door walks. The legs are read again
+/// when the walk is done, before anything of it is queued, so the diff
+/// does not land on the strength of a session that is no longer the one
+/// that was attested — and a moved leg is not the guard's refusal, so
+/// nothing is latched. The reconnect then shuts the door for good, and
+/// the diff waits for the replay to go quiet.
+#[test]
+fn a_session_that_flaps_during_the_walk_shuts_the_door() {
+    use std::sync::atomic::Ordering;
+    use steered_seeded::*;
+    let mut d = Driver::new();
+    let (f, t0) = adopted("ss-flap-walk", table(6), table(6), ALL, &mut d);
+    f.mirror.flap_on_walk.store(true, Ordering::SeqCst);
+    let (now, seen) = replay(&mut d, &f, t0, 200, |_| false);
+    assert!(
+        f.mirror.walks.load(Ordering::SeqCst) >= 1 && !f.mirror.flap_on_walk.load(Ordering::SeqCst),
+        "the door opened and walked"
+    );
+    assert_eq!(
+        f.session.liveness().epoch,
+        2,
+        "and the session reconnected under it"
+    );
+    assert_eq!(d.state(), State::AdoptedResyncing, "{seen:?}");
+    assert!(
+        f.rt.status().resync_deferred.is_some(),
+        "the diff did not run on legs that no longer held"
+    );
+    assert_eq!(f.rt.status().pending_ops, 0, "and nothing of it was queued");
+    assert!(f.rt.status().seeded_door_refused.is_none());
+    assert!(f.log.lock().unwrap().is_empty());
+
+    let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+}
+
+/// VPP's route counts moved while the restart waited for the route
+/// source (another client added a route), so at the early door the seed
+/// no longer describes VPP. The door's release carries over to the dump
+/// path as a quiet release always has: the unsteer goes out at once — the
+/// eBPF tier forwards on the very mirror the authority just counted
+/// complete — rather than leaving traffic on the misdescribed FIB for the
+/// replay's length. The dump reads the idle VPP, the diff withdraws the
+/// stranger, verify passes and steering returns, all while the replay
+/// streams.
+#[test]
+fn a_seed_that_no_longer_holds_at_the_early_door_unsteers_at_once() {
+    use steered_seeded::*;
+    let mut d = Driver::new();
+    let (f, t0) = adopted(
+        "ss-moved",
+        table(6),
+        table(6),
+        Legs { live: false, ..ALL },
+        &mut d,
+    );
+    // Held: the route source has not connected.
+    let (now, _) = replay(&mut d, &f, t0, 20, |_| false);
+    assert!(f.rt.status().resync_deferred.is_some());
+    f.fake.routes.lock().unwrap().insert(
+        ([198, 51, 100, 0], 24),
+        vec![fake_vpp::table_path([192, 0, 2, 1], ASSIGNED_INDEX, 1)],
+    );
+    let _ = f.fake.drain_events();
+    f.session.set_up(true);
+    f.agree();
+
+    let (_, seen) = replay(&mut d, &f, now, 400, |d| d.state() == State::Steered);
+    assert_eq!(d.state(), State::Steered, "{seen:?}");
+    assert_eq!(
+        f.log.lock().unwrap().as_slice(),
+        &["unsteer", "steer"],
+        "off VPP at once to read it, back on once the dump path verified"
+    );
+    let events = f.fake.drain_events();
+    assert_eq!(preserved::dumps(&events), 1, "VPP's FIB was read");
+    assert!(
+        preserved::route_ops(&events).contains(&(false, [198, 51, 100, 0])),
+        "the stranger the seed could not see is withdrawn: {:?}",
+        preserved::route_ops(&events)
+    );
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+}
+
+/// The walk resolves every route through the neighbours the feed holds at
+/// that moment. A next hop the fast-path's resolver has not re-announced
+/// yet when the door opens resolves to nothing, and the drain would take
+/// every route through it out of the steered VPP as unresolvable: the
+/// guard counts them as replaced and keeps the door shut. Once the
+/// neighbour is back, the quiet door's diff finds the table unchanged and
+/// sends VPP nothing.
+#[test]
+fn a_next_hop_not_yet_relearned_keeps_the_early_door_shut() {
+    use std::sync::atomic::Ordering;
+    use steered_seeded::*;
+    let mut d = Driver::new();
+    let (f, t0) = adopted("ss-no-neighbour", table(6), table(6), ALL, &mut d);
+    f.mirror.neighbours.store(false, Ordering::SeqCst);
+    let (now, seen) = replay(&mut d, &f, t0, 200, |_| false);
+    assert_eq!(d.state(), State::AdoptedResyncing, "{seen:?}");
+    let refused =
+        f.rt.status()
+            .seeded_door_refused
+            .expect("the door refused the diff it counted");
+    assert_eq!(
+        (refused.withdrawals, refused.replaces, refused.additions),
+        (0, 6, 0)
+    );
+    assert!(
+        preserved::route_ops(&f.fake.drain_events()).is_empty(),
+        "no route left the steered VPP"
+    );
+    assert!(f.log.lock().unwrap().is_empty());
+
+    f.mirror.neighbours.store(true, Ordering::SeqCst);
+    let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+    assert!(
+        preserved::route_ops(&f.fake.drain_events()).is_empty(),
+        "with the neighbour back, every route is unchanged"
+    );
+    assert_eq!(f.log.lock().unwrap().as_slice(), &["steer"]);
+}
+
+/// The door the dump path inherits never releases a diff onto traffic.
+/// VPP's route counts moved before the early door opened, so the dump path
+/// took over with the door's release: off VPP, and its FIB read. Then the
+/// authority disputes the mirror while that dump runs, so the dump is kept
+/// and the revocation puts the traffic back on the adopted VPP. When the
+/// authority agrees again the door's legs hold once more — and still the
+/// diff against the kept dump waits for the quiet release, steered, as it
+/// always has: it is a diff onto traffic that the door's guard never
+/// counted.
+#[test]
+fn the_inherited_door_never_diffs_onto_traffic() {
+    use packetframe_common::fib::{
+        AuthorityObservation, CompletenessReport, FeedSession, TableCompleteness,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use steered_seeded::*;
+
+    /// The mirror, with the authority disputing it the first time it is
+    /// counted after VPP's FIB was read.
+    struct DisputeOnDump {
+        inner: Shared,
+        dumped: &'static AtomicBool,
+        authority: Mutex<Option<Arc<TableCompleteness>>>,
+    }
+    impl RouteSource for DisputeOnDump {
+        fn requeue(&self, changes: packetframe_vpp_offload::engine::SourceChanges) {
+            self.inner.requeue(changes)
+        }
+        fn route_count(&self) -> u64 {
+            let n = self.inner.route_count();
+            if self.dumped.load(Ordering::SeqCst) {
+                if let Some(a) = self.authority.lock().unwrap().take() {
+                    a.record(AuthorityObservation::Clean(CompletenessReport {
+                        authority_routes: n * 2,
+                        mirror_routes: n,
+                        at: Instant::now(),
+                    }));
+                }
+            }
+            n
+        }
+        fn change_seq(&self) -> u64 {
+            self.inner.change_seq()
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            self.inner.for_each_route(visit)
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            self.inner.for_each_neighbour(visit)
+        }
+    }
+
+    let dumped: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let fake = Fake::start_behaving(
+        "ss-inherited",
+        Behaviour {
+            track_routes: true,
+            dumped: Some(dumped),
+            ..Default::default()
+        },
+    );
+    let body = daemon_a(&fake, FamilyPolicy::V4Only, table(6));
+    // Daemon A's own adoption read the empty VPP.
+    dumped.store(false, Ordering::SeqCst);
+    let session = Arc::new(FeedSession::new());
+    session.mark_mirror_seeded();
+    let mirror = Mirror::new(table(6), session.clone());
+    let authority = Arc::new(TableCompleteness::new());
+    let log: steered::Log = Arc::new(Mutex::new(Vec::new()));
+    let rt = runtime_on(
+        &fake,
+        FamilyPolicy::V4Only,
+        Box::new(DisputeOnDump {
+            inner: Shared(mirror.clone()),
+            dumped,
+            authority: Mutex::new(Some(authority.clone())),
+        }),
+        Box::new(steered::RecordingSteering {
+            rules: vec![("eth4".into(), 1)],
+            log: log.clone(),
+        }),
+        Box::new(NullStore),
+    );
+    rt.feed_session(session.clone());
+    rt.require_table_complete(authority.clone());
+    rt.seed_ledger(preserved::record(body));
+    handshake(&rt);
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+    // Another client adds a route before the route source connects.
+    fake.routes.lock().unwrap().insert(
+        ([198, 51, 100, 0], 24),
+        vec![fake_vpp::table_path([192, 0, 2, 1], ASSIGNED_INDEX, 1)],
+    );
+    let _ = fake.drain_events();
+    session.set_up(true);
+    let f = Fixture {
+        fake,
+        rt,
+        log,
+        mirror,
+        session,
+        authority: Some(authority),
+    };
+    f.agree();
+
+    // Until the revocation has put the traffic back on VPP.
+    let watched = f.log.clone();
+    let (now, seen) = replay(&mut d, &f, t0, 400, move |_| {
+        watched.lock().unwrap().len() >= 2
+    });
+    assert_eq!(
+        f.log.lock().unwrap().as_slice(),
+        &["unsteer", "steer"],
+        "off VPP for the dump, back on it when the authority disputed the mirror: {seen:?}"
+    );
+    let events = f.fake.drain_events();
+    assert_eq!(preserved::dumps(&events), 1, "VPP's FIB was read, and kept");
+    assert!(preserved::route_ops(&events).is_empty(), "no diff yet");
+
+    // The authority agrees again: the door's legs hold, the traffic is on
+    // VPP, and the replay streams on.
+    f.agree();
+    let (now, seen) = replay(&mut d, &f, now, 200, |_| false);
+    assert_eq!(d.state(), State::AdoptedResyncing, "{seen:?}");
+    assert!(
+        preserved::route_ops(&f.fake.drain_events()).is_empty(),
+        "no diff lands on the steered VPP through the inherited door"
+    );
+    assert_eq!(f.log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+
+    // Once the replay goes quiet, the quiet release diffs the kept dump as
+    // it always has.
+    let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+    assert!(
+        preserved::route_ops(&f.fake.drain_events()).contains(&(false, [198, 51, 100, 0])),
+        "the stranger is withdrawn"
+    );
+}
+
+/// Each family against its own table. A dual-stack VPP forwards on a
+/// hundred IPv4 and two hundred IPv6 routes, and the restart's IPv4
+/// disagrees by three: within 1% of the three hundred together, three
+/// times IPv4's own bound of one. The door refuses, naming IPv4 — and the
+/// reverse, three IPv6 routes against a hundred-route IPv6 table hidden
+/// in two hundred IPv4 ones, names IPv6. Nothing of either diff lands
+/// while the replay streams.
+#[test]
+fn one_family_over_its_bound_shuts_the_door_whatever_the_other_holds() {
+    use packetframe_vpp_offload::runtime::IpFamily;
+    use steered_seeded::*;
+    let small_v4 = table(100);
+    let large_v6 = table6(200);
+    let large_v4 = table(200);
+    let small_v6 = table6(100);
+    for (name, vpp, mirror, family, adopted) in [
+        (
+            "ss-v4-in-v6",
+            small_v4
+                .iter()
+                .chain(&large_v6)
+                .copied()
+                .collect::<Vec<_>>(),
+            small_v4[3..]
+                .iter()
+                .chain(&large_v6)
+                .copied()
+                .collect::<Vec<_>>(),
+            IpFamily::V4,
+            100,
+        ),
+        (
+            "ss-v6-in-v4",
+            large_v4.iter().chain(&small_v6).copied().collect(),
+            large_v4.iter().chain(&small_v6[3..]).copied().collect(),
+            IpFamily::V6,
+            100,
+        ),
+    ] {
+        let mut d = Driver::new();
+        let (f, t0) = adopted_in(FamilyPolicy::Both, name, vpp, mirror, ALL, &mut d);
+        let (_, seen) = replay(&mut d, &f, t0, 200, |_| false);
+        assert_eq!(d.state(), State::AdoptedResyncing, "{name}: {seen:?}");
+        assert!(!seen.contains(&Event::VerifyPassed), "{name}: {seen:?}");
+        assert!(
+            f.fake
+                .drain_events()
+                .iter()
+                .all(|e| !matches!(e, fake_vpp::Event::Route(_))),
+            "{name}: nothing of the diff lands on the steered VPP"
+        );
+        assert!(f.log.lock().unwrap().is_empty(), "{name}");
+        let refused =
+            f.rt.status()
+                .seeded_door_refused
+                .unwrap_or_else(|| panic!("{name}: the refusal is reported"));
+        assert_eq!(
+            (
+                refused.family,
+                refused.adopted,
+                refused.withdrawals,
+                refused.allowance
+            ),
+            (family, adopted, 3, 1),
+            "{name}"
+        );
+    }
+}
+
+/// What a release records is the mirror the walk read, not the count the
+/// tick began with. On the dump path the early door hands over, the
+/// replay streams through a dump of seconds, so the two can differ by a
+/// lot: here the mirror grows from six routes to thirteen while VPP's FIB
+/// is read (the authority agreeing with each count in turn), and the
+/// `resync_released` event says thirteen.
+///
+/// The event log is the process's own, so this installs one for the
+/// test binary and looks for the one event only this scenario writes.
+#[test]
+fn a_release_after_a_dump_records_the_mirror_the_walk_read() {
+    use packetframe_common::events;
+    use packetframe_common::fib::{
+        AuthorityObservation, CompletenessReport, FeedSession, TableCompleteness,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use steered_seeded::*;
+
+    /// The routes the mirror gains, and the authority that then agrees.
+    type Growth = (Vec<(IpPrefix, IpAddr)>, Arc<TableCompleteness>);
+    /// The mirror, growing by `extra` routes (and the authority agreeing
+    /// with it) the first time it is counted after VPP's FIB was read.
+    struct GrowOnDump {
+        inner: Shared,
+        dumped: &'static AtomicBool,
+        grow: Mutex<Option<Growth>>,
+    }
+    impl RouteSource for GrowOnDump {
+        fn requeue(&self, changes: packetframe_vpp_offload::engine::SourceChanges) {
+            self.inner.requeue(changes)
+        }
+        fn route_count(&self) -> u64 {
+            if self.dumped.load(Ordering::SeqCst) {
+                if let Some((extra, authority)) = self.grow.lock().unwrap().take() {
+                    let mut routes = self.inner.0.routes.lock().unwrap();
+                    routes.extend(extra);
+                    let n = routes.len() as u64;
+                    authority.record(AuthorityObservation::Clean(CompletenessReport {
+                        authority_routes: n,
+                        mirror_routes: n,
+                        at: Instant::now(),
+                    }));
+                }
+            }
+            self.inner.route_count()
+        }
+        fn change_seq(&self) -> u64 {
+            self.inner.change_seq()
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            self.inner.for_each_route(visit)
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            self.inner.for_each_neighbour(visit)
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("pf-ss-events-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("event log dir");
+    let log_path = dir.join("events.log");
+    assert!(
+        events::install(log_path.clone(), events::DEFAULT_MAX_BYTES),
+        "no other test in this binary installs the event log"
+    );
+
+    let dumped: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let fake = Fake::start_behaving(
+        "ss-count",
+        Behaviour {
+            track_routes: true,
+            dumped: Some(dumped),
+            ..Default::default()
+        },
+    );
+    let body = daemon_a(&fake, FamilyPolicy::V4Only, table(6));
+    dumped.store(false, Ordering::SeqCst);
+    let session = Arc::new(FeedSession::new());
+    session.mark_mirror_seeded();
+    let mirror = Mirror::new(table(6), session.clone());
+    let authority = Arc::new(TableCompleteness::new());
+    let extra: Vec<_> = (0..7)
+        .map(|i| {
+            (
+                IpPrefix::V4 {
+                    addr: [198, 51, 100, 200 + i],
+                    prefix_len: 32,
+                },
+                fake_vpp::nh(),
+            )
+        })
+        .collect();
+    let log: steered::Log = Arc::new(Mutex::new(Vec::new()));
+    let rt = runtime_on(
+        &fake,
+        FamilyPolicy::V4Only,
+        Box::new(GrowOnDump {
+            inner: Shared(mirror.clone()),
+            dumped,
+            grow: Mutex::new(Some((extra, authority.clone()))),
+        }),
+        Box::new(steered::RecordingSteering {
+            rules: vec![("eth4".into(), 1)],
+            log: log.clone(),
+        }),
+        Box::new(NullStore),
+    );
+    rt.feed_session(session.clone());
+    rt.require_table_complete(authority.clone());
+    rt.seed_ledger(preserved::record(body));
+    handshake(&rt);
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+    // VPP's counts move before the source connects, so the early door
+    // hands the dump path over.
+    fake.routes.lock().unwrap().insert(
+        ([198, 51, 100, 0], 24),
+        vec![fake_vpp::table_path([192, 0, 2, 1], ASSIGNED_INDEX, 1)],
+    );
+    let _ = fake.drain_events();
+    session.set_up(true);
+    let f = Fixture {
+        fake,
+        rt,
+        log,
+        mirror,
+        session,
+        authority: Some(authority),
+    };
+    f.agree();
+    let (_, seen) = replay(&mut d, &f, t0, 400, |d| d.state() == State::Steered);
+    assert_eq!(d.state(), State::Steered, "{seen:?}");
+    assert_eq!(f.log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+
+    assert!(events::installed().expect("installed").flush(), "flushed");
+    let mut released = Vec::new();
+    events::read_each(&log_path, |r| {
+        if r.event == "resync_released"
+            && r.fields.get("path").and_then(|v| v.as_str()) == Some("readback-deferred")
+            && r.fields.get("door").and_then(|v| v.as_str()) == Some("seeded")
+        {
+            released.push(r.fields.get("routes").and_then(|v| v.as_u64()));
+        }
+    })
+    .expect("the event log reads");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        released.contains(&Some(13)),
+        "the release records the thirteen routes the walk read, not the six the tick \
+         began with: {released:?}"
+    );
+}
+
+/// The guard judges the walk it commits. The door's legs are read, it
+/// opens, and as its walk begins the route source has replaced three of
+/// two hundred routes with three others: the count the legs saw is
+/// unchanged, the authority still agrees, and the plan the walk finds —
+/// three withdrawals and three additions — is past the bound. It is that
+/// plan the guard refuses, and nothing of it reaches the pending map or
+/// VPP; the quiet door lands it once the replay goes quiet. A plan judged
+/// on one walk and committed by another let exactly this through (review
+/// finding, PR #356).
+#[test]
+fn routes_replaced_as_the_walk_begins_are_judged_on_that_walk() {
+    use steered_seeded::*;
+    let vpp = table(200);
+    let mut replaced: Vec<_> = vpp[3..].to_vec();
+    replaced.extend((0..3).map(|i| {
+        (
+            IpPrefix::V4 {
+                addr: [198, 51, 100, 128 + i],
+                prefix_len: 32,
+            },
+            fake_vpp::nh(),
+        )
+    }));
+    let mut d = Driver::new();
+    let (f, t0) = adopted("ss-replaced", vpp.clone(), vpp.clone(), ALL, &mut d);
+    *f.mirror.replace_at_walk.lock().unwrap() = Some(replaced);
+    let (now, seen) = replay(&mut d, &f, t0, 200, |_| false);
+    assert_eq!(d.state(), State::AdoptedResyncing, "{seen:?}");
+    assert!(
+        preserved::route_ops(&f.fake.drain_events()).is_empty(),
+        "nothing of the plan lands on the steered VPP"
+    );
+    let status = f.rt.status();
+    assert_eq!(status.pending_ops, 0, "and none of it was queued");
+    let refused = status
+        .seeded_door_refused
+        .expect("the walk's own plan was refused");
+    assert_eq!(
+        (refused.withdrawals, refused.replaces, refused.additions),
+        (3, 0, 3)
+    );
+    assert_eq!(
+        f.mirror.walks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one walk, judged and refused"
+    );
+    assert!(f.log.lock().unwrap().is_empty());
+
+    let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+    assert_eq!(preserved::route_ops(&f.fake.drain_events()).len(), 6);
+}
+
+/// The plan the door commits is the one its walk found, and the walk reads
+/// the neighbours once. A next hop lost after that read is a change the
+/// route source reports later, not a reason to re-derive the plan: here
+/// every later read of the neighbours finds none, and the committed
+/// table — unchanged — stays in VPP. When a second walk committed what a
+/// first one had been judged on, the same loss between the two turned an
+/// approved unchanged table into two hundred withdrawals on the steered
+/// VPP (review finding, PR #356).
+#[test]
+fn a_next_hop_lost_after_the_walk_does_not_change_what_it_committed() {
+    use std::sync::atomic::Ordering;
+    use steered_seeded::*;
+    let mut d = Driver::new();
+    let (f, t0) = adopted("ss-lost-after", table(200), table(200), ALL, &mut d);
+    f.mirror.neighbours_for.store(1, Ordering::SeqCst);
+    let (_, seen) = replay(&mut d, &f, t0, 200, |_| false);
+    assert!(
+        f.rt.status().resync_deferred.is_none(),
+        "the door opened and its diff ran: {seen:?}"
+    );
+    let deletes: Vec<_> = preserved::route_ops(&f.fake.drain_events())
+        .into_iter()
+        .filter(|(add, _)| !add)
+        .collect();
+    assert!(
+        deletes.is_empty(),
+        "no route left the steered VPP: {} withdrawn",
+        deletes.len()
+    );
+}
+
+/// Every addition counts, whatever room the table has left. VPP holds two
+/// hundred routes at a high-water mark of two hundred, and the seed has
+/// two of them through a next hop no neighbour resolves plus two routes VPP
+/// lacks. Counting only the room the withdrawals leave, the additions
+/// looked withheld and the diff passed as two replaces. But the drain
+/// withdraws a replace whose next hops resolve to nothing, freeing its
+/// slot, and the two additions take them: four changes on a steered VPP
+/// that allows two (review finding, PR #356). Counted whole, the door
+/// refuses, and the quiet door lands exactly those four.
+#[test]
+fn a_full_table_counts_the_additions_its_unresolvable_replaces_make_room_for() {
+    use steered_seeded::*;
+    let vpp = table(200);
+    let unreachable = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
+    let mut mirror: Vec<_> = vpp
+        .iter()
+        .enumerate()
+        .map(|(i, (p, via))| (*p, if i >= 198 { unreachable } else { *via }))
+        .collect();
+    mirror.extend((0..2).map(|i| {
+        (
+            IpPrefix::V4 {
+                addr: [198, 51, 100, 128 + i],
+                prefix_len: 32,
+            },
+            fake_vpp::nh(),
+        )
+    }));
+    let mut d = Driver::new();
+    let (f, t0) = adopted_capped(
+        FamilyPolicy::V4Only,
+        200,
+        "ss-full",
+        vpp.clone(),
+        mirror,
+        ALL,
+        &mut d,
+    );
+    let (now, seen) = replay(&mut d, &f, t0, 200, |_| false);
+    assert_eq!(d.state(), State::AdoptedResyncing, "{seen:?}");
+    assert!(preserved::route_ops(&f.fake.drain_events()).is_empty());
+    let refused =
+        f.rt.status()
+            .seeded_door_refused
+            .expect("the door counted every addition");
+    assert_eq!(
+        (
+            refused.withdrawals,
+            refused.replaces,
+            refused.additions,
+            refused.allowance
+        ),
+        (0, 2, 2, 2)
+    );
+
+    // Two routes are left unresolvable, so verify is incomplete and the
+    // port settles in `Ready`: what matters here is what reached VPP.
+    let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| {
+        matches!(d.state(), State::Ready | State::Steered)
+    });
+    assert!(seen.contains(&Event::VerifyIncomplete), "{seen:?}");
+    let mut want = vec![
+        (false, v4_of(vpp[198].0)),
+        (false, v4_of(vpp[199].0)),
+        (true, [198, 51, 100, 128]),
+        (true, [198, 51, 100, 129]),
+    ];
+    want.sort_unstable();
+    assert_eq!(
+        preserved::route_ops(&f.fake.drain_events()),
+        want,
+        "the drain frees two slots and fills them: four changes"
+    );
+}
+
+/// An addition is an addition whether or not its next hop resolves at the
+/// walk. Fifty routes the seed holds and VPP does not go through a next
+/// hop whose neighbour the source learns only after the walk has read its
+/// neighbours: the walk finds them unresolvable, but each upsert keeps its
+/// next hop, the neighbour's delta is not one a walk supersedes, and
+/// `apply_changes` hands it to the engine before the drain resolves the
+/// upserts — fifty routes installed on the steered VPP. Counted as
+/// additions, the door refuses, nothing is queued, and the quiet door
+/// lands the same fifty. Counted by whether they resolved at the walk,
+/// they passed the guard as nothing (review finding, PR #356).
+#[test]
+fn an_unresolved_addition_counts_though_its_neighbour_arrives_later() {
+    use steered_seeded::*;
+    let late = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
+    let vpp = table(200);
+    let mut mirror = vpp.clone();
+    mirror.extend((0..50).map(|i| {
+        (
+            IpPrefix::V4 {
+                addr: [198, 51, 100, 150 + i],
+                prefix_len: 32,
+            },
+            late,
+        )
+    }));
+    let mut d = Driver::new();
+    let (f, t0) = adopted("ss-learned-late", vpp, mirror, ALL, &mut d);
+    *f.mirror.learn_later.lock().unwrap() = Some((late, [0x02, 0x00, 0x00, 0x00, 0x00, 0x09]));
+    let (now, seen) = replay(&mut d, &f, t0, 200, |_| false);
+    assert_eq!(d.state(), State::AdoptedResyncing, "{seen:?}");
+    assert!(
+        preserved::route_ops(&f.fake.drain_events()).is_empty(),
+        "none of the fifty reaches the steered VPP"
+    );
+    let status = f.rt.status();
+    assert_eq!(status.pending_ops, 0, "and none was queued");
+    let refused = status
+        .seeded_door_refused
+        .expect("fifty additions are past two");
+    assert_eq!(
+        (refused.withdrawals, refused.replaces, refused.additions),
+        (0, 0, 50)
+    );
+
+    // Once the replay goes quiet, the quiet door lands them as it always
+    // did — the neighbour arrives, and all fifty install.
+    let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+    let adds = preserved::route_ops(&f.fake.drain_events())
+        .into_iter()
+        .filter(|(add, _)| *add)
+        .count();
+    assert_eq!(adds, 50, "the neighbour learned later installs every one");
+}

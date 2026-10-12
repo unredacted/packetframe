@@ -405,6 +405,13 @@ pub struct StatusSnapshot {
     /// for it the same way it is wrong for the deferral, unless the table
     /// is empty.
     pub preserved_fib: bool,
+    /// The steered seeded diff's early door refused its diff, so the
+    /// deferral `resync_deferred` reports waits for the replay to go quiet
+    /// instead. Named on the deferral row, because an operator who expected
+    /// a steered restart to verify within seconds is looking at a wait of
+    /// minutes and needs the reason. See
+    /// [`crate::runtime::SeededDiffRefusal`].
+    pub seeded_door_refused: Option<crate::runtime::SeededDiffRefusal>,
     /// See [`crate::runtime::RuntimeStatus::authority`].
     pub authority: crate::runtime::AuthorityPosture,
     pub ports: Vec<PortLink>,
@@ -697,6 +704,7 @@ impl StatusSnapshot {
             resync_deferred,
             fresh_hold,
             preserved_fib,
+            seeded_door_refused: None,
             authority,
             ports,
             store_error,
@@ -780,6 +788,7 @@ impl StatusSnapshot {
             rs.drift_v6,
         );
         snap.steer_hold = rs.steer_hold;
+        snap.seeded_door_refused = rs.seeded_door_refused;
         snap.neighbour_counters = rs.neighbour_counters;
         snap.kernel_path = rs.kernel_path;
         snap.drift_scan_ms = rs.drift_scan_ms;
@@ -1729,6 +1738,14 @@ impl StatusSnapshot {
                          gone quiet, and the adopted FIB keeps forwarding untouched until \
                          then"
                     )
+                };
+                // Whichever posture is reported: the refusal is a fact about
+                // the two ledgers, not about the authority or the floor, and
+                // it explains why a steered restart that would otherwise
+                // have verified within seconds is waiting out the replay.
+                let msg = match &self.seeded_door_refused {
+                    Some(refused) => format!("{msg}; {refused}"),
+                    None => msg,
                 };
                 (HealthState::Degraded, Some(msg))
             }
@@ -5605,6 +5622,70 @@ mod tests {
             msg.contains("not the authority feeding it"),
             "it must name the real blocker instead: {msg}"
         );
+    }
+
+    /// A steered seeded deferral whose early door refused its diff says so
+    /// on the deferral row, whatever else the row reports: an operator who
+    /// expected a steered restart to verify within seconds is looking at a
+    /// wait of minutes, and the reason is the two ledgers, not the
+    /// authority or the floor. Without a refusal the row is unchanged.
+    #[test]
+    fn a_refused_seeded_door_explains_the_wait_on_the_deferral_row() {
+        use crate::runtime::{AuthorityPosture, IpFamily, SeededDiffRefusal};
+        let led = ledger_with(10, 0, 0);
+        let row = |authority, have, refused| {
+            let mut snap = snap_of(
+                &steered_supervisor(),
+                &led,
+                ApiHealth::Answering {
+                    silent_for: Duration::from_millis(200),
+                },
+                FibSync::NeverVerified,
+                ports_up(),
+            );
+            snap.resync_deferred = Some((have, 100));
+            snap.authority = authority;
+            snap.seeded_door_refused = refused;
+            snap.report()
+                .subsystems
+                .into_iter()
+                .find(|s| s.name == SUBSYS_FIB)
+                .and_then(|s| s.message)
+                .expect("a deferral always explains itself")
+        };
+        let refused = SeededDiffRefusal {
+            family: IpFamily::V6,
+            adopted: 200,
+            withdrawals: 3,
+            replaces: 1,
+            additions: 2,
+            allowance: 2,
+        };
+        for authority in [
+            AuthorityPosture::Absent,
+            AuthorityPosture::Attesting,
+            AuthorityPosture::AwaitingAuthority,
+            AuthorityPosture::DemotedByFlap,
+            AuthorityPosture::Vetoing,
+        ] {
+            for have in [50, 196] {
+                let plain = row(authority, have, None);
+                let msg = row(authority, have, Some(refused));
+                assert!(
+                    !plain.contains("early door"),
+                    "{authority:?} {have}: {plain}"
+                );
+                assert!(
+                    msg.starts_with(&plain)
+                        && msg.contains(
+                            "its IPv6 diff would withdraw 3, replace 1 and add 2 routes \
+                             against the 200 IPv6 routes VPP is forwarding on, more than the 2"
+                        )
+                        && msg.contains("waits for the route source's replay to go quiet"),
+                    "{authority:?} {have}: {msg}"
+                );
+            }
+        }
     }
 
     #[test]

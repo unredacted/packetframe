@@ -931,7 +931,11 @@ runs against an unsteered VPP; a restart whose previous daemon left a
 preserved route ledger skips the dump and the unsteer entirely, and only
 its diff waits here — see the next section). The deferral releases
 through exactly
-**two** doors, both requiring the feed session up (raised when the
+**two** doors (a mirror the fast-path seeded from its route ledger has
+one more for the diff, which needs the authority too: [the unsteered
+diff](#the-unsteered-diff-and-a-seeded-mirror) and [the steered
+diff](#the-steered-diff-and-a-seeded-mirror) below), both requiring the
+feed session up (raised when the
 stream STARTS — with one deliberate exception. For BGP it is the first
 UPDATE of the session. For BMP it is the first RouteMonitoring frame,
 but only while **no earlier stream's routes are still in the mirror** —
@@ -967,7 +971,8 @@ holds the gate loud until it actually ends:
    count agrees with the mirror, recomputed against the mirror as it is
    at release time. A negative verdict vetoes door 1 as well.
 
-**There is no third door, deliberately.** A deployment whose real table
+**There is no third door for it, deliberately** (the seeded-mirror doors
+need an authority as well). A deployment whose real table
 sits below capacity/16 with no bird has nothing honest to release on,
 and the gate refuses to guess: the reconciliation defers indefinitely,
 `fib-synced` reports Degraded with this exact remedy, and the adopted
@@ -1051,6 +1056,137 @@ afterwards as ordinary updates. Nothing here waits for it; the
 hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table)
 is what keeps that verdict from admitting a lever move over the loaded
 table (2026-10-07).
+
+### The steered diff and a seeded mirror
+
+A STEERED keep-vpp restart whose stopping daemon left both its ledgers
+(the fast-path's [route ledger](packetframe-fib.md#restarts-the-route-ledger)
+and VPP's [preserved route
+ledger](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger))
+adopts VPP's FIB from the record and stays steered, with no dump. Only
+its diff waits, and it takes the same seeded-mirror door as the
+unsteered diff above, with the same four legs: an unreconciled seed, the
+feed session up in its first session, the authority's current word yes,
+and the floor (half the seeded table). Verify and the post-verify
+re-assert steer then follow within seconds of the route source's first
+route. They used to follow the end of the replay, about 11 minutes at
+1.35M routes from FRR. For all that time VPP's FIB took no route change
+(no deltas apply during a deferral), `fib-synced` read `resync deferred`,
+and the keep rules waited for the re-assert to move them to the RSS form.
+
+**What changes when the diff lands on traffic.** Here VPP is forwarding
+through every route the diff touches. Against the diff that would run
+after the replay, an early one differs by what the replay has not
+re-advertised yet, and by how long what it lands stays wrong:
+
+- *Withdrawals* of routes VPP holds that the seed lacks and the replay
+  would bring back. An early diff takes them out of VPP until the
+  replay reaches them, and their traffic follows a less specific route
+  meanwhile.
+- *Replacements* of routes VPP holds through other paths than the seed
+  resolves to now, where the replay would say otherwise again. An early
+  diff moves their traffic onto the seed's paths until it does, and a
+  route whose next hop resolves to nothing at the walk leaves VPP.
+- *Additions*, routes the seed holds that VPP does not. Both diffs add
+  them, but not for as long. A seeded route the source has dropped
+  leaves the mirror at the route source's GC, five quiet seconds after
+  the replay, and the quiet door's diff runs two quiet seconds after it,
+  so there such a route sits in VPP for seconds. The early door's leaves
+  it there for the whole replay, and a stale more-specific pulls traffic
+  off the less specific route VPP was using. The completeness authority
+  counts routes, not which ones, so it cannot tell two ledgers from
+  different stops that agree in size.
+
+**Why that is near nothing.** Both ledgers are snapshots from the same
+clean stop: the fast-path's of the route mirror, vpp-offload's of what
+VPP acknowledged from that mirror. They differ only by what VPP had not
+received or acknowledged at that moment, which is churn-sized. Routes the
+previous process kept out of VPP do not count: a shadowed,
+kernel-delivered or link-local-only route is left out of the diff again.
+Routes it left unresolvable or withheld do count, as additions: VPP's
+preserved ledger records only what VPP installed, and an unresolved
+route keeps its next hops, so a neighbour learned before the drain
+reaches it installs it on the steered VPP. Additions also count whole
+rather than against an estimate of the room left (the drain withdraws a
+replaced route whose next hops resolve to nothing, freeing a slot an
+addition then takes). On a healthy box these are a handful: `fib-synced`
+names every unresolvable route, and withheld ones exist only on a table
+over its capacity, degraded anyway. Where there are more, a refusal
+costs the old wait. The replay's re-advertisement of an
+unchanged route is no FIB write and no VPP delta (the fast-path's
+no-change shortcut), and the walk drops the deltas the seed queued. What
+the seed holds that the source dropped while the daemon was down leaves
+VPP as an ordinary update when the route source's GC withdraws it from
+the mirror, as it leaves the eBPF tier. Real changes in the replay reach
+VPP as ordinary updates as they arrive. Before, the deferral held them
+back for the replay's whole length.
+
+**The guard.** "One stop, two snapshots" is not something vpp-offload can
+check. A stop can write one ledger and not the other, and a start
+without vpp-offload consumes the fast-path ledger but leaves VPP's. The
+walk also resolves every route through the neighbours the feed holds at
+that moment, seconds into the process: a next hop the fast-path's
+resolver has not re-announced yet would take every route through it out
+of VPP as unresolvable. So
+the early door judges the diff before any of it reaches VPP — the resync
+walk itself, its plan put to the guard before anything of it is queued,
+so the plan judged is the plan the drain gets — and opens only if, **in
+each address family**, its withdrawals, replacements and additions together
+are at most **1% of that family's routes VPP holds**. That is the drift
+bound the completeness authority uses for a converged mirror, and it
+draws the same line between churn and a missing table. Each family is
+held to its own table, so 400k IPv6 routes cannot cover a diff that
+rewrites a small IPv4 table, or the reverse. A bigger diff in either
+family shuts the early door for the rest of the restart, and the diff
+waits for the replay to go quiet, as it always did. The journal warns
+`the early door for a mirror the fast-path seeded is shut for this
+restart: its IPv4 diff would withdraw W, replace R and add A routes
+against the N IPv4 routes VPP is forwarding on, more than the X that two
+snapshots of one clean stop can differ by ...` (naming IPv4 when both
+families are over), the event log records `seeded_door_refused` with
+its `family`, and the
+`fib-synced` deferral line ends with the same sentence. On a small
+table 1% rounds down to a handful (to none below 100 routes), so even a
+small disagreement refuses, and waiting there costs nothing: the replay
+of a few thousand routes is a burst of a second or two.
+
+**The order at the door.** VPP's route counts are re-read first, exactly
+as at the quiet release. If something else changed VPP's FIB while the
+restart waited, the seed is discarded and the adoption takes the dump
+path. The early door's release carries over to it, as a quiet release
+always has: the unsteer goes out at once (the eBPF tier forwards on the
+mirror the authority just counted complete), the dump reads an idle VPP,
+and the unsteered diff, verify and re-steer follow, all while the replay
+streams. The resync walk follows the count re-read directly, the same
+order as at the quiet release, and its plan is judged before any of it
+is queued. The door's legs are read once more when the walk is done (it
+reads the whole mirror), so a session that dropped meanwhile is never
+acted on; that reconnect shuts the door for good on the next tick. A
+refused walk queues nothing, and the route updates it superseded are
+not lost: none applies while the diff waits, and the walk that
+eventually runs (the quiet door's, or the dump path's) reads the mirror
+as it then is.
+
+**What still waits for quiet:** a mirror that loaded from empty, no
+`require-table-complete`, a route source that reconnected, a seed the
+route source's GC has already reconciled, and a refused diff.
+
+What you see on a steered restart that takes the door:
+
+```
+adopted resync deferred until the route source is loaded and quiet; over a mirror the fast-path seeded ... it runs sooner ...
+the route mirror was seeded from the fast-path route ledger, the route source is streaming in its first session, the completeness authority agrees with it, and the diff disturbs no more of either family's table than one clean stop's two snapshots can differ by: diffing it against the preserved ledger now ...   door=seeded
+verify passed
+steering UP: allowlisted traffic is now diverted to VPP ...
+```
+
+The event log reads `adoption_path` (`path: preserved-ledger`) →
+`resync_released` (`door: seeded`, `steered: true`, with what the diff
+queued) → `verify_passed` (`seeded: true`) → `steering_up`, and only
+later, when the replay finishes, `route_ledger_reconciled`. The quiet
+door records `resync_released` with `door: quiet` after the replay
+instead. Steering never comes down, and the VPP process is the same
+throughout.
 
 ## What a keep-vpp restart costs now: the preserved route ledger
 
@@ -1137,7 +1273,10 @@ unsteering, in this order:
 3. The resync diff waits behind the same loaded-and-quiet release the
    dump path uses (feed live, floor = half the seeded table, quiet 2 s
    with a completeness authority / 5 s without), **steered the whole
-   time**. At the release VPP's route counts are read AGAIN — the wait
+   time** — or, over a mirror the fast-path seeded, behind the
+   seeded-mirror door, which does not wait for the replay ([the steered
+   diff and a seeded mirror](#the-steered-diff-and-a-seeded-mirror)).
+   At the release VPP's route counts are read AGAIN — the wait
    can be minutes, and a route another client adds or removes in it is
    one the seed knows nothing about — and a change discards the seed for
    the dump path. Then the diff pushes only the differences: a route VPP
@@ -1151,16 +1290,21 @@ ledger](packetframe-fib.md#restarts-the-route-ledger)), so the mirror is
 at full size seconds after the start instead of after the route
 source's replay: the release floor is met at once, and the
 completeness authority attests the seeded mirror at the route source's
-first route. The diff described here still waits for the replay to go
-quiet — "quiet" counts every streamed element — so a steered adoption
-behaves as before. What changes is an UNSTEERED VPP: a fresh one's
-convergence hold releases on that first attested check, and an adopted
-one's diff takes the seeded-mirror door ([the unsteered diff and a
-seeded mirror](#the-unsteered-diff-and-a-seeded-mirror)).
+first route. The loaded-and-quiet release would still wait for the
+replay to end ("quiet" counts every streamed element), so the diff
+described here takes the seeded-mirror door instead, guarded because it
+lands on traffic ([the steered diff and a seeded
+mirror](#the-steered-diff-and-a-seeded-mirror)). An UNSTEERED VPP gains
+the same: a fresh one's convergence hold releases on that first
+attested check, and an adopted one's diff takes the door unguarded ([the
+unsteered diff and a seeded
+mirror](#the-unsteered-diff-and-a-seeded-mirror)).
 
 What you see: `fib-synced DEGRADED — resync deferred ... the adopted FIB
-keeps forwarding untouched` while the feed reloads (on the primary the
-iBGP refill is ~2 minutes), then briefly `resyncing the FIB the previous
+keeps forwarding untouched` until the diff is released: seconds after
+the route source's first route over a seeded mirror, otherwise for as
+long as the feed takes to reload and go quiet (about 11 minutes for
+1.35M routes from FRR). Then briefly `resyncing the FIB the previous
 process verified and preserved (N routes installed) ...` while the diff
 lands, then healthy. `packetframe_vpp_state` stays at
 `adopted_resyncing` → `verifying` → `ready`/`steered` with steering never
@@ -1205,7 +1349,9 @@ The last one is `PreservedLedgerRejected`, deliberately not
 `VerifyFailed`: it disproves the RECORD, not VPP, so it is not a
 teardown. Steering comes off first (the seed traffic was on is now known
 wrong, and the eBPF tier is loaded — the seeded diff only ran after the
-release), the seed is discarded, and the resync starts over on the same
+loaded-and-quiet release, or through the seeded-mirror door, whose
+authority counted complete the very mirror the eBPF tier forwards on),
+the seed is discarded, and the resync starts over on the same
 VPP from a dump. A mismatch on THAT pass is an ordinary `VerifyFailed`.
 
 **The dump path itself changed too.**
@@ -4194,7 +4340,9 @@ for the length of the deferral plus the reconcile, then clears to
 (d12): unsteer at +40 s, re-steer at +78 s, worst forwarding gap
 0.109 s. That is the DUMP path (on the reference router's full table,
 ~3 minutes unsteered); a clean `--keep-vpp` restart that left a
-preserved route ledger holds the same Degraded line for the deferral but
+preserved route ledger holds the same Degraded line for the deferral
+(seconds, when the fast-path left its route ledger too: [the steered
+diff and a seeded mirror](#the-steered-diff-and-a-seeded-mirror)) but
 never unsteers — measured on the reference router at zero unsteered
 time, see [What a keep-vpp restart costs
 now](#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger).

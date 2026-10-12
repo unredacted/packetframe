@@ -613,6 +613,143 @@ fn adoption_withdraws_stale_routes_without_touching_vpps_own() {
     );
 }
 
+/// A judged resync is ONE walk whose plan is put to the judge before any
+/// of it is queued: the steered seeded diff's guard judges the plan
+/// through this, and a plan judged on one walk and committed by another
+/// bounds nothing while the route source streams (review finding, PR
+/// #356). A refusal leaves the pending map empty, the phase as it was and
+/// the ledger untouched; an acceptance queues exactly what the judge saw.
+/// Both discard the source's queued route deltas, once, before the walk.
+///
+/// Over a ledger whose paths VPP acknowledged (a dump adoption records
+/// none, so nothing it adopts can read unchanged), one prefix of each
+/// kind: held through the same paths (unchanged), held through another
+/// next hop (a replace), held and no longer advertised (a withdrawal),
+/// new (an addition), and new through a next hop with no neighbour —
+/// an addition too: the upsert keeps its next hops, and a neighbour
+/// learned before the drain reaches it installs it.
+#[test]
+fn a_judged_resync_commits_only_the_plan_its_judge_saw() {
+    use packetframe_vpp_offload::engine::Disturbance;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let other_nh = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+    let p = |a: [u8; 4], len| IpPrefix::V4 {
+        addr: a,
+        prefix_len: len,
+    };
+    struct Source {
+        routes: Vec<(IpPrefix, IpAddr)>,
+        other_nh: IpAddr,
+        discarded: AtomicUsize,
+    }
+    impl RouteSource for Source {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("nothing is handed back in this test")
+        }
+        fn route_count(&self) -> u64 {
+            self.routes.len() as u64
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for (prefix, via) in &self.routes {
+                visit(*prefix, &[*via]);
+            }
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(nh(), "eth4", MAC);
+            visit(self.other_nh, "eth4", [0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        }
+        fn discard_route_deltas(&self) {
+            self.discarded.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let source = |routes| Source {
+        routes,
+        other_nh,
+        discarded: AtomicUsize::new(0),
+    };
+    let fake = Fake::start("judged-resync");
+    let mut engine = engine_for(&fake);
+    assert!(engine.api_ready(), "handshake");
+    engine.attach_devices(AttachMode::Fresh).expect("attach");
+    // What VPP holds, acknowledged through these paths.
+    let before = source(vec![
+        (p([203, 0, 113, 0], 27), nh()),
+        (p([203, 0, 113, 32], 27), nh()),
+        (p([203, 0, 113, 64], 27), nh()),
+    ]);
+    let _ = engine.begin_resync(&before);
+    engine.program_neighbours(&before).expect("neighbours land");
+    drain_to_empty(&mut engine);
+    assert_eq!(engine.counts().installed, 3);
+    // Out of the resync phase, so a refusal's phase can be told apart.
+    engine.abort_convergence();
+    assert_eq!(engine.phase(), None);
+    let _ = fake.drain_events();
+
+    let after = source(vec![
+        (p([203, 0, 113, 0], 27), nh()),
+        (p([203, 0, 113, 32], 27), other_nh),
+        (p([198, 51, 100, 128], 25), nh()),
+        (
+            p([198, 51, 100, 64], 26),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+        ),
+    ]);
+    let mut judged = Vec::new();
+    let refused = engine
+        .begin_resync_judged(&after, &mut |plan| {
+            judged.push(*plan);
+            false
+        })
+        .expect_err("the judge refused");
+    assert_eq!(judged, vec![refused], "the judge saw the plan it refused");
+    assert_eq!(
+        (refused.unchanged, refused.upserts, refused.withdrawals),
+        (1, 3, 1),
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.v4,
+        Disturbance {
+            withdrawals: 1,
+            replaces: 1,
+            additions: 2,
+        },
+        "the unresolved new route is an addition all the same: {refused:?}"
+    );
+    assert_eq!(refused.v6, Disturbance::default());
+    assert_eq!(engine.pending().len(), 0, "a refusal queues nothing");
+    assert_eq!(engine.phase(), None, "and leaves the phase as it was");
+    assert_eq!(engine.counts().installed, 3, "and the ledger untouched");
+    assert_eq!(
+        after.discarded.load(Ordering::SeqCst),
+        1,
+        "the walk discarded the source's deltas before it began, as every walk does"
+    );
+
+    let plan = engine
+        .begin_resync_judged(&after, &mut |plan| plan.v4.withdrawals <= 1)
+        .expect("the judge accepted");
+    assert_eq!(plan, refused, "the same mirror, the same plan");
+    assert_eq!(
+        engine.pending().len() as u64,
+        plan.upserts + plan.withdrawals,
+        "an acceptance queues exactly what the judge saw"
+    );
+    assert!(engine.phase().is_some(), "and starts the resync");
+    assert_eq!(after.discarded.load(Ordering::SeqCst), 2);
+    assert!(
+        !fake
+            .drain_events()
+            .iter()
+            .any(|e| matches!(e, Event::Route(_))),
+        "neither walk sends a route to VPP: the drain does"
+    );
+}
+
 /// The generated `Encode` and `Decode` must agree on a reply's
 /// geometry, proven by round-tripping a ping through the fake.
 ///
