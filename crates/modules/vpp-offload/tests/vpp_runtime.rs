@@ -4983,7 +4983,7 @@ mod first_steer_hold {
     pub fn report(d: &Driver, rt: &Runtime, now: Instant) -> HealthReport {
         let rs = rt.status();
         let fib = rs.last_verify.as_ref().map_or(FibSync::NeverVerified, |v| {
-            FibSync::from_outcome(v, Duration::ZERO)
+            FibSync::from_outcome(v, Duration::ZERO, rs.v6_ledger().as_ref())
         });
         StatusSnapshot::from_runtime(d.supervisor(), rs, d.api_health(now), fib).report()
     }
@@ -4992,7 +4992,7 @@ mod first_steer_hold {
     pub fn metrics(d: &Driver, rt: &Runtime, now: Instant) -> String {
         let rs = rt.status();
         let fib = rs.last_verify.as_ref().map_or(FibSync::NeverVerified, |v| {
-            FibSync::from_outcome(v, Duration::ZERO)
+            FibSync::from_outcome(v, Duration::ZERO, rs.v6_ledger().as_ref())
         });
         let snap = StatusSnapshot::from_runtime(d.supervisor(), rs, d.api_health(now), fib);
         packetframe_vpp_offload::status::render_metrics(&snap, "vpp-offload")

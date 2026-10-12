@@ -1556,7 +1556,7 @@ publishes status, normally within a fraction of a second, in either
 direction. An accepted route is **acknowledged, not fixed**: it stays
 out of VPP and diverted IPv6 for it still dies there, exactly as before
 the line. It is still classified unresolvable, and still named as such in
-the verify summary, from the next verify on
+the verify summary
 (``unresolvable=1 [1 accepted by `unresolvable-accept6`: …]``), and in the
 `unresolvable_routes` event, in its own `ipv6_accepted` field. What
 changes is that it no longer degrades `fib-v6` or overall health, and is
@@ -3722,12 +3722,15 @@ device appeared in the table or a member port is missing. Check the
 
 **Read the names first.** Every surface that reports the count also
 names up to five of the routes, then `+K more`: the `fib-synced` and
-`fib-v6` rows (live), the verify summary (as of that verify), a refused
-first steer, and an `unresolvable_routes` event in `packetframe events`
-whenever the set changes (at most once a minute; `detail: none` once it
-empties). IPv6 routes an `unresolvable-accept6` names are listed apart,
-as accepted, on each of those that carries v6 (`ipv6_accepted` in the
-event), and never take one of the five slots. Each name reads
+`fib-v6` rows (live), the verify summary (as of that verify, except its
+IPv6 half's unresolvable and withheld counts and names, which are the
+live table's whenever the summary is rendered, so `fib-synced` always
+agrees with `fib-v6`), a refused first steer, and an `unresolvable_routes` event in
+`packetframe events` whenever the set changes (at most once a minute;
+`detail: none` once it empties). IPv6 routes an `unresolvable-accept6`
+names are listed apart, as accepted, on each of those that carries v6
+(`ipv6_accepted` in the event), and never take one of the five slots.
+Each name reads
 
 ```
 <prefix> via <nexthop> [dev <device>] (<why>)

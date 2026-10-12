@@ -252,7 +252,17 @@ impl FibSync {
     /// [`VerifyOutcome::passed`] decides pass/fail — this must not
     /// re-derive the criteria, or the gate that governs steering and the
     /// gate that reports health could disagree.
-    pub fn from_outcome(outcome: &VerifyOutcome, age: Duration) -> Self {
+    ///
+    /// `v6_ledger` is the live IPv6 ledger the `fib-v6` row reads
+    /// ([`crate::runtime::RuntimeStatus::v6_ledger`]); the summary's IPv6
+    /// half names its routes from it, so a reload of `unresolvable-accept6`
+    /// after the verify moves a route on both rows at once
+    /// ([`crate::verify::V6Ledger`]).
+    pub fn from_outcome(
+        outcome: &VerifyOutcome,
+        age: Duration,
+        v6_ledger: Option<&crate::verify::V6Ledger>,
+    ) -> Self {
         if outcome.passed() {
             Self::Verified {
                 age,
@@ -262,12 +272,12 @@ impl FibSync {
         } else if outcome.restart_worthy() {
             Self::Failed {
                 age,
-                summary: outcome.summary(),
+                summary: outcome.summary_with(v6_ledger),
             }
         } else {
             Self::Unfit {
                 age,
-                summary: outcome.summary(),
+                summary: outcome.summary_with(v6_ledger),
                 reruns: outcome.awaits_clean_table(),
                 sampled: outcome.sampled,
                 table: outcome.table,
@@ -5412,7 +5422,7 @@ mod tests {
             "but a restart cannot make the source dump faster"
         );
         assert!(matches!(
-            FibSync::from_outcome(&empty, Duration::ZERO),
+            FibSync::from_outcome(&empty, Duration::ZERO, None),
             FibSync::Unfit { .. }
         ));
 
@@ -5424,7 +5434,7 @@ mod tests {
         };
         assert!(!holes.passed() && !holes.restart_worthy());
         assert!(matches!(
-            FibSync::from_outcome(&holes, Duration::ZERO),
+            FibSync::from_outcome(&holes, Duration::ZERO, None),
             FibSync::Unfit { .. }
         ));
 
@@ -5441,7 +5451,7 @@ mod tests {
         };
         assert!(wrong.restart_worthy());
         assert!(matches!(
-            FibSync::from_outcome(&wrong, Duration::ZERO),
+            FibSync::from_outcome(&wrong, Duration::ZERO, None),
             FibSync::Failed { .. }
         ));
 
@@ -5451,7 +5461,7 @@ mod tests {
         };
         assert!(good.passed());
         assert!(matches!(
-            FibSync::from_outcome(&good, Duration::ZERO),
+            FibSync::from_outcome(&good, Duration::ZERO, None),
             FibSync::Verified { sampled: 64, .. }
         ));
     }

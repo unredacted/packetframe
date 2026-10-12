@@ -3124,6 +3124,23 @@ pub struct RuntimeStatus {
     pub drift_v6: crate::drift::V6DriftState,
 }
 
+impl RuntimeStatus {
+    /// IPv6's ledger as this status's `fib-v6` row renders it, for the
+    /// verify summary the same status renders
+    /// ([`crate::status::FibSync::from_outcome`]): built from the very
+    /// fields that row reads, so the two cannot name a route differently.
+    /// `None` under `v6 off`.
+    pub fn v6_ledger(&self) -> Option<crate::verify::V6Ledger> {
+        let v6 = self.counts.v6?;
+        Some(crate::verify::V6Ledger {
+            unresolvable: v6.unresolvable,
+            withheld: v6.withheld,
+            named: self.unresolvable_named_v6.clone(),
+            accepted: self.unresolvable_accepted_v6.clone(),
+        })
+    }
+}
+
 impl Core {
     /// A freshly spawned child whose identity cannot be made durable —
     /// the store refused it, or its boot_id could not be read — must
@@ -4268,7 +4285,7 @@ impl Observe for ObserveView {
         };
         match c.engine.refresh_verify() {
             Ok(outcome) => {
-                let summary = outcome.summary();
+                let summary = outcome.summary_with(c.engine.v6_ledger().as_ref());
                 let kind = if outcome.passed() {
                     tracing::info!(outcome = %summary, cause = %cause, "verify re-run: passed");
                     event_log::Event::info(crate::MODULE_NAME, event_kind::VERIFY_PASSED)
@@ -5687,9 +5704,10 @@ impl Effects for EffectsView {
                     // but it disproves the record all the same
                     // (`VerifyOutcome::any_mismatch`).
                     if verdict.outcome.any_mismatch() {
-                        ledger_rejected("verify", &verdict.outcome.summary());
+                        let summary = verdict.outcome.summary_with(c.engine.v6_ledger().as_ref());
+                        ledger_rejected("verify", &summary);
                         tracing::warn!(
-                            outcome = %verdict.outcome.summary(),
+                            outcome = %summary,
                             first = ?verdict.outcome.mismatches.first().or_else(|| {
                                 verdict.outcome.v6.as_ref().and_then(|v| v.mismatches.first())
                             }),
@@ -5715,7 +5733,7 @@ impl Effects for EffectsView {
                 // — sampled/mismatches/unresolvable were invisible
                 // even with the unit log captured, and the loop was
                 // misread for a hardware fault because of it.
-                let summary = verdict.outcome.summary();
+                let summary = verdict.outcome.summary_with(c.engine.v6_ledger().as_ref());
                 let recorded = match event {
                     Event::VerifyFailed => {
                         tracing::warn!(

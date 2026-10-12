@@ -302,17 +302,37 @@ pub struct FamilyVerify {
     /// See [`VerifyOutcome::table`]; this family's.
     pub table: u64,
     pub mismatches: Vec<Mismatch>,
+    /// The ledger's counts when the probes were drawn. Not what a summary
+    /// prints when it is given the live ledger ([`V6Ledger`]), and never
+    /// names: the routes behind them are named from the live ledger.
     pub unresolvable: u64,
-    /// See [`VerifyOutcome::unresolvable_named`]. Only the routes no
-    /// `unresolvable-accept6` names; those are in
-    /// [`Self::unresolvable_accepted`], and both are in `unresolvable`.
-    pub unresolvable_named: Vec<String>,
-    /// The unresolvable routes an `unresolvable-accept6` names, by name
-    /// ([`crate::engine::ConvergenceEngine::unresolvable_accepted_named`]).
-    /// Still unresolvable and still in the count: the summary names them
-    /// as accepted, so the log says what `fib-v6` does.
-    pub unresolvable_accepted: Vec<String>,
     pub withheld: u64,
+}
+
+/// IPv6's ledger state as the `fib-v6` row reads it — counts and named
+/// routes from the live engine, never from a verdict — for the IPv6
+/// half of [`VerifyOutcome::summary_with`].
+///
+/// Why the summary does not keep its own copy: which unresolvable routes
+/// an `unresolvable-accept6` names is decided against the accept set in
+/// force, which a reload changes without a verify. A verdict that is
+/// rendered long after it was taken (an incomplete one that never
+/// re-runs, on the `fib-synced` row) would otherwise go on classifying a
+/// route under the old set while `fib-v6` used the new one. None of this
+/// can fail the pass, so the verdict loses nothing by not holding it;
+/// IPv4's names stay the verdict's own, because they are what it failed
+/// on. Built by [`crate::engine::ConvergenceEngine::v6_ledger`] and,
+/// from the same fields the `fib-v6` row renders,
+/// [`crate::runtime::RuntimeStatus::v6_ledger`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct V6Ledger {
+    pub unresolvable: u64,
+    pub withheld: u64,
+    /// [`crate::engine::ConvergenceEngine::unresolvable_named`]: the
+    /// unresolvable routes no accept names.
+    pub named: Vec<String>,
+    /// [`crate::engine::ConvergenceEngine::unresolvable_accepted_named`].
+    pub accepted: Vec<String>,
 }
 
 impl FamilyVerify {
@@ -444,7 +464,19 @@ impl VerifyOutcome {
     /// operator to bounce a dataplane a bounce cannot fix (the
     /// supervisor made exactly that mistake until 2026-08-13 — see
     /// `Verdict::event`).
+    ///
+    /// The IPv6 half's ledger counts are the verdict's, with no route
+    /// named: this form is for a verdict whose engine is gone. Anything
+    /// that has the live ledger renders [`Self::summary_with`].
     pub fn summary(&self) -> String {
+        self.summary_with(None)
+    }
+
+    /// [`Self::summary`], with the IPv6 half's ledger counts and named
+    /// unresolvable routes — accepted ones apart — taken from
+    /// `v6_ledger`, the live ledger the `fib-v6` row reads ([`V6Ledger`] says why), when
+    /// it is given. The probes stay the verdict's.
+    pub fn summary_with(&self, v6_ledger: Option<&V6Ledger>) -> String {
         let mut s = format!(
             "verify {}: {}/{} probes matched against {} routes, unresolvable={}{}, withheld={}",
             if self.passed() {
@@ -473,24 +505,30 @@ impl VerifyOutcome {
             s.push_str(" (no installed routes to verify)");
         }
         if let Some(v6) = &self.v6 {
+            let (unresolvable, withheld, named, accepted) = match v6_ledger {
+                Some(l) => (
+                    l.unresolvable,
+                    l.withheld,
+                    named_in_parens(&l.named),
+                    if l.accepted.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " [{} accepted by `unresolvable-accept6`: {}]",
+                            l.accepted.len(),
+                            l.accepted.join("; ")
+                        )
+                    },
+                ),
+                None => (v6.unresolvable, v6.withheld, String::new(), String::new()),
+            };
             s.push_str(&format!(
                 "; IPv6 (loaded, not steered — cannot fail the pass): {}/{} probes matched \
-                 against {} routes, unresolvable={}{}{}, withheld={}",
+                 against {} routes, unresolvable={unresolvable}{named}{accepted}, \
+                 withheld={withheld}",
                 v6.sampled.saturating_sub(v6.mismatches.len()),
                 v6.sampled,
                 v6.table,
-                v6.unresolvable,
-                named_in_parens(&v6.unresolvable_named),
-                if v6.unresolvable_accepted.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " [{} accepted by `unresolvable-accept6`: {}]",
-                        v6.unresolvable_accepted.len(),
-                        v6.unresolvable_accepted.join("; ")
-                    )
-                },
-                v6.withheld
             ));
         }
         for d in &self.dead_interfaces {
@@ -964,6 +1002,48 @@ mod tests {
     #[test]
     fn an_empty_table_samples_nothing() {
         assert!(sample(&[], 64, 1).is_empty());
+    }
+
+    /// The IPv6 half's ledger counts and names come from the live ledger
+    /// the summary is given, never from the verdict: the verdict holds
+    /// counts only, and without a ledger the summary prints those and
+    /// names nothing, so it cannot classify a route under an accept set
+    /// that has since been reloaded.
+    #[test]
+    fn the_v6_ledger_half_is_rendered_from_the_ledger_it_is_given() {
+        let o = VerifyOutcome {
+            sampled: 1,
+            table: 1,
+            v6: Some(FamilyVerify {
+                sampled: 1,
+                table: 1,
+                unresolvable: 2,
+                withheld: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cached = o.summary();
+        assert!(cached.contains("unresolvable=2, withheld=0"), "{cached}");
+        let live = V6Ledger {
+            unresolvable: 2,
+            withheld: 3,
+            named: vec!["2001:db8:0:5::/64 via 2001:db8::1 (…)".into()],
+            accepted: vec!["2001:db8::/48 via 2001:db8::1 (…)".into()],
+        };
+        let s = o.summary_with(Some(&live));
+        assert!(
+            s.contains(
+                "unresolvable=2 (2001:db8:0:5::/64 via 2001:db8::1 (…)) [1 accepted by \
+                 `unresolvable-accept6`: 2001:db8::/48 via 2001:db8::1 (…)], withheld=3"
+            ),
+            "{s}"
+        );
+        assert_eq!(
+            s.split_once("; IPv6").map(|(v4, _)| v4.to_string()),
+            cached.split_once("; IPv6").map(|(v4, _)| v4.to_string()),
+            "IPv4's half is the verdict's either way"
+        );
     }
 
     #[test]

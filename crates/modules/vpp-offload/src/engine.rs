@@ -1973,6 +1973,19 @@ impl ConvergenceEngine {
             .collect()
     }
 
+    /// IPv6's ledger state as the `fib-v6` row reads it, for a verify
+    /// summary rendered now ([`crate::verify::V6Ledger`]). `None` unless
+    /// VPP carries IPv6.
+    pub fn v6_ledger(&self) -> Option<crate::verify::V6Ledger> {
+        let v6 = self.counts().v6?;
+        Some(crate::verify::V6Ledger {
+            unresolvable: v6.unresolvable,
+            withheld: v6.withheld,
+            named: self.unresolvable_named(true),
+            accepted: self.unresolvable_accepted_named(),
+        })
+    }
+
     /// The `unresolvable-accept6` prefixes that name no unresolvable
     /// route right now, `addr/len`, in config order: the route resolved,
     /// or is not in the table. Empty unless VPP carries IPv6.
@@ -4679,11 +4692,9 @@ impl ConvergenceEngine {
         ) {
             Ok(mut outcome) => {
                 outcome.unexempted_local = self.counts().unexempted_local;
+                // IPv4's only: IPv6's are named from the live ledger when
+                // the verdict is rendered (`verify::V6Ledger`).
                 outcome.unresolvable_named = self.unresolvable_named(false);
-                if let Some(v6) = outcome.v6.as_mut() {
-                    v6.unresolvable_named = self.unresolvable_named(true);
-                    v6.unresolvable_accepted = self.unresolvable_accepted_named();
-                }
                 self.disproved |= outcome.any_mismatch();
                 self.last_verify = Some(outcome.clone());
                 // The pass dumped the interfaces too, and that is now the
