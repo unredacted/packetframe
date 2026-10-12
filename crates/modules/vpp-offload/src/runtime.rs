@@ -722,6 +722,12 @@ struct Core {
     /// module's handle, so a reload reaches it without this loop — see
     /// [`crate::drift::DriftAccepts6`] for why it is not in the scope.
     drift_accepts6: std::sync::Arc<crate::drift::DriftAccepts6>,
+    /// The `unresolvable-accept6` set, handed to the engine each time
+    /// status is read and before the unresolvable routes are logged
+    /// ([`Core::sync_unresolvable_accepts6`]). The module's handle, so a
+    /// reload reaches it without this loop — see
+    /// [`crate::engine::UnresolvableAccepts6`].
+    unresolvable_accepts6: std::sync::Arc<crate::engine::UnresolvableAccepts6>,
     /// Set when a steering change failed PARTWAY and left rules on
     /// the NIC, so neither the old exemption set nor the new one
     /// describes what is installed.
@@ -844,15 +850,22 @@ pub const UNRESOLVABLE_LOG_EVERY: Duration = Duration::from_secs(60);
 /// The status rows carry the live list regardless.
 #[derive(Debug, Default)]
 pub struct UnresolvableLog {
-    written: (Vec<String>, Vec<String>),
+    written: (Vec<String>, Vec<String>, Vec<String>),
     at: Option<std::time::Instant>,
 }
 
 impl UnresolvableLog {
-    /// Whether `(v4, v6)` should be written now. A `true` records it as
-    /// written.
-    pub fn due(&mut self, now: std::time::Instant, v4: &[String], v6: &[String]) -> bool {
-        if self.written.0 == v4 && self.written.1 == v6 {
+    /// Whether `(v4, v6, v6_accepted)` should be written now. A `true`
+    /// records it as written. A route moving between `v6` and
+    /// `v6_accepted` — an accept added or dropped — is a change.
+    pub fn due(
+        &mut self,
+        now: std::time::Instant,
+        v4: &[String],
+        v6: &[String],
+        v6_accepted: &[String],
+    ) -> bool {
+        if self.written.0 == v4 && self.written.1 == v6 && self.written.2 == v6_accepted {
             return false;
         }
         if self
@@ -861,7 +874,7 @@ impl UnresolvableLog {
         {
             return false;
         }
-        self.written = (v4.to_vec(), v6.to_vec());
+        self.written = (v4.to_vec(), v6.to_vec(), v6_accepted.to_vec());
         self.at = Some(now);
         true
     }
@@ -2171,6 +2184,7 @@ impl Runtime {
                 pending_drift_scope: None,
                 drift_v6: crate::drift::V6DriftState::default(),
                 drift_accepts6: std::sync::Arc::default(),
+                unresolvable_accepts6: std::sync::Arc::default(),
                 steer_missing: 0,
                 steer_gone_at: Vec::new(),
                 steer_stray: 0,
@@ -2340,6 +2354,16 @@ impl Runtime {
     /// into. Without one the set is empty: every v6 finding degrades.
     pub fn drift_accepts6(&self, handle: std::sync::Arc<crate::drift::DriftAccepts6>) {
         self.core.borrow_mut().drift_accepts6 = handle;
+    }
+
+    /// Attach the `unresolvable-accept6` handle the module publishes
+    /// reloads into. Without one the set is empty: every unresolvable v6
+    /// route degrades `fib-v6`.
+    pub fn unresolvable_accepts6(
+        &self,
+        handle: std::sync::Arc<crate::engine::UnresolvableAccepts6>,
+    ) {
+        self.core.borrow_mut().unresolvable_accepts6 = handle;
     }
 
     /// Install the exemption tripwire. Same wiring rule as the others.
@@ -2710,6 +2734,9 @@ impl Runtime {
                 }
             }
         }
+        // Before anything below reads a count or a name, so every one of
+        // them in this status is judged against the same accept set.
+        self.core.borrow_mut().sync_unresolvable_accepts6();
         let c = self.core.borrow();
         // ONE reading, used for both the verdict and the question of
         // whether it has been seen before: asking twice could pair a
@@ -2760,6 +2787,8 @@ impl Runtime {
             } else {
                 Vec::new()
             },
+            unresolvable_accepted_v6: c.engine.unresolvable_accepted_named(),
+            unresolvable_accepts_unmatched_v6: c.engine.unresolvable_accepts_unmatched(),
             null_drops: c.engine.null_drops(),
             neighbour_counters: c.engine.neighbour_counters(),
             kernel_path: c
@@ -3048,8 +3077,15 @@ pub struct RuntimeStatus {
     pub kernel_delivered_routes: u64,
     /// [`crate::engine::ConvergenceEngine::unresolvable_named`], IPv4.
     pub unresolvable_named: Vec<String>,
-    /// The same for IPv6; empty under `v6 off`.
+    /// The same for IPv6, less the routes an `unresolvable-accept6`
+    /// names; empty under `v6 off`.
     pub unresolvable_named_v6: Vec<String>,
+    /// [`crate::engine::ConvergenceEngine::unresolvable_accepted_named`]:
+    /// the accepted unresolvable v6 routes; empty under `v6 off`.
+    pub unresolvable_accepted_v6: Vec<String>,
+    /// [`crate::engine::ConvergenceEngine::unresolvable_accepts_unmatched`]:
+    /// the `unresolvable-accept6` lines naming no unresolvable route.
+    pub unresolvable_accepts_unmatched_v6: Vec<String>,
     /// Cumulative null-node drops as last sampled, absent until read.
     pub null_drops: Option<u64>,
     /// VPP's glean and ARP-reply transmit counters as last sampled,
@@ -3645,34 +3681,68 @@ impl Core {
         crate::steer::adds_diversion(&target, &present)
     }
 
+    /// Hand the engine the `unresolvable-accept6` set the module last
+    /// published ([`crate::engine::UnresolvableAccepts6`]).
+    fn sync_unresolvable_accepts6(&mut self) {
+        let accepts = self.unresolvable_accepts6.get();
+        self.engine.set_unresolvable_accepts6(accepts);
+    }
+
     /// Write the named unresolvable routes to the event log when the set
     /// has changed ([`UnresolvableLog`]), and to the journal alongside.
+    ///
+    /// The routes an `unresolvable-accept6` names are written too, in
+    /// their own `ipv6_accepted` field (present only when there are
+    /// some): they are still unresolvable, so `detail: none` must not
+    /// appear while one is. When they are all there is, the record is
+    /// `info`, the level the `fib-v6` row (Healthy) and the
+    /// `module_health` transitions speak at — an accepted route is a
+    /// decision already made, not news.
     fn log_unresolvable(&mut self, now: std::time::Instant) {
+        self.sync_unresolvable_accepts6();
         let v4 = self.engine.unresolvable_named(false);
-        let v6 = if self.engine.counts().v6.is_some() {
-            self.engine.unresolvable_named(true)
+        let (v6, v6_accepted) = if self.engine.counts().v6.is_some() {
+            (
+                self.engine.unresolvable_named(true),
+                self.engine.unresolvable_accepted_named(),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        if !self.unresolvable_log.due(now, &v4, &v6) {
+        if !self.unresolvable_log.due(now, &v4, &v6, &v6_accepted) {
             return;
         }
-        if v4.is_empty() && v6.is_empty() {
+        if v4.is_empty() && v6.is_empty() && v6_accepted.is_empty() {
             tracing::info!("no route is unresolvable any more");
             event_log::Event::info(crate::MODULE_NAME, event_kind::UNRESOLVABLE_ROUTES)
                 .detail("none")
                 .emit();
             return;
         }
-        tracing::warn!(
-            ipv4 = ?v4,
-            ipv6 = ?v6,
-            "unresolvable routes: VPP holds no path for these, so they are missing from its FIB"
-        );
-        event_log::Event::warn(crate::MODULE_NAME, event_kind::UNRESOLVABLE_ROUTES)
+        let event = if v4.is_empty() && v6.is_empty() {
+            tracing::info!(
+                ipv6_accepted = ?v6_accepted,
+                "the only unresolvable routes are IPv6 ones an `unresolvable-accept6` \
+                 acknowledges: they stay out of VPP, and diverted IPv6 for them dies there"
+            );
+            event_log::Event::info(crate::MODULE_NAME, event_kind::UNRESOLVABLE_ROUTES)
+        } else {
+            tracing::warn!(
+                ipv4 = ?v4,
+                ipv6 = ?v6,
+                ipv6_accepted = ?v6_accepted,
+                "unresolvable routes: VPP holds no path for these, so they are missing from its FIB"
+            );
+            event_log::Event::warn(crate::MODULE_NAME, event_kind::UNRESOLVABLE_ROUTES)
+        };
+        let event = event
             .field("ipv4", v4.join("; "))
-            .field("ipv6", v6.join("; "))
-            .emit();
+            .field("ipv6", v6.join("; "));
+        if v6_accepted.is_empty() {
+            event.emit();
+        } else {
+            event.field("ipv6_accepted", v6_accepted.join("; ")).emit();
+        }
     }
 
     /// Whether the FIB itself is fit to take traffic.
@@ -5908,17 +5978,35 @@ mod tests {
         let b = vec!["203.0.113.0/24 via 192.0.2.9 (no neighbour)".to_string()];
         let mut log = UnresolvableLog::default();
         assert!(
-            !log.due(at(0), &[], &[]),
+            !log.due(at(0), &[], &[], &[]),
             "nothing, and nothing written yet"
         );
-        assert!(log.due(at(1), &a, &[]), "a new set");
-        assert!(!log.due(at(2), &a, &[]), "unchanged: not per tick");
-        assert!(!log.due(at(30), &b, &[]), "changed, inside the window");
-        assert!(log.due(at(61), &b, &[]), "written once the window passed");
-        assert!(!log.due(at(200), &b, &[]));
-        assert!(log.due(at(300), &[], &[]), "emptying is a change");
-        assert!(!log.due(at(400), &[], &[]));
-        assert!(log.due(at(500), &[], &a), "v6 counts as the set too");
+        assert!(log.due(at(1), &a, &[], &[]), "a new set");
+        assert!(!log.due(at(2), &a, &[], &[]), "unchanged: not per tick");
+        assert!(!log.due(at(30), &b, &[], &[]), "changed, inside the window");
+        assert!(
+            log.due(at(61), &b, &[], &[]),
+            "written once the window passed"
+        );
+        assert!(!log.due(at(200), &b, &[], &[]));
+        assert!(log.due(at(300), &[], &[], &[]), "emptying is a change");
+        assert!(!log.due(at(400), &[], &[], &[]));
+        assert!(log.due(at(500), &[], &a, &[]), "v6 counts as the set too");
+        // An accept moving a route out of `v6` is a change, and so is the
+        // accept going away again.
+        assert!(log.due(at(600), &[], &[], &a), "accepted");
+        assert!(!log.due(at(700), &[], &[], &a));
+        // So is the accepted route alone resolving, with nothing else
+        // moving: `detail: none` must follow it.
+        assert!(
+            log.due(at(800), &[], &[], &[]),
+            "the accepted route resolved"
+        );
+        assert!(
+            log.due(at(900), &[], &[], &a),
+            "and is back, still accepted"
+        );
+        assert!(log.due(at(1000), &[], &a, &[]), "unaccepted again");
     }
 
     /// A veto is only a veto where the gate actually asks.

@@ -303,8 +303,15 @@ pub struct FamilyVerify {
     pub table: u64,
     pub mismatches: Vec<Mismatch>,
     pub unresolvable: u64,
-    /// See [`VerifyOutcome::unresolvable_named`].
+    /// See [`VerifyOutcome::unresolvable_named`]. Only the routes no
+    /// `unresolvable-accept6` names; those are in
+    /// [`Self::unresolvable_accepted`], and both are in `unresolvable`.
     pub unresolvable_named: Vec<String>,
+    /// The unresolvable routes an `unresolvable-accept6` names, by name
+    /// ([`crate::engine::ConvergenceEngine::unresolvable_accepted_named`]).
+    /// Still unresolvable and still in the count: the summary names them
+    /// as accepted, so the log says what `fib-v6` does.
+    pub unresolvable_accepted: Vec<String>,
     pub withheld: u64,
 }
 
@@ -468,12 +475,21 @@ impl VerifyOutcome {
         if let Some(v6) = &self.v6 {
             s.push_str(&format!(
                 "; IPv6 (loaded, not steered — cannot fail the pass): {}/{} probes matched \
-                 against {} routes, unresolvable={}{}, withheld={}",
+                 against {} routes, unresolvable={}{}{}, withheld={}",
                 v6.sampled.saturating_sub(v6.mismatches.len()),
                 v6.sampled,
                 v6.table,
                 v6.unresolvable,
                 named_in_parens(&v6.unresolvable_named),
+                if v6.unresolvable_accepted.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " [{} accepted by `unresolvable-accept6`: {}]",
+                        v6.unresolvable_accepted.len(),
+                        v6.unresolvable_accepted.join("; ")
+                    )
+                },
                 v6.withheld
             ));
         }

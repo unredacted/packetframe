@@ -342,6 +342,23 @@ pub enum ModuleDirective {
         prefix: Ipv6Prefix,
         line: usize,
     },
+    /// `unresolvable-accept6 <ipv6-prefix>` — an unresolvable IPv6 route
+    /// the operator has examined and accepted: typically their own
+    /// announced aggregate, originated with the router as next hop and
+    /// with no kernel route behind it. A route whose prefix is EXACTLY
+    /// this one stops degrading `fib-v6` and is counted apart
+    /// (`packetframe_vpp_family_routes{family="ipv6",
+    /// state="unresolvable_accepted"}`). An acknowledgement, not a fix:
+    /// the route stays out of VPP and diverted traffic to it still dies
+    /// there. Exact, not covering, so an accept for an aggregate cannot
+    /// hide a more specific route that goes unresolvable inside it later.
+    /// IPv6 only: an unresolvable v4 route gates the first steer, and v4
+    /// has `steer-exempt`. Repeatable; hot-reloadable; needs `v6 on`.
+    /// Host bits must be zero and `/0` is refused.
+    VppUnresolvableAccept6 {
+        prefix: Ipv6Prefix,
+        line: usize,
+    },
     /// `require-table-complete on|off` — whether a first steer waits
     /// for the route mirror to be confirmed converged against bird.
     ///
@@ -2406,6 +2423,54 @@ impl Config {
         Ok(())
     }
 
+    /// `unresolvable-accept6`: `v6 on`, and no line twice. (Host bits and
+    /// `/0` are refused where the line is parsed.)
+    ///
+    /// `v6 on` is required for `drift-accept6`'s reason: without it VPP
+    /// carries no IPv6 route, so none can be unresolvable and the line
+    /// would sit in the file reading as a decision that is being
+    /// honoured. Not tied to `v6-divert`: the route is unresolvable
+    /// whether or not anything is diverted, and an accept kept across a
+    /// `v6-divert` taken off and put back stays decided.
+    fn validate_vpp_unresolvable_accepts6(vpp: &ModuleSection) -> Result<(), ConfigError> {
+        let v6_on = vpp
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::VppV6(v) => Some(*v),
+                _ => None,
+            })
+            .next_back()
+            .unwrap_or(false);
+        let mut seen: Vec<&Ipv6Prefix> = Vec::new();
+        for d in &vpp.directives {
+            let ModuleDirective::VppUnresolvableAccept6 { prefix, line } = d else {
+                continue;
+            };
+            let cidr = format!("{}/{}", prefix.addr, prefix.prefix_len);
+            if !v6_on {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!(
+                        "`unresolvable-accept6 {cidr}` needs `v6 on` in module vpp-offload: \
+                         without it VPP carries no IPv6 route, so there is no unresolvable \
+                         route for the line to accept. Add `v6 on`, or drop the line"
+                    ),
+                ));
+            }
+            if seen.contains(&prefix) {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!(
+                        "duplicate `unresolvable-accept6 {cidr}` in module vpp-offload; drop one"
+                    ),
+                ));
+            }
+            seen.push(prefix);
+        }
+        Ok(())
+    }
+
     /// `local-route6` structural rules: `local-route`'s, per family, plus
     /// `v6 on`. Like those they hold whether or not anything steers — the
     /// attached route is installed at attach.
@@ -2529,6 +2594,7 @@ impl Config {
     ///   are more than [`VPP_MAX_PORTS`];
     /// - the IPv6 steering rules ([`Self::validate_vpp_v6_steering`]);
     /// - `drift-accept6` ([`Self::validate_vpp_drift_accepts6`]);
+    /// - `unresolvable-accept6` ([`Self::validate_vpp_unresolvable_accepts6`]);
     /// - `local-route6` ([`Self::validate_vpp_local_routes6`]).
     pub fn validate_vpp_offload(&self) -> Result<(), ConfigError> {
         let Some(vpp) = self.modules.iter().find(|m| m.name == "vpp-offload") else {
@@ -2645,6 +2711,7 @@ impl Config {
 
         self.validate_vpp_v6_steering(vpp)?;
         Self::validate_vpp_drift_accepts6(vpp)?;
+        Self::validate_vpp_unresolvable_accepts6(vpp)?;
 
         let Some(fp) = fast_path else {
             return Err(ConfigError::parse(
@@ -4811,6 +4878,28 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                 );
             }
             Ok(ModuleDirective::VppDriftAccept6 { prefix, line })
+        }),
+        "unresolvable-accept6" => parse_single_arg(line, rest, "unresolvable-accept6", |t| {
+            let prefix: Ipv6Prefix = t.parse()?;
+            // The route's own prefix, as the ledger keys it: the match is
+            // exact, so a host inside it would match nothing, and the
+            // status line echoes the accept back.
+            if prefix.addr != prefix.network() {
+                return Err(format!(
+                    "`{t}` has host bits set; write the route's prefix as {}/{}",
+                    prefix.network(),
+                    prefix.prefix_len
+                ));
+            }
+            if prefix.prefix_len == 0 {
+                return Err(
+                    "a /0 would accept an unresolvable default route, which every diverted \
+                     IPv6 packet VPP has no more specific route for follows; fix the route \
+                     instead. An accept matches its prefix exactly, never what is inside it"
+                        .to_string(),
+                );
+            }
+            Ok(ModuleDirective::VppUnresolvableAccept6 { prefix, line })
         }),
         "require-table-complete" => {
             parse_single_arg(line, rest, "require-table-complete", |t| match t {
@@ -8445,6 +8534,104 @@ module vpp-offload
         let e = check("  v6 on\n  drift-accept6 2001:db8::/32\n  drift-accept6 2001:db8::/32\n")
             .unwrap_err();
         assert!(e.contains("duplicate `drift-accept6 2001:db8::/32`"), "{e}");
+    }
+
+    /// `unresolvable-accept6` parses a normalised, non-default IPv6
+    /// prefix and nothing else, repeatably: host bits and `/0` are
+    /// refused where the line is read, with the fix in the message.
+    #[test]
+    fn unresolvable_accept6_parses_a_normalised_prefix_only() {
+        let c = Config::parse(
+            "module vpp-offload\n  unresolvable-accept6 2001:db8::/48\n  \
+             unresolvable-accept6 2001:db8:5::/64\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.modules[0].directives,
+            [
+                ModuleDirective::VppUnresolvableAccept6 {
+                    prefix: v6("2001:db8::/48"),
+                    line: 2,
+                },
+                ModuleDirective::VppUnresolvableAccept6 {
+                    prefix: v6("2001:db8:5::/64"),
+                    line: 3,
+                },
+            ]
+        );
+        assert!(
+            Config::parse("module vpp-offload\n  unresolvable-accept6 2001:db8::1/128\n").is_ok()
+        );
+
+        let refused = |arg: &str| {
+            Config::parse(&format!(
+                "module vpp-offload\n  unresolvable-accept6 {arg}\n"
+            ))
+            .expect_err(arg)
+            .to_string()
+        };
+        let e = refused("2001:db8::1/48");
+        assert!(
+            e.contains("host bits") && e.contains("2001:db8::/48"),
+            "{e}"
+        );
+        let e = refused("::/0");
+        assert!(e.contains("/0") && e.contains("exactly"), "{e}");
+        for bad in [
+            "192.0.2.0/24",
+            "2001:db8::",
+            "2001:db8::/129",
+            "not-a-prefix",
+        ] {
+            let e = refused(bad);
+            assert!(e.contains("unresolvable-accept6"), "{e}");
+        }
+        let e = refused("2001:db8::/48 2001:db8:1::/48");
+        assert!(e.contains("exactly one argument"), "{e}");
+        let e = Config::parse("module vpp-offload\n  unresolvable-accept6\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("requires a value"), "{e}");
+    }
+
+    /// Cross-validation: `unresolvable-accept6` needs `v6 on` (no IPv6
+    /// route reaches VPP without it) and refuses an exact duplicate;
+    /// nested accepts, and the same prefix under `drift-accept6`, are
+    /// allowed — each names a different route or finding.
+    #[test]
+    fn unresolvable_accept6_needs_v6_on_and_refuses_duplicates() {
+        let base = "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth3 generic\n  \
+                    allow-prefix 192.0.2.0/24\n\n\
+                    module vpp-offload\n  loopback-address 198.51.100.254/32\n  \
+                    port eth3 cores 1 steer off\n";
+        let check = |body: &str| {
+            Config::parse(&format!("{base}{body}"))
+                .unwrap()
+                .validate_vpp_offload()
+                .map_err(|e| format!("{e}"))
+        };
+        check(
+            "  v6 on\n  unresolvable-accept6 2001:db8::/48\n  \
+             unresolvable-accept6 2001:db8::/64\n  drift-accept6 2001:db8::/48\n",
+        )
+        .unwrap();
+
+        let e = check("  unresolvable-accept6 2001:db8::/48\n").unwrap_err();
+        assert!(e.contains("needs `v6 on`"), "{e}");
+        let e = check("  v6 off\n  unresolvable-accept6 2001:db8::/48\n").unwrap_err();
+        assert!(e.contains("needs `v6 on`"), "{e}");
+        // The last `v6` line decides, as everywhere else.
+        let e = check("  v6 on\n  v6 off\n  unresolvable-accept6 2001:db8::/48\n").unwrap_err();
+        assert!(e.contains("needs `v6 on`"), "{e}");
+
+        let e = check(
+            "  v6 on\n  unresolvable-accept6 2001:db8::/48\n  unresolvable-accept6 2001:db8::/48\n",
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("duplicate `unresolvable-accept6 2001:db8::/48`"),
+            "{e}"
+        );
     }
 
     #[test]
