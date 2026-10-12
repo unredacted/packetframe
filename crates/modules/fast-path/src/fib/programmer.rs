@@ -302,6 +302,20 @@ impl FibProgrammerHandle {
         rx.await.map_err(|_| ProgrammerError::Shutdown)?
     }
 
+    /// [`Self::apply_route_event`] without waiting for the event to be
+    /// applied: it is queued behind every command sent before it, which
+    /// is all the ordering either method gives, and its outcome is not
+    /// reported. For a sender that must not wait out the programmer's
+    /// current work, such as the BGP listener's `Resync` between
+    /// sessions, which would otherwise hold the next handshake behind it.
+    pub async fn queue_route_event(&self, event: RouteEvent) -> Result<(), ProgrammerError> {
+        let (tx, _) = oneshot::channel();
+        self.tx
+            .send(Command::ApplyRouteEvent { event, reply: tx })
+            .await
+            .map_err(|_| ProgrammerError::Shutdown)
+    }
+
     /// Return the current `(v4, v6)` route mirror counts. Used by the
     /// integrity checker to diff against bird's `show route count`.
     /// Reads the programmer's in-memory mirror, not the BPF maps

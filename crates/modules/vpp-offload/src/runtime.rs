@@ -1451,15 +1451,24 @@ pub const ADOPTED_SOURCE_FLOOR_DIVISOR: u64 = 2;
 pub const UNATTESTED_QUIET_RATE_PER_SEC: u64 = 0;
 
 /// The quiet a release must show when NO completeness authority is
-/// configured. Five seconds, deliberately equal to both listeners'
-/// INIT_COMPLETE_QUIESCENCE: that is each protocol's own definition of
-/// "the initial dump is complete", and a release that has no authority
-/// to attest completion must not claim it on LESS evidence than the
-/// protocol itself requires — two seconds of stall mid-dump released a
-/// partial mirror whose only sin was pausing (review finding). With an
-/// authority present the shorter window stands, because the authority
-/// carries the completion truth and its current-mirror drift vetoes a
-/// partial table regardless of quiet.
+/// configured. The rule: a release that has no authority to attest
+/// completion must not claim it on LESS evidence than the listener's own
+/// definition of "the initial dump is complete" — two seconds of stall
+/// mid-dump released a partial mirror whose only sin was pausing (review
+/// finding). With an authority present the shorter window stands,
+/// because the authority carries the completion truth and its
+/// current-mirror drift vetoes a partial table regardless of quiet.
+///
+/// Five seconds is the BMP station's INIT_COMPLETE_QUIESCENCE, and was
+/// the BGP listener's until 2026-10-12, when a starved FRR paused that
+/// long mid-dump. The BGP listener now completes on End-of-RIB, or on
+/// 30 s of silence from a peer that sends none, so on a BGP feed this
+/// window is less evidence than the listener's and the rule above does
+/// not hold there. It is not raised to match: 30 s of literal stillness
+/// is rare on a live full-table feed, so an unattested deferral would
+/// mostly never release. Gating on the session's own reconciliation
+/// (`FeedSession`'s `reconciled`, stamped at InitiationComplete) would
+/// meet the rule without that cost.
 pub const UNATTESTED_QUIET_FOR: Duration = Duration::from_secs(5);
 
 /// How long the source must stay below the quiet RATE before it counts
