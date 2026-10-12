@@ -1282,3 +1282,403 @@ fn a_v6_route_the_kernel_carries_elsewhere_stays_unresolvable() {
         "{named:?}"
     );
 }
+
+/// `unresolvable-accept6` through the whole loop, on the production shape:
+/// the operator's aggregate `2001:db8::/48`, originated with the router's
+/// own address as next hop and with no kernel route behind it, beside the
+/// router's own /64 inside it (kernel-delivered) and an unrelated /64
+/// inside it that is unresolvable too.
+///
+/// The accept is published to the handle the module reloads into, and
+/// every status read after it reflects it with no loop request and no
+/// restart. It matches the aggregate EXACTLY: the other /64 still
+/// degrades `fib-v6` and is the only route on its degrading list, the
+/// aggregate is listed as accepted, the verify summary names both with
+/// the accepted one marked, and the gauges split them. Accepting the /64
+/// too leaves the row Healthy and the event log at `info`, still naming
+/// both. An accept for an installed route is reported unmatched.
+#[test]
+fn an_accepted_aggregate_stops_degrading_fib_v6_and_nothing_else_does() {
+    use packetframe_common::events;
+    use packetframe_common::module::HealthState;
+    use packetframe_vpp_offload::driver::Driver;
+    use packetframe_vpp_offload::engine::UnresolvableAccepts6;
+    use packetframe_vpp_offload::status::{render_metrics, FibSync, StatusSnapshot, SUBSYS_FIB_V6};
+    use std::time::{Duration, Instant};
+
+    /// The router's address on its own /64, the next hop of what it
+    /// originates.
+    const SELF6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+    fn p6(a: &str, len: u8) -> IpPrefix {
+        IpPrefix::V6 {
+            addr: a.parse::<Ipv6Addr>().unwrap().octets(),
+            prefix_len: len,
+        }
+    }
+    fn accept(a: &str, len: u8) -> packetframe_common::config::Ipv6Prefix {
+        packetframe_common::config::Ipv6Prefix {
+            addr: a.parse().unwrap(),
+            prefix_len: len,
+        }
+    }
+    struct Originated;
+    impl RouteSource for Originated {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            visit(v4(0), &[NH4]);
+            // The aggregate: announced, no kernel route, via the router.
+            visit(p6("2001:db8::", 48), &[IpAddr::V6(SELF6)]);
+            // The router's own subnet inside it: kernel-delivered.
+            visit(p6("2001:db8::", 64), &[IpAddr::V6(SELF6)]);
+            // Another /64 inside the aggregate, via the router, in none
+            // of its subnets: unresolvable, and NOT the accepted route.
+            visit(p6("2001:db8:0:5::", 64), &[IpAddr::V6(SELF6)]);
+            // An ordinary v6 route VPP installs.
+            visit(v6(1), &[NH6]);
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(NH4, "eth4", MAC);
+            visit(NH6, "eth4", MAC6);
+        }
+        fn requeue(&self, _: SourceChanges) {}
+        fn route_count(&self) -> u64 {
+            5
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("pf-v6-accept-events-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("event log dir");
+    let log_path = dir.join("events.log");
+    assert!(
+        events::install(log_path.clone(), events::DEFAULT_MAX_BYTES),
+        "no other test in this binary installs the event log"
+    );
+
+    let fake = Fake::start_behaving(
+        "v6-accept",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let rt = Runtime::new(
+        engine(&fake, FamilyPolicy::Both).with_self_networks_v6([(SELF6, 64)]),
+        Box::new(Originated),
+        Box::new(SteeringUnavailable),
+        Box::new(NullStore),
+        Box::new(NoResources),
+        "/usr/bin/vpp",
+        "/tmp/startup.conf",
+    );
+    // As bring-up hands it over: the config's accepts, the aggregate.
+    let handle = std::sync::Arc::new(UnresolvableAccepts6::new(vec![accept("2001:db8::", 48)]));
+    rt.unresolvable_accepts6(handle.clone());
+
+    let mut d = Driver::new();
+    let mut now = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(now, SupEvent::Adopted { steered: false }, &mut fx);
+    }
+    // Ticks until `until`, then once more past the event log's pacing
+    // window, so a changed set of names is written.
+    let run = |d: &mut Driver, now: &mut Instant, until: fn(&Driver) -> bool| {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..256 {
+            if until(d) {
+                break;
+            }
+            let t = d.tick(*now, &mut obs, &mut fx);
+            for ev in rt.take_pending() {
+                d.inject(*now, ev, &mut fx);
+            }
+            *now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+        *now += Duration::from_secs(61);
+        d.tick(*now, &mut obs, &mut fx);
+    };
+    run(&mut d, &mut now, |d| d.state() == State::Ready);
+    assert_eq!(d.state(), State::Ready);
+
+    let snapshot = |d: &Driver, now: Instant| {
+        let rs = rt.status();
+        let fib = rs.last_verify.as_ref().map_or(FibSync::NeverVerified, |v| {
+            FibSync::from_outcome(v, Duration::ZERO, rs.v6_ledger().as_ref())
+        });
+        let summary = rs
+            .last_verify
+            .as_ref()
+            .map(|v| v.summary_with(rs.v6_ledger().as_ref()));
+        (
+            StatusSnapshot::from_runtime(d.supervisor(), rs, d.api_health(now), fib),
+            summary,
+        )
+    };
+    let fib_v6 = |s: &StatusSnapshot| {
+        let r = s.report();
+        let row = r
+            .subsystems
+            .iter()
+            .find(|x| x.name == SUBSYS_FIB_V6)
+            .unwrap_or_else(|| panic!("no fib-v6 row: {r:?}"));
+        (row.state, row.message.clone().unwrap_or_default())
+    };
+    let gauge = |s: &StatusSnapshot, state: &str| {
+        let want = format!(
+            "packetframe_vpp_family_routes{{module=\"vpp-offload\",family=\"ipv6\",\
+             state=\"{state}\"}} "
+        );
+        let m = render_metrics(s, "vpp-offload");
+        m.lines()
+            .find_map(|l| l.strip_prefix(want.as_str()).map(str::to_string))
+            .unwrap_or_else(|| panic!("no {want}: {m}"))
+    };
+
+    // The aggregate accepted; the /64 inside it not.
+    let (s, summary) = snapshot(&d, now);
+    let v6c = s.counts.v6.expect("v6 on");
+    assert_eq!(
+        (v6c.installed, v6c.unresolvable, v6c.unresolvable_accepted),
+        (1, 2, 1),
+        "{v6c:?}"
+    );
+    let (state, msg) = fib_v6(&s);
+    assert_eq!(state, HealthState::Degraded, "{msg}");
+    let (impaired, note) = msg.split_once(". accepted: ").expect("an accepted clause");
+    assert!(
+        impaired.contains("1 unresolvable (next hop not on a VPP port): 2001:db8:0:5::/64 via"),
+        "{msg}"
+    );
+    assert!(!impaired.contains("2001:db8::/48"), "{msg}");
+    assert!(
+        note.starts_with("2001:db8::/48 via 2001:db8::1 (the router's own address"),
+        "{msg}"
+    );
+    assert_eq!(gauge(&s, "unresolvable"), "1");
+    assert_eq!(gauge(&s, "unresolvable_accepted"), "1");
+    let summary = summary.expect("verified");
+    assert!(
+        summary.contains("unresolvable=2 (2001:db8:0:5::/64 via")
+            && summary.contains("[1 accepted by `unresolvable-accept6`: 2001:db8::/48 via"),
+        "{summary}"
+    );
+
+    // The /64 accepted too, by a reload: Healthy, still both counted.
+    handle.publish(vec![accept("2001:db8::", 48), accept("2001:db8:0:5::", 64)]);
+    let (s, _) = snapshot(&d, now);
+    let (state, msg) = fib_v6(&s);
+    assert_eq!(state, HealthState::Healthy, "{msg}");
+    assert!(
+        msg.contains("accepted: 2001:db8::/48 via") && msg.contains("; 2001:db8:0:5::/64 via"),
+        "{msg}"
+    );
+    assert_eq!(gauge(&s, "unresolvable"), "0");
+    assert_eq!(gauge(&s, "unresolvable_accepted"), "2");
+    run(&mut d, &mut now, |_| true);
+
+    // An accept for a route VPP installed instead of the /64: the /64
+    // degrades again, and the installed one is named unmatched.
+    handle.publish(vec![accept("2001:db8::", 48), accept("2001:db8:1::", 48)]);
+    let (s, _) = snapshot(&d, now);
+    let (state, msg) = fib_v6(&s);
+    assert_eq!(state, HealthState::Degraded, "{msg}");
+    assert!(
+        msg.contains("unresolvable-accept6 2001:db8:1::/48 matches no unresolvable route"),
+        "{msg}"
+    );
+
+    // What the event log made of it: first a warning naming the /64 as
+    // unresolvable and the aggregate as accepted, then — once both were
+    // accepted — an info record with nothing unaccepted left.
+    assert!(events::installed().expect("installed").flush(), "flushed");
+    let mut seen = Vec::new();
+    events::read_each(&log_path, |r| {
+        let field = |k: &str| {
+            r.fields
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        if r.event == "unresolvable_routes" && field("ipv6_accepted").contains("2001:db8::/48") {
+            seen.push((r.level, field("ipv6"), field("ipv6_accepted")));
+        }
+    })
+    .expect("the event log reads");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(seen[0].0, events::Level::Warn, "{seen:?}");
+    assert!(seen[0].1.starts_with("2001:db8:0:5::/64 via"), "{seen:?}");
+    assert!(!seen[0].2.contains("2001:db8:0:5::/64"), "{seen:?}");
+    assert_eq!(seen[1].0, events::Level::Info, "{seen:?}");
+    assert_eq!(seen[1].1, "", "{seen:?}");
+    assert!(seen[1].2.contains("2001:db8:0:5::/64 via"), "{seen:?}");
+}
+
+/// A verdict outlives the accept set it was taken under, and the two rows
+/// that name IPv6's unresolvable routes must still agree about each one.
+///
+/// An IPv4 route with no neighbour leaves the verdict INCOMPLETE, the
+/// kind that is not re-run while the table stays unclean, so `fib-synced`
+/// goes on rendering it for as long as the module runs. Accepting the
+/// aggregate by reload after that verify moves it, on `fib-synced`'s
+/// verify summary exactly as on `fib-v6`, from the unresolvable names to
+/// the accepted ones; taking the accept away moves it back. No verify
+/// runs in between: the verdict itself is unchanged throughout.
+#[test]
+fn a_retained_verdict_names_a_reloaded_accept_as_fib_v6_does() {
+    use packetframe_common::module::HealthState;
+    use packetframe_vpp_offload::driver::Driver;
+    use packetframe_vpp_offload::engine::UnresolvableAccepts6;
+    use packetframe_vpp_offload::status::{FibSync, StatusSnapshot, SUBSYS_FIB, SUBSYS_FIB_V6};
+    use std::time::{Duration, Instant};
+
+    const SELF6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+    /// A v4 next hop nothing has resolved.
+    const GONE: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 77));
+    fn aggregate() -> IpPrefix {
+        IpPrefix::V6 {
+            addr: "2001:db8::".parse::<Ipv6Addr>().unwrap().octets(),
+            prefix_len: 48,
+        }
+    }
+    struct Feed;
+    impl RouteSource for Feed {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            visit(v4(0), &[NH4]);
+            visit(v4(5), &[GONE]);
+            visit(aggregate(), &[IpAddr::V6(SELF6)]);
+            visit(v6(1), &[NH6]);
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(NH4, "eth4", MAC);
+            visit(NH6, "eth4", MAC6);
+        }
+        fn requeue(&self, _: SourceChanges) {}
+        fn route_count(&self) -> u64 {
+            4
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+    }
+
+    let fake = Fake::start_behaving(
+        "v6-accept-verdict",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let rt = Runtime::new(
+        engine(&fake, FamilyPolicy::Both).with_self_networks_v6([(SELF6, 64)]),
+        Box::new(Feed),
+        Box::new(SteeringUnavailable),
+        Box::new(NullStore),
+        Box::new(NoResources),
+        "/usr/bin/vpp",
+        "/tmp/startup.conf",
+    );
+    let handle = std::sync::Arc::new(UnresolvableAccepts6::default());
+    rt.unresolvable_accepts6(handle.clone());
+
+    let mut d = Driver::new();
+    let mut now = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(now, SupEvent::Adopted { steered: false }, &mut fx);
+    }
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..256 {
+            if d.state() == State::Ready {
+                break;
+            }
+            let t = d.tick(now, &mut obs, &mut fx);
+            for ev in rt.take_pending() {
+                d.inject(now, ev, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(d.state(), State::Ready);
+
+    // Both rows as `packetframe status` renders them now, from one status
+    // read, with the verdict the service would be holding.
+    let rows = || {
+        let rs = rt.status();
+        let verdict = rs.last_verify.clone().expect("verified");
+        let fib = FibSync::from_outcome(&verdict, Duration::ZERO, rs.v6_ledger().as_ref());
+        let r = StatusSnapshot::from_runtime(d.supervisor(), rs, d.api_health(now), fib).report();
+        let row = |name: &str| {
+            let s = r
+                .subsystems
+                .iter()
+                .find(|x| x.name == name)
+                .unwrap_or_else(|| panic!("no {name} row: {r:?}"));
+            (s.state, s.message.clone().unwrap_or_default())
+        };
+        (row(SUBSYS_FIB), row(SUBSYS_FIB_V6), verdict.summary())
+    };
+    // The IPv6 half of the verify summary on `fib-synced`.
+    let v6_half = |msg: &str| {
+        msg.split_once("; IPv6 (")
+            .unwrap_or_else(|| panic!("no IPv6 half: {msg}"))
+            .1
+            .to_string()
+    };
+
+    // Taken with nothing accepted: the aggregate is unresolvable on both.
+    let ((fib_state, fib_msg), (v6_state, v6_msg), verdict) = rows();
+    assert_eq!(fib_state, HealthState::Degraded, "{fib_msg}");
+    assert!(fib_msg.contains("INCOMPLETE"), "{fib_msg}");
+    let half = v6_half(&fib_msg);
+    assert!(half.contains("unresolvable=1 (2001:db8::/48 via"), "{half}");
+    assert!(!half.contains("accepted"), "{half}");
+    assert_eq!(v6_state, HealthState::Degraded, "{v6_msg}");
+    assert!(v6_msg.contains("1 unresolvable"), "{v6_msg}");
+
+    // Accepted by reload, no verify since: accepted on both.
+    handle.publish(vec![packetframe_common::config::Ipv6Prefix {
+        addr: "2001:db8::".parse().unwrap(),
+        prefix_len: 48,
+    }]);
+    let ((_, fib_msg), (v6_state, v6_msg), unchanged) = rows();
+    assert_eq!(unchanged, verdict, "no verify ran");
+    let half = v6_half(&fib_msg);
+    assert!(
+        half.contains("unresolvable=1 [1 accepted by `unresolvable-accept6`: 2001:db8::/48 via"),
+        "{half}"
+    );
+    assert!(!half.contains("unresolvable=1 (2001:db8::/48"), "{half}");
+    assert_eq!(v6_state, HealthState::Healthy, "{v6_msg}");
+    assert!(v6_msg.contains("accepted: 2001:db8::/48 via"), "{v6_msg}");
+
+    // The accept taken away again: unresolvable on both.
+    handle.publish(Vec::new());
+    let ((_, fib_msg), (v6_state, v6_msg), unchanged) = rows();
+    assert_eq!(unchanged, verdict, "no verify ran");
+    let half = v6_half(&fib_msg);
+    assert!(half.contains("unresolvable=1 (2001:db8::/48 via"), "{half}");
+    assert!(!half.contains("accepted"), "{half}");
+    assert_eq!(v6_state, HealthState::Degraded, "{v6_msg}");
+    assert!(!v6_msg.contains("accepted:"), "{v6_msg}");
+}

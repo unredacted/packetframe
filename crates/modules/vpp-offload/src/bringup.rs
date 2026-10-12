@@ -120,6 +120,9 @@ pub struct Attached {
     /// `reconfigure` to publish reloads into directly
     /// ([`crate::drift::DriftAccepts6`]).
     pub drift_accepts6: Arc<crate::drift::DriftAccepts6>,
+    /// The `unresolvable-accept6` set, likewise
+    /// ([`crate::engine::UnresolvableAccepts6`]).
+    pub unresolvable_accepts6: Arc<crate::engine::UnresolvableAccepts6>,
     /// The VPP sampler's directory as attach left it: the `sampler-dir`
     /// row.
     pub sampler_dir: crate::sampler::SamplerDir,
@@ -930,6 +933,9 @@ pub fn bring_up(
         held_steering,
         cfg.families(),
         Arc::new(crate::drift::DriftAccepts6::new(cfg.drift_accepts6.clone())),
+        Arc::new(crate::engine::UnresolvableAccepts6::new(
+            cfg.unresolvable_accepts6.clone(),
+        )),
         sampler_dir,
     ) {
         Ok(attached) => Ok(attached),
@@ -1011,6 +1017,7 @@ fn finish(
     held_steering: crate::SteeringInputs,
     families: FamilyPolicy,
     drift_accepts6: Arc<crate::drift::DriftAccepts6>,
+    unresolvable_accepts6: Arc<crate::engine::UnresolvableAccepts6>,
     sampler_dir: crate::sampler::SamplerDir,
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
@@ -1423,6 +1430,7 @@ fn finish(
         .max(1500);
     let handback_wanted = crate::handback::plans_divert_v6(&held_steering.targets);
     let loop_accepts6 = drift_accepts6.clone();
+    let loop_unresolvable_accepts6 = unresolvable_accepts6.clone();
     // The kernel path's host side ([`crate::kernel_path::LiveKernelPath`]),
     // built on the loop thread from these: where the IRQs and counters
     // live, every CPU VPP is on (derived AND observed — the same set the
@@ -1540,6 +1548,7 @@ fn finish(
             runtime.publish_sampler_ports(handle);
         }
         runtime.drift_accepts6(loop_accepts6);
+        runtime.unresolvable_accepts6(loop_unresolvable_accepts6);
         // The kernel rx-mode kick — the AllmultiKick doc in `runtime`
         // carries the w6/w8 evidence. Installed unconditionally on
         // Linux: every member VF attach needs it, and the real
@@ -1733,6 +1742,7 @@ fn finish(
         held_steering: Some(held_steering),
         control_plane,
         drift_accepts6,
+        unresolvable_accepts6,
         sampler_dir,
     })
 }
@@ -1910,6 +1920,7 @@ mod completeness_gate_tests {
             v6_divert: vec![],
             steer_keeps6: vec![],
             drift_accepts6: vec![],
+            unresolvable_accepts6: vec![],
             v6: false,
             steer_direction: Default::default(),
             loopback_address6: None,

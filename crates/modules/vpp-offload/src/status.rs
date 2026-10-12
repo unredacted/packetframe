@@ -252,7 +252,17 @@ impl FibSync {
     /// [`VerifyOutcome::passed`] decides pass/fail — this must not
     /// re-derive the criteria, or the gate that governs steering and the
     /// gate that reports health could disagree.
-    pub fn from_outcome(outcome: &VerifyOutcome, age: Duration) -> Self {
+    ///
+    /// `v6_ledger` is the live IPv6 ledger the `fib-v6` row reads
+    /// ([`crate::runtime::RuntimeStatus::v6_ledger`]); the summary's IPv6
+    /// half names its routes from it, so a reload of `unresolvable-accept6`
+    /// after the verify moves a route on both rows at once
+    /// ([`crate::verify::V6Ledger`]).
+    pub fn from_outcome(
+        outcome: &VerifyOutcome,
+        age: Duration,
+        v6_ledger: Option<&crate::verify::V6Ledger>,
+    ) -> Self {
         if outcome.passed() {
             Self::Verified {
                 age,
@@ -262,12 +272,12 @@ impl FibSync {
         } else if outcome.restart_worthy() {
             Self::Failed {
                 age,
-                summary: outcome.summary(),
+                summary: outcome.summary_with(v6_ledger),
             }
         } else {
             Self::Unfit {
                 age,
-                summary: outcome.summary(),
+                summary: outcome.summary_with(v6_ledger),
                 reruns: outcome.awaits_clean_table(),
                 sampled: outcome.sampled,
                 table: outcome.table,
@@ -474,8 +484,16 @@ pub struct StatusSnapshot {
     /// `observe_parts` argument; the service sets it on the snapshot, as
     /// it does `neighbour_counters`, before anything renders from it.
     pub unresolvable_named: Vec<String>,
-    /// The same for IPv6, under `v6 on`.
+    /// The same for IPv6, under `v6 on` — less the routes an
+    /// `unresolvable-accept6` names, which are the next field.
     pub unresolvable_named_v6: Vec<String>,
+    /// The IPv6 unresolvable routes an `unresolvable-accept6` names, as
+    /// [`crate::engine::ConvergenceEngine::unresolvable_accepted_named`]
+    /// renders them. Set like `unresolvable_named`.
+    pub unresolvable_accepted_v6: Vec<String>,
+    /// `unresolvable-accept6` prefixes naming no unresolvable route,
+    /// `addr/len`. Set like `unresolvable_named`.
+    pub unresolvable_accepts_unmatched_v6: Vec<String>,
     /// Cumulative null-node drops from VPP's own error counters,
     /// sampled over `cli_inband`. `None` until a sample succeeds —
     /// absent rather than 0, so a broken read path cannot impersonate
@@ -716,6 +734,8 @@ impl StatusSnapshot {
             kernel_delivered_routes,
             unresolvable_named: Vec::new(),
             unresolvable_named_v6: Vec::new(),
+            unresolvable_accepted_v6: Vec::new(),
+            unresolvable_accepts_unmatched_v6: Vec::new(),
             null_drops,
             neighbour_counters: None,
             kernel_path: Vec::new(),
@@ -794,6 +814,8 @@ impl StatusSnapshot {
         snap.drift_scan_ms = rs.drift_scan_ms;
         snap.unresolvable_named = rs.unresolvable_named;
         snap.unresolvable_named_v6 = rs.unresolvable_named_v6;
+        snap.unresolvable_accepted_v6 = rs.unresolvable_accepted_v6;
+        snap.unresolvable_accepts_unmatched_v6 = rs.unresolvable_accepts_unmatched_v6;
         snap
     }
 
@@ -1991,6 +2013,13 @@ impl StatusSnapshot {
     /// v4 table and its steering are unaffected either way. Verification's
     /// v6 probes are in the verify summary (`VerifyOutcome::summary`),
     /// logged with every verdict.
+    ///
+    /// Unresolvable routes an `unresolvable-accept6` names degrade
+    /// nothing ([`crate::sink::FamilyCounts::degraded`]): they are listed
+    /// after everything else as accepted, in whichever state the row is
+    /// in, so the decision stays visible without keeping the row red and
+    /// hiding the next real route behind it — `exempt-drift-v6`'s rule
+    /// for `drift-accept6`.
     fn fib_v6_health(&self) -> Option<SubsystemHealth> {
         let v6 = self.counts.v6?;
         // Read from the installed plan, like the steering row: what the
@@ -2007,7 +2036,7 @@ impl StatusSnapshot {
             );
             for (n, what) in [
                 (v6.withheld, "withheld (v6 pool at capacity)"),
-                (v6.unresolvable, v6_unresolvable.as_str()),
+                (v6.unresolvable_unaccepted(), v6_unresolvable.as_str()),
                 (
                     v6.rejected,
                     "refused by VPP (parked; retried when the route next changes or \
@@ -2083,12 +2112,48 @@ impl StatusSnapshot {
                 },
             )
         };
+        let message = match self.unresolvable_v6_acceptance_note() {
+            Some(note) => format!("{message}. {note}"),
+            None => message,
+        };
         Some(SubsystemHealth {
             name: SUBSYS_FIB_V6.into(),
             state,
             message: Some(message),
             last_success_age_seconds: None,
         })
+    }
+
+    /// The `unresolvable-accept6` part of the `fib-v6` row: the accepted
+    /// routes, then each accept that names no unresolvable route. `None`
+    /// when there is neither.
+    ///
+    /// A stale accept is named only once the module has arrived (`Ready`
+    /// or `Steered`): before that the table is still loading, and an
+    /// accept for a route not yet received is not stale. Named, never
+    /// degrading, as `exempt-drift-v6` names a `drift-accept6` that
+    /// matches nothing: left in the file it would accept the same prefix
+    /// unseen the next time it goes unresolvable, possibly for a
+    /// different reason.
+    fn unresolvable_v6_acceptance_note(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.unresolvable_accepted_v6.is_empty() {
+            parts.push(format!(
+                "accepted: {} (`unresolvable-accept6` — acknowledged, not fixed: they stay \
+                 out of VPP, and diverted IPv6 for them still dies there)",
+                self.unresolvable_accepted_v6.join("; ")
+            ));
+        }
+        if matches!(self.state, State::Ready | State::Steered) {
+            parts.extend(self.unresolvable_accepts_unmatched_v6.iter().map(|p| {
+                format!(
+                    "unresolvable-accept6 {p} matches no unresolvable route — the route resolved \
+                     or left the table; drop the line, or it will silently accept that prefix \
+                     the next time it goes unresolvable"
+                )
+            }));
+        }
+        (!parts.is_empty()).then(|| parts.join(". "))
     }
 
     fn steering_health(&self) -> SubsystemHealth {
@@ -2834,6 +2899,10 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
             // exist only for it; IPv4's refusals are requeued, not parked.
             let extra: &[(&str, u64)] = if family == "ipv6" {
                 &[
+                    // Beside `unresolvable`, which counts only what no
+                    // accept names, so the two sum to the ledger's count
+                    // — `exempt_drift_v6`'s rule for its accepted twin.
+                    ("unresolvable_accepted", f.unresolvable_accepted),
                     ("rejected", f.rejected),
                     ("link_local_refused", f.link_local_refused),
                     ("verify_mismatch", f.verify_mismatches),
@@ -2846,7 +2915,7 @@ pub fn render_metrics(snap: &StatusSnapshot, module: &str) -> String {
                 ("installed", f.installed),
                 ("installing", f.installing),
                 ("withheld", f.withheld),
-                ("unresolvable", f.unresolvable),
+                ("unresolvable", f.unresolvable_unaccepted()),
             ]
             .iter()
             .chain(extra)
@@ -5353,7 +5422,7 @@ mod tests {
             "but a restart cannot make the source dump faster"
         );
         assert!(matches!(
-            FibSync::from_outcome(&empty, Duration::ZERO),
+            FibSync::from_outcome(&empty, Duration::ZERO, None),
             FibSync::Unfit { .. }
         ));
 
@@ -5365,7 +5434,7 @@ mod tests {
         };
         assert!(!holes.passed() && !holes.restart_worthy());
         assert!(matches!(
-            FibSync::from_outcome(&holes, Duration::ZERO),
+            FibSync::from_outcome(&holes, Duration::ZERO, None),
             FibSync::Unfit { .. }
         ));
 
@@ -5382,7 +5451,7 @@ mod tests {
         };
         assert!(wrong.restart_worthy());
         assert!(matches!(
-            FibSync::from_outcome(&wrong, Duration::ZERO),
+            FibSync::from_outcome(&wrong, Duration::ZERO, None),
             FibSync::Failed { .. }
         ));
 
@@ -5392,7 +5461,7 @@ mod tests {
         };
         assert!(good.passed());
         assert!(matches!(
-            FibSync::from_outcome(&good, Duration::ZERO),
+            FibSync::from_outcome(&good, Duration::ZERO, None),
             FibSync::Verified { sampled: 64, .. }
         ));
     }
@@ -6029,6 +6098,162 @@ mod tests {
         let msg = whole.message.unwrap_or_default();
         assert!(!msg.contains("not steered"), "{msg}");
         assert!(msg.contains("diverted into VPP on eth4 vlan 100"), "{msg}");
+    }
+
+    /// `unresolvable-accept6` on the `fib-v6` row and its gauges. An
+    /// accepted route alone leaves the row and overall Healthy, listed as
+    /// accepted and counted on its own gauge — `unresolvable` reads 0 and
+    /// the two still sum to the ledger's count. With another unresolvable
+    /// route the row is Degraded and names only the other in the
+    /// degrading list, the accepted one after. An accept naming no
+    /// unresolvable route is named once the module has arrived, never
+    /// while the table loads, and degrades nothing.
+    #[test]
+    fn an_accepted_unresolvable_v6_route_is_listed_and_degrades_nothing() {
+        use crate::sink::FamilyCounts;
+        const AGGREGATE: &str = "2001:db8::/48 via 2001:db8::1 (the router's own address, \
+                                 which VPP has no adjacency for; …)";
+        const OTHER: &str = "2001:db8:0:5::/64 via 2001:db8::1 (the router's own address, \
+                             which VPP has no adjacency for; …)";
+        let snap = |sup: &Supervisor,
+                    v6: FamilyCounts,
+                    open: &[&str],
+                    accepted: &[&str],
+                    stale: &[&str]| {
+            let mut counts = ledger_with(5, 0, 0).counts();
+            counts.v6 = Some(v6);
+            let mut s = StatusSnapshot::observe(
+                sup,
+                counts,
+                &PendingMap::new(),
+                ApiHealth::Answering {
+                    silent_for: Duration::from_millis(1),
+                },
+                verified(1),
+                ports_up(),
+                true,
+            );
+            let owned = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+            s.unresolvable_named_v6 = owned(open);
+            s.unresolvable_accepted_v6 = owned(accepted);
+            s.unresolvable_accepts_unmatched_v6 = owned(stale);
+            s
+        };
+        let row = |s: &StatusSnapshot| {
+            s.report()
+                .subsystems
+                .into_iter()
+                .find(|x| x.name == SUBSYS_FIB_V6)
+                .expect("row")
+        };
+        let gauge = |s: &StatusSnapshot, state: &str| {
+            let want = format!(
+                "packetframe_vpp_family_routes{{module=\"vpp-offload\",family=\"ipv6\",\
+                 state=\"{state}\"}} "
+            );
+            let m = render_metrics(s, "vpp-offload");
+            m.lines()
+                .find_map(|l| l.strip_prefix(want.as_str()).map(str::to_string))
+                .unwrap_or_else(|| panic!("no {want}: {m}"))
+        };
+
+        // Accepted alone.
+        let alone = snap(
+            &steered_supervisor(),
+            FamilyCounts {
+                installed: 250,
+                unresolvable: 1,
+                unresolvable_accepted: 1,
+                ..Default::default()
+            },
+            &[],
+            &[AGGREGATE],
+            &[],
+        );
+        let r = row(&alone);
+        let msg = r.message.unwrap_or_default();
+        assert_eq!(r.state, HealthState::Healthy, "{msg}");
+        assert!(msg.starts_with("250 IPv6 routes loaded in VPP"), "{msg}");
+        assert!(!msg.contains("impaired"), "{msg}");
+        assert!(
+            msg.contains(
+                "accepted: 2001:db8::/48 via 2001:db8::1 (the router's own address, which VPP \
+                 has no adjacency for; …) (`unresolvable-accept6` — acknowledged, not fixed"
+            ),
+            "{msg}"
+        );
+        assert_eq!(alone.report().overall, HealthState::Healthy);
+        assert_eq!(gauge(&alone, "unresolvable"), "0");
+        assert_eq!(gauge(&alone, "unresolvable_accepted"), "1");
+
+        // Accepted plus another: Degraded over the other alone.
+        let both = snap(
+            &steered_supervisor(),
+            FamilyCounts {
+                installed: 250,
+                unresolvable: 2,
+                unresolvable_accepted: 1,
+                ..Default::default()
+            },
+            &[OTHER],
+            &[AGGREGATE],
+            &[],
+        );
+        let r = row(&both);
+        let msg = r.message.unwrap_or_default();
+        assert_eq!(r.state, HealthState::Degraded, "{msg}");
+        let (impaired, note) = msg.split_once(". accepted: ").expect("an accepted clause");
+        assert!(
+            impaired.contains("1 unresolvable (next hop not on a VPP port): 2001:db8:0:5::/64"),
+            "{msg}"
+        );
+        assert!(!impaired.contains("2001:db8::/48"), "{msg}");
+        assert!(note.starts_with("2001:db8::/48 via"), "{msg}");
+        assert_eq!(both.report().overall, HealthState::Degraded);
+        assert_eq!(gauge(&both, "unresolvable"), "1");
+        assert_eq!(gauge(&both, "unresolvable_accepted"), "1");
+
+        // An accept that names no unresolvable route: named once arrived,
+        // degrading nothing.
+        let stale = snap(
+            &steered_supervisor(),
+            FamilyCounts {
+                installed: 250,
+                ..Default::default()
+            },
+            &[],
+            &[],
+            &["2001:db8::/48"],
+        );
+        let r = row(&stale);
+        let msg = r.message.unwrap_or_default();
+        assert_eq!(r.state, HealthState::Healthy, "{msg}");
+        assert!(
+            msg.contains("unresolvable-accept6 2001:db8::/48 matches no unresolvable route"),
+            "{msg}"
+        );
+        assert!(!msg.contains("accepted:"), "nothing is accepted: {msg}");
+        assert_eq!(stale.report().overall, HealthState::Healthy);
+        assert_eq!(gauge(&stale, "unresolvable_accepted"), "0");
+
+        // ...but not while the table is still loading.
+        let mut syncing = Supervisor::new();
+        syncing.on(Event::StartRequested);
+        syncing.on(Event::Spawned);
+        syncing.on(Event::ApiUp);
+        assert_eq!(syncing.state(), State::Syncing);
+        let loading = snap(
+            &syncing,
+            FamilyCounts {
+                installing: 40,
+                ..Default::default()
+            },
+            &[],
+            &[],
+            &["2001:db8::/48"],
+        );
+        let msg = row(&loading).message.unwrap_or_default();
+        assert!(!msg.contains("matches no unresolvable route"), "{msg}");
     }
 
     /// The exemption tripwire: quiet = no row, firing = Degraded with

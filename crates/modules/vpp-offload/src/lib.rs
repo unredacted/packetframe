@@ -176,6 +176,12 @@ pub struct VppOffloadConfig {
     /// tripwire reports, never what the NIC holds, so it does not wait on
     /// a steer the way the drift scope does.
     pub drift_accepts6: Vec<packetframe_common::config::Ipv6Prefix>,
+    /// `unresolvable-accept6` lines, in config order: unresolvable IPv6
+    /// routes the operator has accepted, each matched exactly
+    /// ([`engine::UnresolvableAccepts6`]). Hot without the supervision
+    /// loop, like `drift_accepts6` and for the same reason: it changes
+    /// what `fib-v6` reports, never what VPP or the NIC holds.
+    pub unresolvable_accepts6: Vec<packetframe_common::config::Ipv6Prefix>,
     /// `v6 on`: VPP carries IPv6 routes and neighbours
     /// ([`fib_sync::FamilyPolicy::Both`]). Default off. Restart-only —
     /// it sizes the segments VPP fixes at start, and decides what the
@@ -300,6 +306,9 @@ impl VppOffloadConfig {
                 }
                 ModuleDirective::VppSteerKeep6(k) => out.steer_keeps6.push(*k),
                 ModuleDirective::VppDriftAccept6 { prefix, .. } => out.drift_accepts6.push(*prefix),
+                ModuleDirective::VppUnresolvableAccept6 { prefix, .. } => {
+                    out.unresolvable_accepts6.push(*prefix)
+                }
                 ModuleDirective::VppBinary(p) => out.vpp_binary = Some(p.clone()),
                 ModuleDirective::ExpectedRoutes(n) => out.expected_routes = *n,
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
@@ -1717,7 +1726,13 @@ impl Module for VppOffloadModule {
         // first steer refused by the completeness gate, say, must not
         // leave an accepted finding degrading health. The loop reads it
         // when the next scan lands ([`drift::DriftAccepts6`]).
+        // `unresolvable-accept6` likewise: it changes only what `fib-v6`
+        // reports, and the loop reads it when it next publishes status
+        // ([`engine::UnresolvableAccepts6`]).
         attached.drift_accepts6.publish(new.drift_accepts6.clone());
+        attached
+            .unresolvable_accepts6
+            .publish(new.unresolvable_accepts6.clone());
 
         let allowlist = self.allowlist.get();
         let target = (self.plan_reload)(&new, &allowlist, &self.state_dir)
@@ -1770,8 +1785,9 @@ impl Module for VppOffloadModule {
         //   every hot input this method applies through the loop — the
         //   `steer` flags, directions, exemptions, keeps, `v6-divert`, and
         //   fast-path's allowlist read live — so an `allow-prefix` edit
-        //   fails this test and a `dry-run` flip passes it. The one other
-        //   hot directive, `drift-accept6`, was published above;
+        //   fails this test and a `dry-run` flip passes it. The two other
+        //   hot directives, `drift-accept6` and `unresolvable-accept6`,
+        //   were published above;
         // - an identical request would not ACT: nothing is steered or
         //   wanted, or the state would refuse it untouched — in every
         //   convergence state, degraded or not. What still goes to the
@@ -2724,6 +2740,7 @@ mod tests {
             v6_divert: vec![],
             steer_keeps6: vec![],
             drift_accepts6: vec![],
+            unresolvable_accepts6: vec![],
             v6: false,
             steer_direction: Default::default(),
             loopback_address6: None,
@@ -2985,6 +3002,9 @@ mod tests {
             control_plane: None,
             drift_accepts6: std::sync::Arc::new(drift::DriftAccepts6::new(
                 m.cfg.drift_accepts6.clone(),
+            )),
+            unresolvable_accepts6: std::sync::Arc::new(engine::UnresolvableAccepts6::new(
+                m.cfg.unresolvable_accepts6.clone(),
             )),
             sampler_dir: sampler::SamplerDir::Unavailable("not prepared in this test".into()),
         });
@@ -3367,6 +3387,48 @@ mod tests {
 
         reload(&mut m, &section).expect("and taking it away is not either");
         assert!(handle.get().is_empty());
+        m.detach().expect("the stand-in loop stops");
+    }
+
+    /// `unresolvable-accept6` is hot WITHOUT the loop, for the same
+    /// reason: it changes what `fib-v6` reports and nothing the NIC or
+    /// VPP holds. A reload that edits only it is answered at once behind
+    /// a loop that would never pick up a request, and lands in the handle
+    /// the loop reads when it publishes status — in both directions, and
+    /// apart from the `drift-accept6` handle beside it.
+    #[test]
+    fn an_unresolvable_accept6_edit_reaches_the_loop_handle_without_asking_the_loop() {
+        let accept = packetframe_common::config::Ipv6Prefix {
+            addr: "2001:db8::".parse().unwrap(),
+            prefix_len: 48,
+        };
+        let section = resend_section(vec![]);
+        let accepting = resend_section(vec![
+            packetframe_common::config::ModuleDirective::VppUnresolvableAccept6 {
+                prefix: accept,
+                line: 2,
+            },
+        ]);
+        let mut m = behind_a_wedged_loop(&section, healthy_published());
+        let attached = m.attached.as_ref().expect("attached");
+        let handle = attached.unresolvable_accepts6.clone();
+        let drift = attached.drift_accepts6.clone();
+        assert!(handle.get().is_empty());
+
+        let started = std::time::Instant::now();
+        reload(&mut m, &accepting).expect("an accept is not a steering change");
+        assert!(
+            started.elapsed() < service::STEERING_BUDGET / 2,
+            "answered in {:?} — that is the loop's budget, so it was asked",
+            started.elapsed()
+        );
+        assert_eq!(handle.get(), [accept]);
+        assert_eq!(m.cfg.unresolvable_accepts6, [accept]);
+        assert!(drift.get().is_empty(), "a drift-accept6 it is not");
+
+        reload(&mut m, &section).expect("and taking it away is not either");
+        assert!(handle.get().is_empty());
+        assert!(m.cfg.unresolvable_accepts6.is_empty());
         m.detach().expect("the stand-in loop stops");
     }
 

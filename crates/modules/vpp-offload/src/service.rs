@@ -1535,7 +1535,9 @@ fn run_loop(
         let now = Instant::now();
         let rs = runtime.status();
         let fib = match (last_verify, last_verify_at) {
-            (Some(outcome), Some(at)) => FibSync::from_outcome(outcome, now - *at),
+            (Some(outcome), Some(at)) => {
+                FibSync::from_outcome(outcome, now - *at, rs.v6_ledger().as_ref())
+            }
             _ => FibSync::NeverVerified,
         };
         // The store failure goes INTO the snapshot, not onto the report

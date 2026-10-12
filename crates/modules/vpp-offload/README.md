@@ -118,14 +118,17 @@ module vpp-offload
   table, and the binary path.
 - `v6 on` carries the IPv6 table in VPP. `v6-divert <vid>,…|untagged`
   on a `port` line then steers IPv6 by frame (below), `steer-keep6`
-  keeps IPv6 services on the kernel, and `drift-accept6` acknowledges
-  an IPv6 drift finding that has been examined.
+  keeps IPv6 services on the kernel, `drift-accept6` acknowledges
+  an IPv6 drift finding that has been examined, and
+  `unresolvable-accept6` acknowledges an examined unresolvable IPv6
+  route (typically the operator's own announced aggregate).
 
 **Reloads.** The steering inputs — `steer`, `direction` /
 `steer-direction`, `steer-exempt`, `v6-divert`, `steer-keep6` — and
-`drift-accept6` change under a running VPP: a SIGHUP applies them as an
-MCAM delta (or, for `drift-accept6`, at the next scan), with no VPP
-restart and no resync. Everything else is fixed when VPP starts, and
+`drift-accept6` and `unresolvable-accept6` change under a running VPP:
+a SIGHUP applies them as an MCAM delta (or, for the two accepts, at the
+next scan and the next status publication), with no VPP restart and no
+resync. Everything else is fixed when VPP starts, and
 `reconfigure` refuses it by name. All ports as members with steering
 off is the safe staging state and where every rollback ends.
 

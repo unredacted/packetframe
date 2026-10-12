@@ -151,6 +151,43 @@ pub const KERNEL_REFUSALS_CAP: usize = 4_096;
 /// ([`ConvergenceEngine::unresolvable_named`]). The rest are "+K more".
 pub const NAMED_UNRESOLVABLE: usize = 5;
 
+/// The `unresolvable-accept6` set, shared between the module, which
+/// replaces it on every accepted reconfigure, and the supervision loop,
+/// which hands it to the engine each time it publishes status or writes
+/// the unresolvable routes to the event log
+/// ([`ConvergenceEngine::set_unresolvable_accepts6`]).
+///
+/// A handle for [`crate::drift::DriftAccepts6`]'s reason: an accept
+/// changes what `fib-v6` reports and nothing VPP or the NIC holds, so a
+/// reload that edits only it must not wait on the loop or a steer.
+///
+/// Each accept matches one ledger prefix EXACTLY, never what lies inside
+/// it. The route it is written for is an aggregate the operator
+/// announces with the router as next hop and no kernel route behind it,
+/// whose unused space dropping in VPP is the outcome a blackhole anchor
+/// would give. A more specific route inside the aggregate that goes
+/// unresolvable is a different route, with its own next hop and its own
+/// remedy (a subnet just addressed, a transit route under
+/// `next-hop-self`); a covering match would accept it unseen, which is
+/// how the one red row an operator watches goes quiet over a real fault.
+#[derive(Debug, Default)]
+pub struct UnresolvableAccepts6(std::sync::RwLock<Vec<packetframe_common::config::Ipv6Prefix>>);
+
+impl UnresolvableAccepts6 {
+    pub fn new(accepts: Vec<packetframe_common::config::Ipv6Prefix>) -> Self {
+        Self(std::sync::RwLock::new(accepts))
+    }
+
+    /// Replace the whole set. The module is the only writer.
+    pub fn publish(&self, accepts: Vec<packetframe_common::config::Ipv6Prefix>) {
+        *self.0.write().expect("unresolvable-accept6 lock") = accepts;
+    }
+
+    pub fn get(&self) -> Vec<packetframe_common::config::Ipv6Prefix> {
+        self.0.read().expect("unresolvable-accept6 lock").clone()
+    }
+}
+
 /// Where routes and nexthop devices come from.
 ///
 /// A trait because the real source is the fast-path crate's
@@ -905,6 +942,13 @@ pub struct ConvergenceEngine {
     /// `kernel_delivered` prefix before a first steer
     /// ([`Self::unexempted_local`]).
     steer_exempts: Vec<packetframe_common::config::Ipv4Prefix>,
+    /// The `unresolvable-accept6` set as the loop last handed it over
+    /// ([`Self::set_unresolvable_accepts6`]): IPv6 routes, matched
+    /// exactly, whose unresolvability is acknowledged and so named and
+    /// counted apart ([`Self::unresolvable_accepted_named`]). A copy
+    /// rather than the handle, so every count and name one status read
+    /// takes is judged against the same set.
+    unresolvable_accepts6: Vec<packetframe_common::config::Ipv6Prefix>,
     /// Kernel FIB lookups the current walk may still make
     /// ([`Self::kernel_owns`]). Reset to [`FIB_MATCH_BUDGET_RESYNC`] by
     /// each resync and to [`FIB_MATCH_BUDGET_DELTA`] by each delta
@@ -1171,6 +1215,7 @@ impl ConvergenceEngine {
             kernel_refused: std::collections::HashMap::new(),
             link_local_refused: HashSet::new(),
             steer_exempts: Vec::new(),
+            unresolvable_accepts6: Vec::new(),
             loopback,
             loop_index: None,
             loopback6: None,
@@ -1631,6 +1676,17 @@ impl ConvergenceEngine {
         self.steer_exempts = exempts;
     }
 
+    /// The `unresolvable-accept6` set ([`UnresolvableAccepts6`]), as the
+    /// loop read it from the module's handle. Classification never reads
+    /// it: an accepted route is unresolvable exactly as before, only
+    /// named and counted apart.
+    pub fn set_unresolvable_accepts6(
+        &mut self,
+        accepts: Vec<packetframe_common::config::Ipv6Prefix>,
+    ) {
+        self.unresolvable_accepts6 = accepts;
+    }
+
     /// Whether a route is the router's own business — delivered, or
     /// carried, by the kernel through nothing VPP has — and so left out
     /// of VPP and counted as kernel-delivered rather than unresolvable.
@@ -1853,6 +1909,12 @@ impl ConvergenceEngine {
     /// reported one — then `"+K more"` when the count is larger. Empty
     /// when nothing is unresolvable.
     ///
+    /// For IPv6, only the routes no `unresolvable-accept6` names: the
+    /// accepted ones are [`Self::unresolvable_accepted_named`], so a
+    /// surface listing what degrades it never lists what does not, and an
+    /// accepted route never takes one of the few name slots from a route
+    /// that is news. `+K more` counts the unaccepted only.
+    ///
     /// The names the count never had: `unresolvable=1` on its own sent an
     /// operator through `vppctl show ip fib` and the fast-path dump for
     /// rounds, and the fast-path dump cannot even show it — a route whose
@@ -1863,47 +1925,127 @@ impl ConvergenceEngine {
     /// mapping's own reasons ([`NexthopMap::why_unresolved`]), so a name
     /// cannot describe a different decision from the one that was made.
     pub fn unresolvable_named(&self, v6: bool) -> Vec<String> {
+        let accepted = if v6 {
+            self.accepted_unresolvable()
+        } else {
+            Vec::new()
+        };
         let total = if v6 {
             self.ledger.v6_counts().unresolvable
         } else {
             self.ledger.counts().unresolvable
-        };
+        }
+        .saturating_sub(accepted.len() as u64);
         if total == 0 {
             return Vec::new();
         }
+        // Over-asked by the accepted count, which are then skipped: of the
+        // first N + k entries at most k are accepted, so the first N
+        // unaccepted ones are among them.
         let mut out: Vec<String> = self
             .ledger
-            .unresolvable_detail(v6, NAMED_UNRESOLVABLE)
+            .unresolvable_detail(v6, NAMED_UNRESOLVABLE + accepted.len())
             .into_iter()
-            .map(|(prefix, nhs)| {
-                if nhs.is_empty() {
-                    return format!("{} (no next hop)", cidr(&prefix));
-                }
-                // An ECMP set is named by its first few paths: the reason
-                // is usually shared, and a line per path would bury the
-                // other prefixes.
-                const PATHS_NAMED: usize = 3;
-                let mut paths: Vec<String> = nhs
-                    .iter()
-                    .take(PATHS_NAMED)
-                    .map(|nh| match self.nexthops.device_of(nh) {
-                        Some(dev) => {
-                            format!("{nh} dev {dev} ({})", self.why_unresolved(&prefix, nh))
-                        }
-                        None => format!("{nh} ({})", self.why_unresolved(&prefix, nh)),
-                    })
-                    .collect();
-                if nhs.len() > PATHS_NAMED {
-                    paths.push(format!("+{} more path(s)", nhs.len() - PATHS_NAMED));
-                }
-                format!("{} via {}", cidr(&prefix), paths.join(", "))
-            })
+            .filter(|(prefix, _)| !accepted.contains(prefix))
+            .take(NAMED_UNRESOLVABLE)
+            .map(|(prefix, nhs)| self.unresolvable_name(&prefix, &nhs))
             .collect();
         let named = out.len() as u64;
         if total > named {
             out.push(format!("+{} more", total - named));
         }
         out
+    }
+
+    /// The IPv6 routes an `unresolvable-accept6` names that are
+    /// unresolvable now, in config order, each named as
+    /// [`Self::unresolvable_named`] names one — the reason included, so a
+    /// route accepted for one reason that is now unresolvable for another
+    /// says so. Not capped: there is one at most per accept line. A route
+    /// past the ledger's detail cap is named by its prefix alone.
+    pub fn unresolvable_accepted_named(&self) -> Vec<String> {
+        self.accepted_unresolvable()
+            .iter()
+            .map(|p| match self.ledger.unresolvable_nexthops(*p) {
+                Some(nhs) => self.unresolvable_name(p, nhs),
+                None => cidr(p),
+            })
+            .collect()
+    }
+
+    /// IPv6's ledger state as the `fib-v6` row reads it, for a verify
+    /// summary rendered now ([`crate::verify::V6Ledger`]). `None` unless
+    /// VPP carries IPv6.
+    pub fn v6_ledger(&self) -> Option<crate::verify::V6Ledger> {
+        let v6 = self.counts().v6?;
+        Some(crate::verify::V6Ledger {
+            unresolvable: v6.unresolvable,
+            withheld: v6.withheld,
+            named: self.unresolvable_named(true),
+            accepted: self.unresolvable_accepted_named(),
+        })
+    }
+
+    /// The `unresolvable-accept6` prefixes that name no unresolvable
+    /// route right now, `addr/len`, in config order: the route resolved,
+    /// or is not in the table. Empty unless VPP carries IPv6.
+    pub fn unresolvable_accepts_unmatched(&self) -> Vec<String> {
+        if !self.drainer.families().carries_v6() {
+            return Vec::new();
+        }
+        self.unresolvable_accepts6
+            .iter()
+            .filter(|a| !self.is_unresolvable(accept_key(a)))
+            .map(|a| format!("{}/{}", a.addr, a.prefix_len))
+            .collect()
+    }
+
+    /// The ledger prefixes of the accepted unresolvable routes, in config
+    /// order: every `unresolvable-accept6` whose prefix is EXACTLY an
+    /// unresolvable IPv6 route ([`UnresolvableAccepts6`] says why exact).
+    /// A lookup per accept line, never a walk of the table. Empty unless
+    /// VPP carries IPv6. Validation refuses a duplicate line, so no route
+    /// is counted twice.
+    fn accepted_unresolvable(&self) -> Vec<IpPrefix> {
+        if !self.drainer.families().carries_v6() {
+            return Vec::new();
+        }
+        self.unresolvable_accepts6
+            .iter()
+            .map(accept_key)
+            .filter(|p| self.is_unresolvable(*p))
+            .collect()
+    }
+
+    fn is_unresolvable(&self, p: IpPrefix) -> bool {
+        self.ledger.state_of(p)
+            == Some(crate::sink::RouteState::NotInstalled(
+                crate::sink::NotInstalled::Unresolvable,
+            ))
+    }
+
+    /// One unresolvable route's name: `"<prefix> via <nexthop> [dev
+    /// <device>] (<why>)"`, the first few paths of an ECMP set.
+    fn unresolvable_name(&self, prefix: &IpPrefix, nhs: &[IpAddr]) -> String {
+        if nhs.is_empty() {
+            return format!("{} (no next hop)", cidr(prefix));
+        }
+        // An ECMP set is named by its first few paths: the reason is
+        // usually shared, and a line per path would bury the other
+        // prefixes.
+        const PATHS_NAMED: usize = 3;
+        let mut paths: Vec<String> = nhs
+            .iter()
+            .take(PATHS_NAMED)
+            .map(|nh| match self.nexthops.device_of(nh) {
+                Some(dev) => format!("{nh} dev {dev} ({})", self.why_unresolved(prefix, nh)),
+                None => format!("{nh} ({})", self.why_unresolved(prefix, nh)),
+            })
+            .collect();
+        if nhs.len() > PATHS_NAMED {
+            paths.push(format!("+{} more path(s)", nhs.len() - PATHS_NAMED));
+        }
+        format!("{} via {}", cidr(prefix), paths.join(", "))
     }
 
     /// Why one next hop does not reach VPP. The engine's own refusals
@@ -2748,6 +2890,7 @@ impl ConvergenceEngine {
         c.unexempted_local = self.unexempted_local().len() as u64;
         if self.drainer.families().carries_v6() {
             let mut v6 = self.ledger.v6_counts();
+            v6.unresolvable_accepted = self.accepted_unresolvable().len() as u64;
             // Only IPv6 ops are ever parked as refused.
             v6.rejected = self.pending.rejected_len() as u64;
             v6.link_local_refused = self.link_local_refused.len() as u64;
@@ -4549,10 +4692,9 @@ impl ConvergenceEngine {
         ) {
             Ok(mut outcome) => {
                 outcome.unexempted_local = self.counts().unexempted_local;
+                // IPv4's only: IPv6's are named from the live ledger when
+                // the verdict is rendered (`verify::V6Ledger`).
                 outcome.unresolvable_named = self.unresolvable_named(false);
-                if let Some(v6) = outcome.v6.as_mut() {
-                    v6.unresolvable_named = self.unresolvable_named(true);
-                }
                 self.disproved |= outcome.any_mismatch();
                 self.last_verify = Some(outcome.clone());
                 // The pass dumped the interfaces too, and that is now the
@@ -4897,6 +5039,15 @@ fn is_neighbour_adj_fib(route: &IpRoute, nh: &[u8; 16]) -> bool {
         _ => route.prefix.len == 128,
     };
     host && route.prefix.address.un.0 == *nh
+}
+
+/// An `unresolvable-accept6` prefix as the ledger keys a route. Host
+/// bits are refused at parse, so the network is the prefix as written.
+fn accept_key(a: &packetframe_common::config::Ipv6Prefix) -> IpPrefix {
+    IpPrefix::V6 {
+        addr: a.network().octets(),
+        prefix_len: a.prefix_len,
+    }
 }
 
 /// `addr/len`, as `ip route` prints it.
@@ -6448,5 +6599,136 @@ mod tests {
         *kernel.borrow_mut() = addressed(&[p4(198, 51, 100, 9, 30)], &after);
         assert!(!e.refresh_self_networks(&src));
         assert!(src.via.borrow().is_empty() && src.within.borrow().is_empty());
+    }
+
+    fn accept6(addr: &str, len: u8) -> packetframe_common::config::Ipv6Prefix {
+        packetframe_common::config::Ipv6Prefix {
+            addr: addr.parse().unwrap(),
+            prefix_len: len,
+        }
+    }
+
+    /// Classify `p` unresolvable through `nh`, as the drain leaves it.
+    fn unresolvable_via(e: &mut ConvergenceEngine, p: IpPrefix, nh: IpAddr) {
+        e.ledger_mut().classify_resolved(p, 0);
+        e.ledger_mut().note_unresolvable(p, &[nh]);
+    }
+
+    /// An `unresolvable-accept6` names its route EXACTLY. The operator's
+    /// aggregate is accepted: counted apart, named apart, no longer
+    /// degrading. A /64 inside it that goes unresolvable is not covered —
+    /// it degrades and is the only name on the degrading list — and an
+    /// accept whose route is installed, or not in the table at all, is
+    /// reported unmatched. The ledger's count is untouched throughout:
+    /// the accepted route is still unresolvable, only acknowledged.
+    #[test]
+    fn an_unresolvable_accept6_matches_its_route_exactly_and_nothing_inside_it() {
+        let own: IpAddr = "2001:db8::1".parse().unwrap();
+        let aggregate = v6("2001:db8::", 48);
+        let inside = v6("2001:db8:0:5::", 64);
+        let installed = v6("2001:db8:100::", 48);
+        let mut e = engine_carrying(FamilyPolicy::Both);
+        unresolvable_via(&mut e, aggregate, own);
+        unresolvable_via(&mut e, inside, own);
+        e.ledger_mut().adopt_installed(installed);
+
+        // No accept: both degrade, both named.
+        let v6c = e.counts().v6.expect("v6 on");
+        assert_eq!((v6c.unresolvable, v6c.unresolvable_accepted), (2, 0));
+        assert!(v6c.degraded());
+        assert_eq!(e.unresolvable_named(true).len(), 2);
+        assert!(e.unresolvable_accepted_named().is_empty());
+
+        e.set_unresolvable_accepts6(vec![
+            accept6("2001:db8::", 48),
+            accept6("2001:db8:100::", 48),
+            accept6("2001:db8:200::", 56),
+        ]);
+        let v6c = e.counts().v6.expect("v6 on");
+        assert_eq!(
+            (
+                v6c.unresolvable,
+                v6c.unresolvable_accepted,
+                v6c.unresolvable_unaccepted()
+            ),
+            (2, 1, 1),
+            "the ledger's count stays every unresolvable route"
+        );
+        assert!(
+            v6c.degraded(),
+            "the /64 inside the aggregate is not accepted"
+        );
+        let named = e.unresolvable_named(true);
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert!(
+            named[0].starts_with("2001:db8:0:5::/64 via 2001:db8::1 ("),
+            "{named:?}"
+        );
+        let accepted = e.unresolvable_accepted_named();
+        assert_eq!(accepted.len(), 1, "{accepted:?}");
+        assert!(
+            accepted[0].starts_with("2001:db8::/48 via 2001:db8::1 ("),
+            "named with its reason, as an unaccepted route is: {accepted:?}"
+        );
+        assert_eq!(
+            e.unresolvable_accepts_unmatched(),
+            ["2001:db8:100::/48", "2001:db8:200::/56"],
+            "installed, and not in the table"
+        );
+
+        // The /64 resolves: only the accepted route is left, and nothing
+        // degrades.
+        e.ledger_mut().classify_resolved(inside, 1);
+        let v6c = e.counts().v6.expect("v6 on");
+        assert_eq!((v6c.unresolvable, v6c.unresolvable_accepted), (1, 1));
+        assert!(!v6c.degraded());
+        assert!(e.unresolvable_named(true).is_empty());
+        assert_eq!(e.unresolvable_accepted_named().len(), 1);
+
+        // The accept withdrawn: the aggregate degrades again.
+        e.set_unresolvable_accepts6(Vec::new());
+        let v6c = e.counts().v6.expect("v6 on");
+        assert_eq!((v6c.unresolvable, v6c.unresolvable_accepted), (1, 0));
+        assert!(v6c.degraded());
+        assert_eq!(e.unresolvable_named(true).len(), 1);
+    }
+
+    /// Accepted routes never take a name slot from one that is news:
+    /// with accepted prefixes sorting first, the degrading list still
+    /// names [`NAMED_UNRESOLVABLE`] unaccepted routes, and its `+K more`
+    /// counts only unaccepted ones. Under `v6 off` an accept is inert —
+    /// VPP carries no IPv6 route for it to name.
+    #[test]
+    fn accepted_routes_take_no_name_slot_and_are_inert_under_v6_off() {
+        let own: IpAddr = "2001:db8::1".parse().unwrap();
+        let mut e = engine_carrying(FamilyPolicy::Both);
+        // Two accepted, sorting before six unaccepted.
+        for i in 0..8u16 {
+            unresolvable_via(&mut e, v6(&format!("2001:db8:{i:x}::"), 48), own);
+        }
+        e.set_unresolvable_accepts6(vec![accept6("2001:db8:1::", 48), accept6("2001:db8::", 48)]);
+        let named = e.unresolvable_named(true);
+        assert_eq!(named.len(), NAMED_UNRESOLVABLE + 1, "{named:?}");
+        assert!(
+            named[..NAMED_UNRESOLVABLE]
+                .iter()
+                .all(|n| !n.starts_with("2001:db8::/48") && !n.starts_with("2001:db8:1::/48")),
+            "{named:?}"
+        );
+        assert_eq!(named[NAMED_UNRESOLVABLE], "+1 more", "{named:?}");
+        let accepted = e.unresolvable_accepted_named();
+        assert!(
+            accepted[0].starts_with("2001:db8:1::/48") && accepted[1].starts_with("2001:db8::/48"),
+            "config order: {accepted:?}"
+        );
+
+        let mut off = engine();
+        off.set_unresolvable_accepts6(vec![accept6("2001:db8::", 48)]);
+        assert!(off.counts().v6.is_none());
+        assert!(off.unresolvable_accepted_named().is_empty());
+        assert!(
+            off.unresolvable_accepts_unmatched().is_empty(),
+            "nothing to be stale against"
+        );
     }
 }

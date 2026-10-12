@@ -212,15 +212,27 @@ pub struct FamilyCounts {
     /// adjacencies use. Reported here and nowhere that gates: IPv4's link
     /// gate counts only interfaces IPv4 routes use.
     pub dark_egress: u64,
+    /// Of `unresolvable`, the routes an `unresolvable-accept6` names
+    /// exactly ([`crate::engine::UnresolvableAccepts6`]). Inside the
+    /// ledger's count, which stays every unresolvable route; left out of
+    /// [`Self::degraded`] and of the `unresolvable` gauge, which carry
+    /// [`Self::unresolvable_unaccepted`].
+    pub unresolvable_accepted: u64,
 }
 
 impl FamilyCounts {
+    /// The unresolvable routes no accept names: the ones that degrade.
+    pub fn unresolvable_unaccepted(&self) -> u64 {
+        self.unresolvable.saturating_sub(self.unresolvable_accepted)
+    }
+
     /// Whether this family's table is incomplete or disagrees with VPP —
     /// the per-family twin of [`SinkCounts::degraded`], wider because a
     /// non-gating family has more ways to be impaired without blocking
-    /// anything.
+    /// anything. An accepted unresolvable route is not: the operator has
+    /// examined it and decided to live with it.
     pub fn degraded(&self) -> bool {
-        self.unresolvable > 0
+        self.unresolvable_unaccepted() > 0
             || self.withheld > 0
             || self.rejected > 0
             || self.link_local_refused > 0
@@ -1116,6 +1128,15 @@ impl RouteLedger {
             .take(n)
             .map(|(k, nhs)| ((*k).into(), nhs.clone()))
             .collect()
+    }
+
+    /// The next hops one unresolvable prefix was classified through, if
+    /// they were noted ([`Self::note_unresolvable`]).
+    pub fn unresolvable_nexthops(&self, prefix: IpPrefix) -> Option<&[IpAddr]> {
+        let key = PrefixKey::from(prefix);
+        self.unresolvable_nh[usize::from(key.family == 6)]
+            .get(&key)
+            .map(Vec::as_slice)
     }
 
     /// Drop a prefix's unresolvable detail unless `st` keeps it

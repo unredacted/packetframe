@@ -1500,11 +1500,113 @@ v6 is dropped — none of it is steered:
 | Condition (`state=`) | Meaning | What to do |
 |---|---|---|
 | `withheld` | the v6 table outgrew its 400k budget | sizing; raise the budget in `startup_conf.rs` once rung 0 has measured |
-| `unresolvable` | a v6 next hop VPP has no adjacency for (a neighbour on a port VPP does not own, or one the kernel never resolved) | as for v4: `ip -6 neigh`, the port list |
+| `unresolvable` | a v6 next hop VPP has no adjacency for (a neighbour on a port VPP does not own, or one the kernel never resolved), or a route via the router itself that none of the [kernel-delivered shapes](#kernel-delivered-routes-the-routers-own-never-unresolvable) covers. Counts only routes no `unresolvable-accept6` names | as for v4: `ip -6 neigh`, the port list; for the router's own announced aggregate, [accept it](#accepting-an-unresolvable-ipv6-route-unresolvable-accept6) |
+| `unresolvable_accepted` | not a condition: unresolvable routes an `unresolvable-accept6` names. Never degrades the row; with `unresolvable` it sums to every unresolvable v6 route, so a step up here is an accept matching again (the route went unresolvable again) | nothing, if you meant it |
 | `rejected` | VPP refused the route (non-zero `ip_route_add_del`). Parked, not retried every drain — a v6 retry loop would keep the drain from going idle and hold back IPv4's convergence. Retried when the route next changes, and at every resync | the journal's retval; a VPP-side limit or bug |
 | `link_local_refused` | every next hop is link-local. Scoped addresses reach the module without their interface (the feed, and the fast path upstream of it, key neighbours by address alone, and the same `fe80::` can be on two links), so VPP is never given one. A route that also names a global next hop installs through that alone | expected for peers announcing link-local-only next hops; the follow-up is carrying `(address, ifindex)` end to end |
 | `verify_mismatch` | the last verify's v6 probes found VPP disagreeing with the ledger. Retained until the next verify (which does not re-run in steady state) | `vppctl … show ip6 fib <prefix>` against the ledger; a restart re-derives the v6 table |
 | `dark_egress` | a member with no link carries v6 adjacencies. IPv4's link gate counts only interfaces IPv4 routes use, so a dark port with only v6 on it never refuses a v4 steer | the cable / the port, as for any dark member |
+
+#### Accepting an unresolvable IPv6 route (`unresolvable-accept6`)
+
+One unresolvable v6 route is expected and harmless: your own aggregate.
+The routing daemon originates it for announcement (an `aggregate-address`
+or `network` statement) and sends it to packetframe with the router's own
+address as next hop, while the router's real subnets inside it are more
+specific routes of their own (kernel-delivered, or a `local-route6`). No
+kernel table holds the aggregate itself. VPP refuses it, rightly: the
+next hop is the router, the prefix is in no subnet or address of the
+router, and IPv6 has no `steer-exempt` to leave its traffic to the kernel.
+Diverted IPv6 for the unused parts of the aggregate is dropped in VPP,
+which is what a blackhole route for it would do. Nothing is broken, but
+`fib-v6`, and overall health with it, would read Degraded for as long as
+you announce the prefix:
+
+```
+fib-v6: degraded — IPv6 in VPP is impaired: 248113 installed, 1 unresolvable
+  (next hop not on a VPP port): 2001:db8::/48 via 2001:db8::1 (the router's own
+  address, which VPP has no adjacency for; the prefix is in no subnet or address
+  of the router, and IPv6 has no steer-exempt, …)
+```
+
+Confirm that is what it is before accepting it:
+
+```sh
+ip -6 route show table all 2001:db8::/48        # EMPTY: no kernel route for exactly the aggregate, in any table
+ip -6 route show table all root 2001:db8::/48   # the more specifics inside it: the router's own subnets, each judged on its own
+ip -6 addr show to 2001:db8::1                  # the next hop the row names: one of the router's own addresses
+vtysh -c 'show bgp ipv6 unicast 2001:db8::/48'  # originated here (with FRR), not learned from a peer
+```
+
+A kernel `blackhole` or `unreachable` route for exactly the prefix is the
+same case (the kernel drops it too). Anything else in the first command
+means the kernel carries the prefix somewhere, and diverted traffic for
+it should not die in VPP: fix that instead (the feed, a `steer-keep6`, or
+dropping `v6-divert`). Then accept the aggregate:
+
+```
+module vpp-offload
+  v6 on
+  unresolvable-accept6 2001:db8::/48
+```
+
+`packetframe reconfigure` applies it with no VPP restart and without
+asking the supervision loop: the loop picks it up the next time it
+publishes status, normally within a fraction of a second, in either
+direction. An accepted route is **acknowledged, not fixed**: it stays
+out of VPP and diverted IPv6 for it still dies there, exactly as before
+the line. It is still classified unresolvable, and still named as such in
+the verify summary
+(``unresolvable=1 [1 accepted by `unresolvable-accept6`: …]``), and in the
+`unresolvable_routes` event, in its own `ipv6_accepted` field. What
+changes is that it no longer degrades `fib-v6` or overall health, and is
+counted on `packetframe_vpp_family_routes{family="ipv6",state="unresolvable_accepted"}`
+instead of `state="unresolvable"`:
+
+```
+fib-v6: healthy — 248113 IPv6 routes loaded in VPP, not steered. accepted:
+  2001:db8::/48 via 2001:db8::1 (the router's own address, …) (`unresolvable-accept6`
+  — acknowledged, not fixed: they stay out of VPP, and diverted IPv6 for them
+  still dies there)
+```
+
+With other unresolvable routes too, the row is Degraded and names only
+those in its degrading list, the accepted ones after it. When nothing but
+accepted routes is unresolvable, the `unresolvable_routes` event is
+written at `info` (`ipv6` empty, `ipv6_accepted` naming them), never
+`detail: none`, since they are still unresolvable.
+
+The match is **exact**. An accept names one route, the one you examined:
+`unresolvable-accept6 2001:db8::/48` does not cover `2001:db8:0:5::/64`.
+A more specific route inside your aggregate that goes unresolvable is a
+different route with its own next hop and its own remedy (a subnet
+addressed in the last few seconds, a transit route under `next-hop-self`),
+and an accept that silently covered it would hide exactly the fault the
+row exists to show. Accept each route by its own prefix. The accept is
+on the prefix, not on the reason: the row lists each accepted route with
+its current reason, so after a routing change that could touch it (the
+aggregate now learned from a peer instead of originated here, say),
+check that it still reads `the router's own address`.
+
+An accept whose route is not unresolvable (VPP installed it, or it left
+the table) adds `unresolvable-accept6 2001:db8::/48 matches no unresolvable
+route` to the row, without degrading it, once the module is `ready` or
+`steered` (not while the table is still loading). Drop the line: left in,
+it would silently accept that prefix the next time it goes unresolvable,
+whatever the reason then.
+
+Validation: a valid IPv6 prefix with host bits zero, `v6 on` required,
+an exact duplicate refused, and `/0` refused (a default route that is
+unresolvable is never an aggregate to live with). Repeatable. The same
+prefix may also carry a `drift-accept6`: the two accept different
+things.
+
+There is deliberately **no IPv4 form**. An unresolvable v4 route blocks
+the first steer for a real reason: a steered v4 packet whose route VPP
+lacks does not die there, it follows a less specific VPP route out of the
+box. And v4 has the remedies v6 lacks: `steer-exempt` keeps a prefix's
+traffic on the kernel, and the third kernel-delivered shape leaves a v4
+route the kernel carries elsewhere out of VPP on the kernel's word.
 
 ### What to measure (the numbers rung 0 exists for)
 
@@ -1630,7 +1732,10 @@ the router's MAC whatever the destination, there is no v6 `steer-exempt`,
 and the hand-back path returns only the router's own `/128`s (every global
 address, which is why shape 2 is safe for v6). A v6 prefix the kernel
 carries out a tunnel would be diverted traffic dropped in VPP, so it stays
-unresolvable on `fib-v6`, with a name that says so.
+unresolvable on `fib-v6`, with a name that says so. So does your own
+announced v6 aggregate, which no kernel table holds; that one, once
+examined, can be
+[accepted](#accepting-an-unresolvable-ipv6-route-unresolvable-accept6).
 
 The next hop alone is never enough. Under `next-hop-self` every transit
 route carries the router's address; the kernel sends those out member
@@ -3617,10 +3722,15 @@ device appeared in the table or a member port is missing. Check the
 
 **Read the names first.** Every surface that reports the count also
 names up to five of the routes, then `+K more`: the `fib-synced` and
-`fib-v6` rows (live), the verify summary (as of that verify), a refused
-first steer, and an `unresolvable_routes` event in `packetframe events`
-whenever the set changes (at most once a minute; `detail: none` once it
-empties). Each name reads
+`fib-v6` rows (live), the verify summary (as of that verify, except its
+IPv6 half's unresolvable and withheld counts and names, which are the
+live table's whenever the summary is rendered, so `fib-synced` always
+agrees with `fib-v6`), a refused first steer, and an `unresolvable_routes` event in
+`packetframe events` whenever the set changes (at most once a minute;
+`detail: none` once it empties). IPv6 routes an `unresolvable-accept6`
+names are listed apart, as accepted, on each of those that carries v6
+(`ipv6_accepted` in the event), and never take one of the five slots.
+Each name reads
 
 ```
 <prefix> via <nexthop> [dev <device>] (<why>)
@@ -3635,7 +3745,7 @@ reason is the mapping's own decision:
 | `not a VPP port` | the neighbour is on a device that is not a member port | add the `port`, or the route is not VPP's to carry |
 | `VLAN N on P, which is not a VPP port` / `VLAN N is not declared on port P` | a VLAN device over a non-member, or a vid missing from `port … vlans` | the `port` line |
 | `bridge neighbour …` | the FDB has not placed it behind a member, or it is behind a non-member or a tagged VLAN with no BVI | see [bridge neighbours](#bridge-neighbours-placed-per-neighbour-from-the-fdb) |
-| `… and IPv6 has no steer-exempt, so diverted traffic for it would be dropped in VPP …` | a v6 route via the router outside its subnets and addresses; never left to the kernel (shape 3 is v4 only) | the feed, a `steer-keep6`, or dropping `v6-divert` |
+| `… and IPv6 has no steer-exempt, so diverted traffic for it would be dropped in VPP …` | a v6 route via the router outside its subnets and addresses; never left to the kernel (shape 3 is v4 only) | the feed, a `steer-keep6`, or dropping `v6-divert`; for your own announced aggregate with no kernel route, [`unresolvable-accept6`](#accepting-an-unresolvable-ipv6-route-unresolvable-accept6) |
 | `the router's own address, which VPP has no adjacency for; …` | every next hop is the router, and none of the kernel-delivered shapes held. The rest of the reason says how the kernel answered for exactly that prefix: `sends this prefix out <dev>, which VPP can reach` (a transit route under `next-hop-self`: the feed is wrong; or a subnet the router was addressed on in the last few seconds, which clears by itself, see [kernel-delivered routes](#kernel-delivered-routes-the-routers-own-never-unresolvable)), `drops it (blackhole, unreachable or prohibit)` (an aggregate the router originates; VPP would send its traffic down a less-specific route, so it is not left to the kernel), `has no route of its own for exactly this prefix`, `could not be read`, or `was not asked` (the per-walk lookup budget was spent). A trailing `the router's addresses could not be re-read (<error>)` means the 2-second address read is failing, so a subnet addressed since the last good read is not known yet | `ip route get <prefix-address> fibmatch` shows the same entry the module read; `ip -br addr` shows whether the router holds an address in the prefix |
 | `reachable now; …` | the neighbour arrived after the route was classified | nothing: it is re-programmed with the neighbour |
 
@@ -5332,10 +5442,11 @@ while VPP runs is not followed until the next restart.
   via `--config`, on every configured port — including the native-XDP
   attach that panics this fleet. Fixed in v0.2.7; on an older build, do
   not run it against a live config.
-- **`reconfigure` accepts only the steering inputs and
-  `drift-accept6`.** `steer`, `direction` / `steer-direction`,
+- **`reconfigure` accepts only the steering inputs, `drift-accept6` and
+  `unresolvable-accept6`.** `steer`, `direction` / `steer-direction`,
   `steer-exempt`, `v6-divert` and `steer-keep6` apply as an MCAM
-  reconcile, `drift-accept6` at the next drift scan. Everything else —
+  reconcile, `drift-accept6` at the next drift scan,
+  `unresolvable-accept6` at the next status publication. Everything else —
   `port` membership, `cores`, `vlans`, `expected-routes`, `hugepages`,
   `steer-capacity`, `v6`, `loopback-address` / `loopback-address6`,
   `local-route` / `local-route6`, `require-table-complete` and
