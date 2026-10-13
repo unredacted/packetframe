@@ -1108,8 +1108,8 @@ struct FeedGate {
     /// down and up again underneath us: the world may have been
     /// reloaded, a cached authority report cannot attest that
     /// routes belong to the current stream (review finding), and
-    /// the deferral adopts the full unattested posture until it
-    /// releases. Baselined at first-up rather than at creation
+    /// the deferral is `demoted` until the new epoch's GC.
+    /// Baselined at first-up rather than at creation
     /// because the deferral is normally created BEFORE the feed
     /// connects — counting the initial raise as a flap demoted
     /// every ordinary release (caught by the completeness test
@@ -1119,21 +1119,20 @@ struct FeedGate {
     /// session flap it has observed.
     ///
     /// The demotion has to be revocable or it is a wedge, not a
-    /// safeguard. What a flap invalidates is the AUTHORITY'S WORD,
-    /// because a report from before the reconnect cannot attest
-    /// that routes belong to the current stream — and the integrity
-    /// checker publishes a new one every few minutes, which can.
-    /// Latching `flapped` forever meant a single ordinary session
-    /// bounce (bird restart, hold-timer expiry) permanently
+    /// safeguard. Latching `flapped` forever meant a single ordinary
+    /// session bounce (bird restart, hold-timer expiry) permanently
     /// disabled the completeness door: a below-floor authoritative
     /// deployment could then never release at all, and an
     /// above-floor churning one fell to the zero-rate posture it
     /// never satisfies (review finding). So the demotion lasts
-    /// exactly until a report timestamped after this moment
-    /// arrives, at which point the epoch re-baselines and the
-    /// attested path returns. A report that is merely NEWER is
-    /// enough: its own drift check is what judges whether the
-    /// current stream has actually converged.
+    /// exactly until the feed session reports the new epoch
+    /// reconciled, at which point the epoch re-baselines and the
+    /// attested path returns. A report taken after the flap is NOT
+    /// enough: the checker compares counts, and a reannouncement
+    /// still carrying the previous session's unseen routes keeps
+    /// them aligned (see `read_fallback`). Nor does a demoted
+    /// deferral release on quiet: it needs that same reconciliation
+    /// ([`completion_evidence`]), so it waits for the GC either way.
     demoted: bool,
 }
 
@@ -1144,6 +1143,25 @@ impl FeedGate {
             epoch: None,
             demoted: false,
         }
+    }
+
+    /// The authority's word counts for this deferral: one is configured
+    /// and no flap has demoted it.
+    fn attested(&self, authority_configured: bool) -> bool {
+        authority_configured && !self.demoted
+    }
+
+    /// The feed session is up and this deferral's floor door waits for
+    /// it to reconcile its current epoch ([`completion_evidence`]): the
+    /// route source's InitiationComplete is what is outstanding. For the
+    /// status row.
+    fn awaits_reconciliation(
+        &self,
+        authority_configured: bool,
+        liveness: Option<packetframe_common::fib::FeedLiveness>,
+    ) -> bool {
+        liveness.is_some_and(|l| l.up)
+            && !completion_evidence(self.attested(authority_configured), liveness)
     }
 }
 
@@ -1452,24 +1470,55 @@ pub const UNATTESTED_QUIET_RATE_PER_SEC: u64 = 0;
 
 /// The quiet a release must show when NO completeness authority is
 /// configured. The rule: a release that has no authority to attest
-/// completion must not claim it on LESS evidence than the listener's own
-/// definition of "the initial dump is complete" — two seconds of stall
-/// mid-dump released a partial mirror whose only sin was pausing (review
-/// finding). With an authority present the shorter window stands,
-/// because the authority carries the completion truth and its
-/// current-mirror drift vetoes a partial table regardless of quiet.
+/// completion must not claim "the initial dump is complete" on LESS
+/// evidence than the route source's own InitiationComplete — two seconds
+/// of stall mid-dump released a partial mirror whose only sin was pausing
+/// (review finding), and a CPU-starved FRR paused five seconds 384
+/// UPDATEs into a full-table dump (2026-10-12). With an authority present
+/// the shorter window stands, because the authority carries the
+/// completion truth and its current-mirror drift vetoes a partial table
+/// regardless of quiet.
 ///
-/// Five seconds is the BMP station's INIT_COMPLETE_QUIESCENCE, and was
-/// the BGP listener's until 2026-10-12, when a starved FRR paused that
-/// long mid-dump. The BGP listener now completes on End-of-RIB, or on
-/// 30 s of silence from a peer that sends none, so on a BGP feed this
-/// window is less evidence than the listener's and the rule above does
-/// not hold there. It is not raised to match: 30 s of literal stillness
-/// is rare on a live full-table feed, so an unattested deferral would
-/// mostly never release. Gating on the session's own reconciliation
-/// (`FeedSession`'s `reconciled`, stamped at InitiationComplete) would
-/// meet the rule without that cost.
+/// The window is one of two legs that meet the rule. The other is the
+/// feed session reconciled for its current epoch ([`completion_evidence`]),
+/// which the BGP listener stamps at its InitiationComplete and nowhere
+/// else: its own standard by construction, whatever that fires on. The
+/// window is not raised to match it, because literal stillness as long as
+/// a listener's quiescence is rare on a live full-table feed and an
+/// unattested deferral would mostly never release.
+///
+/// Five seconds is still owed, for the BMP station. It stamps
+/// `reconciled` at the raise of a stream no earlier stream's routes can
+/// linger behind, typically its first, because the stamp claims only that;
+/// its InitiationComplete is five seconds without a RouteMonitoring frame.
+/// Every frame it applies pulses the session (one for a peer that is not
+/// up is dropped unapplied), so five seconds of zero activity while live
+/// is the station's own standard over every frame that carries routes. A
+/// reconnect's stream is reconciled by its GC, as on BGP. With no route
+/// source at all, the fast-path marks the session reconciled at start:
+/// there is no dump to wait for.
+///
+/// A deferral a session flap demoted never releases on this window: it
+/// needs the same reconciliation, and that is what lifts the demotion, so
+/// it releases on the attested terms after it.
 pub const UNATTESTED_QUIET_FOR: Duration = Duration::from_secs(5);
+
+/// Whether a steered stage's floor door has its posture's evidence that
+/// the initial dump is complete: the leg of that release that is neither
+/// the floor nor the quiet. Attested, it is the completeness authority,
+/// whose current word `read_fallback` applies as a veto. Otherwise it is
+/// the feed session reconciled for its current epoch; see
+/// [`UNATTESTED_QUIET_FOR`] for why, and for what that stamp means on each
+/// route source.
+///
+/// One function for the gate and the status row that reports waiting on
+/// it ([`FeedGate::awaits_reconciliation`]), so the two cannot disagree.
+fn completion_evidence(
+    attested: bool,
+    liveness: Option<packetframe_common::fib::FeedLiveness>,
+) -> bool {
+    attested || liveness.is_some_and(|l| l.reconciled)
+}
 
 /// How long the source must stay below the quiet RATE before it counts
 /// as loaded. A duration, never a number of checks: the production loop
@@ -2823,6 +2872,16 @@ impl Runtime {
             drift_scope_stale: c.drift_scope_stale.clone(),
             drift_v6: c.drift_v6.clone(),
             preserved_fib: c.seeded.is_some(),
+            awaiting_reconciliation: c
+                .deferred_resync
+                .as_ref()
+                .and_then(DeferredResync::feed)
+                .is_some_and(|f| {
+                    f.awaits_reconciliation(
+                        c.completeness.is_some(),
+                        c.feed_session.as_ref().map(|s| s.liveness()),
+                    )
+                }),
             seeded_door_refused: c
                 .deferred_resync
                 .as_ref()
@@ -3063,6 +3122,12 @@ pub struct RuntimeStatus {
     /// recommends the thing it already has, while a demoted one is
     /// waiting on something else entirely.
     pub authority: AuthorityPosture,
+    /// The deferral's floor door waits for the feed session, up now, to
+    /// reconcile its current epoch: the route source's InitiationComplete
+    /// is outstanding, and with no authority to attest the table, or one
+    /// a flap demoted, nothing else may say the dump is done. Read from
+    /// the predicate the gate applies ([`completion_evidence`]).
+    pub awaiting_reconciliation: bool,
     /// The FIB being converged is the previous process's, adopted from
     /// its preserved route ledger and not yet verified by this one. See
     /// `Core::seeded` and `StatusSnapshot::preserved_fib`.
@@ -3818,7 +3883,9 @@ impl Core {
     /// alone cannot: capacity is an upper sizing bound, so a real table
     /// below capacity/16 would defer forever on it (review finding).
     ///  - the coupled floor+quiescence release, for tables within 16x of
-    ///    their sizing (the fleet);
+    ///    their sizing (the fleet) — and, with no authority to attest the
+    ///    table or one a flap demoted, only once the route source has
+    ///    reconciled its current session (`completion_evidence`);
     ///  - the completeness authority, where a bird exists — the exact
     ///    signal, and the same one `Effects::steer` gates on.
     ///
@@ -3843,16 +3910,17 @@ impl Core {
         let liveness = self.feed_session.as_ref().map(|f| f.liveness());
         let live = liveness.is_some_and(|l| l.up);
         // Rate scaled to the mirror as observed — never to capacity,
-        // which is a ceiling, not a table. The floor door's quiet
-        // requirement depends on whether anyone can attest completion:
-        // with no authority, quiet must at least match the protocol's own
-        // initiation-complete standard — see UNATTESTED_QUIET_FOR.
+        // which is a ceiling, not a table. The floor door's requirements
+        // depend on whether anyone can attest completion: with no
+        // authority, the route source's own InitiationComplete for this
+        // epoch and quiet that matches the protocol's — see
+        // UNATTESTED_QUIET_FOR and `completion_evidence`.
         // The attested fast path holds only while the session has NOT
         // flapped under this deferral: a reconnect reopens the stream
         // epoch, and a cached report cannot attest that routes belong to
         // the current one — so a flapped deferral takes the full
-        // unattested posture UNTIL A REPORT NEWER THAN THE GC HAS RUN
-        // (see `demoted`; latching it forever turned an ordinary session
+        // unattested posture UNTIL THE NEW EPOCH'S GC HAS RUN (see
+        // `demoted`; latching it forever turned an ordinary session
         // bounce into a deferral that could never release). The fleet's
         // steady 40 s release never flaps and never pays this at all.
         let current_epoch = liveness.map(|l| l.epoch);
@@ -3877,16 +3945,17 @@ impl Core {
             feed.epoch = current_epoch;
             feed.demoted = false;
         }
-        // Consequence, accepted deliberately: on a feed whose churn never
-        // yields the initiation-complete silence, a flap mid-deferral
-        // holds the deferral in the unattested posture indefinitely. That
-        // is the safe direction and a visible one — VPP keeps forwarding
-        // the FIB it was adopted with, health reports the deferral — and
-        // it is the same bargain FALLBACK_FLOOR_DIVISOR already makes:
-        // refuse visibly rather than release on evidence that does not
-        // mean what it appears to.
+        // Consequence, accepted deliberately: on a feed that never gives
+        // its route source the InitiationComplete it waits for, a flap
+        // mid-deferral holds the deferral indefinitely — the floor door
+        // below needs the same reconciliation, so a demoted deferral has
+        // no door of its own. That is the safe direction and a visible
+        // one — VPP keeps forwarding the FIB it was adopted with, health
+        // reports the deferral — and it is the same bargain
+        // FALLBACK_FLOOR_DIVISOR already makes: refuse visibly rather than
+        // release on evidence that does not mean what it appears to.
         let flapped = feed.demoted;
-        let attested = self.completeness.is_some() && !flapped;
+        let attested = feed.attested(self.completeness.is_some());
         let view = feed.gate.observe(
             now,
             SourceSample {
@@ -3949,8 +4018,14 @@ impl Core {
                 .rate_quiet_for
                 .is_some_and(|q| q >= spoiled_backoff(SOURCE_QUIET_FOR, spoiled))
             && authority == Some(true);
+        // The floor door: floor and quiet from the gate, and its
+        // posture's evidence that the dump is complete. Without an
+        // authority that is the feed's reconciliation, so a pause mid-dump
+        // that the gate's window cannot tell from the end of it holds the
+        // door until the route source itself says the dump is done.
+        let floor_door = view.released && live && completion_evidence(attested, liveness);
         FallbackReading {
-            released: !veto && ((view.released && live) || complete),
+            released: !veto && (floor_door || complete),
             live,
             veto,
             // From the same liveness and authority words as the rest of
@@ -4608,7 +4683,8 @@ impl ObserveView {
                             (feed.epoch, liveness_now.map(|l| l.epoch)),
                             (Some(e), Some(c_)) if c_ != e
                         );
-                        let churn_budget = if completeness.is_some() && !flapped_now {
+                        let attested_now = completeness.is_some() && !flapped_now;
+                        let churn_budget = if attested_now {
                             source_quiet_rate_per_sec(have) * SOURCE_QUIET_FOR.as_secs()
                         } else {
                             UNATTESTED_QUIET_RATE_PER_SEC * UNATTESTED_QUIET_FOR.as_secs()
@@ -4620,12 +4696,21 @@ impl ObserveView {
                             .max(pulses_now.saturating_sub(pulses));
                         // Each release is re-judged on the far side of the
                         // dump by what it rested on. The quiet one: the
-                        // churn budget above. The seeded-mirror door's
-                        // did not rest on quiet — a replay streams through
-                        // it by design — so churn during the dump does not
-                        // make it retroactively false; its legs, read
-                        // again now, are what has to still hold. The diff
-                        // that follows lands on an unsteered VPP, which is
+                        // churn budget above, and its posture's evidence
+                        // that the dump is complete, read again in the
+                        // same observation as the epoch. A reconnect
+                        // during the dump opens an epoch nothing has
+                        // reconciled, and usually streams an element the
+                        // zero budget refuses too — but the BGP listener
+                        // raises a session a moment before it counts the
+                        // UPDATE that raised it, and a read between the
+                        // two sees a new epoch and no activity at all.
+                        // The seeded-mirror door's did not rest on quiet —
+                        // a replay streams through it by design — so
+                        // churn during the dump does not make it
+                        // retroactively false; its legs, read again now,
+                        // are what has to still hold. The diff that
+                        // follows lands on an unsteered VPP, which is
                         // exactly the unsteered seeded diff
                         // (`AwaitingDiff`).
                         let release_holds = if door {
@@ -4637,6 +4722,7 @@ impl ObserveView {
                             )
                         } else {
                             dump_churn <= churn_budget
+                                && completion_evidence(attested_now, liveness_now)
                         };
                         // Both bounds, because each covers the other's
                         // small end: the absolute budget is 128
@@ -4653,6 +4739,7 @@ impl ObserveView {
                             tracing::warn!(
                                 adopted,
                                 live = live_now,
+                                reconciled = liveness_now.is_some_and(|l| l.reconciled),
                                 dump_churn,
                                 churn_budget,
                                 have_now,
