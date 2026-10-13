@@ -424,6 +424,10 @@ pub struct StatusSnapshot {
     pub seeded_door_refused: Option<crate::runtime::SeededDiffRefusal>,
     /// See [`crate::runtime::RuntimeStatus::authority`].
     pub authority: crate::runtime::AuthorityPosture,
+    /// The deferral `resync_deferred` reports waits for the route source's
+    /// InitiationComplete. See
+    /// [`crate::runtime::RuntimeStatus::awaiting_reconciliation`].
+    pub awaiting_reconciliation: bool,
     pub ports: Vec<PortLink>,
     /// The runtime could not persist something it observed.
     ///
@@ -724,6 +728,7 @@ impl StatusSnapshot {
             preserved_fib,
             seeded_door_refused: None,
             authority,
+            awaiting_reconciliation: false,
             ports,
             store_error,
             drain_error,
@@ -809,6 +814,7 @@ impl StatusSnapshot {
         );
         snap.steer_hold = rs.steer_hold;
         snap.seeded_door_refused = rs.seeded_door_refused;
+        snap.awaiting_reconciliation = rs.awaiting_reconciliation;
         snap.neighbour_counters = rs.neighbour_counters;
         snap.kernel_path = rs.kernel_path;
         snap.drift_scan_ms = rs.drift_scan_ms;
@@ -1663,6 +1669,21 @@ impl StatusSnapshot {
                 // floor was told it had "no authority" and should enable
                 // `require-table-complete`, which was already enabled and
                 // was the thing blocking it (review finding).
+                //
+                // What carries the traffic meanwhile is the supervisor's
+                // belief about the NIC (`steered`), not the deferral's. A
+                // steered adoption is what defers, so it is usually the
+                // adopted FIB. Not always: the dump path takes the traffic
+                // off VPP before it reads the FIB, and leaves it off when
+                // the feed spoils that release (a reconnect or a burst
+                // during the dump) until the diff runs; `steer off` takes
+                // it off too. Then the eBPF tier carries everything, and
+                // naming the adopted FIB sends an operator to the idle tier.
+                let forwarding = if self.steered {
+                    "the adopted FIB keeps forwarding untouched"
+                } else {
+                    "VPP is unsteered, so the traffic is on the eBPF tier"
+                };
                 let msg = if self.authority == AuthorityPosture::Vetoing {
                     // Persistent by construction, in BOTH senses now:
                     // `Vetoing` is only `AuthorityMismatch` (the one
@@ -1687,9 +1708,9 @@ impl StatusSnapshot {
                          `require-table-complete off` is the right answer — but it is read \
                          once at bring-up, so it needs a daemon RESTART. A reload is \
                          refused by name and says so, so there is nothing to try first and \
-                         nothing that silently carries the old gate forward. The adopted \
-                         FIB keeps forwarding untouched meanwhile, and every steering \
-                         change is refused while this holds"
+                         nothing that silently carries the old gate forward. Meanwhile \
+                         {forwarding}, and every steering change but `steer off` on every \
+                         port is refused while this holds"
                     )
                 } else if self.authority == AuthorityPosture::AwaitingAuthority {
                     // Blocked, but self-clearing: no report yet, one that
@@ -1709,14 +1730,14 @@ impl StatusSnapshot {
                          once a sample agrees; the source holds {have} routes against a \
                          floor of {want}. If the authority really is at fault rather than \
                          merely unasked or caught mid-withdrawal, the next sample says so \
-                         and this line changes to name it. Nothing is dropping: the \
-                         adopted FIB keeps forwarding untouched"
+                         and this line changes to name it. Nothing is dropping: \
+                         {forwarding}"
                     )
                 } else if have < want && self.authority == AuthorityPosture::Attesting {
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
-                         release floor of {want}; the adopted FIB keeps forwarding \
-                         untouched. The completeness authority can release this once its \
+                         release floor of {want}; {forwarding}. The completeness authority \
+                         can release this once its \
                          report agrees with the mirror — expected within one \
                          `integrity-authority` interval. If it persists well beyond that, \
                          check the integrity checker and the route daemon rather than the \
@@ -1725,17 +1746,19 @@ impl StatusSnapshot {
                 } else if have < want && self.authority == AuthorityPosture::DemotedByFlap {
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
-                         release floor of {want}; the adopted FIB keeps forwarding \
-                         untouched. The feed session reconnected under this deferral, so \
+                         release floor of {want}; {forwarding}. The feed session \
+                         reconnected under this deferral, so \
                          the authority's report can no longer attest that the mirror is \
                          THIS session's — a count can match while a reannouncement is \
-                         still mid-flight. Attestation returns when the source reports \
-                         its initiation-complete GC, which needs 5 s without updates: on \
-                         a continuously active DFZ feed that gap may never arrive, and \
-                         this deferral can hold indefinitely BY DESIGN. Nothing is \
-                         dropping — VPP forwards the FIB it was adopted with. To resolve \
-                         it, let the feed idle briefly, or restart the daemon once the \
-                         table is loaded so the adoption starts unsteered"
+                         still mid-flight. Attestation returns when the route source \
+                         reports InitiationComplete for the new session (`InitiationComplete \
+                         fired` in the journal), whose GC removes what the previous session \
+                         left. What fires it depends on the route source, and the \
+                         packetframe-fib runbook names it; a feed that never gives it holds \
+                         this deferral indefinitely BY DESIGN. Nothing is dropping. To \
+                         resolve it, let the route \
+                         source finish its dump, or restart the daemon once the table is \
+                         loaded so the adoption starts unsteered"
                     )
                 } else if have < want {
                     // Reachable only with NO authority now: every other
@@ -1744,8 +1767,8 @@ impl StatusSnapshot {
                     // rather than an assumption.
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
-                         release floor of {want}; the adopted FIB keeps forwarding \
-                         untouched. If the source is still loading this clears itself — \
+                         release floor of {want}; {forwarding}. If the source is still \
+                         loading this clears itself — \
                          but if {have} IS the whole table, the gate will never release: \
                          with no authority it refuses to guess completeness below the \
                          floor, by design. Size `expected-routes` within 16x of the real \
@@ -1753,12 +1776,33 @@ impl StatusSnapshot {
                          (`integrity-authority birdc|frr`) and enable \
                          `require-table-complete`"
                     )
+                } else if self.awaiting_reconciliation {
+                    // The floor is met, and what is outstanding is the
+                    // door's own evidence that the dump is complete. Only
+                    // the unattested and demoted postures reach this: an
+                    // attesting authority is that evidence.
+                    let why = if self.authority == AuthorityPosture::DemotedByFlap {
+                        "the feed session reconnected under this deferral, so the \
+                         completeness authority's report can no longer attest that the \
+                         mirror is THIS session's"
+                    } else {
+                        "with no completeness authority, only the route source itself can \
+                         say its dump is complete"
+                    };
+                    format!(
+                        "resync deferred: the route source holds {have} routes (release \
+                         floor {want} met), and {why}: release waits for its \
+                         InitiationComplete for the current session (`InitiationComplete \
+                         fired` in the journal), so that a pause mid-dump is not taken for \
+                         the end of it. What fires it depends on the route source, and the \
+                         packetframe-fib runbook names it; a feed that never gives it holds \
+                         this indefinitely, by design. Nothing is dropping: {forwarding}"
+                    )
                 } else {
                     format!(
                         "resync deferred: the route source holds {have} routes (release \
                          floor {want} met); the diff runs once the source is live and has \
-                         gone quiet, and the adopted FIB keeps forwarding untouched until \
-                         then"
+                         gone quiet, and {forwarding} until then"
                     )
                 };
                 // Whichever posture is reported: the refusal is a fact about
@@ -5753,6 +5797,137 @@ mod tests {
                         && msg.contains("waits for the route source's replay to go quiet"),
                     "{authority:?} {have}: {msg}"
                 );
+            }
+        }
+    }
+
+    /// A deferral whose floor door waits for the route source's
+    /// InitiationComplete says so once the floor is met, naming why for
+    /// the posture it is in — and only there. Below the floor the floor is
+    /// the first thing to explain, a veto outranks it (the authority blocks
+    /// at any table size, and a demoted deferral can be vetoing too), and
+    /// a deferral that is not waiting on it keeps the plain quiet line.
+    #[test]
+    fn a_deferral_waiting_for_initiation_complete_names_it_above_the_floor() {
+        use crate::runtime::AuthorityPosture;
+        let led = ledger_with(10, 0, 0);
+        let row = |authority, have, awaiting| {
+            let mut snap = snap_of(
+                &steered_supervisor(),
+                &led,
+                ApiHealth::Answering {
+                    silent_for: Duration::from_millis(200),
+                },
+                FibSync::NeverVerified,
+                ports_up(),
+            );
+            snap.resync_deferred = Some((have, 100));
+            snap.authority = authority;
+            snap.awaiting_reconciliation = awaiting;
+            snap.report()
+                .subsystems
+                .into_iter()
+                .find(|s| s.name == SUBSYS_FIB)
+                .and_then(|s| s.message)
+                .expect("a deferral always explains itself")
+        };
+        let waiting = "InitiationComplete for the current session";
+
+        let absent = row(AuthorityPosture::Absent, 196, true);
+        assert!(
+            absent.contains(waiting) && absent.contains("with no completeness authority"),
+            "{absent}"
+        );
+        let demoted = row(AuthorityPosture::DemotedByFlap, 196, true);
+        assert!(
+            demoted.contains(waiting) && demoted.contains("reconnected under this deferral"),
+            "{demoted}"
+        );
+        for authority in [AuthorityPosture::Absent, AuthorityPosture::DemotedByFlap] {
+            let plain = row(authority, 196, false);
+            assert!(
+                !plain.contains("InitiationComplete") && plain.contains("has gone quiet"),
+                "{authority:?}: {plain}"
+            );
+            let below = row(authority, 50, true);
+            assert!(
+                below.contains("below the release floor of 100") && !below.contains(waiting),
+                "{authority:?}: {below}"
+            );
+        }
+        let vetoed = row(AuthorityPosture::Vetoing, 196, true);
+        assert!(
+            vetoed.contains("not the authority feeding it") && !vetoed.contains(waiting),
+            "{vetoed}"
+        );
+    }
+
+    /// Every deferral line names the tier carrying the traffic, from the
+    /// supervisor's belief about the NIC, in every posture and phase.
+    ///
+    /// A deferral is a steered adoption's, but the dump path takes the
+    /// traffic off VPP before it reads the FIB and leaves it off when the
+    /// feed spoils that release, and `steer off` takes it off too. Then
+    /// the eBPF tier carries everything, and a line saying the adopted FIB
+    /// keeps forwarding sends an operator to the idle tier. The veto line
+    /// also no longer says every steering change is refused: `steer off`
+    /// is admitted throughout a deferral (`accepts_steering_removal`).
+    #[test]
+    fn every_deferral_line_names_the_tier_carrying_the_traffic() {
+        use crate::runtime::AuthorityPosture;
+        let led = ledger_with(10, 0, 0);
+        let on_vpp = "the adopted FIB keeps forwarding untouched";
+        let on_ebpf = "VPP is unsteered, so the traffic is on the eBPF tier";
+        for authority in [
+            AuthorityPosture::Absent,
+            AuthorityPosture::Attesting,
+            AuthorityPosture::DemotedByFlap,
+            AuthorityPosture::Vetoing,
+            AuthorityPosture::AwaitingAuthority,
+        ] {
+            for have in [50, 196] {
+                for awaiting in [false, true] {
+                    for steered in [true, false] {
+                        let mut snap = snap_of(
+                            &steered_supervisor(),
+                            &led,
+                            ApiHealth::Answering {
+                                silent_for: Duration::from_millis(200),
+                            },
+                            FibSync::NeverVerified,
+                            ports_up(),
+                        );
+                        snap.resync_deferred = Some((have, 100));
+                        snap.authority = authority;
+                        snap.awaiting_reconciliation = awaiting;
+                        snap.steered = steered;
+                        let msg = snap
+                            .report()
+                            .subsystems
+                            .into_iter()
+                            .find(|s| s.name == SUBSYS_FIB)
+                            .and_then(|s| s.message)
+                            .expect("a deferral always explains itself");
+                        let case = format!("{authority:?} have={have} awaiting={awaiting}");
+                        if steered {
+                            assert!(
+                                msg.contains(on_vpp) && !msg.contains("eBPF tier"),
+                                "{case}, steered: {msg}"
+                            );
+                        } else {
+                            assert!(
+                                msg.contains(on_ebpf)
+                                    && !msg.contains("keeps forwarding")
+                                    && !msg.contains("forwards the FIB"),
+                                "{case}, unsteered: {msg}"
+                            );
+                        }
+                        assert!(
+                            !msg.contains("every steering change is refused"),
+                            "{case}: `steer off` is admitted during a deferral: {msg}"
+                        );
+                    }
+                }
             }
         }
     }

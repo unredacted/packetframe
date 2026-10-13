@@ -332,6 +332,11 @@ pub struct Behaviour {
     /// Set when an `ip_route_dump` is served — the moment VPP's FIB is
     /// being read, which a test's route source can key churn on.
     pub dumped: Option<&'static std::sync::atomic::AtomicBool>,
+    /// Run when an `ip_route_dump` is served, before any of its replies:
+    /// whatever it does happens before the client's dump returns, for a
+    /// test that needs the world to move DURING the dump rather than
+    /// whenever the route source is next asked.
+    pub on_dump: Option<&'static (dyn Fn() + Sync)>,
     /// Refuse every IPv6 route op with a non-zero retval, forever, without
     /// applying it — a VPP that will not take some v6 route, whatever the
     /// reason, which must never stall IPv4's convergence.
@@ -1097,6 +1102,9 @@ fn serve(
                 if let Some(f) = behaviour.dumped {
                     f.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
+                if let Some(f) = behaviour.on_dump {
+                    f();
+                }
                 let mut d = Decoder::new(&req);
                 let want6 = IpRouteDump::decode(&mut d)
                     .expect("decodes as a route dump")
@@ -1140,6 +1148,9 @@ fn serve(
             "ip_route_dump" => {
                 if let Some(f) = behaviour.dumped {
                     f.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                if let Some(f) = behaviour.on_dump {
+                    f();
                 }
                 // `existing_routes` is a v4 table: the v6 dump answers
                 // empty, as a real VPP holding no v6 routes does.

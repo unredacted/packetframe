@@ -4,6 +4,7 @@
 //! - [`config`]: line-based config parser (see SPEC.md §6)
 //! - [`events`]: the persistent event log of significant transitions
 //! - [`ethtool`]: NIC interrupt coalescing over `SIOCETHTOOL`
+//! - [`malloc`]: the daemon's glibc allocator setting (fastbins off)
 //! - [`module`]: the [`Module`] trait and support types (see SPEC.md §3.2)
 //! - [`placement`]: the CPUs the daemon's control-plane threads run on
 //! - [`probe`]: kernel capability probes (see SPEC.md §2.1)
@@ -16,6 +17,7 @@ pub mod fib;
 pub mod flow_coverage;
 #[cfg(feature = "frr")]
 pub mod frr;
+pub mod malloc;
 pub mod module;
 pub mod placement;
 pub mod probe;
