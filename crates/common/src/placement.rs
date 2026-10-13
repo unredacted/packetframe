@@ -33,8 +33,9 @@
 //! process, so there is nothing a restore would ever run for.
 
 /// Thread names placed by [`publish`], as the kernel keeps them —
-/// `comm` is truncated to 15 bytes, which both 15-character names fit
-/// exactly. The last two are spawned by the supervision loop.
+/// `comm` is truncated to 15 bytes, which the 15-character names fit
+/// exactly. `pf-drift-scan` and `pf-vpp-fdb` are spawned by the
+/// supervision loop.
 pub const CONTROL_PLANE_THREADS: &[&str] = &[
     "packetframe-fib",
     "vpp-supervision",
@@ -42,6 +43,9 @@ pub const CONTROL_PLANE_THREADS: &[&str] = &[
     "pf-vpp-fdb",
     // flow-export's worker (`packetframe_flow_export::THREAD_NAME`).
     "pf-flow-export",
+    // A BGP feed session's KEEPALIVE thread, one per established
+    // session (fast-path's `route_source_bgp::LIVENESS_THREAD`).
+    "pf-bgp-liveness",
 ];
 
 /// What [`publish`] did to the threads that already existed.

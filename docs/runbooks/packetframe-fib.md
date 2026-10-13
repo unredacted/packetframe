@@ -189,6 +189,12 @@ Startup refuses an `anyip` address some interface already owns —
 that shape can never establish (FRR would reject the neighbor), so
 failing attach loudly beats converging into a dead feed. The session
 should report Established, and `ss` one line.
+
+Then check that packetframe's `received peer OPEN` journal line says
+`graceful_restart=true`. That is what lets it take FRR's End-of-RIB as
+the end of a reload instead of inferring it from silence, which a
+starved FRR can fake mid-dump (see [the route mirror empties after a
+feed reconnect](#symptom-the-route-mirror-empties-after-a-feed-reconnect)).
 ### The completeness authority on an FRR-fed box
 
 `integrity-authority` names the daemon packetframe cross-checks its
@@ -387,14 +393,27 @@ birdc enable bmp1
 
 packetframe emits `RouteEvent::Resync` on disconnect and receives
 the fresh dump on reconnect. Routes the new session does not
-re-announce are GC'd at `InitiationComplete`, which fires after 5 s of
-post-first-update quiescence. On the iBGP feed the listener's socket
-reader judges it: 5 s with no UPDATE read and nothing left unread on
-the socket (KEEPALIVEs do not count either way), and the event is
-applied behind every UPDATE read before it. A slow programmer
-therefore neither fires it early (ahead of a backlog, mid-reload) nor
-late. A session that drops before then GCs nothing; the next
-session's `InitiationComplete` does.
+re-announce are GC'd at `InitiationComplete`. On the iBGP feed:
+
+- From a peer that negotiated graceful restart (the `received peer
+  OPEN` line says `graceful_restart=true`), it fires once End-of-RIB
+  has arrived for every family the session carries (`families=` on the
+  same line), and is applied behind every UPDATE before it. Silence is
+  only a backstop there: 300 s with no UPDATE, for a peer configured
+  not to send End-of-RIB (FRR's `bgp graceful-restart disable-eor`;
+  don't).
+- From any other peer, silence is all there is: 30 s with no UPDATE
+  read and nothing left unread on the socket (KEEPALIVEs do not count
+  either way). It was 5 s until 2026-10-12, when an FRR starved for
+  CPU during a reload paused that long mid-dump.
+
+The listener's socket reader judges the silence, and the event is
+applied behind every UPDATE read before it, so a slow programmer
+neither fires it early (ahead of a backlog, mid-reload) nor late. The
+journal says which fired it: `InitiationComplete fired
+trigger=end-of-rib` or `trigger=quiescence quiescence_secs=30`. A
+session that drops before then GCs nothing; the next session's
+`InitiationComplete` does.
 
 The GC covers the feed's routes only. The `fallback-default` 0/0 and
 the `local-prefix` host routes come from the neighbour resolver, not
@@ -1140,9 +1159,11 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
    identical route marks it seen and changes nothing else: no FIB
    write, no destination-cache flush, no route delta to VPP. A route
    that changed while the daemon was down is an ordinary update. When
-   the session's initial dump goes quiet (`InitiationComplete`, 5 s of
-   silence), the GC removes every seeded route it did not re-advertise —
-   event `route_ledger_reconciled` with `gc_removed`.
+   the session's initial dump is complete (`InitiationComplete`: the
+   peer's End-of-RIB, or silence from a peer that sends none; see
+   [Force a route-source resync](#force-a-route-source-resync)), the GC
+   removes every seeded route it did not re-advertise — event
+   `route_ledger_reconciled` with `gc_removed`.
 
 The staleness this accepts is the one a session loss already accepts:
 until the replay reaches a route, it forwards where it did when the
@@ -1223,9 +1244,11 @@ keeps it.
 
 ### Known limits
 
-- The GC needs the route source to pause for 5 s after its dump. A feed
-  that never pauses keeps seeded routes it no longer has until a later
-  session's GC — exactly what a session loss does today.
+- Over `route-source bgp`, the GC needs the peer's End-of-RIB, or from
+  a peer that sends none, 30 s of silence after its dump (BMP: 5 s). A
+  feed that never pauses and sends no End-of-RIB keeps seeded routes it
+  no longer has until a later session's GC — exactly what a session
+  loss does today.
 - An ADD-PATH negotiation that differs from the previous run files the
   live paths under different keys than the seeded ones, so both
   contribute nexthops until the GC removes the seeded ones.
@@ -2000,13 +2023,18 @@ Check:
 What it means: a hold timer expired, and every drop costs a `Resync`
 and the whole table again. Which side's timer fired says where to look.
 
-- **FRR's.** FRR logs `Notification sent (Hold Timer Expired)` and
-  `show bgp neighbor` gives it as the last reset: FRR heard no
-  KEEPALIVE from packetframe for its hold time. packetframe sends them
-  from a task of their own, every third of the hold time (30 s at the
-  default 90), so a slow load does not delay them. What still can is a
-  packetframe that gets no CPU at all, or a send that cannot complete
-  because FRR stopped reading. Look at
+- **FRR's.** FRR logs `%NOTIFICATION: sent to neighbor <addr> 4/0
+  (Hold Timer Expired)` and `show bgp neighbor` gives it as the last
+  reset: FRR heard no KEEPALIVE from packetframe for its hold time.
+  packetframe sends them every third of the hold time (30 s at the
+  default 90) from a thread of their own, one per established session,
+  named `pf-bgp-liveness`. It shares nothing with route processing, not
+  even the runtime routes are applied on: on 2026-10-12, when they came
+  from a task on that runtime, FRR heard none during a full-table load
+  on a CPU-starved gateway. What can still delay them is a packetframe
+  that gets no CPU at all, or FRR not reading its socket. Check the
+  thread is there (`ps -T -p "$(pgrep -x packetframe)" | grep
+  pf-bgp-liveness`, one line per session) and look at
   `top -H -p "$(pgrep -x packetframe)"` around the drop.
 - **packetframe's.** packetframe logs `BGP connection handler exited
   with error` with `hold timer (90 s) expired`: it waited on the
@@ -2019,6 +2047,48 @@ and the whole table again. Which side's timer fired says where to look.
 The reverse also holds: packetframe keeps the session up however
 slowly routes apply, so FRR showing `Established` says nothing about
 whether they are landing.
+
+When FRR ends the session (a NOTIFICATION, then its close), packetframe
+ends it too, at once: `BGP connection handler exited with error` with
+`the peer closed the connection with N bytes still unread here`. N is
+the part of FRR's stream that was still queued, unapplied; the next
+session re-sends it. Before 2026-10-12 packetframe applied all of it
+first, and on a starved gateway that took four and a half minutes,
+with FRR's reconnects waiting unanswered. FRR's reconnects meanwhile
+queue in the kernel, and the listener takes the newest; the journal
+then shows `BGP connection dropped unopened` for the older ones, and
+for any whose peer had already given up on it. That is expected after
+a drop: those connections are ones FRR abandoned.
+
+### Symptom: the route mirror empties after a feed reconnect
+
+What it means: `InitiationComplete` fired before the peer had re-sent
+its table, and its GC removed every route the peer had not reached yet.
+The mirror refills as the dump goes on, but until it does those
+prefixes leave the PacketFrame FIB. In the journal, shortly after `BGP
+client connected`: `InitiationComplete fired` with a small
+`updates_seen`, then `InitiationComplete: garbage-collected unseen
+advertisements` with a `gc_count` near the table size; the integrity
+line then shows `packetframe_prefixes` far below `authority_prefixes`.
+On 2026-10-12 it fired 384 UPDATEs into the dump: a starved FRR paused
+for the 5 s the window was then.
+
+Check the `received peer OPEN` line and the `trigger=` on `InitiationComplete fired`:
+
+- `graceful_restart=false`: the peer did not negotiate graceful restart,
+  so it sends no End-of-RIB and packetframe can only infer the end from
+  30 s of silence. Make it negotiate: on FRR, `bgp graceful-restart`
+  (global) or `neighbor <addr> graceful-restart-helper`. `show bgp
+  neighbors <addr>` then lists Graceful Restart among the received and
+  advertised capabilities.
+- `graceful_restart=true` and `trigger=quiescence`: the peer negotiated
+  graceful restart but sent no End-of-RIB for 300 s, so the backstop
+  fired. On FRR, look for `bgp graceful-restart disable-eor` and remove
+  it.
+- `trigger=end-of-rib`: the peer said its table was complete. Each
+  family's arrival is logged as `End-of-RIB received`, and
+  `InitiationComplete` waits for every family on the `families=` of the
+  OPEN line.
 
 ### Symptom: route-source session stays up but routes stop flowing
 
