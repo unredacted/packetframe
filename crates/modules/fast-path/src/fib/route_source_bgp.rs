@@ -59,8 +59,8 @@
 //! our hold timer runs in the reader ([`reader_task`]), so neither
 //! direction's liveness waits on route processing.
 //!
-//! **What we send.** OPEN, KEEPALIVEs, and one End-of-RIB per
-//! negotiated family right after the OPEN-confirming KEEPALIVE: we
+//! **What we send.** OPEN, KEEPALIVEs, and one End-of-RIB per family
+//! the session carries right after the OPEN-confirming KEEPALIVE: we
 //! announce nothing, so our side of the table is complete at once.
 //! No other UPDATE, no NOTIFICATION (we close on protocol error rather
 //! than send a structured NOTIFICATION, the peer reconnects either
@@ -294,7 +294,7 @@ impl Default for QuietWindows {
 /// What fired InitiationComplete, for its log line.
 #[derive(Debug, Clone, Copy)]
 enum InitTrigger {
-    /// End-of-RIB arrived for every negotiated family.
+    /// End-of-RIB arrived for every family the session carries.
     EndOfRib,
     /// The stream went quiet for this long.
     Quiescence(Duration),
@@ -539,9 +539,10 @@ impl BgpListener {
         };
 
         // Step 3: a KEEPALIVE confirming the OPEN, then End-of-RIB for
-        // every family both sides negotiated. Our Graceful Restart
-        // capability obliges the End-of-RIB (RFC 4724 §2), and it costs
-        // nothing: we announce no routes, so our table is complete now.
+        // every family the session carries (see `unicast_families`). Our
+        // Graceful Restart capability obliges the End-of-RIB (RFC 4724
+        // §2), and it costs nothing: we announce no routes, so our table
+        // is complete now.
         // It also matters to the peer: an FRR restarting with
         // `preserve-fw-state` defers its best-path selection until every
         // graceful-restart peer's End-of-RIB is in, ours included. TCP
@@ -644,12 +645,11 @@ impl BgpListener {
                     };
                     info!(?family, updates_seen, "End-of-RIB received");
                     end_of_rib.insert(family);
-                    // Every family the session negotiated, not merely the
+                    // Every family the session may carry, not merely the
                     // one that just ended: an InitiationComplete after
                     // IPv4's End-of-RIB would GC every IPv6 route still to
-                    // come. A family set left empty by an exotic OPEN
-                    // never completes this way; the silence backstop does.
-                    if families.is_empty() || !end_of_rib.contains_all(families) {
+                    // come, and the reverse every IPv4 route.
+                    if !end_of_rib.contains_all(families) {
                         continue;
                     }
                     InitTrigger::EndOfRib
@@ -1517,10 +1517,6 @@ impl Families {
             .filter_map(|(on, family)| on.then_some(family))
     }
 
-    fn is_empty(self) -> bool {
-        !self.v4 && !self.v6
-    }
-
     fn contains_all(self, other: Families) -> bool {
         (self.v4 || !other.v4) && (self.v6 || !other.v6)
     }
@@ -1552,10 +1548,8 @@ struct NegotiatedCapabilities {
     /// restart peer and marks the end of each family's table with
     /// End-of-RIB, so silence is only the backstop for it.
     graceful_restart: bool,
-    /// Peer advertised Multiprotocol Extensions (RFC 4760) at all, and
-    /// for which unicast families. See [`Self::unicast_families`].
-    multiprotocol: bool,
-    mp_v4_unicast: bool,
+    /// Peer advertised Multiprotocol Extensions (RFC 4760) for IPv6
+    /// unicast. See [`Self::unicast_families`].
     mp_v6_unicast: bool,
 }
 
@@ -1572,21 +1566,22 @@ impl NegotiatedCapabilities {
         self.add_path_v4_recv && self.add_path_v6_recv
     }
 
-    /// The unicast families the session carries: those the peer
-    /// advertised Multiprotocol Extensions for, since we advertise both.
-    /// A peer that advertised none speaks plain RFC 4271, IPv4 unicast
-    /// only. Each side sends End-of-RIB for exactly these.
+    /// The unicast families the session may carry, and so the ones we
+    /// send End-of-RIB for and wait for one in. IPv6 when the peer
+    /// advertised Multiprotocol Extensions for it (we advertise both).
+    /// IPv4 always: BGP-4's own NLRI carries it with no capability at
+    /// all, and RFC 4760 §8 does not settle whether a peer that
+    /// advertised other families still uses that encoding with us.
+    /// Leaving IPv4 out when the peer does would let another family's
+    /// End-of-RIB fire InitiationComplete mid-replay and GC every IPv4
+    /// route not yet re-sent, the failure End-of-RIB exists to prevent;
+    /// waiting for an IPv4 End-of-RIB that never comes costs only the
+    /// silence backstop. Ours, an empty UPDATE, is a message every BGP-4
+    /// speaker parses.
     fn unicast_families(&self) -> Families {
-        if self.multiprotocol {
-            Families {
-                v4: self.mp_v4_unicast,
-                v6: self.mp_v6_unicast,
-            }
-        } else {
-            Families {
-                v4: true,
-                v6: false,
-            }
+        Families {
+            v4: true,
+            v6: self.mp_v6_unicast,
         }
     }
 }
@@ -1639,11 +1634,8 @@ fn walk_open_capabilities(
                     caps.four_octet_asn = Some(foa.asn);
                 }
                 CapabilityValue::MultiprotocolExtensions(mp) => {
-                    caps.multiprotocol = true;
-                    match (mp.afi, mp.safi) {
-                        (Afi::Ipv4, Safi::Unicast) => caps.mp_v4_unicast = true,
-                        (Afi::Ipv6, Safi::Unicast) => caps.mp_v6_unicast = true,
-                        _ => {}
+                    if (mp.afi, mp.safi) == (Afi::Ipv6, Safi::Unicast) {
+                        caps.mp_v6_unicast = true;
                     }
                 }
                 CapabilityValue::GracefulRestart(_) => caps.graceful_restart = true,
@@ -2380,6 +2372,17 @@ mod tests {
         families: Families,
     }
 
+    impl PeerCaps {
+        /// The families the session carries with this peer: IPv4 always,
+        /// see [`NegotiatedCapabilities::unicast_families`].
+        fn session_families(self) -> Families {
+            Families {
+                v4: true,
+                v6: self.families.v6,
+            }
+        }
+    }
+
     /// A peer that does not negotiate graceful restart: InitiationComplete
     /// can only come from silence.
     const PLAIN_PEER: PeerCaps = PeerCaps {
@@ -2520,12 +2523,12 @@ mod tests {
             MSG_TYPE_KEEPALIVE,
             "the OPEN-confirming KEEPALIVE comes first"
         );
-        for family in setup.peer.families.iter() {
+        for family in setup.peer.session_families().iter() {
             let msg = read_message(&mut peer).await.expect("End-of-RIB");
             assert_eq!(
                 end_of_rib_in(&msg),
                 Some(family),
-                "then our End-of-RIB for each family the session negotiated"
+                "then our End-of-RIB for each family the session carries"
             );
         }
         (peer, session, shutdown)
@@ -3276,7 +3279,7 @@ mod tests {
     /// 384 UPDATEs into a 1.3M-route dump, an FRR starved for CPU went
     /// quiet for the 5 s window, and InitiationComplete GC'd ~76K routes
     /// the session had yet to re-send. From a graceful-restart peer it
-    /// waits for End-of-RIB in every negotiated family: silence mid-dump
+    /// waits for End-of-RIB in every family the session carries: silence mid-dump
     /// fires nothing, IPv4's End-of-RIB alone fires nothing, and the last
     /// one fires it at once, behind every UPDATE.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3490,25 +3493,64 @@ mod tests {
         let none = NegotiatedCapabilities::default();
         assert_eq!(none.unicast_families(), V4_ONLY, "plain RFC 4271");
         let v6 = NegotiatedCapabilities {
-            multiprotocol: true,
             mp_v6_unicast: true,
             ..Default::default()
         };
         assert_eq!(
             v6.unicast_families(),
-            Families {
-                v4: false,
-                v6: true
-            }
+            BOTH,
+            "IPv4 stays in when the peer advertised Multiprotocol for IPv6 alone"
         );
-        let other = NegotiatedCapabilities {
-            multiprotocol: true,
-            ..Default::default()
-        };
-        assert!(
-            other.unicast_families().is_empty(),
-            "Multiprotocol for other families only: no unicast at all"
+    }
+
+    /// A peer that advertised Multiprotocol Extensions for IPv6 alone and
+    /// sends IPv4 routes anyway, in BGP-4's own encoding. Its IPv6
+    /// End-of-RIB must not fire InitiationComplete while IPv4 may still
+    /// be replaying: that would GC every IPv4 route not yet re-sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ipv6_only_multiprotocol_peer_still_owes_an_ipv4_end_of_rib() {
+        let (prog, log) = recording_handle();
+        let (peer, session, shutdown) = establish_with(
+            prog,
+            Setup {
+                peer: PeerCaps {
+                    graceful_restart: true,
+                    families: Families {
+                        v4: false,
+                        v6: true,
+                    },
+                },
+                ..Setup::default()
+            },
+        )
+        .await;
+        let (rd, mut wr) = peer.into_split();
+        let seen = watch(rd);
+        let fired = || initiation_complete_at(&log).is_some();
+
+        wr.write_all(&test_update()).await.expect("IPv4 UPDATE");
+        wr.write_all(&encode_end_of_rib(Family::V6))
+            .await
+            .expect("End-of-RIB");
+        assert_eq!(
+            quiet_peer_until(&mut wr, Duration::from_secs(2), fired).await,
+            None,
+            "IPv6's End-of-RIB fired InitiationComplete with IPv4 still able to replay"
         );
+        wr.write_all(&test_update()).await.expect("IPv4 UPDATE");
+        wr.write_all(&encode_end_of_rib(Family::V4))
+            .await
+            .expect("End-of-RIB");
+        quiet_peer_until(&mut wr, Duration::from_secs(5), fired)
+            .await
+            .expect("IPv4's End-of-RIB completes the table");
+        assert_eq!(initiation_complete_at(&log), Some(2), "after both UPDATEs");
+        assert_eq!(seen.lock().expect("seen").closed, None);
+        shutdown.cancel();
+        session
+            .await
+            .expect("join")
+            .expect("shutdown ends a session cleanly");
     }
 
     #[test]
