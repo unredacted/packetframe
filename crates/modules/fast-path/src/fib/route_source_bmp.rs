@@ -226,7 +226,7 @@ impl BmpStation {
     /// Ordering is free: commands share one channel and every route
     /// dispatch at these sites is awaited, so a count sent afterwards
     /// observes the wipe — including a wipe that only PARTIALLY
-    /// succeeded. `drop_routes_for_peer` logs and swallows map and
+    /// succeeded. The programmer's `PeerDown` logs and swallows map and
     /// recompute failures, so "we dispatched PeerDown" is not evidence
     /// the routes are gone (review finding). Counting them is.
     ///
