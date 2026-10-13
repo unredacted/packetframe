@@ -438,12 +438,22 @@ impl RouteSource for RouteFeed {
     }
 
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+        let _ = self.for_each_route_from(None, usize::MAX, visit);
+    }
+
+    fn for_each_route_from(
+        &self,
+        after: Option<IpPrefix>,
+        max: usize,
+        visit: &mut dyn FnMut(IpPrefix, &[IpAddr]),
+    ) -> Option<IpPrefix> {
         // Chunked so the writer never waits for more than `WALK_CHUNK`
         // copies. `after` is the resume cursor; a prefix inserted below it
         // mid-walk is missed by this pass and picked up as a pending
         // delta, which is the same path every other live change takes.
-        let mut after: Option<PrefixKey> = None;
-        loop {
+        let mut after: Option<PrefixKey> = after.map(PrefixKey::from);
+        let mut left = max;
+        while left > 0 {
             let chunk: Vec<(PrefixKey, Vec<IpAddr>)> = {
                 let g = self.lock();
                 let lower = match after {
@@ -452,18 +462,20 @@ impl RouteSource for RouteFeed {
                 };
                 g.routes
                     .range((lower, std::ops::Bound::Unbounded))
-                    .take(WALK_CHUNK)
+                    .take(WALK_CHUNK.min(left))
                     .map(|(k, id)| (*k, g.sets[*id as usize].clone()))
                     .collect()
             };
             if chunk.is_empty() {
-                return;
+                return None;
             }
+            left -= chunk.len();
             after = Some(chunk[chunk.len() - 1].0);
             for (k, nhs) in chunk {
                 visit(k.into(), &nhs);
             }
         }
+        after.map(IpPrefix::from)
     }
 
     fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
@@ -520,6 +532,14 @@ impl RouteSource for std::sync::Arc<RouteFeed> {
     }
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
         (**self).for_each_route(visit)
+    }
+    fn for_each_route_from(
+        &self,
+        after: Option<IpPrefix>,
+        max: usize,
+        visit: &mut dyn FnMut(IpPrefix, &[IpAddr]),
+    ) -> Option<IpPrefix> {
+        (**self).for_each_route_from(after, max, visit)
     }
     fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
         (**self).for_each_neighbour(visit)
@@ -877,6 +897,64 @@ mod tests {
             count += 1;
         });
         assert_eq!(count, total, "every prefix visited once");
+    }
+
+    /// A walk taken `max` routes a call resumes after the last key it
+    /// returned and visits every prefix exactly once, through the `Arc`
+    /// the loader boxes — whose default would visit everything in one
+    /// call and hand a resync release's whole table to one pass. The
+    /// cursor is a key: a prefix removed ahead of it, or the one it names,
+    /// costs nothing, and one inserted behind it is missed by this walk and
+    /// queued as the delta the walk leaves for it.
+    #[test]
+    fn a_walk_resumes_after_its_last_key_across_calls() {
+        let p = |i: u16| {
+            let [hi, lo] = i.to_be_bytes();
+            IpPrefix::V6 {
+                addr: [0x20, 0x01, 0x0d, 0xb8, hi, lo, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                prefix_len: 32,
+            }
+        };
+        let via = [IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 1,
+        ))];
+        let f = std::sync::Arc::new(RouteFeed::new());
+        for i in (2..=40).step_by(2) {
+            f.route_resolved(p(i), &via);
+        }
+        let src: &dyn RouteSource = &f;
+        let mut visited = Vec::new();
+        let mut calls = 0;
+        let mut after = None;
+        loop {
+            calls += 1;
+            let mut this_call = 0;
+            after = src.for_each_route_from(after, 3, &mut |prefix, nhs| {
+                assert_eq!(nhs, via);
+                visited.push(prefix);
+                this_call += 1;
+            });
+            assert!(this_call <= 3, "at most `max` a call");
+            if calls == 2 {
+                // Behind the cursor (p(2) was visited), at it, and ahead.
+                f.route_resolved(p(3), &via);
+                f.route_withdrawn(after.expect("more to come"));
+                f.route_withdrawn(p(40));
+            }
+            if after.is_none() {
+                break;
+            }
+        }
+        let want: Vec<IpPrefix> = (2..=38).step_by(2).map(p).collect();
+        assert_eq!(visited, want, "each once, in key order, none skipped");
+        assert!(calls > 6, "{calls} calls of three");
+        assert!(
+            f.drain_changes(64)
+                .routes
+                .iter()
+                .any(|(prefix, nhs)| *prefix == p(3) && nhs.is_some()),
+            "the prefix behind the cursor is a delta"
+        );
     }
 
     /// The walk terminates on an empty table rather than spinning on the
