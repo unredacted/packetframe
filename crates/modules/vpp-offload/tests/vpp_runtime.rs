@@ -2967,6 +2967,10 @@ fn an_unattested_release_waits_for_the_route_sources_initiation_complete() {
             && msg.contains("InitiationComplete fired"),
         "the row names the wait and the journal line that ends it: {msg}"
     );
+    assert!(
+        msg.contains("the adopted FIB keeps forwarding untouched"),
+        "still steered, so the adopted FIB carries the traffic: {msg}"
+    );
 
     // The route source fires InitiationComplete: the same mirror releases.
     session.mark_reconciled();
@@ -3151,6 +3155,18 @@ fn a_reconnect_during_the_dump_spoils_the_release_until_it_reconciles() {
         "and nothing of it reached VPP"
     );
     assert!(rt.status().awaiting_reconciliation);
+    // VPP was unsteered for the dump and stays so: the row must not say
+    // the adopted FIB is forwarding while the eBPF tier carries it all.
+    let (_, msg) = first_steer_hold::row(
+        &first_steer_hold::report(&d, &rt, now),
+        packetframe_vpp_offload::status::SUBSYS_FIB,
+    );
+    assert!(
+        msg.contains("InitiationComplete fired")
+            && msg.contains("VPP is unsteered, so the traffic is on the eBPF tier")
+            && !msg.contains("keeps forwarding"),
+        "{msg}"
+    );
 
     // The new session reconciles: the diff runs against the kept dump.
     session.mark_reconciled();
