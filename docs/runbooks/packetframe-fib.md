@@ -561,12 +561,13 @@ The setting is the daemon's process only, which is why it is a
 `mallopt` call and not `GLIBC_TUNABLES` in the unit: VPP, which
 vpp-offload spawns, keeps glibc's default. Its cost is a little CPU on
 small allocations that miss glibc's per-thread cache, which now merge
-with their neighbours as they are freed. In Docker on arm64 the
-1M-route measurement's resident set was the same at a full table
-(1083 MiB either way) and no larger after a teardown and a second seed
-(1046 MiB, against 1077 MiB and once 1809 MiB with fastbins on). The
-daemon's own RSS on a gateway, against a build without the setting,
-has not been measured yet.
+with their neighbours as they are freed. On the reference gateway
+(glibc 2.31) the 1M-route measurement's resident set was the same at a
+full table, 1080 MiB seeded and 1060 MiB after the GC either way, and
+smaller after the `PeerDown`: 1038 MiB, peaking at 1099 MiB, against
+1801 MiB and a 1840 MiB peak with `PACKETFRAME_MALLOC_FASTBINS=on`. A
+lab daemon on a 15,104-route table read the same either way (29 MiB
+resident, 62 MiB peak, a minute after it reported healthy).
 
 A stop that comes mid-GC or mid-`PeerDown` finishes the walk before the
 daemon exits, waiting up to 5 s for it, because XDP goes on forwarding
