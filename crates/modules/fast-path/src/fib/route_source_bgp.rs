@@ -650,10 +650,12 @@ impl BgpListener {
                     // and on any deployment with a completeness
                     // authority the drift a stale mirror shows against
                     // bird's current count vetoes the release outright.
-                    // The residual is an unattested deployment whose
-                    // feed reconnects and then stops mid-dump; it is
-                    // named here rather than closed, because closing it
-                    // the obvious way is worse.
+                    // Without an authority, the second tier's floor door
+                    // also waits for this session's InitiationComplete
+                    // (its `mark_reconciled`), which this raise resets:
+                    // a feed that reconnects and then stops
+                    // mid-dump holds that door until the GC rather than
+                    // releasing it on stale credit.
                     if let Some(sess) = &self.cfg.session {
                         sess.set_up(true);
                     }

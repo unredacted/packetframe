@@ -958,15 +958,25 @@ holds the gate loud until it actually ends:
 
 1. **The floor**: the mirror holds ≥ `expected-routes`-derived
    capacity / 16 and has been quiet for **2 s when a completeness
-   authority is configured, 5 s without one** — five being both
-   listeners' own initiation-complete standard, because an unattested
-   release may not claim completion on less evidence than the protocol
-   itself requires. And without an authority, quiet means LITERALLY
-   still: zero stream elements and zero mirror mutations for the whole
-   window, because no rate allowance can distinguish slow churn from a
-   throttled reload. Real feeds pause between churn bursts; one that
-   never does keeps the deferral, visibly. This is the fleet's door —
-   a full-table box with bird releases ~40 s after attach.
+   authority is configured, 5 s without one**. Without an authority it
+   also needs the **route source's own InitiationComplete for the
+   current session** (`InitiationComplete fired` in the journal; what
+   fires it on each feed is under [Force a route-source
+   resync](packetframe-fib.md#force-a-route-source-resync)), because an
+   unattested release may not claim the table is complete on less
+   evidence than the route source itself requires: quiet alone cannot
+   tell a pause mid-dump from the end of the dump, and a CPU-starved FRR
+   paused five seconds mid-dump on 2026-10-12. On a BMP feed's first
+   stream that comes as the stream
+   starts — no earlier stream can have left routes behind — and the five
+   still seconds are the station's own standard (5 s without a
+   RouteMonitoring frame). And without an authority, quiet means
+   LITERALLY still: zero stream elements and zero mirror mutations for
+   the whole window, because no rate allowance can distinguish slow
+   churn from a throttled reload. Real feeds pause between churn bursts;
+   one that never does keeps the deferral, visibly, and so does one whose
+   route source never fires InitiationComplete. This is the fleet's door
+   — a full-table box with bird releases ~40 s after attach.
 2. **The completeness authority** (`require-table-complete on`): bird's
    count agrees with the mirror, recomputed against the mirror as it is
    at release time. A negative verdict vetoes door 1 as well.
@@ -985,7 +995,10 @@ later, it was deleted. See PR #151/#152.)
 If `fib-synced` shows the deferral persisting on a box that SHOULD
 release: check the feed session actually started (`BGP client
 connected` + at least one UPDATE in the log), then check the mirror
-count against the floor in the health text.
+count against the floor in the health text. Past the floor, with no
+authority or after a reconnect, the row says when the route source's
+InitiationComplete is what it waits for: look for `InitiationComplete
+fired` after the session's latest connect.
 
 ### The unsteered diff and a seeded mirror
 
@@ -1272,7 +1285,8 @@ unsteering, in this order:
    is seeded from the record.
 3. The resync diff waits behind the same loaded-and-quiet release the
    dump path uses (feed live, floor = half the seeded table, quiet 2 s
-   with a completeness authority / 5 s without), **steered the whole
+   with a completeness authority / 5 s and the route source's
+   InitiationComplete without), **steered the whole
    time** — or, over a mirror the fast-path seeded, behind the
    seeded-mirror door, which does not wait for the replay ([the steered
    diff and a seeded mirror](#the-steered-diff-and-a-seeded-mirror)).
@@ -4476,12 +4490,17 @@ of **two minutes or more** — comfortably past the measured 80 s — or
 exclude the window explicitly. Thirty seconds, the pre-#151 guidance,
 now fires on every restart.
 
-One case where the wait is legitimately unbounded: if the feed session
-flaps DURING the deferral, the completeness authority is demoted until
-the source reports its initiation-complete GC, which needs 5 s without
-updates and which a live DFZ feed may never give. The deferral message
-says so explicitly when that is what is happening — read it before
-concluding the checker is broken. Nothing is dropping meanwhile.
+One case where the wait is legitimately unbounded: the route source's
+InitiationComplete for its current session never arrives. Two deferrals
+wait on it. If the feed session flaps DURING the deferral, the
+completeness authority is demoted until it arrives, and nothing else
+releases the deferral meanwhile: not a fresh report, and not quiet. With
+no authority at all, every release needs it. A feed that never gives its
+route source what InitiationComplete fires on ([what that
+is](packetframe-fib.md#force-a-route-source-resync)) holds either
+indefinitely. The deferral message says so explicitly when that is what
+is happening — read it before concluding the checker is broken. Nothing
+is dropping meanwhile.
 
 **A second unbounded case, and this one takes the rollback lever with
 it: the completeness authority is VETOING.** `authority_current`

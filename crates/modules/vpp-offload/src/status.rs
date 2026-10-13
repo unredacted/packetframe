@@ -424,6 +424,10 @@ pub struct StatusSnapshot {
     pub seeded_door_refused: Option<crate::runtime::SeededDiffRefusal>,
     /// See [`crate::runtime::RuntimeStatus::authority`].
     pub authority: crate::runtime::AuthorityPosture,
+    /// The deferral `resync_deferred` reports waits for the route source's
+    /// InitiationComplete. See
+    /// [`crate::runtime::RuntimeStatus::awaiting_reconciliation`].
+    pub awaiting_reconciliation: bool,
     pub ports: Vec<PortLink>,
     /// The runtime could not persist something it observed.
     ///
@@ -724,6 +728,7 @@ impl StatusSnapshot {
             preserved_fib,
             seeded_door_refused: None,
             authority,
+            awaiting_reconciliation: false,
             ports,
             store_error,
             drain_error,
@@ -809,6 +814,7 @@ impl StatusSnapshot {
         );
         snap.steer_hold = rs.steer_hold;
         snap.seeded_door_refused = rs.seeded_door_refused;
+        snap.awaiting_reconciliation = rs.awaiting_reconciliation;
         snap.neighbour_counters = rs.neighbour_counters;
         snap.kernel_path = rs.kernel_path;
         snap.drift_scan_ms = rs.drift_scan_ms;
@@ -1729,13 +1735,15 @@ impl StatusSnapshot {
                          untouched. The feed session reconnected under this deferral, so \
                          the authority's report can no longer attest that the mirror is \
                          THIS session's — a count can match while a reannouncement is \
-                         still mid-flight. Attestation returns when the source reports \
-                         its initiation-complete GC, which needs 5 s without updates: on \
-                         a continuously active DFZ feed that gap may never arrive, and \
-                         this deferral can hold indefinitely BY DESIGN. Nothing is \
-                         dropping — VPP forwards the FIB it was adopted with. To resolve \
-                         it, let the feed idle briefly, or restart the daemon once the \
-                         table is loaded so the adoption starts unsteered"
+                         still mid-flight. Attestation returns when the route source \
+                         reports InitiationComplete for the new session (`InitiationComplete \
+                         fired` in the journal), whose GC removes what the previous session \
+                         left. What fires it depends on the route source, and the \
+                         packetframe-fib runbook names it; a feed that never gives it holds \
+                         this deferral indefinitely BY DESIGN. Nothing is dropping — VPP \
+                         forwards the FIB it was adopted with. To resolve it, let the route \
+                         source finish its dump, or restart the daemon once the table is \
+                         loaded so the adoption starts unsteered"
                     )
                 } else if have < want {
                     // Reachable only with NO authority now: every other
@@ -1752,6 +1760,29 @@ impl StatusSnapshot {
                          table, or name a completeness authority \
                          (`integrity-authority birdc|frr`) and enable \
                          `require-table-complete`"
+                    )
+                } else if self.awaiting_reconciliation {
+                    // The floor is met, and what is outstanding is the
+                    // door's own evidence that the dump is complete. Only
+                    // the unattested and demoted postures reach this: an
+                    // attesting authority is that evidence.
+                    let why = if self.authority == AuthorityPosture::DemotedByFlap {
+                        "the feed session reconnected under this deferral, so the \
+                         completeness authority's report can no longer attest that the \
+                         mirror is THIS session's"
+                    } else {
+                        "with no completeness authority, only the route source itself can \
+                         say its dump is complete"
+                    };
+                    format!(
+                        "resync deferred: the route source holds {have} routes (release \
+                         floor {want} met), and {why}: release waits for its \
+                         InitiationComplete for the current session (`InitiationComplete \
+                         fired` in the journal), so that a pause mid-dump is not taken for \
+                         the end of it. What fires it depends on the route source, and the \
+                         packetframe-fib runbook names it; a feed that never gives it holds \
+                         this indefinitely, by design. Nothing is dropping: the adopted FIB \
+                         keeps forwarding untouched"
                     )
                 } else {
                     format!(
@@ -5755,6 +5786,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A deferral whose floor door waits for the route source's
+    /// InitiationComplete says so once the floor is met, naming why for
+    /// the posture it is in — and only there. Below the floor the floor is
+    /// the first thing to explain, a veto outranks it (the authority blocks
+    /// at any table size, and a demoted deferral can be vetoing too), and
+    /// a deferral that is not waiting on it keeps the plain quiet line.
+    #[test]
+    fn a_deferral_waiting_for_initiation_complete_names_it_above_the_floor() {
+        use crate::runtime::AuthorityPosture;
+        let led = ledger_with(10, 0, 0);
+        let row = |authority, have, awaiting| {
+            let mut snap = snap_of(
+                &steered_supervisor(),
+                &led,
+                ApiHealth::Answering {
+                    silent_for: Duration::from_millis(200),
+                },
+                FibSync::NeverVerified,
+                ports_up(),
+            );
+            snap.resync_deferred = Some((have, 100));
+            snap.authority = authority;
+            snap.awaiting_reconciliation = awaiting;
+            snap.report()
+                .subsystems
+                .into_iter()
+                .find(|s| s.name == SUBSYS_FIB)
+                .and_then(|s| s.message)
+                .expect("a deferral always explains itself")
+        };
+        let waiting = "InitiationComplete for the current session";
+
+        let absent = row(AuthorityPosture::Absent, 196, true);
+        assert!(
+            absent.contains(waiting) && absent.contains("with no completeness authority"),
+            "{absent}"
+        );
+        let demoted = row(AuthorityPosture::DemotedByFlap, 196, true);
+        assert!(
+            demoted.contains(waiting) && demoted.contains("reconnected under this deferral"),
+            "{demoted}"
+        );
+        for authority in [AuthorityPosture::Absent, AuthorityPosture::DemotedByFlap] {
+            let plain = row(authority, 196, false);
+            assert!(
+                !plain.contains("InitiationComplete") && plain.contains("has gone quiet"),
+                "{authority:?}: {plain}"
+            );
+            let below = row(authority, 50, true);
+            assert!(
+                below.contains("below the release floor of 100") && !below.contains(waiting),
+                "{authority:?}: {below}"
+            );
+        }
+        let vetoed = row(AuthorityPosture::Vetoing, 196, true);
+        assert!(
+            vetoed.contains("not the authority feeding it") && !vetoed.contains(waiting),
+            "{vetoed}"
+        );
     }
 
     #[test]

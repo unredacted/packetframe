@@ -1979,6 +1979,17 @@ mod steered {
     pub type SharedRoutes = Arc<Mutex<Vec<IpPrefix>>>;
     pub type Session = Arc<packetframe_common::fib::FeedSession>;
 
+    /// Raise the session with its new epoch already reconciled: what the
+    /// BMP station does for a stream no earlier stream's routes can linger
+    /// behind, and what any route source's InitiationComplete stamps. For
+    /// tests of the steered release's floor and quiet legs, which would
+    /// otherwise also wait for the route source to say its dump is
+    /// complete — the leg its own tests cover.
+    pub fn raise_reconciled(session: &packetframe_common::fib::FeedSession) {
+        session.set_up(true);
+        session.mark_reconciled();
+    }
+
     /// A steered adoption over a six-route VPP, mirror starting with
     /// `initial` routes, rules already in the NIC. The pre-dump floor
     /// is `capacity / 16` — and that the floor is capacity-derived and
@@ -2176,7 +2187,7 @@ fn an_operator_can_unsteer_a_held_deferral() {
 fn a_steered_adoption_unsteers_before_reading_vpps_fib() {
     let (fake, shared, log, rt, session) =
         steered::fixture("steered-adopt", &[fake_vpp::v4(0, 0)], 160);
-    session.set_up(true);
+    steered::raise_reconciled(&session);
     let mut d = Driver::new();
     let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 40);
     assert_eq!(
@@ -2250,7 +2261,7 @@ fn a_met_floor_without_a_live_session_stays_deferred() {
     // nothing, so the clock restarts at the up-transition (review
     // finding: without the reset, the first OPEN after an outage
     // released on stale quiet before a single route had arrived).
-    session.set_up(true);
+    steered::raise_reconciled(&session);
     let mut now = now;
     {
         let (mut obs, mut fx) = rt.views();
@@ -2568,7 +2579,7 @@ fn a_reannouncement_dump_holds_the_gate_loud() {
         .chain((0..8).map(|i| fake_vpp::v4(1, i)))
         .collect();
     let (_fake, _shared, log, rt, session) = steered::fixture("steered-reannounce", &full, 160);
-    session.set_up(true);
+    steered::raise_reconciled(&session);
     let mut d = Driver::new();
     {
         let (mut obs, _) = rt.views();
@@ -2627,7 +2638,7 @@ fn a_revoked_fallback_re_steers_the_intact_adopted_vpp() {
         .chain((0..8).map(|i| fake_vpp::v4(1, i)))
         .collect();
     let (fake, _shared, log, rt, session) = steered::fixture("steered-revoke", &full, 160);
-    session.set_up(true);
+    steered::raise_reconciled(&session);
     let mut d = Driver::new();
     {
         let (mut obs, _) = rt.views();
@@ -2713,8 +2724,9 @@ fn a_revoked_fallback_re_steers_the_intact_adopted_vpp() {
         "the dump and diff must not have run against the revoked window: {touched:?}"
     );
 
-    // Readiness returns: the ordinary cycle completes from the top.
-    session.set_up(true);
+    // Readiness returns, the new stream reconciled: the ordinary cycle
+    // completes from the top.
+    steered::raise_reconciled(&session);
     let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
     // Consecutive duplicates collapse before comparing: the paced
     // RestoreSteer re-ask fires again if the wait outlasts its pace
@@ -2897,6 +2909,253 @@ fn a_flap_demotes_attestation_only_until_a_newer_report_arrives() {
         &["unsteer", "steer"],
         "the current epoch's GC restores the attested release"
     );
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+}
+
+/// Twelve routes, over the floor of a 160-route sizing (10).
+fn twelve() -> Vec<IpPrefix> {
+    (0..4)
+        .map(|i| fake_vpp::v4(0, i))
+        .chain((0..8).map(|i| fake_vpp::v4(1, i)))
+        .collect()
+}
+
+/// An unattested release waits for the route source to say its dump is
+/// complete, however long the stream stays still.
+///
+/// On 2026-10-12 a CPU-starved FRR paused five seconds 384 UPDATEs into a
+/// full-table dump. Five seconds of literal stillness was all an
+/// unattested release asked for, so a pause like that past the floor
+/// would release a steered deferral onto a partial mirror, and the diff
+/// withdraws from VPP every route the mirror lacks. The route source's own
+/// InitiationComplete is the evidence a release with no authority may not
+/// undercut, and the feed session's reconciliation of its current epoch is
+/// where that lands. The row says what is outstanding, because nothing
+/// else on the box would.
+#[test]
+fn an_unattested_release_waits_for_the_route_sources_initiation_complete() {
+    use first_steer_hold::{report, row};
+    use packetframe_common::module::HealthState;
+    use packetframe_vpp_offload::runtime::UNATTESTED_QUIET_FOR;
+    use packetframe_vpp_offload::status::SUBSYS_FIB;
+
+    // The session is up — its first UPDATE raised it — and the dump has
+    // stalled past the floor. Nothing has reconciled the epoch.
+    let (fake, _shared, log, rt, session) =
+        steered::fixture("steered-unattested-pause", &twelve(), 160);
+    session.set_up(true);
+    let mut d = Driver::new();
+    let t0 = Instant::now();
+    // Holds, asserting on the way that nothing was unsteered and no route
+    // op reached the steered VPP.
+    let now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, t0, 400);
+    assert!(
+        now.duration_since(t0) >= 3 * UNATTESTED_QUIET_FOR,
+        "the premise: the stream stayed still well past the unattested window ({:?})",
+        now.duration_since(t0)
+    );
+    assert_eq!(d.state(), State::AdoptedResyncing);
+    assert!(
+        rt.status().awaiting_reconciliation,
+        "the status names the reconciliation as what is outstanding"
+    );
+    let (state, msg) = row(&report(&d, &rt, now), SUBSYS_FIB);
+    assert_eq!(state, HealthState::Degraded, "{msg}");
+    assert!(
+        msg.contains("release floor 10 met")
+            && msg.contains("with no completeness authority")
+            && msg.contains("InitiationComplete fired"),
+        "the row names the wait and the journal line that ends it: {msg}"
+    );
+
+    // The route source fires InitiationComplete: the same mirror releases.
+    session.mark_reconciled();
+    assert!(!rt.status().awaiting_reconciliation);
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+}
+
+/// A session flap demotes an attested deferral above the floor to waiting
+/// for the new session's InitiationComplete, too.
+///
+/// The test above is why the authority's word cannot lift it: a report,
+/// however fresh, compares counts, and a reannouncement mid-flight keeps
+/// them aligned. The demoted posture fell back to the unattested one, whose
+/// only evidence was five still seconds — the same pause the unattested
+/// release would mistake for the end of a dump — so here, with the floor
+/// met and a fresh report agreeing, it released. Below the floor (the test
+/// above) it never could, which is why nothing caught it.
+#[test]
+fn a_flapped_deferral_above_the_floor_waits_for_the_new_sessions_gc() {
+    use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+    use packetframe_vpp_offload::runtime::{AuthorityPosture, UNATTESTED_QUIET_FOR};
+
+    let (fake, _shared, log, rt, session) =
+        steered::fixture("steered-flap-above-floor", &twelve(), 160);
+    let handle = std::sync::Arc::new(TableCompleteness::new());
+    rt.require_table_complete(handle.clone());
+    let mut d = Driver::new();
+    let mut now = steered::adopt_and_hold(&mut d, &rt, &fake, &log, Instant::now(), 20);
+
+    // Raise, and let the deferral observe it so it baselines the epoch.
+    // With no report published the authority vetoes, so nothing releases
+    // in this window.
+    session.set_up(true);
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..40 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+
+    // The session bounces, and the authority then agrees with the mirror
+    // in a report taken after the reconnect.
+    session.set_up(false);
+    session.set_up(true);
+    handle.publish(CompletenessReport {
+        authority_routes: 12,
+        mirror_routes: 12,
+        at: std::time::Instant::now(),
+    });
+    let held_from = now;
+    {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..400 {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        now.duration_since(held_from) >= 3 * UNATTESTED_QUIET_FOR,
+        "the premise: still well past the unattested window ({:?})",
+        now.duration_since(held_from)
+    );
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "nothing may be unsteered before the new session's GC: {:?}",
+        log.lock().unwrap()
+    );
+    assert_eq!(d.state(), State::AdoptedResyncing);
+    let status = rt.status();
+    assert_eq!(status.authority, AuthorityPosture::DemotedByFlap);
+    assert!(status.awaiting_reconciliation);
+    let (_, msg) = first_steer_hold::row(
+        &first_steer_hold::report(&d, &rt, now),
+        packetframe_vpp_offload::status::SUBSYS_FIB,
+    );
+    assert!(
+        msg.contains("reconnected under this deferral") && msg.contains("InitiationComplete fired"),
+        "{msg}"
+    );
+
+    // The new session's GC lifts the demotion, and the attested release
+    // follows.
+    session.mark_reconciled();
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
+    assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
+    assert!(events.contains(&Event::VerifyPassed), "{events:?}");
+}
+
+/// A reconnect DURING the dump spoils the release that unsteered for it,
+/// even before the new session has streamed anything: the release is
+/// re-judged on the far side of the dump by every leg it rested on, and
+/// the reconciliation is one. Nothing else would catch this moment. The
+/// BGP listener raises a session a moment before it counts the UPDATE
+/// that raised it, so a dump that returns between the two finds a new
+/// epoch and no activity for its churn budget to refuse. The dump is kept,
+/// and the diff runs against it once the new session reconciles.
+#[test]
+fn a_reconnect_during_the_dump_spoils_the_release_until_it_reconciles() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let session: steered::Session = Arc::new(packetframe_common::fib::FeedSession::new());
+    let flapped: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let in_dump = session.clone();
+    let on_dump: &'static (dyn Fn() + Sync) = Box::leak(Box::new(move || {
+        // A new epoch and no pulse: the listener's raise, before the
+        // UPDATE that raised it is counted. Once.
+        if !flapped.swap(true, Ordering::SeqCst) {
+            in_dump.set_up(false);
+            in_dump.set_up(true);
+        }
+    }));
+    let fake = Fake::start_behaving(
+        "steered-reconnect-in-dump",
+        Behaviour {
+            existing_routes: steered::EXISTING,
+            on_dump: Some(on_dump),
+            ..Default::default()
+        },
+    );
+    let log: steered::Log = Arc::new(Mutex::new(Vec::new()));
+    let rt = runtime_custom(
+        &fake,
+        Box::new(steered::SharedMirror(Arc::new(Mutex::new(twelve())))),
+        Box::new(steered::RecordingSteering {
+            rules: vec![("eth4".into(), 1)],
+            log: log.clone(),
+        }),
+        160,
+    );
+    rt.feed_session(session.clone());
+    // No authority; the first session reconciled, and still.
+    steered::raise_reconciled(&session);
+    let mut d = Driver::new();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready(), "the fake must answer the handshake");
+    }
+    let t0 = Instant::now();
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(t0, Event::Adopted { steered: true }, &mut fx);
+    }
+    rt.set_steered(true);
+
+    // Until the dump has been served, and the tick that served it is done.
+    let (now, events) =
+        steered::run_paced(&mut d, &rt, t0, 1024, |_| flapped.load(Ordering::SeqCst));
+    assert_eq!(
+        session.liveness().epoch,
+        2,
+        "the premise: the session reconnected during the dump"
+    );
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["unsteer"],
+        "unsteered for the dump, and nothing since"
+    );
+    assert!(
+        rt.status().resync_deferred.is_some() && !events.contains(&Event::SyncComplete),
+        "the diff did not run on a release the reconnect undid: {events:?}"
+    );
+    assert!(
+        steered::deletes(&fake).is_empty(),
+        "and nothing of it reached VPP"
+    );
+    assert!(rt.status().awaiting_reconciliation);
+
+    // The new session reconciles: the diff runs against the kept dump.
+    session.mark_reconciled();
+    let (_, events) = steered::run_paced(&mut d, &rt, now, 1024, |d| d.state() == State::Steered);
+    assert_eq!(log.lock().unwrap().as_slice(), &["unsteer", "steer"]);
     assert!(events.contains(&Event::VerifyPassed), "{events:?}");
 }
 
@@ -3801,7 +4060,9 @@ mod preserved {
             Box::new(NullStore),
         );
         let session = Arc::new(packetframe_common::fib::FeedSession::new());
-        session.set_up(live);
+        if live {
+            super::steered::raise_reconciled(&session);
+        }
         rt.feed_session(session.clone());
         if let Some(rec) = seed {
             rt.seed_ledger(rec);
@@ -4035,7 +4296,7 @@ mod preserved {
             vec![fake_vpp::table_path([192, 0, 2, 1], ASSIGNED_INDEX, 1)],
         );
         let _ = fake.drain_events();
-        session.set_up(true);
+        super::steered::raise_reconciled(&session);
         let (_, events) = run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
 
         assert!(
@@ -5890,7 +6151,7 @@ fn a_convergence_re_steer_waits_for_vpp_to_catch_up() {
     );
     let session = Arc::new(packetframe_common::fib::FeedSession::new());
     rt.feed_session(session.clone());
-    session.set_up(true);
+    steered::raise_reconciled(&session);
     // Changes at the source VPP has not taken, and will not until released.
     reload.allow.store(0, Ordering::SeqCst);
     reload.announce(pool[12..300].iter().copied());
@@ -6815,6 +7076,11 @@ fn a_steered_seeded_diff_without_every_leg_waits_for_the_replay_to_go_quiet() {
             // again, the quiet one releases it as ever.
             f.agree();
         }
+        // The replay is over, and the route source says so: its
+        // InitiationComplete, which the quiet door needs wherever no
+        // authority attests the table (no authority, or one the
+        // reconnect demoted).
+        f.session.mark_reconciled();
         let (_, seen) =
             steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
         assert!(seen.contains(&Event::VerifyPassed), "{name}: {seen:?}");
@@ -6969,6 +7235,9 @@ fn a_session_that_flaps_during_the_walk_shuts_the_door() {
     assert!(f.rt.status().seeded_door_refused.is_none());
     assert!(f.log.lock().unwrap().is_empty());
 
+    // The new session's replay ends with its InitiationComplete, which
+    // lifts the demotion the reconnect left.
+    f.session.mark_reconciled();
     let (_, seen) = steered::run_paced(&mut d, &f.rt, now, 512, |d| d.state() == State::Steered);
     assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
 }
