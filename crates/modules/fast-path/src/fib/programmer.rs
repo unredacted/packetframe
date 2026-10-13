@@ -102,7 +102,10 @@ pub const DEFAULT_ROUTE_GRACE: Duration = Duration::from_millis(100);
 /// to free IDs promptly after the grace period; loose enough not to
 /// burn CPU. The select!'s other arms will still drive progress;
 /// this is just a backstop.
-const RECLAIM_TICK: Duration = Duration::from_millis(50);
+///
+/// Public, with [`REPROBE_TICK`], so the integration tests can bound how
+/// often an idle programmer is polled.
+pub const RECLAIM_TICK: Duration = Duration::from_millis(50);
 
 /// Re-probe cadence for nexthops that are allocated but not
 /// `Resolved`.
@@ -127,7 +130,7 @@ const RECLAIM_TICK: Duration = Duration::from_millis(50);
 /// disarmed by the next `Learned`. A dead neighbour therefore costs one
 /// kernel probe cycle per minute; a live one recovers on the first
 /// probe.
-const REPROBE_TICK: Duration = Duration::from_secs(1);
+pub const REPROBE_TICK: Duration = Duration::from_secs(1);
 const REPROBE_INITIAL: Duration = Duration::from_secs(1);
 const REPROBE_MAX: Duration = Duration::from_secs(60);
 /// Requests issued per tick, so a mass loss (link flap over hundreds
@@ -1270,6 +1273,17 @@ impl FibProgrammer {
         reclaim_tick.tick().await;
         let mut reprobe_tick = interval(REPROBE_TICK);
         reprobe_tick.tick().await;
+        // A closed channel's `recv` is always ready, and `select!` gives
+        // the worker back only once the task's coop budget is spent, so an
+        // arm left on one spins this task on its worker. Each arm is
+        // switched off at its close, as the resolver does with its resolve
+        // queue. Neither close is a fault to report from here. The event
+        // sender belongs to the resolver's supervisor, which keeps it
+        // until shutdown (a panic aborts the release build). A resolver
+        // that stops working is the `neigh-resolver` row's to report. The
+        // controller holds a command handle until shutdown.
+        let mut events_open = true;
+        let mut commands_open = true;
 
         loop {
             tokio::select! {
@@ -1297,19 +1311,21 @@ impl FibProgrammer {
                 _ = reprobe_tick.tick() => {
                     self.fire_due_reprobes();
                 }
-                evt = self.events_rx.recv() => {
+                evt = self.events_rx.recv(), if events_open => {
                     match evt {
                         Some(e) => self.on_neigh_event(e),
                         None => {
                             debug!("NeighEvent channel closed");
+                            events_open = false;
                         }
                     }
                 }
-                cmd = self.cmd_rx.recv(), if !self.mid_chunked_work() => {
+                cmd = self.cmd_rx.recv(), if commands_open && !self.mid_chunked_work() => {
                     match cmd {
                         Some(c) => self.on_command(c),
                         None => {
                             debug!("Command channel closed");
+                            commands_open = false;
                         }
                     }
                 }

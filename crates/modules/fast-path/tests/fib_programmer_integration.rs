@@ -36,7 +36,9 @@ use aya::Ebpf;
 use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, RouteEvent};
 use packetframe_fast_path::aligned_bpf_copy;
 use packetframe_fast_path::fib::netlink_neigh::NeighborResolveHandle;
-use packetframe_fast_path::fib::programmer::{FibProgrammer, ECMP_GROUPS_CAP, WALK_CHUNK};
+use packetframe_fast_path::fib::programmer::{
+    FibProgrammer, ECMP_GROUPS_CAP, RECLAIM_TICK, REPROBE_TICK, WALK_CHUNK,
+};
 use packetframe_fast_path::fib::types::{
     EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, NexthopSlotClass, FIB_KIND_ECMP,
     FIB_KIND_SINGLE, NH_FAMILY_V4, NH_FAMILY_V6, NH_STATE_FAILED, NH_STATE_INCOMPLETE,
@@ -238,10 +240,10 @@ struct ProgrammerHarness {
     shutdown: CancellationToken,
     handle: packetframe_fast_path::fib::programmer::FibProgrammerHandle,
     task: Option<tokio::task::JoinHandle<()>>,
-    /// Retained only by the sink variant, which needs to inject
-    /// `NeighEvent`s. `new()`/`new_with_cache()` drop their sender, which
-    /// closes the channel — fine for route-only tests, fatal here.
-    events_tx: Option<tokio::sync::mpsc::Sender<NeighEvent>>,
+    /// Kept for the programmer's whole life, as the resolver's supervisor
+    /// keeps it in production, whether or not the test injects
+    /// `NeighEvent`s: dropping it would run every test on a closed channel.
+    events_tx: tokio::sync::mpsc::Sender<NeighEvent>,
 }
 
 impl ProgrammerHarness {
@@ -265,7 +267,7 @@ impl ProgrammerHarness {
         let ecmp_groups: Array<MapData, EcmpGroup> = open_array(&pins.path("ECMP_GROUPS"));
 
         let shutdown = CancellationToken::new();
-        let (_events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
         let (mut programmer, handle) = FibProgrammer::new(
             nexthops,
             fib_v4,
@@ -291,7 +293,7 @@ impl ProgrammerHarness {
             shutdown,
             handle,
             task: Some(task),
-            events_tx: None,
+            events_tx,
         }
     }
 
@@ -308,7 +310,7 @@ impl ProgrammerHarness {
         let ecmp_groups: Array<MapData, EcmpGroup> = open_array(&pins.path("ECMP_GROUPS"));
         let cache_cfg: Array<MapData, FibCacheCfg> = open_array(&pins.path("FIB_CACHE_CFG"));
         let shutdown = CancellationToken::new();
-        let (_events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
         let (programmer, handle) = FibProgrammer::new_with_resolver(
             nexthops,
             fib_v4,
@@ -331,12 +333,11 @@ impl ProgrammerHarness {
             shutdown,
             handle,
             task: Some(task),
-            events_tx: None,
+            events_tx,
         }
     }
 
-    /// Variant with a second-tier sink registered and the neigh-event
-    /// sender retained.
+    /// Variant with a second-tier sink registered.
     fn with_sink() -> (Self, Arc<RecordingSink>) {
         let pins = PinDirs::setup();
         let ebpf = load_and_pin(&pins);
@@ -369,7 +370,7 @@ impl ProgrammerHarness {
                 shutdown,
                 handle,
                 task: Some(task),
-                events_tx: Some(events_tx),
+                events_tx,
             },
             sink,
         )
@@ -421,7 +422,7 @@ impl ProgrammerHarness {
                 shutdown,
                 handle,
                 task: Some(task),
-                events_tx: Some(events_tx),
+                events_tx,
             },
             sink,
             status,
@@ -471,7 +472,7 @@ impl ProgrammerHarness {
                 shutdown,
                 handle,
                 task: Some(task),
-                events_tx: Some(events_tx),
+                events_tx,
             },
             sink,
             resolve_rx,
@@ -504,7 +505,7 @@ impl ProgrammerHarness {
     /// to await. 200 ms against a current-thread runtime whose only other
     /// work is this event is generous by three orders of magnitude.
     fn feed_neigh(&self, evt: NeighEvent) {
-        let tx = self.events_tx.as_ref().expect("sink harness only").clone();
+        let tx = self.events_tx.clone();
         self.run(async move {
             tx.send(evt).await.expect("neigh channel open");
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -679,8 +680,6 @@ impl OneFreeWorker {
         let fib_v6 = open_lpm_v6(&pins.path("FIB_V6"));
         let ecmp_groups: Array<MapData, EcmpGroup> = open_array(&pins.path("ECMP_GROUPS"));
         let shutdown = CancellationToken::new();
-        // The sender is kept: a closed channel is always ready, and the run
-        // loop would spin on it.
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
         let (mut programmer, handle) = FibProgrammer::new(
             nexthops,
@@ -717,7 +716,7 @@ impl OneFreeWorker {
                 shutdown,
                 handle,
                 task: Some(task),
-                events_tx: Some(events_tx),
+                events_tx,
             },
             sink,
             polls,
@@ -3778,6 +3777,92 @@ fn no_command_overtakes_a_resync_or_its_gc() {
         t.sink.withdrawn.load(Ordering::SeqCst),
         MANY_CHUNKS - readvertised.len()
     );
+}
+
+/// A closed channel is not polled again, and the programmer serves on.
+///
+/// A closed channel's `recv` is always ready, and `select!` returns
+/// `Pending` only once the task's coop budget is spent, so a loop that
+/// keeps polling one spins its worker; every harness that dropped its event
+/// sender ran that way. Each channel is closed in turn here, and the
+/// programmer's polls over an idle interval are held to its timer ticks, a
+/// few dozen a second, where a spinning loop is polled thousands of times.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_closed_channel_does_not_spin_the_programmer() {
+    const IDLE: Duration = Duration::from_millis(500);
+    let pins = PinDirs::setup();
+    let _ebpf = load_and_pin(&pins);
+    let shutdown = CancellationToken::new();
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+    let (programmer, handle) = FibProgrammer::new(
+        open_array(&pins.path("NEXTHOPS")),
+        open_lpm_v4(&pins.path("FIB_V4")),
+        open_lpm_v6(&pins.path("FIB_V6")),
+        open_array(&pins.path("ECMP_GROUPS")),
+        events_rx,
+        shutdown.clone(),
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let polls = Arc::new(AtomicUsize::new(0));
+    let task = rt.spawn(CountPolls {
+        inner: Box::pin(programmer.run()),
+        polls: polls.clone(),
+        longest_ns: Arc::new(AtomicU64::new(0)),
+    });
+    let polls_while_idle = || {
+        let before = polls.load(Ordering::SeqCst);
+        rt.block_on(async { tokio::time::sleep(IDLE).await });
+        polls.load(Ordering::SeqCst) - before
+    };
+    // An idle programmer is polled once per timer tick, plus once to see a
+    // close. A window can hold one more tick than its length divided by the
+    // period, depending on where it falls. Missed ticks burst into a single
+    // poll, so a stalled runtime polls it less, never more. Doubled for
+    // slack, the bound is still far below a spinning loop's thousands.
+    let ticks = |period: Duration| (IDLE.as_millis() / period.as_millis()) as usize + 1;
+    let bound = 2 * (ticks(RECLAIM_TICK) + ticks(REPROBE_TICK) + 1);
+    let open = polls_while_idle();
+    assert!(
+        open <= bound,
+        "premise: {open} polls in {IDLE:?} with both channels open, over the bound of {bound}"
+    );
+
+    drop(events_tx);
+    let events_closed = polls_while_idle();
+    assert!(
+        events_closed <= bound,
+        "{events_closed} polls in {IDLE:?} with the event channel closed, against {open} with \
+         it open: the loop is spinning on the closed channel"
+    );
+    assert!(!task.is_finished(), "the programmer stopped at the close");
+    let nh = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let id = rt
+        .block_on(handle.register_nexthop(nh))
+        .expect("register_nexthop after the event channel closed");
+    let nexthops: Array<MapData, NexthopEntry> = open_array(&pins.path("NEXTHOPS"));
+    assert_eq!(
+        nexthops.get(&id, 0).expect("NEXTHOPS read").state,
+        NH_STATE_INCOMPLETE
+    );
+    assert_eq!(rt.block_on(handle.mirror_counts()).expect("counts"), (0, 0));
+
+    drop(handle);
+    let commands_closed = polls_while_idle();
+    assert!(
+        commands_closed <= bound,
+        "{commands_closed} polls in {IDLE:?} with the command channel closed too, against \
+         {open} with both open: the loop is spinning on the closed channel"
+    );
+    assert!(!task.is_finished(), "the programmer stopped at the close");
+
+    shutdown.cancel();
+    rt.block_on(async { tokio::time::timeout(Duration::from_secs(2), task).await })
+        .expect("the programmer stops at shutdown")
+        .expect("the programmer's task did not panic");
 }
 
 /// What a stop writes: the route source's advertisements, and nothing
