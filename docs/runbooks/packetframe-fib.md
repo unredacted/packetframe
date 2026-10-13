@@ -543,9 +543,10 @@ line says what applies:
 - `malloc: fastbins off (mallopt M_MXFAST 0) ...`: the default.
 - `malloc: PACKETFRAME_MALLOC_FASTBINS=on, so glibc's fastbins are kept ...`:
   the opt-out, set in the daemon's environment (a systemd drop-in,
-  `Environment=PACKETFRAME_MALLOC_FASTBINS=on`). It restores glibc's
-  default without a rebuild, and is how one build measures both
-  settings. A `glibc.malloc.mxfast` in `GLIBC_TUNABLES` is not honoured:
+  `Environment=PACKETFRAME_MALLOC_FASTBINS=on`). The daemon then sets
+  glibc's default fastbin limit itself (`mallopt`, 128 on 64-bit), so it
+  restores glibc's default without a rebuild whatever `GLIBC_TUNABLES`
+  holds, and one build measures both settings. A `glibc.malloc.mxfast` in `GLIBC_TUNABLES` is not honoured:
   the daemon's own setting overrides it (`overrode_glibc_tunable=true`
   on the first line), because whether glibc applied such a tunable
   cannot be told reliably from outside.

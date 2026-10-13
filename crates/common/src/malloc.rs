@@ -38,14 +38,22 @@
 //! the variable names `glibc.malloc.mxfast`, so the start-up line can say
 //! it was overridden.
 
-/// Set to `on` in the daemon's environment (a systemd drop-in) to keep
-/// glibc's fastbins: the way back to glibc's default without a rebuild,
-/// and how one build measures both settings. Any other value, or none,
-/// leaves the daemon's setting in force.
+/// Set to `on` in the daemon's environment (a systemd drop-in) to run
+/// with glibc's default fastbins: the way back to glibc's default without
+/// a rebuild, and how one build measures both settings. The daemon then
+/// sets glibc's default limit itself ([`DEFAULT_MXFAST`]), so a
+/// `glibc.malloc.mxfast` left in `GLIBC_TUNABLES` cannot change what is
+/// measured. Any other value, or none, leaves the daemon's setting in
+/// force.
 pub const KEEP_ENV: &str = "PACKETFRAME_MALLOC_FASTBINS";
 
 /// The first glibc release without fastbins: 2.43 removed them, and
 /// `M_MXFAST` became a no-op there.
+/// glibc's `DEFAULT_MXFAST` (malloc.c): `64 * sizeof(size_t) / 4`, 128 on
+/// 64-bit. What [`KEEP_ENV`] restores.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const DEFAULT_MXFAST: libc::c_int = (64 * std::mem::size_of::<usize>() / 4) as libc::c_int;
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const FIRST_GLIBC_WITHOUT_FASTBINS: (u32, u32) = (2, 43);
 
@@ -56,10 +64,13 @@ pub enum Fastbins {
     /// `mallopt(M_MXFAST, 0)` returned 1. Carries whether `GLIBC_TUNABLES`
     /// named `glibc.malloc.mxfast`, which this overrides.
     Disabled { overrode_tunable: bool },
-    /// [`KEEP_ENV`] is `on`: glibc's fastbins are left as they are.
+    /// [`KEEP_ENV`] is `on`, and `mallopt(M_MXFAST, DEFAULT_MXFAST)`
+    /// returned 1: glibc's default fastbins, whatever `GLIBC_TUNABLES`
+    /// said.
     Kept,
-    /// `mallopt(M_MXFAST, 0)` returned 0. glibc refuses only a value above
-    /// its maximum, so this is not expected; fastbins stay as they were.
+    /// `mallopt(M_MXFAST, …)` returned 0. glibc refuses only a value above
+    /// its maximum, which neither 0 nor its own default is, so this is not
+    /// expected; fastbins stay as they were.
     Refused,
     /// This glibc has no fastbins (2.43 and later), so there is nothing to
     /// set. Carries the version glibc reports.
@@ -100,9 +111,9 @@ impl Fastbins {
                  overridden"
             ),
             Fastbins::Kept => tracing::info!(
-                "malloc: {KEEP_ENV}=on, so glibc's fastbins are kept. Freeing a full-table \
-                 walk's routes can then hold a control-plane worker for about a second at 1M \
-                 routes"
+                "malloc: {KEEP_ENV}=on, so fastbins are at glibc's default (mallopt M_MXFAST \
+                 set to it, overriding any glibc.malloc.mxfast). Freeing a full-table walk's \
+                 routes can then hold a control-plane worker for about a second at 1M routes"
             ),
             Fastbins::Refused => tracing::warn!(
                 "malloc: mallopt(M_MXFAST, 0) refused; fastbins stay on, so freeing a \
@@ -131,15 +142,15 @@ fn apply(keep: bool, tunable: bool, glibc: Option<(String, (u32, u32))>) -> Fast
             return Fastbins::NoFastbins(version);
         }
     }
-    if keep {
-        return Fastbins::Kept;
-    }
     // `libc` exposes `M_MXFAST` (glibc's malloc.h, 1) and `mallopt` for
-    // every linux-gnu target.
+    // every linux-gnu target. Set either way, so the outcome never rests on
+    // what a GLIBC_TUNABLES entry did or did not do at start.
+    let limit = if keep { DEFAULT_MXFAST } else { 0 };
     // SAFETY: two ints in, an int out; glibc changes only its own malloc
     // state, under the main arena's lock.
-    match unsafe { libc::mallopt(libc::M_MXFAST, 0) } {
-        1 => Fastbins::Disabled {
+    match (unsafe { libc::mallopt(libc::M_MXFAST, limit) }, keep) {
+        (1, true) => Fastbins::Kept,
+        (1, false) => Fastbins::Disabled {
             overrode_tunable: tunable,
         },
         _ => Fastbins::Refused,
@@ -213,7 +224,17 @@ mod tests {
                 overrode_tunable: true
             }
         );
-        assert_eq!(apply(true, true, old()), Fastbins::Kept);
+        assert_eq!(
+            apply(true, true, old()),
+            Fastbins::Kept,
+            "mallopt(M_MXFAST, DEFAULT_MXFAST) returns 1"
+        );
+        assert_eq!(apply(true, false, old()), Fastbins::Kept);
+        // Leave the process at the daemon's setting for the tests after.
+        assert!(matches!(
+            apply(false, false, old()),
+            Fastbins::Disabled { .. }
+        ));
         assert_eq!(
             apply(false, false, Some(("2.43".to_string(), (2, 43)))),
             Fastbins::NoFastbins("2.43".into())
