@@ -136,7 +136,7 @@ Releases are on the [releases page](https://github.com/unredacted/packetframe/re
 **Debian or Ubuntu:**
 
 ```sh
-VERSION=0.5.0
+VERSION=0.6.0
 ARCH=$(dpkg --print-architecture)   # amd64 or arm64
 curl -LO "https://github.com/unredacted/packetframe/releases/download/v${VERSION}/packetframe_${VERSION}_${ARCH}.deb"
 curl -LO "https://github.com/unredacted/packetframe/releases/download/v${VERSION}/SHA256SUMS"
@@ -150,7 +150,7 @@ The package doesn't start the service, and it doesn't tell systemd it was instal
 **Any Linux (tarball):**
 
 ```sh
-VERSION=0.5.0
+VERSION=0.6.0
 TARGET=x86_64-unknown-linux-musl    # or x86_64-unknown-linux-gnu, aarch64-unknown-linux-{gnu,musl}
 curl -LO "https://github.com/unredacted/packetframe/releases/download/v${VERSION}/packetframe-v${VERSION}-${TARGET}.tar.gz"
 curl -LO "https://github.com/unredacted/packetframe/releases/download/v${VERSION}/SHA256SUMS"
