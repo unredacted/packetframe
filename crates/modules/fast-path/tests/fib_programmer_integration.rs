@@ -664,6 +664,7 @@ struct OneFreeWorker {
     _held: HeldWorker,
     h: ProgrammerHarness,
     sink: Arc<CountingSink>,
+    status: packetframe_fast_path::fib::route_ledger::SharedLedgerStatus,
     /// Polls of the programmer's task ([`CountPolls`]).
     polls: Arc<AtomicUsize>,
     /// The longest of them, in nanoseconds.
@@ -692,6 +693,8 @@ impl OneFreeWorker {
         );
         let sink = Arc::new(CountingSink::default());
         programmer.set_route_sink(sink.clone());
+        let status = packetframe_fast_path::fib::route_ledger::shared_status();
+        programmer.set_ledger_status(status.clone());
         if let Some(seed) = seed {
             programmer.set_seed(seed);
         }
@@ -720,14 +723,29 @@ impl OneFreeWorker {
                 events_tx: Some(events_tx),
             },
             sink,
+            status,
             polls,
             longest_poll_ns,
         }
     }
 
+    /// The seed's route-source advertisements not yet re-advertised or
+    /// removed, as the ledger status publishes them.
+    fn unconfirmed(&self) -> u64 {
+        let st = self.status.lock().expect("ledger status lock");
+        st.seed.as_ref().expect("a seed was applied").unconfirmed
+    }
+
     /// The longest single poll of the programmer's task since the last
     /// call: the longest it held its worker in one go.
+    ///
+    /// Asks the programmer a question first. The poll that finishes a walk
+    /// sends the walk's reply and goes on running, and its length is
+    /// recorded only when it ends, so read straight after the reply the
+    /// longest poll could still be running. A command is served in a later
+    /// poll, so by its answer that one has been recorded.
     fn take_longest_poll(&self) -> Duration {
+        self.mirror_counts();
         Duration::from_nanos(self.longest_poll_ns.swap(0, Ordering::SeqCst))
     }
 
@@ -2695,6 +2713,125 @@ fn a_failed_gc_recompute_is_owed_until_it_reconciles() {
     );
 }
 
+/// A `PeerDown` whose recompute failed leaves the prefix owed, so the
+/// departed session still counts until the prefix reconciles.
+///
+/// The PeerDown takes the peer out of `routes_by_peer` before it
+/// recomputes anything. When another advertisement keeps the record alive
+/// (a `local_arp` one here) and the recompute fails, the prefix is still
+/// installed over the departed peer's nexthop, and the debt is all that
+/// says so: `has_session_routes` is what a second tier holds its deferral
+/// open on. Same failure injection as the GC's test above.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_failed_peer_down_recompute_is_owed_until_it_reconciles() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let session = PeerId(0x5250);
+    let local = PeerId::local_arp(33);
+    let target = IpPrefix::V6 {
+        addr: v6("2001:db8:21::"),
+        prefix_len: 48,
+    };
+    let nh = |i: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, i));
+    let (nh_session, nh_a, nh_b) = (nh(1), nh(2), nh(3));
+
+    let add = |peer: PeerId, prefix: IpPrefix, nexthops: Vec<IpAddr>| RouteEvent::Add {
+        peer_id: peer,
+        prefix,
+        nexthops,
+        path_id: None,
+        local_pref: None,
+        origin_asn: None,
+    };
+
+    h.run(async {
+        h.handle
+            .apply_route_event(add(session, target, vec![nh_session]))
+            .await
+            .expect("target via the session");
+        h.handle
+            .apply_route_event(add(local, target, vec![nh_a, nh_b]))
+            .await
+            .expect("target via the local peer");
+    });
+
+    // Fill the ECMP pool under the local peer, so no session route is
+    // left to answer `has_session_routes` once the session is down.
+    let mut filler: Vec<IpPrefix> = Vec::new();
+    let exhausted = h.run(async {
+        for i in 0..u16::try_from(ECMP_GROUPS_CAP + 8).expect("fits") {
+            let mut addr = v6("2001:db8:f::");
+            addr[6..8].copy_from_slice(&i.to_be_bytes());
+            let prefix = IpPrefix::V6 {
+                addr,
+                prefix_len: 64,
+            };
+            let pair =
+                |k: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0xe, 0, 0, 0, i, k));
+            let (n1, n2) = (pair(1), pair(2));
+            if h.handle
+                .apply_route_event(add(local, prefix, vec![n1, n2]))
+                .await
+                .is_err()
+            {
+                return true;
+            }
+            filler.push(prefix);
+        }
+        false
+    });
+    assert!(
+        exhausted,
+        "the ECMP pool never filled — this test cannot inject its failure"
+    );
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::PeerDown { peer_id: session })
+            .await
+            .expect("PeerDown answers Ok whatever its recomputes did");
+    });
+    assert!(
+        !sink
+            .calls()
+            .contains(&SinkCall::Resolved(target, vec![nh_a, nh_b])),
+        "the narrowed set cannot have been announced — the recompute failed"
+    );
+    assert!(
+        h.run(async { h.handle.has_session_routes().await.expect("query") }),
+        "the target still forwards over the departed session's nexthop, so the session \
+         must still count"
+    );
+
+    // Free a group and let the grace queue release it; the next GC retries
+    // the owed prefix, and the debt must clear rather than latch.
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: local,
+                prefix: filler[0],
+                path_id: None,
+            })
+            .await
+            .expect("free one filler");
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+            .expect("with a group free the owed recompute must succeed");
+    });
+    assert!(
+        sink.calls()
+            .contains(&SinkCall::Resolved(target, vec![nh_a, nh_b])),
+        "the second tier must end up with the narrowed set: {:?}",
+        sink.calls()
+    );
+    assert!(
+        !h.run(async { h.handle.has_session_routes().await.expect("query") }),
+        "reconciled, the departed session leaves nothing behind"
+    );
+}
+
 /// `has_session_routes` answers for route-source peers only.
 ///
 /// The mirror is shared with the neighbour resolver's `local-prefix`
@@ -3780,6 +3917,107 @@ fn no_command_overtakes_a_resync_or_its_gc() {
     );
 }
 
+/// A `PeerDown` gives the runtime back between chunks.
+///
+/// A full-table BMP peer's PeerDownNotification withdraws a whole table,
+/// and that was one synchronous call on the control-plane runtime, the
+/// shape the GC had before it was chunked. As there, a task sharing the
+/// programmer's worker sees the withdrawal partway only if the programmer
+/// gives the worker back between chunks. The reply must still follow the
+/// last withdrawal: the BMP station counts the mirror behind it.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_peer_down_gives_the_runtime_back_between_chunks() {
+    use ledger::*;
+    let routes: Vec<_> = many_v6_64s(MANY_CHUNKS)
+        .into_iter()
+        .map(|p| route(p, nh6()))
+        .collect();
+    let t = OneFreeWorker::new(Some(ledger(&routes, now_unix())));
+    // Queued behind the seed, so the mirror is whole from here.
+    assert_eq!(t.mirror_counts(), (0, MANY_CHUNKS));
+    assert_eq!(t.unconfirmed(), MANY_CHUNKS as u64);
+
+    let watcher = t.first_sight(|s| s.withdrawn.load(Ordering::SeqCst));
+    let down = t.h.run(async {
+        t.h.handle
+            .apply_route_event(RouteEvent::PeerDown { peer_id: PEER })
+            .await
+    });
+    let withdrawn_at_reply = t.sink.withdrawn.load(Ordering::SeqCst);
+    assert!(down.is_ok(), "the PeerDown must complete: {down:?}");
+    assert_eq!(
+        withdrawn_at_reply, MANY_CHUNKS,
+        "the PeerDown reply came before the peer's routes were all withdrawn"
+    );
+    let seen = t.h.run(watcher).expect("watcher");
+    assert!(
+        seen < MANY_CHUNKS,
+        "a task sharing the programmer's worker first ran when the PeerDown had withdrawn \
+         {seen} of {MANY_CHUNKS} routes: the PeerDown never gave the worker back"
+    );
+    assert_eq!(t.mirror_counts(), (0, 0));
+    assert_eq!(
+        t.unconfirmed(),
+        0,
+        "the seeded routes were unseen, and the PeerDown removed every one"
+    );
+}
+
+/// No command overtakes a `PeerDown`. It walks the departed peer's
+/// prefixes a chunk at a time and the run loop serves neighbour events and
+/// its timers between chunks, but never a command:
+///
+/// - an `Add` sent behind it is the peer coming back (a BMP PeerUp and its
+///   route monitoring). Served partway through the walk, it could land on
+///   a prefix still ahead of the cursor, and a later chunk would delete a
+///   route the peer had just announced;
+/// - a question sent behind it sees the mirror the whole walk left, which
+///   is what the BMP station asks after a last peer's PeerDown, to learn
+///   whether the wipe left anything behind.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn no_command_overtakes_a_peer_down() {
+    use ledger::*;
+    let prefixes = many_v6_64s(MANY_CHUNKS);
+    let routes: Vec<_> = prefixes.iter().map(|p| route(*p, nh6())).collect();
+    let t = OneFreeWorker::new(Some(ledger(&routes, now_unix())));
+    assert_eq!(t.mirror_counts(), (0, MANY_CHUNKS));
+
+    // Spread over the table, so a walk that let them in early would have
+    // most of them still ahead of its cursor.
+    let readvertised: Vec<IpPrefix> = prefixes.iter().step_by(MANY_CHUNKS / 64).copied().collect();
+    let (down, counts, ()) = t.h.run(async {
+        tokio::join!(
+            t.h.handle
+                .apply_route_event(RouteEvent::PeerDown { peer_id: PEER }),
+            t.h.handle.mirror_counts(),
+            async {
+                for p in &readvertised {
+                    t.h.handle
+                        .apply_route_event(add(*p, nh6()))
+                        .await
+                        .expect("re-advertisement");
+                }
+            },
+        )
+    });
+    down.expect("PeerDown");
+    assert_eq!(
+        counts.expect("counts"),
+        (0, 0),
+        "a question sent behind the PeerDown saw the mirror partway through it"
+    );
+    for p in &readvertised {
+        assert!(
+            has(&t.h, *p),
+            "{p:?} was re-advertised behind the PeerDown, and the PeerDown deleted it"
+        );
+    }
+    assert_eq!(t.mirror_counts(), (0, readvertised.len()));
+    assert_eq!(t.sink.withdrawn.load(Ordering::SeqCst), MANY_CHUNKS);
+}
+
 /// What a stop writes: the route source's advertisements, and nothing
 /// the neighbour resolver injected — not its `local-prefix` host routes,
 /// not its `fallback-default`, not even where the fallback shares a
@@ -4101,11 +4339,11 @@ fn measure_a_full_table_seed() {
     );
 }
 
-/// What a seed, a `Resync` and its GC take over a full table, and the
-/// longest the programmer held its worker in one poll during each: the
-/// bound the chunking buys the rest of the control-plane runtime. The
-/// Resync's and the GC's longest poll include the one unchunked step, the
-/// copy of the mirror's keys at the start of the walk.
+/// What a seed, a `Resync` and its GC, and a `PeerDown` take over a full
+/// table, and the longest the programmer held its worker in one poll
+/// during each: the bound the chunking buys the rest of the control-plane
+/// runtime. The walks' longest poll includes the one unchunked step, the
+/// copy of the prefixes at the start of the walk.
 #[test]
 #[ignore = "needs CAP_BPF + bpffs; measurement, also needs PF_MEASURE_LEDGER_SEED=1"]
 fn measure_full_table_walks() {
@@ -4133,6 +4371,8 @@ fn measure_full_table_walks() {
         })
         .collect();
     let seed = ledger(&routes, now_unix());
+    // The GC leaves nothing for a PeerDown, which gets a seed of its own.
+    let peer_down_seed = ledger(&routes, now_unix());
     drop(routes);
 
     let started = std::time::Instant::now();
@@ -4154,9 +4394,23 @@ fn measure_full_table_walks() {
     .expect("InitiationComplete");
     let gc_took = (started.elapsed(), t.take_longest_poll());
     assert_eq!(t.sink.withdrawn.load(Ordering::SeqCst), N as usize);
+    drop(t);
+
+    let t = OneFreeWorker::new(Some(peer_down_seed));
+    assert_eq!(t.mirror_counts(), (0, N as usize));
+    t.take_longest_poll();
+    let started = std::time::Instant::now();
+    t.h.run(async {
+        t.h.handle
+            .apply_route_event(RouteEvent::PeerDown { peer_id: PEER })
+            .await
+    })
+    .expect("PeerDown");
+    let peer_down_took = (started.elapsed(), t.take_longest_poll());
+    assert_eq!(t.sink.withdrawn.load(Ordering::SeqCst), N as usize);
 
     println!(
         "{N} routes into real BPF maps, one of two workers held; (whole, longest poll): \
-         seed {seed_took:?}, Resync {resync_took:?}, GC {gc_took:?}"
+         seed {seed_took:?}, Resync {resync_took:?}, GC {gc_took:?}, PeerDown {peer_down_took:?}"
     );
 }

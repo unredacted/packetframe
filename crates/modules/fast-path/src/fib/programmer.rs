@@ -18,8 +18,9 @@
 //!     (they were in the BPF maps from before the reconnect but
 //!     bird didn't re-announce → stale).
 //!
-//!     Both walk the whole mirror a [`WALK_CHUNK`] at a time, with
-//!     commands held until the walk is done.
+//! `Resync` and `InitiationComplete` walk the whole mirror, and
+//! `PeerDown` the departed peer's prefixes, a [`WALK_CHUNK`] at a time,
+//! with commands held until the walk is done.
 //!
 //! ECMP groups are deduplicated by a sorted-NH-id signature so one
 //! set of upstream transits announcing 200K prefixes allocates one
@@ -145,20 +146,26 @@ const REPROBE_BATCH: usize = 256;
 /// `InitiationComplete`, deleting a route the source still has.
 const SEED_CHUNK: usize = 2048;
 
-/// Mirror prefixes a `Resync` mark walk or an `InitiationComplete` GC
-/// visits per pass of the run loop, giving the worker back to the
-/// runtime between passes as the seed does. Each was one synchronous
-/// call over the whole mirror, which starved every other task on the
-/// control-plane runtime (the neighbour resolver, the integrity checker,
-/// the BGP listener) for its length: on 2026-10-12 a reconnect's GC
-/// removed ~1.25M advertisements in one call on a CPU-saturated router.
+/// Prefixes a `Resync` mark walk, an `InitiationComplete` GC or a
+/// `PeerDown` visits per pass of the run loop, giving the worker back to
+/// the runtime between passes as the seed does. Each was one synchronous
+/// call, over the whole mirror or, for a `PeerDown`, over every prefix
+/// of the departed peer (a whole table for a full-table BMP peer), which
+/// starved every other task on the control-plane runtime (the neighbour
+/// resolver, the integrity checker, the BGP listener) for its length: on
+/// 2026-10-12 a reconnect's GC removed ~1.25M advertisements in one call
+/// on a CPU-saturated router.
 ///
 /// Commands wait for a walk as they wait for the seed, and its reply is
 /// sent when the last chunk is done. A route event served between chunks
-/// would land in a half-marked or half-collected mirror: an `Add` behind
+/// would land in a half-marked or half-drained mirror: an `Add` behind
 /// an unfinished `Resync` could be marked unseen by a later chunk and
-/// collected though its session just announced it, and the route source
-/// treats the `InitiationComplete` reply as the GC having been applied.
+/// collected though its session just announced it, and one behind an
+/// unfinished `PeerDown`, from the peer coming back, drained by a later
+/// chunk while its prefix was still ahead of the cursor. The route
+/// source treats the `InitiationComplete` reply as the GC having been
+/// applied, and the BMP station counts the mirror after the last
+/// `PeerDown`'s reply to learn whether the wipe left anything.
 ///
 /// Public so the integration tests can size a mirror in chunks.
 pub const WALK_CHUNK: usize = 2048;
@@ -885,8 +892,8 @@ pub struct FibProgrammer {
     ///   over a prefix still installed with the withdrawn stream's
     ///   nexthops — which a second tier reads as "the GC finished, the
     ///   mirror is current".
-    /// - `drop_routes_for_peer` takes the peer's key out of
-    ///   `routes_by_peer` first, so after a failure nothing else
+    /// - a `PeerDown` takes the peer's key out of `routes_by_peer`
+    ///   when its walk begins, so after a failure nothing else
     ///   records that the prefix may still forward over the departed
     ///   peer's nexthops — which it does whenever another
     ///   advertisement (a `local_arp` /32) keeps the record alive and
@@ -982,9 +989,9 @@ pub struct FibProgrammer {
     /// a stop, so a route nobody re-confirmed cannot be carried forward
     /// as fresh by restarts that never reconcile it.
     unconfirmed_since: Option<u64>,
-    /// A `Resync` mark walk or an `InitiationComplete` GC under way,
-    /// applied in [`WALK_CHUNK`]s at the top of the run loop. `None` once
-    /// done and answered.
+    /// A `Resync` mark walk, an `InitiationComplete` GC or a `PeerDown`
+    /// under way, applied in [`WALK_CHUNK`]s at the top of the run loop.
+    /// `None` once done and answered.
     walk: Option<PendingWalk>,
     /// Where the seed's progress is reported. `None` in harnesses.
     ledger_status: Option<SharedLedgerStatus>,
@@ -1007,14 +1014,17 @@ struct PendingSeed {
     first_error: Option<String>,
 }
 
-/// A `Resync` mark walk or an `InitiationComplete` GC being applied: what
-/// it visits, how far in, and the reply owed when it is done.
+/// A `Resync` mark walk, an `InitiationComplete` GC or a `PeerDown` being
+/// applied: what it visits, how far in, and the reply owed when it is
+/// done.
 struct PendingWalk {
-    /// Every prefix the walk visits: the mirror's when it began, and for a
-    /// GC also each owed prefix ([`FibProgrammer::recompute_owed`]) the
-    /// mirror no longer holds. Commands wait for the walk and nothing
-    /// served between its chunks adds or removes a record, so this stays
-    /// the whole mirror; the GC removes records only at its own cursor.
+    /// Every prefix the walk visits, fixed when it began: for a `Resync`
+    /// or a GC the mirror's, and for a GC also each owed prefix
+    /// ([`FibProgrammer::recompute_owed`]) the mirror no longer holds; for
+    /// a `PeerDown` the departed peer's, out of `routes_by_peer`. Commands
+    /// wait for the walk and nothing served between its chunks adds or
+    /// removes a record, so the list stays current: a walk removes
+    /// records only at its own cursor.
     prefixes: Vec<IpPrefix>,
     next: usize,
     started: Instant,
@@ -1035,6 +1045,9 @@ enum WalkKind {
         /// The first failed recompute. The GC still visits every prefix.
         first_err: Option<ProgrammerError>,
     },
+    /// `PeerDown`: the departed peer, whose advertisements leave every
+    /// prefix visited.
+    PeerDown { peer_id: PeerId },
 }
 
 /// A snapshot of the mirror as a ledger, ready to write.
@@ -1345,7 +1358,7 @@ impl FibProgrammer {
                 // Surviving advertisement owners are not the whole
                 // answer. A recompute that failed leaves the RECORD —
                 // and so the second tier — holding the departed
-                // session's nexthops, while `drop_routes_for_peer` has
+                // session's nexthops, while its `PeerDown` has
                 // already removed that peer's key here (review
                 // finding). Anything owed a repair counts as session
                 // state until the repair lands.
@@ -2546,8 +2559,9 @@ impl FibProgrammer {
     // --- Route event handling (Phase 3, RFC 7911 aggregation) ----------
 
     /// Apply `event` and answer `reply` with the outcome: at once, except
-    /// for `Resync` and `InitiationComplete`, which walk the whole mirror
-    /// and are answered when the walk is done (see [`WALK_CHUNK`]).
+    /// for `Resync` and `InitiationComplete`, which walk the whole mirror,
+    /// and a `PeerDown`, which walks the peer's prefixes, all answered
+    /// when the walk is done (see [`WALK_CHUNK`]).
     fn on_route_event(
         &mut self,
         event: RouteEvent,
@@ -2560,7 +2574,9 @@ impl FibProgrammer {
                 debug!(?peer_id, "PeerUp received");
                 Ok(())
             }
-            RouteEvent::PeerDown { peer_id } => self.drop_routes_for_peer(peer_id),
+            RouteEvent::PeerDown { peer_id } => {
+                return self.start_walk(WalkKind::PeerDown { peer_id }, reply);
+            }
             RouteEvent::Add {
                 peer_id,
                 prefix,
@@ -2625,75 +2641,43 @@ impl FibProgrammer {
         self.recompute_fib_entry(prefix)
     }
 
-    /// Drop every advertisement contributed by `peer_id`. Called on
-    /// `PeerDown`. Each affected prefix is recomputed; prefixes whose
-    /// only remaining advertisements were from this peer are torn
-    /// down entirely. Prefixes still carrying advertisements from
-    /// other peers keep their FIB entries, possibly with a narrowed
-    /// NH set.
-    fn drop_routes_for_peer(&mut self, peer_id: PeerId) -> Result<(), ProgrammerError> {
-        let prefixes_for_peer = match self.routes_by_peer.remove(&peer_id) {
-            Some(set) => set,
-            None => return Ok(()),
-        };
-        let prefix_count = prefixes_for_peer.len();
-        for (is_v4, addr, plen) in prefixes_for_peer {
-            let prefix = if is_v4 {
-                let mut a = [0u8; 4];
-                a.copy_from_slice(&addr[..4]);
-                IpPrefix::V4 {
-                    addr: a,
-                    prefix_len: plen,
-                }
-            } else {
-                IpPrefix::V6 {
-                    addr,
-                    prefix_len: plen,
-                }
-            };
-            let drained = self.drain_peer_advertisements(peer_id, &prefix);
-            if drained == 0 {
-                continue;
-            }
-            if let Err(e) = self.recompute_fib_entry(prefix) {
-                // Owed, not merely logged. The peer's key left
-                // `routes_by_peer` before this loop began, so once the
-                // recompute fails nothing else records that this prefix
-                // may still be forwarding over the departed peer's
-                // nexthops — and it does, whenever another advertisement
-                // (a `local_arp` /32) keeps the record alive and the
-                // mirror keeps its pre-failure `nexthop_ips`.
-                self.recompute_owed.insert(prefix);
-                warn!(?peer_id, ?prefix, error = %e, "recompute after PeerDown failed");
-            }
-        }
-        info!(
-            ?peer_id,
-            prefix_count, "PeerDown: withdrew peer's advertisements"
-        );
-        Ok(())
-    }
+    // --- Resync, InitiationComplete and PeerDown walks ---
 
-    // --- Resync and InitiationComplete walks ---
-
-    /// Begin a walk over the mirror, owing `reply` until it is done.
+    /// Begin a walk, owing `reply` until it is done: over the mirror for a
+    /// `Resync` or a GC, over the departed peer's prefixes for a
+    /// `PeerDown`. A `PeerDown` for a peer with nothing in the mirror is
+    /// answered at once.
     ///
-    /// The prefixes are copied out up front because a `HashMap` walk
-    /// cannot be resumed across the run loop's passes. That copy is the
-    /// one pass over the mirror left unchunked: keys only, no syscall, no
+    /// The prefixes are copied out up front because a `HashMap` or
+    /// `HashSet` walk cannot be resumed across the run loop's passes. That
+    /// copy is the one pass left unchunked: keys only, no syscall, no
     /// second-tier call, no allocation per prefix.
     fn start_walk(&mut self, kind: WalkKind, reply: oneshot::Sender<Result<(), ProgrammerError>>) {
-        let mut prefixes = Vec::with_capacity(self.routes_v4.len() + self.routes_v6.len());
-        prefixes.extend(
-            self.routes_v4
-                .keys()
-                .map(|&(addr, prefix_len)| IpPrefix::V4 { addr, prefix_len }),
-        );
-        prefixes.extend(
-            self.routes_v6
-                .keys()
-                .map(|&(addr, prefix_len)| IpPrefix::V6 { addr, prefix_len }),
-        );
+        let mut prefixes = match &kind {
+            WalkKind::Mark { .. } | WalkKind::Gc { .. } => {
+                let mut all = Vec::with_capacity(self.routes_v4.len() + self.routes_v6.len());
+                all.extend(
+                    self.routes_v4
+                        .keys()
+                        .map(|&(addr, prefix_len)| IpPrefix::V4 { addr, prefix_len }),
+                );
+                all.extend(
+                    self.routes_v6
+                        .keys()
+                        .map(|&(addr, prefix_len)| IpPrefix::V6 { addr, prefix_len }),
+                );
+                all
+            }
+            // The peer's whole index entry goes here rather than prefix by
+            // prefix: `drain_peer_advertisements` leaves it to the caller.
+            WalkKind::PeerDown { peer_id } => match self.routes_by_peer.remove(peer_id) {
+                Some(keys) => keys.into_iter().map(peer_key_prefix).collect(),
+                None => {
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
+            },
+        };
         if matches!(kind, WalkKind::Gc { .. }) {
             // Carry forward whatever a previous GC left unreconciled — see
             // `recompute_owed` — including a prefix whose record is gone.
@@ -2734,6 +2718,7 @@ impl FibProgrammer {
                     *removed += gone;
                     *unseen += left;
                 }
+                WalkKind::PeerDown { peer_id } => self.drop_peer_prefix(*peer_id, prefix),
             }
         }
         w.next = end;
@@ -2814,6 +2799,26 @@ impl FibProgrammer {
         (removed, unseen)
     }
 
+    /// Drop every advertisement `peer_id` contributed to `prefix` and
+    /// recompute it: torn down when they were its only ones, otherwise
+    /// kept, possibly with a narrower nexthop set, for the other peers'.
+    fn drop_peer_prefix(&mut self, peer_id: PeerId, prefix: IpPrefix) {
+        if self.drain_peer_advertisements(peer_id, &prefix) == 0 {
+            return;
+        }
+        if let Err(e) = self.recompute_fib_entry(prefix) {
+            // Owed, not merely logged. The peer's key left
+            // `routes_by_peer` when the walk began, so once the
+            // recompute fails nothing else records that this prefix
+            // may still be forwarding over the departed peer's
+            // nexthops — and it does, whenever another advertisement
+            // (a `local_arp` /32) keeps the record alive and the
+            // mirror keeps its pre-failure `nexthop_ips`.
+            self.recompute_owed.insert(prefix);
+            warn!(?peer_id, ?prefix, error = %e, "recompute after PeerDown failed");
+        }
+    }
+
     /// The walk's last chunk is done: its bookkeeping, its log line and
     /// its reply, each once.
     fn finish_walk(&mut self, w: PendingWalk) {
@@ -2853,6 +2858,18 @@ impl FibProgrammer {
                         Ok(())
                     }
                 }
+            }
+            // `Ok` whatever a recompute did: a failed one is owed, and the
+            // BMP station asks the mirror rather than this reply whether
+            // the wipe left anything.
+            WalkKind::PeerDown { peer_id } => {
+                info!(
+                    ?peer_id,
+                    prefix_count = w.prefixes.len(),
+                    took_ms,
+                    "PeerDown: withdrew peer's advertisements"
+                );
+                Ok(())
             }
         };
         let _ = w.reply.send(outcome);
@@ -2912,8 +2929,8 @@ impl FibProgrammer {
 
     /// Remove every advertisement on `prefix` that originated from
     /// `peer_id`. Returns the number removed. `routes_by_peer`
-    /// cleanup is the caller's responsibility (typically a bulk
-    /// `drop_routes_for_peer`).
+    /// cleanup is the caller's responsibility (a `PeerDown` takes the
+    /// peer's whole entry when its walk begins).
     fn drain_peer_advertisements(&mut self, peer_id: PeerId, prefix: &IpPrefix) -> usize {
         let (drained, unseen) = match self.lookup_mirror_mut(prefix) {
             Some(rec) => {
@@ -3539,6 +3556,20 @@ fn prefix_peer_key(prefix: &IpPrefix) -> (bool, [u8; 16], u8) {
             (true, padded, *prefix_len)
         }
         IpPrefix::V6 { addr, prefix_len } => (false, *addr, *prefix_len),
+    }
+}
+
+/// The `IpPrefix` a [`prefix_peer_key`] was made from.
+fn peer_key_prefix((is_v4, addr, prefix_len): (bool, [u8; 16], u8)) -> IpPrefix {
+    if is_v4 {
+        let mut a = [0u8; 4];
+        a.copy_from_slice(&addr[..4]);
+        IpPrefix::V4 {
+            addr: a,
+            prefix_len,
+        }
+    } else {
+        IpPrefix::V6 { addr, prefix_len }
     }
 }
 
