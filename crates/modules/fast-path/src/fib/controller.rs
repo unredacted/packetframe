@@ -179,6 +179,13 @@ pub enum RouteSourceConfig {
 
 /// Grace period for tasks to drain after `cancel()` fires. Netlink
 /// reader and programmer should both unwind well within this.
+///
+/// The programmer's unwind includes the rest of a GC or `PeerDown` it
+/// was partway through (`FibProgrammer::run`), at most one walk: a whole
+/// 1M-route `PeerDown` took 1.7-2.0 s in one call in a Linux VM on Apple
+/// silicon, and slower cores take longer. What does not fit is left
+/// undone, as it would have been had the old single call outrun the
+/// runtime's own shutdown.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// v0.2.2: starting backoff between route-source listener restart
@@ -219,6 +226,11 @@ pub struct RouteController {
     /// `shutdown_timeout` rather than rely on Drop.
     runtime: Option<Runtime>,
     shutdown_token: CancellationToken,
+    /// Apart from `tasks` because the preserving stop (`Drop`) waits for
+    /// it too, not only `shutdown()`: at shutdown it finishes a GC or
+    /// `PeerDown` it is partway through, and that stop leaves the
+    /// dataplane forwarding on what it wrote.
+    programmer_task: Option<JoinHandle<()>>,
     tasks: Vec<JoinHandle<()>>,
 
     neigh_handle: NeighborResolveHandle,
@@ -478,7 +490,7 @@ impl RouteController {
         let resolver_task = runtime.spawn(resolver.run());
         let programmer_task = runtime.spawn(async move { programmer.run().await });
 
-        let mut tasks = vec![resolver_task, programmer_task];
+        let mut tasks = vec![resolver_task];
 
         // Spawn the configured route-source feed (BMP or BGP). The
         // integrity checker spawns alongside any feed because both
@@ -749,6 +761,7 @@ impl RouteController {
         Ok(Self {
             runtime: Some(runtime),
             shutdown_token,
+            programmer_task: Some(programmer_task),
             tasks,
             neigh_handle,
             prog_handle,
@@ -789,6 +802,12 @@ impl RouteController {
     /// the next start loads cold, which is what every start did before; a
     /// stop that dies mid-write likewise leaves no record rather than half
     /// of one.
+    ///
+    /// A walk under way (a `Resync`, a GC, a `PeerDown`) is done before the
+    /// snapshot is taken, never midway: the snapshot is a command, and
+    /// commands wait for walks. A walk that outlasts the budget leaves no
+    /// ledger, and the drop that follows lets the programmer finish a GC
+    /// or `PeerDown` before the runtime goes (see the `Drop` impl).
     pub fn preserve_route_ledger(&self, state_dir: &Path) -> Preserved {
         use crate::fib::route_ledger::{now_unix, write_within, PRESERVE_BUDGET};
         let Some(identity) = self.ledger_identity.clone() else {
@@ -892,20 +911,10 @@ impl RouteController {
         self.shutdown_token.cancel();
         if let Some(runtime) = self.runtime.take() {
             let anyip_addr = self.anyip_addr.take();
+            let programmer = self.programmer_task.take();
             runtime.block_on(async {
-                for task in self.tasks.drain(..) {
-                    match tokio::time::timeout(SHUTDOWN_TIMEOUT, task).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(join_err)) => {
-                            warn!(error = %join_err, "controller task panicked during shutdown");
-                        }
-                        Err(_) => {
-                            warn!(
-                                "controller task did not drain within {} s; forcing drop",
-                                SHUTDOWN_TIMEOUT.as_secs()
-                            );
-                        }
-                    }
+                for task in programmer.into_iter().chain(self.tasks.drain(..)) {
+                    drain_task(task).await;
                 }
                 // After the listener has drained: remove the AnyIP
                 // route this controller installed. Best-effort — an
@@ -935,6 +944,23 @@ impl RouteController {
     }
 }
 
+/// Wait up to [`SHUTDOWN_TIMEOUT`] for a cancelled controller task to
+/// return, and say so if it does not or if it panicked.
+async fn drain_task(task: JoinHandle<()>) {
+    match tokio::time::timeout(SHUTDOWN_TIMEOUT, task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join_err)) => {
+            warn!(error = %join_err, "controller task panicked during shutdown");
+        }
+        Err(_) => {
+            warn!(
+                "controller task did not drain within {} s; forcing drop",
+                SHUTDOWN_TIMEOUT.as_secs()
+            );
+        }
+    }
+}
+
 /// The §8.5 preserve-attach exit (SIGTERM/SIGINT) drops modules
 /// without calling `detach`, so [`RouteController::shutdown`] never
 /// runs on the *normal* stop path — and the AnyIP route survived
@@ -951,12 +977,26 @@ impl RouteController {
 /// this is a no-op. Drop runs on the daemon's signal-loop thread,
 /// never inside a tokio context, so `shutdown_timeout`/`block_on`
 /// here cannot panic on nested-runtime rules.
+///
+/// Before the runtime goes, the programmer is given up to
+/// [`SHUTDOWN_TIMEOUT`] to return, as `shutdown()` gives every task.
+/// This is the stop that leaves the dataplane forwarding on the FIB
+/// the programmer wrote, and a GC or `PeerDown` it is partway through is
+/// finished before it returns. `shutdown_timeout` alone would not wait
+/// for that: once a worker sees the runtime shutting down it drops every
+/// task not being polled at that moment, and a walk between its chunks
+/// is not, so the programmer might never see its cancellation. Nor are
+/// its two seconds much room for the rest of a full-table walk, which
+/// took about that long whole on Apple-silicon cores.
 impl Drop for RouteController {
     fn drop(&mut self) {
         let Some(runtime) = self.runtime.take() else {
             return; // explicit shutdown() already ran
         };
         self.shutdown_token.cancel();
+        if let Some(task) = self.programmer_task.take() {
+            runtime.block_on(drain_task(task));
+        }
         runtime.shutdown_timeout(Duration::from_secs(2));
         if let Some(addr) = self.anyip_addr.take() {
             match tokio::runtime::Builder::new_current_thread()

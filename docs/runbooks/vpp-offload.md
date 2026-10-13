@@ -4502,8 +4502,9 @@ indefinitely. The deferral message says so explicitly when that is what
 is happening — read it before concluding the checker is broken. Nothing
 is dropping meanwhile.
 
-**A second unbounded case, and this one takes the rollback lever with
-it: the completeness authority is VETOING.** `authority_current`
+**A second unbounded case: the completeness authority is VETOING.**
+(It leaves the rollback lever alone: `steer off` works through it, as
+through any deferral; see below.) `authority_current`
 compares the checker's report against the mirror as it is now, and a
 `false` there vetoes the release **outright** — no floor, liveness or
 quiescence gets past it, and unlike a quiet-wait it does not clear on

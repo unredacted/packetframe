@@ -594,6 +594,10 @@ impl Drop for ProgrammerHarness {
 struct CountingSink {
     resolved: AtomicUsize,
     withdrawn: AtomicUsize,
+    /// One more than `withdrawn` when the first neighbour resolution was
+    /// announced, so 0 means none has been: how far a walk was when the
+    /// programmer served a neighbour event.
+    first_neighbour_at: AtomicUsize,
 }
 
 impl ResolvedRouteSink for CountingSink {
@@ -603,7 +607,12 @@ impl ResolvedRouteSink for CountingSink {
     fn route_withdrawn(&self, _: IpPrefix) {
         self.withdrawn.fetch_add(1, Ordering::SeqCst);
     }
-    fn neighbour_resolved(&self, _: IpAddr, _: [u8; 6], _: u32) {}
+    fn neighbour_resolved(&self, _: IpAddr, _: [u8; 6], _: u32) {
+        let at = self.withdrawn.load(Ordering::SeqCst) + 1;
+        let _ = self
+            .first_neighbour_at
+            .compare_exchange(0, at, Ordering::SeqCst, Ordering::SeqCst);
+    }
     fn neighbour_lost(&self, _: IpAddr) {}
 }
 
@@ -4103,6 +4112,335 @@ fn no_command_overtakes_a_peer_down() {
     assert_eq!(t.sink.withdrawn.load(Ordering::SeqCst), MANY_CHUNKS);
 }
 
+/// Every key in FIB_V6, through a handle of its own.
+fn fib_v6_len(pin: &Path) -> usize {
+    let mut n = 0;
+    for key in open_lpm_v6(pin).keys() {
+        key.expect("FIB_V6 key walk");
+        n += 1;
+    }
+    n
+}
+
+/// A shutdown partway through a GC or a `PeerDown` finishes it before the
+/// programmer's task ends.
+///
+/// A preserving stop (`systemctl stop`) leaves XDP forwarding on the maps
+/// as the programmer last wrote them. While each walk was one synchronous
+/// call no cancellation could cut it short. Chunked, a cancellation seen
+/// between chunks dropped the rest, and every stale or departed route the
+/// cursor had not reached stayed in the maps. Here a task sharing the
+/// programmer's worker cancels it once the walk has withdrawn its first
+/// routes, which that task can see only between chunks.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_shutdown_mid_walk_finishes_a_gc_or_a_peer_down() {
+    use ledger::*;
+    for (what, event) in [
+        ("GC", RouteEvent::InitiationComplete),
+        ("PeerDown", RouteEvent::PeerDown { peer_id: PEER }),
+    ] {
+        let routes: Vec<_> = many_v6_64s(MANY_CHUNKS)
+            .into_iter()
+            .map(|p| route(p, nh6()))
+            .collect();
+        // Seeded routes are unseen, so the GC removes every one, as the
+        // PeerDown does.
+        let mut t = OneFreeWorker::new(Some(ledger(&routes, now_unix())));
+        assert_eq!(t.mirror_counts(), (0, MANY_CHUNKS));
+
+        let (sink, shutdown) = (t.sink.clone(), t.h.shutdown.clone());
+        let cancel = t.h.rt.spawn(async move {
+            loop {
+                let withdrawn = sink.withdrawn.load(Ordering::SeqCst);
+                if withdrawn > 0 {
+                    shutdown.cancel();
+                    return withdrawn;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        let handle = t.h.handle.clone();
+        let reply =
+            t.h.rt
+                .spawn(async move { handle.apply_route_event(event).await });
+        let at_cancel = t.h.run(cancel).expect("canceller");
+        assert!(
+            at_cancel < MANY_CHUNKS,
+            "{what}: the premise, a shutdown partway through the walk: it came with \
+             {at_cancel} of {MANY_CHUNKS} routes withdrawn"
+        );
+        let task = t.h.task.take().expect("the programmer's task");
+        t.h.run(async { tokio::time::timeout(Duration::from_secs(10), task).await })
+            .unwrap_or_else(|_| panic!("{what}: the programmer's task must end at shutdown"))
+            .unwrap_or_else(|e| panic!("{what}: the programmer's task panicked: {e}"));
+
+        assert_eq!(
+            fib_v6_len(&t.h.pins.path("FIB_V6")),
+            0,
+            "{what}: routes the walk had not reached when the shutdown came are still in the \
+             FIB the dataplane goes on forwarding with"
+        );
+        assert_eq!(
+            t.sink.withdrawn.load(Ordering::SeqCst),
+            MANY_CHUNKS,
+            "{what}"
+        );
+        let answered = t.h.run(reply).expect("the sender's task");
+        assert!(
+            answered.is_ok(),
+            "{what}: the walk, finished, is answered as one: {answered:?}"
+        );
+    }
+}
+
+/// Long enough that a neighbour event sent after the walk's first chunk is
+/// all but certain to be served before its last, where the loop serves
+/// events between chunks at all. Each pass picks the event over the next
+/// chunk one time in three (`select!` starts at a random one of its six
+/// arms, and usually only those two are ready), so it is passed over for all 29
+/// remaining chunks about once in 10^5 runs.
+const MORE_CHUNKS: usize = 30 * WALK_CHUNK;
+
+/// Neighbour events are served between a walk's chunks.
+///
+/// Commands wait for a walk ([`no_command_overtakes_a_resync_or_its_gc`]),
+/// but a neighbour event moves no route. Held behind a full-table GC, a
+/// nexthop the kernel has just resolved would stay unresolved in the maps,
+/// its traffic on the kernel path, for the length of the walk. A task
+/// sharing the programmer's worker sends a `Learned` once the GC has
+/// withdrawn its first routes, and the sink notes how far the GC had got
+/// when the programmer applied it.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn neighbour_events_are_served_between_a_walks_chunks() {
+    use ledger::*;
+    let routes: Vec<_> = many_v6_64s(MORE_CHUNKS)
+        .into_iter()
+        .map(|p| route(p, nh6()))
+        .collect();
+    let t = OneFreeWorker::new(Some(ledger(&routes, now_unix())));
+    assert_eq!(t.mirror_counts(), (0, MORE_CHUNKS));
+    let neighbour = IpAddr::V6("2001:db8::2".parse().unwrap());
+    t.h.run(async { t.h.handle.register_nexthop(neighbour).await })
+        .expect("register_nexthop");
+
+    let (sink, events) = (t.sink.clone(), t.h.events_tx.clone());
+    let sender = t.h.rt.spawn(async move {
+        while sink.withdrawn.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        events
+            .send(NeighEvent::Learned {
+                ip: neighbour,
+                mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x02],
+                ifindex: 4242,
+                src_mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
+            })
+            .await
+            .expect("the event channel is open");
+    });
+    t.h.run(async {
+        t.h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    })
+    .expect("InitiationComplete");
+    t.h.run(sender).expect("the sender's task");
+    // Applied by now if it was served mid-walk. A version that holds events
+    // behind the walk applies it just after, so wait for it either way.
+    let at = t.h.run(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match t.sink.first_neighbour_at.load(Ordering::SeqCst) {
+                    0 => tokio::time::sleep(Duration::from_millis(1)).await,
+                    at => return at - 1,
+                }
+            }
+        })
+        .await
+        .expect("the Learned is applied")
+    });
+    assert!(
+        at < MORE_CHUNKS,
+        "a Learned sent once the GC had begun was applied only when it had withdrawn {at} of \
+         {MORE_CHUNKS} routes: neighbour events waited behind the walk"
+    );
+}
+
+/// An owed prefix the mirror no longer holds is visited by the next GC,
+/// and its debt clears.
+///
+/// A record leaves the mirror with its recompute still owed only through a
+/// tear-down whose map delete failed, because the record goes first
+/// (`withdraw_from_mirror`). A GC's walk lists the mirror, so it would
+/// never reach that prefix again, and the debt would hold
+/// `has_session_routes`, which a second tier keeps its deferral open on,
+/// true for good. The walk therefore appends such prefixes after the
+/// mirror's. The mirror here is two chunks of local routes, so the owed
+/// prefix is reached only in the walk's third.
+///
+/// The failure is a v4 /33. The kernel's LPM trie refuses a prefix longer
+/// than its key (EINVAL) on insert and delete alike, so the Add leaves its
+/// record in the mirror uninstalled, and the GC's tear-down of it fails
+/// after the record has gone.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn an_owed_prefix_the_mirror_no_longer_holds_is_reconciled_by_the_next_gc() {
+    let h = ProgrammerHarness::new();
+    let session = PeerId(0x5350);
+    let local = PeerId::local_arp(34);
+    let too_long = IpPrefix::V4 {
+        addr: [192, 0, 2, 0],
+        prefix_len: 33,
+    };
+    let add = |peer: PeerId, prefix: IpPrefix, nexthop: IpAddr| RouteEvent::Add {
+        peer_id: peer,
+        prefix,
+        nexthops: vec![nexthop],
+        path_id: None,
+        local_pref: None,
+        origin_asn: None,
+    };
+    let local_routes = many_v6_64s(2 * WALK_CHUNK);
+    let refused = h.run(async {
+        for p in &local_routes {
+            h.handle
+                .apply_route_event(add(local, *p, ledger::nh6()))
+                .await
+                .expect("a local route");
+        }
+        h.handle
+            .apply_route_event(add(session, too_long, ledger::nh_a()))
+            .await
+    });
+    assert!(
+        refused.is_err(),
+        "the premise: the trie refuses a /33: {refused:?}"
+    );
+    let counts = || h.run(async { h.handle.mirror_counts().await.expect("counts") });
+    let session_state = || h.run(async { h.handle.has_session_routes().await.expect("query") });
+    assert_eq!(
+        counts(),
+        (1, local_routes.len()),
+        "the premise: the refused Add's record stays in the mirror"
+    );
+
+    // The session goes, and its /33's tear-down fails at the map delete.
+    let failed = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Resync)
+            .await
+            .expect("Resync");
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(
+        failed.is_err(),
+        "the premise: the GC's tear-down of the /33 fails: {failed:?}"
+    );
+    assert_eq!(
+        counts(),
+        (0, local_routes.len()),
+        "the premise: the record has left the mirror"
+    );
+    assert!(
+        session_state(),
+        "the premise: the owed prefix counts as session state"
+    );
+
+    let retry = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(retry.is_ok(), "{retry:?}");
+    assert!(
+        !session_state(),
+        "the next GC must visit the owed prefix the mirror no longer holds and clear its debt"
+    );
+    assert_eq!(counts(), (0, local_routes.len()), "local routes stay");
+}
+
+/// A reconnect's walks judge each advertisement by its owner in every
+/// chunk: the session's go, a local route stays, and a prefix carrying both
+/// keeps the local one.
+///
+/// The prefixes alternate by thirds, so every chunk of the walk holds all
+/// three shapes.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_gc_over_many_chunks_keeps_local_advertisements_and_removes_the_sessions() {
+    let h = ProgrammerHarness::new();
+    let session = PeerId(0x5450);
+    let local = PeerId::local_arp(35);
+    let nh_session = IpAddr::V6("2001:db8::5:1".parse().unwrap());
+    let nh_local = IpAddr::V6("2001:db8::5:2".parse().unwrap());
+    let add = |peer: PeerId, prefix: IpPrefix, nexthop: IpAddr| RouteEvent::Add {
+        peer_id: peer,
+        prefix,
+        nexthops: vec![nexthop],
+        path_id: None,
+        local_pref: None,
+        origin_asn: None,
+    };
+    let prefixes = many_v6_64s(3 * WALK_CHUNK);
+    h.run(async {
+        for (i, p) in prefixes.iter().enumerate() {
+            if i % 3 != 1 {
+                h.handle
+                    .apply_route_event(add(session, *p, nh_session))
+                    .await
+                    .expect("a session route");
+            }
+            if i % 3 != 0 {
+                h.handle
+                    .apply_route_event(add(local, *p, nh_local))
+                    .await
+                    .expect("a local route");
+            }
+        }
+    });
+    let fib = |p: IpPrefix| ledger::fib_value(&h, p);
+    assert_eq!(
+        fib(prefixes[2]).map(|v| v.kind),
+        Some(FIB_KIND_ECMP),
+        "the premise: a prefix both own forwards over both nexthops"
+    );
+    let local_id = h
+        .run(async { h.handle.register_nexthop(nh_local).await })
+        .expect("the local nexthop's id");
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Resync)
+            .await
+            .expect("Resync");
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+            .expect("InitiationComplete");
+    });
+    for (i, p) in prefixes.iter().enumerate() {
+        let got = fib(*p);
+        if i % 3 == 0 {
+            assert_eq!(got, None, "{p:?} was the session's alone");
+        } else {
+            assert_eq!(
+                got,
+                Some(FibValue::single(local_id)),
+                "{p:?} keeps its local advertisement, and only that"
+            );
+        }
+    }
+    assert_eq!(
+        h.run(async { h.handle.mirror_counts().await.expect("counts") }),
+        (0, prefixes.len() - prefixes.len().div_ceil(3))
+    );
+    assert!(!h.run(async { h.handle.has_session_routes().await.expect("query") }));
+}
+
 /// What a stop writes: the route source's advertisements, and nothing
 /// the neighbour resolver injected — not its `local-prefix` host routes,
 /// not its `fallback-default`, not even where the fallback shares a
@@ -4227,6 +4565,28 @@ fn a_stop_records_when_its_oldest_route_was_last_confirmed() {
     );
 }
 
+/// The maps a `RouteController` opens, pinned in the production layout
+/// (`<bpffs>/fast-path/maps/<NAME>`) under a private bpffs directory.
+fn pin_production_layout(pins: &PinDirs) -> Ebpf {
+    let bytes = aligned_bpf_copy();
+    let ebpf = Ebpf::load(&bytes).expect("Ebpf::load");
+    let maps = pins.dir.join("fast-path").join("maps");
+    std::fs::create_dir_all(&maps).expect("maps dir");
+    for name in [
+        "NEXTHOPS",
+        "FIB_V4",
+        "FIB_V6",
+        "ECMP_GROUPS",
+        "FIB_CACHE_CFG",
+    ] {
+        ebpf.map(name)
+            .unwrap_or_else(|| panic!("{name} map missing from ELF"))
+            .pin(maps.join(name))
+            .unwrap_or_else(|e| panic!("pin {name}: {e}"));
+    }
+    ebpf
+}
+
 /// A restart, end to end through the control plane — minus only the
 /// process boundary and the route source: a start seeds from a ledger,
 /// the preserving stop writes the mirror back out, and the next start's
@@ -4247,24 +4607,8 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
         consume, shared_status, Consumed, Expectations,
     };
 
-    // Production pin layout under a private bpffs directory.
     let pins = PinDirs::setup();
-    let bytes = aligned_bpf_copy();
-    let ebpf = Ebpf::load(&bytes).expect("Ebpf::load");
-    let maps = pins.dir.join("fast-path").join("maps");
-    std::fs::create_dir_all(&maps).expect("maps dir");
-    for name in [
-        "NEXTHOPS",
-        "FIB_V4",
-        "FIB_V6",
-        "ECMP_GROUPS",
-        "FIB_CACHE_CFG",
-    ] {
-        ebpf.map(name)
-            .unwrap_or_else(|| panic!("{name} map missing from ELF"))
-            .pin(maps.join(name))
-            .unwrap_or_else(|e| panic!("pin {name}: {e}"));
-    }
+    let ebpf = pin_production_layout(&pins);
     let state_dir = std::env::temp_dir().join(format!("pf-ledger-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state_dir);
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -4363,6 +4707,252 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
         !packetframe_fast_path::fib::route_ledger::path_in(&state_dir).exists(),
         "and consumed it"
     );
+    let _ = std::fs::remove_dir_all(&state_dir);
+    drop(ebpf);
+}
+
+/// Three chunks for the stop test: it holds the walk in its second, and
+/// the rest stays small enough to finish inside the stop's wait under
+/// emulation too.
+const STOP_ROUTES: usize = 3 * WALK_CHUNK;
+
+/// A sink that holds the programmer for `hold` in the first withdrawal of
+/// a walk's second chunk, so the walk's rest outlasts the runtime's own
+/// two-second shutdown, as a full table's can on a gateway's cores.
+struct HoldingSink {
+    withdrawn: AtomicUsize,
+    holding: std::sync::atomic::AtomicBool,
+    hold: Duration,
+}
+
+impl ResolvedRouteSink for HoldingSink {
+    fn route_resolved(&self, _: IpPrefix, _: &[IpAddr]) {}
+    fn route_withdrawn(&self, _: IpPrefix) {
+        if self.withdrawn.fetch_add(1, Ordering::SeqCst) == WALK_CHUNK {
+            self.holding.store(true, Ordering::SeqCst);
+            std::thread::sleep(self.hold);
+        }
+    }
+    fn neighbour_resolved(&self, _: IpAddr, _: [u8; 6], _: u32) {}
+    fn neighbour_lost(&self, _: IpAddr) {}
+}
+
+/// The preserving stop finishes a GC the programmer is partway through.
+///
+/// `systemctl stop` drops the controller without `shutdown()` and leaves
+/// XDP forwarding on the maps (SPEC.md §8.5). The runtime's own shutdown
+/// waits two seconds for its workers and drops every task it does not
+/// find being polled, so the stop has to wait for the programmer itself.
+/// The walk is held three seconds in the sink when the stop comes, and the
+/// stop must still return with every route the GC was removing gone from
+/// the maps.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs + netlink; run via sudo -E cargo test -- --ignored"]
+fn a_preserving_stop_finishes_a_gc_under_way() {
+    use ledger::*;
+    use packetframe_fast_path::fib::controller::{
+        LedgerWiring, ResolverPolicy, RouteController, RouteFeed, SecondTierSignals,
+    };
+
+    let pins = PinDirs::setup();
+    let ebpf = pin_production_layout(&pins);
+    let routes: Vec<_> = many_v6_64s(STOP_ROUTES)
+        .into_iter()
+        .map(|p| route(p, nh6()))
+        .collect();
+    let sink = Arc::new(HoldingSink {
+        withdrawn: AtomicUsize::new(0),
+        holding: std::sync::atomic::AtomicBool::new(false),
+        hold: Duration::from_secs(3),
+    });
+    let ctrl = RouteController::start(
+        &pins.dir,
+        RouteFeed {
+            // A listener nothing dials, as in the round trip above.
+            source: Some(
+                packetframe_fast_path::fib::controller::RouteSourceConfig::Bgp {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    local_as: 64512,
+                    peer_as: 64512,
+                    router_id: Ipv4Addr::new(192, 0, 2, 10),
+                    peer_acl: Vec::new(),
+                    expected_peer_ip: None,
+                    anyip: false,
+                },
+            ),
+            integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::None,
+            asn_table: None,
+        },
+        ResolverPolicy::default(),
+        std::collections::HashMap::new(),
+        Some(sink.clone()),
+        SecondTierSignals {
+            completeness: None,
+            feed_session: None,
+        },
+        LedgerWiring {
+            // Seeded routes are unseen: the GC removes every one.
+            seed: Some(ledger(&routes, now_unix())),
+            status: packetframe_fast_path::fib::route_ledger::shared_status(),
+            identity: Some(IDENTITY.into()),
+        },
+    )
+    .expect("RouteController::start");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let prog = ctrl.programmer_handle();
+    assert_eq!(
+        rt.block_on(prog.mirror_counts()).expect("counts"),
+        (0, STOP_ROUTES)
+    );
+    rt.block_on(prog.queue_route_event(RouteEvent::InitiationComplete))
+        .expect("InitiationComplete queued");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !sink.holding.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the GC never reached its second chunk"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    drop(ctrl);
+    assert_eq!(
+        fib_v6_len(&pins.dir.join("fast-path").join("maps").join("FIB_V6")),
+        0,
+        "the stop returned with routes the GC had not reached still in the FIB the \
+         dataplane goes on forwarding with"
+    );
+    assert_eq!(sink.withdrawn.load(Ordering::SeqCst), STOP_ROUTES);
+    drop(ebpf);
+}
+
+/// A preserving stop that lands mid-GC writes the mirror the GC leaves,
+/// never one from partway through it.
+///
+/// The ledger is the next start's seed. Taken mid-walk it would carry
+/// every stale route the GC had not reached yet into that start, to be
+/// forwarded on until its first GC. The snapshot is a command, and commands
+/// wait for a walk, so it is taken once the GC is done. The walk is held in
+/// the sink when the stop begins.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs + netlink; run via sudo -E cargo test -- --ignored"]
+fn a_preserving_stop_mid_gc_writes_the_mirror_the_gc_leaves() {
+    use ledger::*;
+    use packetframe_fast_path::fib::controller::{
+        LedgerWiring, Preserved, ResolverPolicy, RouteController, RouteFeed, SecondTierSignals,
+    };
+    use packetframe_fast_path::fib::route_ledger::{consume, Consumed, Expectations};
+
+    let pins = PinDirs::setup();
+    let ebpf = pin_production_layout(&pins);
+    let state_dir = std::env::temp_dir().join(format!(
+        "pf-ledger-mid-gc-{}-{}",
+        std::process::id(),
+        TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::fs::create_dir_all(&state_dir).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // Many chunks, so a loop that let the snapshot in mid-walk would
+    // nearly always take it with chunks still to go.
+    let prefixes = many_v6_64s(MANY_CHUNKS);
+    let routes: Vec<_> = prefixes.iter().map(|p| route(*p, nh6())).collect();
+    let sink = Arc::new(HoldingSink {
+        withdrawn: AtomicUsize::new(0),
+        holding: std::sync::atomic::AtomicBool::new(false),
+        hold: Duration::from_secs(1),
+    });
+    let ctrl = RouteController::start(
+        &pins.dir,
+        RouteFeed {
+            source: Some(
+                packetframe_fast_path::fib::controller::RouteSourceConfig::Bgp {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    local_as: 64512,
+                    peer_as: 64512,
+                    router_id: Ipv4Addr::new(192, 0, 2, 10),
+                    peer_acl: Vec::new(),
+                    expected_peer_ip: None,
+                    anyip: false,
+                },
+            ),
+            integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::None,
+            asn_table: None,
+        },
+        ResolverPolicy::default(),
+        std::collections::HashMap::new(),
+        Some(sink.clone()),
+        SecondTierSignals {
+            completeness: None,
+            feed_session: None,
+        },
+        LedgerWiring {
+            seed: Some(ledger(&routes, now_unix())),
+            status: packetframe_fast_path::fib::route_ledger::shared_status(),
+            identity: Some(IDENTITY.into()),
+        },
+    )
+    .expect("RouteController::start");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let prog = ctrl.programmer_handle();
+    // The live session re-advertises a few of the seeded routes; the GC
+    // removes the rest.
+    let kept: Vec<IpPrefix> = prefixes.iter().step_by(MANY_CHUNKS / 64).copied().collect();
+    rt.block_on(async {
+        for p in &kept {
+            prog.apply_route_event(add(*p, nh6()))
+                .await
+                .expect("re-advertisement");
+        }
+        prog.queue_route_event(RouteEvent::InitiationComplete)
+            .await
+            .expect("InitiationComplete queued");
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !sink.holding.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the GC never reached its second chunk"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let written = ctrl.preserve_route_ledger(&state_dir);
+    match &written {
+        Preserved::Written { counts, .. } => assert_eq!(
+            counts.prefixes() as usize,
+            kept.len(),
+            "the ledger holds routes the GC was removing when the stop began"
+        ),
+        other => panic!("{other:?}"),
+    }
+    drop(ctrl);
+
+    let exp = Expectations {
+        spec: packetframe_common::config::RouteLedgerSpec::default(),
+        forwarding_mode: packetframe_common::config::ForwardingMode::PacketframeFib,
+        identity: Some(IDENTITY),
+        single_peer: None,
+        now_unix: now_unix(),
+    };
+    let again = match consume(&state_dir, &exp) {
+        Consumed::Seed(l) => l,
+        other => panic!("{other:?}"),
+    };
+    let mut got: Vec<IpPrefix> = again.routes().map(|r| r.prefix).collect();
+    got.sort_by_key(|p| format!("{p:?}"));
+    let mut want = kept;
+    want.sort_by_key(|p| format!("{p:?}"));
+    assert_eq!(got, want, "the next start seeds exactly what the GC left");
     let _ = std::fs::remove_dir_all(&state_dir);
     drop(ebpf);
 }

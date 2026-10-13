@@ -20,7 +20,8 @@
 //!
 //! `Resync` and `InitiationComplete` walk the whole mirror, and
 //! `PeerDown` the departed peer's prefixes, a [`WALK_CHUNK`] at a time,
-//! with commands held until the walk is done.
+//! with commands held until the walk is done. A shutdown finishes a GC
+//! or a `PeerDown` still under way in one go.
 //!
 //! ECMP groups are deduplicated by a sorted-NH-id signature so one
 //! set of upstream transits announcing 200K prefixes allocates one
@@ -1316,6 +1317,7 @@ impl FibProgrammer {
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
                     info!("FibProgrammer shutdown requested");
+                    self.settle_walk_for_shutdown();
                     return;
                 }
                 // The seed or a walk, a chunk at a time, while commands
@@ -1366,6 +1368,54 @@ impl FibProgrammer {
     /// A seed or a walk is being applied, and commands wait for it.
     fn mid_chunked_work(&self) -> bool {
         self.seed.is_some() || self.walk.is_some()
+    }
+
+    /// Settle a walk still under way at shutdown: finish a GC or a
+    /// `PeerDown` in one go, drop a `Resync`.
+    ///
+    /// A preserving stop leaves the dataplane forwarding on the BPF maps
+    /// as this task last wrote them (SPEC.md §8.5), so a GC or `PeerDown`
+    /// dropped between chunks would leave in them every route its cursor
+    /// had not reached yet: advertisements the new session did not
+    /// re-announce, or a departed peer's routes. Before the walks were
+    /// chunked each was one synchronous call, which a cancellation could
+    /// not cut short. No yields here: nothing else on the runtime is owed
+    /// the worker any more.
+    ///
+    /// Bounded by what is left of this one walk. Its list was fixed when
+    /// it began, and nothing can start another, because the task returns
+    /// next: at most the whole mirror (or the departed peer's prefixes)
+    /// plus the owed ones, the work of the single call this replaced. How
+    /// long a stop waits for it is the controller's (`SHUTDOWN_TIMEOUT`).
+    ///
+    /// A `Resync`'s marks touch only this task's mirror, with no map write
+    /// and no second-tier call. They die with it, the maps hold what they
+    /// held before the `Resync`, and the next start loads or seeds afresh.
+    /// No ledger can hold a half-marked mirror either: a stop's
+    /// `EncodeLedger` is a command, and commands wait for the walk. The
+    /// reply is dropped, which its sender reads as the programmer gone.
+    fn settle_walk_for_shutdown(&mut self) {
+        let Some(w) = &self.walk else {
+            return;
+        };
+        let left = w.prefixes.len() - w.next;
+        if matches!(w.kind, WalkKind::Mark { .. }) {
+            info!(
+                left,
+                "shutdown: dropping the Resync's unfinished walk (its marks were in this \
+                 process's mirror only)"
+            );
+            self.walk = None;
+            return;
+        }
+        info!(
+            left,
+            "shutdown: finishing the walk in one go, so the FIB left forwarding keeps none of \
+             the routes it was removing"
+        );
+        while self.walk.is_some() {
+            self.walk_chunk();
+        }
     }
 
     fn on_command(&mut self, cmd: Command) {

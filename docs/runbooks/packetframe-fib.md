@@ -513,6 +513,26 @@ every reconnect deleted them (and FRR on UniFi reconnects at every
 config upload); a host route came back at the kernel's next update
 of its neighbour entry, the default only at a daemon restart.
 
+The disconnect's `Resync`, the `InitiationComplete` GC and a BMP
+`PeerDown` each walk the mirror 2,048 prefixes at a time and give the
+control-plane runtime back between chunks, so the neighbour resolver,
+the integrity checker and the route source keep running through a
+full-table sweep. Route updates queue until the walk is done. Each
+walk's journal line (`Resync: route-source advertisements marked
+not-seen-this-session`, `InitiationComplete: garbage-collected unseen
+advertisements`, `PeerDown: withdrew peer's advertisements`) carries
+`took_ms` for the whole walk. One stall is left: a walk that removed a
+full table holds the runtime for about 200 ms when it frees its list,
+because glibc then consolidates the memory the removed routes left
+(191–225 ms at 1M routes in Docker on arm64; more on a gateway's
+cores). `mallopt(M_MXFAST, 0)` took that to about 8 ms in the same
+measurement and is a possible later change; nothing sets it today.
+
+A stop that comes mid-GC or mid-`PeerDown` finishes the walk before the
+daemon exits, waiting up to 5 s for it, because XDP goes on forwarding
+after `systemctl stop` on what the walk leaves. A `Resync` cut short by a
+stop is dropped: its marks were only ever in the process's memory.
+
 ### Inspecting the FIB programmatically
 
 The `packetframe fib` subcommand opens the pinned BPF maps directly.

@@ -1669,6 +1669,21 @@ impl StatusSnapshot {
                 // floor was told it had "no authority" and should enable
                 // `require-table-complete`, which was already enabled and
                 // was the thing blocking it (review finding).
+                //
+                // What carries the traffic meanwhile is the supervisor's
+                // belief about the NIC (`steered`), not the deferral's. A
+                // steered adoption is what defers, so it is usually the
+                // adopted FIB. Not always: the dump path takes the traffic
+                // off VPP before it reads the FIB, and leaves it off when
+                // the feed spoils that release (a reconnect or a burst
+                // during the dump) until the diff runs; `steer off` takes
+                // it off too. Then the eBPF tier carries everything, and
+                // naming the adopted FIB sends an operator to the idle tier.
+                let forwarding = if self.steered {
+                    "the adopted FIB keeps forwarding untouched"
+                } else {
+                    "VPP is unsteered, so the traffic is on the eBPF tier"
+                };
                 let msg = if self.authority == AuthorityPosture::Vetoing {
                     // Persistent by construction, in BOTH senses now:
                     // `Vetoing` is only `AuthorityMismatch` (the one
@@ -1693,9 +1708,9 @@ impl StatusSnapshot {
                          `require-table-complete off` is the right answer — but it is read \
                          once at bring-up, so it needs a daemon RESTART. A reload is \
                          refused by name and says so, so there is nothing to try first and \
-                         nothing that silently carries the old gate forward. The adopted \
-                         FIB keeps forwarding untouched meanwhile, and every steering \
-                         change is refused while this holds"
+                         nothing that silently carries the old gate forward. Meanwhile \
+                         {forwarding}, and every steering change but `steer off` on every \
+                         port is refused while this holds"
                     )
                 } else if self.authority == AuthorityPosture::AwaitingAuthority {
                     // Blocked, but self-clearing: no report yet, one that
@@ -1715,14 +1730,14 @@ impl StatusSnapshot {
                          once a sample agrees; the source holds {have} routes against a \
                          floor of {want}. If the authority really is at fault rather than \
                          merely unasked or caught mid-withdrawal, the next sample says so \
-                         and this line changes to name it. Nothing is dropping: the \
-                         adopted FIB keeps forwarding untouched"
+                         and this line changes to name it. Nothing is dropping: \
+                         {forwarding}"
                     )
                 } else if have < want && self.authority == AuthorityPosture::Attesting {
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
-                         release floor of {want}; the adopted FIB keeps forwarding \
-                         untouched. The completeness authority can release this once its \
+                         release floor of {want}; {forwarding}. The completeness authority \
+                         can release this once its \
                          report agrees with the mirror — expected within one \
                          `integrity-authority` interval. If it persists well beyond that, \
                          check the integrity checker and the route daemon rather than the \
@@ -1731,8 +1746,8 @@ impl StatusSnapshot {
                 } else if have < want && self.authority == AuthorityPosture::DemotedByFlap {
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
-                         release floor of {want}; the adopted FIB keeps forwarding \
-                         untouched. The feed session reconnected under this deferral, so \
+                         release floor of {want}; {forwarding}. The feed session \
+                         reconnected under this deferral, so \
                          the authority's report can no longer attest that the mirror is \
                          THIS session's — a count can match while a reannouncement is \
                          still mid-flight. Attestation returns when the route source \
@@ -1740,8 +1755,8 @@ impl StatusSnapshot {
                          fired` in the journal), whose GC removes what the previous session \
                          left. What fires it depends on the route source, and the \
                          packetframe-fib runbook names it; a feed that never gives it holds \
-                         this deferral indefinitely BY DESIGN. Nothing is dropping — VPP \
-                         forwards the FIB it was adopted with. To resolve it, let the route \
+                         this deferral indefinitely BY DESIGN. Nothing is dropping. To \
+                         resolve it, let the route \
                          source finish its dump, or restart the daemon once the table is \
                          loaded so the adoption starts unsteered"
                     )
@@ -1752,8 +1767,8 @@ impl StatusSnapshot {
                     // rather than an assumption.
                     format!(
                         "resync deferred: the route source holds {have} routes, below the \
-                         release floor of {want}; the adopted FIB keeps forwarding \
-                         untouched. If the source is still loading this clears itself — \
+                         release floor of {want}; {forwarding}. If the source is still \
+                         loading this clears itself — \
                          but if {have} IS the whole table, the gate will never release: \
                          with no authority it refuses to guess completeness below the \
                          floor, by design. Size `expected-routes` within 16x of the real \
@@ -1781,15 +1796,13 @@ impl StatusSnapshot {
                          fired` in the journal), so that a pause mid-dump is not taken for \
                          the end of it. What fires it depends on the route source, and the \
                          packetframe-fib runbook names it; a feed that never gives it holds \
-                         this indefinitely, by design. Nothing is dropping: the adopted FIB \
-                         keeps forwarding untouched"
+                         this indefinitely, by design. Nothing is dropping: {forwarding}"
                     )
                 } else {
                     format!(
                         "resync deferred: the route source holds {have} routes (release \
                          floor {want} met); the diff runs once the source is live and has \
-                         gone quiet, and the adopted FIB keeps forwarding untouched until \
-                         then"
+                         gone quiet, and {forwarding} until then"
                     )
                 };
                 // Whichever posture is reported: the refusal is a fact about
@@ -5847,6 +5860,76 @@ mod tests {
             vetoed.contains("not the authority feeding it") && !vetoed.contains(waiting),
             "{vetoed}"
         );
+    }
+
+    /// Every deferral line names the tier carrying the traffic, from the
+    /// supervisor's belief about the NIC, in every posture and phase.
+    ///
+    /// A deferral is a steered adoption's, but the dump path takes the
+    /// traffic off VPP before it reads the FIB and leaves it off when the
+    /// feed spoils that release, and `steer off` takes it off too. Then
+    /// the eBPF tier carries everything, and a line saying the adopted FIB
+    /// keeps forwarding sends an operator to the idle tier. The veto line
+    /// also no longer says every steering change is refused: `steer off`
+    /// is admitted throughout a deferral (`accepts_steering_removal`).
+    #[test]
+    fn every_deferral_line_names_the_tier_carrying_the_traffic() {
+        use crate::runtime::AuthorityPosture;
+        let led = ledger_with(10, 0, 0);
+        let on_vpp = "the adopted FIB keeps forwarding untouched";
+        let on_ebpf = "VPP is unsteered, so the traffic is on the eBPF tier";
+        for authority in [
+            AuthorityPosture::Absent,
+            AuthorityPosture::Attesting,
+            AuthorityPosture::DemotedByFlap,
+            AuthorityPosture::Vetoing,
+            AuthorityPosture::AwaitingAuthority,
+        ] {
+            for have in [50, 196] {
+                for awaiting in [false, true] {
+                    for steered in [true, false] {
+                        let mut snap = snap_of(
+                            &steered_supervisor(),
+                            &led,
+                            ApiHealth::Answering {
+                                silent_for: Duration::from_millis(200),
+                            },
+                            FibSync::NeverVerified,
+                            ports_up(),
+                        );
+                        snap.resync_deferred = Some((have, 100));
+                        snap.authority = authority;
+                        snap.awaiting_reconciliation = awaiting;
+                        snap.steered = steered;
+                        let msg = snap
+                            .report()
+                            .subsystems
+                            .into_iter()
+                            .find(|s| s.name == SUBSYS_FIB)
+                            .and_then(|s| s.message)
+                            .expect("a deferral always explains itself");
+                        let case = format!("{authority:?} have={have} awaiting={awaiting}");
+                        if steered {
+                            assert!(
+                                msg.contains(on_vpp) && !msg.contains("eBPF tier"),
+                                "{case}, steered: {msg}"
+                            );
+                        } else {
+                            assert!(
+                                msg.contains(on_ebpf)
+                                    && !msg.contains("keeps forwarding")
+                                    && !msg.contains("forwards the FIB"),
+                                "{case}, unsteered: {msg}"
+                            );
+                        }
+                        assert!(
+                            !msg.contains("every steering change is refused"),
+                            "{case}: `steer off` is admitted during a deferral: {msg}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
