@@ -42,7 +42,7 @@ use std::time::Duration;
 use aya::maps::lpm_trie::Key as LpmKey;
 use aya::maps::{Array, LpmTrie, Map, MapData};
 use aya::Ebpf;
-use packetframe_common::fib::{IpPrefix, PeerId, RouteEvent};
+use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, RouteEvent};
 use packetframe_fast_path::aligned_bpf_copy;
 use packetframe_fast_path::fib::programmer::FibProgrammer;
 use packetframe_fast_path::fib::types::{
@@ -165,6 +165,10 @@ struct Harness {
     shutdown: CancellationToken,
     handle: packetframe_fast_path::fib::programmer::FibProgrammerHandle,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// Kept for the programmer's whole life, as the resolver's supervisor
+    /// keeps it in production: dropping it would run every test on a closed
+    /// channel.
+    _events_tx: tokio::sync::mpsc::Sender<NeighEvent>,
 }
 
 impl Harness {
@@ -176,7 +180,7 @@ impl Harness {
         let fib_v6 = open_lpm_v6(&pins.path("FIB_V6"));
         let ecmp_groups: Array<MapData, EcmpGroup> = open_array(&pins.path("ECMP_GROUPS"));
         let shutdown = CancellationToken::new();
-        let (_events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
         let (programmer, handle) = FibProgrammer::new(
             nexthops,
             fib_v4,
@@ -197,6 +201,7 @@ impl Harness {
             shutdown,
             handle,
             task: Some(task),
+            _events_tx: events_tx,
         }
     }
 
