@@ -546,6 +546,11 @@ line says what applies:
   `glibc.malloc.mxfast=128` is glibc's own 64-bit default, so setting
   it brings the old behaviour back without a rebuild; VPP inherits it
   and is at that default anyway. Any other value reaches VPP as well.
+- A warning, `GLIBC_TUNABLES sets glibc.malloc.mxfast to a value glibc
+  ignores ...`: the value was not a number glibc reads (decimal, `0x`
+  hex, a leading `0` octal) or was above its largest fast size (160 on
+  64-bit), so glibc kept its default and the daemon turned fastbins off
+  itself. Fix or remove the tunable.
 - `malloc: not glibc's allocator ...`: a musl build. musl's allocator
   has no fastbins, and nothing changes.
 - A warning, `mallopt(M_MXFAST, 0) refused`: glibc kept its fastbins;

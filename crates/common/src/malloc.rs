@@ -36,6 +36,11 @@ pub enum Fastbins {
     /// `GLIBC_TUNABLES` sets `glibc.malloc.mxfast`, to the value carried
     /// as written there. Fastbins are left as glibc set them from it.
     OperatorTunable(String),
+    /// `GLIBC_TUNABLES` sets `glibc.malloc.mxfast` to a value glibc does not
+    /// apply (not a number it reads, or above its largest fast size), so
+    /// glibc kept its default fastbins and `mallopt(M_MXFAST, 0)` turned
+    /// them off after all. Carries the value as written there.
+    DisabledOverIgnoredTunable(String),
     /// `mallopt(M_MXFAST, 0)` returned 0. glibc refuses only a value
     /// above its maximum, so this is not expected; fastbins stay as they
     /// were.
@@ -80,6 +85,14 @@ impl Fastbins {
                  a full-table walk's routes can hold a control-plane worker for about a second \
                  at 1M routes"
             ),
+            Fastbins::DisabledOverIgnoredTunable(value) => tracing::warn!(
+                glibc_malloc_mxfast = %value,
+                max = MAX_FAST_SIZE,
+                "malloc: GLIBC_TUNABLES sets glibc.malloc.mxfast to a value glibc ignores (not \
+                 a number it reads, or above its largest fast size), so glibc kept its default \
+                 fastbins; packetframe turned them off (mallopt M_MXFAST 0) instead. Fix or \
+                 remove the tunable"
+            ),
             Fastbins::Refused => tracing::warn!(
                 "malloc: mallopt(M_MXFAST, 0) refused; fastbins stay on, so freeing a \
                  full-table walk's routes can hold a control-plane worker for about a second \
@@ -102,17 +115,49 @@ impl Fastbins {
 /// bring the stall back; the journal line says when one has.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn apply(tunables: Option<&str>) -> Fastbins {
-    if let Some(value) = tunables.and_then(mxfast_tunable) {
-        return Fastbins::OperatorTunable(value.to_owned());
-    }
+    let ignored = match tunables.and_then(mxfast_tunable) {
+        Some(value) if glibc_applies_mxfast(value) => {
+            return Fastbins::OperatorTunable(value.to_owned())
+        }
+        // glibc left its default in place, so keeping the operator's value
+        // would keep nothing: apply ours, and say why.
+        other => other,
+    };
     // `libc` exposes `M_MXFAST` (glibc's malloc.h, 1) and `mallopt` for
     // every linux-gnu target.
     // SAFETY: two ints in, an int out; glibc changes only its own malloc
     // state, under the main arena's lock.
     match unsafe { libc::mallopt(libc::M_MXFAST, 0) } {
-        1 => Fastbins::Disabled,
+        1 => match ignored {
+            Some(value) => Fastbins::DisabledOverIgnoredTunable(value.to_owned()),
+            None => Fastbins::Disabled,
+        },
         _ => Fastbins::Refused,
     }
+}
+
+/// glibc's `MAX_FAST_SIZE` (malloc.c): `80 * sizeof(size_t) / 4`, 160 on
+/// 64-bit. `do_set_mxfast` applies a `glibc.malloc.mxfast` only up to it
+/// and otherwise leaves the default.
+const MAX_FAST_SIZE: u64 = (80 * std::mem::size_of::<usize>() / 4) as u64;
+
+/// Whether glibc applies this `glibc.malloc.mxfast` value. Tunables are
+/// read as `_dl_strtoul` reads them (decimal, `0x` hex, a leading `0`
+/// octal) and only when the whole string is a number; glibc ignores a
+/// value it cannot read, and `do_set_mxfast` one above [`MAX_FAST_SIZE`].
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn glibc_applies_mxfast(value: &str) -> bool {
+    let parsed = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else if value.len() > 1 && value.starts_with('0') {
+        u64::from_str_radix(&value[1..], 8).ok()
+    } else {
+        value.parse::<u64>().ok()
+    };
+    parsed.is_some_and(|v| v <= MAX_FAST_SIZE)
 }
 
 /// musl's allocator, or no Linux at all: see [`Fastbins::NotGlibc`].
@@ -148,6 +193,27 @@ mod tests {
             apply(Some("glibc.malloc.tcache_count=0")),
             Fastbins::Disabled
         );
+    }
+
+    #[test]
+    fn an_mxfast_glibc_ignores_is_not_kept() {
+        for bad in ["999999", "161", "abc", "", "0x", "12k", "-1", "0x1000"] {
+            assert_eq!(
+                apply(Some(&format!("glibc.malloc.mxfast={bad}"))),
+                Fastbins::DisabledOverIgnoredTunable(bad.into()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn glibc_reads_mxfast_as_its_tunables_parser_does() {
+        for ok in ["0", "64", "128", "160", "0x80", "0XA0", "0200", "00"] {
+            assert!(glibc_applies_mxfast(ok), "{ok:?} should apply");
+        }
+        for bad in ["161", "0xA1", "0241", "999999", "abc", "", "0x", "09", "1 "] {
+            assert!(!glibc_applies_mxfast(bad), "{bad:?} should be ignored");
+        }
     }
 
     #[test]
