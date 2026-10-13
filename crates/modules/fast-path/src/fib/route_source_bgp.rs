@@ -168,8 +168,9 @@ const INIT_COMPLETE_EOR_BACKSTOP: Duration = Duration::from_secs(300);
 const GR_RESTART_TIME: u16 = 120;
 
 /// NOTIFICATION error code Cease (RFC 4271 §4.5, subcodes RFC 4486):
-/// the peer chose to end the session (an operator's `clear bgp`, a
-/// configuration change, a shutdown), as opposed to reporting a fault.
+/// the peer ended the session other than for a protocol error, by
+/// choice (an operator's `clear bgp`, a configuration change, a
+/// shutdown) or for a fault of its own; see [`cease_is_administrative`].
 const NOTIFICATION_CEASE: u8 = 6;
 
 /// How long a session the peer closed reads on through what the peer
@@ -313,9 +314,10 @@ impl Default for QuietWindows {
 enum SessionEnd {
     /// We are shutting down.
     Shutdown,
-    /// The peer ended it, with a Cease NOTIFICATION (`cease` is its
-    /// subcode) or by closing the connection without one. `left` is what
-    /// it had sent that was never applied.
+    /// The peer ended it, with an administrative Cease NOTIFICATION
+    /// (`cease` is its subcode; see [`cease_is_administrative`]) or by
+    /// closing the connection without one. `left` is what it had sent
+    /// that was never applied.
     PeerClosed { cease: Option<u8>, left: Unapplied },
 }
 
@@ -1085,14 +1087,15 @@ async fn peer_gone(
 }
 
 /// The session's end on the peer's NOTIFICATION `n`, with `left` of its
-/// stream unapplied: a clean end for a Cease, the peer's choice, and an
-/// error for any other code, which reports a fault.
+/// stream unapplied: a clean end for an administrative Cease
+/// ([`cease_is_administrative`]), the peer's choice, and an error for
+/// anything else, which reports a fault.
 fn peer_notification(
     n: &BgpNotificationMessage,
     left: Unapplied,
 ) -> Result<SessionEnd, RouteSourceError> {
     let (code, subcode) = n.error.get_codes();
-    if code == NOTIFICATION_CEASE {
+    if code == NOTIFICATION_CEASE && cease_is_administrative(subcode) {
         info!(
             code,
             subcode,
@@ -1111,6 +1114,28 @@ fn peer_notification(
          session left unapplied and {} bytes unread here",
         n.error, left.updates, left.unread_bytes
     )))
+}
+
+/// Whether a Cease with `subcode` (RFC 4486 §4) ended the session by an
+/// operator's or the protocol's choice rather than for a fault:
+/// Administrative Shutdown (2), Peer De-configured (3), Administrative
+/// Reset (4, FRR's `clear bgp`), Connection Rejected (5), Other
+/// Configuration Change (6) and Connection Collision Resolution (7).
+///
+/// Collision Resolution is the RFC 4271 §6.8 procedure closing the
+/// losing one of two connections between the same speakers, the session
+/// going on over the other: routine, not a fault. It cannot reach this
+/// listener in practice, since we never connect out.
+///
+/// Not administrative: Maximum Number of Prefixes Reached (1) and Out of
+/// Resources (8) report a fault, after which the peer typically keeps
+/// tearing the session down or stays away, so they must reach
+/// warning-level monitoring, as must BFD Down (10, IANA), a failed path.
+/// So does every other subcode: 0 is reserved, RFC 8538's Hard Reset (9)
+/// is sent only to a peer that negotiated the N bit, which we do not,
+/// and an unknown one says nothing we could call clean.
+fn cease_is_administrative(subcode: u8) -> bool {
+    matches!(subcode, 2..=7)
 }
 
 // --- Session liveness, off the runtime ---------------------------------------
@@ -3548,13 +3573,10 @@ mod tests {
         );
     }
 
-    /// `clear bgp` on FRR from a session that has caught up: a Cease
-    /// (Administrative Reset), then the close. That is the peer's choice,
-    /// not a fault, so the session ends cleanly and says which Cease,
-    /// whichever reaches the main loop first, the NOTIFICATION or the
-    /// close.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cease_ends_a_caught_up_session_cleanly() {
+    /// A session that has caught up (its one UPDATE applied), then `msg`
+    /// and the peer's close: how the session ended, within 3 s or the test
+    /// fails, once it is checked nothing more was applied.
+    async fn closed_when_caught_up(msg: Vec<u8>) -> Result<SessionEnd, RouteSourceError> {
         let (prog, log) = recording_handle();
         let (mut peer, session, _shutdown) = establish(prog).await;
         peer.write_all(&test_update()).await.expect("UPDATE");
@@ -3562,22 +3584,90 @@ mod tests {
             log.len() == 1
         })
         .await;
-        peer.write_all(&notification(NOTIFICATION_CEASE, 4))
-            .await
-            .expect("NOTIFICATION");
+        peer.write_all(&msg).await.expect("NOTIFICATION");
         drop(peer);
         let ended = tokio::time::timeout(Duration::from_secs(3), session)
             .await
-            .expect("a Cease ends the session")
+            .expect("a NOTIFICATION and a close end the session")
             .expect("join");
-        match ended {
+        assert_eq!(log.len(), 1, "nothing else was applied");
+        ended
+    }
+
+    /// `clear bgp` on FRR from a session that has caught up: a Cease
+    /// (Administrative Reset), then the close. That is the peer's choice,
+    /// not a fault, so the session ends cleanly and says which Cease,
+    /// whichever reaches the main loop first, the NOTIFICATION or the
+    /// close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cease_ends_a_caught_up_session_cleanly() {
+        match closed_when_caught_up(notification(NOTIFICATION_CEASE, 4)).await {
             Ok(SessionEnd::PeerClosed {
                 cease: Some(4),
                 left,
             }) => assert_eq!(left.updates, 0, "nothing was left to apply"),
             other => panic!("a Cease is a clean end that names its subcode: {other:?}"),
         }
-        assert_eq!(log.len(), 1, "and nothing else was applied");
+    }
+
+    /// A Cease that reports a fault is not a clean end. Maximum Number of
+    /// Prefixes Reached (6/1), the peer's prefix limit tripping, comes
+    /// back as the session's error, so warning-level monitoring sees it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_maximum_prefixes_cease_is_a_session_error() {
+        let ended = closed_when_caught_up(notification(NOTIFICATION_CEASE, 1)).await;
+        let err = ended.expect_err("Cease/1 reports a fault");
+        assert!(err.cause.contains("NOTIFICATION 6/1"), "{err}");
+    }
+
+    /// The same for Out of Resources (6/8), read from behind a backlog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_out_of_resources_cease_behind_a_backlog_is_a_session_error() {
+        let ended = closed_behind_a_backlog(Some(notification(NOTIFICATION_CEASE, 8))).await;
+        let err = ended.expect_err("Cease/8 reports a fault");
+        assert!(err.cause.contains("NOTIFICATION 6/8"), "{err}");
+    }
+
+    /// Which NOTIFICATIONs end a session cleanly: the administrative and
+    /// configuration Ceases, 2 to 7, and nothing else.
+    #[test]
+    fn only_an_administrative_cease_is_a_clean_end() {
+        use bgpkit_parser::models::BgpError;
+        let left = Unapplied {
+            updates: 3,
+            unread_bytes: 99,
+        };
+        let notified = |code, subcode| {
+            peer_notification(
+                &BgpNotificationMessage {
+                    error: BgpError::new(code, subcode),
+                    data: Vec::new(),
+                },
+                left,
+            )
+        };
+        for subcode in 2..=7 {
+            assert_eq!(
+                notified(NOTIFICATION_CEASE, subcode).ok(),
+                Some(SessionEnd::PeerClosed {
+                    cease: Some(subcode),
+                    left
+                }),
+                "Cease/{subcode} is administrative"
+            );
+        }
+        // Faults (1 Maximum Number of Prefixes Reached, 8 Out of
+        // Resources, 10 BFD Down), the reserved 0, Hard Reset, which we
+        // never negotiate, and subcodes nobody has assigned.
+        for subcode in [0, 1, 8, 9, 10, 11, 255] {
+            let err = notified(NOTIFICATION_CEASE, subcode)
+                .expect_err(&format!("Cease/{subcode} is not a clean end"));
+            assert!(
+                err.cause.contains(&format!("NOTIFICATION 6/{subcode}")),
+                "{err}"
+            );
+        }
+        assert!(notified(4, 0).is_err(), "Hold Timer Expired");
     }
 
     /// Whether the peer's end of a connection closes without our having

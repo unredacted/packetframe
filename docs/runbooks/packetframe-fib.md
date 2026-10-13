@@ -2165,17 +2165,24 @@ The journal then says why the session ended. packetframe reads on
 through what FRR sent last, without applying it, for the NOTIFICATION
 (up to 2 s, normally milliseconds):
 
-- A **Cease** (code 6: `clear bgp`, a configuration change, a
-  shutdown) is the peer's choice, logged at info: `received
-  NOTIFICATION: the BGP peer ended the session` with `code=6
-  subcode=…`, then `BGP client disconnected cleanly: the peer ended the
-  session` with `cease_subcode`, `unapplied_updates` and
+- An **administrative Cease** (code 6 with subcode 2 to 7:
+  Administrative Shutdown, Peer De-configured, Administrative Reset,
+  which is FRR's `clear bgp`, Connection Rejected, Other Configuration
+  Change, Connection Collision Resolution) is the peer's choice, logged
+  at info: `received NOTIFICATION: the BGP peer ended the session` with
+  `code=6 subcode=…`, then `BGP client disconnected cleanly: the peer
+  ended the session` with `cease_subcode`, `unapplied_updates` and
   `unread_bytes`.
-- **Any other code** reports a fault, logged as a warning: `BGP
+- **Any other NOTIFICATION** reports a fault, logged as a warning: `BGP
   connection handler exited with error` with `received NOTIFICATION
   4/0 (HoldTimerExpired(0)); closing session; N UPDATEs from this
   session left unapplied and M bytes unread here`. 4/0 is FRR's hold
-  timer expiring on packetframe (see FRR's bullet above).
+  timer expiring on packetframe (see FRR's bullet above). That includes
+  the Ceases that report a fault: 6/1, Maximum Number of Prefixes
+  Reached (the peer's prefix limit tripped), 6/8, Out of Resources,
+  and 6/10, BFD Down, as well as any subcode outside 2 to 7. After one
+  of those, FRR typically keeps resetting the session or stays away
+  until the cause is fixed.
 - **No NOTIFICATION** at all after a FIN logs `the BGP peer closed the
   connection: the stream ended without a NOTIFICATION` at info, a clean
   end too. That is normal behind a backlog: FRR writes its NOTIFICATION
