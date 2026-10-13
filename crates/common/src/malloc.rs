@@ -18,7 +18,7 @@
 //! now coalesces with its neighbours, and a small request that misses it
 //! is carved from the bins rather than popped from a fastbin. The heap's
 //! layout changes with it, and so can the resident set; what was measured
-//! of that, and what is owed, is in docs/runbooks/packetframe-fib.md
+//! of that is in docs/runbooks/packetframe-fib.md
 //! ("Force a route-source resync").
 //!
 //! `mallopt` rather than `GLIBC_TUNABLES=glibc.malloc.mxfast=0` in the
