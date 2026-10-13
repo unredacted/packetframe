@@ -1507,6 +1507,22 @@ impl RouteLedger {
         self.state.keys().map(|k| (*k).into()).collect()
     }
 
+    /// Up to `max` of [`Self::known_prefixes`], in key order, after
+    /// `after` (from the first when `None`): a resync walk's withdrawal
+    /// half, a slice at a time
+    /// ([`crate::engine::ConvergenceEngine::walk_resync_slice`]).
+    pub fn known_prefixes_after(&self, after: Option<IpPrefix>, max: usize) -> Vec<IpPrefix> {
+        let lower = match after {
+            Some(p) => std::ops::Bound::Excluded(PrefixKey::from(p)),
+            None => std::ops::Bound::Unbounded,
+        };
+        self.state
+            .range((lower, std::ops::Bound::Unbounded))
+            .take(max)
+            .map(|(k, _)| (*k).into())
+            .collect()
+    }
+
     /// Sampling pool for readback verification: only prefixes VPP has
     /// **confirmed**. Withheld and unresolvable prefixes would fail by
     /// design; in-flight ones would race the transport.

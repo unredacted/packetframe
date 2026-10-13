@@ -138,7 +138,9 @@ use crate::supervisor::{Event, State, Supervisor};
 pub enum Drain {
     /// Nothing left pending.
     Idle,
-    /// A batch went out; more remains.
+    /// A batch went out, or a slice of a deferred resync's release walk
+    /// ran (`runtime`'s `ReleaseWalk`); more remains. Progress either way,
+    /// and a pass asked for at once.
     More,
     /// The adopted resync is deliberately deferred: the route source
     /// holds `have` routes against a floor of `want`. See
