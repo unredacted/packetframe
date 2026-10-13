@@ -21,10 +21,13 @@
 
 #![cfg(target_os = "linux")]
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use aya::maps::lpm_trie::Key as LpmKey;
@@ -33,7 +36,7 @@ use aya::Ebpf;
 use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, RouteEvent};
 use packetframe_fast_path::aligned_bpf_copy;
 use packetframe_fast_path::fib::netlink_neigh::NeighborResolveHandle;
-use packetframe_fast_path::fib::programmer::{FibProgrammer, ECMP_GROUPS_CAP};
+use packetframe_fast_path::fib::programmer::{FibProgrammer, ECMP_GROUPS_CAP, WALK_CHUNK};
 use packetframe_fast_path::fib::types::{
     EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, NexthopSlotClass, FIB_KIND_ECMP,
     FIB_KIND_SINGLE, NH_FAMILY_V4, NH_FAMILY_V6, NH_STATE_FAILED, NH_STATE_INCOMPLETE,
@@ -581,6 +584,174 @@ impl Drop for ProgrammerHarness {
                 .rt
                 .block_on(async { tokio::time::timeout(Duration::from_secs(2), task).await });
         }
+    }
+}
+
+/// A [`ResolvedRouteSink`] that only counts, so a task can watch a walk's
+/// progress through it without copying a log of every call.
+#[derive(Default)]
+struct CountingSink {
+    resolved: AtomicUsize,
+    withdrawn: AtomicUsize,
+}
+
+impl ResolvedRouteSink for CountingSink {
+    fn route_resolved(&self, _: IpPrefix, _: &[IpAddr]) {
+        self.resolved.fetch_add(1, Ordering::SeqCst);
+    }
+    fn route_withdrawn(&self, _: IpPrefix) {
+        self.withdrawn.fetch_add(1, Ordering::SeqCst);
+    }
+    fn neighbour_resolved(&self, _: IpAddr, _: [u8; 6], _: u32) {}
+    fn neighbour_lost(&self, _: IpAddr) {}
+}
+
+/// One worker of a multi-thread runtime, held by a task blocked in a
+/// synchronous wait until this is dropped: busy as far as the scheduler
+/// can tell, without using any CPU.
+struct HeldWorker {
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+impl HeldWorker {
+    fn hold(rt: &tokio::runtime::Runtime) -> Self {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        rt.spawn(async move {
+            let _ = held_tx.send(());
+            // Returns once the sender is dropped.
+            let _ = release_rx.recv();
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a worker took the hold");
+        Self { _release: release }
+    }
+}
+
+/// Counts the polls of the future it wraps, and times the longest. A task
+/// polled again has returned `Pending` in between: given its worker back
+/// to the runtime.
+struct CountPolls<F> {
+    inner: Pin<Box<F>>,
+    polls: Arc<AtomicUsize>,
+    longest_ns: Arc<AtomicU64>,
+}
+
+impl<F: Future> Future for CountPolls<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let out = self.inner.as_mut().poll(cx);
+        let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.longest_ns.fetch_max(took, Ordering::SeqCst);
+        out
+    }
+}
+
+/// A programmer on the controller's runtime shape, `worker_threads(2)`,
+/// with one worker held ([`HeldWorker`]) before it starts. Every task a
+/// test spawns then shares the programmer's worker and runs only when the
+/// programmer gives it back: what the control plane's other tasks (the
+/// neighbour resolver, the integrity checker, the BGP listener) see when
+/// the other worker is busy too.
+///
+/// Field order is drop order: the held worker goes first, or the
+/// runtime's shutdown would wait on it for good.
+struct OneFreeWorker {
+    _held: HeldWorker,
+    h: ProgrammerHarness,
+    sink: Arc<CountingSink>,
+    /// Polls of the programmer's task ([`CountPolls`]).
+    polls: Arc<AtomicUsize>,
+    /// The longest of them, in nanoseconds.
+    longest_poll_ns: Arc<AtomicU64>,
+}
+
+impl OneFreeWorker {
+    fn new(seed: Option<packetframe_fast_path::fib::route_ledger::RouteLedger>) -> Self {
+        let pins = PinDirs::setup();
+        let ebpf = load_and_pin(&pins);
+        let nexthops: Array<MapData, NexthopEntry> = open_array(&pins.path("NEXTHOPS"));
+        let fib_v4 = open_lpm_v4(&pins.path("FIB_V4"));
+        let fib_v6 = open_lpm_v6(&pins.path("FIB_V6"));
+        let ecmp_groups: Array<MapData, EcmpGroup> = open_array(&pins.path("ECMP_GROUPS"));
+        let shutdown = CancellationToken::new();
+        // The sender is kept: a closed channel is always ready, and the run
+        // loop would spin on it.
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+        let (mut programmer, handle) = FibProgrammer::new(
+            nexthops,
+            fib_v4,
+            fib_v6,
+            ecmp_groups,
+            events_rx,
+            shutdown.clone(),
+        );
+        let sink = Arc::new(CountingSink::default());
+        programmer.set_route_sink(sink.clone());
+        if let Some(seed) = seed {
+            programmer.set_seed(seed);
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let held = HeldWorker::hold(&rt);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let longest_poll_ns = Arc::new(AtomicU64::new(0));
+        let task = rt.spawn(CountPolls {
+            inner: Box::pin(programmer.run()),
+            polls: polls.clone(),
+            longest_ns: longest_poll_ns.clone(),
+        });
+        Self {
+            _held: held,
+            h: ProgrammerHarness {
+                pins,
+                _ebpf: ebpf,
+                rt,
+                shutdown,
+                handle,
+                task: Some(task),
+                events_tx: Some(events_tx),
+            },
+            sink,
+            polls,
+            longest_poll_ns,
+        }
+    }
+
+    /// The longest single poll of the programmer's task since the last
+    /// call: the longest it held its worker in one go.
+    fn take_longest_poll(&self) -> Duration {
+        Duration::from_nanos(self.longest_poll_ns.swap(0, Ordering::SeqCst))
+    }
+
+    /// Spawn a task that returns the first non-zero value of `count` it
+    /// sees. Sharing a worker with the programmer, it can see a value
+    /// short of a walk's total only if the programmer gave the worker back
+    /// partway through.
+    fn first_sight(&self, count: fn(&CountingSink) -> usize) -> tokio::task::JoinHandle<usize> {
+        let sink = self.sink.clone();
+        self.h.rt.spawn(async move {
+            loop {
+                let n = count(&sink);
+                if n > 0 {
+                    return n;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    }
+
+    fn mirror_counts(&self) -> (usize, usize) {
+        self.h
+            .run(async { self.h.handle.mirror_counts().await })
+            .expect("counts")
     }
 }
 
@@ -2366,7 +2537,7 @@ fn an_entry_already_gone_from_the_map_is_a_completed_withdrawal() {
 /// A GC whose recompute failed keeps reporting failure until it
 /// actually reconciles — and then announces the corrected set.
 ///
-/// `gc_unseen` drains the unseen advertisements before recomputing, so
+/// The GC drains the unseen advertisements before recomputing, so
 /// its failure is not retryable by re-running the sweep: the victims
 /// are gone and the next GC collects none. Reporting `Ok(0)` there is
 /// the dangerous answer, because the prefix is still installed with the
@@ -3448,6 +3619,167 @@ fn a_route_event_never_overtakes_the_seed() {
     );
 }
 
+/// `n` distinct /64s, `2001:db8:c:<i>::/64`: a mirror many chunks long.
+fn many_v6_64s(n: usize) -> Vec<IpPrefix> {
+    (0..u16::try_from(n).expect("fits the group"))
+        .map(|i| {
+            let mut a = v6("2001:db8:c::");
+            a[6..8].copy_from_slice(&i.to_be_bytes());
+            IpPrefix::V6 {
+                addr: a,
+                prefix_len: 64,
+            }
+        })
+        .collect()
+}
+
+/// Long enough that a seed or walk takes many chunks.
+const MANY_CHUNKS: usize = 16 * WALK_CHUNK;
+
+/// A seed gives the runtime back between chunks.
+///
+/// It is up to a full table at every start, applied on the programmer's
+/// task. With one of the runtime's two workers held, a task spawned beside
+/// the programmer runs only when the programmer gives its worker back, so
+/// it sees the seed partway — some routes announced, not all — only if
+/// that happens between chunks. A seed applied in one poll shows it
+/// everything at once.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_seed_gives_the_runtime_back_between_chunks() {
+    use ledger::*;
+    let routes: Vec<_> = many_v6_64s(MANY_CHUNKS)
+        .into_iter()
+        .map(|p| route(p, nh6()))
+        .collect();
+    let t = OneFreeWorker::new(Some(ledger(&routes, now_unix())));
+
+    let watcher = t.first_sight(|s| s.resolved.load(Ordering::SeqCst));
+    let seen = t.h.run(watcher).expect("watcher");
+    assert!(
+        seen < MANY_CHUNKS,
+        "a task sharing the programmer's worker first ran when the seed had announced \
+         {seen} of {MANY_CHUNKS} routes: the seed never gave the worker back"
+    );
+    assert_eq!(t.mirror_counts(), (0, MANY_CHUNKS));
+    assert_eq!(t.sink.resolved.load(Ordering::SeqCst), MANY_CHUNKS);
+}
+
+/// A reconnect's `Resync` and its `InitiationComplete` GC give the runtime
+/// back between chunks.
+///
+/// On 2026-10-12 a reconnect's GC removed ~1.25M advertisements in one
+/// synchronous call on the control-plane runtime, and every other task on
+/// it waited that long. Here the mirror spans many chunks and one of the
+/// runtime's two workers is held, so a task spawned beside the programmer
+/// sees the GC partway — some routes withdrawn, not all — only if the
+/// programmer gives its worker back between chunks. A Resync's marks show
+/// nothing outside until it answers, so its yields are counted on the
+/// programmer's task instead.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_resync_and_its_gc_give_the_runtime_back_between_chunks() {
+    use ledger::*;
+    let routes: Vec<_> = many_v6_64s(MANY_CHUNKS)
+        .into_iter()
+        .map(|p| route(p, nh6()))
+        .collect();
+    let t = OneFreeWorker::new(Some(ledger(&routes, now_unix())));
+    // Queued behind the seed, so the mirror is whole from here.
+    assert_eq!(t.mirror_counts(), (0, MANY_CHUNKS));
+
+    // Every chunk of the walk ends by returning `Pending`, so the task is
+    // polled once more per chunk. In one call the walk takes one poll.
+    let before = t.polls.load(Ordering::SeqCst);
+    t.h.run(async { t.h.handle.apply_route_event(RouteEvent::Resync).await })
+        .expect("Resync");
+    let polls = t.polls.load(Ordering::SeqCst) - before;
+    assert!(
+        polls >= MANY_CHUNKS / WALK_CHUNK,
+        "the Resync's walk over {MANY_CHUNKS} routes took {polls} polls of the programmer's \
+         task: it did not give the worker back between chunks"
+    );
+
+    let watcher = t.first_sight(|s| s.withdrawn.load(Ordering::SeqCst));
+    let gc = t.h.run(async {
+        t.h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    // Read before anything else can move it: the route source marks the
+    // session reconciled on this reply, so it must follow the whole GC.
+    let withdrawn_at_reply = t.sink.withdrawn.load(Ordering::SeqCst);
+    assert!(gc.is_ok(), "the GC must complete: {gc:?}");
+    assert_eq!(
+        withdrawn_at_reply, MANY_CHUNKS,
+        "the InitiationComplete reply came before the GC was whole"
+    );
+    let seen = t.h.run(watcher).expect("watcher");
+    assert!(
+        seen < MANY_CHUNKS,
+        "a task sharing the programmer's worker first ran when the GC had withdrawn \
+         {seen} of {MANY_CHUNKS} routes: the GC never gave the worker back"
+    );
+    assert_eq!(t.mirror_counts(), (0, 0));
+}
+
+/// No command overtakes a `Resync` or an `InitiationComplete`. Both walk
+/// the mirror a chunk at a time and the run loop serves neighbour events
+/// and its timers between chunks, but never a command:
+///
+/// - an `Add` sent behind a `Resync` is the new session's. Served partway
+///   through the walk, a later chunk would mark it unseen and the GC would
+///   delete a route the session had just announced;
+/// - a question sent behind an `InitiationComplete` sees the mirror the
+///   whole GC left, not one from partway through it.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn no_command_overtakes_a_resync_or_its_gc() {
+    use ledger::*;
+    let prefixes = many_v6_64s(MANY_CHUNKS);
+    let routes: Vec<_> = prefixes.iter().map(|p| route(*p, nh6())).collect();
+    let t = OneFreeWorker::new(Some(ledger(&routes, now_unix())));
+    assert_eq!(t.mirror_counts(), (0, MANY_CHUNKS));
+
+    // Spread over the table, so a walk that let them in early would have
+    // most of them still ahead of its cursor.
+    let readvertised: Vec<IpPrefix> = prefixes.iter().step_by(MANY_CHUNKS / 64).copied().collect();
+    t.h.run(async {
+        let (resync, ()) = tokio::join!(t.h.handle.apply_route_event(RouteEvent::Resync), async {
+            for p in &readvertised {
+                t.h.handle
+                    .apply_route_event(add(*p, nh6()))
+                    .await
+                    .expect("re-advertisement");
+            }
+        });
+        resync.expect("Resync");
+    });
+
+    let (gc, counts) = t.h.run(async {
+        tokio::join!(
+            t.h.handle.apply_route_event(RouteEvent::InitiationComplete),
+            t.h.handle.mirror_counts(),
+        )
+    });
+    gc.expect("InitiationComplete");
+    assert_eq!(
+        counts.expect("counts"),
+        (0, readvertised.len()),
+        "a question sent behind the InitiationComplete saw the mirror partway through the GC"
+    );
+    for p in &readvertised {
+        assert!(
+            has(&t.h, *p),
+            "{p:?} was re-advertised behind the Resync, and the GC deleted it"
+        );
+    }
+    assert_eq!(
+        t.sink.withdrawn.load(Ordering::SeqCst),
+        MANY_CHUNKS - readvertised.len()
+    );
+}
+
 /// What a stop writes: the route source's advertisements, and nothing
 /// the neighbour resolver injected — not its `local-prefix` host routes,
 /// not its `fallback-default`, not even where the fallback shares a
@@ -3766,5 +4098,65 @@ fn measure_a_full_table_seed() {
          served (programmer's own figure {applied:?}); stop-side snapshot {encode_took:?} \
          ({} bytes)",
         enc.bytes.len()
+    );
+}
+
+/// What a seed, a `Resync` and its GC take over a full table, and the
+/// longest the programmer held its worker in one poll during each: the
+/// bound the chunking buys the rest of the control-plane runtime. The
+/// Resync's and the GC's longest poll include the one unchunked step, the
+/// copy of the mirror's keys at the start of the walk.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; measurement, also needs PF_MEASURE_LEDGER_SEED=1"]
+fn measure_full_table_walks() {
+    use ledger::*;
+    if std::env::var("PF_MEASURE_LEDGER_SEED").is_err() {
+        eprintln!("skipped: set PF_MEASURE_LEDGER_SEED=1 to measure");
+        return;
+    }
+    // Under FIB_V6_CAP, so every route installs and the GC withdraws each.
+    const N: u32 = 1_000_000;
+    let nhs: Vec<IpAddr> = (1..=768u16)
+        .map(|i| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)))
+        .collect();
+    let routes: Vec<_> = (0..N)
+        .map(|i| {
+            let mut a = v6("2001:db8::");
+            a[4..8].copy_from_slice(&i.to_be_bytes());
+            route(
+                IpPrefix::V6 {
+                    addr: a,
+                    prefix_len: 64,
+                },
+                nhs[i as usize % nhs.len()],
+            )
+        })
+        .collect();
+    let seed = ledger(&routes, now_unix());
+    drop(routes);
+
+    let started = std::time::Instant::now();
+    let t = OneFreeWorker::new(Some(seed));
+    assert_eq!(t.mirror_counts(), (0, N as usize));
+    let seed_took = (started.elapsed(), t.take_longest_poll());
+
+    let started = std::time::Instant::now();
+    t.h.run(async { t.h.handle.apply_route_event(RouteEvent::Resync).await })
+        .expect("Resync");
+    let resync_took = (started.elapsed(), t.take_longest_poll());
+
+    let started = std::time::Instant::now();
+    t.h.run(async {
+        t.h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    })
+    .expect("InitiationComplete");
+    let gc_took = (started.elapsed(), t.take_longest_poll());
+    assert_eq!(t.sink.withdrawn.load(Ordering::SeqCst), N as usize);
+
+    println!(
+        "{N} routes into real BPF maps, one of two workers held; (whole, longest poll): \
+         seed {seed_took:?}, Resync {resync_took:?}, GC {gc_took:?}"
     );
 }
