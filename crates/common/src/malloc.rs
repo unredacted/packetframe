@@ -26,77 +26,92 @@
 //! environment, and a setting chosen for packetframe's control plane is
 //! not VPP's to take. `mallopt` changes this process only, and a child's
 //! `exec` starts its allocator afresh.
+//!
+//! **`GLIBC_TUNABLES` is not interpreted.** Whether glibc applied a
+//! `glibc.malloc.mxfast` there depends on its tunables parser in detail
+//! (a sign, whitespace, a malformed entry elsewhere that voids the whole
+//! string, a value above its bound, a release with no fastbins at all),
+//! and guessing at that from outside would have the start-up line claim a
+//! setting glibc had dropped. So the daemon always applies its own, which
+//! overrides such a tunable (a `mallopt` after start wins), and the opt-out
+//! is a variable of its own: [`KEEP_ENV`]. The daemon only notes whether
+//! the variable names `glibc.malloc.mxfast`, so the start-up line can say
+//! it was overridden.
+
+/// Set to `on` in the daemon's environment (a systemd drop-in) to keep
+/// glibc's fastbins: the way back to glibc's default without a rebuild,
+/// and how one build measures both settings. Any other value, or none,
+/// leaves the daemon's setting in force.
+pub const KEEP_ENV: &str = "PACKETFRAME_MALLOC_FASTBINS";
+
+/// The first glibc release without fastbins: 2.43 removed them, and
+/// `M_MXFAST` became a no-op there.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const FIRST_GLIBC_WITHOUT_FASTBINS: (u32, u32) = (2, 43);
 
 /// What [`disable_fastbins`] did. Returned as well as logged, so the
 /// measurement tests can print which allocator they measured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fastbins {
-    /// `mallopt(M_MXFAST, 0)` returned 1.
-    Disabled,
-    /// `GLIBC_TUNABLES` sets `glibc.malloc.mxfast`, to the value carried
-    /// as written there. Fastbins are left as glibc set them from it.
-    OperatorTunable(String),
-    /// `GLIBC_TUNABLES` sets `glibc.malloc.mxfast` to a value glibc does not
-    /// apply (not a number it reads, or above its largest fast size), so
-    /// glibc kept its default fastbins and `mallopt(M_MXFAST, 0)` turned
-    /// them off after all. Carries the value as written there.
-    DisabledOverIgnoredTunable(String),
-    /// `mallopt(M_MXFAST, 0)` returned 0. glibc refuses only a value
-    /// above its maximum, so this is not expected; fastbins stay as they
-    /// were.
+    /// `mallopt(M_MXFAST, 0)` returned 1. Carries whether `GLIBC_TUNABLES`
+    /// named `glibc.malloc.mxfast`, which this overrides.
+    Disabled { overrode_tunable: bool },
+    /// [`KEEP_ENV`] is `on`: glibc's fastbins are left as they are.
+    Kept,
+    /// `mallopt(M_MXFAST, 0)` returned 0. glibc refuses only a value above
+    /// its maximum, so this is not expected; fastbins stay as they were.
     Refused,
-    /// Not glibc's allocator, so there is nothing to set. The musl
-    /// release builds link musl's (mallocng, what Rust's musl targets
-    /// ship), which has no fastbins and defers no merging; a macOS dev
-    /// build cannot run the daemon at all.
+    /// This glibc has no fastbins (2.43 and later), so there is nothing to
+    /// set. Carries the version glibc reports.
+    NoFastbins(String),
+    /// Not glibc's allocator, so there is nothing to set. The musl release
+    /// builds link musl's (mallocng, what Rust's musl targets ship), which
+    /// has no fastbins and defers no merging; a macOS dev build cannot run
+    /// the daemon at all.
     NotGlibc,
 }
 
-/// Turn glibc's fastbins off for this process, unless `GLIBC_TUNABLES`
-/// already sets them, and log the outcome once. Never fails: an
-/// allocator that keeps its fastbins costs the stall described in the
-/// [module docs](self), not correctness.
+/// Turn glibc's fastbins off for this process, unless [`KEEP_ENV`] says to
+/// keep them, and log the outcome once. Never fails: an allocator that
+/// keeps its fastbins costs the stall described in the [module
+/// docs](self), not correctness.
 ///
 /// Call it first thing in `packetframe run`, while the process is still
 /// one thread (glibc consolidates only the main arena before it lowers
 /// the limit), and nowhere else in the CLI: the other subcommands are
 /// short-lived and never walk a table.
 pub fn disable_fastbins() -> Fastbins {
-    let tunables = std::env::var_os(TUNABLES_ENV);
-    let outcome = apply(tunables.as_ref().map(|t| t.to_string_lossy()).as_deref());
+    let keep = std::env::var_os(KEEP_ENV).is_some_and(|v| v == "on");
+    let tunable = std::env::var_os("GLIBC_TUNABLES")
+        .is_some_and(|t| t.to_string_lossy().contains("glibc.malloc.mxfast"));
+    let outcome = apply(keep, tunable, glibc_version());
     outcome.log();
     outcome
 }
 
-const TUNABLES_ENV: &str = "GLIBC_TUNABLES";
-
 impl Fastbins {
     fn log(&self) {
         match self {
-            Fastbins::Disabled => tracing::info!(
+            Fastbins::Disabled { overrode_tunable } => tracing::info!(
+                overrode_glibc_tunable = *overrode_tunable,
                 "malloc: fastbins off (mallopt M_MXFAST 0), so glibc merges freed memory as it \
-                 goes, not in one long call at the end of a full-table walk; a \
-                 glibc.malloc.mxfast in GLIBC_TUNABLES, when set, is kept instead"
+                 goes, not in one long call at the end of a full-table walk; {KEEP_ENV}=on \
+                 keeps glibc's fastbins, and a glibc.malloc.mxfast in GLIBC_TUNABLES is \
+                 overridden"
             ),
-            Fastbins::OperatorTunable(value) => tracing::info!(
-                glibc_malloc_mxfast = %value,
-                "malloc: GLIBC_TUNABLES sets glibc.malloc.mxfast, which is kept, and \
-                 packetframe's own fastbins-off setting is skipped. With fastbins on, freeing \
-                 a full-table walk's routes can hold a control-plane worker for about a second \
-                 at 1M routes"
-            ),
-            Fastbins::DisabledOverIgnoredTunable(value) => tracing::warn!(
-                glibc_malloc_mxfast = %value,
-                max = MAX_FAST_SIZE,
-                "malloc: GLIBC_TUNABLES sets glibc.malloc.mxfast to a value glibc ignores (not \
-                 a number it reads, or above its largest fast size), so glibc kept its default \
-                 fastbins; packetframe turned them off (mallopt M_MXFAST 0) instead. Fix or \
-                 remove the tunable"
+            Fastbins::Kept => tracing::info!(
+                "malloc: {KEEP_ENV}=on, so glibc's fastbins are kept. Freeing a full-table \
+                 walk's routes can then hold a control-plane worker for about a second at 1M \
+                 routes"
             ),
             Fastbins::Refused => tracing::warn!(
                 "malloc: mallopt(M_MXFAST, 0) refused; fastbins stay on, so freeing a \
                  full-table walk's routes can hold a control-plane worker for about a second \
                  at 1M routes"
+            ),
+            Fastbins::NoFastbins(version) => tracing::info!(
+                glibc = %version,
+                "malloc: this glibc has no fastbins (removed in 2.43); nothing to set"
             ),
             Fastbins::NotGlibc => tracing::info!(
                 "malloc: not glibc's allocator (musl's has no fastbins); nothing to set"
@@ -105,146 +120,121 @@ impl Fastbins {
     }
 }
 
-/// An operator's `glibc.malloc.mxfast` wins over the daemon's 0, as
-/// `RUST_LOG` wins over the config's log level (crates/cli/src/logging.rs):
-/// an explicit setting the daemon silently undid would make the mechanism
-/// the operator reached for lie to them. It is also the one way back to
-/// glibc's default without a rebuild, and how one build measures both
-/// settings: `glibc.malloc.mxfast=128` is that default on 64-bit, so VPP
-/// inheriting it changes nothing there. The price is that an operator can
-/// bring the stall back; the journal line says when one has.
+/// The decision, apart from the environment and the running glibc so it
+/// can be tested. A glibc version that cannot be read is taken to have
+/// fastbins: every release before 2.43 does, and `mallopt` is harmless
+/// where they are gone.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn apply(tunables: Option<&str>) -> Fastbins {
-    let ignored = match tunables.and_then(mxfast_tunable) {
-        Some(value) if glibc_applies_mxfast(value) => {
-            return Fastbins::OperatorTunable(value.to_owned())
+fn apply(keep: bool, tunable: bool, glibc: Option<(String, (u32, u32))>) -> Fastbins {
+    if let Some((version, parsed)) = glibc {
+        if parsed >= FIRST_GLIBC_WITHOUT_FASTBINS {
+            return Fastbins::NoFastbins(version);
         }
-        // glibc left its default in place, so keeping the operator's value
-        // would keep nothing: apply ours, and say why.
-        other => other,
-    };
+    }
+    if keep {
+        return Fastbins::Kept;
+    }
     // `libc` exposes `M_MXFAST` (glibc's malloc.h, 1) and `mallopt` for
     // every linux-gnu target.
     // SAFETY: two ints in, an int out; glibc changes only its own malloc
     // state, under the main arena's lock.
     match unsafe { libc::mallopt(libc::M_MXFAST, 0) } {
-        1 => match ignored {
-            Some(value) => Fastbins::DisabledOverIgnoredTunable(value.to_owned()),
-            None => Fastbins::Disabled,
+        1 => Fastbins::Disabled {
+            overrode_tunable: tunable,
         },
         _ => Fastbins::Refused,
     }
 }
 
-/// glibc's `MAX_FAST_SIZE` (malloc.c): `80 * sizeof(size_t) / 4`, 160 on
-/// 64-bit. `do_set_mxfast` applies a `glibc.malloc.mxfast` only up to it
-/// and otherwise leaves the default.
-const MAX_FAST_SIZE: u64 = (80 * std::mem::size_of::<usize>() / 4) as u64;
-
-/// Whether glibc applies this `glibc.malloc.mxfast` value. Tunables are
-/// read as `_dl_strtoul` reads them (decimal, `0x` hex, a leading `0`
-/// octal) and only when the whole string is a number; glibc ignores a
-/// value it cannot read, and `do_set_mxfast` one above [`MAX_FAST_SIZE`].
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn glibc_applies_mxfast(value: &str) -> bool {
-    let parsed = if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        u64::from_str_radix(hex, 16).ok()
-    } else if value.len() > 1 && value.starts_with('0') {
-        u64::from_str_radix(&value[1..], 8).ok()
-    } else {
-        value.parse::<u64>().ok()
-    };
-    parsed.is_some_and(|v| v <= MAX_FAST_SIZE)
-}
-
 /// musl's allocator, or no Linux at all: see [`Fastbins::NotGlibc`].
-/// `GLIBC_TUNABLES` means nothing to either.
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn apply(_tunables: Option<&str>) -> Fastbins {
+fn apply(_keep: bool, _tunable: bool, _glibc: Option<(String, (u32, u32))>) -> Fastbins {
     Fastbins::NotGlibc
 }
 
-/// The value `GLIBC_TUNABLES` gives `glibc.malloc.mxfast`: `name=value`
-/// pairs separated by `:`, the last one naming the tunable standing, as
-/// in glibc. An entry without `=` names nothing.
+/// The running glibc's version, as `gnu_get_libc_version` reports it, and
+/// its major and minor parsed. `None` off glibc or when it cannot be read.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn mxfast_tunable(tunables: &str) -> Option<&str> {
-    tunables
-        .rsplit(':')
-        .filter_map(|entry| entry.split_once('='))
-        .find(|(name, _)| *name == "glibc.malloc.mxfast")
-        .map(|(_, value)| value)
+fn glibc_version() -> Option<(String, (u32, u32))> {
+    // SAFETY: glibc returns a pointer to a static NUL-terminated string.
+    let raw = unsafe { libc::gnu_get_libc_version() };
+    if raw.is_null() {
+        return None;
+    }
+    let version = unsafe { std::ffi::CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
+    let parsed = parse_version(&version)?;
+    Some((version, parsed))
 }
 
-#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn glibc_version() -> Option<(String, (u32, u32))> {
+    None
+}
+
+/// `major.minor[.anything]` as two numbers.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
+fn parse_version(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The daemon's own call, without an operator tunable: glibc accepts
-    /// `M_MXFAST` 0 (mallopt returns 1). Changes this test binary's
-    /// allocator, which nothing here depends on.
     #[test]
-    fn mallopt_accepts_mxfast_zero() {
-        assert_eq!(apply(None), Fastbins::Disabled);
+    fn glibc_versions_parse_to_major_and_minor() {
+        assert_eq!(parse_version("2.31"), Some((2, 31)));
+        assert_eq!(parse_version("2.43"), Some((2, 43)));
+        assert_eq!(parse_version("2.43.9000"), Some((2, 43)));
+        assert_eq!(parse_version("2"), None);
+        assert_eq!(parse_version("x.y"), None);
+        assert_eq!(parse_version(""), None);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn fastbins_go_off_unless_kept_or_absent() {
+        let old = || Some(("2.31".to_string(), (2, 31)));
         assert_eq!(
-            apply(Some("glibc.malloc.tcache_count=0")),
-            Fastbins::Disabled
+            apply(false, false, old()),
+            Fastbins::Disabled {
+                overrode_tunable: false
+            },
+            "mallopt(M_MXFAST, 0) returns 1"
+        );
+        assert_eq!(
+            apply(false, true, old()),
+            Fastbins::Disabled {
+                overrode_tunable: true
+            }
+        );
+        assert_eq!(apply(true, true, old()), Fastbins::Kept);
+        assert_eq!(
+            apply(false, false, Some(("2.43".to_string(), (2, 43)))),
+            Fastbins::NoFastbins("2.43".into())
+        );
+        assert_eq!(
+            apply(true, false, Some(("2.44".to_string(), (2, 44)))),
+            Fastbins::NoFastbins("2.44".into()),
+            "nothing to keep either"
+        );
+        assert_eq!(
+            apply(false, false, None),
+            Fastbins::Disabled {
+                overrode_tunable: false
+            },
+            "an unreadable version is taken to have fastbins"
         );
     }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
-    fn an_mxfast_glibc_ignores_is_not_kept() {
-        for bad in ["999999", "161", "abc", "", "0x", "12k", "-1", "0x1000"] {
-            assert_eq!(
-                apply(Some(&format!("glibc.malloc.mxfast={bad}"))),
-                Fastbins::DisabledOverIgnoredTunable(bad.into()),
-                "{bad:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn glibc_reads_mxfast_as_its_tunables_parser_does() {
-        for ok in ["0", "64", "128", "160", "0x80", "0XA0", "0200", "00"] {
-            assert!(glibc_applies_mxfast(ok), "{ok:?} should apply");
-        }
-        for bad in ["161", "0xA1", "0241", "999999", "abc", "", "0x", "09", "1 "] {
-            assert!(!glibc_applies_mxfast(bad), "{bad:?} should be ignored");
-        }
-    }
-
-    #[test]
-    fn an_operator_mxfast_is_kept() {
-        assert_eq!(
-            apply(Some("glibc.malloc.mxfast=128")),
-            Fastbins::OperatorTunable("128".into())
-        );
-    }
-
-    #[test]
-    fn mxfast_is_read_as_glibc_reads_tunables() {
-        assert_eq!(mxfast_tunable("glibc.malloc.mxfast=0"), Some("0"));
-        assert_eq!(
-            mxfast_tunable("glibc.malloc.tcache_count=0:glibc.malloc.mxfast=64"),
-            Some("64")
-        );
-        // The last one stands.
-        assert_eq!(
-            mxfast_tunable("glibc.malloc.mxfast=0:glibc.malloc.mxfast=128"),
-            Some("128")
-        );
-        // An entry without `=` names nothing, and does not swallow the
-        // next one.
-        assert_eq!(
-            mxfast_tunable("glibc.malloc.mxfast:glibc.malloc.mxfast=32"),
-            Some("32")
-        );
-        assert_eq!(mxfast_tunable("glibc.malloc.mxfast"), None);
-        assert_eq!(mxfast_tunable("glibc.malloc.mxfastx=1"), None);
-        assert_eq!(mxfast_tunable("glibc.malloc.trim_threshold=131072"), None);
-        assert_eq!(mxfast_tunable(""), None);
+    fn the_running_glibc_reports_a_version() {
+        assert!(glibc_version().is_some(), "gnu_get_libc_version");
     }
 }

@@ -541,16 +541,16 @@ walks took about as long either way, within ±12%. The start-up journal
 line says what applies:
 
 - `malloc: fastbins off (mallopt M_MXFAST 0) ...`: the default.
-- `malloc: GLIBC_TUNABLES sets glibc.malloc.mxfast, which is kept ...`:
-  an explicit `glibc.malloc.mxfast` in the daemon's environment wins.
-  `glibc.malloc.mxfast=128` is glibc's own 64-bit default, so setting
-  it brings the old behaviour back without a rebuild; VPP inherits it
-  and is at that default anyway. Any other value reaches VPP as well.
-- A warning, `GLIBC_TUNABLES sets glibc.malloc.mxfast to a value glibc
-  ignores ...`: the value was not a number glibc reads (decimal, `0x`
-  hex, a leading `0` octal) or was above its largest fast size (160 on
-  64-bit), so glibc kept its default and the daemon turned fastbins off
-  itself. Fix or remove the tunable.
+- `malloc: PACKETFRAME_MALLOC_FASTBINS=on, so glibc's fastbins are kept ...`:
+  the opt-out, set in the daemon's environment (a systemd drop-in,
+  `Environment=PACKETFRAME_MALLOC_FASTBINS=on`). It restores glibc's
+  default without a rebuild, and is how one build measures both
+  settings. A `glibc.malloc.mxfast` in `GLIBC_TUNABLES` is not honoured:
+  the daemon's own setting overrides it (`overrode_glibc_tunable=true`
+  on the first line), because whether glibc applied such a tunable
+  cannot be told reliably from outside.
+- `malloc: this glibc has no fastbins ...`: glibc 2.43 and later
+  removed them; nothing to set, and the stall this avoids cannot occur.
 - `malloc: not glibc's allocator ...`: a musl build. musl's allocator
   has no fastbins, and nothing changes.
 - A warning, `mallopt(M_MXFAST, 0) refused`: glibc kept its fastbins;

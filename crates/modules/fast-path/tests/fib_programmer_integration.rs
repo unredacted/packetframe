@@ -5019,8 +5019,8 @@ fn measure_a_full_table_seed() {
 /// The allocator setting `packetframe run` starts with, through the same
 /// call, so a measurement times what the daemon runs. It is
 /// process-wide: every test in this binary runs on it from here on.
-/// `GLIBC_TUNABLES=glibc.malloc.mxfast=128` measures glibc's default
-/// instead, as the same variable would give the daemon.
+/// `PACKETFRAME_MALLOC_FASTBINS=on` measures glibc's default instead,
+/// as the same variable would give the daemon.
 fn production_malloc() -> packetframe_common::malloc::Fastbins {
     packetframe_common::malloc::disable_fastbins()
 }
