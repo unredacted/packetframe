@@ -4965,7 +4965,8 @@ fn a_preserving_stop_mid_gc_writes_the_mirror_the_gc_leaves() {
 /// it an upper bound: the v6 trie insert is the dearer one.
 ///
 /// Gated on `PF_MEASURE_LEDGER_SEED=1` as well as `--ignored`, so the qemu
-/// job's `--ignored` run does not spend minutes on it.
+/// job's `--ignored` run does not spend minutes on it. Runs on the
+/// daemon's allocator setting ([`production_malloc`]).
 #[test]
 #[ignore = "needs CAP_BPF + bpffs; measurement, also needs PF_MEASURE_LEDGER_SEED=1"]
 fn measure_a_full_table_seed() {
@@ -4974,6 +4975,7 @@ fn measure_a_full_table_seed() {
         eprintln!("skipped: set PF_MEASURE_LEDGER_SEED=1 to measure");
         return;
     }
+    let malloc = production_malloc();
     const N: u32 = 1_350_000;
     let nhs: Vec<IpAddr> = (1..=768u16)
         .map(|i| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)))
@@ -5007,18 +5009,47 @@ fn measure_a_full_table_seed() {
         .expect("encode");
     let encode_took = started.elapsed();
     println!(
-        "seed of {N} routes into real BPF maps: {seed_took:?} until the first command was \
-         served (programmer's own figure {applied:?}); stop-side snapshot {encode_took:?} \
-         ({} bytes)",
+        "seed of {N} routes into real BPF maps, malloc {malloc:?}: {seed_took:?} until the \
+         first command was served (programmer's own figure {applied:?}); stop-side snapshot \
+         {encode_took:?} ({} bytes)",
         enc.bytes.len()
     );
+}
+
+/// The allocator setting `packetframe run` starts with, through the same
+/// call, so a measurement times what the daemon runs. It is
+/// process-wide: every test in this binary runs on it from here on.
+/// `PACKETFRAME_MALLOC_FASTBINS=on` measures glibc's default instead,
+/// as the same variable would give the daemon.
+fn production_malloc() -> packetframe_common::malloc::Fastbins {
+    packetframe_common::malloc::disable_fastbins()
+}
+
+/// This process's resident set and its peak so far, in MiB
+/// (`/proc/self/status`).
+fn rss_mib() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
+    let mib = |key: &str| -> u64 {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|v| v.trim().strip_suffix(" kB"))
+            .and_then(|kb| kb.trim().parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+            .unwrap_or_else(|| panic!("{key} in /proc/self/status"))
+    };
+    (mib("VmRSS:"), mib("VmHWM:"))
 }
 
 /// What a seed, a `Resync` and its GC, and a `PeerDown` take over a full
 /// table, and the longest the programmer held its worker in one poll
 /// during each: the bound the chunking buys the rest of the control-plane
 /// runtime. The walks' longest poll includes the one unchunked step, the
-/// copy of the prefixes at the start of the walk.
+/// copy of the prefixes at the start of the walk, and, with glibc's
+/// fastbins on, the consolidation that freeing a full table's routes sets
+/// off. Runs on the daemon's allocator setting ([`production_malloc`]),
+/// and prints this process's resident set after each phase; the test's
+/// own copy of the second seed is in it, alike in both settings.
 #[test]
 #[ignore = "needs CAP_BPF + bpffs; measurement, also needs PF_MEASURE_LEDGER_SEED=1"]
 fn measure_full_table_walks() {
@@ -5027,6 +5058,7 @@ fn measure_full_table_walks() {
         eprintln!("skipped: set PF_MEASURE_LEDGER_SEED=1 to measure");
         return;
     }
+    let malloc = production_malloc();
     // Under FIB_V6_CAP, so every route installs and the GC withdraws each.
     const N: u32 = 1_000_000;
     let nhs: Vec<IpAddr> = (1..=768u16)
@@ -5054,6 +5086,7 @@ fn measure_full_table_walks() {
     let t = OneFreeWorker::new(Some(seed));
     assert_eq!(t.mirror_counts(), (0, N as usize));
     let seed_took = (started.elapsed(), t.take_longest_poll());
+    let rss_seeded = rss_mib().0;
 
     let started = std::time::Instant::now();
     t.h.run(async { t.h.handle.apply_route_event(RouteEvent::Resync).await })
@@ -5069,6 +5102,7 @@ fn measure_full_table_walks() {
     .expect("InitiationComplete");
     let gc_took = (started.elapsed(), t.take_longest_poll());
     assert_eq!(t.sink.withdrawn.load(Ordering::SeqCst), N as usize);
+    let rss_gc = rss_mib().0;
     drop(t);
 
     let t = OneFreeWorker::new(Some(peer_down_seed));
@@ -5083,9 +5117,12 @@ fn measure_full_table_walks() {
     .expect("PeerDown");
     let peer_down_took = (started.elapsed(), t.take_longest_poll());
     assert_eq!(t.sink.withdrawn.load(Ordering::SeqCst), N as usize);
+    let (rss_peer_down, rss_peak) = rss_mib();
 
     println!(
-        "{N} routes into real BPF maps, one of two workers held; (whole, longest poll): \
-         seed {seed_took:?}, Resync {resync_took:?}, GC {gc_took:?}, PeerDown {peer_down_took:?}"
+        "{N} routes into real BPF maps, one of two workers held, malloc {malloc:?}; \
+         (whole, longest poll): seed {seed_took:?}, Resync {resync_took:?}, GC {gc_took:?}, \
+         PeerDown {peer_down_took:?}; RSS MiB: seeded {rss_seeded}, after GC {rss_gc}, \
+         after PeerDown {rss_peer_down}, peak {rss_peak}"
     );
 }

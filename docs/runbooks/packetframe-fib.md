@@ -521,12 +521,52 @@ full-table sweep. Route updates queue until the walk is done. Each
 walk's journal line (`Resync: route-source advertisements marked
 not-seen-this-session`, `InitiationComplete: garbage-collected unseen
 advertisements`, `PeerDown: withdrew peer's advertisements`) carries
-`took_ms` for the whole walk. One stall is left: a walk that removed a
-full table holds the runtime for about 200 ms when it frees its list,
-because glibc then consolidates the memory the removed routes left
-(191–225 ms at 1M routes in Docker on arm64; more on a gateway's
-cores). `mallopt(M_MXFAST, 0)` took that to about 8 ms in the same
-measurement and is a possible later change; nothing sets it today.
+`took_ms` for the whole walk. Each walk still holds the runtime once
+for longer than a chunk: its longest poll, which includes copying the
+prefixes it will visit. At 1M routes on the reference gateway
+(`measure_full_table_walks`, hwtest build 379) that was 43 ms for a
+`Resync`, 68 ms for the GC and 47 ms for a `PeerDown`. The seed at
+start holds it longest, about 220 ms, and the allocator setting below
+does not change that.
+
+Those holds are that short because since 0.6.0 the daemon turns
+glibc's malloc fastbins off (`mallopt(M_MXFAST, 0)`) first thing in
+`packetframe run`. With fastbins on, glibc parks a freed small
+allocation unmerged and later merges every parked one in a single
+call. A walk that removed a full table left millions, and freeing the
+walk's own list set that call off: it held the runtime for 1.058 s
+after the GC and 553 ms after the `PeerDown` in the same measurement of
+a build without the setting (about 200 ms in Docker on arm64). The whole
+walks took about as long either way, within ±12%. The start-up journal
+line says what applies:
+
+- `malloc: fastbins off (mallopt M_MXFAST 0) ...`: the default.
+- `malloc: PACKETFRAME_MALLOC_FASTBINS=on, so glibc's fastbins are kept ...`:
+  the opt-out, set in the daemon's environment (a systemd drop-in,
+  `Environment=PACKETFRAME_MALLOC_FASTBINS=on`). The daemon then sets
+  glibc's default fastbin limit itself (`mallopt`, 128 on 64-bit), so it
+  restores glibc's default without a rebuild whatever `GLIBC_TUNABLES`
+  holds, and one build measures both settings. A `glibc.malloc.mxfast` in `GLIBC_TUNABLES` is not honoured:
+  the daemon's own setting overrides it (`overrode_glibc_tunable=true`
+  on the first line), because whether glibc applied such a tunable
+  cannot be told reliably from outside.
+- `malloc: this glibc has no fastbins ...`: glibc 2.43 and later
+  removed them; nothing to set, and the stall this avoids cannot occur.
+- `malloc: not glibc's allocator ...`: a musl build. musl's allocator
+  has no fastbins, and nothing changes.
+- A warning, `mallopt(M_MXFAST, 0) refused`: glibc kept its fastbins;
+  expect the second-long hold after a full-table GC.
+
+The setting is the daemon's process only, which is why it is a
+`mallopt` call and not `GLIBC_TUNABLES` in the unit: VPP, which
+vpp-offload spawns, keeps glibc's default. Its cost is a little CPU on
+small allocations that miss glibc's per-thread cache, which now merge
+with their neighbours as they are freed. In Docker on arm64 the
+1M-route measurement's resident set was the same at a full table
+(1083 MiB either way) and no larger after a teardown and a second seed
+(1046 MiB, against 1077 MiB and once 1809 MiB with fastbins on). The
+daemon's own RSS on a gateway, against a build without the setting,
+has not been measured yet.
 
 A stop that comes mid-GC or mid-`PeerDown` finishes the walk before the
 daemon exits, waiting up to 5 s for it, because XDP goes on forwarding

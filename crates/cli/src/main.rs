@@ -321,6 +321,11 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Feasibility { config, human } => run_feasibility(config, human),
         Command::Run { config } => {
+            // Before the config, the runtimes and the modules, while
+            // this is still the process's only thread; the daemon only.
+            // Why, and the GLIBC_TUNABLES precedence, in
+            // `packetframe_common::malloc`.
+            packetframe_common::malloc::disable_fastbins();
             let path = config_path_or_default(config);
             match loader::run(&path) {
                 Ok(()) => ExitCode::from(EXIT_OK),
