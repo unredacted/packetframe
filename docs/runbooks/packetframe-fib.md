@@ -195,6 +195,91 @@ Then check that packetframe's `received peer OPEN` journal line says
 the end of a reload instead of inferring it from silence, which a
 starved FRR can fake mid-dump (see [the route mirror empties after a
 feed reconnect](#symptom-the-route-mirror-empties-after-a-feed-reconnect)).
+FRR negotiates it out of the box, so nothing needs configuring for it;
+[graceful restart on the feed session](#graceful-restart-on-the-feed-session)
+says how to confirm it on the FRR side and what not to change.
+
+### Graceful restart on the feed session
+
+packetframe's OPEN carries the Graceful Restart capability (RFC 4724)
+as a **receiving speaker**: Restart Flags 0, Restart Time 120 s, and no
+address families, since it keeps no forwarding state of its own across
+a restart of its own. It advertises it for one reason: FRR schedules
+End-of-RIB toward a peer only when that peer advertised the capability,
+and End-of-RIB is how packetframe knows a reload's table is complete.
+packetframe sends its own End-of-RIB (IPv4, and IPv6 when negotiated)
+right after the session comes up, since it announces nothing.
+
+**FRR needs no configuration for this.** FRR's default graceful-restart
+mode is *helper* (FRR 10.1: `GLOBAL_HELPER`, "the default mode"), in
+which it advertises the capability itself and handles a peer's. Confirm
+on the FRR side:
+
+```sh
+vtysh -c 'show bgp neighbors 192.0.2.202' | grep -E 'Graceful Restart Capability|GR Mode|End-of-RIB'
+```
+
+On a working feed that shows `Graceful Restart Capability: advertised
+and received`, `Local GR Mode: Helper*` (the `*` means inherited from
+the global default), `Remote GR Mode: Helper` (packetframe), and
+`End-of-RIB send:` / `End-of-RIB received:` listing the families. If
+the capability is not `advertised and received`, someone disabled it.
+Look for the commands that do:
+
+```sh
+vtysh -c 'show running-config' | grep -nE 'graceful-restart-disable|disable-eor'
+```
+
+`bgp graceful-restart-disable` (global) or `neighbor <pf>
+graceful-restart-disable` turns the capability off; `bgp
+graceful-restart disable-eor` (hidden) keeps it but stops FRR sending
+End-of-RIB. Remove whichever applies, or if a deployment disabled
+helper mode globally on purpose, re-enable it for packetframe alone with
+`neighbor 192.0.2.202 graceful-restart-helper`.
+
+**Do not enable `bgp graceful-restart` globally for this.** That puts
+all of FRR in *restart* mode, not helper mode: after every bgpd restart
+FRR defers best-path selection for the whole router until each
+graceful-restart peer's End-of-RIB is in or `select-defer-time` runs
+out (360 s by default). It buys packetframe nothing that helper mode
+does not already give it. The same goes for `preserve-fw-state`.
+
+**What packetframe does not do as a receiving speaker.** RFC 4724 §4.2
+asks a receiving speaker to keep a lost session's routes only for the
+families the peer listed with forwarding preserved (FRR's helper mode
+lists none), to delete them when the peer's Restart Time passes, and
+to purge a family at once when the peer comes back without that
+family's F bit. packetframe does none of these. It keeps every route a
+lost session had sent until the next session's `InitiationComplete`
+garbage-collects whatever that session did not re-send, however long
+the peer takes and whatever its capability said. That is how the
+listener has always handled a session loss (a `Resync` marks the
+routes, `InitiationComplete` sweeps the unmarked ones; see [force a
+route-source resync](#force-a-route-source-resync)), and the route
+ledger reconciles a daemon restart the same way. It harms no one: the
+routes feed only packetframe's own data plane and are never passed to
+another speaker, and following §4.2 would empty the PacketFrame FIB for
+the whole of every FRR reload. The one receiving-speaker duty it does
+perform is the stale-route sweep at the peer's End-of-RIB.
+
+**Known limitation: a bgpd restart can send End-of-RIB over a nearly
+empty table.** When bgpd itself restarts (not a session reset: the
+process), it comes back with an empty RIB and brings packetframe's
+session up within a second or so, typically before its upstream
+sessions have re-learned the table. In helper mode nothing makes it
+wait, so it sends what little it has and then End-of-RIB.
+packetframe takes that End-of-RIB at its word: `InitiationComplete`
+fires with a small `updates_seen` and its GC removes nearly the whole
+mirror, which then refills as FRR learns routes and sends them, the
+same as a cold load. packetframe does not guard against this. On the
+FRR side, `bgp update-delay <max-delay>` should avoid it: a restarted
+bgpd then runs no best-path selection and sends no updates to any peer
+until every configured peer has sent End-of-RIB (FRR counts a peer's
+first KEEPALIVE as one) or `max-delay` seconds pass. That is untested
+here; it applies to the whole router, and an upstream that is
+configured but down holds every peer's updates for the full
+`max-delay`.
+
 ### The completeness authority on an FRR-fed box
 
 `integrity-authority` names the daemon packetframe cross-checks its
@@ -396,12 +481,18 @@ the fresh dump on reconnect. Routes the new session does not
 re-announce are GC'd at `InitiationComplete`. On the iBGP feed:
 
 - From a peer that negotiated graceful restart (the `received peer
-  OPEN` line says `graceful_restart=true`), it fires once End-of-RIB
-  has arrived for every family the session carries (`families=` on the
-  same line), and is applied behind every UPDATE before it. Silence is
-  only a backstop there: 300 s with no UPDATE, for a peer configured
-  not to send End-of-RIB (FRR's `bgp graceful-restart disable-eor`;
-  don't).
+  OPEN` line says `graceful_restart=true`, which FRR does by default),
+  it fires once End-of-RIB has arrived for every family the session
+  carries, and is applied behind every UPDATE before it. The families
+  are the ones the OPENs negotiated (`families=` on the same line: IPv4
+  when the peer lists it or advertises no Multiprotocol capability at
+  all, IPv6 when it lists it), plus any family whose routes arrive
+  anyway, which the journal reports as `UPDATE carried routes in a
+  family the OPENs did not negotiate`. An End-of-RIB is recognised from
+  the message's bytes, exactly as RFC 4724 defines it, so an UPDATE
+  whose contents fail to decode is never taken for one. Silence is only
+  a backstop there: 300 s with no UPDATE, for a peer configured not to
+  send End-of-RIB (FRR's `bgp graceful-restart disable-eor`; don't).
 - From any other peer, silence is all there is: 30 s with no UPDATE
   read and nothing left unread on the socket (KEEPALIVEs do not count
   either way). It was 5 s until 2026-10-12, when an FRR starved for
@@ -2069,16 +2160,67 @@ slowly routes apply, so FRR showing `Established` says nothing about
 whether they are landing.
 
 When FRR ends the session (a NOTIFICATION, then its close), packetframe
-ends it too, at once: `BGP connection handler exited with error` with
-`the peer closed the connection with N bytes still unread here`. N is
-the part of FRR's stream that was still queued, unapplied; the next
-session re-sends it. Before 2026-10-12 packetframe applied all of it
-first, and on a starved gateway that took four and a half minutes,
-with FRR's reconnects waiting unanswered. FRR's reconnects meanwhile
-queue in the kernel, and the listener takes the newest; the journal
-then shows `BGP connection dropped unopened` for the older ones, and
-for any whose peer had already given up on it. That is expected after
-a drop: those connections are ones FRR abandoned.
+ends it as soon as the close reaches it, without applying what is
+still queued at its end; the next session re-sends that. How soon that
+is depends on how the close comes:
+
+- **A reset** (RST) is seen at once.
+- **A FIN**, FRR's ordinary close, travels behind everything still in
+  FRR's socket send buffer, and TCP moves that data only as fast as
+  packetframe's reads reopen its receive window. Behind a full pipe,
+  packetframe therefore applies about another send buffer's worth of
+  the abandoned stream before the FIN can reach it (measured on
+  loopback with a 64K `SO_SNDBUF` at the peer: the close showed after
+  reading 195K of the 271K queued). What it skips is what was queued at
+  its own end at that moment: up to 256 framed messages and about one
+  receive buffer. FRR wipes its userspace output queue before it sends
+  the NOTIFICATION, so its kernel send buffer is all that stands ahead
+  of the FIN.
+
+Before 2026-10-12 packetframe applied the whole backlog first, and on a
+starved gateway that took four and a half minutes, with FRR's
+reconnects waiting unanswered.
+
+The journal then says why the session ended. packetframe reads on
+through what FRR sent last, without applying it, for the NOTIFICATION
+(up to 2 s, normally milliseconds):
+
+- An **administrative Cease** (code 6 with subcode 2 to 7:
+  Administrative Shutdown, Peer De-configured, Administrative Reset,
+  which is FRR's `clear bgp`, Connection Rejected, Other Configuration
+  Change, Connection Collision Resolution) is the peer's choice, logged
+  at info: `received NOTIFICATION: the BGP peer ended the session` with
+  `code=6 subcode=…`, then `BGP client disconnected cleanly: the peer
+  ended the session` with `cease_subcode`, `unapplied_updates` and
+  `unread_bytes`.
+- **Any other NOTIFICATION** reports a fault, logged as a warning: `BGP
+  connection handler exited with error` with `received NOTIFICATION
+  4/0 (HoldTimerExpired(0)); closing session; N UPDATEs from this
+  session left unapplied and M bytes unread here`. 4/0 is FRR's hold
+  timer expiring on packetframe (see FRR's bullet above). That includes
+  the Ceases that report a fault: 6/1, Maximum Number of Prefixes
+  Reached (the peer's prefix limit tripped), 6/8, Out of Resources,
+  and 6/10, BFD Down, as well as any subcode outside 2 to 7. After one
+  of those, FRR typically keeps resetting the session or stays away
+  until the cause is fixed.
+- **No NOTIFICATION** at all after a FIN logs `the BGP peer closed the
+  connection: the stream ended without a NOTIFICATION` at info, a clean
+  end too. That is normal behind a backlog: FRR writes its NOTIFICATION
+  without blocking, so one that does not fit a send buffer full of
+  UPDATEs is never sent.
+- **A reset** is a warning: `the peer reset the connection; …`.
+
+FRR's reconnects meanwhile queue in the kernel, and the listener takes
+the newest one whose source the ACL permits and whose far end is still
+open, judging each as it is taken off the queue, so neither a
+connection from outside the ACL nor one already closed (a port probe,
+an attempt FRR gave up) can displace FRR's live one. The journal shows
+`BGP connection dropped unopened` for the rest: `the peer had already
+given it up while it waited to be accepted`, or `a newer live one from
+a permitted source was queued behind it` for an older one still open.
+That is expected after a drop: FRR keeps one connection attempt to
+packetframe open at a time and closes each before it opens the next, so
+those are attempts it abandoned.
 
 ### Symptom: the route mirror empties after a feed reconnect
 
@@ -2097,10 +2239,12 @@ Check the `received peer OPEN` line and the `trigger=` on `InitiationComplete fi
 
 - `graceful_restart=false`: the peer did not negotiate graceful restart,
   so it sends no End-of-RIB and packetframe can only infer the end from
-  30 s of silence. Make it negotiate: on FRR, `bgp graceful-restart`
-  (global) or `neighbor <addr> graceful-restart-helper`. `show bgp
-  neighbors <addr>` then lists Graceful Restart among the received and
-  advertised capabilities.
+  30 s of silence. FRR negotiates it by default (helper mode), so
+  something on the FRR side turned it off: see [graceful restart on the
+  feed session](#graceful-restart-on-the-feed-session) for the `show
+  bgp neighbors` check and the commands to look for. Do not reach for a
+  global `bgp graceful-restart`, which puts the whole router in restart
+  mode.
 - `graceful_restart=true` and `trigger=quiescence`: the peer negotiated
   graceful restart but sent no End-of-RIB for 300 s, so the backstop
   fired. On FRR, look for `bgp graceful-restart disable-eor` and remove
@@ -2108,7 +2252,12 @@ Check the `received peer OPEN` line and the `trigger=` on `InitiationComplete fi
 - `trigger=end-of-rib`: the peer said its table was complete. Each
   family's arrival is logged as `End-of-RIB received`, and
   `InitiationComplete` waits for every family on the `families=` of the
-  OPEN line.
+  OPEN line, plus any the journal added with `UPDATE carried routes in
+  a family the OPENs did not negotiate`. If it fired with a small
+  `updates_seen` right after FRR's bgpd itself restarted, FRR said its
+  table was complete while it was still nearly empty: the [known
+  limitation](#graceful-restart-on-the-feed-session) of a bgpd
+  restart.
 
 ### Symptom: route-source session stays up but routes stop flowing
 

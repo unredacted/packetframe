@@ -48,7 +48,9 @@
 //!   `bgp_write_proceed_actions`) reschedules its update generation for
 //!   a pending End-of-RIB only toward a peer that advertised it, and
 //!   End-of-RIB is how [`RouteEvent::InitiationComplete`] knows the
-//!   initial table is complete instead of guessing from silence.
+//!   initial table is complete instead of guessing from silence. Of a
+//!   receiving speaker's duties we perform only that sweep; see
+//!   [`open_capabilities`] for the two we do not, and why.
 //! - Route Refresh is **not** advertised. We never originate routes,
 //!   so bird has nothing to ask us to refresh.
 //!
@@ -59,9 +61,10 @@
 //! our hold timer runs in the reader ([`reader_task`]), so neither
 //! direction's liveness waits on route processing.
 //!
-//! **What we send.** OPEN, KEEPALIVEs, and one End-of-RIB per family
-//! the session carries right after the OPEN-confirming KEEPALIVE: we
-//! announce nothing, so our side of the table is complete at once.
+//! **What we send.** OPEN, KEEPALIVEs, and right after the
+//! OPEN-confirming KEEPALIVE an End-of-RIB for IPv4 and, when
+//! negotiated, IPv6 (see [`NegotiatedCapabilities::end_of_rib_to_send`]):
+//! we announce nothing, so our side of the table is complete at once.
 //! No other UPDATE, no NOTIFICATION (we close on protocol error rather
 //! than send a structured NOTIFICATION, the peer reconnects either
 //! way), no ROUTE-REFRESH (we don't advertise the capability).
@@ -70,9 +73,11 @@
 //! [`RouteEvent::Resync`] → re-listen → on reconnect, the peer's full
 //! RIB streams in and [`RouteEvent::InitiationComplete`] fires at its
 //! End-of-RIB, or after a stretch of silence from a peer that sends
-//! none. A peer that closes ends the session at once, even with
-//! UPDATEs from it still queued here: they belong to a session that is
-//! over, and the next one re-sends them.
+//! none. A peer's close ends the session as soon as it reaches us, even
+//! with UPDATEs from it still queued here: they belong to a session
+//! that is over, and the next one re-sends them. A reset reaches us at
+//! once; a FIN only behind the data the peer still has to send, so see
+//! [`Liveness`] for what that saves and what it cannot.
 
 #![cfg(target_os = "linux")]
 
@@ -84,8 +89,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bgpkit_parser::models::{
-    Afi, Asn, AsnLength, AttributeValue, BgpMessage, BgpUpdateMessage, ElemType, NetworkPrefix,
-    Safi,
+    Afi, Asn, AsnLength, BgpMessage, BgpNotificationMessage, BgpUpdateMessage, ElemType,
+    NetworkPrefix, Safi,
 };
 use bgpkit_parser::parser::bgp::messages::parse_bgp_message;
 use bgpkit_parser::Elementor;
@@ -161,6 +166,19 @@ const INIT_COMPLETE_EOR_BACKSTOP: Duration = Duration::from_secs(300);
 /// families in it, RFC 4724 §3 makes the value irrelevant; 120 s is the
 /// conventional default, so nothing reads it as unusual.
 const GR_RESTART_TIME: u16 = 120;
+
+/// NOTIFICATION error code Cease (RFC 4271 §4.5, subcodes RFC 4486):
+/// the peer ended the session other than for a protocol error, by
+/// choice (an operator's `clear bgp`, a configuration change, a
+/// shutdown) or for a fault of its own; see [`cease_is_administrative`].
+const NOTIFICATION_CEASE: u8 = 6;
+
+/// How long a session the peer closed reads on through what the peer
+/// sent last, looking for its NOTIFICATION ([`peer_gone`]). Everything
+/// the peer sent is in our receive queue by then (a FIN arrives behind
+/// its data), so this bounds a read of at most the frame channel and
+/// one receive buffer, which takes milliseconds.
+const LAST_WORDS: Duration = Duration::from_secs(2);
 
 /// Name of the thread each established session's [`Liveness`] runs on.
 /// Listed in [`packetframe_common::placement::CONTROL_PLANE_THREADS`],
@@ -291,6 +309,27 @@ impl Default for QuietWindows {
     }
 }
 
+/// How a session that ended without a fault ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    /// We are shutting down.
+    Shutdown,
+    /// The peer ended it, with an administrative Cease NOTIFICATION
+    /// (`cease` is its subcode; see [`cease_is_administrative`]) or by
+    /// closing the connection without one. `left` is what it had sent
+    /// that was never applied.
+    PeerClosed { cease: Option<u8>, left: Unapplied },
+}
+
+/// What a session the peer ended had received but not applied.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Unapplied {
+    /// UPDATEs read off the socket and discarded.
+    updates: usize,
+    /// Bytes still in our receive queue when the close was seen.
+    unread_bytes: usize,
+}
+
 /// What fired InitiationComplete, for its log line.
 #[derive(Debug, Clone, Copy)]
 enum InitTrigger {
@@ -349,11 +388,12 @@ impl BgpListener {
     /// While a session runs, the peer's later connections wait in the
     /// kernel's accept queue, handshaken and with the peer's OPEN in
     /// them. A peer that gave up on us has moved on to a newer one and
-    /// closed the old, so the queue is read for the newest connection,
-    /// and one whose peer has already closed it is dropped before we say
-    /// anything on it. On 2026-10-12 the first one accepted after a long
-    /// session was such a leftover: OPEN, then `send KEEPALIVE: Broken
-    /// pipe`, and a Resync, before the live connection behind it.
+    /// closed the old, so the queue is read for the newest connection
+    /// still open at the far end ([`Self::newest_live`]), and every
+    /// other is dropped before we say anything on it. On 2026-10-12 the
+    /// first one accepted after a long session was a leftover FRR had
+    /// closed: OPEN, then `send KEEPALIVE: Broken pipe`, and a Resync,
+    /// before the live connection behind it.
     async fn serve(self, listener: TcpListener) -> Result<(), RouteSourceError> {
         loop {
             let first = tokio::select! {
@@ -369,28 +409,19 @@ impl BgpListener {
                     }
                 },
             };
-            let Some((stream, addr)) = self.newest_permitted(&listener, first) else {
+            let Some((stream, addr)) = self.newest_live(&listener, first) else {
                 continue;
             };
-            match hung_up(stream.as_fd().as_raw_fd(), Duration::ZERO) {
-                Ok(Some(how)) => {
-                    info!(
-                        %addr,
-                        how,
-                        "BGP connection dropped unopened: the peer had already given it up while \
-                         it waited to be accepted"
-                    );
-                    continue;
-                }
-                Ok(None) => {}
-                // Cannot tell; the handshake will.
-                Err(e) => debug!(%addr, error = %e, "could not poll a new BGP connection"),
-            }
             info!(%addr, "BGP client connected");
-            if let Err(e) = self.handle_connection(stream).await {
-                warn!(error = %e, "BGP connection handler exited with error");
-            } else {
-                info!("BGP client disconnected cleanly");
+            match self.handle_connection(stream).await {
+                Ok(SessionEnd::Shutdown) => info!("BGP client disconnected cleanly: shutdown"),
+                Ok(SessionEnd::PeerClosed { cease, left }) => info!(
+                    cease_subcode = ?cease,
+                    unapplied_updates = left.updates,
+                    unread_bytes = left.unread_bytes,
+                    "BGP client disconnected cleanly: the peer ended the session"
+                ),
+                Err(e) => warn!(error = %e, "BGP connection handler exited with error"),
             }
             // However the session ended — clean close,
             // NOTIFICATION, hold-timer expiry — it is
@@ -412,26 +443,39 @@ impl BgpListener {
         }
     }
 
-    /// `first`, unless newer connections are already queued behind it:
-    /// then the newest of them, every older one closed unread. Each goes
-    /// through [`Self::admit`] first, so one from outside the ACL can
-    /// never displace the peer's.
-    fn newest_permitted(
+    /// Of `first` and the connections queued behind it, the newest that
+    /// may speak BGP to us ([`Self::admit`]) and that its peer has not
+    /// closed ([`hung_up`]); every other is closed unread. A connection
+    /// is judged as it is taken off the queue, and only one that passes
+    /// both checks can replace the one chosen so far, so neither a source
+    /// outside the ACL nor a connection already given up (a port probe,
+    /// or an attempt the peer abandoned) can displace a live one.
+    ///
+    /// An older live connection loses to a newer live one, and is closed
+    /// rather than kept to fall back on. FRR has one connection attempt
+    /// to us open at a time: a ConnectRetry or OpenSent hold-timer expiry
+    /// stops the attempt, closing its socket, before the next starts. So
+    /// an older connection still open behind a newer one is not the
+    /// attempt FRR is waiting on, and answering it later would repeat
+    /// 2026-10-12's Broken pipe. If that reading is wrong, the newer one
+    /// being some other client from a permitted address, the cost is one
+    /// of FRR's ConnectRetry intervals (`timers connect`).
+    fn newest_live(
         &self,
         listener: &TcpListener,
         first: (TcpStream, SocketAddr),
     ) -> Option<(TcpStream, SocketAddr)> {
-        let mut newest = self.admit(first);
+        let mut newest = self.live(first);
         // One poll each: the queue as it stands, never a wait.
         while let Some(next) = listener.accept().now_or_never() {
             match next {
                 Ok(conn) => {
-                    if let Some(conn) = self.admit(conn) {
+                    if let Some(conn) = self.live(conn) {
                         if let Some((_, older)) = newest.replace(conn) {
                             info!(
                                 %older,
-                                "BGP connection dropped unopened: a newer one from the peer was \
-                                 queued behind it"
+                                "BGP connection dropped unopened: a newer live one from a \
+                                 permitted source was queued behind it"
                             );
                         }
                     }
@@ -443,6 +487,29 @@ impl BgpListener {
             }
         }
         newest
+    }
+
+    /// The connection, if [`Self::admit`] lets it speak BGP to us and its
+    /// peer has not already closed it.
+    fn live(&self, conn: (TcpStream, SocketAddr)) -> Option<(TcpStream, SocketAddr)> {
+        let (stream, addr) = self.admit(conn)?;
+        match hung_up(stream.as_fd().as_raw_fd(), Duration::ZERO) {
+            Ok(Some(how)) => {
+                info!(
+                    %addr,
+                    how,
+                    "BGP connection dropped unopened: the peer had already given it up while it \
+                     waited to be accepted"
+                );
+                None
+            }
+            Ok(None) => Some((stream, addr)),
+            // Cannot tell; the handshake will.
+            Err(e) => {
+                debug!(%addr, error = %e, "could not poll a new BGP connection");
+                Some((stream, addr))
+            }
+        }
     }
 
     /// The connection, if its source may speak BGP to us.
@@ -473,7 +540,10 @@ impl BgpListener {
     }
 
     /// Handshake + drain one BGP session.
-    async fn handle_connection(&self, mut stream: TcpStream) -> Result<(), RouteSourceError> {
+    async fn handle_connection(
+        &self,
+        mut stream: TcpStream,
+    ) -> Result<SessionEnd, RouteSourceError> {
         // Step 1: send our OPEN.
         let open = encode_open(self.cfg.local_as, self.cfg.hold_time, self.cfg.router_id);
         stream
@@ -489,7 +559,7 @@ impl BgpListener {
             .await
             .map_err(|_| RouteSourceError::recoverable("peer OPEN timeout".to_string()))?
             .map_err(|e| RouteSourceError::recoverable(format!("read peer OPEN: {e}")))?;
-        let (effective_hold, peer_asn_observed, negotiated) = match peer_open {
+        let (effective_hold, peer_asn_observed, negotiated) = match peer_open.parsed {
             BgpMessage::Open(o) => {
                 if o.version != 4 {
                     return Err(RouteSourceError::recoverable(format!(
@@ -525,7 +595,7 @@ impl BgpListener {
                     add_path_v4 = negotiated.add_path_v4_recv,
                     add_path_v6 = negotiated.add_path_v6_recv,
                     graceful_restart = negotiated.graceful_restart,
-                    families = ?negotiated.unicast_families(),
+                    families = ?negotiated.families(),
                     "received peer OPEN"
                 );
                 (effective_hold, effective_peer_asn, negotiated)
@@ -538,19 +608,18 @@ impl BgpListener {
             }
         };
 
-        // Step 3: a KEEPALIVE confirming the OPEN, then End-of-RIB for
-        // every family the session carries (see `unicast_families`). Our
-        // Graceful Restart capability obliges the End-of-RIB (RFC 4724
-        // §2), and it costs nothing: we announce no routes, so our table
-        // is complete now.
+        // Step 3: a KEEPALIVE confirming the OPEN, then our End-of-RIB
+        // (see `end_of_rib_to_send` for which families). Our Graceful
+        // Restart capability obliges the End-of-RIB (RFC 4724 §2), and it
+        // costs nothing: we announce no routes, so our table is complete
+        // now.
         // It also matters to the peer: an FRR restarting with
         // `preserve-fw-state` defers its best-path selection until every
         // graceful-restart peer's End-of-RIB is in, ours included. TCP
         // delivers these behind our OPEN and KEEPALIVE, so the peer has
         // reached Established before it reads them.
-        let families = negotiated.unicast_families();
         let mut confirm = encode_keepalive();
-        for family in families.iter() {
+        for family in negotiated.end_of_rib_to_send().iter() {
             confirm.extend_from_slice(&encode_end_of_rib(family));
         }
         stream
@@ -563,7 +632,7 @@ impl BgpListener {
         // thread sends the periodic KEEPALIVEs and watches for the peer
         // closing, and this loop applies what the reader framed, in
         // order. Both liveness duties used to live in this loop's
-        // `select!`, where they waited out every `process_msg` await, so
+        // `select!`, where they waited out every route-processing await, so
         // a full-table load behind a slow programmer went quiet toward
         // the peer for its whole hold time and the peer tore the session
         // down (2026-08-19, 2026-10-07). The KEEPALIVEs then moved to a
@@ -612,6 +681,10 @@ impl BgpListener {
         let mut init_complete_fired = false;
         let mut updates_seen = 0usize;
         let mut end_of_rib = Families::default();
+        // The families InitiationComplete waits for End-of-RIB in: the
+        // ones the OPENs negotiated, and any other whose routes arrive
+        // anyway (see `NegotiatedCapabilities::families`).
+        let mut awaited = negotiated.families();
 
         // Synthetic peer_id for an iBGP session: bird is the singular
         // peer here, so PeerId is constant. We hash (peer_ip, peer_asn)
@@ -620,40 +693,76 @@ impl BgpListener {
 
         // Every return below drops `reader`, which aborts it (see
         // `SessionTask`), and `liveness`, which ends its thread. Every
-        // await goes through `unless_ended`, so a peer that closes ends
-        // the session at once, however much of its stream is still
-        // queued here: on 2026-10-12 a session FRR had renounced at
+        // await goes through `unless_ended`, so a peer's close ends the
+        // session as soon as it reaches us, however much of its stream is
+        // still queued here: on 2026-10-12 a session FRR had renounced at
         // 17:48:50 went on applying its backlog until 17:53:14, while
-        // FRR's new connection waited in the accept queue.
+        // FRR's new connection waited in the accept queue. `peer_gone`
+        // then reads on through what is queued, without applying it, for
+        // the NOTIFICATION that says why.
+        macro_rules! or_end {
+            ($fut:expr) => {{
+                let waited = self.unless_ended(&mut liveness, $fut).await;
+                match waited {
+                    Wait::Done(out) => out,
+                    Wait::Shutdown => return Ok(SessionEnd::Shutdown),
+                    Wait::Ended(end) => return peer_gone(end, &mut frame_rx, reader).await,
+                }
+            }};
+        }
         loop {
-            let Some(frame) = self.unless_ended(&mut liveness, frame_rx.recv()).await? else {
-                return Ok(());
-            };
+            let frame = or_end!(frame_rx.recv());
             let trigger = match frame {
-                Some(Frame::Message(m)) => {
-                    let Some(processed) = self
-                        .unless_ended(
-                            &mut liveness,
-                            self.process_msg(m, peer_id, peer_asn_observed, &mut updates_seen),
-                        )
-                        .await?
-                    else {
-                        return Ok(());
-                    };
-                    let Some(family) = processed? else {
-                        continue;
-                    };
-                    info!(?family, updates_seen, "End-of-RIB received");
-                    end_of_rib.insert(family);
-                    // Every family the session may carry, not merely the
-                    // one that just ended: an InitiationComplete after
-                    // IPv4's End-of-RIB would GC every IPv6 route still to
-                    // come, and the reverse every IPv4 route.
-                    if !end_of_rib.contains_all(families) {
+                Some(Frame::Message(Message {
+                    parsed,
+                    end_of_rib: marker,
+                })) => match parsed {
+                    BgpMessage::Update(update) => {
+                        let carried = or_end!(self.process_update(
+                            update,
+                            peer_id,
+                            peer_asn_observed,
+                            &mut updates_seen
+                        ))?;
+                        for family in carried.iter() {
+                            if !awaited.contains(family) {
+                                awaited.insert(family);
+                                info!(
+                                    ?family,
+                                    "UPDATE carried routes in a family the OPENs did not \
+                                     negotiate; InitiationComplete now waits for its End-of-RIB \
+                                     too"
+                                );
+                            }
+                        }
+                        let Some(family) = marker else {
+                            continue;
+                        };
+                        info!(?family, updates_seen, "End-of-RIB received");
+                        end_of_rib.insert(family);
+                        // Every family the session may carry, not merely
+                        // the one that just ended: an InitiationComplete
+                        // after IPv4's End-of-RIB would GC every IPv6 route
+                        // still to come, and the reverse every IPv4 route.
+                        if !end_of_rib.contains_all(awaited) {
+                            continue;
+                        }
+                        InitTrigger::EndOfRib
+                    }
+                    // Everything the peer sent before it has been applied.
+                    BgpMessage::Notification(n) => {
+                        return peer_notification(&n, Unapplied::default());
+                    }
+                    // The reader re-armed the hold timer when it read this;
+                    // no further work.
+                    BgpMessage::KeepAlive => continue,
+                    BgpMessage::Open(_) => {
+                        // Spurious post-handshake OPEN, bird shouldn't do
+                        // this. Log + ignore.
+                        warn!("unexpected OPEN after handshake");
                         continue;
                     }
-                    InitTrigger::EndOfRib
-                }
+                },
                 // The reader sends Quiet only once it has gone
                 // `quiet_after` without reading an UPDATE and has just
                 // found the socket empty, and Quiet travels behind every
@@ -668,7 +777,10 @@ impl BgpListener {
                     return match (&mut reader.0).await {
                         Ok(Ok(())) => {
                             debug!(updates_seen, "BGP stream done");
-                            Ok(())
+                            Ok(SessionEnd::PeerClosed {
+                                cease: None,
+                                left: Unapplied::default(),
+                            })
                         }
                         Ok(Err(e)) => Err(e),
                         Err(e) => Err(RouteSourceError::recoverable(format!(
@@ -680,35 +792,26 @@ impl BgpListener {
             if init_complete_fired {
                 continue;
             }
-            let Some(fired) = self
-                .unless_ended(
-                    &mut liveness,
-                    self.initiation_complete(trigger, updates_seen),
-                )
-                .await?
-            else {
-                return Ok(());
-            };
-            init_complete_fired = fired;
+            init_complete_fired = or_end!(self.initiation_complete(trigger, updates_seen));
         }
     }
 
-    /// `fut`'s output, unless the session ends first: `Ok(None)` at
-    /// shutdown, `Err` when the [`Liveness`] thread reports the
-    /// connection gone or a KEEPALIVE unsendable. Dropping `fut` there
-    /// is safe for every future this wraps: a route event already sent
-    /// to the programmer is applied regardless, and what the session
-    /// had not sent yet the next one re-sends.
+    /// `fut`'s output, unless the session ends first: at shutdown, or
+    /// when the [`Liveness`] thread reports the connection gone or a
+    /// KEEPALIVE unsendable. Dropping `fut` there is safe for every
+    /// future this wraps: a route event already sent to the programmer
+    /// is applied regardless, and what the session had not sent yet the
+    /// next one re-sends.
     async fn unless_ended<T>(
         &self,
         liveness: &mut Liveness,
         fut: impl Future<Output = T>,
-    ) -> Result<Option<T>, RouteSourceError> {
+    ) -> Wait<T> {
         tokio::select! {
             biased;
-            _ = self.shutdown.cancelled() => Ok(None),
-            end = &mut liveness.ended => Err(liveness_error(end)),
-            out = fut => Ok(Some(out)),
+            _ = self.shutdown.cancelled() => Wait::Shutdown,
+            end = &mut liveness.ended => Wait::Ended(end),
+            out = fut => Wait::Done(out),
         }
     }
 
@@ -744,7 +847,7 @@ impl BgpListener {
         //
         // Safe HERE, unlike the BMP station: both triggers follow an
         // UPDATE through the frame channel (Quiet is sent only after one,
-        // and End-of-RIB is one), so `process_msg` has already accepted
+        // and End-of-RIB is one), so `process_update` has already accepted
         // an UPDATE and raised on the session's first, and the epoch is
         // open. Marking before a raise stamps the epoch that is ending
         // and `set_up` clears it a moment later (review finding, on the
@@ -762,150 +865,122 @@ impl BgpListener {
     /// InitiationComplete, and marked a feed LIVE whose last UPDATE
     /// had been thrown away whole.
     ///
-    /// `Ok(Some(family))` when the message was `family`'s End-of-RIB,
-    /// once it has been accepted like any other UPDATE.
-    async fn process_msg(
+    /// `Ok` with the families the UPDATE carried routes in, once it has
+    /// been accepted.
+    async fn process_update(
         &self,
-        msg: BgpMessage,
+        update: BgpUpdateMessage,
         peer_id: PeerId,
         peer_asn: u32,
         updates_seen: &mut usize,
-    ) -> Result<Option<Family>, RouteSourceError> {
-        match msg {
-            BgpMessage::Open(_) => {
-                // Spurious post-handshake OPEN, bird shouldn't do
-                // this. Log + ignore.
-                warn!("unexpected OPEN after handshake");
-            }
-            BgpMessage::KeepAlive => {
-                // The reader re-armed the hold timer when it read this;
-                // no further work.
-            }
-            BgpMessage::Notification(n) => {
-                // Session-fatal for real, not just in the log line: a
-                // NOTIFICATION ends the session per RFC 4271, and while
-                // bird usually closes the TCP right after (the reader
-                // would see EOF), waiting on the peer's close leaves a
-                // window where the connection quiesces, settles, and
-                // reports a feed live that its peer has already
-                // renounced.
-                return Err(RouteSourceError::recoverable(format!(
-                    "received NOTIFICATION ({:?}); closing session",
-                    n.error
-                )));
-            }
-            BgpMessage::Update(update) => {
-                // Read before Elementor consumes the UPDATE.
-                let end_of_rib = end_of_rib_family(&update);
-                // Pretend the peer-IP for Elementor is the listen
-                // address (bird-side IP isn't carried in BGP UPDATE
-                // we know it from the connection, but Elementor
-                // doesn't need an accurate value, just something
-                // stable for elem.peer_ip). For peer_asn we pass
-                // bird's observed ASN.
-                let peer_ip_for_elems = self.cfg.listen_addr.ip();
-                let peer_asn_for_elems = Asn::from(peer_asn);
-                let elems = Elementor::bgp_update_to_elems(
-                    update,
-                    0.0,
-                    &peer_ip_for_elems,
-                    &peer_asn_for_elems,
-                );
-                let fallback_nh = self.cfg.listen_addr.ip();
-                if elems.len() > MAX_ELEMS_PER_UPDATE {
-                    // Session-fatal: leaving an UPDATE half-applied
-                    // would put the FIB in a torn state across
-                    // peer_id's mirror, and we don't want the next
-                    // attacker-shaped UPDATE to just keep adding to
-                    // the per-message budget. Close, emit Resync,
-                    // let the peer reconnect.
-                    return Err(RouteSourceError::recoverable(format!(
-                        "BGP UPDATE fanned out to {} elems (cap {}); closing session — a \
+    ) -> Result<Families, RouteSourceError> {
+        // Pretend the peer-IP for Elementor is the listen
+        // address (bird-side IP isn't carried in BGP UPDATE
+        // we know it from the connection, but Elementor
+        // doesn't need an accurate value, just something
+        // stable for elem.peer_ip). For peer_asn we pass
+        // bird's observed ASN.
+        let peer_ip_for_elems = self.cfg.listen_addr.ip();
+        let peer_asn_for_elems = Asn::from(peer_asn);
+        let elems =
+            Elementor::bgp_update_to_elems(update, 0.0, &peer_ip_for_elems, &peer_asn_for_elems);
+        let fallback_nh = self.cfg.listen_addr.ip();
+        if elems.len() > MAX_ELEMS_PER_UPDATE {
+            // Session-fatal: leaving an UPDATE half-applied
+            // would put the FIB in a torn state across
+            // peer_id's mirror, and we don't want the next
+            // attacker-shaped UPDATE to just keep adding to
+            // the per-message budget. Close, emit Resync,
+            // let the peer reconnect.
+            return Err(RouteSourceError::recoverable(format!(
+                "BGP UPDATE fanned out to {} elems (cap {}); closing session — a \
                          skipped UPDATE must not leave a session that later settles and \
                          reports a feed live with that UPDATE's prefixes missing",
-                        elems.len(),
-                        MAX_ELEMS_PER_UPDATE
-                    )));
-                }
-                // ACCEPTED — and not one line earlier. Everything below
-                // records this UPDATE as stream evidence, and the cap
-                // above closes the session, so recording it first meant
-                // publishing a feed EPOCH for an UPDATE that never
-                // applied. A runtime sampling that transient raise
-                // during an adopted deferral baselines on it, the next
-                // healthy connection reads as a flap, and the
-                // attestation is gone for good (review finding; the
-                // BMP path had the same ordering).
-                *updates_seen += 1;
-                self.last_update_unix.store(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64,
-                    Ordering::Relaxed,
-                );
-                if *updates_seen == 1 {
-                    // The stream has started; see the handshake note
-                    // for why this — and not post-stream silence — is
-                    // where the session becomes live.
-                    //
-                    // DELIBERATELY UNLIKE `BmpStation`, which withholds
-                    // this raise while a previous stream's routes may
-                    // still sit in the mirror (`stale_state_possible`)
-                    // and waits for InitiationComplete's GC. The
-                    // asymmetry is the point, not an oversight: that
-                    // wait is five seconds of UPDATE silence, and a
-                    // live DFZ feed does not go quiet for five seconds
-                    // — measured on the shadow 2026-08-09, 91 minutes
-                    // of session and zero InitiationComplete firings.
-                    // Porting the guard here would re-create #152 on
-                    // the one path the fleet actually runs, trading a
-                    // narrow staleness window for a reconciliation that
-                    // never happens at all.
-                    //
-                    // What covers the window instead: a reconnect's
-                    // stale credit only reaches the floor door if the
-                    // stream ALSO stalls immediately (a streaming dump
-                    // runs orders of magnitude above the quiet rate),
-                    // and on any deployment with a completeness
-                    // authority the drift a stale mirror shows against
-                    // bird's current count vetoes the release outright.
-                    // Without an authority, the second tier's floor door
-                    // also waits for this session's InitiationComplete
-                    // (its `mark_reconciled`), which this raise resets:
-                    // a feed that reconnects and then stops
-                    // mid-dump holds that door until the GC rather than
-                    // releasing it on stale credit.
-                    if let Some(sess) = &self.cfg.session {
-                        sess.set_up(true);
-                    }
-                }
-                if let Some(sess) = &self.cfg.session {
-                    // Stream activity in ROUTE-ELEMENT units, changed
-                    // or not: a reconnect reannounces an unchanged
-                    // table, the mirror never moves, and the gate
-                    // compares activity against route-scaled quiet
-                    // rates — counting frames instead of the elements
-                    // they fan out to let a batched million-route dump
-                    // read as quiet (review finding). Floored at one
-                    // unit so an empty UPDATE (End-of-RIB shape) still
-                    // counts as stream evidence — one unit against
-                    // route-scaled rates is noise.
-                    sess.pulse_n((elems.len() as u64).max(1));
-                }
-                for elem in elems {
-                    let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
-                        Some(e) => e,
-                        None => continue,
-                    };
-                    if let Err(e) = self.prog_handle.apply_route_event(event).await {
-                        warn!(error = %e, "route event dispatch failed");
-                    }
-                }
-                return Ok(end_of_rib);
+                elems.len(),
+                MAX_ELEMS_PER_UPDATE
+            )));
+        }
+        // ACCEPTED — and not one line earlier. Everything below
+        // records this UPDATE as stream evidence, and the cap
+        // above closes the session, so recording it first meant
+        // publishing a feed EPOCH for an UPDATE that never
+        // applied. A runtime sampling that transient raise
+        // during an adopted deferral baselines on it, the next
+        // healthy connection reads as a flap, and the
+        // attestation is gone for good (review finding; the
+        // BMP path had the same ordering).
+        *updates_seen += 1;
+        self.last_update_unix.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            Ordering::Relaxed,
+        );
+        if *updates_seen == 1 {
+            // The stream has started; see the handshake note
+            // for why this — and not post-stream silence — is
+            // where the session becomes live.
+            //
+            // DELIBERATELY UNLIKE `BmpStation`, which withholds
+            // this raise while a previous stream's routes may
+            // still sit in the mirror (`stale_state_possible`)
+            // and waits for InitiationComplete's GC. The
+            // asymmetry is the point, not an oversight: that
+            // wait is five seconds of UPDATE silence, and a
+            // live DFZ feed does not go quiet for five seconds
+            // — measured on the shadow 2026-08-09, 91 minutes
+            // of session and zero InitiationComplete firings.
+            // Porting the guard here would re-create #152 on
+            // the one path the fleet actually runs, trading a
+            // narrow staleness window for a reconciliation that
+            // never happens at all.
+            //
+            // What covers the window instead: a reconnect's
+            // stale credit only reaches the floor door if the
+            // stream ALSO stalls immediately (a streaming dump
+            // runs orders of magnitude above the quiet rate),
+            // and on any deployment with a completeness
+            // authority the drift a stale mirror shows against
+            // bird's current count vetoes the release outright.
+            // Without an authority, the second tier's floor door
+            // also waits for this session's InitiationComplete
+            // (its `mark_reconciled`), which this raise resets:
+            // a feed that reconnects and then stops
+            // mid-dump holds that door until the GC rather than
+            // releasing it on stale credit.
+            if let Some(sess) = &self.cfg.session {
+                sess.set_up(true);
             }
         }
-        Ok(None)
+        if let Some(sess) = &self.cfg.session {
+            // Stream activity in ROUTE-ELEMENT units, changed
+            // or not: a reconnect reannounces an unchanged
+            // table, the mirror never moves, and the gate
+            // compares activity against route-scaled quiet
+            // rates — counting frames instead of the elements
+            // they fan out to let a batched million-route dump
+            // read as quiet (review finding). Floored at one
+            // unit so an empty UPDATE (End-of-RIB shape) still
+            // counts as stream evidence — one unit against
+            // route-scaled rates is noise.
+            sess.pulse_n((elems.len() as u64).max(1));
+        }
+        let mut carried = Families::default();
+        for elem in elems {
+            carried.insert(match elem.prefix.prefix {
+                ipnet::IpNet::V4(_) => Family::V4,
+                ipnet::IpNet::V6(_) => Family::V6,
+            });
+            let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
+                Some(e) => e,
+                None => continue,
+            };
+            if let Err(e) = self.prog_handle.apply_route_event(event).await {
+                warn!(error = %e, "route event dispatch failed");
+            }
+        }
+        Ok(carried)
     }
 }
 
@@ -922,6 +997,145 @@ impl<T> Drop for SessionTask<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// How a wait in the session loop came out ([`BgpListener::unless_ended`]).
+enum Wait<T> {
+    Done(T),
+    Shutdown,
+    /// The [`Liveness`] thread's report: the session is over.
+    Ended(Result<LivenessEnd, oneshot::error::RecvError>),
+}
+
+/// The session's end once its [`Liveness`] thread has reported, with
+/// what the peer said on its way out if it said anything.
+///
+/// A peer that ends a session sends a NOTIFICATION and then closes
+/// (RFC 4271 §6), so when the close preempts the main loop, the
+/// NOTIFICATION is the last message queued behind whatever the loop had
+/// not applied yet. Everything the peer sent is in our receive queue by
+/// now (TCP delivers a FIN only behind the data before it), so this
+/// reads on through it without applying any of it, bounded by
+/// [`LAST_WORDS`], to report the NOTIFICATION's code. Not finding one is
+/// normal too: FRR writes its NOTIFICATION without blocking (10.1,
+/// `bgp_write_notify`), so one that does not fit a send buffer full of
+/// UPDATEs is never sent, or is cut short.
+async fn peer_gone(
+    end: Result<LivenessEnd, oneshot::error::RecvError>,
+    frames: &mut mpsc::Receiver<Frame>,
+    mut reader: SessionTask<Result<(), RouteSourceError>>,
+) -> Result<SessionEnd, RouteSourceError> {
+    let (how, unread_bytes) = match end {
+        Ok(LivenessEnd::Gone { how, unread }) => (how, unread),
+        Ok(LivenessEnd::Failed { what, error }) => {
+            return Err(RouteSourceError::recoverable(format!("{what}: {error}")))
+        }
+        Err(_) => {
+            return Err(RouteSourceError::recoverable(format!(
+                "the {LIVENESS_THREAD} thread ended without a report"
+            )))
+        }
+    };
+    let mut left = Unapplied {
+        updates: 0,
+        unread_bytes,
+    };
+    let last = tokio::time::timeout(LAST_WORDS, async {
+        while let Some(frame) = frames.recv().await {
+            match frame {
+                Frame::Message(Message {
+                    parsed: BgpMessage::Notification(n),
+                    ..
+                }) => return Ok(Some(n)),
+                Frame::Message(Message {
+                    parsed: BgpMessage::Update(_),
+                    ..
+                }) => left.updates += 1,
+                Frame::Message(_) | Frame::Quiet => {}
+            }
+        }
+        // The reader has stopped: at the end of the stream, or on an
+        // error reading toward it.
+        match (&mut reader.0).await {
+            Ok(Ok(())) => Ok(None),
+            Ok(Err(e)) => Err(e.cause),
+            Err(e) => Err(format!("reader task join: {e}")),
+        }
+    })
+    .await;
+    if let Ok(Ok(Some(n))) = &last {
+        return peer_notification(n, left);
+    }
+    let tail = match last {
+        Ok(Ok(_)) => "the stream ended without a NOTIFICATION".to_string(),
+        Ok(Err(e)) => format!("reading what it sent last failed: {e}"),
+        Err(_) => format!("its last message was not reached within {LAST_WORDS:?}"),
+    };
+    if how == "reset" {
+        return Err(RouteSourceError::recoverable(format!(
+            "the peer reset the connection; {tail}; {} UPDATEs from this session left unapplied \
+             and {} bytes unread here",
+            left.updates, left.unread_bytes
+        )));
+    }
+    info!(
+        unapplied_updates = left.updates,
+        unread_bytes = left.unread_bytes,
+        "the BGP peer closed the connection: {tail}"
+    );
+    Ok(SessionEnd::PeerClosed { cease: None, left })
+}
+
+/// The session's end on the peer's NOTIFICATION `n`, with `left` of its
+/// stream unapplied: a clean end for an administrative Cease
+/// ([`cease_is_administrative`]), the peer's choice, and an error for
+/// anything else, which reports a fault.
+fn peer_notification(
+    n: &BgpNotificationMessage,
+    left: Unapplied,
+) -> Result<SessionEnd, RouteSourceError> {
+    let (code, subcode) = n.error.get_codes();
+    if code == NOTIFICATION_CEASE && cease_is_administrative(subcode) {
+        info!(
+            code,
+            subcode,
+            error = ?n.error,
+            unapplied_updates = left.updates,
+            unread_bytes = left.unread_bytes,
+            "received NOTIFICATION: the BGP peer ended the session"
+        );
+        return Ok(SessionEnd::PeerClosed {
+            cease: Some(subcode),
+            left,
+        });
+    }
+    Err(RouteSourceError::recoverable(format!(
+        "received NOTIFICATION {code}/{subcode} ({:?}); closing session; {} UPDATEs from this \
+         session left unapplied and {} bytes unread here",
+        n.error, left.updates, left.unread_bytes
+    )))
+}
+
+/// Whether a Cease with `subcode` (RFC 4486 §4) ended the session by an
+/// operator's or the protocol's choice rather than for a fault:
+/// Administrative Shutdown (2), Peer De-configured (3), Administrative
+/// Reset (4, FRR's `clear bgp`), Connection Rejected (5), Other
+/// Configuration Change (6) and Connection Collision Resolution (7).
+///
+/// Collision Resolution is the RFC 4271 §6.8 procedure closing the
+/// losing one of two connections between the same speakers, the session
+/// going on over the other: routine, not a fault. It cannot reach this
+/// listener in practice, since we never connect out.
+///
+/// Not administrative: Maximum Number of Prefixes Reached (1) and Out of
+/// Resources (8) report a fault, after which the peer typically keeps
+/// tearing the session down or stays away, so they must reach
+/// warning-level monitoring, as must BFD Down (10, IANA), a failed path.
+/// So does every other subcode: 0 is reserved, RFC 8538's Hard Reset (9)
+/// is sent only to a peer that negotiated the N bit, which we do not,
+/// and an unknown one says nothing we could call clean.
+fn cease_is_administrative(subcode: u8) -> bool {
+    matches!(subcode, 2..=7)
 }
 
 // --- Session liveness, off the runtime ---------------------------------------
@@ -945,7 +1159,21 @@ impl<T> Drop for SessionTask<T> {
 /// **Why it also watches for a close.** `poll` reports the peer's FIN or
 /// reset the moment it arrives, while the reader learns of it only after
 /// reading everything queued ahead of it, which behind a slow programmer
-/// took minutes on 2026-10-12. The report ends the session.
+/// took minutes on 2026-10-12. The report ends the session ([`peer_gone`]).
+///
+/// What that saves is bounded by our own buffering, because a FIN is
+/// not sent ahead of data. A reset is, and is seen at once. A FIN goes
+/// out behind everything still in the peer's socket send buffer, and
+/// that data moves only as fast as our reads reopen our receive window,
+/// so behind a full pipe the FIN reaches us only once we have read
+/// nearly a send buffer's worth more of the abandoned stream. Measured
+/// on loopback with a 64K `SO_SNDBUF` at the peer: `POLLRDHUP` came after
+/// reading 195K of the 271K queued. What the session then skips is what
+/// is queued at our end at that moment: up to [`FRAME_CHANNEL_CAPACITY`]
+/// framed messages and about one receive buffer. FRR wipes its own
+/// output queue before it sends a NOTIFICATION (10.1,
+/// `bgp_notify_send_internal`), so its kernel send buffer is all that
+/// stands ahead of the FIN.
 ///
 /// The thread works on its own descriptor for the socket (a `dup`), so
 /// it keeps the connection open while it runs. Dropping this shuts the
@@ -995,18 +1223,6 @@ impl Drop for Liveness {
         // descriptor, and leaves both valid for the thread's last `poll`.
         unsafe { libc::shutdown(self.sock.as_raw_fd(), libc::SHUT_RDWR) };
     }
-}
-
-/// The session-ending error a [`Liveness`] report stands for.
-fn liveness_error(end: Result<LivenessEnd, oneshot::error::RecvError>) -> RouteSourceError {
-    RouteSourceError::recoverable(match end {
-        Ok(LivenessEnd::Gone { how, unread }) => format!(
-            "the peer {how} the connection with {unread} bytes still unread here; nothing more \
-             from this session is applied"
-        ),
-        Ok(LivenessEnd::Failed { what, error }) => format!("{what}: {error}"),
-        Err(_) => format!("the {LIVENESS_THREAD} thread ended without a report"),
-    })
 }
 
 /// Send a KEEPALIVE every `period` on `fd` until the connection goes
@@ -1089,8 +1305,9 @@ fn send_all(fd: RawFd, buf: &[u8]) -> Option<LivenessEnd> {
 /// it is still up when the wait ends or a signal cuts it short.
 ///
 /// `POLLRDHUP` is the peer's FIN, reported as soon as it arrives
-/// however much data precedes it unread; `POLLHUP` and `POLLERR` come
-/// with a reset or our own `shutdown`. Data arriving does not wake it.
+/// however much data precedes it unread (it arrives only behind that
+/// data; see [`Liveness`]); `POLLHUP` and `POLLERR` come with a reset or
+/// our own `shutdown`. Data arriving does not wake it.
 fn hung_up(fd: RawFd, timeout: Duration) -> std::io::Result<Option<&'static str>> {
     let mut p = libc::pollfd {
         fd,
@@ -1136,9 +1353,17 @@ fn gone(fd: RawFd, how: &'static str) -> LivenessEnd {
     }
 }
 
+/// One message as read off the wire.
+struct Message {
+    parsed: BgpMessage,
+    /// The family this message is the End-of-RIB marker of, judged on
+    /// its bytes ([`end_of_rib_marker`]), not on `parsed`.
+    end_of_rib: Option<Family>,
+}
+
 /// What the reader hands the main loop, in the order it happened.
 enum Frame {
-    Message(BgpMessage),
+    Message(Message),
     /// No UPDATE read for the session's quiet window, judged on an
     /// empty socket; see `reader_task`. Behind every UPDATE read before
     /// it, so the main loop applies InitiationComplete only after them.
@@ -1279,7 +1504,7 @@ where
             }
         };
         messages_parsed += 1;
-        if matches!(msg, BgpMessage::Update(_)) {
+        if matches!(msg.parsed, BgpMessage::Update(_)) {
             quiet_at = Some(tokio::time::Instant::now() + quiet_after);
         }
         if tx.send(Frame::Message(msg)).await.is_err() {
@@ -1302,7 +1527,7 @@ where
 /// `add_path = false` (negotiation cannot have completed yet);
 /// post-OPEN messages use the value computed by
 /// [`walk_open_capabilities`].
-async fn read_one_message<R>(stream: &mut R, add_path: bool) -> std::io::Result<BgpMessage>
+async fn read_one_message<R>(stream: &mut R, add_path: bool) -> std::io::Result<Message>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -1335,8 +1560,13 @@ where
     // requests to us anyway since we don't advertise the capability.
     if msg_type == MSG_TYPE_ROUTE_REFRESH {
         debug!("ignoring ROUTE-REFRESH");
-        return Ok(BgpMessage::KeepAlive); // benign placeholder; resets hold
+        // Benign placeholder; resets hold.
+        return Ok(Message {
+            parsed: BgpMessage::KeepAlive,
+            end_of_rib: None,
+        });
     }
+    let end_of_rib = end_of_rib_marker(msg_type, &body);
 
     // Reconstruct full frame for parse_bgp_message.
     let mut full = BytesMut::with_capacity(length);
@@ -1344,8 +1574,9 @@ where
     full.extend_from_slice(&body);
     let mut bytes: Bytes = full.freeze();
 
-    parse_bgp_message(&mut bytes, add_path, &AsnLength::Bits32)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))
+    let parsed = parse_bgp_message(&mut bytes, add_path, &AsnLength::Bits32)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
+    Ok(Message { parsed, end_of_rib })
 }
 
 fn is_clean_eof(e: &std::io::Error) -> bool {
@@ -1392,6 +1623,22 @@ fn open_capabilities(local_as: u32) -> Vec<u8> {
     // restarting nor RFC 8538's N bit), Restart Time in the low 12 bits,
     // and no <AFI, SAFI> tuples, which §3 defines as "cannot preserve
     // forwarding state, supports the Receiving Speaker procedures".
+    //
+    // Of the receiving speaker's procedures (§4.2) we perform one: the
+    // sweep of stale routes at the peer's End-of-RIB, which is
+    // InitiationComplete's GC. Two we do not. §4.2 keeps a lost
+    // session's routes only for the families the peer's capability
+    // listed with forwarding preserved (FRR's helper mode lists none),
+    // deletes them when its Restart Time passes, and purges a family
+    // whose F bit is clear when the peer returns. We keep every route
+    // until the next session's GC instead, however long that takes and
+    // whatever the peer's capability said. Deliberately: these routes
+    // feed only our own data plane and are never passed to another
+    // speaker, and this is how the listener has always handled a
+    // session loss (a Resync marks them, InitiationComplete GCs what the
+    // next session did not re-send; the route ledger reconciles a
+    // daemon restart the same way). Following §4.2 would empty the
+    // PacketFrame FIB for the whole of every FRR reload.
     caps.extend_from_slice(&[64, 2]);
     caps.extend_from_slice(&(GR_RESTART_TIME & 0x0fff).to_be_bytes());
     caps
@@ -1470,24 +1717,54 @@ fn encode_end_of_rib(family: Family) -> Vec<u8> {
     out
 }
 
-/// The unicast family an End-of-RIB marker closes, or `None` for any
-/// other UPDATE (including another family's End-of-RIB). Both of RFC
-/// 4724 §2's IPv4 forms count: the empty UPDATE, and an MP_UNREACH_NLRI
-/// for IPv4 unicast with no NLRI.
-fn end_of_rib_family(update: &BgpUpdateMessage) -> Option<Family> {
-    if !update.is_end_of_rib() {
+/// The unicast family whose End-of-RIB marker (RFC 4724 §2) a message
+/// of type `msg_type` with `body` (everything after the 19-byte header)
+/// is, or `None` for any other message, another family's End-of-RIB
+/// included. IPv4's marker is an UPDATE of exactly 23 bytes: no
+/// withdrawn routes, no attributes, no NLRI. Any family's, IPv4's other
+/// form among them, is an UPDATE with no withdrawn routes and no NLRI
+/// whose only attribute is an MP_UNREACH_NLRI holding just that AFI and
+/// SAFI. The attribute's length may come in either encoding (RFC 4271
+/// §4.3's Extended Length bit); its other flags do not change what it
+/// says, so they are not checked.
+///
+/// Judged on the bytes, not on bgpkit's parse, because that parse drops
+/// an attribute it fails to decode and keeps only a validation warning
+/// (0.17, `parse_attributes`), and skips a one-byte NLRI field. An
+/// UPDATE carrying only an IPv6 withdrawal it could not decode (from an
+/// ADD-PATH negotiation the peer reads differently, for one) then reads
+/// as empty, which `is_end_of_rib` calls IPv4's End-of-RIB: with IPv6's
+/// already in, InitiationComplete's GC ran in the middle of the IPv4
+/// dump. Refusing End-of-RIB whenever the parse warned was the other
+/// way to close that, and it is weaker: an attribute whose length runs
+/// past the attribute section ends the parse with no warning at all
+/// (the attributes before it are returned as the whole set), and a stray
+/// flag warning on a real marker would cost the 300 s backstop. The
+/// bytes say exactly what RFC 4724 defines, whatever the parser does.
+fn end_of_rib_marker(msg_type: u8, body: &[u8]) -> Option<Family> {
+    const MP_UNREACH_NLRI: u8 = 15;
+    const EXTENDED_LENGTH: u8 = 0x10;
+    if msg_type != MSG_TYPE_UPDATE {
         return None;
     }
-    // `is_end_of_rib` admits no attributes, or exactly one empty
-    // MP_UNREACH_NLRI.
-    match update.attributes.iter().next() {
-        None => Some(Family::V4),
-        Some(AttributeValue::MpUnreachNlri(nlri)) if nlri.safi == Safi::Unicast => match nlri.afi {
-            Afi::Ipv4 => Some(Family::V4),
-            Afi::Ipv6 => Some(Family::V6),
-            _ => None,
-        },
-        Some(_) => None,
+    let (afi_safi, attrs_len) = match *body {
+        [0, 0, 0, 0] => return Some(Family::V4),
+        [0, 0, a, b, flags, MP_UNREACH_NLRI, 3, x, y, z] if flags & EXTENDED_LENGTH == 0 => {
+            ([x, y, z], u16::from_be_bytes([a, b]))
+        }
+        [0, 0, a, b, flags, MP_UNREACH_NLRI, 0, 3, x, y, z] if flags & EXTENDED_LENGTH != 0 => {
+            ([x, y, z], u16::from_be_bytes([a, b]))
+        }
+        _ => return None,
+    };
+    // The attribute section ends where the message does: no NLRI.
+    if attrs_len as usize != body.len() - 4 {
+        return None;
+    }
+    match afi_safi {
+        [0, 1, 1] => Some(Family::V4),
+        [0, 2, 1] => Some(Family::V6),
+        _ => None,
     }
 }
 
@@ -1510,6 +1787,13 @@ impl Families {
         match family {
             Family::V4 => self.v4 = true,
             Family::V6 => self.v6 = true,
+        }
+    }
+
+    fn contains(self, family: Family) -> bool {
+        match family {
+            Family::V4 => self.v4,
+            Family::V6 => self.v6,
         }
     }
 
@@ -1550,8 +1834,12 @@ struct NegotiatedCapabilities {
     /// restart peer and marks the end of each family's table with
     /// End-of-RIB, so silence is only the backstop for it.
     graceful_restart: bool,
-    /// Peer advertised Multiprotocol Extensions (RFC 4760) for IPv6
-    /// unicast. See [`Self::unicast_families`].
+    /// Peer advertised Multiprotocol Extensions (RFC 4760), for any
+    /// family. See [`Self::families`].
+    multiprotocol: bool,
+    /// Peer advertised Multiprotocol Extensions for IPv4 unicast.
+    mp_v4_unicast: bool,
+    /// Peer advertised Multiprotocol Extensions for IPv6 unicast.
     mp_v6_unicast: bool,
 }
 
@@ -1568,19 +1856,42 @@ impl NegotiatedCapabilities {
         self.add_path_v4_recv && self.add_path_v6_recv
     }
 
-    /// The unicast families the session may carry, and so the ones we
-    /// send End-of-RIB for and wait for one in. IPv6 when the peer
-    /// advertised Multiprotocol Extensions for it (we advertise both).
-    /// IPv4 always: BGP-4's own NLRI carries it with no capability at
-    /// all, and RFC 4760 §8 does not settle whether a peer that
-    /// advertised other families still uses that encoding with us.
-    /// Leaving IPv4 out when the peer does would let another family's
-    /// End-of-RIB fire InitiationComplete mid-replay and GC every IPv4
-    /// route not yet re-sent, the failure End-of-RIB exists to prevent;
-    /// waiting for an IPv4 End-of-RIB that never comes costs only the
-    /// silence backstop. Ours, an empty UPDATE, is a message every BGP-4
-    /// speaker parses.
-    fn unicast_families(&self) -> Families {
+    /// The unicast families the OPENs negotiated, which InitiationComplete
+    /// starts out waiting for End-of-RIB in. We advertise Multiprotocol
+    /// Extensions for both, so this is the peer's own list (RFC 4760 §8:
+    /// each side must advertise a family for the two to exchange it),
+    /// read the way FRR reads ours (10.1, `bgp_open_receive`): a peer
+    /// that advertised no Multiprotocol capability at all speaks plain
+    /// BGP-4, which is IPv4 unicast, and one that advertised any carries
+    /// exactly the families it listed. So IPv4 is out for a peer that
+    /// listed IPv6 alone.
+    ///
+    /// IPv4 was always in until a review of #360: a peer whose list left
+    /// IPv4 out could still send it in BGP-4's own encoding, and an
+    /// InitiationComplete at its IPv6 End-of-RIB would GC every IPv4
+    /// route not yet re-sent. But a session that waits for an End-of-RIB
+    /// in a family it does not carry reconciles only on 300 s of silence,
+    /// which a live feed never gives, and vpp-offload's unattested
+    /// release waits on that reconciliation (#361), so an IPv6-only feed
+    /// held it for good. The case it guarded is covered where it can
+    /// actually arise: an UPDATE that carries routes in a family not
+    /// listed here adds that family to what the session waits for
+    /// (`handle_connection`).
+    fn families(&self) -> Families {
+        Families {
+            v4: self.mp_v4_unicast || !self.multiprotocol,
+            v6: self.mp_v6_unicast,
+        }
+    }
+
+    /// The families we send our End-of-RIB in: IPv4 always, and IPv6
+    /// when negotiated. IPv4's is an empty UPDATE, which every BGP-4
+    /// speaker parses and FRR ignores for a family it has not enabled
+    /// (10.1, `bgp_update_receive`), so it costs nothing where IPv4 is
+    /// not carried, and a peer that uses IPv4 without having listed it
+    /// (FRR's `override-capability`) still gets the End-of-RIB it waits
+    /// for as a restarting speaker.
+    fn end_of_rib_to_send(&self) -> Families {
         Families {
             v4: true,
             v6: self.mp_v6_unicast,
@@ -1636,8 +1947,11 @@ fn walk_open_capabilities(
                     caps.four_octet_asn = Some(foa.asn);
                 }
                 CapabilityValue::MultiprotocolExtensions(mp) => {
-                    if (mp.afi, mp.safi) == (Afi::Ipv6, Safi::Unicast) {
-                        caps.mp_v6_unicast = true;
+                    caps.multiprotocol = true;
+                    match (mp.afi, mp.safi) {
+                        (Afi::Ipv4, Safi::Unicast) => caps.mp_v4_unicast = true,
+                        (Afi::Ipv6, Safi::Unicast) => caps.mp_v6_unicast = true,
+                        _ => {}
                     }
                 }
                 CapabilityValue::GracefulRestart(_) => caps.graceful_restart = true,
@@ -2375,9 +2689,9 @@ mod tests {
     }
 
     impl PeerCaps {
-        /// The families the session carries with this peer: IPv4 always,
-        /// see [`NegotiatedCapabilities::unicast_families`].
-        fn session_families(self) -> Families {
+        /// The families we send this peer End-of-RIB in: IPv4 always,
+        /// see [`NegotiatedCapabilities::end_of_rib_to_send`].
+        fn end_of_rib_we_send(self) -> Families {
             Families {
                 v4: true,
                 v6: self.families.v6,
@@ -2392,7 +2706,8 @@ mod tests {
         families: BOTH,
     };
 
-    /// FRR with `bgp graceful-restart`.
+    /// FRR as it comes: its default helper mode advertises Graceful
+    /// Restart.
     const GR_PEER: PeerCaps = PeerCaps {
         graceful_restart: true,
         families: BOTH,
@@ -2455,18 +2770,15 @@ mod tests {
         Ok(read_message(rd).await?[18])
     }
 
-    /// The family `msg` is the End-of-RIB of, if it is one.
+    /// The family `msg`, a whole message, is the End-of-RIB of, if it is
+    /// one.
     fn end_of_rib_in(msg: &[u8]) -> Option<Family> {
-        let mut b = Bytes::copy_from_slice(msg);
-        match parse_bgp_message(&mut b, false, &AsnLength::Bits32).expect("parse") {
-            BgpMessage::Update(u) => end_of_rib_family(&u),
-            _ => None,
-        }
+        end_of_rib_marker(msg[18], &msg[BGP_HEADER_LEN..])
     }
 
     type Established = (
         TcpStream,
-        JoinHandle<Result<(), RouteSourceError>>,
+        JoinHandle<Result<SessionEnd, RouteSourceError>>,
         CancellationToken,
     );
 
@@ -2525,12 +2837,12 @@ mod tests {
             MSG_TYPE_KEEPALIVE,
             "the OPEN-confirming KEEPALIVE comes first"
         );
-        for family in setup.peer.session_families().iter() {
+        for family in setup.peer.end_of_rib_we_send().iter() {
             let msg = read_message(&mut peer).await.expect("End-of-RIB");
             assert_eq!(
                 end_of_rib_in(&msg),
                 Some(family),
-                "then our End-of-RIB for each family the session carries"
+                "then our End-of-RIB for IPv4, and for IPv6 when negotiated"
             );
         }
         (peer, session, shutdown)
@@ -3153,19 +3465,28 @@ mod tests {
 
     // --- Peer close and the accept queue (2026-10-12) ----------------
 
-    /// FRR renounced the session at 17:48:50 (NOTIFICATION, then close),
-    /// and the session went on applying the UPDATEs queued ahead of the
-    /// close until 17:53:14, while FRR's reconnects waited in the accept
-    /// queue. A peer's close ends the session at once, backlog or not.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_peer_that_closes_ends_the_session_without_draining_its_backlog() {
+    /// A NOTIFICATION, `code`/`subcode` with no data.
+    fn notification(code: u8, subcode: u8) -> Vec<u8> {
+        let mut msg = BGP_MARKER.to_vec();
+        msg.extend_from_slice(&21u16.to_be_bytes());
+        msg.extend_from_slice(&[MSG_TYPE_NOTIFICATION, code, subcode]);
+        msg
+    }
+
+    /// A session stalled on its first UPDATE with `FLOOD - 1` more
+    /// queued behind it, then `last` (if any) and the peer's close: how
+    /// the session ended, within 3 s or the test fails.
+    async fn closed_behind_a_backlog(
+        last: Option<Vec<u8>>,
+    ) -> Result<SessionEnd, RouteSourceError> {
         // The stalled apply, a full channel and one in the reader's
         // hands, with as many again left in the socket buffer.
         const FLOOD: usize = 2 * FRAME_CHANNEL_CAPACITY;
         let (prog, log, gate) = gated_recording_handle();
         let (mut peer, session, _shutdown) = establish(prog).await;
 
-        let flood: Vec<u8> = (0..FLOOD).flat_map(|_| test_update()).collect();
+        let mut flood: Vec<u8> = (0..FLOOD).flat_map(|_| test_update()).collect();
+        flood.extend(last.unwrap_or_default());
         tokio::time::timeout(Duration::from_secs(5), peer.write_all(&flood))
             .await
             .expect("premise: the flood fits in the socket buffers")
@@ -3182,13 +3503,171 @@ mod tests {
             .await
             .expect("a peer's close must end the session while its backlog is still queued")
             .expect("join");
-        let err = ended.expect_err("a peer's close mid-stream is a session loss");
+        assert_eq!(gate.arrived(), 1, "premise: the programmer stayed stalled");
         assert!(
-            err.cause.contains("the peer") && err.cause.contains("the connection"),
+            log.is_empty(),
+            "nothing queued behind the stall was applied"
+        );
+        ended
+    }
+
+    /// FRR renounced the session at 17:48:50 (NOTIFICATION, then close),
+    /// and the session went on applying the UPDATEs queued ahead of the
+    /// close until 17:53:14, while FRR's reconnects waited in the accept
+    /// queue. Once the peer's close reaches us the session ends, with
+    /// what is queued here unapplied, and a close is the peer's to make:
+    /// a clean end.
+    ///
+    /// What this shows and what it does not. The flood is 512 small
+    /// UPDATEs, about 21 KB, which fits in the socket buffers between the
+    /// two ends, so the FIN reaches us as soon as the peer sends it and
+    /// the end follows at once. It does not show a FIN sent behind a peer
+    /// send buffer still full of UPDATEs, as on 2026-10-12: TCP delivers
+    /// that FIN only once our reads have made room for the data ahead of
+    /// it, so the session applies about a send buffer's worth more before
+    /// it can see the close (see `Liveness`). That is the kernel's flow
+    /// control, which nothing here changes, so a test of it would pin
+    /// loopback's buffer sizes rather than this code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_that_closes_ends_the_session_without_draining_its_backlog() {
+        let ended = closed_behind_a_backlog(None).await;
+        let left = match ended {
+            Ok(SessionEnd::PeerClosed { cease: None, left }) => left,
+            other => panic!("a peer's close is a clean end, with no Cease: {other:?}"),
+        };
+        assert_eq!(
+            left.updates,
+            2 * FRAME_CHANNEL_CAPACITY - 1,
+            "every UPDATE behind the stalled one is counted as left unapplied"
+        );
+    }
+
+    /// The NOTIFICATION that says why the peer ended a session comes last
+    /// in its stream, behind whatever we had not applied, and the close
+    /// that preempts the main loop must not lose it (it did after #360,
+    /// which logged every such end as an unexplained close). An error code
+    /// comes back as the session's error, naming it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_notification_behind_a_backlog_still_says_why_the_session_ended() {
+        // Hold Timer Expired: what FRR sent on 2026-10-12.
+        let ended = closed_behind_a_backlog(Some(notification(4, 0))).await;
+        let err = ended.expect_err("a NOTIFICATION other than Cease reports a fault");
+        assert!(err.cause.contains("NOTIFICATION 4/0"), "{err}");
+        assert!(
+            err.cause.contains(&format!(
+                "{} UPDATEs from this session left unapplied",
+                2 * FRAME_CHANNEL_CAPACITY - 1
+            )),
             "{err}"
         );
-        assert_eq!(gate.arrived(), 1, "premise: the programmer stayed stalled");
-        assert!(log.is_empty(), "premise: nothing was applied");
+    }
+
+    /// And a Cease behind a backlog is a clean end that names its subcode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cease_behind_a_backlog_is_a_clean_end() {
+        // Administrative Reset: FRR's `clear bgp`.
+        let ended = closed_behind_a_backlog(Some(notification(NOTIFICATION_CEASE, 4))).await;
+        assert!(
+            matches!(ended, Ok(SessionEnd::PeerClosed { cease: Some(4), .. })),
+            "{ended:?}"
+        );
+    }
+
+    /// A session that has caught up (its one UPDATE applied), then `msg`
+    /// and the peer's close: how the session ended, within 3 s or the test
+    /// fails, once it is checked nothing more was applied.
+    async fn closed_when_caught_up(msg: Vec<u8>) -> Result<SessionEnd, RouteSourceError> {
+        let (prog, log) = recording_handle();
+        let (mut peer, session, _shutdown) = establish(prog).await;
+        peer.write_all(&test_update()).await.expect("UPDATE");
+        wait_until("the UPDATE is applied", Duration::from_secs(5), || {
+            log.len() == 1
+        })
+        .await;
+        peer.write_all(&msg).await.expect("NOTIFICATION");
+        drop(peer);
+        let ended = tokio::time::timeout(Duration::from_secs(3), session)
+            .await
+            .expect("a NOTIFICATION and a close end the session")
+            .expect("join");
+        assert_eq!(log.len(), 1, "nothing else was applied");
+        ended
+    }
+
+    /// `clear bgp` on FRR from a session that has caught up: a Cease
+    /// (Administrative Reset), then the close. That is the peer's choice,
+    /// not a fault, so the session ends cleanly and says which Cease,
+    /// whichever reaches the main loop first, the NOTIFICATION or the
+    /// close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cease_ends_a_caught_up_session_cleanly() {
+        match closed_when_caught_up(notification(NOTIFICATION_CEASE, 4)).await {
+            Ok(SessionEnd::PeerClosed {
+                cease: Some(4),
+                left,
+            }) => assert_eq!(left.updates, 0, "nothing was left to apply"),
+            other => panic!("a Cease is a clean end that names its subcode: {other:?}"),
+        }
+    }
+
+    /// A Cease that reports a fault is not a clean end. Maximum Number of
+    /// Prefixes Reached (6/1), the peer's prefix limit tripping, comes
+    /// back as the session's error, so warning-level monitoring sees it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_maximum_prefixes_cease_is_a_session_error() {
+        let ended = closed_when_caught_up(notification(NOTIFICATION_CEASE, 1)).await;
+        let err = ended.expect_err("Cease/1 reports a fault");
+        assert!(err.cause.contains("NOTIFICATION 6/1"), "{err}");
+    }
+
+    /// The same for Out of Resources (6/8), read from behind a backlog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_out_of_resources_cease_behind_a_backlog_is_a_session_error() {
+        let ended = closed_behind_a_backlog(Some(notification(NOTIFICATION_CEASE, 8))).await;
+        let err = ended.expect_err("Cease/8 reports a fault");
+        assert!(err.cause.contains("NOTIFICATION 6/8"), "{err}");
+    }
+
+    /// Which NOTIFICATIONs end a session cleanly: the administrative and
+    /// configuration Ceases, 2 to 7, and nothing else.
+    #[test]
+    fn only_an_administrative_cease_is_a_clean_end() {
+        use bgpkit_parser::models::BgpError;
+        let left = Unapplied {
+            updates: 3,
+            unread_bytes: 99,
+        };
+        let notified = |code, subcode| {
+            peer_notification(
+                &BgpNotificationMessage {
+                    error: BgpError::new(code, subcode),
+                    data: Vec::new(),
+                },
+                left,
+            )
+        };
+        for subcode in 2..=7 {
+            assert_eq!(
+                notified(NOTIFICATION_CEASE, subcode).ok(),
+                Some(SessionEnd::PeerClosed {
+                    cease: Some(subcode),
+                    left
+                }),
+                "Cease/{subcode} is administrative"
+            );
+        }
+        // Faults (1 Maximum Number of Prefixes Reached, 8 Out of
+        // Resources, 10 BFD Down), the reserved 0, Hard Reset, which we
+        // never negotiate, and subcodes nobody has assigned.
+        for subcode in [0, 1, 8, 9, 10, 11, 255] {
+            let err = notified(NOTIFICATION_CEASE, subcode)
+                .expect_err(&format!("Cease/{subcode} is not a clean end"));
+            assert!(
+                err.cause.contains(&format!("NOTIFICATION 6/{subcode}")),
+                "{err}"
+            );
+        }
+        assert!(notified(4, 0).is_err(), "Hold Timer Expired");
     }
 
     /// Whether the peer's end of a connection closes without our having
@@ -3272,6 +3751,66 @@ mod tests {
             "no session ran on the abandoned connection, so no Resync: {:?}",
             log.events()
         );
+        shutdown.cancel();
+        serving.await.expect("join").expect("serve");
+    }
+
+    /// The peer's live connection must not lose to a newer one queued
+    /// behind it from outside the `peer-from` ACL: that one is refused as
+    /// it is found, and the peer's is served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_serves_the_peer_over_a_newer_connection_from_outside_the_acl() {
+        let (prog, log) = recording_handle();
+        let (lst, mut listener, addr) = unserved(prog).await;
+        listener.cfg.peer_acl = vec!["127.0.0.1/32".parse().expect("ACL")];
+        let shutdown = listener.shutdown.clone();
+        let mut peer = TcpStream::connect(addr).await.expect("connect");
+        peer.write_all(&peer_open(GR_PEER)).await.expect("OPEN");
+        let outsider = TcpSocket::new_v4().expect("socket");
+        outsider
+            .bind("127.0.0.2:0".parse().expect("addr"))
+            .expect("bind");
+        let mut outsider = outsider.connect(addr).await.expect("connect");
+        outsider.write_all(&peer_open(GR_PEER)).await.expect("OPEN");
+
+        let serving = tokio::spawn(listener.serve(lst));
+        let first = tokio::time::timeout(Duration::from_secs(5), read_type(&mut peer))
+            .await
+            .expect("the peer's connection must be served")
+            .expect("OPEN");
+        assert_eq!(first, MSG_TYPE_OPEN);
+        assert!(
+            ends_unanswered(&mut outsider).await,
+            "a connection from outside the ACL must be closed without our OPEN"
+        );
+        assert!(log.is_empty(), "{:?}", log.events());
+        shutdown.cancel();
+        serving.await.expect("join").expect("serve");
+    }
+
+    /// Nor to a newer one its own client has already closed, as a port
+    /// probe does: after #360 the probe won the queue, the peer's live
+    /// connection was closed in its favour, and then the probe was found
+    /// dead too, leaving nothing served. A connection is now judged
+    /// before it can displace another.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_serves_the_peer_over_a_newer_connection_already_closed() {
+        let (prog, log) = recording_handle();
+        let (lst, listener, addr) = unserved(prog).await;
+        let shutdown = listener.shutdown.clone();
+        let mut peer = TcpStream::connect(addr).await.expect("connect");
+        peer.write_all(&peer_open(GR_PEER)).await.expect("OPEN");
+        let probe = TcpStream::connect(addr).await.expect("connect");
+        drop(probe);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let serving = tokio::spawn(listener.serve(lst));
+        let first = tokio::time::timeout(Duration::from_secs(5), read_type(&mut peer))
+            .await
+            .expect("the peer's connection must be served")
+            .expect("the peer's connection was closed, not served");
+        assert_eq!(first, MSG_TYPE_OPEN);
+        assert!(log.is_empty(), "{:?}", log.events());
         shutdown.cancel();
         serving.await.expect("join").expect("serve");
     }
@@ -3391,9 +3930,9 @@ mod tests {
             .expect("shutdown ends a session cleanly");
     }
 
-    /// A peer without Multiprotocol Extensions speaks IPv4 unicast only:
-    /// one End-of-RIB each way (`establish` checks ours), and IPv4's
-    /// alone completes the table.
+    /// A peer without Multiprotocol Extensions speaks plain BGP-4, IPv4
+    /// unicast in BGP-4's own encoding: one End-of-RIB each way
+    /// (`establish` checks ours), and IPv4's alone completes the table.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ipv4_only_peer_trades_one_end_of_rib() {
         let (prog, log) = recording_handle();
@@ -3468,7 +4007,53 @@ mod tests {
         assert_eq!(gr.restart_time, GR_RESTART_TIME);
         let caps = walk_open_capabilities(&open.opt_params);
         assert!(caps.graceful_restart);
-        assert_eq!(caps.unicast_families(), BOTH);
+        assert_eq!(caps.families(), BOTH);
+    }
+
+    /// An End-of-RIB marker in the given encoding of its attribute length.
+    fn mp_end_of_rib(afi: u8, extended_length: bool) -> Vec<u8> {
+        let attr: &[u8] = if extended_length {
+            &[0x90, 15, 0, 3, 0, afi, 1]
+        } else {
+            &[0x80, 15, 3, 0, afi, 1]
+        };
+        update_with(&[0, 0], attr, &[])
+    }
+
+    /// An UPDATE with `withdrawn` (its length field included), the path
+    /// attributes `attrs`, and the NLRI `nlri`.
+    fn update_with(withdrawn: &[u8], attrs: &[u8], nlri: &[u8]) -> Vec<u8> {
+        let len = BGP_HEADER_LEN + withdrawn.len() + 2 + attrs.len() + nlri.len();
+        let mut msg = BGP_MARKER.to_vec();
+        msg.extend_from_slice(&(len as u16).to_be_bytes());
+        msg.push(MSG_TYPE_UPDATE);
+        msg.extend_from_slice(withdrawn);
+        msg.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        msg.extend_from_slice(attrs);
+        msg.extend_from_slice(nlri);
+        msg
+    }
+
+    /// An UPDATE whose only content is an IPv6 withdrawal bgpkit cannot
+    /// decode (a /200), as a withdrawal read with the wrong ADD-PATH
+    /// framing can be.
+    fn undecodable_ipv6_withdrawal() -> Vec<u8> {
+        update_with(&[0, 0], &[0x80, 15, 4, 0, 2, 1, 200], &[])
+    }
+
+    /// A one-prefix IPv6 UPDATE: 2001:db8::/32 via 2001:db8::1.
+    fn ipv6_update() -> Vec<u8> {
+        #[rustfmt::skip]
+        let mp_reach: [u8; 29] = [
+            0x80, 14, 26,                       // MP_REACH_NLRI
+            0x00, 0x02, 0x01,                   // AFI 2, SAFI 1
+            16, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+            0,                                  // reserved
+            32, 0x20, 0x01, 0x0d, 0xb8,         // NLRI 2001:db8::/32
+        ];
+        let mut attrs = vec![0x40, 1, 1, 0, 0x40, 2, 0]; // ORIGIN IGP, empty AS_PATH
+        attrs.extend_from_slice(&mp_reach);
+        update_with(&[0, 0], &attrs, &[])
     }
 
     #[test]
@@ -3476,41 +4061,216 @@ mod tests {
         for family in [Family::V4, Family::V6] {
             let bytes = encode_end_of_rib(family);
             assert_eq!(end_of_rib_in(&bytes), Some(family));
-            // The marker carries no NLRI, so ADD-PATH decoding agrees.
-            let mut b = Bytes::copy_from_slice(&bytes);
-            match parse_bgp_message(&mut b, true, &AsnLength::Bits32).expect("parse") {
-                BgpMessage::Update(u) => assert_eq!(end_of_rib_family(&u), Some(family)),
-                other => panic!("expected UPDATE, got {:?}", other.msg_type()),
+            // The marker carries no NLRI, so it is a valid UPDATE with
+            // ADD-PATH decoding too.
+            for add_path in [false, true] {
+                let mut b = Bytes::copy_from_slice(&bytes);
+                match parse_bgp_message(&mut b, add_path, &AsnLength::Bits32).expect("parse") {
+                    BgpMessage::Update(u) => assert!(u.is_end_of_rib()),
+                    other => panic!("expected UPDATE, got {:?}", other.msg_type()),
+                }
             }
         }
-        // IPv4's other form: an empty MP_UNREACH_NLRI for AFI 1.
-        let mut mp_v4 = encode_end_of_rib(Family::V6);
-        mp_v4[BGP_HEADER_LEN + 8] = 0x01;
-        assert_eq!(end_of_rib_in(&mp_v4), Some(Family::V4));
+        // IPv4's other form, and each form with the attribute's length in
+        // two bytes.
+        for extended_length in [false, true] {
+            assert_eq!(
+                end_of_rib_in(&mp_end_of_rib(1, extended_length)),
+                Some(Family::V4)
+            );
+            assert_eq!(
+                end_of_rib_in(&mp_end_of_rib(2, extended_length)),
+                Some(Family::V6)
+            );
+        }
+        assert_eq!(
+            end_of_rib_in(&mp_end_of_rib(25, false)),
+            None,
+            "not unicast IP"
+        );
         assert_eq!(end_of_rib_in(&test_update()), None, "an ordinary UPDATE");
+        assert_eq!(
+            end_of_rib_in(&ipv6_update()),
+            None,
+            "an ordinary IPv6 UPDATE"
+        );
+        assert_eq!(end_of_rib_in(&encode_keepalive()), None, "not an UPDATE");
+    }
+
+    /// An UPDATE whose content bgpkit fails to decode is not an
+    /// End-of-RIB, though bgpkit reads it as one: it drops an attribute it
+    /// cannot parse, keeping only a validation warning, and skips a
+    /// one-byte NLRI field, and what is left is empty. With IPv6's
+    /// End-of-RIB already in, that fired InitiationComplete mid-dump.
+    #[test]
+    fn an_update_bgpkit_cannot_decode_is_not_an_end_of_rib() {
+        let mut stray_nlri = encode_end_of_rib(Family::V4);
+        stray_nlri.push(0x18);
+        stray_nlri[17] += 1;
+        for (what, msg) in [
+            (
+                "an undecodable IPv6 withdrawal",
+                undecodable_ipv6_withdrawal(),
+            ),
+            ("a one-byte NLRI field", stray_nlri),
+        ] {
+            let mut b = Bytes::copy_from_slice(&msg);
+            match parse_bgp_message(&mut b, false, &AsnLength::Bits32) {
+                Ok(BgpMessage::Update(u)) => assert!(
+                    u.is_end_of_rib(),
+                    "premise ({what}): bgpkit reads it as an End-of-RIB; if it no longer does, \
+                     this test only checks the bytes"
+                ),
+                other => panic!("premise ({what}): bgpkit parses it as an UPDATE: {other:?}"),
+            }
+            assert_eq!(end_of_rib_in(&msg), None, "{what}");
+        }
+    }
+
+    /// The session-level shape: IPv6's End-of-RIB in, then an UPDATE
+    /// whose IPv6 withdrawal bgpkit cannot decode. That must not complete
+    /// the table; IPv4's real End-of-RIB does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_undecodable_withdrawal_does_not_complete_the_table() {
+        let (prog, log) = recording_handle();
+        let (peer, session, shutdown) = establish_with(
+            prog,
+            Setup {
+                peer: GR_PEER,
+                ..Setup::default()
+            },
+        )
+        .await;
+        let (rd, mut wr) = peer.into_split();
+        let seen = watch(rd);
+        let fired = || initiation_complete_at(&log).is_some();
+
+        wr.write_all(&test_update()).await.expect("UPDATE");
+        wr.write_all(&encode_end_of_rib(Family::V6))
+            .await
+            .expect("End-of-RIB");
+        wr.write_all(&undecodable_ipv6_withdrawal())
+            .await
+            .expect("UPDATE");
+        assert_eq!(
+            quiet_peer_until(&mut wr, Duration::from_secs(2), fired).await,
+            None,
+            "an undecodable IPv6 withdrawal read as IPv4's End-of-RIB"
+        );
+        wr.write_all(&encode_end_of_rib(Family::V4))
+            .await
+            .expect("End-of-RIB");
+        quiet_peer_until(&mut wr, Duration::from_secs(5), fired)
+            .await
+            .expect("IPv4's End-of-RIB completes the table");
+        assert_eq!(initiation_complete_at(&log), Some(1), "after the one route");
+        assert_eq!(seen.lock().expect("seen").closed, None);
+        shutdown.cancel();
+        session
+            .await
+            .expect("join")
+            .expect("shutdown ends a session cleanly");
+    }
+
+    /// The capabilities a peer that sends `open` negotiates with us.
+    fn negotiated_with(open: &[u8]) -> NegotiatedCapabilities {
+        let mut b = Bytes::copy_from_slice(open);
+        let BgpMessage::Open(open) =
+            parse_bgp_message(&mut b, false, &AsnLength::Bits32).expect("parse")
+        else {
+            panic!("expected OPEN");
+        };
+        walk_open_capabilities(&open.opt_params)
     }
 
     #[test]
-    fn unicast_families_follow_the_peers_multiprotocol_capabilities() {
-        let none = NegotiatedCapabilities::default();
-        assert_eq!(none.unicast_families(), V4_ONLY, "plain RFC 4271");
-        let v6 = NegotiatedCapabilities {
-            mp_v6_unicast: true,
+    fn the_families_awaited_are_the_ones_the_peer_listed_or_plain_bgp4s() {
+        const V6_ONLY: Families = Families {
+            v4: false,
+            v6: true,
+        };
+        let open = |families| {
+            peer_open(PeerCaps {
+                graceful_restart: true,
+                families,
+            })
+        };
+        // (what the peer lists, what we wait for, what we send)
+        for (listed, awaited, sent) in [
+            // No Multiprotocol capability at all: plain BGP-4.
+            (V4_ONLY, V4_ONLY, V4_ONLY),
+            (V6_ONLY, V6_ONLY, BOTH),
+            (BOTH, BOTH, BOTH),
+        ] {
+            let caps = negotiated_with(&open(listed));
+            assert_eq!(caps.families(), awaited, "peer lists {listed:?}");
+            assert_eq!(caps.end_of_rib_to_send(), sent, "peer lists {listed:?}");
+        }
+        // Multiprotocol for IPv4 unicast alone.
+        let v4_listed = NegotiatedCapabilities {
+            multiprotocol: true,
+            mp_v4_unicast: true,
             ..Default::default()
         };
-        assert_eq!(
-            v6.unicast_families(),
-            BOTH,
-            "IPv4 stays in when the peer advertised Multiprotocol for IPv6 alone"
-        );
+        assert_eq!(v4_listed.families(), V4_ONLY);
+        // Multiprotocol for some other family alone: no unicast at all.
+        let other_only = NegotiatedCapabilities {
+            multiprotocol: true,
+            ..Default::default()
+        };
+        assert_eq!(other_only.families(), Families::default());
     }
 
-    /// A peer that advertised Multiprotocol Extensions for IPv6 alone and
-    /// sends IPv4 routes anyway, in BGP-4's own encoding. Its IPv6
-    /// End-of-RIB must not fire InitiationComplete while IPv4 may still
-    /// be replaying: that would GC every IPv4 route not yet re-sent.
+    /// A peer that negotiated IPv6 alone carries no IPv4, so its IPv6
+    /// End-of-RIB completes the table. After #360 the session waited for
+    /// IPv4's as well, so such a feed reconciled only on 300 s of silence,
+    /// which a live feed never gives, and vpp-offload's unattested release
+    /// waits on that reconciliation (#361).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_ipv6_only_multiprotocol_peer_still_owes_an_ipv4_end_of_rib() {
+    async fn an_ipv6_only_peer_completes_its_table_at_ipv6s_end_of_rib() {
+        let (prog, log) = recording_handle();
+        let (peer, session, shutdown) = establish_with(
+            prog,
+            Setup {
+                peer: PeerCaps {
+                    graceful_restart: true,
+                    families: Families {
+                        v4: false,
+                        v6: true,
+                    },
+                },
+                ..Setup::default()
+            },
+        )
+        .await;
+        let (rd, mut wr) = peer.into_split();
+        let seen = watch(rd);
+
+        wr.write_all(&ipv6_update()).await.expect("IPv6 UPDATE");
+        wr.write_all(&encode_end_of_rib(Family::V6))
+            .await
+            .expect("End-of-RIB");
+        quiet_peer_until(&mut wr, Duration::from_secs(5), || {
+            initiation_complete_at(&log).is_some()
+        })
+        .await
+        .expect("IPv6's End-of-RIB completes an IPv6-only session");
+        assert_eq!(initiation_complete_at(&log), Some(1), "after the one route");
+        assert_eq!(seen.lock().expect("seen").closed, None);
+        shutdown.cancel();
+        session
+            .await
+            .expect("join")
+            .expect("shutdown ends a session cleanly");
+    }
+
+    /// A peer that listed IPv6 alone and sends IPv4 routes anyway, in
+    /// BGP-4's own encoding. Its IPv6 End-of-RIB must not fire
+    /// InitiationComplete while IPv4 may still be replaying, which would
+    /// GC every IPv4 route not yet re-sent: the IPv4 route it sent adds
+    /// IPv4 to what the session waits for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ipv4_routes_from_a_peer_that_listed_ipv6_alone_make_it_wait_for_ipv4() {
         let (prog, log) = recording_handle();
         let (peer, session, shutdown) = establish_with(
             prog,
