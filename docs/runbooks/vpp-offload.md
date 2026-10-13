@@ -958,13 +958,16 @@ holds the gate loud until it actually ends:
 
 1. **The floor**: the mirror holds ≥ `expected-routes`-derived
    capacity / 16 and has been quiet for **2 s when a completeness
-   authority is configured, 5 s without one** — five being both
-   listeners' own initiation-complete standard, because an unattested
+   authority is configured, 5 s without one** — five being the BMP
+   station's own initiation-complete standard, because an unattested
    release may not claim completion on less evidence than the protocol
-   itself requires. And without an authority, quiet means LITERALLY
-   still: zero stream elements and zero mirror mutations for the whole
-   window, because no rate allowance can distinguish slow churn from a
-   throttled reload. Real feeds pause between churn bursts; one that
+   itself requires. The BGP listener's standard is stricter since
+   2026-10-12 (End-of-RIB, or 30 s of silence from a peer that sends
+   none), so on a BGP feed an unattested release has less evidence than
+   that; run BGP-fed steering with a completeness authority. And without
+   an authority, quiet means LITERALLY still: zero stream elements and
+   zero mirror mutations for the whole window, because no rate allowance
+   can distinguish slow churn from a throttled reload. Real feeds pause between churn bursts; one that
    never does keeps the deferral, visibly. This is the fleet's door —
    a full-table box with bird releases ~40 s after attach.
 2. **The completeness authority** (`require-table-complete on`): bird's
