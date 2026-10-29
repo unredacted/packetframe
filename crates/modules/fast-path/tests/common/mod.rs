@@ -901,9 +901,11 @@ pub fn enter_routed_netns() -> u32 {
 // --- Raw bpf(BPF_PROG_TEST_RUN) ----------------------------------------
 
 /// `bpf(BPF_PROG_TEST_RUN, ...)` struct layout. Matches the kernel's
-/// `union bpf_attr` `test` variant through kernel 6.1. 76 meaningful
-/// bytes + 4 bytes of trailing padding to hit 8-byte alignment.
+/// `union bpf_attr` `test` variant through kernel 6.1. The reserved
+/// word makes all 80 bytes explicit: Rust need not preserve implicit
+/// padding when moving a value, but the kernel requires it to be zero.
 #[repr(C)]
+#[derive(Default)]
 struct TestRunAttr {
     prog_fd: u32,
     retval: u32,
@@ -920,7 +922,11 @@ struct TestRunAttr {
     flags: u32,
     cpu: u32,
     batch_size: u32,
+    reserved: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<TestRunAttr>() == 80);
+const _: () = assert!(std::mem::offset_of!(TestRunAttr, reserved) == 76);
 
 const BPF_PROG_TEST_RUN: u32 = 10;
 
@@ -943,20 +949,17 @@ fn test_run_xdp_repeat(prog_fd: i32, packet: &[u8], repeat: u32) -> (u32, u32, V
     // output with headroom so the kernel doesn't truncate.
     let mut data_out = vec![0u8; packet.len() + 256];
 
-    // `mem::zeroed` over a struct-literal init: the kernel's CHECK_ATTR
-    // macro validates that bytes past `batch_size` (the last field of
-    // the TEST_RUN variant) are zero. A `#[derive(Default)]` init only
-    // zeros named fields, the 4 bytes of trailing padding we carry to
-    // hit 8-byte alignment stay uninitialized and land as garbage in
-    // the attr buffer → kernel 6.0+ returns EINVAL with no log. Zeroing
-    // the whole buffer first is the fix.
-    let mut attr: TestRunAttr = unsafe { std::mem::zeroed() };
-    attr.prog_fd = prog_fd as u32;
-    attr.data_size_in = packet.len() as u32;
-    attr.data_size_out = data_out.len() as u32;
-    attr.data_in = packet.as_ptr() as u64;
-    attr.data_out = data_out.as_mut_ptr() as u64;
-    attr.repeat = repeat;
+    // CHECK_ATTR includes the reserved word after `batch_size`. Name
+    // and initialize it rather than relying on implicit struct padding.
+    let mut attr = TestRunAttr {
+        prog_fd: prog_fd as u32,
+        data_size_in: packet.len() as u32,
+        data_size_out: data_out.len() as u32,
+        data_in: packet.as_ptr() as u64,
+        data_out: data_out.as_mut_ptr() as u64,
+        repeat,
+        ..Default::default()
+    };
 
     let ret = unsafe {
         libc::syscall(
@@ -969,7 +972,15 @@ fn test_run_xdp_repeat(prog_fd: i32, packet: &[u8], repeat: u32) -> (u32, u32, V
 
     if ret != 0 {
         let e = std::io::Error::last_os_error();
-        panic!("BPF_PROG_TEST_RUN returned {ret} (errno {e})");
+        panic!(
+            "BPF_PROG_TEST_RUN returned {ret} (errno {e}); input_len={} flags={} cpu={} \
+             batch_size={} reserved={}",
+            packet.len(),
+            attr.flags,
+            attr.cpu,
+            attr.batch_size,
+            attr.reserved,
+        );
     }
 
     data_out.truncate(attr.data_size_out as usize);
