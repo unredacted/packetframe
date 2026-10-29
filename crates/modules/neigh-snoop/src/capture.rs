@@ -171,8 +171,10 @@ pub async fn pump(
     dropped: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) -> Result<(), String> {
-    let afd =
-        AsyncFd::with_interest(fd, Interest::READABLE).map_err(|e| format!("AsyncFd: {e}"))?;
+    // SAFETY: AsyncFd owns this OwnedFd until deregistration. We only borrow
+    // it through get_ref(), so the descriptor stays open and is never replaced.
+    let afd = unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }
+        .map_err(|e| format!("AsyncFd: {e}"))?;
     let mut buf = vec![0u8; RECV_BUF];
     loop {
         let mut guard = tokio::select! {
