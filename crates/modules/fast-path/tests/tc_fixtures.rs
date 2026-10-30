@@ -178,18 +178,17 @@ fn tc_mss_clamp_parity_with_xdp() {
 fn tc_parse_error_bumps_both_shared_and_tc_counter() {
     let mut h = Harness::new();
     h.set_packetframe_fib(true, false);
-    // A frame the KERNEL accepts but the PARSER rejects. Sub-14-byte
-    // buffers can't be used here: `bpf_prog_test_run` fails the whole
-    // syscall with EINVAL when `size < ETH_HLEN`, so the program never
-    // runs and the test panics in the harness rather than exercising
-    // the parse-error path. Instead: a complete 14-byte Ethernet
-    // header declaring IPv4, with the IP header truncated to 6 bytes.
-    // Both datapaths clear the `EthHdr::LEN` check, then fail
-    // `start + ip_offset + Ipv4Hdr::LEN > end` — the parse error we
-    // actually want to attribute.
-    let mut runt = vec![0u8; 20];
+    // A frame the kernel accepts but the parser rejects. The native
+    // Linux 7.0 runner rejects the old 20-byte, untagged IPv4 frame with
+    // EINVAL before our program runs. Wrap a truncated IPv4 header in
+    // 802.1Q instead: kernel test setup sees the outer VLAN protocol,
+    // while both datapaths parse the inner IPv4 protocol at offset 18.
+    // Its 16-byte header still fails the same Ipv4Hdr::LEN bounds check
+    // and must move only err_parse_tc_l3_v4, as asserted below.
+    let mut runt = vec![0u8; 30];
     runt[12] = 0x08; // ethertype 0x0800 (IPv4)
     runt[13] = 0x00;
+    let runt = common::insert_vlan_tag(&runt, 66);
 
     let parse_before = h.stat(StatIdx::ErrParse);
     let parse_tc_before = h.stat(StatIdx::ErrParseTc);
