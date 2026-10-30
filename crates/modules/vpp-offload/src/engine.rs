@@ -4100,7 +4100,7 @@ impl ConvergenceEngine {
     /// alone — an unadopted route is one we will not withdraw, which is
     /// the safe direction.
     pub fn adopt_vpp_fib(&mut self) -> Result<u64, EngineError> {
-        if !self.ledger.known_prefixes().is_empty() {
+        if !self.ledger_is_empty() {
             return Ok(0);
         }
         self.arm_timeout();
