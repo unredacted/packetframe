@@ -123,6 +123,19 @@ fn op_timeout(steered: bool, converging: bool) -> Duration {
 /// full table so a tick cannot monopolise the loop and starve the ping.
 pub const DRAIN_BATCH: usize = 4_096;
 
+/// Routes, or ledger prefixes, one slice of a resync walk visits
+/// ([`ConvergenceEngine::walk_resync_slice`]).
+///
+/// Bounds what a deferral's release holds the supervision loop for, the
+/// loop that pings VPP: the walk hands the loop back after every slice.
+/// On the reference gateway one whole-table walk of a steered seeded
+/// release held it ~4.2 s at 1.35M routes (2026-10-13), about 3 µs a
+/// route on its cores; this many routes is then ~50 ms, a tenth of the
+/// ping interval, and a full table ~165 slices, each a pass the loop
+/// runs anyway. A ledger prefix (the withdrawal half of the walk) costs a
+/// set lookup, a fraction of a route.
+pub const RESYNC_WALK_SLICE: usize = 16_384;
+
 /// Kernel FIB lookups one resync walk may make for routes whose every
 /// next hop is the router ([`ConvergenceEngine::kernel_owns`]). A
 /// production feed has tens of those (what the routing daemon originates
@@ -204,6 +217,34 @@ pub trait RouteSource {
     /// Visit every route in the authoritative mirror, best-path
     /// nexthops included. Multipath routes present all their nexthops.
     fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr]));
+
+    /// Visit at most `max` routes of [`Self::for_each_route`]'s, in the
+    /// source's own key order after `after` (from the first when `None`),
+    /// and return the last one visited for the next call to resume after,
+    /// or `None` once the routes are exhausted.
+    ///
+    /// What lets a resync walk hand the supervision loop back between
+    /// slices ([`ConvergenceEngine::walk_resync_slice`]). The cursor is a
+    /// key, never a position, so a resumed walk skips no route that is
+    /// there throughout it however the table changes between calls.
+    ///
+    /// The default ignores both bounds and visits everything in one call:
+    /// right for the static fixtures, whose walks are small. The live feed
+    /// overrides it, and the delegating `Arc<RouteFeed>` forwards it by
+    /// hand, as every defaulted method here (`requeue`'s doc says why); a
+    /// test pins that.
+    fn for_each_route_from(
+        &self,
+        after: Option<IpPrefix>,
+        max: usize,
+        visit: &mut dyn FnMut(IpPrefix, &[IpAddr]),
+    ) -> Option<IpPrefix> {
+        let _ = max;
+        if after.is_none() {
+            self.for_each_route(visit);
+        }
+        None
+    }
 
     /// Visit each resolved neighbour: nexthop address, egress device, and
     /// **link-layer address**.
@@ -570,6 +611,85 @@ impl WalkOps {
             WalkOps::Held(ops) => ops.push(op),
         }
     }
+}
+
+/// A resync walk spread over as many calls as its caller likes: begun by
+/// [`ConvergenceEngine::start_resync_walk`], advanced a slice at a time by
+/// [`ConvergenceEngine::walk_resync_slice`], and judged and committed by
+/// [`ConvergenceEngine::finish_resync_walk`] once every slice is done.
+/// The walk [`ConvergenceEngine::begin_resync`] runs in one call, for a
+/// caller that must not be held for all of it: a deferral's release runs
+/// on the supervision loop, which pings VPP between its passes, and at
+/// full table one walk kept the loop from pinging a steered VPP for
+/// seconds (2026-10-13).
+///
+/// It HOLDS what it finds until it finishes — the ops it owes the pending
+/// map, and the shadowed, kernel-delivered, link-local-refused and
+/// kernel-refused sets it rebuilds — so between two slices the engine
+/// reads as it did before the walk began, apart from what the walk's
+/// start refreshed about the kernel and the route source (the nexthop
+/// map, the FDB and bridge-port VLAN reads, the router's own addresses),
+/// which describes the world as it is. A judge can then refuse the whole
+/// of it, exactly as [`ConvergenceEngine::begin_resync_judged`]'s.
+///
+/// Dropping one unfinished queues nothing. The route source's queued
+/// deltas were discarded when it started
+/// ([`RouteSource::discard_route_deltas`]), so, as after a refused judge,
+/// its caller must not apply deltas until another full walk has
+/// superseded them.
+pub struct ResyncWalk {
+    stage: WalkStage,
+    plan: ResyncPlan,
+    /// The source's prefixes this walk has visited, so the ledger half can
+    /// withdraw everything else.
+    seen: HashSet<IpPrefix>,
+    ops: WalkOps,
+    /// What the walk rebuilds of the engine's own view, kept here between
+    /// slices and swapped in while one runs ([`Rebuilt`]).
+    rebuilt: Rebuilt,
+}
+
+/// A [`ResyncWalk`] every slice of which is done: the only kind
+/// [`ConvergenceEngine::finish_resync_walk`] takes, so no plan can be
+/// judged or committed from part of the table — a part-walked source
+/// makes every prefix it has not reached yet a withdrawal.
+pub struct WalkedResync(ResyncWalk);
+
+/// What one slice of a resync walk left. See
+/// [`ConvergenceEngine::walk_resync_slice`].
+pub enum WalkSlice {
+    /// More to visit: the walk, for another slice.
+    More(ResyncWalk),
+    /// Everything visited: the walk, ready to finish.
+    Done(WalkedResync),
+}
+
+/// Where a [`ResyncWalk`] resumes.
+#[derive(Debug, Clone, Copy)]
+enum WalkStage {
+    /// In the route source, after this prefix (from its first when
+    /// `None`): [`RouteSource::for_each_route_from`].
+    Source(Option<IpPrefix>),
+    /// In the ledger, after this prefix (from its first when `None`),
+    /// withdrawing what the source did not hold.
+    Ledger(Option<IpPrefix>),
+}
+
+/// The engine state a resync walk rebuilds from scratch rather than
+/// refreshes in place: cleared as the walk starts, filled as it visits
+/// the source. A [`ResyncWalk`] keeps its own copy and swaps it in only
+/// for the length of a slice ([`ConvergenceEngine::swap_rebuilt`]), so a
+/// reader between slices sees the last finished walk's, never a part-built
+/// one; the finish swaps it in for good.
+#[derive(Default)]
+struct Rebuilt {
+    shadowed: HashSet<IpPrefix>,
+    kernel_delivered: HashSet<IpPrefix>,
+    link_local_refused: HashSet<IpPrefix>,
+    kernel_refused: std::collections::HashMap<IpPrefix, String>,
+    fib_match_budget: usize,
+    fib_match_spent: Duration,
+    fib_match_halted: Option<String>,
 }
 
 /// What a verify pass concluded, and whether traffic may be diverted
@@ -4314,8 +4434,12 @@ impl ConvergenceEngine {
     }
 
     pub fn begin_resync(&mut self, src: &dyn RouteSource) -> ResyncPlan {
-        // With no judge, the walk always commits.
-        self.walk_resync(src, None).unwrap_or_else(|plan| plan)
+        // With no judge the walk always commits, so nothing is held: its
+        // ops go to the pending map as it finds them.
+        let walk = self.start_walk(src, WalkOps::Pending);
+        let walked = self.walk_to_end(walk, src);
+        self.finish_resync_walk(walked, None)
+            .unwrap_or_else(|plan| plan)
     }
 
     /// [`Self::begin_resync`], with the plan it found put to `judge` before
@@ -4344,27 +4468,29 @@ impl ConvergenceEngine {
     /// the walk as for every walk (`RouteSource::discard_route_deltas`):
     /// a caller that refuses must not apply deltas until another full
     /// walk has superseded them.
+    ///
+    /// The same walk, a slice at a time: [`Self::start_resync_walk`].
     pub fn begin_resync_judged(
         &mut self,
         src: &dyn RouteSource,
         judge: &mut dyn FnMut(&ResyncPlan) -> bool,
     ) -> Result<ResyncPlan, ResyncPlan> {
-        self.walk_resync(src, Some(judge))
+        let walk = self.start_resync_walk(src);
+        let walked = self.walk_to_end(walk, src);
+        self.finish_resync_walk(walked, Some(judge))
     }
 
-    /// The resync walk behind [`Self::begin_resync`] and
-    /// [`Self::begin_resync_judged`]: classify, then commit — unless a
-    /// judge refuses the plan in between.
-    fn walk_resync(
-        &mut self,
-        src: &dyn RouteSource,
-        judge: Option<&mut dyn FnMut(&ResyncPlan) -> bool>,
-    ) -> Result<ResyncPlan, ResyncPlan> {
-        let mut ops = if judge.is_some() {
-            WalkOps::Held(Vec::new())
-        } else {
-            WalkOps::Pending
-        };
+    /// Begin a [`ResyncWalk`]: everything [`Self::begin_resync`] does
+    /// before it reads the first route, and nothing after. The walk holds
+    /// its ops until [`Self::finish_resync_walk`], judged or not, so a
+    /// judge may refuse it there.
+    pub fn start_resync_walk(&mut self, src: &dyn RouteSource) -> ResyncWalk {
+        self.start_walk(src, WalkOps::Held(Vec::new()))
+    }
+
+    /// The start of every resync walk, with its ops queued as found
+    /// (`Pending`) or held for the finish (`Held`).
+    fn start_walk(&mut self, src: &dyn RouteSource, ops: WalkOps) -> ResyncWalk {
         // Rebuild, not merge. An insert-only refresh leaves a nexthop the
         // source has stopped reporting mapped to its last known device,
         // so a route still naming it resolves as reachable through a
@@ -4399,104 +4525,128 @@ impl ConvergenceEngine {
             }
             self.nexthops.set_device(nh, dev);
         }
-
-        let mut plan = ResyncPlan::default();
-        // The source's prefix set, so withdrawals are everything the
-        // ledger holds that is not in it. ~50 MB transient at full
-        // table, which is the unavoidable cost of a correct diff — the
-        // alternative is an add-only resync that black-holes withdrawn
-        // routes.
-        let mut seen: HashSet<IpPrefix> = HashSet::with_capacity(1 << 20);
-        // Rebuilt from this walk, so a prefix the mirror dropped while
-        // we were not looking leaves the count too.
-        self.shadowed.clear();
-        self.kernel_delivered.clear();
-        self.link_local_refused.clear();
-        self.kernel_refused.clear();
-        self.fib_match_budget = FIB_MATCH_BUDGET_RESYNC;
-        self.fib_match_spent = Duration::ZERO;
-        self.fib_match_halted = None;
-        let families = self.drainer.families();
+        let walk = ResyncWalk {
+            stage: WalkStage::Source(None),
+            plan: ResyncPlan::default(),
+            // The source's prefix set, so withdrawals are everything the
+            // ledger holds that is not in it. ~50 MB transient at full
+            // table, which is the unavoidable cost of a correct diff — the
+            // alternative is an add-only resync that black-holes withdrawn
+            // routes.
+            seen: HashSet::with_capacity(1 << 20),
+            ops,
+            // Rebuilt from this walk, so a prefix the mirror dropped while
+            // we were not looking leaves the count too.
+            rebuilt: Rebuilt {
+                fib_match_budget: FIB_MATCH_BUDGET_RESYNC,
+                ..Rebuilt::default()
+            },
+        };
         // Immediately before the walk, never earlier: what is queued now
         // is what the walk supersedes, and anything written from here on
         // stays a delta. See `RouteSource::discard_route_deltas`. Judged
         // walks too, refused or not: a refusing caller applies no delta
         // until another full walk supersedes them (`begin_resync_judged`).
         src.discard_route_deltas();
-        src.for_each_route(&mut |prefix, nexthops| {
-            // A family VPP does not carry never enters the diff — the
-            // route-side twin of the neighbour filter
-            // ([`Self::carried_neighbours`]). Dropped by the drainer
-            // anyway, but only after being counted as an upsert and held
-            // in the pending map, so the plan's numbers and the map's size
-            // described a table VPP was never going to hold. Not in `seen`
-            // either, which is harmless because the ledger never holds an
-            // uncarried prefix (the drainer, the dump and the seed all
-            // filter it) and so no withdrawal can be derived for one.
-            if !families.carries(prefix) {
-                plan.out_of_family += 1;
-                return;
-            }
-            if self.shadows(&prefix) {
-                // Deliberately NOT in `seen`: if the ledger holds a
-                // stale install of a shadowed prefix (a pre-local-route
-                // run, or adoption), the withdrawal loop below is what
-                // cleans it out of VPP.
-                self.shadowed.insert(prefix);
-                plan.shadowed += 1;
-                return;
-            }
-            // Same reasoning: not in `seen`, so a stale install goes.
-            if self.kernel_delivered_route(&prefix, nexthops) {
-                self.kernel_delivered.insert(prefix);
-                plan.kernel_delivered += 1;
-                return;
-            }
-            // Link-local next hops dropped; with none left the route is
-            // refused — not in `seen` either, so a stale install goes.
-            let Some(scoped) = scope_nexthops(prefix, nexthops) else {
-                self.link_local_refused.insert(prefix);
-                plan.link_local_refused += 1;
-                return;
-            };
-            let nexthops: &[IpAddr] = &scoped;
-            seen.insert(prefix);
-            // Unchanged: VPP holds this prefix through exactly the paths
-            // it resolves to now, so re-sending it would replace a route
-            // with itself. Anything owed for it from before this walk is
-            // an OLDER intent, and goes.
-            if self.installed_unchanged(prefix, nexthops) {
-                ops.put(&mut self.pending, WalkOp::Discard(prefix));
-                plan.unchanged += 1;
-                return;
-            }
-            // A route VPP holds (or has been handed) through other paths,
-            // or through none it can resolve now: the upsert replaces, or
-            // removes, one it forwards on. Otherwise it adds one, whether
-            // or not a next hop resolves at this moment: see
-            // [`Disturbance`].
-            if matches!(
-                self.ledger.state_of(prefix),
-                Some(
-                    crate::sink::RouteState::Installed | crate::sink::RouteState::Installing { .. }
-                )
-            ) {
-                plan.family_mut(&prefix).replaces += 1;
-            } else {
-                plan.family_mut(&prefix).additions += 1;
-            }
-            ops.put(&mut self.pending, WalkOp::Upsert(prefix, nexthops.to_vec()));
-            plan.upserts += 1;
-        });
+        walk
+    }
 
-        let known: HashSet<IpPrefix> = self.ledger.known_prefixes().into_iter().collect();
-        for prefix in &known {
-            if !seen.contains(prefix) {
-                ops.put(&mut self.pending, WalkOp::Withdraw(*prefix));
-                plan.withdrawals += 1;
-                plan.family_mut(prefix).withdrawals += 1;
+    /// Visit up to `max` more of `walk` (at least one): the route source's
+    /// routes in its own order, resuming where the last slice stopped
+    /// ([`RouteSource::for_each_route_from`]), then the ledger's prefixes
+    /// in key order, withdrawing each the source did not hold. `Done` once
+    /// both are exhausted.
+    ///
+    /// Both cursors are keys, never positions, so neither half skips an
+    /// entry present throughout the walk however the source changes
+    /// between slices; a route changed behind the source cursor is caught
+    /// as a delta, exactly as within one call (the walk has never been a
+    /// coherent snapshot of a live source: `RouteSource::for_each_route`).
+    /// Nothing between two slices changes the ledger: a deferral holds
+    /// every drain while its release walks.
+    pub fn walk_resync_slice(
+        &mut self,
+        mut walk: ResyncWalk,
+        src: &dyn RouteSource,
+        max: usize,
+    ) -> WalkSlice {
+        self.swap_rebuilt(&mut walk.rebuilt);
+        let mut left = max.max(1);
+        let done = loop {
+            if left == 0 {
+                break false;
+            }
+            match walk.stage {
+                WalkStage::Source(after) => {
+                    let ResyncWalk {
+                        plan, seen, ops, ..
+                    } = &mut walk;
+                    let mut visited = 0usize;
+                    let next = src.for_each_route_from(after, left, &mut |prefix, nexthops| {
+                        visited += 1;
+                        self.walk_route(plan, seen, ops, prefix, nexthops);
+                    });
+                    left = left.saturating_sub(visited);
+                    walk.stage = match next {
+                        Some(last) => WalkStage::Source(Some(last)),
+                        None => WalkStage::Ledger(None),
+                    };
+                }
+                WalkStage::Ledger(after) => {
+                    let prefixes = self.ledger.known_prefixes_after(after, left);
+                    left -= prefixes.len();
+                    for prefix in &prefixes {
+                        if !walk.seen.contains(prefix) {
+                            walk.ops.put(&mut self.pending, WalkOp::Withdraw(*prefix));
+                            walk.plan.withdrawals += 1;
+                            walk.plan.family_mut(prefix).withdrawals += 1;
+                        }
+                    }
+                    // Fewer than asked for: the ledger is exhausted.
+                    match prefixes.last() {
+                        Some(last) if left == 0 => walk.stage = WalkStage::Ledger(Some(*last)),
+                        _ => break true,
+                    }
+                }
+            }
+        };
+        self.swap_rebuilt(&mut walk.rebuilt);
+        if done {
+            WalkSlice::Done(WalkedResync(walk))
+        } else {
+            WalkSlice::More(walk)
+        }
+    }
+
+    /// Every slice of `walk` at once.
+    fn walk_to_end(&mut self, mut walk: ResyncWalk, src: &dyn RouteSource) -> WalkedResync {
+        loop {
+            match self.walk_resync_slice(walk, src, usize::MAX) {
+                WalkSlice::More(more) => walk = more,
+                WalkSlice::Done(walked) => return walked,
             }
         }
+    }
+
+    /// Judge and commit a walk every slice of which is done: the end of
+    /// [`Self::begin_resync`], and with a judge of
+    /// [`Self::begin_resync_judged`], whose contract this keeps. `Ok` with
+    /// the plan when there is no judge or it accepted, and the walk's ops
+    /// are queued; `Err` with the plan when it refused, and nothing was.
+    /// Either way what the walk rebuilt replaces the engine's.
+    pub fn finish_resync_walk(
+        &mut self,
+        walk: WalkedResync,
+        judge: Option<&mut dyn FnMut(&ResyncPlan) -> bool>,
+    ) -> Result<ResyncPlan, ResyncPlan> {
+        let WalkedResync(ResyncWalk {
+            plan,
+            seen,
+            ops,
+            mut rebuilt,
+            ..
+        }) = walk;
+        self.swap_rebuilt(&mut rebuilt);
         if let Some(judge) = judge {
             if !judge(&plan) {
                 return Err(plan);
@@ -4524,8 +4674,9 @@ impl ConvergenceEngine {
         // VPP never received them, and a withdrawal for a route that was
         // never installed is a wasted round trip inside the convergence
         // budget.
+        let ledger = &self.ledger;
         self.pending
-            .retain(|p| seen.contains(p) || known.contains(p));
+            .retain(|p| seen.contains(p) || ledger.state_of(*p).is_some());
 
         // Anything parked at the high-water mark gets another chance:
         // withdrawals in this same plan may have freed the headroom.
@@ -4541,6 +4692,91 @@ impl ConvergenceEngine {
             );
         }
         Ok(plan)
+    }
+
+    /// Exchange what a resync walk rebuilds ([`Rebuilt`]) with the
+    /// engine's own: in for a slice and out after it, in for good at the
+    /// finish.
+    fn swap_rebuilt(&mut self, r: &mut Rebuilt) {
+        std::mem::swap(&mut self.shadowed, &mut r.shadowed);
+        std::mem::swap(&mut self.kernel_delivered, &mut r.kernel_delivered);
+        std::mem::swap(&mut self.link_local_refused, &mut r.link_local_refused);
+        std::mem::swap(&mut self.kernel_refused, &mut r.kernel_refused);
+        std::mem::swap(&mut self.fib_match_budget, &mut r.fib_match_budget);
+        std::mem::swap(&mut self.fib_match_spent, &mut r.fib_match_spent);
+        std::mem::swap(&mut self.fib_match_halted, &mut r.fib_match_halted);
+    }
+
+    /// One route of a resync walk's source half.
+    fn walk_route(
+        &mut self,
+        plan: &mut ResyncPlan,
+        seen: &mut HashSet<IpPrefix>,
+        ops: &mut WalkOps,
+        prefix: IpPrefix,
+        nexthops: &[IpAddr],
+    ) {
+        // A family VPP does not carry never enters the diff — the
+        // route-side twin of the neighbour filter
+        // ([`Self::carried_neighbours`]). Dropped by the drainer
+        // anyway, but only after being counted as an upsert and held
+        // in the pending map, so the plan's numbers and the map's size
+        // described a table VPP was never going to hold. Not in `seen`
+        // either, which is harmless because the ledger never holds an
+        // uncarried prefix (the drainer, the dump and the seed all
+        // filter it) and so no withdrawal can be derived for one.
+        if !self.drainer.families().carries(prefix) {
+            plan.out_of_family += 1;
+            return;
+        }
+        if self.shadows(&prefix) {
+            // Deliberately NOT in `seen`: if the ledger holds a
+            // stale install of a shadowed prefix (a pre-local-route
+            // run, or adoption), the withdrawal loop below is what
+            // cleans it out of VPP.
+            self.shadowed.insert(prefix);
+            plan.shadowed += 1;
+            return;
+        }
+        // Same reasoning: not in `seen`, so a stale install goes.
+        if self.kernel_delivered_route(&prefix, nexthops) {
+            self.kernel_delivered.insert(prefix);
+            plan.kernel_delivered += 1;
+            return;
+        }
+        // Link-local next hops dropped; with none left the route is
+        // refused — not in `seen` either, so a stale install goes.
+        let Some(scoped) = scope_nexthops(prefix, nexthops) else {
+            self.link_local_refused.insert(prefix);
+            plan.link_local_refused += 1;
+            return;
+        };
+        let nexthops: &[IpAddr] = &scoped;
+        seen.insert(prefix);
+        // Unchanged: VPP holds this prefix through exactly the paths
+        // it resolves to now, so re-sending it would replace a route
+        // with itself. Anything owed for it from before this walk is
+        // an OLDER intent, and goes.
+        if self.installed_unchanged(prefix, nexthops) {
+            ops.put(&mut self.pending, WalkOp::Discard(prefix));
+            plan.unchanged += 1;
+            return;
+        }
+        // A route VPP holds (or has been handed) through other paths,
+        // or through none it can resolve now: the upsert replaces, or
+        // removes, one it forwards on. Otherwise it adds one, whether
+        // or not a next hop resolves at this moment: see
+        // [`Disturbance`].
+        if matches!(
+            self.ledger.state_of(prefix),
+            Some(crate::sink::RouteState::Installed | crate::sink::RouteState::Installing { .. })
+        ) {
+            plan.family_mut(&prefix).replaces += 1;
+        } else {
+            plan.family_mut(&prefix).additions += 1;
+        }
+        ops.put(&mut self.pending, WalkOp::Upsert(prefix, nexthops.to_vec()));
+        plan.upserts += 1;
     }
 
     /// Whether VPP is recorded holding `prefix` through exactly the wire

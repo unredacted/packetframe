@@ -750,6 +750,218 @@ fn a_judged_resync_commits_only_the_plan_its_judge_saw() {
     );
 }
 
+/// A resync walk taken a slice at a time — what a deferral's release runs
+/// on the supervision loop, handing it back between slices — finds exactly
+/// the plan one call finds, and holds all of it until its finish. Between
+/// slices nothing reached the pending map, the phase and the ledger are as
+/// they were, and what the walk rebuilds reads the last finished walk's,
+/// never a part-built one: here the link-local-refused count, one before
+/// the walk and two after it, held at one through slices that visit both.
+/// A judge at the finish refuses or commits the whole plan, as one call's
+/// does, and every route is visited once, resumed by key.
+#[test]
+fn a_resync_walk_in_slices_finds_one_calls_plan_and_holds_it_until_the_finish() {
+    use packetframe_vpp_offload::engine::{ResyncPlan, WalkSlice};
+    use std::cell::RefCell;
+    const OTHER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+    const NH6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 1));
+    const LL: IpAddr = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+    let p4 = |last: u8| IpPrefix::V4 {
+        addr: [203, 0, 113, last],
+        prefix_len: 32,
+    };
+    let p6 = |i: u8| IpPrefix::V6 {
+        addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, i, 0, 0, 0, 0, 0, 0, 0, 0],
+        prefix_len: 64,
+    };
+    /// Routes in the order given, resumed by the position of the prefix
+    /// the last call returned; every prefix each walk visits, recorded.
+    struct Sliced {
+        routes: Vec<(IpPrefix, IpAddr)>,
+        visits: RefCell<Vec<IpPrefix>>,
+    }
+    impl RouteSource for Sliced {
+        fn requeue(&self, _: packetframe_vpp_offload::engine::SourceChanges) {
+            unreachable!("nothing is handed back in this test")
+        }
+        fn route_count(&self) -> u64 {
+            self.routes.len() as u64
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            let _ = self.for_each_route_from(None, usize::MAX, visit);
+        }
+        fn for_each_route_from(
+            &self,
+            after: Option<IpPrefix>,
+            max: usize,
+            visit: &mut dyn FnMut(IpPrefix, &[IpAddr]),
+        ) -> Option<IpPrefix> {
+            let start = after.map_or(0, |a| {
+                1 + self
+                    .routes
+                    .iter()
+                    .position(|(p, _)| *p == a)
+                    .expect("the cursor names a route")
+            });
+            let end = start.saturating_add(max).min(self.routes.len());
+            for (prefix, via) in &self.routes[start..end] {
+                self.visits.borrow_mut().push(*prefix);
+                visit(*prefix, &[*via]);
+            }
+            (end < self.routes.len()).then(|| self.routes[end - 1].0)
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            visit(nh(), "eth4", MAC);
+            visit(OTHER, "eth4", [0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+            visit(NH6, "eth4", [0x02, 0x00, 0x00, 0x00, 0x00, 0x06]);
+        }
+    }
+    let source = |routes| Sliced {
+        routes,
+        visits: RefCell::new(Vec::new()),
+    };
+    let fake = Fake::start_behaving(
+        "sliced-walk",
+        Behaviour {
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let mut e = ConvergenceEngine::new(
+        &fake.path,
+        vec![PortAttach {
+            port: "eth4".into(),
+            pci_addr: "0002:07:00.1".into(),
+            port_id: 0,
+            num_rx_queues: 1,
+            pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            accept_macs: vec![],
+            mtu: None,
+            vlans: vec![],
+        }],
+        vec!["eth4".into()],
+        1_000_000,
+        FamilyPolicy::Both,
+        packetframe_common::config::Ipv4Prefix {
+            addr: Ipv4Addr::new(198, 51, 100, 1),
+            prefix_len: 32,
+        },
+    );
+    assert!(e.api_ready(), "handshake");
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    // What VPP holds, acknowledged: four v4 and two v6 routes, and one v6
+    // route refused for having only a link-local next hop.
+    let before = source(vec![
+        (p6(9), LL),
+        (p4(1), nh()),
+        (p4(2), nh()),
+        (p4(3), nh()),
+        (p4(4), nh()),
+        (p6(1), NH6),
+        (p6(2), NH6),
+    ]);
+    let _ = e.begin_resync(&before);
+    e.program_neighbours(&before).expect("neighbours land");
+    drain_to_empty(&mut e);
+    // What a walk reads the engine by, between its slices.
+    let held = |e: &ConvergenceEngine| {
+        let c = e.counts();
+        let v6 = c.v6.expect("v6 carried");
+        (c.installed, v6.installed, v6.link_local_refused)
+    };
+    assert_eq!(held(&e), (4, 2, 1));
+    // Out of the resync phase, so a commit's phase can be told apart.
+    e.abort_convergence();
+    let _ = fake.drain_events();
+
+    // The source now: two routes refused for link-local next hops, one
+    // replaced through another next hop, one of each family withdrawn and
+    // one of each added, three unchanged.
+    let after = source(vec![
+        (p6(9), LL),
+        (p6(10), LL),
+        (p4(1), nh()),
+        (p4(2), OTHER),
+        (p4(4), nh()),
+        (p4(5), nh()),
+        (p6(1), NH6),
+        (p6(3), NH6),
+    ]);
+    // Two prefixes a slice, the engine read between every two.
+    let in_slices = |e: &mut ConvergenceEngine,
+                     judge: &mut dyn FnMut(&ResyncPlan) -> bool|
+     -> (Result<ResyncPlan, ResyncPlan>, usize) {
+        let before = held(e);
+        after.visits.borrow_mut().clear();
+        let mut walk = e.start_resync_walk(&after);
+        let mut slices = 1;
+        let walked = loop {
+            match e.walk_resync_slice(walk, &after, 2) {
+                WalkSlice::More(more) => {
+                    assert!(e.pending().is_empty(), "nothing queued between slices");
+                    assert_eq!(e.phase(), None, "nor the resync started");
+                    assert_eq!(held(e), before, "and the engine reads as before the walk");
+                    walk = more;
+                    slices += 1;
+                }
+                WalkSlice::Done(walked) => break walked,
+            }
+        };
+        let visited: Vec<IpPrefix> = after.routes.iter().map(|(p, _)| *p).collect();
+        assert_eq!(*after.visits.borrow(), visited, "each route once, in order");
+        (e.finish_resync_walk(walked, Some(judge)), slices)
+    };
+
+    let (refused, slices) = in_slices(&mut e, &mut |_| false);
+    let refused = refused.expect_err("the judge refused");
+    assert!(
+        slices >= 5,
+        "four of the source's and the ledger's: {slices}"
+    );
+    assert_eq!(
+        (
+            refused.unchanged,
+            refused.upserts,
+            refused.withdrawals,
+            refused.link_local_refused
+        ),
+        (3, 3, 2, 2),
+        "{refused:?}"
+    );
+    assert!(e.pending().is_empty(), "a refusal queues nothing");
+    assert_eq!(e.phase(), None);
+    assert_eq!(
+        held(&e),
+        (4, 2, 2),
+        "and leaves what the walk rebuilt in place, as one call's refusal does"
+    );
+
+    let one_call = e
+        .begin_resync_judged(&after, &mut |_| false)
+        .expect_err("the judge refused");
+    assert_eq!(refused, one_call, "the plan one call finds");
+
+    let (accepted, _) = in_slices(&mut e, &mut |_| true);
+    let plan = accepted.expect("the judge accepted");
+    assert_eq!(plan, one_call);
+    assert_eq!(
+        e.pending().len() as u64,
+        plan.upserts + plan.withdrawals,
+        "an acceptance queues the whole plan"
+    );
+    assert!(e.phase().is_some(), "and starts the resync");
+    assert!(
+        !fake
+            .drain_events()
+            .iter()
+            .any(|ev| matches!(ev, Event::Route(_))),
+        "no walk sends VPP a route: the drain does"
+    );
+}
+
 /// The generated `Encode` and `Decode` must agree on a reply's
 /// geometry, proven by round-tripping a ping through the fake.
 ///

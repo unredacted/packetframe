@@ -16,6 +16,12 @@ notes are on the [releases page](https://github.com/unredacted/packetframe/relea
 Versions 0.2.8, 0.2.9 and 0.2.10, which some code comments cite, never
 shipped; that work is part of 0.5.0.
 
+## [0.6.1] - UNRELEASED
+
+### Changes
+
+- **A steered keep-vpp restart at full table no longer leaves VPP unpinged while its diff is walked** (vpp-offload). An adopted resync's release walked the whole route mirror, then every prefix of VPP's route ledger, in one pass of the supervision loop, the loop that pings VPP, and the same pass then programmed the neighbours, drained, verified and re-asserted steering. At 1.35M routes on the reference gateway that pass kept a steered VPP unpinged for about 4.9 s, and the journal logged `the supervision loop was away longer than the wedge budget` once, just after `steering UP` (`loop_gap_ms=4886`). The stall was excused, so nothing was torn down, but a VPP that hung in that window would have been noticed only after it. The walk now takes 16,384 routes or ledger prefixes a pass and hands the loop back between them, so VPP is pinged on the usual 500 ms cadence throughout: at 1.35M routes the longest pass fell from 588–719 ms to 32–33 ms in a Linux arm64 measurement, and the release takes no longer. Nothing of the diff is queued before the walk's last slice, so the seeded door's 1% guard still judges the whole walk's plan, `fib-synced` reads `resync deferred` until then, and VPP's FIB is untouched until the diff lands. The doors, the guard, the journal lines and the `resync_released` and `seeded_door_refused` events are unchanged, and every adopted resync release walks this way, by either door, steered or not. The pass that finishes the walk still runs the drain, verify and the re-assert steer, about 0.7 s of the 4.9 s by the gateway's journal, under the 1.5 s wedge budget. See [the steered diff and a seeded mirror](docs/runbooks/vpp-offload.md#the-steered-diff-and-a-seeded-mirror).
+
 ## [0.6.0] - 2026-10-13
 
 The first release since 0.5.0 (2026-09-28). It adds the flow-export module (experimental) and fast-path's `wan-egress`, brings a restart on a full table down from minutes to seconds, and hardens vpp-offload, neigh-snoop and the route feed against the failures a production incident on 2026-10-07 exposed. A 0.5.0 config parses unchanged, but read **Upgrading from 0.5.0** before installing: an `attach` of keepalived's dedicated VRRP link is now refused, and the state directory's ownership rules are stricter.

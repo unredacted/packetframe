@@ -7933,3 +7933,741 @@ fn an_unresolved_addition_counts_though_its_neighbour_arrives_later() {
         .count();
     assert_eq!(adds, 50, "the neighbour learned later installs every one");
 }
+
+/// A steered keep-VPP restart over a table of many resync walk slices
+/// ([`RESYNC_WALK_SLICE`]), through the production feed: daemon A
+/// converges a table onto the fake and stops the preserving way, and
+/// daemon B adopts the still-steered VPP with that ledger over a
+/// `RouteFeed` the fast-path seeded with the mirror's table — the route
+/// source up and streaming, the completeness authority agreeing with the
+/// mirror, so the seeded-mirror door opens on the first pass.
+///
+/// [`RESYNC_WALK_SLICE`]: packetframe_vpp_offload::engine::RESYNC_WALK_SLICE
+mod seeded_at_scale {
+    use super::*;
+    use packetframe_common::fib::ResolvedRouteSink as _;
+    use packetframe_common::fib::{
+        AuthorityObservation, CompletenessReport, FeedSession, TableCompleteness,
+    };
+    use packetframe_vpp_offload::driver::Observe as _;
+    use packetframe_vpp_offload::feed::RouteFeed;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    pub use steered_seeded::nh6;
+
+    /// Every prefix of the IPv4 documentation /24 203.0.113.0/24, /24 to
+    /// /32 (511), then IPv6 /64s from 2001:db8::/32 for the rest: RFC 5737
+    /// holds no full IPv4 table, so the family split is not production's,
+    /// only the size is.
+    pub fn table(n: usize) -> Vec<(IpPrefix, IpAddr)> {
+        let mut table = Vec::with_capacity(n);
+        for len in 24..=32u8 {
+            let step = 1u16 << (32 - len);
+            let mut host = 0u16;
+            while host < 256 && table.len() < n {
+                table.push((
+                    IpPrefix::V4 {
+                        addr: [203, 0, 113, host as u8],
+                        prefix_len: len,
+                    },
+                    fake_vpp::nh(),
+                ));
+                host += step;
+            }
+        }
+        let mut i: u32 = 0;
+        while table.len() < n {
+            table.push((v6(i), nh6()));
+            i += 1;
+        }
+        table
+    }
+
+    /// The `i`th IPv6 /64 of [`table`].
+    pub fn v6(i: u32) -> IpPrefix {
+        let mut addr = [0u8; 16];
+        addr[..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
+        addr[4..8].copy_from_slice(&i.to_be_bytes());
+        IpPrefix::V6 {
+            addr,
+            prefix_len: 64,
+        }
+    }
+
+    const MAC6: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x06];
+
+    /// The production feed, counting the routes walks visit.
+    pub struct Counted {
+        pub feed: Arc<RouteFeed>,
+        pub visited: Arc<AtomicUsize>,
+    }
+    impl RouteSource for Counted {
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            self.feed.for_each_route(&mut |p, nhs| {
+                self.visited.fetch_add(1, Ordering::SeqCst);
+                visit(p, nhs)
+            })
+        }
+        fn for_each_route_from(
+            &self,
+            after: Option<IpPrefix>,
+            max: usize,
+            visit: &mut dyn FnMut(IpPrefix, &[IpAddr]),
+        ) -> Option<IpPrefix> {
+            self.feed.for_each_route_from(after, max, &mut |p, nhs| {
+                self.visited.fetch_add(1, Ordering::SeqCst);
+                visit(p, nhs)
+            })
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            self.feed.for_each_neighbour(visit)
+        }
+        fn drain_changes(&self, max: usize) -> packetframe_vpp_offload::engine::SourceChanges {
+            self.feed.drain_changes(max)
+        }
+        fn requeue(&self, changes: packetframe_vpp_offload::engine::SourceChanges) {
+            self.feed.requeue(changes)
+        }
+        fn requeue_via(&self, nexthops: &[IpAddr]) {
+            self.feed.requeue_via(nexthops)
+        }
+        fn requeue_within(&self, nets: &[IpPrefix]) {
+            self.feed.requeue_within(nets)
+        }
+        fn discard_route_deltas(&self) {
+            self.feed.discard_route_deltas()
+        }
+        fn backlog(&self) -> u64 {
+            self.feed.backlog()
+        }
+        fn backlog_split(&self) -> packetframe_vpp_offload::engine::SourceBacklog {
+            self.feed.backlog_split()
+        }
+        fn route_count(&self) -> u64 {
+            self.feed.route_count()
+        }
+        fn change_seq(&self) -> u64 {
+            self.feed.change_seq()
+        }
+    }
+
+    pub struct Fixture {
+        pub fake: Fake,
+        pub rt: Runtime,
+        pub feed: Arc<RouteFeed>,
+        /// Routes the walks have visited so far.
+        pub visited: Arc<AtomicUsize>,
+        pub session: Arc<FeedSession>,
+        pub log: steered::Log,
+        /// How long daemon A took to converge the table.
+        pub converged_in: Duration,
+    }
+
+    /// Daemon A converges `vpp` and preserves VPP's ledger; daemon B
+    /// adopts the steered VPP with it over a feed holding `mirror`.
+    /// Adopted, so the seeded diff is deferred.
+    pub fn adopted(
+        name: &str,
+        vpp: &[(IpPrefix, IpAddr)],
+        mirror: &[(IpPrefix, IpAddr)],
+        d: &mut Driver,
+    ) -> Fixture {
+        let (ifindex, dev) = local_interface();
+        let fake = Fake::start_behaving(
+            name,
+            Behaviour {
+                track_routes: true,
+                ..Default::default()
+            },
+        );
+        let runtime =
+            |source: Box<dyn RouteSource>,
+             steering: Box<dyn packetframe_vpp_offload::runtime::Steering>,
+             store: Box<dyn packetframe_vpp_offload::runtime::IdentityStore>| {
+                let engine = ConvergenceEngine::new(
+                    &fake.path,
+                    vec![PortAttach {
+                        port: dev.clone(),
+                        pci_addr: "0002:07:00.1".into(),
+                        port_id: 0,
+                        num_rx_queues: 1,
+                        pf_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+                        accept_macs: vec![],
+                        mtu: None,
+                        vlans: vec![],
+                    }],
+                    vec![dev.clone()],
+                    2_000_000,
+                    FamilyPolicy::Both,
+                    packetframe_common::config::Ipv4Prefix {
+                        addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                        prefix_len: 32,
+                    },
+                );
+                Runtime::new(
+                    engine,
+                    source,
+                    steering,
+                    store,
+                    Box::new(NoResources),
+                    "/usr/bin/vpp",
+                    "/tmp/startup.conf",
+                )
+            };
+        let feed_of = |table: &[(IpPrefix, IpAddr)]| {
+            let feed = Arc::new(RouteFeed::new());
+            feed.neighbour_resolved(fake_vpp::nh(), MAC, ifindex);
+            feed.neighbour_resolved(nh6(), MAC6, ifindex);
+            for (p, via) in table {
+                feed.route_resolved(*p, &[*via]);
+            }
+            feed
+        };
+
+        let started = Instant::now();
+        let body = {
+            let captured = Arc::new(Mutex::new(None));
+            let rt = runtime(
+                Box::new(feed_of(vpp)),
+                Box::new(SteeringUnavailable),
+                Box::new(preserved::CaptureStore(captured.clone())),
+            );
+            {
+                let (mut obs, _) = rt.views();
+                assert!(obs.api_ready(), "the fake must answer the handshake");
+            }
+            let mut a = Driver::new();
+            let mut now = Instant::now();
+            {
+                let (_, mut fx) = rt.views();
+                a.inject(now, Event::Adopted { steered: false }, &mut fx);
+            }
+            let (mut obs, mut fx) = rt.views();
+            while a.state() != State::Ready {
+                let t = a.tick(now, &mut obs, &mut fx);
+                for e in rt.take_pending() {
+                    a.inject(now, e, &mut fx);
+                }
+                let _ = fake.drain_events();
+                now += t
+                    .sleep
+                    .unwrap_or(Duration::from_millis(100))
+                    .max(Duration::from_millis(1));
+            }
+            rt.preserve(a.state())
+                .expect("a converged ledger preserves");
+            let body = captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the ledger was left");
+            body
+        };
+        assert_eq!(body.entries.len(), vpp.len(), "daemon A installed it all");
+        let converged_in = started.elapsed();
+        let _ = fake.drain_events();
+
+        let feed = feed_of(mirror);
+        let visited = Arc::new(AtomicUsize::new(0));
+        let log: steered::Log = Arc::new(Mutex::new(Vec::new()));
+        let rt = runtime(
+            Box::new(Counted {
+                feed: feed.clone(),
+                visited: visited.clone(),
+            }),
+            Box::new(steered::RecordingSteering {
+                rules: vec![("eth4".into(), 1)],
+                log: log.clone(),
+            }),
+            Box::new(NullStore),
+        );
+        let session = Arc::new(FeedSession::new());
+        // Before the route source can connect, as the fast-path does.
+        session.mark_mirror_seeded();
+        rt.feed_session(session.clone());
+        let authority = Arc::new(TableCompleteness::new());
+        rt.require_table_complete(authority.clone());
+        rt.seed_ledger(preserved::record(body));
+        {
+            let (mut obs, _) = rt.views();
+            assert!(obs.api_ready(), "the fake must answer the handshake");
+        }
+        {
+            let (_, mut fx) = rt.views();
+            d.inject(Instant::now(), Event::Adopted { steered: true }, &mut fx);
+        }
+        rt.set_steered(true);
+        assert_eq!(d.state(), State::AdoptedResyncing);
+        assert!(rt.status().resync_deferred.is_some(), "the diff deferred");
+        session.set_up(true);
+        let n = mirror.len() as u64;
+        authority.record(AuthorityObservation::Clean(CompletenessReport {
+            authority_routes: n,
+            mirror_routes: n,
+            at: Instant::now(),
+        }));
+        Fixture {
+            fake,
+            rt,
+            feed,
+            visited,
+            session,
+            log,
+            converged_in,
+        }
+    }
+
+    /// The v6 route ops the fake saw in `events`: (add, prefix).
+    pub fn route_ops6(events: &[fake_vpp::Event]) -> Vec<(bool, [u8; 16])> {
+        let mut v: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                fake_vpp::Event::Route(r) if r.is_ip6 => Some((r.is_add, r.addr16)),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    pub fn addr16(p: IpPrefix) -> [u8; 16] {
+        match p {
+            IpPrefix::V6 { addr, .. } => addr,
+            IpPrefix::V4 { .. } => unreachable!("a v6 route"),
+        }
+    }
+}
+
+/// The steered seeded release at a table of several walk slices hands the
+/// supervision loop back after every slice: no pass walks more than one,
+/// the walk spans the passes in between, the loop pings VPP during it, and
+/// nothing of the diff reaches VPP until the walk is done — then the
+/// release lands as it always has, steering up throughout. Each pass is
+/// taken as a ping interval of the loop's clock — a host on which the
+/// whole walk takes seconds, as the gateway's did (2026-10-13) — so the
+/// loop owes VPP a ping on every one of them.
+#[test]
+fn a_steered_seeded_release_walks_a_slice_a_pass_and_pings_in_between() {
+    use packetframe_vpp_offload::engine::RESYNC_WALK_SLICE;
+    use seeded_at_scale::*;
+    use std::sync::atomic::Ordering;
+    let n = 3 * RESYNC_WALK_SLICE + 100;
+    let vpp = table(n);
+    // The source dropped a route the stop caught still in VPP, early in
+    // the walk, and holds one VPP was not sent yet, at its end: two, well
+    // inside the guard's allowance.
+    let mut mirror = vpp.clone();
+    let (gone, _) = mirror.remove(600);
+    let late = v6(n as u32 + 1);
+    mirror.push((late, nh6()));
+    let mut d = Driver::new();
+    let f = adopted("scale-slices", &vpp, &mirror, &mut d);
+
+    /// One pass: routes walked, pings VPP answered, route ops it saw,
+    /// and whether the diff was still deferred after it.
+    struct Pass {
+        walked: usize,
+        pings: usize,
+        ops: Vec<(bool, [u8; 16])>,
+        deferred: bool,
+    }
+    let (mut obs, mut fx) = f.rt.views();
+    let mut now = Instant::now();
+    let mut passes: Vec<Pass> = Vec::new();
+    while d.state() != State::Steered {
+        assert!(passes.len() < 1_000, "no steer within a thousand passes");
+        f.session.pulse_n(200);
+        let walked = f.visited.load(Ordering::SeqCst);
+        let t = d.tick(now, &mut obs, &mut fx);
+        for e in f.rt.take_pending() {
+            d.inject(now, e, &mut fx);
+        }
+        f.rt.set_steered(d.supervisor().is_steered());
+        let events = f.fake.drain_events();
+        passes.push(Pass {
+            walked: f.visited.load(Ordering::SeqCst) - walked,
+            pings: events
+                .iter()
+                .filter(|e| matches!(e, fake_vpp::Event::Msg(m) if m == "control_ping"))
+                .count(),
+            ops: route_ops6(&events),
+            deferred: f.rt.status().resync_deferred.is_some(),
+        });
+        let _ = t;
+        now += packetframe_vpp_offload::liveness::PING_INTERVAL;
+    }
+
+    assert!(
+        passes.iter().all(|p| p.walked <= RESYNC_WALK_SLICE),
+        "one slice a pass at most: {:?}",
+        passes.iter().map(|p| p.walked).collect::<Vec<_>>()
+    );
+    let first = passes
+        .iter()
+        .position(|p| p.walked > 0)
+        .expect("the release walked");
+    let done = passes
+        .iter()
+        .position(|p| !p.deferred)
+        .expect("the release finished");
+    assert_eq!(
+        passes.iter().map(|p| p.walked).sum::<usize>(),
+        mirror.len(),
+        "one walk of the whole mirror"
+    );
+    // The mirror's routes, then the ledger's prefixes, a slice's worth a
+    // pass across both.
+    let slices = (mirror.len() + vpp.len()).div_ceil(RESYNC_WALK_SLICE);
+    assert_eq!(done - first + 1, slices, "the walk spans a pass a slice");
+    // Between the pass that began the walk (whose seed re-check ends its
+    // requests with pings of their own) and the one that finished it
+    // (likewise the neighbours, the drain and verify), nothing but the
+    // walk and the liveness probe.
+    assert!(
+        passes[first + 1..done].iter().all(|p| p.pings == 1),
+        "the loop pings VPP on every pass the release walks: {:?}",
+        passes[first..=done]
+            .iter()
+            .map(|p| p.pings)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        passes[..done].iter().all(|p| p.ops.is_empty()),
+        "nothing of the diff reaches VPP before the walk is done"
+    );
+    let ops: Vec<_> = passes.iter().flat_map(|p| p.ops.clone()).collect();
+    let mut want = vec![(false, addr16(gone)), (true, addr16(late))];
+    want.sort_unstable();
+    assert_eq!(ops, want, "the diff is what it always was");
+    assert_eq!(
+        f.log.lock().unwrap().as_slice(),
+        &["steer"],
+        "steering never came down"
+    );
+    assert!(f.rt.status().seeded_door_refused.is_none());
+    assert_eq!(f.feed.stats().pending, 0, "the replay's deltas applied");
+}
+
+/// The seeded door's guard judges the whole walk's diff, however many
+/// slices it took: a withdrawal in every slice of the route source, each
+/// alone far inside the 1% allowance and together one past it, shuts the
+/// door, queues nothing and leaves VPP untouched, steering up, until the
+/// replay goes quiet — the guard as it was, at a table it now walks in
+/// slices.
+#[test]
+fn the_seeded_door_guard_judges_the_diff_of_every_slice() {
+    use packetframe_vpp_offload::engine::RESYNC_WALK_SLICE;
+    use packetframe_vpp_offload::runtime::IpFamily;
+    use seeded_at_scale::*;
+    let n = 3 * RESYNC_WALK_SLICE + 100;
+    let vpp = table(n);
+    let adopted_v6 = (n - 511) as u64;
+    let allowance = adopted_v6 / 100;
+    // One past the allowance, spread evenly through the table.
+    let over = allowance as usize + 1;
+    let stride = (n - 511) / over;
+    let gone: Vec<usize> = (0..over).map(|k| 511 + k * stride).collect();
+    let mirror: Vec<_> = vpp
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !gone.contains(i))
+        .map(|(_, r)| *r)
+        .collect();
+    let mut d = Driver::new();
+    let f = adopted("scale-guard", &vpp, &mirror, &mut d);
+    let (mut obs, mut fx) = f.rt.views();
+    let mut now = Instant::now();
+    for _ in 0..200 {
+        f.session.pulse_n(200);
+        let t = d.tick(now, &mut obs, &mut fx);
+        for e in f.rt.take_pending() {
+            d.inject(now, e, &mut fx);
+        }
+        now += t
+            .sleep
+            .unwrap_or(Duration::from_millis(100))
+            .max(Duration::from_millis(1));
+    }
+    let refused =
+        f.rt.status()
+            .seeded_door_refused
+            .expect("the guard refused the walk's diff");
+    assert_eq!(
+        (
+            refused.family,
+            refused.adopted,
+            refused.withdrawals,
+            refused.allowance
+        ),
+        (IpFamily::V6, adopted_v6, over as u64, allowance)
+    );
+    assert_eq!(d.state(), State::AdoptedResyncing);
+    assert_eq!(f.rt.status().pending_ops, 0, "nothing of it queued");
+    assert!(
+        route_ops6(&f.fake.drain_events()).is_empty(),
+        "nothing of it reached VPP"
+    );
+    assert!(f.log.lock().unwrap().is_empty(), "steering untouched");
+}
+
+/// What a steered keep-VPP restart's seeded release holds the supervision
+/// loop for, at full table: the restart that logged the loop-gap warning
+/// right after `steering UP` on the reference gateway (2026-10-13:
+/// `loop_gap_ms=4886` at 1.35M routes).
+///
+/// The loop runs on the REAL clock the way `service::run_loop` does: tick,
+/// inject what the tick left pending, read the status (the publish), sleep
+/// what the tick allows. Each pass's gap is measured as the driver
+/// measures it — from the previous pass, less the time spent on VPP's
+/// socket — and the longest is printed with the steps inside it.
+#[test]
+#[ignore = "measurement; set PF_MEASURE_SEEDED_RELEASE=1 (PF_MEASURE_ROUTES overrides 1.35M)"]
+fn measure_steered_seeded_release_at_full_table() {
+    use packetframe_vpp_offload::driver::{Drain, Observe};
+    use packetframe_vpp_offload::executor::{Effects, StepError};
+    use packetframe_vpp_offload::process::Disposition;
+    use packetframe_vpp_offload::runtime::SteerOutcome;
+    use std::cell::RefCell;
+
+    if std::env::var("PF_MEASURE_SEEDED_RELEASE").is_err() {
+        eprintln!("skipped: set PF_MEASURE_SEEDED_RELEASE=1 to measure");
+        return;
+    }
+    let n: usize = std::env::var("PF_MEASURE_ROUTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_350_000);
+    let table = seeded_at_scale::table(n);
+    let mut d = Driver::new();
+    let f = seeded_at_scale::adopted("ss-scale", &table, &table, &mut d);
+    drop(table);
+
+    // The steps one pass ran, by name: wall time, and the part of it spent
+    // on VPP's socket.
+    type Spans = RefCell<Vec<(&'static str, Duration, Duration)>>;
+    struct TimedObs<'a> {
+        inner: &'a mut dyn Observe,
+        spans: &'a Spans,
+    }
+    impl TimedObs<'_> {
+        fn timed<T>(&mut self, name: &'static str, f: impl FnOnce(&mut dyn Observe) -> T) -> T {
+            let (t, w) = (Instant::now(), self.inner.api_wait());
+            let r = f(&mut *self.inner);
+            let waited = self.inner.api_wait().saturating_sub(w);
+            self.spans.borrow_mut().push((name, t.elapsed(), waited));
+            r
+        }
+    }
+    impl Observe for TimedObs<'_> {
+        fn poll_exit(&mut self) -> Option<Option<i32>> {
+            self.inner.poll_exit()
+        }
+        fn api_ready(&mut self) -> bool {
+            self.timed("api_ready", |o| o.api_ready())
+        }
+        fn ping(&mut self) -> Result<(), String> {
+            self.timed("ping", |o| o.ping())
+        }
+        fn api_wait(&self) -> Duration {
+            self.inner.api_wait()
+        }
+        fn api_error(&self) -> Option<String> {
+            self.inner.api_error()
+        }
+        fn api_answers(&self) -> u64 {
+            self.inner.api_answers()
+        }
+        fn steer_permitted(&mut self, steered: bool) -> bool {
+            self.timed("steer_permitted", |o| o.steer_permitted(steered))
+        }
+        fn fib_empty(&mut self) -> bool {
+            self.inner.fib_empty()
+        }
+        fn drain_batch(&mut self, now: Instant) -> Result<Drain, StepError> {
+            self.timed("drain_batch", |o| o.drain_batch(now))
+        }
+        fn last_drain_took(&self) -> Duration {
+            self.inner.last_drain_took()
+        }
+        fn convergence_budget(&mut self) -> Duration {
+            self.inner.convergence_budget()
+        }
+        fn poll_reverify(&mut self, now: Instant) {
+            self.timed("poll_reverify", |o| o.poll_reverify(now))
+        }
+    }
+    struct TimedFx<'a> {
+        inner: &'a mut dyn Effects,
+        obs: &'a dyn Observe,
+        spans: &'a Spans,
+    }
+    impl TimedFx<'_> {
+        fn timed<T>(&mut self, name: &'static str, f: impl FnOnce(&mut dyn Effects) -> T) -> T {
+            let (t, w) = (Instant::now(), self.obs.api_wait());
+            let r = f(&mut *self.inner);
+            let waited = self.obs.api_wait().saturating_sub(w);
+            self.spans.borrow_mut().push((name, t.elapsed(), waited));
+            r
+        }
+    }
+    impl Effects for TimedFx<'_> {
+        fn spawn(&mut self) -> Result<(), String> {
+            self.timed("spawn", |f| f.spawn())
+        }
+        fn unsteer(&mut self) -> Result<(), String> {
+            self.timed("unsteer", |f| f.unsteer())
+        }
+        fn steer(&mut self) -> Result<SteerOutcome, String> {
+            self.timed("steer", |f| f.steer())
+        }
+        fn restore_steer(&mut self) -> Result<SteerOutcome, String> {
+            self.timed("restore_steer", |f| f.restore_steer())
+        }
+        fn steering_in_place(&self) -> bool {
+            self.inner.steering_in_place()
+        }
+        fn kill(&mut self) -> Disposition {
+            self.timed("kill", |f| f.kill())
+        }
+        fn attach_devices(&mut self) -> Result<(), StepError> {
+            self.timed("attach_devices", |f| f.attach_devices())
+        }
+        fn start_resync(&mut self) -> Result<(), StepError> {
+            self.timed("start_resync", |f| f.start_resync())
+        }
+        fn start_verify(&mut self) -> Result<(), StepError> {
+            self.timed("start_verify", |f| f.start_verify())
+        }
+        fn abort_convergence(&mut self) {
+            self.timed("abort_convergence", |f| f.abort_convergence())
+        }
+        fn arm_backoff(&mut self, delay: Duration) {
+            self.inner.arm_backoff(delay)
+        }
+        fn release_resources(&mut self) -> Result<(), String> {
+            self.timed("release_resources", |f| f.release_resources())
+        }
+    }
+
+    // One pass: when it began, how long it ran and waited on VPP, the
+    // steps inside it, and what it did.
+    struct Pass {
+        at: Instant,
+        took: Duration,
+        waited: Duration,
+        spans: Vec<(&'static str, Duration, Duration)>,
+        events: Vec<Event>,
+    }
+    let (mut obs, mut fx) = f.rt.views();
+    // A second view on the same runtime, for the socket clock while the
+    // first is lent to the tick.
+    let (probe, _) = f.rt.views();
+    let spans: Spans = RefCell::new(Vec::new());
+    let mut passes: Vec<Pass> = Vec::new();
+    let release_started = Instant::now();
+    let deadline = release_started + Duration::from_secs(600);
+    // One pass past the steer: the one whose gap the driver judges.
+    let mut steered_at: Option<usize> = None;
+    while steered_at.is_none_or(|i| passes.len() <= i + 1) {
+        assert!(Instant::now() < deadline, "no steer within ten minutes");
+        // The route source replaying its table, as through the whole
+        // release on the gateway.
+        f.session.pulse_n(200);
+        let now = Instant::now();
+        let waited_before = obs.api_wait();
+        let mut events = Vec::new();
+        let t = {
+            let mut tobs = TimedObs {
+                inner: &mut obs,
+                spans: &spans,
+            };
+            let mut tfx = TimedFx {
+                inner: &mut fx,
+                obs: &probe,
+                spans: &spans,
+            };
+            d.tick(now, &mut tobs, &mut tfx)
+        };
+        events.extend(t.events.clone());
+        for e in f.rt.take_pending() {
+            let mut tfx = TimedFx {
+                inner: &mut fx,
+                obs: &probe,
+                spans: &spans,
+            };
+            events.extend(d.inject(Instant::now(), e, &mut tfx).events);
+        }
+        f.rt.set_steered(d.supervisor().is_steered());
+        let published = Instant::now();
+        let _ = f.rt.status();
+        spans
+            .borrow_mut()
+            .push(("status", published.elapsed(), Duration::ZERO));
+        let _ = f.fake.drain_events();
+        passes.push(Pass {
+            at: now,
+            took: now.elapsed(),
+            waited: obs.api_wait().saturating_sub(waited_before),
+            spans: std::mem::take(&mut *spans.borrow_mut()),
+            events,
+        });
+        if steered_at.is_none() && d.state() == State::Steered {
+            steered_at = Some(passes.len() - 1);
+        }
+        match t.sleep {
+            Some(s) if s.is_zero() => {}
+            Some(s) => std::thread::sleep(s.min(Duration::from_millis(50))),
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let last = &passes[steered_at.expect("steered")];
+    let total = (last.at + last.took) - release_started;
+    assert_eq!(
+        f.log.lock().unwrap().as_slice(),
+        &["steer"],
+        "never unsteered"
+    );
+
+    // The driver's own loop gap: pass to pass, less the socket's share.
+    let gaps: Vec<Duration> = passes
+        .windows(2)
+        .map(|w| {
+            w[1].at
+                .saturating_duration_since(w[0].at)
+                .saturating_sub(w[0].waited)
+        })
+        .collect();
+    let worst = (0..gaps.len()).max_by_key(|&i| gaps[i]).unwrap_or(0);
+    let longest = &passes[worst];
+    let over_budget = gaps
+        .iter()
+        .filter(|g| **g > packetframe_vpp_offload::liveness::PING_BUDGET)
+        .count();
+    let mut sorted = gaps.clone();
+    sorted.sort_unstable();
+    let median = sorted.get(sorted.len() / 2).copied().unwrap_or_default();
+    let mut by_step: Vec<(&'static str, Duration, Duration, usize)> = Vec::new();
+    for (name, took, waited) in &longest.spans {
+        match by_step.iter_mut().find(|(n, ..)| n == name) {
+            Some(e) => {
+                e.1 += *took;
+                e.2 += *waited;
+                e.3 += 1;
+            }
+            None => by_step.push((name, *took, *waited, 1)),
+        }
+    }
+    println!(
+        "{n} routes ({} v4), daemon A converged in {:?}; release to Steered: {total:?} over \
+         {} passes, {over_budget} gap(s) past the steered budget, median gap {median:?}; \
+         longest gap {:?} (pass took {:?}, {:?} of it on VPP's socket, events {:?}); its \
+         steps (wall, socket, calls): {by_step:?}",
+        511.min(n),
+        f.converged_in,
+        passes.len(),
+        gaps.get(worst).copied().unwrap_or_default(),
+        longest.took,
+        longest.waited,
+        longest.events,
+    );
+}

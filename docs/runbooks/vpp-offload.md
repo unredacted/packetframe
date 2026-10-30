@@ -1180,6 +1180,23 @@ not lost: none applies while the diff waits, and the walk that
 eventually runs (the quiet door's, or the dump path's) reads the mirror
 as it then is.
 
+**The walk takes a slice a pass.** It reads the whole mirror and then
+every prefix of VPP's ledger, about 4 s at 1.35M routes on the reference
+gateway's cores, on the supervision loop: the loop that pings VPP. So it
+takes 16,384 routes or ledger prefixes a pass and hands the loop back
+between them, tens of milliseconds a slice there, and VPP is pinged on
+the usual 500 ms cadence throughout. Nothing of the diff is queued
+before the last slice, so the guard still judges the whole walk's plan,
+and until then `fib-synced` reads `resync deferred` and VPP's FIB is
+untouched. The pass that finishes the walk also runs the drain, verify
+and the re-assert steer, as the release always has. Every adopted
+resync release walks this way, by either door, steered or not. Up to
+0.6.0 the walk ran in one pass, so a steered restart at full table
+logged `the supervision loop was away longer than the wedge budget`
+once, just after `steering UP` (`loop_gap_ms` about 4900 at 1.35M
+routes). That stall was excused and tore nothing down, but VPP went
+unpinged for those seconds while steered.
+
 **What still waits for quiet:** a mirror that loaded from empty, no
 `require-table-complete`, a route source that reconnected, a seed the
 route source's GC has already reconciled, and a refused diff.
