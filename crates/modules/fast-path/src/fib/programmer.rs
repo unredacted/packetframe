@@ -1019,6 +1019,15 @@ pub struct FibProgrammer {
     /// The live route source has delivered its first route since the
     /// seed.
     seed_stream_started: bool,
+    /// The completeness handle the second tier steers by, when there is
+    /// one: a preserving stop's ledger records whether its word was yes
+    /// for the mirror written ([`LedgerMeta::attested`]). `None` in
+    /// harnesses and without a second tier.
+    completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
+    /// The feed session the second tier reads, told when a seed is whole
+    /// ([`packetframe_common::fib::FeedSession::mark_seed_whole`]). `None`
+    /// in harnesses and without a second tier.
+    feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
 }
 
 /// A seed being applied: the validated ledger, how far in, and what it
@@ -1075,6 +1084,8 @@ pub struct EncodedLedger {
     pub counts: LedgerCounts,
     /// See [`LedgerMeta::confirmed_at_unix`].
     pub confirmed_at_unix: u64,
+    /// See [`LedgerMeta::attested`].
+    pub attested: bool,
     /// Time the programmer spent building it.
     pub took: Duration,
 }
@@ -1234,6 +1245,8 @@ impl FibProgrammer {
                 ledger_status: None,
                 seed_open: false,
                 seed_stream_started: false,
+                completeness: None,
+                feed_session: None,
             },
             FibProgrammerHandle { tx: cmd_tx },
         )
@@ -1265,6 +1278,20 @@ impl FibProgrammer {
     /// caller has already recorded there) through `status`.
     pub fn set_ledger_status(&mut self, status: SharedLedgerStatus) {
         self.ledger_status = Some(status);
+    }
+
+    /// The second tier's handles: what a preserving stop consults to
+    /// record whether the authority vouched for the mirror it writes, and
+    /// where a whole seed is reported. Same window as
+    /// [`Self::set_route_sink`], so a seed already applied cannot have
+    /// gone unreported.
+    pub fn set_second_tier(
+        &mut self,
+        completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
+        feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
+    ) {
+        self.completeness = completeness;
+        self.feed_session = feed_session;
     }
 
     /// Register the second forwarding tier's sink.
@@ -1581,6 +1608,18 @@ impl FibProgrammer {
              table while the route source replays it; its re-advertisements confirm each \
              route and its InitiationComplete removes what it no longer has"
         );
+        // Whole: its writer's authority vouched for it, and every
+        // advertisement went in and installed. Only then may it stand in
+        // for the authority's count while the authority cannot count (a
+        // fresh VPP's seeded door). A seed that stopped short or failed an
+        // install is the table it was minus what is missing, and the door
+        // waits for the authority instead.
+        let whole = meta.attested && p.advertisements >= counts.advertisements() && p.failed == 0;
+        if whole {
+            if let Some(h) = &self.feed_session {
+                h.mark_seed_whole();
+            }
+        }
         let mut ev = packetframe_common::events::Event::info(
             crate::MODULE_NAME,
             packetframe_common::events::kind::ROUTE_LEDGER_SEEDED,
@@ -1590,7 +1629,8 @@ impl FibProgrammer {
         .field("advertisements", p.advertisements)
         .field("age_secs", age)
         .field("writer_version", meta.writer_version.clone())
-        .field("took_ms", took.as_millis() as u64);
+        .field("took_ms", took.as_millis() as u64)
+        .field("attested", meta.attested);
         if p.failed > 0 {
             ev = ev.field("failed", p.failed);
         }
@@ -1598,10 +1638,19 @@ impl FibProgrammer {
         if let Some(status) = &self.ledger_status {
             let mut st = status.lock().expect("ledger status lock");
             st.start = StartReport::Seeded;
+            // The start recorded the max-age it judged the ledger against;
+            // the programmer does not know it. Without a start's report
+            // (harnesses) the default stands in.
+            let max_age_secs = st.seed.as_ref().map_or(
+                packetframe_common::config::ROUTE_LEDGER_DEFAULT_MAX_AGE_SECS,
+                |s| s.max_age_secs,
+            );
             st.seed = Some(SeedReport {
                 writer_version: meta.writer_version.clone(),
                 written_at_unix: meta.written_at_unix,
                 confirmed_at_unix: meta.confirmed_at_unix,
+                attested: meta.attested,
+                max_age_secs,
                 counts,
                 applied_at: Some(Instant::now()),
                 apply_took: Some(took),
@@ -1609,6 +1658,7 @@ impl FibProgrammer {
                 unconfirmed: self.unseen_session,
                 stream_started_at: None,
                 reconciled: None,
+                gc_held: None,
             });
         }
     }
@@ -1767,10 +1817,21 @@ impl FibProgrammer {
         } else {
             written_at_unix
         };
+        // Against the whole mirror, which is what the authority's report
+        // compared: its `mirror_routes` is `MirrorCounts`. A report
+        // retained across the stop's own session loss still counts (the
+        // mirror keeps every route a `Resync` marks); one that no longer
+        // describes the mirror's size — a GC since removed much of it —
+        // does not.
+        let attested = self
+            .completeness
+            .as_ref()
+            .is_some_and(|h| h.attests((self.routes_v4.len() + self.routes_v6.len()) as u64));
         let meta = LedgerMeta {
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
             written_at_unix,
             confirmed_at_unix,
+            attested,
             identity,
         };
         let mut enc = LedgerEncoder::new(&meta, counts, &peers, &nexthops);
@@ -1826,6 +1887,7 @@ impl FibProgrammer {
             bytes,
             counts,
             confirmed_at_unix,
+            attested,
             took: started.elapsed(),
         })
     }

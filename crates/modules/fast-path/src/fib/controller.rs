@@ -38,7 +38,7 @@ use crate::fib::netlink_neigh::{
 };
 use crate::fib::programmer::{FibProgrammer, FibProgrammerHandle, ProgrammerError};
 use crate::fib::route_ledger::{RouteLedger, SharedLedgerStatus};
-use crate::fib::route_source_bgp::{BgpListener, BgpListenerConfig};
+use crate::fib::route_source_bgp::{BgpListener, BgpListenerConfig, SeedGcHold};
 use crate::fib::route_source_bmp::BmpStation;
 use packetframe_common::config::IntegrityAuthoritySpec;
 
@@ -282,6 +282,8 @@ pub enum Preserved {
         /// carry an older confirmation time than the write.
         confirmed_at_unix: u64,
         written_at_unix: u64,
+        /// See [`crate::fib::route_ledger::LedgerMeta::attested`].
+        attested: bool,
         encode: Duration,
         write: Duration,
     },
@@ -432,6 +434,7 @@ impl RouteController {
         // than racing it. After the sink, so the second tier hears every
         // seeded route like any other install.
         programmer.set_ledger_status(ledger_status.clone());
+        programmer.set_second_tier(completeness.clone(), feed_session.clone());
         if let Some(seed) = seed {
             programmer.set_seed(seed);
             // Told to the second tier before the route source can
@@ -656,6 +659,17 @@ impl RouteController {
                 let prog = prog_handle.clone();
                 let shut = shutdown_token.clone();
                 let stall = snapshot.clone();
+                // Only the FRR authority reads the upstreams FRR learns its
+                // table from, so only it can say when a seed's GC may run;
+                // with any other there is nothing to hold for, and the GC
+                // runs at End-of-RIB as it always has.
+                let seed_gc_hold =
+                    matches!(integrity_authority, IntegrityAuthoritySpec::Frr { .. }).then(|| {
+                        SeedGcHold {
+                            ledger: ledger_status.clone(),
+                            authority: snapshot.clone(),
+                        }
+                    });
                 tasks.push(runtime.spawn(async move {
                     let mut backoff = LISTENER_BACKOFF_INITIAL;
                     loop {
@@ -670,8 +684,12 @@ impl RouteController {
                                 warn!(error = %e, addr = %a, "anyip: re-ensure failed");
                             }
                         }
-                        let listener = BgpListener::new(cfg.clone(), prog.clone(), shut.clone())
-                            .with_stall_gate(stall.clone());
+                        let mut listener =
+                            BgpListener::new(cfg.clone(), prog.clone(), shut.clone())
+                                .with_stall_gate(stall.clone());
+                        if let Some(hold) = &seed_gc_hold {
+                            listener = listener.with_seed_gc_hold(hold.clone());
+                        }
                         // (The flushed-while-BOUND case is covered by
                         // the reconcile task spawned below, not this
                         // loop — a bound listener gives no exit signal
@@ -847,10 +865,11 @@ impl RouteController {
                 PRESERVE_BUDGET.as_secs()
             ));
         }
-        let (counts, bytes, confirmed_at_unix) = (
+        let (counts, bytes, confirmed_at_unix, attested) = (
             encoded.counts,
             encoded.bytes.len(),
             encoded.confirmed_at_unix,
+            encoded.attested,
         );
         let started = Instant::now();
         if let Err(e) = write_within(state_dir, encoded.bytes, remaining) {
@@ -861,6 +880,7 @@ impl RouteController {
             bytes,
             confirmed_at_unix,
             written_at_unix,
+            attested,
             encode,
             write: started.elapsed(),
         }

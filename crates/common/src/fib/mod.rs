@@ -481,6 +481,16 @@ pub enum AuthorityObservation {
     Clean(CompletenessReport),
     /// Read, and something disqualifies the mirror.
     Disqualified(Revocation),
+    /// Read in full, and the one thing disqualifying the mirror is that
+    /// declared upstreams have not finished loading for their current
+    /// session: every reading answered, nothing narrows the export, no
+    /// session moved, the feed's families are declared and a seed has
+    /// been spoken to. A disqualification like any other for the verdict
+    /// (the revocation is recorded and sticky). What it adds is
+    /// [`TableCompleteness::loading_only`], for the one consumer that may
+    /// act on a mirror whose authority is still filling: a fresh VPP
+    /// over a route-ledger seed (vpp-offload's seeded fresh door).
+    Loading(Revocation),
     /// Could not be read at all — a timeout, unparseable output. Says
     /// nothing about the mirror either way.
     Unreadable,
@@ -492,6 +502,13 @@ struct CompletenessState {
     /// Sticky. Survives every observation that is not a clean,
     /// converged one.
     revoked: Option<Revocation>,
+    /// When the most recent READABLE observation was
+    /// [`AuthorityObservation::Loading`]. Not sticky, unlike `revoked`:
+    /// any other readable observation clears it, because it claims
+    /// something about the latest reading and nothing older. An
+    /// unreadable one leaves it, as it leaves everything, and the
+    /// consumer ages it.
+    loading_at: Option<std::time::Instant>,
 }
 
 /// Where the route mirror publishes how complete it is, for the second
@@ -557,17 +574,67 @@ impl TableCompleteness {
                     Completeness::Converged { .. }
                 );
                 st.report = Some(report);
+                st.loading_at = None;
                 if converged {
                     st.revoked = None;
                 }
             }
-            AuthorityObservation::Disqualified(r) => st.revoked = Some(r),
+            AuthorityObservation::Disqualified(r) => {
+                st.revoked = Some(r);
+                st.loading_at = None;
+            }
+            AuthorityObservation::Loading(r) => {
+                st.revoked = Some(r);
+                st.loading_at = Some(std::time::Instant::now());
+            }
             // Deliberately nothing. An observation failure is not
             // evidence about the mirror, so the previous report stands
             // under the ordinary age policy — and a standing revocation
             // stands too.
             AuthorityObservation::Unreadable => {}
         }
+    }
+
+    /// When the most recent readable observation found the declared
+    /// upstreams still loading and nothing else wrong
+    /// ([`AuthorityObservation::Loading`]), or `None` when it found
+    /// anything else, or nothing has been read.
+    ///
+    /// Not a verdict and not permission: the verdict over such an
+    /// observation is `Ineligible`, and `permits_steering` stays false.
+    /// It is the narrower fact one consumer needs, which the sticky
+    /// revocation cannot give it. A clean observation whose counts
+    /// disagree leaves the loading revocation standing (only a
+    /// converged one clears it), so reading "still loading" off the
+    /// verdict would read a count mismatch as loading. This answers for
+    /// the latest reading only.
+    pub fn loading_only(&self) -> Option<std::time::Instant> {
+        self.0.read().expect("completeness lock").loading_at
+    }
+
+    /// Whether the authority's CURRENT word is yes for a mirror of
+    /// `mirror_now` routes: the verdict permits steering AND the report
+    /// it came from still describes a mirror that size, under the same
+    /// drift bound the verdict enforces. The verdict alone is not
+    /// enough, because a report may be up to `STEER_MAX_REPORT_AGE` old
+    /// and the mirror can have moved since: a GC that removed most of it
+    /// would still read `Converged`.
+    ///
+    /// One read for both halves — the verdict and the report it came from
+    /// have to describe the SAME sample, or a publish landing between two
+    /// separate reads recomputes one report's drift against another
+    /// report's verdict.
+    pub fn attests(&self, mirror_now: u64) -> bool {
+        let (report, verdict) = self.latest_verdict();
+        verdict.permits_steering()
+            && report.is_some_and(|r| {
+                CompletenessReport {
+                    mirror_routes: mirror_now,
+                    ..r
+                }
+                .drift()
+                .is_some_and(|d| d <= STEER_MAX_DRIFT)
+            })
     }
 
     /// Deliberately **no** `revocation()` accessor.
@@ -679,6 +746,10 @@ pub struct FeedLiveness {
     /// stale-route GC has run since. See
     /// [`FeedSession::mark_mirror_seeded`].
     pub mirror_seeded: bool,
+    /// That seed was attested complete by the process that wrote it and
+    /// has been applied in full. Never without `mirror_seeded`. See
+    /// [`FeedSession::mark_seed_whole`].
+    pub seed_whole: bool,
 }
 
 impl FeedSession {
@@ -705,8 +776,15 @@ impl FeedSession {
     /// reads it with the liveness it is judged alongside.
     const MIRROR_SEEDED_BIT: u64 = 1 << 2;
 
-    /// The epoch occupies the remaining 61 bits.
-    const EPOCH_SHIFT: u32 = 3;
+    /// Bit 3 of `state`: the seed [`Self::MIRROR_SEEDED_BIT`] reports is
+    /// WHOLE — the process that wrote the ledger had its completeness
+    /// authority's current word for it, and this one applied every route
+    /// of it. A refinement of that bit, so it lives and dies with it: the
+    /// first GC clears both.
+    const SEED_WHOLE_BIT: u64 = 1 << 3;
+
+    /// The epoch occupies the remaining 60 bits.
+    const EPOCH_SHIFT: u32 = 4;
 
     pub fn new() -> Self {
         Self::default()
@@ -737,7 +815,7 @@ impl FeedSession {
                     reconciled = false;
                 }
                 (epoch << Self::EPOCH_SHIFT)
-                    | (cur & Self::MIRROR_SEEDED_BIT)
+                    | (cur & (Self::MIRROR_SEEDED_BIT | Self::SEED_WHOLE_BIT))
                     | if reconciled { Self::RECONCILED_BIT } else { 0 }
                     | u64::from(up)
             },
@@ -759,6 +837,35 @@ impl FeedSession {
             .fetch_or(Self::MIRROR_SEEDED_BIT, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// The seed is whole: the ledger's writer recorded that its
+    /// completeness authority's current word was yes for the mirror it
+    /// wrote, and the programmer has applied every advertisement of it
+    /// without a failed install. Set by the programmer when it finishes
+    /// the seed, and only over a seed still unreconciled: a GC that won
+    /// the race has already removed what this would vouch for. Cleared
+    /// with [`Self::MIRROR_SEEDED_BIT`] by the first
+    /// [`Self::mark_reconciled`].
+    ///
+    /// What it adds to `mirror_seeded`: a seed can be partial and still
+    /// pass every check a start makes — a clean stop during a cold load,
+    /// or during the refill after an early End-of-RIB, writes the table
+    /// it had. A consumer that must not act on a partial table before the
+    /// authority can count it (vpp-offload's seeded fresh door) needs this
+    /// bit, not that one.
+    pub fn mark_seed_whole(&self) {
+        self.state.update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| {
+                if cur & Self::MIRROR_SEEDED_BIT != 0 {
+                    cur | Self::SEED_WHOLE_BIT
+                } else {
+                    cur
+                }
+            },
+        );
+    }
+
     /// The session owner reports that the stale-route GC has completed
     /// for the current epoch — for BGP and BMP, a successful
     /// [`RouteEvent::InitiationComplete`] dispatch.
@@ -777,12 +884,12 @@ impl FeedSession {
     /// the GC and this call.
     ///
     /// The same GC is what reconciles a ledger seed, so this also clears
-    /// [`Self::MIRROR_SEEDED_BIT`].
+    /// [`Self::MIRROR_SEEDED_BIT`] and [`Self::SEED_WHOLE_BIT`].
     pub fn mark_reconciled(&self) {
         self.state.update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
-            |cur| (cur | Self::RECONCILED_BIT) & !Self::MIRROR_SEEDED_BIT,
+            |cur| (cur | Self::RECONCILED_BIT) & !(Self::MIRROR_SEEDED_BIT | Self::SEED_WHOLE_BIT),
         );
     }
 
@@ -794,6 +901,7 @@ impl FeedSession {
             up: s & Self::UP_BIT != 0,
             reconciled: s & Self::RECONCILED_BIT != 0,
             mirror_seeded: s & Self::MIRROR_SEEDED_BIT != 0,
+            seed_whole: s & Self::SEED_WHOLE_BIT != 0,
             epoch: s >> Self::EPOCH_SHIFT,
         }
     }
@@ -1233,6 +1341,7 @@ mod tests {
             epoch,
             reconciled,
             mirror_seeded: false,
+            seed_whole: false,
         };
         let s = FeedSession::new();
         assert_eq!(s.liveness(), l(false, 0, false));
@@ -1319,6 +1428,46 @@ mod tests {
         assert!(
             !s.liveness().mirror_seeded,
             "nothing re-seeds a mirror mid-process"
+        );
+    }
+
+    /// A whole seed is a refinement of a seed: it needs one to stand on,
+    /// rides through a reconnect with it, and ends with it at the first
+    /// GC. Set over no seed — the GC won the race to the programmer's
+    /// report — it must not appear, or a consumer would read a whole seed
+    /// into a mirror that no longer holds one.
+    #[test]
+    fn a_whole_seed_lives_and_dies_with_the_seed() {
+        let s = FeedSession::new();
+        s.mark_seed_whole();
+        assert!(
+            !s.liveness().seed_whole,
+            "no seed, nothing to be whole: {:?}",
+            s.liveness()
+        );
+
+        s.mark_mirror_seeded();
+        assert!(!s.liveness().seed_whole, "seeded is not yet whole");
+        s.mark_seed_whole();
+        s.set_up(true);
+        s.set_up(false);
+        s.set_up(true);
+        let seen = s.liveness();
+        assert!(
+            seen.mirror_seeded && seen.seed_whole && seen.epoch == 2,
+            "a reconnect changes nothing about the seed: {seen:?}"
+        );
+
+        s.mark_reconciled();
+        let seen = s.liveness();
+        assert!(
+            !seen.mirror_seeded && !seen.seed_whole && seen.reconciled,
+            "{seen:?}"
+        );
+        s.mark_seed_whole();
+        assert!(
+            !s.liveness().seed_whole,
+            "a report arriving after the GC must not resurrect it"
         );
     }
 
@@ -1661,6 +1810,77 @@ mod tests {
             let d = Completeness::Ineligible(not_ready()).describe();
             assert!(d.contains("not Established"), "{d}");
             assert!(d.contains("waiting will not clear it"), "{d}");
+        }
+
+        /// A loading observation disqualifies exactly as any other does:
+        /// it is evidence for one narrow consumer, never permission.
+        #[test]
+        fn a_loading_observation_is_a_disqualification() {
+            let h = TableCompleteness::new();
+            h.record(AuthorityObservation::Clean(agreeing()));
+            h.record(AuthorityObservation::Loading(not_ready()));
+            assert!(matches!(h.verdict(), Completeness::Ineligible(_)));
+            assert!(!h.attests(1_000_000));
+            assert!(h.loading_only().is_some());
+        }
+
+        /// `loading_only` answers for the latest READABLE reading, unlike
+        /// the revocation. The case it exists for is the second one here:
+        /// the upstreams finish loading, the counts then disagree, and the
+        /// sticky loading revocation stays — so the verdict still names
+        /// loading while the authority's actual objection is now the
+        /// count. Reading loading off the verdict would read a mismatch
+        /// as loading.
+        #[test]
+        fn loading_only_answers_for_the_latest_readable_reading() {
+            let h = TableCompleteness::new();
+            assert_eq!(h.loading_only(), None, "nothing read yet");
+
+            h.record(AuthorityObservation::Loading(not_ready()));
+            let at = h.loading_only().expect("a loading reading");
+            h.record(AuthorityObservation::Unreadable);
+            assert_eq!(
+                h.loading_only(),
+                Some(at),
+                "an unreadable tick is no evidence either way; the consumer ages it"
+            );
+
+            h.record(AuthorityObservation::Clean(CompletenessReport {
+                authority_routes: 1_000_000,
+                mirror_routes: 400_000,
+                at: Instant::now(),
+            }));
+            assert!(matches!(h.verdict(), Completeness::Ineligible(_)));
+            assert_eq!(
+                h.loading_only(),
+                None,
+                "the revocation is sticky; loading_only must not be"
+            );
+
+            h.record(AuthorityObservation::Loading(not_ready()));
+            h.record(AuthorityObservation::Disqualified(
+                Revocation::UnsupportedExport("neighbor 192.0.2.9 route-map OUT out".into()),
+            ));
+            assert_eq!(h.loading_only(), None, "a different objection");
+        }
+
+        /// `attests` is the verdict AND the report's count against the
+        /// mirror as it is now: a converged report over a mirror that has
+        /// since lost a large part of itself is not the authority's word
+        /// for what is left.
+        #[test]
+        fn attests_judges_the_mirror_as_it_is_now() {
+            let h = TableCompleteness::new();
+            assert!(!h.attests(1_000_000), "no report, no word");
+            h.record(AuthorityObservation::Clean(agreeing()));
+            assert!(h.attests(1_000_000));
+            assert!(h.attests(995_000), "within the drift bound");
+            assert!(
+                !h.attests(400_000),
+                "a GC removed most of the mirror after the report"
+            );
+            h.record(AuthorityObservation::Disqualified(not_ready()));
+            assert!(!h.attests(1_000_000), "a revocation outranks the counts");
         }
     }
 }

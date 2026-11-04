@@ -661,6 +661,15 @@ struct Core {
     /// by `start_resync`'s fresh arm when an authority is configured;
     /// cleared by `drain_batch` on release. See [`FreshHold`].
     fresh_hold: Option<FreshHold>,
+    /// This convergence's fresh hold was let go by the seeded fresh door
+    /// ([`seeded_fresh_door`]), not by the authority. While the door stays
+    /// open, the completeness gate at the steer chokepoint
+    /// ([`Core::steer_refusal`]) lets the steer through on it too: the
+    /// verify that passed was taken on the door's evidence, and the
+    /// authority's verdict, `Ineligible` while the upstreams load, would
+    /// otherwise refuse the steer that verify was for. Reset with the hold
+    /// by `start_resync`.
+    seeded_fresh: bool,
     /// The kernel rx-mode kick, run per member port after every device
     /// attach. [`NoKick`] until the attach wiring installs
     /// [`AllmultiKick`] on Linux. See [`RxModeKick`] for the incident.
@@ -1095,7 +1104,9 @@ enum SteerRequest {
 /// still holds (`Core::behind`'s doc describes that gap). With no
 /// authority configured there is nothing honest to wait for, the hold
 /// is never armed, and `Verdict::event`'s `VerifyIncomplete` arm is
-/// the backstop.
+/// the backstop. Over a whole route-ledger seed, the same drained backlog
+/// with the authority's only objection being upstreams still loading
+/// releases it too ([`seeded_fresh_door`]).
 struct FreshHold {
     /// One log line per hold, not one per tick.
     announced: bool,
@@ -2030,23 +2041,70 @@ fn authority_current(
     completeness: &Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
     mirror_now: u64,
 ) -> Option<bool> {
-    completeness.as_ref().map(|h| {
-        // One read for both halves — the verdict and the report it came
-        // from have to describe the SAME sample, or a publish landing
-        // between two separate reads recomputes one report's drift
-        // against another report's verdict.
-        let (report, verdict) = h.latest_verdict();
-        verdict.permits_steering()
-            && report.is_some_and(|r| {
-                let now_r = packetframe_common::fib::CompletenessReport {
-                    mirror_routes: mirror_now,
-                    ..r
-                };
-                now_r
-                    .drift()
-                    .is_some_and(|d| d <= packetframe_common::fib::STEER_MAX_DRIFT)
-            })
-    })
+    // The rule itself lives on the handle, where the fast-path's
+    // preserving stop applies it too: a ledger is attested on exactly the
+    // word this release would act on.
+    completeness.as_ref().map(|h| h.attests(mirror_now))
+}
+
+/// Whether a FRESH VPP's verify, and its first steer, may go ahead over a
+/// mirror the fast-path seeded from its route ledger while the completeness
+/// authority is still waiting for its upstreams to load: the seeded fresh
+/// door.
+///
+/// **What it saves.** After a reboot VPP is fresh (its own ledger names a
+/// process that no longer exists), and [`FreshHold`] keeps it short of
+/// verify until the authority attests the table. On an FRR-fed box that
+/// means every declared upstream's End-of-RIB, which a boot-starved bgpd
+/// took 15.5 minutes to deliver on the reference gateway (2026-10-30); the
+/// first steer came 32.5 minutes after the reboot. The table had been in
+/// the mirror since seconds after the start: the seed.
+///
+/// **Why a seed may stand in for the count, with every one of these:**
+/// - `mirror_seeded` and `seed_whole`: this process seeded the mirror from
+///   a ledger whose writer's authority vouched for it at the stop
+///   (`LedgerMeta::attested` in the fast-path), applied every route of it
+///   without a failed install, and no GC has run since. A seed can be part
+///   of a table and pass every check a start makes — a clean stop during a
+///   cold load writes what it had — so the seed alone is not enough; the
+///   writer's attestation is what says it was the whole table.
+/// - the feed session is up in its FIRST epoch ([`FIRST_FEED_EPOCH`]): the
+///   route source is streaming to this process and has not dropped since,
+///   as at the adopted seeded door ([`seeded_mirror_releases_diff`]). A
+///   reconnect shuts it for good.
+/// - the authority's most recent readable check found upstreams still
+///   loading and NOTHING ELSE wrong
+///   ([`packetframe_common::fib::TableCompleteness::loading_only`]), within
+///   [`packetframe_common::fib::STEER_MAX_REPORT_AGE`]: every reading
+///   answered, nothing narrows the export, no session moved, the feed's
+///   families are declared, and the route source has spoken to the seed.
+///   That is the one objection a seed answers — FRR's table is still
+///   arriving, so its count cannot be compared — and it must not be mistaken
+///   for one it does not: a count that disagrees once the upstreams have
+///   loaded is no longer "loading", and the door shuts.
+///
+/// **What it relies on in the fast-path.** The route source's GC, which
+/// would remove every seeded route the replay has not reached, is held over
+/// the seed until the authority reads every upstream loaded
+/// (`route_source_bgp`'s seed GC hold). Without that hold, FRR's End-of-RIB
+/// at `select-defer-time` would pull most of the table out of a VPP this
+/// door had let steer, and a steered miss is dropped.
+///
+/// **What it costs.** VPP verifies and steers on the seed plus the replay so
+/// far: routes FRR has changed since the stop reach VPP as ordinary updates
+/// when the replay re-advertises them, and routes withdrawn while the box
+/// was down leave at the GC, as on the eBPF tier, which forwards on the
+/// same mirror. The seed is at most `route-ledger max-age` old, and the
+/// held GC runs at that age whatever the upstreams say.
+fn seeded_fresh_door(
+    liveness: Option<packetframe_common::fib::FeedLiveness>,
+    loading_only: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    liveness.is_some_and(|l| l.mirror_seeded && l.seed_whole && l.up && l.epoch == FIRST_FEED_EPOCH)
+        && loading_only.is_some_and(|at| {
+            now.saturating_duration_since(at) <= packetframe_common::fib::STEER_MAX_REPORT_AGE
+        })
 }
 
 /// What the authority means **for the deferral that is actually
@@ -2279,6 +2337,7 @@ impl Runtime {
                 deferred_resync: None,
                 release_walk: None,
                 fresh_hold: None,
+                seeded_fresh: false,
                 rx_kick: Box::new(NoKick),
                 kernel_path: Box::new(crate::kernel_path::NoKernelPath),
                 kernel_watch: KernelWatch::default(),
@@ -3657,6 +3716,37 @@ impl Core {
             .map(|h| h.verdict())
     }
 
+    /// The completeness verdict a steer is REFUSED on, or `None` when the
+    /// completeness gate lets it through: no authority, a target that
+    /// diverts nothing, a verdict that permits steering — or a convergence
+    /// the seeded fresh door released whose door is still open now
+    /// (`seeded_fresh`, [`seeded_fresh_door`]).
+    ///
+    /// The door is the gate's one exception and it is narrow by
+    /// construction. Only a convergence whose verify ran on the door's
+    /// evidence has it, and only while every leg still holds: the first GC
+    /// (which ends the seed), a feed reconnect, or any authority reading
+    /// other than "upstreams loading, nothing else" shuts it, and from then
+    /// the authority's verdict alone decides, as it always has. The same
+    /// accessor serves the steer and the retry ([`Self::steer_verdict`]
+    /// says why they must not disagree).
+    fn steer_refusal(&self) -> Option<packetframe_common::fib::Completeness> {
+        let verdict = self.steer_verdict()?;
+        if verdict.permits_steering() || (self.seeded_fresh && self.seeded_fresh_door_open()) {
+            return None;
+        }
+        Some(verdict)
+    }
+
+    /// [`seeded_fresh_door`]'s legs, read now.
+    fn seeded_fresh_door_open(&self) -> bool {
+        seeded_fresh_door(
+            self.feed_session.as_ref().map(|f| f.liveness()),
+            self.completeness.as_ref().and_then(|h| h.loading_only()),
+            std::time::Instant::now(),
+        )
+    }
+
     /// How far VPP is behind the route mirror, or `None` when it has
     /// caught up: the route work still owed to it — changes the source
     /// holds plus ops the engine has pulled and not sent — is within
@@ -4628,9 +4718,7 @@ impl Observe for ObserveView {
         // The ledger's count gate only for a FIRST steer, as the lever
         // applies it: over rules a steer landed, a held addition is
         // judged by the hold alone (`Observe::steer_permitted`).
-        c.steer_hold().is_none()
-            && c.steer_verdict().is_none_or(|v| v.permits_steering())
-            && (steered || c.fib_fit_to_steer())
+        c.steer_hold().is_none() && c.steer_refusal().is_none() && (steered || c.fib_fit_to_steer())
     }
 
     fn fib_empty(&mut self) -> bool {
@@ -5246,7 +5334,9 @@ impl ObserveView {
             source,
             last_drain_error,
             completeness,
+            feed_session,
             fresh_hold,
+            seeded_fresh,
             last_placement,
             ..
         } = &mut *c;
@@ -5305,11 +5395,23 @@ impl ObserveView {
         // authority compares bird against the MIRROR, which the tee has
         // already updated, so an idle map plus a converged word can
         // still hide a burst the feed holds (`Core::behind`'s gap).
+        //
+        // Or the seeded fresh door: a whole route-ledger seed, the feed in
+        // its first session, and an authority whose only objection is that
+        // the upstreams are still loading ([`seeded_fresh_door`]). The same
+        // drained backlog either way — what the door vouches for is the
+        // mirror, and VPP has to hold all of it before verify samples it.
         let mut release_hold = false;
         if let (Ok(crate::driver::Drain::Idle), Some(hold)) = (&r, fresh_hold.as_mut()) {
             let have = source.route_count();
-            let released =
-                authority_current(completeness, have) == Some(true) && source.backlog() == 0;
+            let attested = authority_current(completeness, have) == Some(true);
+            let door = !attested
+                && seeded_fresh_door(
+                    feed_session.as_ref().map(|f| f.liveness()),
+                    completeness.as_ref().and_then(|h| h.loading_only()),
+                    std::time::Instant::now(),
+                );
+            let released = (attested || door) && source.backlog() == 0;
             if !released {
                 if !hold.announced {
                     hold.announced = true;
@@ -5325,11 +5427,29 @@ impl ObserveView {
                     .map_or(0, |rep| rep.authority_routes);
                 return Ok(crate::driver::Drain::AwaitingSource { have, want });
             }
-            tracing::info!(
-                have,
-                "route source converged and drained; fresh resync complete — verifying \
-                 the full table"
-            );
+            if door {
+                tracing::info!(
+                    have,
+                    door = "seeded",
+                    "the route mirror holds a whole route-ledger seed, the route source is \
+                     streaming in its first session, the completeness authority's only \
+                     objection is upstreams still loading, and VPP holds everything the mirror \
+                     does: fresh resync complete — verifying the full table without waiting \
+                     for the upstreams"
+                );
+            } else {
+                tracing::info!(
+                    have,
+                    door = "authority",
+                    "route source converged and drained; fresh resync complete — verifying \
+                     the full table"
+                );
+            }
+            event_log::Event::info(crate::MODULE_NAME, event_kind::FRESH_HOLD_RELEASED)
+                .field("door", if door { "seeded" } else { "authority" })
+                .field("routes", have)
+                .emit();
+            *seeded_fresh = door;
             release_hold = true;
         }
         if release_hold {
@@ -5453,21 +5573,27 @@ impl Effects for EffectsView {
         // precisely when the mirror is unhealthy, which is when the
         // operator is most likely to be rolling back. The exception
         // lives in `steer_verdict` so the retry's own gate cannot
-        // forget it.
-        if let Some(verdict) = c.steer_verdict() {
-            if !verdict.permits_steering() {
-                return Err(format!(
-                    "refusing to steer: {}. Traffic would be diverted into a table that \
-                     cannot forward it, and a steered miss is dropped rather than falling \
-                     back to the kernel path. The want is remembered and re-attempted on \
-                     its own, at most every {}s, once the verdict permits — \
-                     `packetframe reconfigure` asks immediately rather than waiting. \
-                     `require-table-complete off` opts out where there is no bird to \
-                     compare against",
-                    verdict.describe(),
-                    crate::driver::STEER_RETRY_EVERY.as_secs()
-                ));
-            }
+        // forget it — and so does the seeded fresh door's
+        // (`steer_refusal`), for the same reason.
+        if let Some(verdict) = c.steer_refusal() {
+            return Err(format!(
+                "refusing to steer: {}. Traffic would be diverted into a table that \
+                 cannot forward it, and a steered miss is dropped rather than falling \
+                 back to the kernel path. The want is remembered and re-attempted on \
+                 its own, at most every {}s, once the verdict permits — \
+                 `packetframe reconfigure` asks immediately rather than waiting. \
+                 `require-table-complete off` opts out where there is no bird to \
+                 compare against",
+                verdict.describe(),
+                crate::driver::STEER_RETRY_EVERY.as_secs()
+            ));
+        }
+        if c.seeded_fresh && !c.steer_verdict().is_none_or(|v| v.permits_steering()) {
+            tracing::info!(
+                door = "seeded",
+                "steering over the route-ledger seed the fresh resync verified, while the \
+                 completeness authority waits for its upstreams to finish loading"
+            );
         }
         // The first-steer hold, same chokepoint: VPP has caught up with
         // the mirror the completeness gate just judged, and a verify has
@@ -5687,6 +5813,7 @@ impl Effects for EffectsView {
         // Any hold from an earlier attempt is that attempt's state.
         // The fresh arm below re-arms it when it applies.
         c.fresh_hold = None;
+        c.seeded_fresh = false;
         // As is a release's walk: it diffed against that attempt's ledger.
         c.release_walk = None;
         // The preserved ledger, if the attach wiring handed one over:
@@ -6068,6 +6195,7 @@ mod tests {
                 epoch: 1,
                 reconciled: false,
                 mirror_seeded,
+                seed_whole: false,
             })
         };
         assert!(seeded_mirror_releases_diff(
@@ -6081,6 +6209,7 @@ mod tests {
             epoch: 2,
             reconciled: false,
             mirror_seeded: true,
+            seed_whole: false,
         });
         for (liveness, authority, have, why) in [
             (
@@ -6120,6 +6249,59 @@ mod tests {
                 !seeded_mirror_releases_diff(liveness, authority, have, 50),
                 "{why}"
             );
+        }
+    }
+
+    /// The seeded fresh door needs every leg, and each one alone is
+    /// refused: a seed that is not whole (unattested, or applied short), no
+    /// seed, a reconnect, no stream, and an authority whose latest reading
+    /// is not "upstreams loading, nothing else" — or is too old to act on.
+    #[test]
+    fn the_seeded_fresh_door_needs_a_whole_seed_a_first_stream_and_loading_only() {
+        use packetframe_common::fib::{FeedLiveness, STEER_MAX_REPORT_AGE};
+        let now = std::time::Instant::now();
+        let fresh = Some(now - std::time::Duration::from_secs(20));
+        let l = |up, epoch, mirror_seeded, seed_whole| {
+            Some(FeedLiveness {
+                up,
+                epoch,
+                reconciled: false,
+                mirror_seeded,
+                seed_whole,
+            })
+        };
+        assert!(seeded_fresh_door(l(true, 1, true, true), fresh, now));
+        let stale = Some(now - STEER_MAX_REPORT_AGE - std::time::Duration::from_secs(1));
+        for (liveness, loading, why) in [
+            (
+                l(true, 1, true, false),
+                fresh,
+                "a seed nobody attested whole",
+            ),
+            (
+                l(true, 1, false, false),
+                fresh,
+                "no seed, or its GC has run",
+            ),
+            (l(true, 2, true, true), fresh, "a reconnect"),
+            (
+                l(false, 1, true, true),
+                fresh,
+                "the route source is not streaming",
+            ),
+            (
+                l(true, 1, true, true),
+                None,
+                "the authority's latest reading is not loading-only",
+            ),
+            (
+                l(true, 1, true, true),
+                stale,
+                "a loading reading too old to act on",
+            ),
+            (None, fresh, "no feed session handle at all"),
+        ] {
+            assert!(!seeded_fresh_door(liveness, loading, now), "{why}");
         }
     }
 

@@ -96,8 +96,9 @@ use packetframe_common::module::{HealthState, SubsystemHealth};
 pub const LEDGER_FILE_NAME: &str = "fast-path-route-ledger.bin";
 
 /// Bump on any layout change. A record of another version is refused,
-/// which costs one cold reload and nothing else.
-pub const LEDGER_FORMAT_VERSION: u32 = 1;
+/// which costs one cold reload and nothing else. 2: the header carries
+/// [`LedgerMeta::attested`].
+pub const LEDGER_FORMAT_VERSION: u32 = 2;
 
 const MAGIC: &[u8; 8] = b"PFFIBLGR";
 
@@ -134,8 +135,8 @@ const fn route_max_bytes(addr_len: u64) -> u64 {
 }
 
 /// Everything but the routes, at its widest: magic, format version, the
-/// two strings at their `u16` limit, the two times, the four counts,
-/// peer and nexthop tables at the NEXTHOPS map's size each (a BGP
+/// two strings at their `u16` limit, the two times, the flags, the four
+/// counts, peer and nexthop tables at the NEXTHOPS map's size each (a BGP
 /// listener names one peer; a FIB cannot hold more nexthops than that
 /// map), and the checksum.
 const HEADER_MAX_BYTES: u64 = 8
@@ -143,6 +144,7 @@ const HEADER_MAX_BYTES: u64 = 8
     + (2 + u16::MAX as u64)
     + 8
     + 8
+    + 1
     + (2 + u16::MAX as u64)
     + 16
     + 4
@@ -172,6 +174,10 @@ const FLAG_PATH_ID: u8 = 1;
 const FLAG_LOCAL_PREF: u8 = 1 << 1;
 const FLAGS_KNOWN: u8 = FLAG_PATH_ID | FLAG_LOCAL_PREF;
 
+/// Flag bits in the header, after the two times.
+const META_ATTESTED: u8 = 1;
+const META_FLAGS_KNOWN: u8 = META_ATTESTED;
+
 /// What the record says about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerMeta {
@@ -190,6 +196,21 @@ pub struct LedgerMeta {
     /// The age check reads this, so a stale route cannot be carried
     /// from ledger to ledger by restarts that never reconcile it.
     pub confirmed_at_unix: u64,
+    /// The writer's completeness authority vouched for the mirror it
+    /// wrote: its current word was yes for a mirror that size
+    /// ([`packetframe_common::fib::TableCompleteness::attests`]).
+    ///
+    /// Nothing a start checks tells a whole table from part of one. A
+    /// clean stop during a cold load, or during the refill after a bgpd
+    /// restart's early End-of-RIB, writes the table it had, every route of
+    /// it confirmed. The seed is still worth having for the eBPF tier
+    /// (the replay fills the rest), so such a record seeds as any other;
+    /// this says whether it may also stand in for the authority's count
+    /// while the authority cannot count — vpp-offload's seeded fresh
+    /// door, which needs [`packetframe_common::fib::FeedLiveness::seed_whole`].
+    /// `false` with no authority and no second tier to publish to, and
+    /// whenever the authority's word was anything but yes at the stop.
+    pub attested: bool,
     /// [`packetframe_common::config::RouteSourceSpec::ledger_identity`]
     /// of the route source the advertisements came from.
     pub identity: String,
@@ -278,6 +299,7 @@ impl LedgerEncoder {
         put_str(&mut out, &meta.writer_version);
         out.extend_from_slice(&meta.written_at_unix.to_le_bytes());
         out.extend_from_slice(&meta.confirmed_at_unix.to_le_bytes());
+        out.push(if meta.attested { META_ATTESTED } else { 0 });
         put_str(&mut out, &meta.identity);
         for c in [counts.v4, counts.v6] {
             out.extend_from_slice(&c.prefixes.to_le_bytes());
@@ -511,6 +533,10 @@ impl RouteLedger {
             let writer_version = r.string()?;
             let written_at_unix = r.u64()?;
             let confirmed_at_unix = r.u64()?;
+            let flags = r.u8()?;
+            if flags & !META_FLAGS_KNOWN != 0 {
+                return Err(format!("unknown header flags {flags:#x}"));
+            }
             let identity = r.string()?;
             let mut counts = LedgerCounts::default();
             for c in [&mut counts.v4, &mut counts.v6] {
@@ -540,6 +566,7 @@ impl RouteLedger {
                     writer_version,
                     written_at_unix,
                     confirmed_at_unix,
+                    attested: flags & META_ATTESTED != 0,
                     identity,
                 },
                 counts,
@@ -1313,6 +1340,12 @@ pub struct SeedReport {
     pub writer_version: String,
     pub written_at_unix: u64,
     pub confirmed_at_unix: u64,
+    /// [`LedgerMeta::attested`].
+    pub attested: bool,
+    /// The `max-age` the ledger was judged against at this start. It
+    /// bounds the seed after the start too: a GC held over the seed
+    /// ([`GcHeld`]) is let go once the seed's oldest routes reach it.
+    pub max_age_secs: u64,
     pub counts: LedgerCounts,
     /// When the programmer finished applying it; `None` while it is.
     pub applied_at: Option<Instant>,
@@ -1333,9 +1366,34 @@ pub struct SeedReport {
     /// When the first `InitiationComplete` after the seed GC'd the rest,
     /// and how many advertisements that removed.
     pub reconciled: Option<(Instant, u64)>,
+    /// The route source's End-of-RIB has arrived, and the GC that would
+    /// reconcile the seed is being held for the authority's word. Set and
+    /// cleared by the BGP listener.
+    pub gc_held: Option<GcHeld>,
+}
+
+/// A GC the BGP listener is holding over an unreconciled seed: FRR sent
+/// End-of-RIB while an upstream it learns from was still loading, so its
+/// table, and everything it sent before the End-of-RIB, may be part of
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcHeld {
+    /// When the End-of-RIB arrived.
+    pub since: Instant,
+    /// What it is waiting for, as the latest look found it.
+    pub why: String,
 }
 
 impl SeedReport {
+    /// Wall-clock second at which the seed's oldest routes reach
+    /// `max-age`: the age a start would have refused it at, measured from
+    /// the same time [`judge`] measures it from.
+    pub fn expires_at_unix(&self) -> u64 {
+        self.confirmed_at_unix
+            .min(self.written_at_unix)
+            .saturating_add(self.max_age_secs)
+    }
+
     /// Whether a live session has spoken to the seed: its first route
     /// arrived, or its `InitiationComplete` reconciled the seed without
     /// one (see [`LedgerStatus::attestation_blocker`]).
@@ -1439,11 +1497,23 @@ impl LedgerStatus {
                         "; waiting for the route source's first route — forwarding on the seed, \
                          not attested to a second tier until then",
                     ),
-                    (Some(_), Some(_), None) => m.push_str(&format!(
-                        "; the route source is replaying: {} seeded advertisements not yet \
-                         re-advertised (removed at its InitiationComplete if never)",
-                        s.unconfirmed
-                    )),
+                    (Some(_), Some(_), None) => match &s.gc_held {
+                        None => m.push_str(&format!(
+                            "; the route source is replaying: {} seeded advertisements not yet \
+                             re-advertised (removed at its InitiationComplete if never)",
+                            s.unconfirmed
+                        )),
+                        Some(h) => m.push_str(&format!(
+                            "; the route source sent End-of-RIB {} ago with {} seeded \
+                             advertisements not re-advertised, and the GC that would remove them \
+                             is held: {}. It runs once the authority reads every upstream \
+                             loaded, or in {} at most (max-age)",
+                            human_secs(now.saturating_duration_since(h.since).as_secs()),
+                            s.unconfirmed,
+                            h.why,
+                            human_secs(s.expires_at_unix().saturating_sub(now_unix)),
+                        )),
+                    },
                 }
                 if s.failed > 0 {
                     m.push_str(&format!(
@@ -1724,6 +1794,7 @@ mod tests {
             writer_version: "0.6.0".into(),
             written_at_unix: NOW - 120,
             confirmed_at_unix: NOW - 120,
+            attested: true,
             identity: IDENTITY.into(),
         }
     }
@@ -1929,6 +2000,44 @@ mod tests {
                 found: LEDGER_FORMAT_VERSION + 1
             }
         );
+    }
+
+    /// The previous layout, which has no attestation in its header, is
+    /// another format: refused by name and costing one cold reload, never
+    /// read as if every record were attested or none were.
+    #[test]
+    fn a_version_1_record_is_refused_by_name() {
+        let mut bytes = encode(&meta(), &routes()).unwrap();
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            RouteLedger::decode(bytes).unwrap_err(),
+            Refusal::FormatVersion { found: 1 }
+        );
+    }
+
+    /// Both values of the attestation survive the trip, and a header flag
+    /// this build does not know is corruption rather than ignored: a
+    /// later writer's flag could mean something this reader must not
+    /// seed past.
+    #[test]
+    fn the_attestation_round_trips_and_unknown_header_flags_are_refused() {
+        for attested in [true, false] {
+            let m = LedgerMeta { attested, ..meta() };
+            let ledger = RouteLedger::decode(encode(&m, &routes()).unwrap()).unwrap();
+            assert_eq!(ledger.meta.attested, attested);
+        }
+        let mut bytes = encode(&meta(), &routes()).unwrap();
+        // Magic, version, the writer version (length + bytes), two times.
+        let at = 8 + 4 + 2 + meta().writer_version.len() + 8 + 8;
+        assert_eq!(bytes[at], META_ATTESTED, "the flags byte is where it is");
+        bytes[at] |= 1 << 5;
+        let body = bytes.len() - 8;
+        let sum = fnv1a(&bytes[..body]);
+        bytes[body..].copy_from_slice(&sum.to_le_bytes());
+        match RouteLedger::decode(bytes) {
+            Err(Refusal::Corrupt(why)) => assert!(why.contains("header flags"), "{why}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// A record that names a resolver peer is not one this writer could
@@ -2400,6 +2509,8 @@ mod tests {
             writer_version: "0.6.0".into(),
             written_at_unix: NOW - 120,
             confirmed_at_unix: NOW - 120,
+            attested: true,
+            max_age_secs: 1800,
             counts: LedgerCounts::default(),
             applied_at: None,
             apply_took: None,
@@ -2407,6 +2518,7 @@ mod tests {
             unconfirmed: 5,
             stream_started_at: None,
             reconciled: None,
+            gc_held: None,
         });
         assert!(st.attestation_blocker().is_some());
         assert!(st.awaiting_stream());
@@ -2432,6 +2544,8 @@ mod tests {
                 writer_version: "0.6.0".into(),
                 written_at_unix: NOW - 120,
                 confirmed_at_unix: NOW - 120,
+                attested: true,
+                max_age_secs: 1800,
                 counts: LedgerCounts::default(),
                 applied_at: Some(Instant::now()),
                 apply_took: None,
@@ -2439,6 +2553,7 @@ mod tests {
                 unconfirmed: 5,
                 stream_started_at: None,
                 reconciled: None,
+                gc_held: None,
             }),
         };
         assert!(st.attestation_blocker().is_some());
@@ -2479,6 +2594,8 @@ mod tests {
             writer_version: "0.6.0".into(),
             written_at_unix: NOW - 240,
             confirmed_at_unix: NOW - 240,
+            attested: true,
+            max_age_secs: 1800,
             counts: LedgerCounts {
                 v4: FamilyCounts {
                     prefixes: 1_100_000,
@@ -2495,6 +2612,7 @@ mod tests {
             unconfirmed: 900_000,
             stream_started_at: Some(now),
             reconciled: None,
+            gc_held: None,
         });
         let m = row(&st).message.unwrap();
         assert!(
