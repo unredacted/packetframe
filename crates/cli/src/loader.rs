@@ -2265,11 +2265,19 @@ fn keep_vpp_preflight(config: Option<&Config>, state_dir: &Path) -> Result<(), S
         );
     };
     let Some(section) = config.modules.iter().find(|m| m.name == "vpp-offload") else {
-        return Err(
-            "--keep-vpp: this config declares no vpp-offload section, so the next start \
-             would leave the running VPP unsupervised — use `detach --all`"
-                .into(),
-        );
+        // With no VPP on record there is nothing to strand, and this is
+        // the routine restart of the modules there are: it keeps the
+        // fast-path's route ledger and wan-egress rules, which every other
+        // detach removes. Refusing here left a box without the offload no
+        // restart that seeds (found on the lab EFG, 2026-11-04).
+        return match ResourceState::load(state_dir).map_err(|e| format!("vpp state: {e}"))? {
+            None => Ok(()),
+            Some(_) => Err(format!(
+                "--keep-vpp: a VPP is on record in {} but this config declares no vpp-offload \
+                 section, so the next start would leave it unsupervised — use `detach --all`",
+                state_dir.display()
+            )),
+        };
     };
     // Read from the directory the NEXT start will look in. A `state-dir`
     // edit moves it, and a record the new daemon cannot find is a VPP it
@@ -2430,10 +2438,15 @@ mod keep_vpp_tests {
     /// `--keep-vpp` refuses, before tearing anything down, a restart the
     /// next start could not adopt: no record where that start will look
     /// (nothing running, or `state-dir` moved), a config that dropped
-    /// the section, or an attach-time field it changed.
+    /// the section while a VPP is on record, or an attach-time field it
+    /// changed. A config without the section and no VPP on record has
+    /// nothing to keep, and restarts.
     #[test]
     fn keep_vpp_refuses_what_the_next_start_could_not_adopt() {
         let dir = state_dir("pf-keep-vpp");
+
+        keep_vpp_preflight(Some(&conf("", false)), &dir)
+            .expect("no offload and none on record: the routine restart");
 
         let steered = conf(" vlans 88,1337", true);
         let e = keep_vpp_preflight(Some(&steered), &dir).unwrap_err();
@@ -2446,7 +2459,10 @@ mod keep_vpp_tests {
         keep_vpp_preflight(Some(&steered), &dir).expect("unchanged config adopts");
 
         let e = keep_vpp_preflight(Some(&conf("", false)), &dir).unwrap_err();
-        assert!(e.contains("no vpp-offload section"), "{e}");
+        assert!(
+            e.contains("on record") && e.contains("no vpp-offload section"),
+            "{e}"
+        );
 
         let e = keep_vpp_preflight(Some(&conf(" vlans 1337", true)), &dir).unwrap_err();
         assert!(e.contains("`port`") && e.contains("detach --all"), "{e}");
@@ -2456,10 +2472,11 @@ mod keep_vpp_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A state file the reader refuses is not "no record" to either
-    /// door. `detach --all` stops before the hand-back teardown it runs
-    /// when nothing is recorded, and `--keep-vpp` refuses under the
-    /// file's reason instead of saying there is nothing to keep. A sparse
+    /// A state file the reader refuses is not "no record" to any door.
+    /// `detach --all` stops before the hand-back teardown it runs when
+    /// nothing is recorded, and `--keep-vpp` refuses under the file's
+    /// reason instead of saying there is nothing to keep, with the
+    /// offload configured or not. A sparse
     /// file past the bound stands in for the refusals every platform
     /// makes; on Linux, so does a `state-dir` others can write with no
     /// file in it, which such an account could have emptied.
@@ -2486,6 +2503,13 @@ mod keep_vpp_tests {
             assert!(!handback, "{what}: detach took the no-record path");
             let e = keep_vpp_preflight(Some(&steered), &dir).unwrap_err();
             assert!(e.starts_with("vpp state: refusing "), "{what}: {e}");
+            // Nor to a config without the offload, which restarts only
+            // when nothing is on record.
+            let unconfigured = keep_vpp_preflight(Some(&conf("", false)), &dir).unwrap_err();
+            assert!(
+                unconfigured.starts_with("vpp state: refusing "),
+                "{what}: {unconfigured}"
+            );
             e
         };
         assert!(both_refuse("past the bound").contains("-byte bound"));

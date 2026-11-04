@@ -285,6 +285,8 @@ sudo systemctl stop packetframe && sudo packetframe detach --keep-vpp && sudo sy
 
 The clean stop preserves VPP's route ledger, and the next daemon adopts VPP from it without an unsteered window. `--keep-vpp` refuses the restart if the config change touches something VPP fixes at startup.
 
+Without vpp-offload, the same command is the restart that keeps the fast path's route ledger, so the next start seeds its route table instead of loading it cold; `detach --all` removes the ledger.
+
 Coming from 0.2.7? Read the upgrade notes in [CHANGELOG.md](CHANGELOG.md) first. `bridge-resolve` now defaults to on.
 
 ## Everyday commands
