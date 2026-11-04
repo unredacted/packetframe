@@ -921,11 +921,13 @@ pub fn loading_is_the_only_objection(
             return false;
         };
         // An upstream not Established has no epoch yet, and one that came
-        // up during the check gains one: neither is a session moving.
-        if let (Some(e0), Some(e1)) = (before.established_epoch, after.established_epoch) {
-            if is_new_session(e0, e1) {
-                return false;
-            }
+        // up during the check gains one: neither is a session moving. One
+        // that had an epoch and lost it went down during the check, and
+        // FRR may be withdrawing what it carried (review finding, PR #375).
+        match (before.established_epoch, after.established_epoch) {
+            (Some(e0), Some(e1)) if is_new_session(e0, e1) => return false,
+            (Some(_), None) => return false,
+            _ => {}
         }
         loading += 1;
     }
@@ -2598,6 +2600,10 @@ router bgp 65000
                 (
                     bracket(filling_at(EPOCH), filling_at(EPOCH + 600)),
                     "re-established during the check",
+                ),
+                (
+                    bracket(filling_at(EPOCH), Ok(state(A, false, false, None))),
+                    "went down during the check",
                 ),
             ] {
                 assert!(!only_objection(ok(), &[b, ready(B)]), "{why}");

@@ -2094,17 +2094,33 @@ fn authority_current(
 /// far: routes FRR has changed since the stop reach VPP as ordinary updates
 /// when the replay re-advertises them, and routes withdrawn while the box
 /// was down leave at the GC, as on the eBPF tier, which forwards on the
-/// same mirror. The seed is at most `route-ledger max-age` old, and the
-/// held GC runs at that age whatever the upstreams say.
+/// same mirror. The seed is at most `route-ledger max-age` old: the held GC
+/// runs at that age whatever the upstreams say, and this door shuts at it
+/// itself (`seed_expires_at_unix`, against `now_unix`), because the GC
+/// needs a trigger — End-of-RIB, or quiet — that a feed can withhold
+/// (review finding, PR #375).
 fn seeded_fresh_door(
     liveness: Option<packetframe_common::fib::FeedLiveness>,
     loading_only: Option<std::time::Instant>,
     now: std::time::Instant,
+    now_unix: u64,
 ) -> bool {
-    liveness.is_some_and(|l| l.mirror_seeded && l.seed_whole && l.up && l.epoch == FIRST_FEED_EPOCH)
-        && loading_only.is_some_and(|at| {
-            now.saturating_duration_since(at) <= packetframe_common::fib::STEER_MAX_REPORT_AGE
-        })
+    liveness.is_some_and(|l| {
+        l.mirror_seeded
+            && l.seed_whole
+            && now_unix < l.seed_expires_at_unix
+            && l.up
+            && l.epoch == FIRST_FEED_EPOCH
+    }) && loading_only.is_some_and(|at| {
+        now.saturating_duration_since(at) <= packetframe_common::fib::STEER_MAX_REPORT_AGE
+    })
+}
+
+/// Wall-clock seconds now, which a seed's expiry is written in.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// What the authority means **for the deferral that is actually
@@ -3744,6 +3760,7 @@ impl Core {
             self.feed_session.as_ref().map(|f| f.liveness()),
             self.completeness.as_ref().and_then(|h| h.loading_only()),
             std::time::Instant::now(),
+            now_unix(),
         )
     }
 
@@ -5410,6 +5427,7 @@ impl ObserveView {
                     feed_session.as_ref().map(|f| f.liveness()),
                     completeness.as_ref().and_then(|h| h.loading_only()),
                     std::time::Instant::now(),
+                    now_unix(),
                 );
             let released = (attested || door) && source.backlog() == 0;
             if !released {
@@ -6196,6 +6214,7 @@ mod tests {
                 reconciled: false,
                 mirror_seeded,
                 seed_whole: false,
+                seed_expires_at_unix: 0,
             })
         };
         assert!(seeded_mirror_releases_diff(
@@ -6210,6 +6229,7 @@ mod tests {
             reconciled: false,
             mirror_seeded: true,
             seed_whole: false,
+            seed_expires_at_unix: 0,
         });
         for (liveness, authority, have, why) in [
             (
@@ -6254,23 +6274,34 @@ mod tests {
 
     /// The seeded fresh door needs every leg, and each one alone is
     /// refused: a seed that is not whole (unattested, or applied short), no
-    /// seed, a reconnect, no stream, and an authority whose latest reading
-    /// is not "upstreams loading, nothing else" — or is too old to act on.
+    /// seed, a seed past its max-age, a reconnect, no stream, and an
+    /// authority whose latest reading is not "upstreams loading, nothing
+    /// else" — or is too old to act on.
     #[test]
     fn the_seeded_fresh_door_needs_a_whole_seed_a_first_stream_and_loading_only() {
         use packetframe_common::fib::{FeedLiveness, STEER_MAX_REPORT_AGE};
+        const NOW_UNIX: u64 = 1_790_000_000;
         let now = std::time::Instant::now();
         let fresh = Some(now - std::time::Duration::from_secs(20));
-        let l = |up, epoch, mirror_seeded, seed_whole| {
+        let expiring = |up, epoch, mirror_seeded, seed_whole, seed_expires_at_unix| {
             Some(FeedLiveness {
                 up,
                 epoch,
                 reconciled: false,
                 mirror_seeded,
                 seed_whole,
+                seed_expires_at_unix,
             })
         };
-        assert!(seeded_fresh_door(l(true, 1, true, true), fresh, now));
+        let l = |up, epoch, mirror_seeded, seed_whole| {
+            expiring(up, epoch, mirror_seeded, seed_whole, NOW_UNIX + 600)
+        };
+        assert!(seeded_fresh_door(
+            l(true, 1, true, true),
+            fresh,
+            now,
+            NOW_UNIX
+        ));
         let stale = Some(now - STEER_MAX_REPORT_AGE - std::time::Duration::from_secs(1));
         for (liveness, loading, why) in [
             (
@@ -6300,8 +6331,16 @@ mod tests {
                 "a loading reading too old to act on",
             ),
             (None, fresh, "no feed session handle at all"),
+            (
+                expiring(true, 1, true, true, NOW_UNIX),
+                fresh,
+                "the seed reached its max-age, with or without a GC to end it",
+            ),
         ] {
-            assert!(!seeded_fresh_door(liveness, loading, now), "{why}");
+            assert!(
+                !seeded_fresh_door(liveness, loading, now, NOW_UNIX),
+                "{why}"
+            );
         }
     }
 

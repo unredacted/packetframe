@@ -420,7 +420,9 @@ impl ProgrammerHarness {
         programmer.set_route_sink(sink.clone());
         let status = packetframe_fast_path::fib::route_ledger::shared_status();
         programmer.set_ledger_status(status.clone());
-        programmer.set_second_tier(completeness, feed_session.clone());
+        // The scope the harness's authority attests under, when it has one.
+        let scope = completeness.as_ref().map(|_| ledger::SCOPE.to_string());
+        programmer.set_second_tier(completeness, feed_session.clone(), scope);
         if let Some(seed) = seed {
             programmer.set_seed(seed);
             if let Some(h) = &feed_session {
@@ -3466,6 +3468,8 @@ mod ledger {
     pub const PEER: PeerId = PeerId(0x1ed9_e400_0000_0001);
     pub const IDENTITY: &str =
         "bgp listen 192.0.2.10 port 179 local-as 64512 peer-as 64512 peer-ip any";
+    /// The attestation scope the harness's authority attests under.
+    pub const SCOPE: &str = "frr 192.0.2.1=ipv4";
 
     pub fn nh_a() -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))
@@ -3523,10 +3527,18 @@ mod ledger {
             writer_version: "test".into(),
             written_at_unix: now_unix(),
             confirmed_at_unix,
-            attested,
+            attested_for: if attested {
+                SCOPE.into()
+            } else {
+                String::new()
+            },
             identity: IDENTITY.into(),
         };
-        RouteLedger::decode(encode(&meta, routes).expect("encode")).expect("decode")
+        let mut ledger =
+            RouteLedger::decode(encode(&meta, routes).expect("encode")).expect("decode");
+        // As a start under `SCOPE` judges it.
+        ledger.attested = attested;
+        ledger
     }
 
     pub fn add(prefix: IpPrefix, nh: IpAddr) -> RouteEvent {
@@ -4823,6 +4835,7 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
         forwarding_mode: packetframe_common::config::ForwardingMode::PacketframeFib,
         identity: Some(IDENTITY),
         single_peer: None,
+        attestation_scope: None,
         now_unix: now_unix(),
     };
     let again = match consume(&state_dir, &exp) {
@@ -5076,6 +5089,7 @@ fn a_preserving_stop_mid_gc_writes_the_mirror_the_gc_leaves() {
         forwarding_mode: packetframe_common::config::ForwardingMode::PacketframeFib,
         identity: Some(IDENTITY),
         single_peer: None,
+        attestation_scope: None,
         now_unix: now_unix(),
     };
     let again = match consume(&state_dir, &exp) {

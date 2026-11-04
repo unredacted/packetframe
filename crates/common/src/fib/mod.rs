@@ -725,6 +725,10 @@ pub struct FeedSession {
     /// folds it into its activity rate: quiet means the STREAM went
     /// quiet, not merely that nothing changed.
     pulses: std::sync::atomic::AtomicU64,
+    /// Wall-clock second at which a whole seed reaches the ledger's
+    /// `max-age`, written once by [`FeedSession::mark_seed_whole`] before
+    /// its bit. 0 until then.
+    seed_expires_at_unix: std::sync::atomic::AtomicU64,
 }
 
 /// A coupled reading of a [`FeedSession`]'s liveness and epoch.
@@ -750,6 +754,12 @@ pub struct FeedLiveness {
     /// has been applied in full. Never without `mirror_seeded`. See
     /// [`FeedSession::mark_seed_whole`].
     pub seed_whole: bool,
+    /// When that whole seed's oldest routes reach `route-ledger max-age`,
+    /// in wall-clock seconds; meaningful only with `seed_whole`. A
+    /// consumer acting on the seed checks it itself rather than trusting
+    /// the GC to have ended the seed by then: the GC needs a trigger
+    /// (End-of-RIB, or quiet) that a feed can withhold indefinitely.
+    pub seed_expires_at_unix: u64,
 }
 
 impl FeedSession {
@@ -852,7 +862,13 @@ impl FeedSession {
     /// it had. A consumer that must not act on a partial table before the
     /// authority can count it (vpp-offload's seeded fresh door) needs this
     /// bit, not that one.
-    pub fn mark_seed_whole(&self) {
+    ///
+    /// `expires_at_unix` is when the seed reaches its `max-age`
+    /// ([`FeedLiveness::seed_expires_at_unix`]). Stored before the bit is
+    /// set, so a reader that sees the bit sees it.
+    pub fn mark_seed_whole(&self, expires_at_unix: u64) {
+        self.seed_expires_at_unix
+            .store(expires_at_unix, std::sync::atomic::Ordering::Release);
         self.state.update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
@@ -918,6 +934,9 @@ impl FeedSession {
             reconciled: s & Self::RECONCILED_BIT != 0,
             mirror_seeded: s & Self::MIRROR_SEEDED_BIT != 0,
             seed_whole: s & Self::SEED_WHOLE_BIT != 0,
+            seed_expires_at_unix: self
+                .seed_expires_at_unix
+                .load(std::sync::atomic::Ordering::Acquire),
             epoch: s >> Self::EPOCH_SHIFT,
         }
     }
@@ -1358,6 +1377,7 @@ mod tests {
             reconciled,
             mirror_seeded: false,
             seed_whole: false,
+            seed_expires_at_unix: 0,
         };
         let s = FeedSession::new();
         assert_eq!(s.liveness(), l(false, 0, false));
@@ -1455,7 +1475,7 @@ mod tests {
     #[test]
     fn a_whole_seed_lives_and_dies_with_the_seed() {
         let s = FeedSession::new();
-        s.mark_seed_whole();
+        s.mark_seed_whole(1_790_000_000);
         assert!(
             !s.liveness().seed_whole,
             "no seed, nothing to be whole: {:?}",
@@ -1464,7 +1484,7 @@ mod tests {
 
         s.mark_mirror_seeded();
         assert!(!s.liveness().seed_whole, "seeded is not yet whole");
-        s.mark_seed_whole();
+        s.mark_seed_whole(1_790_000_000);
         s.set_up(true);
         s.set_up(false);
         s.set_up(true);
@@ -1473,6 +1493,10 @@ mod tests {
             seen.mirror_seeded && seen.seed_whole && seen.epoch == 2,
             "a reconnect changes nothing about the seed: {seen:?}"
         );
+        assert_eq!(
+            seen.seed_expires_at_unix, 1_790_000_000,
+            "read with the bit"
+        );
 
         s.mark_reconciled();
         let seen = s.liveness();
@@ -1480,7 +1504,7 @@ mod tests {
             !seen.mirror_seeded && !seen.seed_whole && seen.reconciled,
             "{seen:?}"
         );
-        s.mark_seed_whole();
+        s.mark_seed_whole(1_790_000_000);
         assert!(
             !s.liveness().seed_whole,
             "a report arriving after the GC must not resurrect it"
@@ -1494,7 +1518,7 @@ mod tests {
     fn a_seed_ends_at_its_gc_even_unreconciled() {
         let s = FeedSession::new();
         s.mark_mirror_seeded();
-        s.mark_seed_whole();
+        s.mark_seed_whole(1_790_000_000);
         s.set_up(true);
         s.mark_seed_ended();
         let seen = s.liveness();

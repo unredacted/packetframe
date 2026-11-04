@@ -951,11 +951,13 @@ fn take_route_ledger(
             .map(|listen| crate::fib::route_source_bgp::session_peer_id(listen, *peer_as)),
         _ => None,
     };
+    let scope = state.integrity_authority.attestation_scope();
     let exp = Expectations {
         spec,
         forwarding_mode,
         identity: identity.as_deref(),
         single_peer,
+        attestation_scope: scope.as_deref(),
         now_unix: crate::fib::route_ledger::now_unix(),
     };
     let outcome = consume(&state.state_dir, &exp);
@@ -1018,7 +1020,7 @@ fn take_route_ledger(
                 writer_version: ledger.meta.writer_version.clone(),
                 written_at_unix: ledger.meta.written_at_unix,
                 confirmed_at_unix: ledger.meta.confirmed_at_unix,
-                attested: ledger.meta.attested,
+                attested: ledger.attested,
                 max_age_secs: spec.max_age_secs,
                 counts: ledger.counts,
                 applied_at: None,

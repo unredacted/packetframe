@@ -434,7 +434,11 @@ impl RouteController {
         // than racing it. After the sink, so the second tier hears every
         // seeded route like any other install.
         programmer.set_ledger_status(ledger_status.clone());
-        programmer.set_second_tier(completeness.clone(), feed_session.clone());
+        programmer.set_second_tier(
+            completeness.clone(),
+            feed_session.clone(),
+            integrity_authority.attestation_scope(),
+        );
         if let Some(seed) = seed {
             programmer.set_seed(seed);
             // Told to the second tier before the route source can

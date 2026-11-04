@@ -1120,6 +1120,40 @@ pub enum IntegrityAuthoritySpec {
     },
 }
 
+impl IntegrityAuthoritySpec {
+    /// What a route-ledger attestation made under this authority vouches
+    /// for, as the ledger records it, or `None` for an authority that
+    /// attests nothing (`none`).
+    ///
+    /// An attestation is a count of the families this authority counts,
+    /// taken with the upstreams it declares loaded: a ledger attested with
+    /// IPv4 upstreams alone says nothing of an IPv6 table, and one
+    /// attested by bird says nothing of FRR's (review finding, PR #375).
+    /// So the record carries this, and a start under any other value treats
+    /// the seed as unattested. The kind, and for `frr` every upstream with
+    /// its families, order-insensitive; the paths and the interval change
+    /// nothing the attestation claims.
+    pub fn attestation_scope(&self) -> Option<String> {
+        match self {
+            IntegrityAuthoritySpec::None => None,
+            IntegrityAuthoritySpec::Birdc { .. } => Some("birdc".to_string()),
+            IntegrityAuthoritySpec::Frr { upstreams, .. } => {
+                let mut ups: Vec<String> = upstreams
+                    .iter()
+                    .map(|u| {
+                        let mut fams: Vec<&str> = u.families.iter().map(|f| f.afi()).collect();
+                        fams.sort_unstable();
+                        fams.dedup();
+                        format!("{}={}", u.addr, fams.join(","))
+                    })
+                    .collect();
+                ups.sort_unstable();
+                Some(format!("frr {}", ups.join(" ")))
+            }
+        }
+    }
+}
+
 /// Allowed range for `integrity-authority frr interval`.
 ///
 /// The floor is what one check costs. Every tick runs a `vtysh` per
@@ -7393,6 +7427,52 @@ module fast-path
         spec(Some(15)).restart_only_delta(&spec(Some(15))).unwrap();
         let e = spec(None).restart_only_delta(&spec(Some(15))).unwrap_err();
         assert!(e.contains("Restart the daemon"), "{e}");
+    }
+
+    /// The attestation scope names what an attestation vouches for: the
+    /// authority's kind and, for `frr`, every upstream with its families.
+    /// Order does not matter; adding an upstream or a family, or changing
+    /// the kind, does. The interval and paths do not.
+    #[test]
+    fn the_attestation_scope_changes_with_what_an_attestation_counts() {
+        let up = |addr: &str, families: Vec<AuthorityFamily>| AuthorityUpstream {
+            addr: addr.parse().unwrap(),
+            families,
+        };
+        let frr = |upstreams, interval_secs| IntegrityAuthoritySpec::Frr {
+            vtysh: None,
+            upstreams,
+            interval_secs,
+        };
+        let a = frr(
+            vec![
+                up("192.0.2.1", vec![AuthorityFamily::V4]),
+                up("2001:db8::1", vec![AuthorityFamily::V6]),
+            ],
+            None,
+        );
+        let reordered = frr(
+            vec![
+                up("2001:db8::1", vec![AuthorityFamily::V6]),
+                up("192.0.2.1", vec![AuthorityFamily::V4]),
+            ],
+            Some(30),
+        );
+        assert_eq!(a.attestation_scope(), reordered.attestation_scope());
+        let v4_only = frr(vec![up("192.0.2.1", vec![AuthorityFamily::V4])], None);
+        assert_ne!(a.attestation_scope(), v4_only.attestation_scope());
+        let both = frr(
+            vec![
+                up("192.0.2.1", vec![AuthorityFamily::V4, AuthorityFamily::V6]),
+                up("2001:db8::1", vec![AuthorityFamily::V6]),
+            ],
+            None,
+        );
+        assert_ne!(a.attestation_scope(), both.attestation_scope());
+        let birdc = IntegrityAuthoritySpec::Birdc { path: None };
+        assert_eq!(birdc.attestation_scope().as_deref(), Some("birdc"));
+        assert_ne!(birdc.attestation_scope(), a.attestation_scope());
+        assert_eq!(IntegrityAuthoritySpec::None.attestation_scope(), None);
     }
 
     /// There is no default family set, and the refusal explains why in

@@ -1237,10 +1237,13 @@ when all of these hold, judged on each tick the drain goes idle:
 
 - **The mirror holds a whole seed.** This process seeded it from a
   route ledger whose writer's completeness authority vouched for it at
-  the stop (`attested`; see [the route
-  ledger](packetframe-fib.md#when-it-is-written-and-what-is-in-it)),
-  every route of it went in without a failed install, and no GC has
-  run since. The attestation is what makes this safe: nothing a start
+  the stop, under the same `integrity-authority` this daemon runs (the
+  same kind, upstreams and families; see [the route
+  ledger](packetframe-fib.md#when-it-is-written-and-what-is-in-it)).
+  Every route of it went in without a failed install, no GC has run
+  since, and its oldest routes are younger than `route-ledger max-age`:
+  the door shuts at that age itself, whether or not anything has ended
+  the seed. The attestation is what makes this safe: nothing a start
   checks tells a whole table from part of one, and a clean stop during
   a cold load, or during the refill after a bgpd restart's early
   End-of-RIB, writes the table it had.
@@ -1250,8 +1253,9 @@ when all of these hold, judged on each tick the drain goes idle:
 - **The authority's only objection is upstreams still loading.** Its
   most recent readable check (within 15 minutes) found a declared
   upstream not Established, or Established without End-of-RIB, and
-  nothing else: every reading answered, nothing narrows the export, no
-  session re-established, the feed's families are declared, and the
+  nothing else: every reading of every upstream answered (a loading one's
+  included), nothing narrows the export, no session re-established or
+  went down during the check, the feed's families are declared, and the
   route source has spoken to the seed. Any other objection keeps the
   door shut, and so does a count. Once the upstreams have loaded, the
   authority's next check compares the counts, and a mismatch then is a
@@ -1288,8 +1292,9 @@ loading, the GC also removes the seeded routes the replay has not
 reached, from a steered VPP too.
 
 **What still waits for the authority:** a seed that is not whole (its
-writer had no authority, or the authority did not say yes at the stop,
-or this start applied it short), no `require-table-complete`, a route
+writer had no authority, the authority did not say yes at the stop, it
+said yes under another `integrity-authority`, or this start applied it
+short), a seed past `max-age`, no `require-table-complete`, a route
 source that reconnected, a seed already reconciled, and any objection
 other than loading.
 

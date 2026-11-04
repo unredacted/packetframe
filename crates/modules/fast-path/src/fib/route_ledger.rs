@@ -97,7 +97,7 @@ pub const LEDGER_FILE_NAME: &str = "fast-path-route-ledger.bin";
 
 /// Bump on any layout change. A record of another version is refused,
 /// which costs one cold reload and nothing else. 2: the header carries
-/// [`LedgerMeta::attested`].
+/// [`LedgerMeta::attested_for`].
 pub const LEDGER_FORMAT_VERSION: u32 = 2;
 
 const MAGIC: &[u8; 8] = b"PFFIBLGR";
@@ -135,8 +135,8 @@ const fn route_max_bytes(addr_len: u64) -> u64 {
 }
 
 /// Everything but the routes, at its widest: magic, format version, the
-/// two strings at their `u16` limit, the two times, the flags, the four
-/// counts, peer and nexthop tables at the NEXTHOPS map's size each (a BGP
+/// three strings at their `u16` limit, the two times, the four counts,
+/// peer and nexthop tables at the NEXTHOPS map's size each (a BGP
 /// listener names one peer; a FIB cannot hold more nexthops than that
 /// map), and the checksum.
 const HEADER_MAX_BYTES: u64 = 8
@@ -144,7 +144,7 @@ const HEADER_MAX_BYTES: u64 = 8
     + (2 + u16::MAX as u64)
     + 8
     + 8
-    + 1
+    + (2 + u16::MAX as u64)
     + (2 + u16::MAX as u64)
     + 16
     + 4
@@ -174,10 +174,6 @@ const FLAG_PATH_ID: u8 = 1;
 const FLAG_LOCAL_PREF: u8 = 1 << 1;
 const FLAGS_KNOWN: u8 = FLAG_PATH_ID | FLAG_LOCAL_PREF;
 
-/// Flag bits in the header, after the two times.
-const META_ATTESTED: u8 = 1;
-const META_FLAGS_KNOWN: u8 = META_ATTESTED;
-
 /// What the record says about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerMeta {
@@ -196,9 +192,11 @@ pub struct LedgerMeta {
     /// The age check reads this, so a stale route cannot be carried
     /// from ledger to ledger by restarts that never reconcile it.
     pub confirmed_at_unix: u64,
-    /// The writer's completeness authority vouched for the mirror it
-    /// wrote: its current word was yes for a mirror that size
-    /// ([`packetframe_common::fib::TableCompleteness::attests`]).
+    /// The authority the writer's attestation was made under
+    /// ([`packetframe_common::config::IntegrityAuthoritySpec::attestation_scope`]),
+    /// or empty when there was none: the writer's completeness authority
+    /// vouched for the mirror it wrote, its current word yes for a mirror
+    /// that size ([`packetframe_common::fib::TableCompleteness::attests`]).
     ///
     /// Nothing a start checks tells a whole table from part of one. A
     /// clean stop during a cold load, or during the refill after a bgpd
@@ -208,9 +206,14 @@ pub struct LedgerMeta {
     /// this says whether it may also stand in for the authority's count
     /// while the authority cannot count — vpp-offload's seeded fresh
     /// door, which needs [`packetframe_common::fib::FeedLiveness::seed_whole`].
-    /// `false` with no authority and no second tier to publish to, and
+    /// Empty with no authority and no second tier to publish to, and
     /// whenever the authority's word was anything but yes at the stop.
-    pub attested: bool,
+    ///
+    /// A scope rather than a flag, because what an attestation vouches for
+    /// depends on what the authority counted: one made with IPv4 upstreams
+    /// alone says nothing of an IPv6 table (review finding, PR #375). A
+    /// start honours it only under the same scope ([`RouteLedger::attested`]).
+    pub attested_for: String,
     /// [`packetframe_common::config::RouteSourceSpec::ledger_identity`]
     /// of the route source the advertisements came from.
     pub identity: String,
@@ -299,7 +302,7 @@ impl LedgerEncoder {
         put_str(&mut out, &meta.writer_version);
         out.extend_from_slice(&meta.written_at_unix.to_le_bytes());
         out.extend_from_slice(&meta.confirmed_at_unix.to_le_bytes());
-        out.push(if meta.attested { META_ATTESTED } else { 0 });
+        put_str(&mut out, &meta.attested_for);
         put_str(&mut out, &meta.identity);
         for c in [counts.v4, counts.v6] {
             out.extend_from_slice(&c.prefixes.to_le_bytes());
@@ -469,6 +472,10 @@ pub fn encode(meta: &LedgerMeta, routes: &[LedgerRoute]) -> Result<Vec<u8>, Stri
 pub struct RouteLedger {
     pub meta: LedgerMeta,
     pub counts: LedgerCounts,
+    /// The start's reading of [`LedgerMeta::attested_for`]: it names the
+    /// authority this daemon runs. `false` from [`Self::decode`]; set by
+    /// [`judge`], which knows the configuration.
+    pub attested: bool,
     peers: Vec<PeerId>,
     nexthops: Vec<IpAddr>,
     bytes: Vec<u8>,
@@ -533,10 +540,7 @@ impl RouteLedger {
             let writer_version = r.string()?;
             let written_at_unix = r.u64()?;
             let confirmed_at_unix = r.u64()?;
-            let flags = r.u8()?;
-            if flags & !META_FLAGS_KNOWN != 0 {
-                return Err(format!("unknown header flags {flags:#x}"));
-            }
+            let attested_for = r.string()?;
             let identity = r.string()?;
             let mut counts = LedgerCounts::default();
             for c in [&mut counts.v4, &mut counts.v6] {
@@ -566,7 +570,7 @@ impl RouteLedger {
                     writer_version,
                     written_at_unix,
                     confirmed_at_unix,
-                    attested: flags & META_ATTESTED != 0,
+                    attested_for,
                     identity,
                 },
                 counts,
@@ -579,6 +583,7 @@ impl RouteLedger {
         let mut ledger = Self {
             meta,
             counts,
+            attested: false,
             peers,
             nexthops,
             bytes: Vec::new(),
@@ -922,6 +927,10 @@ pub struct Expectations<'a> {
     /// BMP, whose peer ids are per-peer and only known once the stream
     /// names them.
     pub single_peer: Option<PeerId>,
+    /// The configured authority's
+    /// [`packetframe_common::config::IntegrityAuthoritySpec::attestation_scope`];
+    /// a record attested under any other is seeded unattested.
+    pub attestation_scope: Option<&'a str>,
     pub now_unix: u64,
 }
 
@@ -984,7 +993,7 @@ pub fn judge(bytes: Vec<u8>, exp: &Expectations<'_>) -> Result<RouteLedger, Refu
     let Some(identity) = exp.identity else {
         return Err(Refusal::NoRouteSource);
     };
-    let ledger = RouteLedger::decode(bytes)?;
+    let mut ledger = RouteLedger::decode(bytes)?;
     if ledger.counts.prefixes() == 0 {
         // Intact, but no stop writes one: a mirror with nothing to
         // preserve preserves nothing.
@@ -1029,6 +1038,11 @@ pub fn judge(bytes: Vec<u8>, exp: &Expectations<'_>) -> Result<RouteLedger, Refu
             });
         }
     }
+    // Not a refusal: an attestation made under another authority says
+    // nothing about this one's table, but the routes seed the eBPF tier
+    // as well as ever.
+    ledger.attested = !ledger.meta.attested_for.is_empty()
+        && exp.attestation_scope == Some(ledger.meta.attested_for.as_str());
     Ok(ledger)
 }
 
@@ -1769,6 +1783,7 @@ mod tests {
     const IDENTITY: &str = "bgp listen 192.0.2.1 port 179 local-as 64512 peer-as 64512 peer-ip any";
     const PEER: PeerId = PeerId(0x5eed_0000_0000_0001);
     const NOW: u64 = 1_790_000_000;
+    const SCOPE: &str = "frr 192.0.2.1=ipv4";
 
     fn tmpdir(tag: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1794,7 +1809,7 @@ mod tests {
             writer_version: "0.6.0".into(),
             written_at_unix: NOW - 120,
             confirmed_at_unix: NOW - 120,
-            attested: true,
+            attested_for: SCOPE.into(),
             identity: IDENTITY.into(),
         }
     }
@@ -1877,6 +1892,7 @@ mod tests {
             forwarding_mode: ForwardingMode::PacketframeFib,
             identity: Some(IDENTITY),
             single_peer: None,
+            attestation_scope: Some(SCOPE),
             now_unix: NOW,
         }
     }
@@ -2015,29 +2031,44 @@ mod tests {
         );
     }
 
-    /// Both values of the attestation survive the trip, and a header flag
-    /// this build does not know is corruption rather than ignored: a
-    /// later writer's flag could mean something this reader must not
-    /// seed past.
+    /// The attestation's scope survives the trip, empty or not, and a
+    /// start honours it only under the same scope: no authority, another
+    /// authority, or the same one counting other upstreams or families all
+    /// seed the record unattested (review finding, PR #375). None of them
+    /// refuses it.
     #[test]
-    fn the_attestation_round_trips_and_unknown_header_flags_are_refused() {
-        for attested in [true, false] {
-            let m = LedgerMeta { attested, ..meta() };
+    fn an_attestation_counts_only_under_the_scope_it_was_made_in() {
+        for attested_for in [SCOPE, ""] {
+            let m = LedgerMeta {
+                attested_for: attested_for.into(),
+                ..meta()
+            };
             let ledger = RouteLedger::decode(encode(&m, &routes()).unwrap()).unwrap();
-            assert_eq!(ledger.meta.attested, attested);
+            assert_eq!(ledger.meta.attested_for, attested_for);
+            assert!(!ledger.attested, "decode alone attests nothing");
         }
-        let mut bytes = encode(&meta(), &routes()).unwrap();
-        // Magic, version, the writer version (length + bytes), two times.
-        let at = 8 + 4 + 2 + meta().writer_version.len() + 8 + 8;
-        assert_eq!(bytes[at], META_ATTESTED, "the flags byte is where it is");
-        bytes[at] |= 1 << 5;
-        let body = bytes.len() - 8;
-        let sum = fnv1a(&bytes[..body]);
-        bytes[body..].copy_from_slice(&sum.to_le_bytes());
-        match RouteLedger::decode(bytes) {
-            Err(Refusal::Corrupt(why)) => assert!(why.contains("header flags"), "{why}"),
-            other => panic!("{other:?}"),
-        }
+        let judged = |attested_for: &str, scope: Option<&str>| {
+            let m = LedgerMeta {
+                attested_for: attested_for.into(),
+                ..meta()
+            };
+            let exp = Expectations {
+                attestation_scope: scope,
+                ..expect()
+            };
+            judge(encode(&m, &routes()).unwrap(), &exp)
+                .expect("seeds either way")
+                .attested
+        };
+        assert!(judged(SCOPE, Some(SCOPE)));
+        assert!(!judged("", Some(SCOPE)), "never attested");
+        assert!(!judged(SCOPE, None), "no authority now");
+        assert!(!judged(SCOPE, Some("birdc")), "another authority");
+        assert!(
+            !judged(SCOPE, Some("frr 192.0.2.1=ipv4 2001:db8::1=ipv6")),
+            "the same authority counting a family it did not"
+        );
+        assert!(!judged("", None), "an empty scope never matches");
     }
 
     /// A record that names a resolver peer is not one this writer could

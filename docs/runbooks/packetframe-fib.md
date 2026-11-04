@@ -1271,19 +1271,25 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
   the writing version, the write time, the route-source identity (mode,
   listen address and port, ASNs, peer pin, and the `peer-from` ACL when
   no pin names the speaker) and per-family counts.
-- **Whether the authority vouched for it** (`attested`, format version
-  2). True when the stopping daemon's completeness authority (the one
-  vpp-offload steers by) currently said yes for a mirror the size of the
-  one written. False with no authority, with no second tier to publish
-  to, and whenever the authority said anything else. A stop during a
-  cold load, or during the refill after a bgpd restart's early
-  End-of-RIB, writes the table it had with every route confirmed, and
-  nothing at the next start can tell that from a whole one. This bit
-  can. It decides only whether the seed may stand in for the authority's
-  count at [a fresh VPP's seeded
-  door](vpp-offload.md#a-fresh-vpp-and-a-seeded-mirror). An unattested
-  ledger seeds the eBPF tier exactly as an attested one does. Both
-  `route_ledger_preserved` and `route_ledger_seeded` carry `attested`.
+- **Whether the authority vouched for it, and which authority** (format
+  version 2). Attested when the stopping daemon's completeness authority
+  (the one vpp-offload steers by) currently said yes for a mirror the
+  size of the one written; the record then names that authority's scope:
+  its kind and, for `frr`, every declared upstream with its families.
+  Unattested with no authority, with no second tier to publish to, and
+  whenever the authority said anything else. A stop during a cold load,
+  or during the refill after a bgpd restart's early End-of-RIB, writes
+  the table it had with every route confirmed, and nothing at the next
+  start can tell that from a whole one. The attestation can. **A start
+  honours it only under the same scope**: an attestation made with IPv4
+  upstreams alone says nothing of an IPv6 table, so adding an upstream
+  or a family, or changing the authority, seeds the next ledger
+  unattested (routes and all; nothing is refused). It decides only
+  whether the seed may stand in for the authority's count at [a fresh
+  VPP's seeded door](vpp-offload.md#a-fresh-vpp-and-a-seeded-mirror). An
+  unattested ledger seeds the eBPF tier exactly as an attested one does.
+  `route_ledger_preserved` carries `attested` as written and
+  `route_ledger_seeded` as this start honours it.
 - **How old its routes are**, which is not always the write time. A
   route the live session had not re-advertised by the stop — the session
   was down (a `Resync` with no new session yet), or the stop came before

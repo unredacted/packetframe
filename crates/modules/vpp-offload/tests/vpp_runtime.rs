@@ -8721,7 +8721,11 @@ mod seeded_fresh {
         let session = Arc::new(FeedSession::new());
         session.mark_mirror_seeded();
         if whole {
-            session.mark_seed_whole();
+            // A seed well within its max-age.
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            session.mark_seed_whole(now_unix + 1_800);
         }
         rt.feed_session(session.clone());
         let authority = Arc::new(TableCompleteness::new());
