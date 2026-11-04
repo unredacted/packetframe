@@ -63,6 +63,8 @@ CI runs `cargo clippy --workspace --all-targets --all-features -- -D warnings`. 
 
 One feature branch per slice. Commit messages explain **why**, not what the diff already shows. CI must be green before asking for review (eleven jobs: fmt+clippy, build+test, privileged tests native, four cross-builds, sampler-shm on arm64, the sampler plugin in VPP on arm64, two qemu kernels). Amending unreviewed commits and `git push --force-with-lease` on a feature branch is fine pre-review; force-push to `main` is never fine. For multi-phase work (e.g. the Option F rollout) the slicing lives in the plan file; keep PRs scoped to a single slice.
 
+`CHANGELOG.md`'s section is published verbatim as the GitHub release notes, so a PR's entry is one line under its module with its PR link; mechanism, measurements and incident narrative go in the runbook and the PR description. A release's section stays near 0.5.0's size and shape (the preamble of `CHANGELOG.md` says what that is), and `release.sh check` fails CI on a section over 20,000 bytes or a line over 800.
+
 ## What not to change casually
 
 - `SPEC.md` stays out of the repo; it's in `.gitignore`.

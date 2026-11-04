@@ -2,6 +2,7 @@
 # Release consistency helpers for .github/workflows/release.yml.
 #
 #   release.sh check [<tag>]   fail unless every version source agrees
+#                              and every CHANGELOG.md section fits its budget
 #   release.sh notes <version> print that version's CHANGELOG.md section
 #
 # Three things carry the version and nothing else ties them together:
@@ -61,6 +62,35 @@ heading_status() {
         return
     fi
     die "CHANGELOG.md heading '${line}': '${rest}' is not a YYYY-MM-DD date or UNRELEASED"
+}
+
+# A section is published as written, so it is held near 0.5.0's notes
+# (14.8 KB, longest line 741 bytes). Every section is checked, the
+# UNRELEASED one included, so the PR that grows one past a bound is the
+# one that fails, not the tag. Bytes, not characters, so every awk
+# counts alike.
+NOTES_MAX_BYTES=20000
+NOTES_MAX_LINE=800
+
+notes_budget() {
+    local over
+    over="$(LC_ALL=C awk -v max_bytes="$NOTES_MAX_BYTES" -v max_line="$NOTES_MAX_LINE" '
+        function close_section() {
+            if (name != "" && bytes > max_bytes)
+                printf "section %s is %d bytes (budget %d); ", name, bytes, max_bytes
+            name = ""
+        }
+        /^## \[/ { close_section(); name = $2; bytes = 0; next }
+        /^\[[^]]+\]: / { close_section(); next }
+        name != "" {
+            bytes += length($0) + 1
+            if (length($0) > max_line)
+                printf "line %d in %s is %d bytes (budget %d); ", NR, name, length($0), max_line
+        }
+        END { close_section() }
+    ' CHANGELOG.md)"
+    [ -z "$over" ] ||
+        die "CHANGELOG.md sections are the release notes: ${over%; }. One line per change with its PR link; the detail belongs in the runbook and the PR"
 }
 
 # A prerelease tag (0.5.0-rc1) may have its own section; if it does not,
@@ -132,6 +162,7 @@ for p in m["packages"]:
     # substitution only ends the subshell, hence the explicit exit.
     local status
     status="$(heading_status "$nv")" || exit 1
+    notes_budget
 
     if [ -n "$tag" ]; then
         local tag_version="${tag#v}"
