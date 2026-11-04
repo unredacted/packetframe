@@ -3724,19 +3724,21 @@ mod vpp_detach_tests {
     /// this subsystem points at, and one that refuses whenever a steered
     /// VPP had been running would strand the box.
     ///
-    /// The port is one no host has, so no ethtool call can succeed and
-    /// what is exercised is the refusal path. It was `eth5`, which CI
-    /// runners lack and a gateway has: on the lab EFG the read-back found
-    /// no rule at either location, the teardown went on, and the release
-    /// ran against the live sysfs (2026-11-04; nothing there to release, so
-    /// nothing changed). The assertion is on the RECORD rather than on the
+    /// The port is a name the kernel refuses to give an interface (`/` is
+    /// one of the characters `dev_valid_name()` rejects), so every ethtool
+    /// call fails with `ENODEV` and what is exercised is the refusal path.
+    /// It was `eth5`, which CI runners lack and a gateway has: on the lab
+    /// EFG the read-back found no rule at either location, the teardown went
+    /// on, and the release ran against the live sysfs (2026-11-04; nothing
+    /// there to release, so nothing changed). A valid name nobody uses would
+    /// only be absent by luck. The assertion is on the RECORD rather than on the
     /// message, because that is the invariant: rules that would not come
     /// out must stay findable, or nothing can ever remove them.
     #[test]
     fn steering_that_will_not_come_down_blocks_the_teardown() {
         use packetframe_vpp_offload::resources::{flatten_steer_rules, ResourceState};
 
-        const PORT: &str = "pftest-absent0";
+        const PORT: &str = "pftest/absent0";
         let dir = std::env::temp_dir().join(format!("pf-detach-steer-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut state = ResourceState::empty();
