@@ -36,6 +36,10 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 - An adopted resync's release walks the table 16,384 routes a pass, so a steered VPP keeps being pinged every 500 ms instead of going about 4.9 s unpinged at 1.35M routes. ([runbook](docs/runbooks/vpp-offload.md#the-steered-diff-and-a-seeded-mirror), [#368](https://github.com/unredacted/packetframe/pull/368))
 
+**CLI and operations**
+
+- `packetframe detach --keep-vpp` works without vpp-offload when no VPP is on record, so a restart on such a box keeps the route ledger and the wan-egress rules instead of loading cold. ([runbook](docs/runbooks/packetframe-fib.md#turning-it-off-and-detach), [#378](https://github.com/unredacted/packetframe/pull/378))
+
 ## [0.6.0] - 2026-10-13
 
 The first release since 0.5.0 (2026-09-28). It adds the flow-export module (experimental) and fast-path's `wan-egress`, brings a restart on a full table down from minutes to seconds, and hardens vpp-offload, neigh-snoop and the BGP feed against the failures found in production on 2026-10-07 and 2026-10-12. A 0.5.0 config parses unchanged, but read **Upgrading from 0.5.0** first: a mode and three counters were renamed, an `attach` of keepalived's dedicated VRRP link is refused, and the state files' ownership rules are stricter.
