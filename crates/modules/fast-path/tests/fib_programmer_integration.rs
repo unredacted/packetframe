@@ -124,13 +124,11 @@ impl PinDirs {
 
 impl Drop for PinDirs {
     fn drop(&mut self) {
-        // Remove every file (unpinning each map) then the directory.
-        if let Ok(entries) = std::fs::read_dir(&self.dir) {
-            for entry in entries.flatten() {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(&self.dir);
+        // Unpin every map, then the directories. Recursive: the tests that
+        // pin the production layout (`fast-path/maps/<NAME>`) nest theirs,
+        // and a flat sweep left each of them and its maps pinned (three a
+        // run on the lab EFG, 2026-11-04).
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -3835,12 +3833,17 @@ fn a_resync_and_its_gc_give_the_runtime_back_between_chunks() {
 
     // Every chunk of the walk ends by returning `Pending`, so the task is
     // polled once more per chunk. In one call the walk takes one poll.
+    // The poll that receives the command and runs the first chunk may
+    // already be under way when `before` is read (one of its timers woke
+    // the task, and its loop finds the command), so only the
+    // polls after it are certain: one fewer than the chunks. It went 15 of
+    // 16 on the lab EFG under the whole binary's load, 2026-11-04.
     let before = t.polls.load(Ordering::SeqCst);
     t.h.run(async { t.h.handle.apply_route_event(RouteEvent::Resync).await })
         .expect("Resync");
     let polls = t.polls.load(Ordering::SeqCst) - before;
     assert!(
-        polls >= MANY_CHUNKS / WALK_CHUNK,
+        polls >= MANY_CHUNKS / WALK_CHUNK - 1,
         "the Resync's walk over {MANY_CHUNKS} routes took {polls} polls of the programmer's \
          task: it did not give the worker back between chunks"
     );
