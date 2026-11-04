@@ -124,13 +124,11 @@ impl PinDirs {
 
 impl Drop for PinDirs {
     fn drop(&mut self) {
-        // Remove every file (unpinning each map) then the directory.
-        if let Ok(entries) = std::fs::read_dir(&self.dir) {
-            for entry in entries.flatten() {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-        let _ = std::fs::remove_dir(&self.dir);
+        // Unpin every map, then the directories. Recursive: the tests that
+        // pin the production layout (`fast-path/maps/<NAME>`) nest theirs,
+        // and a flat sweep left each of them and its maps pinned (three a
+        // run on the lab EFG, 2026-11-04).
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -644,7 +642,7 @@ impl HeldWorker {
 /// to the runtime.
 struct CountPolls<F> {
     inner: Pin<Box<F>>,
-    polls: Arc<AtomicUsize>,
+    polls: PollCount,
     longest_ns: Arc<AtomicU64>,
 }
 
@@ -652,12 +650,38 @@ impl<F: Future> Future for CountPolls<F> {
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
-        self.polls.fetch_add(1, Ordering::SeqCst);
+        self.polls.begin();
         let started = std::time::Instant::now();
         let out = self.inner.as_mut().poll(cx);
         let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.longest_ns.fetch_max(took, Ordering::SeqCst);
+        self.polls.end();
         out
+    }
+}
+
+/// [`CountPolls`]'s count: twice the polls begun, plus one while a poll is
+/// under way. One atomic, so a reader learns both at a single instant.
+#[derive(Clone, Default)]
+struct PollCount(Arc<AtomicUsize>);
+
+impl PollCount {
+    fn begin(&self) {
+        self.0.fetch_add(3, Ordering::SeqCst);
+    }
+
+    fn end(&self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// The polls begun so far, and whether one is under way now.
+    fn read(&self) -> (usize, bool) {
+        let v = self.0.load(Ordering::SeqCst);
+        (v / 2, v % 2 == 1)
+    }
+
+    fn polls(&self) -> usize {
+        self.read().0
     }
 }
 
@@ -676,7 +700,7 @@ struct OneFreeWorker {
     sink: Arc<CountingSink>,
     status: packetframe_fast_path::fib::route_ledger::SharedLedgerStatus,
     /// Polls of the programmer's task ([`CountPolls`]).
-    polls: Arc<AtomicUsize>,
+    polls: PollCount,
     /// The longest of them, in nanoseconds.
     longest_poll_ns: Arc<AtomicU64>,
 }
@@ -712,7 +736,7 @@ impl OneFreeWorker {
             .build()
             .expect("runtime");
         let held = HeldWorker::hold(&rt);
-        let polls = Arc::new(AtomicUsize::new(0));
+        let polls = PollCount::default();
         let longest_poll_ns = Arc::new(AtomicU64::new(0));
         let task = rt.spawn(CountPolls {
             inner: Box::pin(programmer.run()),
@@ -3835,14 +3859,22 @@ fn a_resync_and_its_gc_give_the_runtime_back_between_chunks() {
 
     // Every chunk of the walk ends by returning `Pending`, so the task is
     // polled once more per chunk. In one call the walk takes one poll.
-    let before = t.polls.load(Ordering::SeqCst);
+    // A poll already under way when the baseline is read (one of the
+    // programmer's timers woke the task, and its loop finds the command)
+    // can be the one that runs the first chunk, and it is not counted: 15
+    // of 16 on the lab EFG under the whole binary's load, 2026-11-04. Only
+    // then is one fewer allowed, so a skipped yield from a clean baseline
+    // still fails.
+    let (before, in_flight) = t.polls.read();
     t.h.run(async { t.h.handle.apply_route_event(RouteEvent::Resync).await })
         .expect("Resync");
-    let polls = t.polls.load(Ordering::SeqCst) - before;
+    let polls = t.polls.polls() - before;
+    let chunks = MANY_CHUNKS / WALK_CHUNK;
     assert!(
-        polls >= MANY_CHUNKS / WALK_CHUNK,
+        polls >= chunks - usize::from(in_flight),
         "the Resync's walk over {MANY_CHUNKS} routes took {polls} polls of the programmer's \
-         task: it did not give the worker back between chunks"
+         task (a poll under way at the baseline: {in_flight}): it did not give the worker back \
+         between chunks"
     );
 
     let watcher = t.first_sight(|s| s.withdrawn.load(Ordering::SeqCst));
@@ -3953,16 +3985,16 @@ fn a_closed_channel_does_not_spin_the_programmer() {
         .enable_all()
         .build()
         .expect("runtime");
-    let polls = Arc::new(AtomicUsize::new(0));
+    let polls = PollCount::default();
     let task = rt.spawn(CountPolls {
         inner: Box::pin(programmer.run()),
         polls: polls.clone(),
         longest_ns: Arc::new(AtomicU64::new(0)),
     });
     let polls_while_idle = || {
-        let before = polls.load(Ordering::SeqCst);
+        let before = polls.polls();
         rt.block_on(async { tokio::time::sleep(IDLE).await });
-        polls.load(Ordering::SeqCst) - before
+        polls.polls() - before
     };
     // An idle programmer is polled once per timer tick, plus once to see a
     // close. A window can hold one more tick than its length divided by the
