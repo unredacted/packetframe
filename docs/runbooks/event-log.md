@@ -83,7 +83,7 @@ Kinds are stable: scripts and alerts may key on them.
 | `reconfigure_applied` | One module applied a SIGHUP's config (`module`: that module) | — |
 | `reconfigure_failed` | One module did not (`module`: that module; the others did, nothing rolled back) | `detail` |
 | `module_health` | A module's overall health changed and held for two polls (~10 s) (`module`: that module) | `from`, `to` (`healthy`, `degraded`, `unhealthy`, `unknown`), `detail` (the failing subsystems) |
-| `detach` | `packetframe detach` finished | `outcome`, `all`, `keep_vpp`, `vpp` (`kept`, `torn-down`, `teardown-failed`, `out-of-scope`), `detail` on failure |
+| `detach` | `packetframe detach` finished | `outcome`, `all`, `keep_vpp`, `vpp` (`kept`, `none` for `--keep-vpp` with no VPP configured or on record, `torn-down`, `teardown-failed`, `out-of-scope`), `detail` on failure |
 
 **vpp-offload**
 

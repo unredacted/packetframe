@@ -117,7 +117,9 @@ enum Command {
         /// steering rules — and tear down every other module (implies
         /// `--all` for them), so the next
         /// `packetframe run` adopts it and steered traffic keeps flowing
-        /// across the restart: stop, `detach --keep-vpp`, start.
+        /// across the restart: stop, `detach --keep-vpp`, start. Without
+        /// vpp-offload (and no VPP on record) it is the same restart: it
+        /// keeps the fast-path's route ledger and wan-egress rules.
         #[arg(long)]
         keep_vpp: bool,
     },

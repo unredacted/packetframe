@@ -1392,7 +1392,11 @@ the config it starts with.
 A full `packetframe detach` (and `detach --all`) removes the ledger:
 it is the recovery path, and the start after it should trust nothing a
 previous process preserved. `detach --keep-vpp` — the routine restart —
-keeps it.
+keeps it, on a box without vpp-offload too: with no VPP on record there
+is nothing for it to keep running, and it refuses only when a VPP is on
+record that the config no longer declares. Before 0.6.1 it refused
+whenever the config had no vpp-offload section, so such a box had no
+restart that seeds.
 
 ### Known limits
 
