@@ -262,37 +262,33 @@ another speaker, and following §4.2 would empty the PacketFrame FIB for
 the whole of every FRR reload. The one receiving-speaker duty it does
 perform is the stale-route sweep at the peer's End-of-RIB.
 
-**Known limitation: a bgpd restart can send End-of-RIB over a nearly
-empty table.** When bgpd itself restarts (not a session reset: the
-process), it comes back with an empty RIB and brings packetframe's
-session up within a second or so, typically before its upstream
-sessions have re-learned the table. In helper mode nothing makes it
-wait, so it sends what little it has and then End-of-RIB.
-packetframe takes that End-of-RIB at its word: `InitiationComplete`
-fires with a small `updates_seen` and its GC removes nearly the whole
-mirror, which then refills as FRR learns routes and sends them, the
-same as a cold load. packetframe does not guard against this. On the
-FRR side, `bgp update-delay <max-delay>` should avoid it: a restarted
-bgpd then runs no best-path selection and sends no updates to any peer
-until every configured peer has sent End-of-RIB (FRR counts a peer's
-first KEEPALIVE as one) or `max-delay` seconds pass. That is untested
-here; it applies to the whole router, and an upstream that is
-configured but down holds every peer's updates for the full
-`max-delay`.
-
-In restart mode (`bgp graceful-restart`) the End-of-RIB comes later but
-can still be early. bgpd defers best-path selection until every
+**A bgpd restart can send End-of-RIB over a nearly empty table.** When
+bgpd itself restarts (not a session reset: the process; every UniFi BGP
+configuration upload is one), it comes back with an empty RIB and brings
+packetframe's session up within a second or so, typically before its
+upstream sessions have re-learned the table. In helper mode nothing
+makes it wait, so it sends what little it has and then End-of-RIB. In
+restart mode (`bgp graceful-restart`) the End-of-RIB comes later but can
+still be early: bgpd defers best-path selection until every
 graceful-restart peer's End-of-RIB is in or `select-defer-time` (360 s)
-runs out, then sends what it has and End-of-RIB, even with transits
-still loading. After the reboot of 2026-10-30 the transits finished about
-nine minutes after it. **The one
-case packetframe does guard is the first GC after a route-ledger seed**,
-where the mirror holds a whole table the early GC would throw away: with
-`integrity-authority frr`, that GC waits until the authority reads every
-declared upstream loaded ([the GC after a
-seed](#the-gc-after-a-seed-waits-for-frrs-upstreams)). A bgpd restart
-under a running packetframe, with no seed waiting, still sweeps as
-described above.
+runs out, then sends what it has, even with transits still loading
+(after the reboot of 2026-10-30 they finished about nine minutes after
+it). With `integrity-authority frr`, packetframe holds the GC that End-of-RIB
+would trigger until the authority reads every declared upstream loaded,
+after a reconnect as after a route-ledger seed ([the held
+GC](#the-gc-over-earlier-routes-waits-for-frrs-upstreams)).
+
+**Known limitation: without the FRR authority it is not guarded.** Under
+`birdc` or `none` packetframe takes that End-of-RIB at its word:
+`InitiationComplete` fires with a small `updates_seen` and its GC
+removes nearly the whole mirror, which then refills as FRR learns routes
+and sends them, the same as a cold load. On the FRR side, `bgp
+update-delay <max-delay>` should avoid it: a restarted bgpd then runs no
+best-path selection and sends no updates to any peer until every
+configured peer has sent End-of-RIB (FRR counts a peer's first KEEPALIVE
+as one) or `max-delay` seconds pass. That is untested here; it applies
+to the whole router, and an upstream that is configured but down holds
+every peer's updates for the full `max-delay`.
 
 ### The completeness authority on an FRR-fed box
 
@@ -1357,7 +1353,7 @@ The staleness this accepts is the one a session loss already accepts:
 until the replay reaches a route, it forwards where it did when the
 daemon stopped. The age bound caps how far behind that can be.
 
-### The GC after a seed waits for FRR's upstreams
+### The GC over earlier routes waits for FRR's upstreams
 
 **The incident this answers (primary, 2026-10-30, a firmware upgrade's
 reboot).** FRR on that box runs `bgp graceful-restart` (restart mode).
@@ -1370,18 +1366,33 @@ End-of-RIB at its word. `InitiationComplete`'s GC removed most of a
 1.35M-route seed that was right, and the mirror refilled as a cold load
 would. A second tier waiting on the mirror waited with it.
 
-**Now the first GC after a seed waits** whenever `integrity-authority
-frr` runs, until the authority's reading of the declared upstreams,
-taken since the current session began, finds every one Established with
-End-of-RIB for every family it carries. Each check publishes that
-reading on its own, apart from the comparison. While the GC waits:
+**The same GC after a bgpd restart.** Every UniFi BGP configuration
+upload restarts zebra and bgpd under a running packetframe. The session
+drops, the mirror keeps the table the earlier session sent, and the next
+session's End-of-RIB comes before the upstreams have reloaded: a second
+or so after Established in helper mode, at `select-defer-time` at the
+latest in restart mode. Its GC would remove what FRR has not re-sent
+yet from both tiers, a steered VPP included ([the known
+limitation](#graceful-restart-on-the-feed-session)).
 
-- UPDATEs keep applying. Each confirms or replaces a seeded route as FRR
-  learns it, and a withdrawal removes one. Only the GC of routes nobody
-  re-advertised waits.
-- The feed session counts as not reconciled, and the seed as not yet
+**Now that GC waits** whenever `integrity-authority frr` runs, whether
+it would remove a seed's routes (the first GC after a route-ledger
+seed) or an earlier session's (the first GC after a reconnect). It waits
+until the authority's reading of the declared upstreams, taken since the
+current session began, finds every one Established with End-of-RIB for
+every family it carries. Each check publishes that reading on its own,
+apart from the comparison, and the hold asks for a check the moment it
+begins rather than waiting out the authority's interval. While the GC
+waits:
+
+- UPDATEs keep applying. Each confirms or replaces an earlier route as
+  FRR learns it, and a withdrawal removes one. Only the GC of routes
+  nobody re-advertised waits.
+- The feed session counts as not reconciled, and a seed as not yet
   ended, for vpp-offload's gates. With the FRR authority configured
-  those gates attest through it rather than through the reconciliation.
+  those gates attest through it rather than through the reconciliation;
+  a steered restart's deferral that saw the session flap waits for this
+  GC, as it waits for any.
 - A session that ends drops its hold. The next session's End-of-RIB is
   judged afresh.
 
@@ -1390,54 +1401,61 @@ reading on its own, apart from the comparison. While the GC waits:
 | `trigger` | When |
 |---|---|
 | `upstreams-loaded` | The authority read every declared upstream loaded in this session (the ordinary end) |
-| `max-age` | The seed's oldest routes reached the `route-ledger max-age` that would have refused it at the start (30 minutes by default, counted from when they were last confirmed) |
+| `max-age` | The routes it would remove reached `route-ledger max-age` (30 minutes by default) since they were last confirmed: a seed's as its start judged them, an earlier session's from the moment that session ended, at the `max-age` in force (it reloads, and applies with the ledger off too) |
 | `authority-silent` | The authority produced no readable reading of the upstreams for 15 minutes (`STEER_MAX_REPORT_AGE`), counted from the later of its last reading and the End-of-RIB. One that keeps answering "loading" never trips it |
 
-With no seed waiting for its first GC, nothing is held. That covers a
-reconnect over a mirror this process loaded, and a seed already
-reconciled. It also covers every box without the FRR authority: `birdc`
-cannot see bird's upstreams, and `none` reads nothing. On a routine
-restart FRR's upstreams are already loaded, and the authority's first
-check (it runs the moment the route source's first route arrives) says
-so long before the replay's End-of-RIB, so nothing is held there either.
+With nothing from before the session, nothing is held: the first
+session of a start without a seed, and every box without the FRR
+authority (`birdc` cannot see bird's upstreams, and `none` reads
+nothing). On a routine restart FRR's upstreams are already loaded, and
+the authority's first check (it runs the moment the route source's first
+route arrives) says so long before the replay's End-of-RIB. A reconnect
+with FRR still up (a `clear bgp` of packetframe's session, a hold-timer
+expiry) is held for the one check the hold asks for, which finds the
+upstreams loaded.
 
 What you see while it holds, and when it lets go:
 
 ```
 End-of-RIB arrived over the route-ledger seed, but the completeness authority does not yet read every upstream loaded: holding the GC ...   unconfirmed=N reason="upstream 192.0.2.1 is Established but has not sent End-of-RIB for ipv4 on this session ..."
-letting the held route-ledger seed GC run   trigger="upstreams-loaded" held_secs=540
-InitiationComplete fired   trigger="end-of-rib" seed_gc="upstreams-loaded"
-route ledger seed reconciled: the route source re-advertised the rest of the seeded table  gc_removed=N
+End-of-RIB arrived after a reconnect, but the completeness authority does not yet read every upstream loaded: holding the GC ...   reason="..."
+letting the held GC run   over="earlier-session" trigger="upstreams-loaded" held_secs=540
+InitiationComplete fired   trigger="end-of-rib" gc_hold="upstreams-loaded"
 ```
 
-Events `route_ledger_gc_held` (`unconfirmed`, `detail`: why) and
-`route_ledger_gc_released` (`trigger`, `held_secs`). The `route-ledger`
-status row reads `the route source sent End-of-RIB … ago with N seeded
+Events `feed_gc_held` (`over`: `seed` or `earlier-session`;
+`unconfirmed` for a seed; `detail`: why) and `feed_gc_released` (`over`,
+`trigger`, `held_secs`). The `route-ledger` status row says so: over a
+seed, `the route source sent End-of-RIB … ago with N seeded
 advertisements not re-advertised, and the GC that would remove them is
-held: <why>. It runs once the authority reads every upstream loaded, or
-in … at most (max-age)`.
+held: <why>`; after a reconnect, `the route source reconnected and sent
+End-of-RIB … ago, and the GC that would remove what the earlier session
+sent and this one has not is held: <why>`. Both end `It runs once the
+authority reads every upstream loaded, or in … at most (max-age)`.
 
-**What it costs.** For as long as the GC waits, a seeded route FRR no
-longer has goes on forwarding where it did at the stop: in the eBPF
-tier and in a VPP that steered on the seed. That covers a route
-withdrawn while the box was down, or one an upstream that stays down
-used to carry and nothing has re-advertised since. It lasts until the
-upstreams finish, and never past `max-age` after the routes were last
-confirmed. A route FRR still has but sends with a different next hop is
-replaced as soon as FRR re-advertises it. The bound cuts the other way
-too: if `max-age` passes before the upstreams finish (a firmware upgrade
-that keeps the box down long enough), the GC runs with the replay
-unfinished. It removes the seeded routes FRR has
+**What it costs.** For as long as the GC waits, an earlier route FRR no
+longer has goes on forwarding where it did: in the eBPF tier and in a
+steered VPP. That covers a route withdrawn while the box was down or the
+session was, or one an upstream that stays down used to carry and
+nothing has re-advertised since. It lasts until the upstreams finish,
+and never past `max-age` after the routes were last confirmed. A route
+FRR still has but sends with a different next hop is replaced as soon as
+FRR re-advertises it. **An upstream that stays down counts as loading**,
+so while a declared upstream is down every reconnect holds its GC for
+`max-age`: fix the upstream or remove it from `integrity-authority`. The
+bound cuts the other way too: if `max-age` passes before the upstreams
+finish (a firmware upgrade that keeps the box down long enough), the GC
+runs with the replay unfinished. It removes the earlier routes FRR has
 not sent yet, as the early GC used to, and they come back as FRR sends
 them. On boxes where a reboot plus the transits' load can approach
 `max-age`, raising it widens the window for both: more time for the
 upstreams, and older routes forwarding meanwhile.
 
 **Turning it off.** No switch of its own. `route-ledger off` removes the
-seed and so the hold (every start loads cold); an `integrity-authority`
-other than `frr` (restart-only) removes the hold and keeps the seed,
-which then reconciles at FRR's End-of-RIB as before. A shorter
-`route-ledger on max-age` shortens the longest hold.
+seed and so the seed's hold (every start loads cold); a reconnect is
+still held. An `integrity-authority` other than `frr` (restart-only)
+removes both holds, and the GC runs at FRR's End-of-RIB as before. A
+shorter `route-ledger … max-age` shortens the longest hold of either.
 
 ### What it means for the gates
 
@@ -1492,8 +1510,8 @@ the route source's first route after the ledger seed arrived; its replay now con
 route ledger seed reconciled: the route source re-advertised the rest of the seeded table  gc_removed=N
 ```
 
-(with the GC-hold lines of [the previous
-section](#the-gc-after-a-seed-waits-for-frrs-upstreams) between the last
+(with the GC-hold lines of [the held
+GC](#the-gc-over-earlier-routes-waits-for-frrs-upstreams) between the last
 two when FRR's End-of-RIB came early).
 
 `packetframe status` carries a `route-ledger` row whenever the
@@ -1543,18 +1561,19 @@ restart that seeds.
   earlier stream's: its feed raises after its first `InitiationComplete`
   rather than on the first frame.
 - With `integrity-authority frr`, [the held
-  GC](#the-gc-after-a-seed-waits-for-frrs-upstreams) keeps a seeded route
+  GC](#the-gc-over-earlier-routes-waits-for-frrs-upstreams) keeps a seeded route
   FRR no longer has (withdrawn while the box was down) forwarding until
   every declared upstream has loaded, or the seed reaches `max-age`. Both
   tiers forward on it meanwhile, VPP too once it steered on the seed. The
-  ADD-PATH case above lasts as long.
+  ADD-PATH case above lasts as long. The GC after a reconnect is held the
+  same way, over what the earlier session sent.
 - If `max-age` passes with an upstream still loading, the held GC runs
-  anyway and removes the seeded routes FRR has not re-sent yet, from a
+  anyway and removes the earlier routes FRR has not re-sent yet, from a
   steered VPP too, until FRR sends them. Size `max-age` for the longest
   reboot plus upstream load you expect.
-- The hold covers only the first GC after a seed. A bgpd restart under a
-  running packetframe still sweeps the mirror at its early End-of-RIB
-  (the known limitation under [graceful
+- Without the FRR authority nothing is held, and a bgpd restart under a
+  running packetframe sweeps the mirror at its early End-of-RIB (the
+  known limitation under [graceful
   restart](#graceful-restart-on-the-feed-session)).
 
 ## Cutover and rollback

@@ -38,7 +38,7 @@ use crate::fib::netlink_neigh::{
 };
 use crate::fib::programmer::{FibProgrammer, FibProgrammerHandle, ProgrammerError};
 use crate::fib::route_ledger::{RouteLedger, SharedLedgerStatus};
-use crate::fib::route_source_bgp::{BgpListener, BgpListenerConfig, SeedGcHold};
+use crate::fib::route_source_bgp::{BgpListener, BgpListenerConfig, FeedGcHold};
 use crate::fib::route_source_bmp::BmpStation;
 use packetframe_common::config::IntegrityAuthoritySpec;
 
@@ -62,11 +62,14 @@ use crate::fib::frr_authority::{FrrAuthorityChecker, FrrAuthorityConfig};
 /// `pf_peer` is packetframe's own listen address, which the FRR
 /// authority needs and the `birdc` one does not. `None` where the feed
 /// has no such session; config validation refuses the FRR authority
-/// there, so the arm cannot be reached with a `None`.
+/// there, so the arm cannot be reached with a `None`. `check_now` is how
+/// the BGP listener's GC hold asks the FRR authority for a check before
+/// its interval.
 #[allow(clippy::too_many_arguments)]
 fn spawn_authority(
     spec: &IntegrityAuthoritySpec,
     pf_peer: Option<IpAddr>,
+    check_now: Option<&std::sync::Arc<tokio::sync::Notify>>,
     snapshot: &SharedSnapshot,
     prog: &FibProgrammerHandle,
     completeness: &Option<std::sync::Arc<packetframe_common::fib::TableCompleteness>>,
@@ -127,6 +130,9 @@ fn spawn_authority(
                     .with_ledger_status(ledger_status.clone());
             if let Some(h) = completeness.clone() {
                 checker = checker.with_completeness(h);
+            }
+            if let Some(n) = check_now {
+                checker = checker.with_check_requests(n.clone());
             }
             tasks.push(runtime.spawn(async move { checker.run().await }));
         }
@@ -526,6 +532,7 @@ impl RouteController {
                     // `integrity-authority frr` here. `None` cannot
                     // reach the FRR arm.
                     None,
+                    None,
                     &snapshot,
                     &prog_handle,
                     &completeness,
@@ -596,6 +603,9 @@ impl RouteController {
                 anyip,
             }) => {
                 let snapshot = shared_snapshot();
+                // The GC hold's way of asking the FRR authority for a
+                // check now; see `FeedGcHold::check_now`.
+                let check_now = std::sync::Arc::new(tokio::sync::Notify::new());
                 // Spawn the checker only when a LOCAL authority is named.
                 // `integrity-authority none` still allocates the snapshot
                 // (the BMP stall gate reads it) but runs no comparison:
@@ -610,6 +620,7 @@ impl RouteController {
                     // here rather than from a directive an operator
                     // could get wrong or let drift.
                     Some(listen.ip()),
+                    Some(&check_now),
                     &snapshot,
                     &prog_handle,
                     &completeness,
@@ -664,16 +675,13 @@ impl RouteController {
                 let shut = shutdown_token.clone();
                 let stall = snapshot.clone();
                 // Only the FRR authority reads the upstreams FRR learns its
-                // table from, so only it can say when a seed's GC may run;
-                // with any other there is nothing to hold for, and the GC
-                // runs at End-of-RIB as it always has.
-                let seed_gc_hold =
-                    matches!(integrity_authority, IntegrityAuthoritySpec::Frr { .. }).then(|| {
-                        SeedGcHold {
-                            ledger: ledger_status.clone(),
-                            authority: snapshot.clone(),
-                        }
-                    });
+                // table from, so only it can say when a GC over earlier
+                // routes may run; with any other there is nothing to hold
+                // for, and the GC runs at End-of-RIB as it always has.
+                // Made once, outside the retry loop below: it records a
+                // session's end for the next listener to judge by.
+                let gc_hold = matches!(integrity_authority, IntegrityAuthoritySpec::Frr { .. })
+                    .then(|| FeedGcHold::new(ledger_status.clone(), snapshot.clone(), check_now));
                 tasks.push(runtime.spawn(async move {
                     let mut backoff = LISTENER_BACKOFF_INITIAL;
                     loop {
@@ -691,8 +699,8 @@ impl RouteController {
                         let mut listener =
                             BgpListener::new(cfg.clone(), prog.clone(), shut.clone())
                                 .with_stall_gate(stall.clone());
-                        if let Some(hold) = &seed_gc_hold {
-                            listener = listener.with_seed_gc_hold(hold.clone());
+                        if let Some(hold) = &gc_hold {
+                            listener = listener.with_gc_hold(hold.clone());
                         }
                         // (The flushed-while-BOUND case is covered by
                         // the reconcile task spawned below, not this

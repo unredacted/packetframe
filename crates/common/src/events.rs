@@ -181,13 +181,15 @@ pub mod kind {
     /// The route source's first completed initial dump after a seed
     /// garbage-collected what it did not re-advertise.
     pub const ROUTE_LEDGER_RECONCILED: &str = "route_ledger_reconciled";
-    /// The route source's End-of-RIB arrived over an unreconciled seed
-    /// while the FRR authority still read an upstream loading, so the GC
-    /// that reconciles the seed is held (`why`).
-    pub const ROUTE_LEDGER_GC_HELD: &str = "route_ledger_gc_held";
-    /// A held seed GC was let go (`trigger`: `upstreams-loaded`,
-    /// `max-age`, `authority-silent`; `held_secs`).
-    pub const ROUTE_LEDGER_GC_RELEASED: &str = "route_ledger_gc_released";
+    /// The route source's End-of-RIB arrived over routes from before its
+    /// session (`over`: `seed` for an unreconciled route-ledger seed,
+    /// `earlier-session` after a reconnect) while the FRR authority did
+    /// not read every upstream loaded, so the GC that would remove the
+    /// ones not re-sent is held (`why`).
+    pub const FEED_GC_HELD: &str = "feed_gc_held";
+    /// A held GC was let go (`over` as held; `trigger`:
+    /// `upstreams-loaded`, `max-age`, `authority-silent`; `held_secs`).
+    pub const FEED_GC_RELEASED: &str = "feed_gc_released";
     /// The neighbour resolver exited or stopped making progress and the
     /// supervisor restarted it (`cause`: `stalled`, `failed`,
     /// `returned`; `detail` the reason).

@@ -962,6 +962,7 @@ fn take_route_ledger(
     };
     let outcome = consume(&state.state_dir, &exp);
     let mut status = state.ledger_status.lock().expect("ledger status lock");
+    status.max_age_secs = spec.max_age_secs;
     match outcome {
         Consumed::Quiet => {
             debug!("no route ledger to consider (route-ledger off, or not packetframe-fib)");
@@ -1029,7 +1030,6 @@ fn take_route_ledger(
                 unconfirmed: ledger.counts.advertisements(),
                 stream_started_at: None,
                 reconciled: None,
-                gc_held: None,
             });
             Some(ledger)
         }

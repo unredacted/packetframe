@@ -84,7 +84,7 @@
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -167,21 +167,20 @@ const INIT_COMPLETE_EOR_BACKSTOP: Duration = Duration::from_secs(300);
 /// conventional default, so nothing reads it as unusual.
 const GR_RESTART_TIME: u16 = 120;
 
-/// How often a held seed GC looks again at what it waits for
-/// ([`SeedGcHold`]). Two lock reads a look; the authority it waits on
+/// How often a held GC looks again at what it waits for
+/// ([`FeedGcHold`]). Two lock reads a look; the authority it waits on
 /// checks every ten seconds at the most.
-const SEED_GC_HOLD_POLL: Duration = Duration::from_secs(1);
+const GC_HOLD_POLL: Duration = Duration::from_secs(1);
 
-/// How long a held seed GC waits on an FRR authority that has produced
-/// no readable reading of the upstreams, before it stops waiting: the age
+/// How long a held GC waits on an FRR authority that has produced no
+/// readable reading of the upstreams, before it stops waiting: the age
 /// past which no part of this system acts on an authority report
 /// ([`packetframe_common::fib::STEER_MAX_REPORT_AGE`]). Measured from the
 /// later of the last readable reading and the hold's start, so an
-/// authority that keeps answering "loading" never trips it. The seed's
-/// `max-age` bounds the hold either way; this only spares a broken
-/// authority (no `vtysh`, output this build cannot parse) the whole of
-/// it.
-const SEED_GC_AUTHORITY_SILENCE: Duration = packetframe_common::fib::STEER_MAX_REPORT_AGE;
+/// authority that keeps answering "loading" never trips it. `max-age`
+/// bounds the hold either way; this only spares a broken authority (no
+/// `vtysh`, output this build cannot parse) the whole of it.
+const GC_HOLD_AUTHORITY_SILENCE: Duration = packetframe_common::fib::STEER_MAX_REPORT_AGE;
 
 /// NOTIFICATION error code Cease (RFC 4271 §4.5, subcodes RFC 4486):
 /// the peer ended the session other than for a protocol error, by
@@ -298,81 +297,179 @@ pub struct BgpListener {
     /// gates on `authority_established_peers`, which only the bird
     /// authority fills, so on an FRR-fed box it would stay silent. A
     /// programmer wedged behind an established session is therefore
-    /// reported by nothing on this path yet. (The seed GC hold reads the
-    /// same snapshot, through its own handle.)
+    /// reported by nothing on this path yet. (The GC hold reads the same
+    /// snapshot, through its own handle.)
     stall_gate: Option<SharedIntegritySnapshot>,
-    /// Set when the FRR authority runs; see [`SeedGcHold`].
-    seed_gc_hold: Option<SeedGcHold>,
+    /// Set when the FRR authority runs; see [`FeedGcHold`].
+    gc_hold: Option<FeedGcHold>,
     /// Empty outside tests; see [`ReadHold`].
     read_hold: ReadHold,
     /// The constants outside tests; see [`QuietWindows`].
     quiet: QuietWindows,
 }
 
-/// What lets the listener hold the first GC after a route-ledger seed
-/// until FRR has learned its whole table.
+/// What lets the listener hold the GC at End-of-RIB until FRR has
+/// learned its whole table, wherever that GC would remove routes from
+/// before the session: the first one after a route-ledger seed, and the
+/// first one after a reconnect.
 ///
-/// **Why.** The GC at InitiationComplete removes every seeded route the
-/// session did not re-send, which is right once the session has sent
-/// FRR's whole table, and End-of-RIB is FRR saying it has sent the table
-/// it has. After a reboot that is not the whole table. An FRR in restart
-/// mode (`bgp graceful-restart`) defers best-path selection after bgpd
-/// starts until every graceful-restart peer's End-of-RIB is in or
+/// **Why.** The GC at InitiationComplete removes every route the session
+/// did not re-send, which is right once the session has sent FRR's whole
+/// table, and End-of-RIB is FRR saying it has sent the table it has.
+/// After a reboot that is not the whole table. An FRR in restart mode
+/// (`bgp graceful-restart`) defers best-path selection after bgpd starts
+/// until every graceful-restart peer's End-of-RIB is in or
 /// `select-defer-time` (360 s) runs out, then sends packetframe what it
 /// has and End-of-RIB, while transits starved by the boot can go on
 /// loading for many minutes (about nine more on 2026-10-30). The GC then
 /// removed most of a seed that was right, and the mirror refilled as a
-/// cold load would. (A helper-mode bgpd restart sends its End-of-RIB
-/// sooner still; see the runbook's known limitation.)
+/// cold load would. A bgpd restart under a running packetframe (every
+/// UniFi BGP configuration upload is one) ends the session the same way:
+/// the mirror holds the table the earlier session sent, and the next
+/// one's End-of-RIB, as early as a second after Established in helper
+/// mode, would remove it from both tiers, a steered VPP included.
 ///
 /// **What it waits for.** The FRR authority's reading of the declared
 /// upstreams, taken in this session: every one Established with
 /// End-of-RIB for every family it carries
 /// ([`crate::fib::frr::UpstreamsLoad::Loaded`]). UPDATEs go on applying
-/// meanwhile, confirming and replacing seeded routes as FRR learns them;
-/// only the GC waits. The seed's own age bounds it, at the `max-age` that
-/// would have refused the seed at the start, and so does an authority
-/// with nothing readable to say for [`SEED_GC_AUTHORITY_SILENCE`].
+/// meanwhile, confirming and replacing the earlier routes as FRR learns
+/// them; only the GC waits. `max-age` bounds it, counted from when the
+/// routes it would remove were last confirmed ([`earlier_routes`]), and
+/// so does an authority with nothing readable to say for
+/// [`GC_HOLD_AUTHORITY_SILENCE`].
 ///
-/// **Only after a seed.** With no unreconciled seed, the GC runs at
-/// End-of-RIB as it always has: a reconnect over a mirror this process
-/// loaded keeps the known limitation, and nothing changes for a box
-/// without the FRR authority.
+/// **Only over routes from before the session.** With no unreconciled
+/// seed and no session ended since the last GC, the GC runs at
+/// End-of-RIB as it always has, and nothing changes for a box without
+/// the FRR authority. A reconnect with FRR still up finds the upstreams
+/// loaded at the first check of the new session, which the hold asks for
+/// at once ([`Self::check_now`]).
 #[derive(Clone)]
-pub struct SeedGcHold {
-    /// Whether a seed is waiting for its first GC, and how old it is.
+pub struct FeedGcHold {
+    /// Whether a seed is waiting for its first GC, and how old it is; the
+    /// `max-age` in force; where the hold is reported.
     pub ledger: crate::fib::route_ledger::SharedLedgerStatus,
     /// Where the FRR authority publishes its upstream readings.
     pub authority: SharedIntegritySnapshot,
+    /// Asks the FRR authority to check now rather than at its interval:
+    /// a held GC needs a reading taken in this session, and at the
+    /// default interval the next is up to five minutes away.
+    pub check_now: Arc<tokio::sync::Notify>,
+    /// Wall-clock second at which a session ended with no GC since, the
+    /// earliest such if several did; 0 while none has. The listener sets
+    /// it as a session ends, before it accepts the next, so it is never
+    /// behind the session it describes. The programmer's own count of
+    /// unconfirmed routes is: a reconnect's `Resync` is queued, and on a
+    /// full table its walk can still be under way when FRR's End-of-RIB
+    /// arrives.
+    earlier_since: Arc<AtomicU64>,
 }
 
-/// The seed GC hold's verdict at one look ([`judge_seed_gc`]).
+impl FeedGcHold {
+    pub fn new(
+        ledger: crate::fib::route_ledger::SharedLedgerStatus,
+        authority: SharedIntegritySnapshot,
+        check_now: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            ledger,
+            authority,
+            check_now,
+            earlier_since: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// A session ended: whatever it and any session before it sent is now
+    /// earlier routes, until a GC. Keeps an older time already recorded.
+    fn session_ended(&self, now_unix: u64) {
+        let _ = self.earlier_since.compare_exchange(
+            0,
+            now_unix.max(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// A GC ran: nothing an earlier session sent is left unconfirmed.
+    fn gc_ran(&self) {
+        self.earlier_since.store(0, Ordering::Release);
+    }
+
+    fn earlier_since(&self) -> Option<u64> {
+        match self.earlier_since.load(Ordering::Acquire) {
+            0 => None,
+            t => Some(t),
+        }
+    }
+}
+
+/// Routes from before this session that a GC would remove: whose, and
+/// when they reach `max-age`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Earlier {
+    over: crate::fib::route_ledger::HeldOver,
+    expires_at_unix: u64,
+}
+
+/// What one look finds of the routes from before this session, from the
+/// ledger status and the time a session last ended with no GC since
+/// ([`FeedGcHold::earlier_since`]). An unreconciled seed's own age, as
+/// its start judged it, bounds it, and so does `max-age` as now
+/// configured from that session's end; whichever comes first.
+fn earlier_routes(
+    st: &crate::fib::route_ledger::LedgerStatus,
+    session_ended_unix: Option<u64>,
+) -> Option<Earlier> {
+    use crate::fib::route_ledger::HeldOver;
+    let seed = st
+        .seed
+        .as_ref()
+        .filter(|s| s.reconciled.is_none())
+        .map(crate::fib::route_ledger::SeedReport::expires_at_unix);
+    let session = session_ended_unix.map(|t| t.saturating_add(st.max_age_secs));
+    match (seed, session) {
+        (Some(seed), session) => Some(Earlier {
+            over: HeldOver::Seed,
+            expires_at_unix: session.map_or(seed, |e| e.min(seed)),
+        }),
+        (None, Some(e)) => Some(Earlier {
+            over: HeldOver::EarlierSession,
+            expires_at_unix: e,
+        }),
+        (None, None) => None,
+    }
+}
+
+/// The GC hold's verdict at one look ([`judge_gc_hold`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GcHold {
     /// Apply InitiationComplete now.
     Release(GcRelease),
-    /// Not yet; why, as the status row and the journal say it.
-    Hold(String),
+    /// Not yet: why, as the status row and the journal say it, over
+    /// which routes.
+    Hold { why: String, earlier: Earlier },
 }
 
-/// Why a seed GC may run.
+/// Why a GC may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GcRelease {
-    /// No seed is waiting for its first GC: the ordinary case, never held.
-    NoSeed,
+    /// Nothing from before this session for it to remove: the ordinary
+    /// case, never held.
+    NotHeld,
     /// The authority read every declared upstream loaded in this session.
     UpstreamsLoaded,
-    /// The seed's oldest routes reached `max-age`.
+    /// The routes it would remove reached `max-age`.
     MaxAge,
-    /// The authority has read nothing for [`SEED_GC_AUTHORITY_SILENCE`].
+    /// The authority has read nothing for [`GC_HOLD_AUTHORITY_SILENCE`].
     AuthoritySilent,
 }
 
 impl GcRelease {
-    /// As the `route_ledger_gc_released` event's `trigger` spells it.
+    /// As the `feed_gc_released` event's `trigger` spells it.
     fn as_str(self) -> &'static str {
         match self {
-            GcRelease::NoSeed => "no-seed",
+            GcRelease::NotHeld => "not-held",
             GcRelease::UpstreamsLoaded => "upstreams-loaded",
             GcRelease::MaxAge => "max-age",
             GcRelease::AuthoritySilent => "authority-silent",
@@ -380,16 +477,17 @@ impl GcRelease {
     }
 }
 
-/// Whether the GC after a seed may run now. Pure, so the rule is tested
-/// without a session.
+/// Whether the GC may run now. Pure, so the rule is tested without a
+/// session.
 ///
-/// `seed_expires_at_unix` is `None` with no unreconciled seed. A
-/// reading counts as the authority's word only if taken since
-/// `session_started`: one from before describes upstreams that a bgpd
-/// restart, which is what usually ends a session, has since reset. Any
-/// reading, from any time, shows the authority is answering.
-fn judge_seed_gc(
-    seed_expires_at_unix: Option<u64>,
+/// `earlier` is `None` with nothing from before this session for the GC
+/// to remove ([`earlier_routes`]). A reading counts as the authority's
+/// word only if taken since `session_started`: one from before describes
+/// upstreams that a bgpd restart, which is what usually ends a session,
+/// has since reset. Any reading, from any time, shows the authority is
+/// answering.
+fn judge_gc_hold(
+    earlier: Option<Earlier>,
     reading: Option<&crate::fib::integrity_status::UpstreamsReading>,
     session_started: Instant,
     held_since: Instant,
@@ -397,10 +495,10 @@ fn judge_seed_gc(
     now_unix: u64,
 ) -> GcHold {
     use crate::fib::frr::UpstreamsLoad;
-    let Some(expires) = seed_expires_at_unix else {
-        return GcHold::Release(GcRelease::NoSeed);
+    let Some(earlier) = earlier else {
+        return GcHold::Release(GcRelease::NotHeld);
     };
-    if now_unix >= expires {
+    if now_unix >= earlier.expires_at_unix {
         return GcHold::Release(GcRelease::MaxAge);
     }
     let current = reading.filter(|r| r.at >= session_started);
@@ -408,86 +506,101 @@ fn judge_seed_gc(
         return GcHold::Release(GcRelease::UpstreamsLoaded);
     }
     let heard = reading.map_or(held_since, |r| r.at.max(held_since));
-    if now.saturating_duration_since(heard) >= SEED_GC_AUTHORITY_SILENCE {
+    if now.saturating_duration_since(heard) >= GC_HOLD_AUTHORITY_SILENCE {
         return GcHold::Release(GcRelease::AuthoritySilent);
     }
-    GcHold::Hold(match current.map(|r| &r.load) {
+    let why = match current.map(|r| &r.load) {
         Some(UpstreamsLoad::Loading(why)) => why.clone(),
         _ => "the completeness authority has not read the upstreams since this session began"
             .to_string(),
-    })
+    };
+    GcHold::Hold { why, earlier }
 }
 
-/// A seed GC being held: the trigger that would have fired it, and the
-/// status row saying so, which this clears however the hold ends — let
-/// go, or the session ending under it (the next session holds afresh).
+/// A GC being held: the trigger that would have fired it, and the status
+/// row saying so, which this clears however the hold ends — let go, or
+/// the session ending under it (the next session holds afresh).
 struct HeldGc {
     trigger: InitTrigger,
     since: Instant,
+    over: crate::fib::route_ledger::HeldOver,
     /// When it is due its next look. A deadline, not a sleep begun per
-    /// wait: frames arrive more often than [`SEED_GC_HOLD_POLL`] on any
-    /// live session (a KEEPALIVE a third of the hold time, a full-table
-    /// feed's churn many times a second), and a sleep restarted at each
-    /// one never ends.
+    /// wait: frames arrive more often than [`GC_HOLD_POLL`] on any live
+    /// session (a KEEPALIVE a third of the hold time, a full-table feed's
+    /// churn many times a second), and a sleep restarted at each one
+    /// never ends.
     next_look: tokio::time::Instant,
     ledger: crate::fib::route_ledger::SharedLedgerStatus,
 }
 
 impl HeldGc {
-    fn begin(
-        trigger: InitTrigger,
-        why: String,
-        ledger: crate::fib::route_ledger::SharedLedgerStatus,
-    ) -> Self {
+    fn begin(trigger: InitTrigger, why: String, earlier: Earlier, hold: &FeedGcHold) -> Self {
+        use crate::fib::route_ledger::HeldOver;
         let since = Instant::now();
         let unconfirmed = {
-            let mut st = ledger.lock().expect("ledger status lock");
-            st.seed.as_mut().map_or(0, |s| {
-                s.gc_held = Some(crate::fib::route_ledger::GcHeld {
-                    since,
-                    why: why.clone(),
-                });
-                s.unconfirmed
-            })
+            let mut st = hold.ledger.lock().expect("ledger status lock");
+            st.gc_held = Some(crate::fib::route_ledger::GcHeld {
+                since,
+                why: why.clone(),
+                over: earlier.over,
+                expires_at_unix: earlier.expires_at_unix,
+            });
+            st.seed
+                .as_ref()
+                .filter(|_| earlier.over == HeldOver::Seed)
+                .map(|s| s.unconfirmed)
         };
-        info!(
-            unconfirmed,
-            reason = %why,
-            "End-of-RIB arrived over the route-ledger seed, but the completeness authority does \
-             not yet read every upstream loaded: holding the GC that would remove the seeded \
-             routes not yet re-advertised, so a table FRR is still learning does not empty the \
-             mirror. Updates keep applying meanwhile"
-        );
-        packetframe_common::events::Event::info(
+        // The reading it waits for has to be taken in this session; ask
+        // for one now rather than wait out the authority's interval.
+        hold.check_now.notify_one();
+        let mut ev = packetframe_common::events::Event::info(
             crate::MODULE_NAME,
-            packetframe_common::events::kind::ROUTE_LEDGER_GC_HELD,
+            packetframe_common::events::kind::FEED_GC_HELD,
         )
-        .field("unconfirmed", unconfirmed)
-        .detail(why)
-        .emit();
+        .field("over", earlier.over.as_str());
+        match unconfirmed {
+            Some(unconfirmed) => {
+                info!(
+                    unconfirmed,
+                    reason = %why,
+                    "End-of-RIB arrived over the route-ledger seed, but the completeness \
+                     authority does not yet read every upstream loaded: holding the GC that would \
+                     remove the seeded routes not yet re-advertised, so a table FRR is still \
+                     learning does not empty the mirror. Updates keep applying meanwhile"
+                );
+                ev = ev.field("unconfirmed", unconfirmed);
+            }
+            None => info!(
+                reason = %why,
+                "End-of-RIB arrived after a reconnect, but the completeness authority does not \
+                 yet read every upstream loaded: holding the GC that would remove what the \
+                 earlier session sent and this one has not, so a table FRR is still learning \
+                 after a bgpd restart does not empty the mirror. Updates keep applying meanwhile"
+            ),
+        }
+        ev.detail(why).emit();
         Self {
             trigger,
             since,
-            next_look: tokio::time::Instant::now() + SEED_GC_HOLD_POLL,
-            ledger,
+            over: earlier.over,
+            next_look: tokio::time::Instant::now() + GC_HOLD_POLL,
+            ledger: hold.ledger.clone(),
         }
     }
 
-    /// The latest reason, for the status row.
-    fn note(&self, why: String) {
+    /// The latest look, for the status row.
+    fn note(&self, why: String, earlier: Earlier) {
         let mut st = self.ledger.lock().expect("ledger status lock");
-        if let Some(h) = st.seed.as_mut().and_then(|s| s.gc_held.as_mut()) {
+        if let Some(h) = st.gc_held.as_mut() {
             h.why = why;
+            h.expires_at_unix = earlier.expires_at_unix;
         }
     }
 }
 
 impl Drop for HeldGc {
     fn drop(&mut self) {
-        let mut st = self.ledger.lock().expect("ledger status lock");
-        if let Some(s) = st.seed.as_mut() {
-            s.gc_held = None;
-        }
+        self.ledger.lock().expect("ledger status lock").gc_held = None;
     }
 }
 
@@ -570,7 +683,7 @@ impl BgpListener {
             shutdown,
             last_update_unix: Arc::new(AtomicI64::new(0)),
             stall_gate: None,
-            seed_gc_hold: None,
+            gc_hold: None,
             read_hold: ReadHold::default(),
             quiet: QuietWindows::default(),
         }
@@ -583,30 +696,26 @@ impl BgpListener {
         self
     }
 
-    /// Hold the first GC after a route-ledger seed for the FRR
-    /// authority's word; see [`SeedGcHold`].
-    pub fn with_seed_gc_hold(mut self, hold: SeedGcHold) -> Self {
-        self.seed_gc_hold = Some(hold);
+    /// Hold a GC over routes from before the session for the FRR
+    /// authority's word; see [`FeedGcHold`].
+    pub fn with_gc_hold(mut self, hold: FeedGcHold) -> Self {
+        self.gc_hold = Some(hold);
         self
     }
 
-    /// The seed GC hold's verdict now, for a hold that began at
-    /// `held_since` in a session that began at `session_started`.
-    async fn seed_gc_verdict(&self, session_started: Instant, held_since: Instant) -> GcHold {
-        let Some(hold) = &self.seed_gc_hold else {
-            return GcHold::Release(GcRelease::NoSeed);
+    /// The GC hold's verdict now, for a hold that began at `held_since`
+    /// in a session that began at `session_started`.
+    async fn gc_hold_verdict(&self, session_started: Instant, held_since: Instant) -> GcHold {
+        let Some(hold) = &self.gc_hold else {
+            return GcHold::Release(GcRelease::NotHeld);
         };
-        let expires = hold
-            .ledger
-            .lock()
-            .expect("ledger status lock")
-            .seed
-            .as_ref()
-            .filter(|s| s.reconciled.is_none())
-            .map(crate::fib::route_ledger::SeedReport::expires_at_unix);
+        let earlier = earlier_routes(
+            &hold.ledger.lock().expect("ledger status lock"),
+            hold.earlier_since(),
+        );
         let reading = hold.authority.read().await.upstreams.clone();
-        judge_seed_gc(
-            expires,
+        judge_gc_hold(
+            earlier,
             reading.as_ref(),
             session_started,
             held_since,
@@ -682,6 +791,11 @@ impl BgpListener {
             // kept the flag stale.
             if let Some(sess) = &self.cfg.session {
                 sess.set_up(false);
+            }
+            // Before the next session can be accepted: its End-of-RIB is
+            // judged against this.
+            if let Some(hold) = &self.gc_hold {
+                hold.session_ended(crate::fib::route_ledger::now_unix());
             }
             // Queued, not awaited. The programmer applies commands in
             // order, so the Resync lands ahead of everything the next
@@ -931,7 +1045,7 @@ impl BgpListener {
         // of magnitude above the quiet rate, so live-but-loading can
         // never release early.
         let mut init_complete_fired = false;
-        // A seed GC being held for the authority's word ([`SeedGcHold`]).
+        // A GC being held for the authority's word ([`FeedGcHold`]).
         let mut held: Option<HeldGc> = None;
         let session_started = Instant::now();
         let mut updates_seen = 0usize;
@@ -975,20 +1089,23 @@ impl BgpListener {
                     let Some(since) = held.as_ref().map(|h| h.since) else {
                         continue;
                     };
-                    match self.seed_gc_verdict(session_started, since).await {
-                        GcHold::Hold(why) => {
+                    match self.gc_hold_verdict(session_started, since).await {
+                        GcHold::Hold { why, earlier } => {
                             if let Some(h) = held.as_mut() {
-                                h.note(why);
-                                h.next_look = tokio::time::Instant::now() + SEED_GC_HOLD_POLL;
+                                h.note(why, earlier);
+                                h.next_look = tokio::time::Instant::now() + GC_HOLD_POLL;
                             }
                         }
                         GcHold::Release(release) => {
-                            let trigger = held.take().map(|h| h.trigger).expect("held above");
+                            let (trigger, over) = held
+                                .take()
+                                .map(|h| (h.trigger, h.over))
+                                .expect("held above");
                             init_complete_fired = or_end!(self.initiation_complete(
                                 trigger,
                                 updates_seen,
                                 release,
-                                Some(since)
+                                Some((since, over))
                             ));
                         }
                     }
@@ -1075,10 +1192,10 @@ impl BgpListener {
             if init_complete_fired || held.is_some() {
                 continue;
             }
-            match self.seed_gc_verdict(session_started, Instant::now()).await {
-                GcHold::Hold(why) => {
-                    if let Some(hold) = &self.seed_gc_hold {
-                        held = Some(HeldGc::begin(trigger, why, hold.ledger.clone()));
+            match self.gc_hold_verdict(session_started, Instant::now()).await {
+                GcHold::Hold { why, earlier } => {
+                    if let Some(hold) = &self.gc_hold {
+                        held = Some(HeldGc::begin(trigger, why, earlier, hold));
                     }
                 }
                 GcHold::Release(release) => {
@@ -1111,50 +1228,60 @@ impl BgpListener {
     /// Apply InitiationComplete, the GC of every route the session has
     /// not re-sent, and report the feed reconciled. `true` once applied.
     ///
-    /// `seed_gc` is what the seed GC hold judged ([`GcRelease::NoSeed`]
-    /// without a seed), and `held_since` when it held the GC first.
+    /// `gc_hold` is what the GC hold judged ([`GcRelease::NotHeld`] with
+    /// nothing from before the session), and `held` when it held the GC
+    /// first and over whose routes.
     async fn initiation_complete(
         &self,
         trigger: InitTrigger,
         updates_seen: usize,
-        seed_gc: GcRelease,
-        held_since: Option<Instant>,
+        gc_hold: GcRelease,
+        held: Option<(Instant, crate::fib::route_ledger::HeldOver)>,
     ) -> bool {
-        if let Some(since) = held_since {
+        if let Some((since, over)) = held {
             let held_secs = since.elapsed().as_secs();
             info!(
-                trigger = seed_gc.as_str(),
-                held_secs, "letting the held route-ledger seed GC run"
+                over = over.as_str(),
+                trigger = gc_hold.as_str(),
+                held_secs,
+                "letting the held GC run"
             );
             packetframe_common::events::Event::info(
                 crate::MODULE_NAME,
-                packetframe_common::events::kind::ROUTE_LEDGER_GC_RELEASED,
+                packetframe_common::events::kind::FEED_GC_RELEASED,
             )
-            .field("trigger", seed_gc.as_str())
+            .field("over", over.as_str())
+            .field("trigger", gc_hold.as_str())
             .field("held_secs", held_secs)
             .emit();
         }
-        if let Err(e) = self
+        let dispatched = self
             .prog_handle
             .apply_route_event(RouteEvent::InitiationComplete)
-            .await
-        {
+            .await;
+        // Whatever the outcome: a GC whose recompute failed has removed
+        // the routes all the same, and a dispatch that failed has no
+        // programmer behind it.
+        if let Some(hold) = &self.gc_hold {
+            hold.gc_ran();
+        }
+        if let Err(e) = dispatched {
             warn!(error = %e, "InitiationComplete dispatch failed");
             return false;
         }
-        let seed_gc = seed_gc.as_str();
+        let gc_hold = gc_hold.as_str();
         match trigger {
             InitTrigger::EndOfRib => info!(
                 updates_seen,
                 trigger = "end-of-rib",
-                seed_gc,
+                gc_hold,
                 "InitiationComplete fired"
             ),
             InitTrigger::Quiescence(window) => info!(
                 updates_seen,
                 trigger = "quiescence",
                 quiescence_secs = window.as_secs(),
-                seed_gc,
+                gc_hold,
                 "InitiationComplete fired"
             ),
         }
@@ -3106,7 +3233,7 @@ mod tests {
         read_hold: ReadHold,
         quiet: QuietWindows,
         peer: PeerCaps,
-        seed_gc_hold: Option<SeedGcHold>,
+        gc_hold: Option<FeedGcHold>,
     }
 
     impl Default for Setup {
@@ -3115,7 +3242,7 @@ mod tests {
                 read_hold: ReadHold::default(),
                 quiet: TEST_QUIET,
                 peer: PLAIN_PEER,
-                seed_gc_hold: None,
+                gc_hold: None,
             }
         }
     }
@@ -3143,7 +3270,7 @@ mod tests {
         let (lst, mut listener, addr) = unserved(prog).await;
         listener.read_hold = setup.read_hold;
         listener.quiet = setup.quiet;
-        listener.seed_gc_hold = setup.seed_gc_hold;
+        listener.gc_hold = setup.gc_hold;
         let shutdown = listener.shutdown.clone();
         let listener = Arc::new(listener);
         let mut peer = TcpStream::connect(addr).await.expect("connect");
@@ -4637,14 +4764,16 @@ mod tests {
             .expect("shutdown ends a session cleanly");
     }
 
-    // --- The seed GC hold ---------------------------------------------
+    // --- The GC hold -------------------------------------------------
 
-    mod seed_gc {
+    mod gc_hold {
         use super::*;
         use crate::fib::frr::UpstreamsLoad;
         use crate::fib::integrity::shared_snapshot;
         use crate::fib::integrity_status::UpstreamsReading;
-        use crate::fib::route_ledger::{shared_status, LedgerCounts, SeedReport, StartReport};
+        use crate::fib::route_ledger::{
+            now_unix, shared_status, HeldOver, LedgerCounts, LedgerStatus, SeedReport, StartReport,
+        };
 
         const NOW_UNIX: u64 = 1_790_000_000;
         const EXPIRES: u64 = NOW_UNIX + 600;
@@ -4659,16 +4788,81 @@ mod tests {
             )
         }
 
-        /// No seed waiting for its first GC: never held, whatever the
-        /// authority says — a reconnect over a mirror this process loaded
-        /// runs its GC at End-of-RIB as it always has.
+        /// A seed's routes, expiring at `expires_at_unix`.
+        fn seed(expires_at_unix: u64) -> Option<Earlier> {
+            Some(Earlier {
+                over: HeldOver::Seed,
+                expires_at_unix,
+            })
+        }
+
+        fn seed_report(confirmed_at_unix: u64, max_age_secs: u64) -> SeedReport {
+            SeedReport {
+                writer_version: "test".into(),
+                written_at_unix: confirmed_at_unix,
+                confirmed_at_unix,
+                attested: true,
+                max_age_secs,
+                counts: LedgerCounts::default(),
+                applied_at: Some(Instant::now()),
+                apply_took: None,
+                failed: 0,
+                unconfirmed: 3,
+                stream_started_at: Some(Instant::now()),
+                reconciled: None,
+            }
+        }
+
+        /// Nothing from before this session for the GC to remove: never
+        /// held, whatever the authority says.
         #[test]
-        fn without_a_seed_nothing_is_held() {
+        fn with_nothing_earlier_nothing_is_held() {
             let t = Instant::now();
             let r = reading(t, loading());
             assert_eq!(
-                judge_seed_gc(None, Some(&r), t, t, t, NOW_UNIX),
-                GcHold::Release(GcRelease::NoSeed)
+                judge_gc_hold(None, Some(&r), t, t, t, NOW_UNIX),
+                GcHold::Release(GcRelease::NotHeld)
+            );
+        }
+
+        /// Whose routes a GC would remove, and when they reach `max-age`.
+        /// An unreconciled seed is named first and bounded by its own age
+        /// and by `max-age` from a session's end, whichever comes first; a
+        /// session that ended with no GC since is bounded by `max-age` as
+        /// now configured; a reconciled seed counts for nothing.
+        #[test]
+        fn earlier_routes_name_whose_and_bound_them_by_max_age() {
+            let mut st = LedgerStatus {
+                max_age_secs: 1800,
+                ..LedgerStatus::default()
+            };
+            assert_eq!(earlier_routes(&st, None), None);
+            assert_eq!(
+                earlier_routes(&st, Some(NOW_UNIX)),
+                Some(Earlier {
+                    over: HeldOver::EarlierSession,
+                    expires_at_unix: NOW_UNIX + 1800,
+                })
+            );
+            st.start = StartReport::Seeded;
+            st.seed = Some(seed_report(NOW_UNIX - 600, 1800));
+            assert_eq!(earlier_routes(&st, None), seed(NOW_UNIX + 1200));
+            assert_eq!(
+                earlier_routes(&st, Some(NOW_UNIX)),
+                seed(NOW_UNIX + 1200),
+                "the seed's own age comes first"
+            );
+            // A reload lowered max-age: the session's bound now comes first.
+            st.max_age_secs = 300;
+            assert_eq!(earlier_routes(&st, Some(NOW_UNIX)), seed(NOW_UNIX + 300));
+            st.seed.as_mut().unwrap().reconciled = Some((Instant::now(), 0));
+            assert_eq!(earlier_routes(&st, None), None);
+            assert_eq!(
+                earlier_routes(&st, Some(NOW_UNIX)),
+                Some(Earlier {
+                    over: HeldOver::EarlierSession,
+                    expires_at_unix: NOW_UNIX + 300,
+                })
             );
         }
 
@@ -4681,13 +4875,16 @@ mod tests {
             let held = start + Duration::from_secs(360);
             let r = reading(held + Duration::from_secs(5), loading());
             let now = held + Duration::from_secs(60);
-            match judge_seed_gc(Some(EXPIRES), Some(&r), start, held, now, NOW_UNIX) {
-                GcHold::Hold(why) => assert!(why.contains("End-of-RIB for ipv4"), "{why}"),
+            match judge_gc_hold(seed(EXPIRES), Some(&r), start, held, now, NOW_UNIX) {
+                GcHold::Hold { why, earlier } => {
+                    assert!(why.contains("End-of-RIB for ipv4"), "{why}");
+                    assert_eq!(Some(earlier), seed(EXPIRES));
+                }
                 other => panic!("{other:?}"),
             }
             let r = reading(now, UpstreamsLoad::Loaded);
             assert_eq!(
-                judge_seed_gc(Some(EXPIRES), Some(&r), start, held, now, NOW_UNIX),
+                judge_gc_hold(seed(EXPIRES), Some(&r), start, held, now, NOW_UNIX),
                 GcHold::Release(GcRelease::UpstreamsLoaded)
             );
         }
@@ -4701,7 +4898,7 @@ mod tests {
             let r = reading(start + Duration::from_secs(2), UpstreamsLoad::Loaded);
             let eor = start + Duration::from_secs(660);
             assert_eq!(
-                judge_seed_gc(Some(EXPIRES), Some(&r), start, eor, eor, NOW_UNIX),
+                judge_gc_hold(seed(EXPIRES), Some(&r), start, eor, eor, NOW_UNIX),
                 GcHold::Release(GcRelease::UpstreamsLoaded)
             );
         }
@@ -4715,114 +4912,130 @@ mod tests {
             let start = before + Duration::from_secs(30);
             let held = start + Duration::from_secs(360);
             let r = reading(before, UpstreamsLoad::Loaded);
-            match judge_seed_gc(Some(EXPIRES), Some(&r), start, held, held, NOW_UNIX) {
-                GcHold::Hold(why) => assert!(why.contains("since this session began"), "{why}"),
+            match judge_gc_hold(seed(EXPIRES), Some(&r), start, held, held, NOW_UNIX) {
+                GcHold::Hold { why, .. } => {
+                    assert!(why.contains("since this session began"), "{why}")
+                }
                 other => panic!("{other:?}"),
             }
         }
 
-        /// The seed's own age bounds the hold: once its oldest routes reach
-        /// the `max-age` that would have refused it at the start, the GC
-        /// runs whatever the authority says.
+        /// The routes' age bounds the hold: once they reach `max-age`, the
+        /// GC runs whatever the authority says.
         #[test]
         fn max_age_lets_the_gc_go() {
             let t = Instant::now();
             let r = reading(t, loading());
             assert_eq!(
-                judge_seed_gc(Some(EXPIRES), Some(&r), t, t, t, EXPIRES),
+                judge_gc_hold(seed(EXPIRES), Some(&r), t, t, t, EXPIRES),
                 GcHold::Release(GcRelease::MaxAge)
             );
         }
 
         /// An authority with nothing readable to say is waited on for
-        /// [`SEED_GC_AUTHORITY_SILENCE`], from the later of its last
+        /// [`GC_HOLD_AUTHORITY_SILENCE`], from the later of its last
         /// readable reading and the hold's start — so one that keeps
         /// answering "loading" never trips it.
         #[test]
         fn a_silent_authority_lets_the_gc_go_and_a_talking_one_does_not() {
             let start = Instant::now();
             let held = start + Duration::from_secs(360);
-            let silent = held + SEED_GC_AUTHORITY_SILENCE;
+            let silent = held + GC_HOLD_AUTHORITY_SILENCE;
+            let later = seed(EXPIRES + 3600);
             assert_eq!(
-                judge_seed_gc(Some(EXPIRES + 3600), None, start, held, silent, NOW_UNIX),
+                judge_gc_hold(later, None, start, held, silent, NOW_UNIX),
                 GcHold::Release(GcRelease::AuthoritySilent)
             );
             assert!(matches!(
-                judge_seed_gc(
-                    Some(EXPIRES + 3600),
+                judge_gc_hold(
+                    later,
                     None,
                     start,
                     held,
                     silent - Duration::from_secs(1),
                     NOW_UNIX
                 ),
-                GcHold::Hold(_)
+                GcHold::Hold { .. }
             ));
             // Readable all along: the latest reading restarts the clock.
             let r = reading(silent - Duration::from_secs(30), loading());
             assert!(matches!(
-                judge_seed_gc(
-                    Some(EXPIRES + 3600),
-                    Some(&r),
-                    start,
-                    held,
-                    silent,
-                    NOW_UNIX
-                ),
-                GcHold::Hold(_)
+                judge_gc_hold(later, Some(&r), start, held, silent, NOW_UNIX),
+                GcHold::Hold { .. }
             ));
             // An old reading does not extend the wait past the hold's
             // start-based bound either.
             let r = reading(start, loading());
             assert_eq!(
-                judge_seed_gc(
-                    Some(EXPIRES + 3600),
-                    Some(&r),
-                    start,
-                    held,
-                    silent,
-                    NOW_UNIX
-                ),
+                judge_gc_hold(later, Some(&r), start, held, silent, NOW_UNIX),
                 GcHold::Release(GcRelease::AuthoritySilent)
             );
         }
 
-        /// A hold over a seed applied at `NOW`, expiring `max_age_secs`
-        /// later, and the authority snapshot it reads.
-        fn hold(max_age_secs: u64) -> (SeedGcHold, crate::fib::integrity::SharedSnapshot) {
+        /// A hold over a seed applied now, expiring `max_age_secs` later,
+        /// and the authority snapshot it reads.
+        fn hold(max_age_secs: u64) -> (FeedGcHold, crate::fib::integrity::SharedSnapshot) {
             let ledger = shared_status();
-            let now = crate::fib::route_ledger::now_unix();
             {
                 let mut st = ledger.lock().unwrap();
                 st.start = StartReport::Seeded;
-                st.seed = Some(SeedReport {
-                    writer_version: "test".into(),
-                    written_at_unix: now,
-                    confirmed_at_unix: now,
-                    attested: true,
-                    max_age_secs,
-                    counts: LedgerCounts::default(),
-                    applied_at: Some(Instant::now()),
-                    apply_took: None,
-                    failed: 0,
-                    unconfirmed: 3,
-                    stream_started_at: Some(Instant::now()),
-                    reconciled: None,
-                    gc_held: None,
-                });
+                st.max_age_secs = max_age_secs;
+                st.seed = Some(seed_report(now_unix(), max_age_secs));
             }
             let authority = shared_snapshot();
             (
-                SeedGcHold {
+                FeedGcHold::new(
                     ledger,
-                    authority: authority.clone(),
-                },
+                    authority.clone(),
+                    Arc::new(tokio::sync::Notify::new()),
+                ),
                 authority,
             )
         }
 
         async fn publish(authority: &crate::fib::integrity::SharedSnapshot, load: UpstreamsLoad) {
             authority.write().await.upstreams = Some(reading(Instant::now(), load));
+        }
+
+        fn initiation_completes(log: &RouteEventLog) -> usize {
+            log.events()
+                .iter()
+                .filter(|e| matches!(e, RouteEvent::InitiationComplete))
+                .count()
+        }
+
+        /// One UPDATE, applied: by then the session loop is running, so a
+        /// reading published after this was taken in the session.
+        async fn one_update_applied(wr: &mut tokio::net::tcp::OwnedWriteHalf, log: &RouteEventLog) {
+            let applied = log.events().len();
+            wr.write_all(&test_update()).await.expect("UPDATE");
+            wait_until("the UPDATE is applied", Duration::from_secs(5), || {
+                log.events().len() > applied
+            })
+            .await;
+        }
+
+        async fn end_of_rib(wr: &mut tokio::net::tcp::OwnedWriteHalf) {
+            for family in [Family::V4, Family::V6] {
+                wr.write_all(&encode_end_of_rib(family))
+                    .await
+                    .expect("End-of-RIB");
+            }
+        }
+
+        /// The peer's half of the OPEN exchange on a connection `serve`
+        /// took.
+        async fn handshake(peer: &mut TcpStream, caps: PeerCaps) {
+            assert_eq!(read_type(peer).await.expect("OPEN"), MSG_TYPE_OPEN);
+            peer.write_all(&peer_open(caps)).await.expect("send OPEN");
+            assert_eq!(
+                read_type(peer).await.expect("KEEPALIVE"),
+                MSG_TYPE_KEEPALIVE
+            );
+            for family in caps.end_of_rib_we_send().iter() {
+                let msg = read_message(peer).await.expect("End-of-RIB");
+                assert_eq!(end_of_rib_in(&msg), Some(family));
+            }
         }
 
         /// The whole hold over a live session: End-of-RIB in every family
@@ -4838,56 +5051,36 @@ mod tests {
                 prog,
                 Setup {
                     peer: GR_PEER,
-                    seed_gc_hold: Some(hold),
+                    gc_hold: Some(hold),
                     ..Setup::default()
                 },
             )
             .await;
-            // Read in this session, as the checker's early check after the
-            // stream's first route would.
-            publish(&authority, loading()).await;
             let (rd, mut wr) = peer.into_split();
             let seen = watch(rd);
             let fired = || initiation_complete_at(&log).is_some();
 
-            wr.write_all(&test_update()).await.expect("UPDATE");
-            for family in [Family::V4, Family::V6] {
-                wr.write_all(&encode_end_of_rib(family))
-                    .await
-                    .expect("End-of-RIB");
-            }
-            let held = || {
-                ledger
-                    .lock()
-                    .unwrap()
-                    .seed
-                    .as_ref()
-                    .and_then(|s| s.gc_held.clone())
-            };
+            one_update_applied(&mut wr, &log).await;
+            // Read in this session, as the checker's early check after the
+            // stream's first route would.
+            publish(&authority, loading()).await;
+            end_of_rib(&mut wr).await;
+            let held = || ledger.lock().unwrap().gc_held.clone();
             wait_until("the GC is held", Duration::from_secs(5), || {
                 held().is_some()
             })
             .await;
-            assert!(
-                held().unwrap().why.contains("End-of-RIB for ipv4"),
-                "{:?}",
-                held()
-            );
+            let h = held().unwrap();
+            assert!(h.why.contains("End-of-RIB for ipv4"), "{h:?}");
+            assert_eq!(h.over, HeldOver::Seed);
             // The hold outlives the poll many times over, and the session
             // keeps applying what the peer sends.
             assert_eq!(
-                quiet_peer_until(&mut wr, 4 * SEED_GC_HOLD_POLL, fired).await,
+                quiet_peer_until(&mut wr, 4 * GC_HOLD_POLL, fired).await,
                 None,
                 "InitiationComplete fired over a seed while an upstream was loading"
             );
-            wr.write_all(&test_update()).await.expect("UPDATE");
-            let applied = log.events().len();
-            wait_until(
-                "the UPDATE is applied while held",
-                Duration::from_secs(5),
-                || log.events().len() > applied,
-            )
-            .await;
+            one_update_applied(&mut wr, &log).await;
 
             publish(&authority, UpstreamsLoad::Loaded).await;
             let at = Instant::now();
@@ -4895,7 +5088,7 @@ mod tests {
                 .await
                 .expect("the authority's word lets the GC go");
             assert!(
-                fired_at - at < 3 * SEED_GC_HOLD_POLL,
+                fired_at - at < 3 * GC_HOLD_POLL,
                 "let go {:?} after the word",
                 fired_at - at
             );
@@ -4924,7 +5117,7 @@ mod tests {
                 prog,
                 Setup {
                     peer: GR_PEER,
-                    seed_gc_hold: Some(hold),
+                    gc_hold: Some(hold),
                     ..Setup::default()
                 },
             )
@@ -4932,11 +5125,7 @@ mod tests {
             let (rd, mut wr) = peer.into_split();
             let _seen = watch(rd);
             wr.write_all(&test_update()).await.expect("UPDATE");
-            for family in [Family::V4, Family::V6] {
-                wr.write_all(&encode_end_of_rib(family))
-                    .await
-                    .expect("End-of-RIB");
-            }
+            end_of_rib(&mut wr).await;
             quiet_peer_until(&mut wr, Duration::from_secs(5), || {
                 initiation_complete_at(&log).is_some()
             })
@@ -4961,7 +5150,7 @@ mod tests {
                 prog,
                 Setup {
                     peer: GR_PEER,
-                    seed_gc_hold: Some(hold),
+                    gc_hold: Some(hold),
                     ..Setup::default()
                 },
             )
@@ -4969,24 +5158,112 @@ mod tests {
             let (rd, mut wr) = peer.into_split();
             let _seen = watch(rd);
             wr.write_all(&test_update()).await.expect("UPDATE");
-            for family in [Family::V4, Family::V6] {
-                wr.write_all(&encode_end_of_rib(family))
-                    .await
-                    .expect("End-of-RIB");
-            }
-            let held = || {
-                ledger
-                    .lock()
-                    .unwrap()
-                    .seed
-                    .as_ref()
-                    .is_some_and(|s| s.gc_held.is_some())
-            };
+            end_of_rib(&mut wr).await;
+            let held = || ledger.lock().unwrap().gc_held.is_some();
             wait_until("the GC is held", Duration::from_secs(5), held).await;
             drop(wr);
             let _ = session.await.expect("join");
             assert!(!held(), "the session ended; its hold went with it");
             assert_eq!(initiation_complete_at(&log), None);
+        }
+
+        /// The bgpd restart under a running packetframe, through `serve`,
+        /// which is what records that a session ended. The first session's
+        /// GC has nothing before it and runs at End-of-RIB. FRR then drops
+        /// the session and comes back with its upstreams reloading: the
+        /// second session's End-of-RIB would remove what the first sent,
+        /// so its GC is held, asks the authority for a check at once,
+        /// reports the hold, and runs on the authority's word — after which
+        /// nothing earlier is left.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_reconnect_holds_its_gc_until_the_upstreams_load() {
+            let (prog, log) = recording_handle();
+            let (lst, mut listener, addr) = unserved(prog).await;
+            let authority = shared_snapshot();
+            let check_now = Arc::new(tokio::sync::Notify::new());
+            let hold = FeedGcHold::new(shared_status(), authority.clone(), check_now.clone());
+            let ledger = hold.ledger.clone();
+            listener.gc_hold = Some(hold.clone());
+            let shutdown = listener.shutdown.clone();
+            let serving = tokio::spawn(listener.serve(lst));
+            publish(&authority, loading()).await;
+
+            let mut first = TcpStream::connect(addr).await.expect("connect");
+            handshake(&mut first, GR_PEER).await;
+            let (rd, mut wr) = first.into_split();
+            let _first_seen = watch(rd);
+            one_update_applied(&mut wr, &log).await;
+            end_of_rib(&mut wr).await;
+            wait_until(
+                "the first session's GC runs at End-of-RIB",
+                Duration::from_secs(5),
+                || initiation_completes(&log) == 1,
+            )
+            .await;
+            assert_eq!(hold.earlier_since(), None);
+            assert!(ledger.lock().unwrap().gc_held.is_none());
+            // FRR's bgpd restarts and the session goes with it.
+            drop(wr);
+            wait_until(
+                "the session's end is recorded",
+                Duration::from_secs(5),
+                || hold.earlier_since().is_some(),
+            )
+            .await;
+
+            let asked = {
+                let n = check_now.clone();
+                tokio::spawn(async move { n.notified().await })
+            };
+            let mut second = TcpStream::connect(addr).await.expect("connect");
+            handshake(&mut second, GR_PEER).await;
+            let (rd, mut wr) = second.into_split();
+            let _seen = watch(rd);
+            one_update_applied(&mut wr, &log).await;
+            publish(&authority, loading()).await;
+            end_of_rib(&mut wr).await;
+            let held = || ledger.lock().unwrap().gc_held.clone();
+            wait_until("the GC is held", Duration::from_secs(5), || {
+                held().is_some()
+            })
+            .await;
+            let h = held().unwrap();
+            assert_eq!(h.over, HeldOver::EarlierSession);
+            assert!(h.why.contains("End-of-RIB for ipv4"), "{h:?}");
+            tokio::time::timeout(Duration::from_secs(5), asked)
+                .await
+                .expect("the hold asks the authority for a check now")
+                .expect("join");
+            let row = ledger
+                .lock()
+                .unwrap()
+                .subsystem_health(now_unix(), Instant::now());
+            let message = row.message.unwrap();
+            assert!(
+                message.contains("reconnected") && message.contains("is held"),
+                "{message}"
+            );
+            assert_eq!(
+                quiet_peer_until(&mut wr, 4 * GC_HOLD_POLL, || initiation_completes(&log) > 1)
+                    .await,
+                None,
+                "a reconnect's GC ran while an upstream was loading"
+            );
+
+            publish(&authority, UpstreamsLoad::Loaded).await;
+            quiet_peer_until(&mut wr, Duration::from_secs(5), || {
+                initiation_completes(&log) == 2
+            })
+            .await
+            .expect("the authority's word lets the GC go");
+            assert!(held().is_none(), "the status row no longer says held");
+            assert_eq!(
+                hold.earlier_since(),
+                None,
+                "the GC removed whatever the first session sent and this one did not"
+            );
+            shutdown.cancel();
+            serving.await.expect("join").expect("serve");
         }
     }
 

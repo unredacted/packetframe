@@ -201,6 +201,7 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     // start — but the preserving stop writes per the setting in force
     // when it runs, so a reload that turns it off (or back on) is
     // honoured at the next stop rather than at the one after a restart.
+    // Its `max-age` also bounds a held GC, which reads it from the status.
     let route_ledger = crate::linux_impl::route_ledger_spec_from_cfg(cfg);
     if route_ledger != state.route_ledger {
         info!(
@@ -209,6 +210,11 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
             "route-ledger changed; the next preserving stop follows it"
         );
         state.route_ledger = route_ledger;
+        state
+            .ledger_status
+            .lock()
+            .expect("ledger status lock")
+            .max_age_secs = route_ledger.max_age_secs;
     }
     // The watcher derives VLAN_RESOLVE from the same directives
     // (`bridge-resolve`), so a reload that changes them must reach it
