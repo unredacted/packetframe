@@ -8671,3 +8671,211 @@ fn measure_steered_seeded_release_at_full_table() {
         longest.events,
     );
 }
+
+/// The seeded fresh door, end to end: a FRESH VPP (nothing to adopt, as
+/// after a reboot) over a mirror the fast-path seeded from a whole route
+/// ledger, while the completeness authority's only objection is upstreams
+/// still loading.
+mod seeded_fresh {
+    use super::*;
+    use packetframe_common::fib::{
+        AuthorityObservation, FeedSession, Revocation, TableCompleteness,
+    };
+    use std::sync::{Arc, Mutex};
+
+    pub struct Fixture {
+        pub _fake: Fake,
+        pub log: steered::Log,
+        pub rt: Runtime,
+        pub session: Arc<FeedSession>,
+        pub authority: Arc<TableCompleteness>,
+    }
+
+    pub fn loading() -> AuthorityObservation {
+        AuthorityObservation::Loading(Revocation::UpstreamNotReady(
+            "upstream 192.0.2.1 is Established but has not sent End-of-RIB for ipv4 on this \
+             session"
+                .into(),
+        ))
+    }
+
+    /// A fresh convergence (the fake holds no routes, so the adoption
+    /// takes `start_resync`'s fresh arm) over the six-route seed,
+    /// `require-table-complete on`, the feed up in its first session and
+    /// the authority reading the upstreams still loading. The seed is
+    /// whole or not as asked.
+    pub fn fresh(name: &str, whole: bool, d: &mut Driver) -> (Fixture, Instant) {
+        let fake = Fake::start(name);
+        let log: steered::Log = Arc::new(Mutex::new(Vec::new()));
+        let rt = runtime_custom(
+            &fake,
+            Box::new(steered::SharedMirror(Arc::new(Mutex::new(
+                seeded_mirror::seed(),
+            )))),
+            Box::new(steered::RecordingSteering {
+                rules: Vec::new(),
+                log: log.clone(),
+            }),
+            1_000_000,
+        );
+        let session = Arc::new(FeedSession::new());
+        session.mark_mirror_seeded();
+        if whole {
+            // A seed well within its max-age.
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            session.mark_seed_whole(now_unix + 1_800);
+        }
+        rt.feed_session(session.clone());
+        let authority = Arc::new(TableCompleteness::new());
+        rt.require_table_complete(authority.clone());
+        {
+            let (mut obs, _) = rt.views();
+            use packetframe_vpp_offload::driver::Observe as _;
+            assert!(obs.api_ready(), "the fake must answer the handshake");
+        }
+        let t0 = Instant::now();
+        {
+            let (_, mut fx) = rt.views();
+            d.inject(t0, Event::Adopted { steered: false }, &mut fx);
+        }
+        assert_eq!(d.state(), State::Syncing);
+        session.set_up(true);
+        authority.record(loading());
+        (
+            Fixture {
+                _fake: fake,
+                log,
+                rt,
+                session,
+                authority,
+            },
+            t0,
+        )
+    }
+
+    /// Ask for a steer, then tick `ticks` times: whether it lands is the
+    /// caller's question.
+    pub fn steer(d: &mut Driver, f: &Fixture, now: Instant, ticks: usize) -> (Instant, Vec<Event>) {
+        let mut seen = {
+            let (_, mut fx) = f.rt.views();
+            d.inject(now, Event::SteerRequested, &mut fx).events
+        };
+        let (now, more) = tick_for(d, f, now, ticks);
+        seen.extend(more);
+        (now, seen)
+    }
+
+    /// [`run_until`]'s loop for exactly `ticks` ticks, with no stop
+    /// condition: for what must NOT happen, and for a steer that should.
+    pub fn tick_for(
+        d: &mut Driver,
+        f: &Fixture,
+        mut now: Instant,
+        ticks: usize,
+    ) -> (Instant, Vec<Event>) {
+        let (mut obs, mut fx) = f.rt.views();
+        let mut seen = Vec::new();
+        for _ in 0..ticks {
+            let t = d.tick(now, &mut obs, &mut fx);
+            seen.extend(t.events.clone());
+            for e in f.rt.take_pending() {
+                seen.extend(d.inject(now, e, &mut fx).events);
+            }
+            f.rt.set_steered(d.supervisor().is_steered());
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+        (now, seen)
+    }
+}
+
+/// The reboot this door exists for: VPP is fresh, the seed is whole, the
+/// route source is streaming in its first session, and the authority
+/// still waits for the transits. Verify runs over the seed now rather
+/// than after the upstreams' End-of-RIB, and the first steer lands
+/// through the completeness gate the authority's `Ineligible` would
+/// otherwise close.
+#[test]
+fn a_fresh_vpp_over_a_whole_seed_verifies_and_steers_while_the_upstreams_load() {
+    let mut d = Driver::new();
+    let (f, t0) = seeded_fresh::fresh("seeded-fresh", true, &mut d);
+    let (now, seen) = run_until(&mut d, &f.rt, t0, |d| d.state() == State::Ready);
+    assert_eq!(d.state(), State::Ready, "{seen:?}");
+    assert!(seen.contains(&Event::SyncComplete), "{seen:?}");
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+    assert!(
+        !f.authority.verdict().permits_steering(),
+        "the premise: the authority still refuses, {:?}",
+        f.authority.verdict()
+    );
+    let (_, seen) = seeded_fresh::steer(&mut d, &f, now, 64);
+    assert_eq!(d.state(), State::Steered, "{seen:?}");
+    assert_eq!(f.log.lock().unwrap().as_slice(), &["steer"]);
+}
+
+/// A seed nobody attested whole is not enough: the fresh hold waits for
+/// the authority exactly as before the door, and the authority's word
+/// releases it as it always has.
+#[test]
+fn a_fresh_vpp_over_a_seed_that_is_not_whole_waits_for_the_authority() {
+    use packetframe_common::fib::{AuthorityObservation, CompletenessReport};
+    let mut d = Driver::new();
+    let (f, t0) = seeded_fresh::fresh("seeded-fresh-partial", false, &mut d);
+    let (now, seen) = seeded_fresh::tick_for(&mut d, &f, t0, 64);
+    assert_eq!(d.state(), State::Syncing, "{seen:?}");
+    assert!(!seen.contains(&Event::SyncComplete), "{seen:?}");
+
+    f.authority
+        .record(AuthorityObservation::Clean(CompletenessReport {
+            authority_routes: 6,
+            mirror_routes: 6,
+            at: std::time::Instant::now(),
+        }));
+    let (_, seen) = run_until(&mut d, &f.rt, now, |d| d.state() == State::Ready);
+    assert_eq!(d.state(), State::Ready, "{seen:?}");
+    assert!(seen.contains(&Event::VerifyPassed), "{seen:?}");
+}
+
+/// The door answers one objection, "still loading", and none other. Once
+/// the upstreams have loaded and the authority's count disagrees, its
+/// latest reading is a count mismatch: the door is shut, and the steer is
+/// refused on the authority's verdict as any steer is.
+#[test]
+fn a_count_mismatch_after_the_upstreams_load_shuts_the_door_on_the_steer() {
+    use packetframe_common::fib::{AuthorityObservation, CompletenessReport};
+    let mut d = Driver::new();
+    let (f, t0) = seeded_fresh::fresh("seeded-fresh-mismatch", true, &mut d);
+    let (now, _) = run_until(&mut d, &f.rt, t0, |d| d.state() == State::Ready);
+    assert_eq!(d.state(), State::Ready);
+
+    f.authority
+        .record(AuthorityObservation::Clean(CompletenessReport {
+            authority_routes: 1_000,
+            mirror_routes: 6,
+            at: std::time::Instant::now(),
+        }));
+    let (_, seen) = seeded_fresh::steer(&mut d, &f, now, 64);
+    assert_ne!(d.state(), State::Steered, "{seen:?}");
+    assert!(
+        f.log.lock().unwrap().is_empty(),
+        "no rule may be installed over a table the authority counts short"
+    );
+}
+
+/// A reconnect shuts the door for good, as at the adopted seeded door: the
+/// loading reading may predate the new stream.
+#[test]
+fn a_reconnect_before_the_release_shuts_the_seeded_fresh_door() {
+    let mut d = Driver::new();
+    let (f, t0) = seeded_fresh::fresh("seeded-fresh-reconnect", true, &mut d);
+    f.session.set_up(false);
+    f.session.set_up(true);
+    f.authority.record(seeded_fresh::loading());
+    let (_, seen) = seeded_fresh::tick_for(&mut d, &f, t0, 64);
+    assert_eq!(d.state(), State::Syncing, "{seen:?}");
+    assert!(!seen.contains(&Event::SyncComplete), "{seen:?}");
+}

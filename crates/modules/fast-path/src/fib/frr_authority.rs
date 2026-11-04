@@ -49,12 +49,26 @@ use packetframe_common::fib::{AuthorityObservation, TableCompleteness};
 use packetframe_common::frr::{RealVtysh, Vtysh};
 
 use crate::fib::frr::{
-    classify_bracketed, mirror_family_mismatch, next_check_delay, observation,
-    parse_established_epoch, parse_export_policy, parse_total_prefixes, parse_upstream_state,
-    split_two_json, Eligibility, ExportPolicy, UpstreamBracket, UpstreamState,
+    classify_bracketed, loading_is_the_only_objection, mirror_family_mismatch, next_check_delay,
+    observation, parse_established_epoch, parse_export_policy, parse_total_prefixes,
+    parse_upstream_state, split_two_json, upstreams_load, Eligibility, ExportPolicy,
+    UpstreamBracket, UpstreamState,
 };
 use crate::fib::integrity::{Comparison, Drift, SharedSnapshot, DEFAULT_DRIFT_WARN_FRACTION};
+use crate::fib::integrity_status::UpstreamsReading;
 use crate::fib::programmer::FibProgrammerHandle;
+
+/// What one check's `vtysh` half concluded, from one set of readings.
+struct Readings {
+    eligibility: Eligibility,
+    /// Upstreams still loading are the only objection the readings
+    /// show ([`loading_is_the_only_objection`]). The checker clears it when
+    /// its own evidence finds another.
+    loading_only: bool,
+    /// The upstreams' load, when the readings could show it
+    /// ([`upstreams_load`]).
+    load: Option<UpstreamsReading>,
+}
 
 /// Subprocess budget for one `vtysh` call.
 ///
@@ -349,7 +363,11 @@ impl FrrAuthorityChecker {
         // outside the pair — same placement as the birdc checker's peer
         // count, and for the same reason: a subprocess call that neither
         // number depends on must not sit between them.
-        let mut eligibility = self.eligibility().await;
+        let Readings {
+            mut eligibility,
+            mut loading_only,
+            load,
+        } = self.eligibility().await;
         // The mirror's own composition is evidence too, and it needs no
         // subprocess — so it is checked here rather than inside
         // `eligibility`, which is the vtysh half. It outranks
@@ -361,13 +379,20 @@ impl FrrAuthorityChecker {
         // ROUTE-SOURCE families, not `mirror`: the mirror carries the
         // resolver's synthetic `local-prefix` routes too, and one /128
         // would read as a v6 feed on a v4-only box. A failed query is
-        // simply no evidence — it cannot produce a revocation.
-        if let Ok((v4, v6)) = self.prog.session_families().await {
-            if let Some(r) = mirror_family_mismatch(v4, v6, &self.config.counted_families()) {
-                if !matches!(eligibility, Eligibility::Revoked(_)) {
-                    eligibility = Eligibility::Revoked(r);
+        // simply no evidence — it cannot produce a revocation. Nor can it
+        // show the families are right, so it is not "nothing else wrong"
+        // for `loading_only`, which a deferred revocation would otherwise
+        // hide too.
+        match self.prog.session_families().await {
+            Ok((v4, v6)) => {
+                if let Some(r) = mirror_family_mismatch(v4, v6, &self.config.counted_families()) {
+                    loading_only = false;
+                    if !matches!(eligibility, Eligibility::Revoked(_)) {
+                        eligibility = Eligibility::Revoked(r);
+                    }
                 }
             }
+            Err(_) => loading_only = false,
         }
         // A seed no session has spoken to: positive evidence, like the
         // composition check above, and needing no subprocess. Read AFTER
@@ -377,6 +402,7 @@ impl FrrAuthorityChecker {
         let seed_blocker = crate::fib::route_ledger::blocker(self.ledger_status.as_ref());
         self.seed_blocked_last = seed_blocker.is_some();
         if let Some(why) = seed_blocker {
+            loading_only = false;
             if !matches!(eligibility, Eligibility::Revoked(_)) {
                 eligibility = Eligibility::Revoked(
                     packetframe_common::fib::Revocation::UpstreamNotReady(why),
@@ -398,7 +424,19 @@ impl FrrAuthorityChecker {
         // fine and lost the counts is `Unreadable`, which retains the
         // previous report under the age policy and retains any standing
         // revocation. Neither of those is the same as renewing.
-        let obs = observation(&eligibility, fresh_authority, fresh_mirror, at);
+        //
+        // A disqualification whose only cause is upstreams still loading
+        // is published as such ([`AuthorityObservation::Loading`]): the
+        // same revocation, plus the fact one consumer acts on. Only from
+        // `Disqualified`, so it never replaces a `Clean` or an
+        // `Unreadable`; `loading_only` implies a not-ready upstream, which
+        // `classify_bracketed` always reports as a revocation.
+        let obs = match observation(&eligibility, fresh_authority, fresh_mirror, at) {
+            AuthorityObservation::Disqualified(r) if loading_only => {
+                AuthorityObservation::Loading(r)
+            }
+            other => other,
+        };
         let readable = !matches!(obs, AuthorityObservation::Unreadable);
         if let Some(handle) = self.completeness.as_ref() {
             handle.record(obs);
@@ -407,6 +445,11 @@ impl FrrAuthorityChecker {
         let mut snap = self.snapshot.write().await;
         snap.last_run = Some(at);
         snap.last_error = None;
+        // Retained when this check could not read it: the seed GC hold
+        // ages it rather than mistaking a failed read for a verdict.
+        if let Some(load) = load {
+            snap.upstreams = Some(load);
+        }
         snap.authority = Some("FRR");
         // The disqualification, on the snapshot as its own fact.
         //
@@ -608,7 +651,12 @@ impl FrrAuthorityChecker {
     /// under a clean observation (review finding, PR #268).
     /// [`classify_bracketed`] says why one reading on either side is not
     /// enough.
-    async fn eligibility(&mut self) -> Eligibility {
+    ///
+    /// The same readings answer two narrower questions alongside the
+    /// eligibility ([`Readings`]); they are judged here, from the very
+    /// brackets the eligibility was, so the three cannot describe
+    /// different moments.
+    async fn eligibility(&mut self) -> Readings {
         let before = self.upstreams().await;
         let export = self.export_policy().await;
         let after = self.upstreams().await;
@@ -623,7 +671,17 @@ impl FrrAuthorityChecker {
                 after,
             })
             .collect();
-        classify_bracketed(export, &brackets, &mut self.seen_epochs)
+        let load = upstreams_load(&brackets).ok().map(|load| UpstreamsReading {
+            at: Instant::now(),
+            load,
+        });
+        let prior_epochs = self.seen_epochs.clone();
+        let eligibility = classify_bracketed(export.clone(), &brackets, &mut self.seen_epochs);
+        Readings {
+            eligibility,
+            loading_only: loading_is_the_only_objection(export, &brackets, prior_epochs),
+            load,
+        }
     }
 
     /// Every declared upstream, one `vtysh` each, concurrently, in
@@ -1119,6 +1177,8 @@ mod tests {
                 writer_version: "test".into(),
                 written_at_unix: 1_790_000_000,
                 confirmed_at_unix: 1_790_000_000,
+                attested: true,
+                max_age_secs: 1800,
                 counts: LedgerCounts::default(),
                 applied_at: Some(std::time::Instant::now()),
                 apply_took: None,
@@ -1126,6 +1186,7 @@ mod tests {
                 unconfirmed: 10,
                 stream_started_at: None,
                 reconciled: None,
+                gc_held: None,
             });
         }
         let mut checker = FrrAuthorityChecker::with_vtysh(

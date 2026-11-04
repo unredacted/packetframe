@@ -1218,6 +1218,118 @@ door records `resync_released` with `door: quiet` after the replay
 instead. Steering never comes down, and the VPP process is the same
 throughout.
 
+### A fresh VPP and a seeded mirror
+
+**The incident this answers (primary, 2026-10-30, a firmware upgrade's
+reboot).** The fast-path seeded the mirror with 1,356,851 routes seconds
+after the start, and VPP took its first steer **32.5 minutes after the
+reboot**. VPP was fresh: its own preserved ledger names the process
+pid, start ticks and boot id, so it cannot outlive a reboot. A fresh
+convergence's verify waits for the completeness authority ([a fresh
+attach holds in `Syncing`](#a-fresh-attach-on-a-full-table-box-holds-in-syncing-for-minutes-that-is-the-fix-working)),
+and on an FRR-fed box the authority needs every declared upstream's
+End-of-RIB. The boot load starved bgpd, so both transits took 15.5
+minutes to send theirs (1.5 minutes on a calm box). After that came the
+drain and the verify. The table was in the mirror the whole time.
+
+**The seeded fresh door.** A fresh convergence's verify now also runs
+when all of these hold, judged on each tick the drain goes idle:
+
+- **The mirror holds a whole seed.** This process seeded it from a
+  route ledger whose writer's completeness authority vouched for it at
+  the stop, under the same `integrity-authority` this daemon runs (the
+  same kind, upstreams and families; see [the route
+  ledger](packetframe-fib.md#when-it-is-written-and-what-is-in-it)).
+  Every route of it went in without a failed install, no GC has run
+  since, and its oldest routes are younger than `route-ledger max-age`:
+  the door shuts at that age itself, whether or not anything has ended
+  the seed. The attestation is what makes this safe: nothing a start
+  checks tells a whole table from part of one, and a clean stop during
+  a cold load, or during the refill after a bgpd restart's early
+  End-of-RIB, writes the table it had.
+- **The route source is streaming in its first session.** It has sent
+  its first route to this process and has not dropped since. A
+  reconnect shuts the door for good, as at the adopted seeded door.
+- **The authority's only objection is upstreams still loading.** Its
+  most recent readable check (within 15 minutes) found a declared
+  upstream not Established, or Established without End-of-RIB, and
+  nothing else: every reading of every upstream answered (a loading one's
+  included), nothing narrows the export, no session re-established or
+  went down during the check, the feed's families are declared, and the
+  route source has spoken to the seed. Any other objection keeps the
+  door shut, and so does a count. Once the upstreams have loaded, the
+  authority's next check compares the counts, and a mismatch then is a
+  count mismatch, not loading. Converged is the ordinary release, as it
+  always was.
+- **VPP holds everything the mirror does**: the drain is idle with
+  nothing left at the route source, the same condition as the
+  authority's release.
+
+Then verify runs its 64 probes over the full table as usual. On a pass
+the first steer goes through the same chokepoint as every steer. The
+completeness gate there lets it through on the door while the door's
+legs still hold (only for the convergence the door released). The
+first-steer hold still applies in full: VPP caught up, no unresolvable,
+withheld or installing route counted against the first steer, and a
+verify that covers the table.
+
+**What it relies on.** The fast-path holds the route source's first GC
+over the seed until the authority reads every upstream loaded ([the GC
+after a seed](packetframe-fib.md#the-gc-after-a-seed-waits-for-frrs-upstreams)).
+Without that hold, FRR's End-of-RIB at `select-defer-time` (360 s
+after bgpd starts, in restart mode) would remove every seeded route the
+replay had not reached yet, from the mirror and from a VPP this door had
+let steer, where a miss is dropped.
+
+**What it costs.** VPP forwards on the seed plus the replay so far.
+Routes FRR has changed since the stop reach VPP as ordinary updates when
+the replay re-advertises them. Routes withdrawn while the box was down
+stay until the held GC removes them, exactly as on the eBPF tier, which
+forwards on the same mirror. That is at most the ledger's `max-age` (30
+minutes by default) after the stop, because the held GC runs then
+whatever the upstreams say. If that happens while an upstream is still
+loading, the GC also removes the seeded routes the replay has not
+reached, from a steered VPP too.
+
+**What still waits for the authority:** a seed that is not whole (its
+writer had no authority, the authority did not say yes at the stop, it
+said yes under another `integrity-authority`, or this start applied it
+short), a seed past `max-age`, no `require-table-complete`, a route
+source that reconnected, a seed already reconciled, and any objection
+other than loading.
+
+What you see after a reboot that takes the door:
+
+```
+fresh resync under a completeness authority: routes install as the source loads, and verify waits ...
+the route mirror holds a whole route-ledger seed, the route source is streaming in its first session, the completeness authority's only objection is upstreams still loading, and VPP holds everything the mirror does: fresh resync complete — verifying the full table without waiting for the upstreams   door=seeded
+verify passed
+steering over the route-ledger seed the fresh resync verified, while the completeness authority waits for its upstreams to finish loading   door=seeded
+steering UP: allowlisted traffic is now diverted to VPP ...
+```
+
+The event log reads `route_ledger_seeded` (`attested: true`) →
+`fresh_hold_released` (`door: seeded`) → `verify_passed` → `steering_up`,
+with the fast-path's `route_ledger_gc_held` wherever FRR's early
+End-of-RIB lands among them, and later `route_ledger_gc_released`
+(`trigger: upstreams-loaded`) → `route_ledger_reconciled`. The authority's own release records
+`fresh_hold_released` with `door: authority`.
+
+**Turning it off.** There is no switch of its own. The door needs an
+attested seed and the FRR authority, so either of these closes it:
+
+- `route-ledger off` in the fast-path block. The next stop writes no
+  ledger and the next start seeds nothing, so there is no door and no
+  GC hold. Every start then loads cold. (Reloadable: the stop and the
+  start each read the setting in force when they run.)
+- `integrity-authority` other than `frr` (restart-only). The fast-path
+  then neither holds the GC nor publishes "loading", so the door never
+  opens, and a fresh VPP waits for its authority exactly as before.
+
+To keep both but shorten how long a stale seed can forward, lower
+`route-ledger on max-age <seconds>`. The held GC runs once the seed's
+oldest routes reach it, and the door shuts with the GC.
+
 ## What a keep-vpp restart costs now: the preserved route ledger
 
 **The incident this answers (primary, 2026-09-26, ~1.09M v4 routes).**
@@ -4356,6 +4468,12 @@ fresh resync complete — verifying the full table`. Do not restart it,
 and do not page on it — the state before this hold existed was seven
 kill-respawn cycles in 31 s over an empty table (w7), and a restart
 re-enters the same dump from zero.
+
+Over a mirror the fast-path seeded from a whole route ledger (after a
+reboot, say), the hold does not wait for the upstreams: [the seeded
+fresh door](#a-fresh-vpp-and-a-seeded-mirror) releases it once VPP holds
+the seed and the authority's only objection is upstreams still loading,
+and the log says `door=seeded`.
 
 A verify that ends `INCOMPLETE — steering refused, no restart` is the
 same philosophy after the hold releases: the FIB is not fit to divert

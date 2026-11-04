@@ -384,6 +384,20 @@ impl ProgrammerHarness {
         Arc<RecordingSink>,
         packetframe_fast_path::fib::route_ledger::SharedLedgerStatus,
     ) {
+        Self::with_seed_and_tier(seed, None, None)
+    }
+
+    /// [`Self::with_seed`], with the second tier's completeness and feed
+    /// session handles registered as the controller registers them.
+    fn with_seed_and_tier(
+        seed: Option<packetframe_fast_path::fib::route_ledger::RouteLedger>,
+        completeness: Option<Arc<packetframe_common::fib::TableCompleteness>>,
+        feed_session: Option<Arc<packetframe_common::fib::FeedSession>>,
+    ) -> (
+        Self,
+        Arc<RecordingSink>,
+        packetframe_fast_path::fib::route_ledger::SharedLedgerStatus,
+    ) {
         let pins = PinDirs::setup();
         let ebpf = load_and_pin(&pins);
         let nexthops: Array<MapData, NexthopEntry> = open_array(&pins.path("NEXTHOPS"));
@@ -404,8 +418,14 @@ impl ProgrammerHarness {
         programmer.set_route_sink(sink.clone());
         let status = packetframe_fast_path::fib::route_ledger::shared_status();
         programmer.set_ledger_status(status.clone());
+        // The scope the harness's authority attests under, when it has one.
+        let scope = completeness.as_ref().map(|_| ledger::SCOPE.to_string());
+        programmer.set_second_tier(completeness, feed_session.clone(), scope);
         if let Some(seed) = seed {
             programmer.set_seed(seed);
+            if let Some(h) = &feed_session {
+                h.mark_mirror_seeded();
+            }
         }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3472,6 +3492,8 @@ mod ledger {
     pub const PEER: PeerId = PeerId(0x1ed9_e400_0000_0001);
     pub const IDENTITY: &str =
         "bgp listen 192.0.2.10 port 179 local-as 64512 peer-as 64512 peer-ip any";
+    /// The attestation scope the harness's authority attests under.
+    pub const SCOPE: &str = "frr 192.0.2.1=ipv4";
 
     pub fn nh_a() -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))
@@ -3516,13 +3538,31 @@ mod ledger {
     }
 
     pub fn ledger(routes: &[LedgerRoute], confirmed_at_unix: u64) -> RouteLedger {
+        ledger_attested(routes, confirmed_at_unix, false)
+    }
+
+    /// [`ledger`], with its writer's attestation as given.
+    pub fn ledger_attested(
+        routes: &[LedgerRoute],
+        confirmed_at_unix: u64,
+        attested: bool,
+    ) -> RouteLedger {
         let meta = LedgerMeta {
             writer_version: "test".into(),
             written_at_unix: now_unix(),
             confirmed_at_unix,
+            attested_for: if attested {
+                SCOPE.into()
+            } else {
+                String::new()
+            },
             identity: IDENTITY.into(),
         };
-        RouteLedger::decode(encode(&meta, routes).expect("encode")).expect("decode")
+        let mut ledger =
+            RouteLedger::decode(encode(&meta, routes).expect("encode")).expect("decode");
+        // As a start under `SCOPE` judges it.
+        ledger.attested = attested;
+        ledger
     }
 
     pub fn add(prefix: IpPrefix, nh: IpAddr) -> RouteEvent {
@@ -4534,6 +4574,112 @@ fn the_ledger_holds_route_source_advertisements_only() {
     assert_eq!(ledger.meta.identity, IDENTITY);
 }
 
+/// A stop records whether the authority vouched for the mirror it
+/// writes: its current word, judged against the mirror as it is at the
+/// stop. No authority, a disqualified one, and a converged report the
+/// mirror has since shrunk away from (a GC removed most of it) all write
+/// `attested: false`.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_stop_records_whether_the_authority_vouched_for_the_mirror() {
+    use ledger::*;
+    use packetframe_common::fib::{
+        AuthorityObservation, CompletenessReport, Revocation, TableCompleteness,
+    };
+    let attested = |h: &ProgrammerHarness| {
+        h.run(async { h.handle.encode_ledger(IDENTITY.into(), now_unix()).await })
+            .expect("encode")
+            .attested
+    };
+    let report = |authority, mirror| {
+        AuthorityObservation::Clean(CompletenessReport {
+            authority_routes: authority,
+            mirror_routes: mirror,
+            at: std::time::Instant::now(),
+        })
+    };
+    let fill = |h: &ProgrammerHarness| {
+        h.run(async {
+            for i in 0..4 {
+                h.handle
+                    .apply_route_event(add(quarter(i), nh_a()))
+                    .await
+                    .expect("add");
+            }
+        })
+    };
+
+    let (h, _sink, _status) = ProgrammerHarness::with_seed(None);
+    fill(&h);
+    assert!(!attested(&h), "no authority, no word");
+
+    let authority = Arc::new(TableCompleteness::new());
+    let (h, _sink, _status) =
+        ProgrammerHarness::with_seed_and_tier(None, Some(authority.clone()), None);
+    fill(&h);
+    authority.record(report(4, 4));
+    assert!(attested(&h), "the current word is yes for four routes");
+
+    authority.record(AuthorityObservation::Disqualified(
+        Revocation::UpstreamNotReady("upstream 192.0.2.1 is not Established".into()),
+    ));
+    assert!(!attested(&h), "disqualified");
+
+    authority.record(report(400, 400));
+    assert!(
+        !attested(&h),
+        "a converged report for 400 routes does not vouch for the four the mirror holds"
+    );
+}
+
+/// A seed is whole only when its writer attested it and every route of
+/// it went in: then, and only then, the second tier hears so. An
+/// unattested seed seeds exactly as before.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn only_an_attested_seed_applied_in_full_is_reported_whole() {
+    use ledger::*;
+    use packetframe_common::fib::FeedSession;
+    let routes = [route(quarter(0), nh_a()), route(quarter(1), nh_a())];
+    for attested in [true, false] {
+        let session = Arc::new(FeedSession::new());
+        let (h, _sink, status) = ProgrammerHarness::with_seed_and_tier(
+            Some(ledger_attested(&routes, now_unix(), attested)),
+            None,
+            Some(session.clone()),
+        );
+        // Queued behind the seed, so it has been applied.
+        let counts = h
+            .run(async { h.handle.mirror_counts().await })
+            .expect("counts");
+        assert_eq!(counts, (2, 0));
+        assert!(seeded(&status));
+        let l = session.liveness();
+        assert!(l.mirror_seeded, "{l:?}");
+        assert_eq!(l.seed_whole, attested, "attested {attested}: {l:?}");
+        assert_eq!(
+            status.lock().unwrap().seed.as_ref().map(|s| s.attested),
+            Some(attested)
+        );
+
+        // The first GC ends the seed on the second tier itself, with no
+        // session owner here to `mark_reconciled` (review finding, PR
+        // #375: a dispatch that fails skips that, and the seed outlived
+        // its GC).
+        h.run(async {
+            h.handle
+                .apply_route_event(RouteEvent::InitiationComplete)
+                .await
+                .expect("InitiationComplete")
+        });
+        let l = session.liveness();
+        assert!(
+            !l.mirror_seeded && !l.seed_whole && !l.reconciled,
+            "attested {attested}: {l:?}"
+        );
+    }
+}
+
 /// The confirmation time a stop records is the OLDEST unconfirmed
 /// route's, so a stale route cannot ride from ledger to ledger.
 ///
@@ -4721,6 +4867,7 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
         forwarding_mode: packetframe_common::config::ForwardingMode::PacketframeFib,
         identity: Some(IDENTITY),
         single_peer: None,
+        attestation_scope: None,
         now_unix: now_unix(),
     };
     let again = match consume(&state_dir, &exp) {
@@ -4974,6 +5121,7 @@ fn a_preserving_stop_mid_gc_writes_the_mirror_the_gc_leaves() {
         forwarding_mode: packetframe_common::config::ForwardingMode::PacketframeFib,
         identity: Some(IDENTITY),
         single_peer: None,
+        attestation_scope: None,
         now_unix: now_unix(),
     };
     let again = match consume(&state_dir, &exp) {

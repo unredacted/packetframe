@@ -832,6 +832,108 @@ pub fn classify_bracketed(
     }
 }
 
+/// Whether the declared upstreams have finished loading, from one
+/// check's two readings of each, apart from eligibility as a whole.
+///
+/// What the stale-route GC after a route-ledger seed waits for
+/// (`route_source_bgp`'s seed GC hold): FRR's own table is complete only
+/// once every upstream it learns from has delivered its whole table, and
+/// before that FRR's End-of-RIB to packetframe can describe a table still
+/// arriving. Only readiness counts here. The export policy, epochs and
+/// counts are about whether a comparison may be trusted, and the GC
+/// compares nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamsLoad {
+    /// Every upstream read Established with End-of-RIB for every family
+    /// it carries, in both readings.
+    Loaded,
+    /// At least one reading, of at least one upstream, was not ready: not
+    /// Established, or missing an End-of-RIB. The first such reason.
+    Loading(String),
+}
+
+/// [`UpstreamsLoad`] from one check's readings, or `Err` with the first
+/// failed read when no reading showed an upstream loading. Positive
+/// evidence first, as everywhere in this authority: an upstream that
+/// answered "loading" is loading whatever another one's read did.
+pub fn upstreams_load(brackets: &[UpstreamBracket]) -> Result<UpstreamsLoad, String> {
+    let mut failed: Option<String> = None;
+    for b in brackets {
+        for reading in [&b.before, &b.after] {
+            match reading {
+                Ok(s) => {
+                    if let Some(why) = s.why_not_ready() {
+                        return Ok(UpstreamsLoad::Loading(why));
+                    }
+                }
+                Err(e) => {
+                    failed.get_or_insert_with(|| e.clone());
+                }
+            }
+        }
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(UpstreamsLoad::Loaded),
+    }
+}
+
+/// Whether upstreams still loading are this check's ONLY objection to
+/// the mirror: at least one upstream reads not ready, and the same rules
+/// [`classify_bracketed`] applies find nothing else wrong once the
+/// loading upstreams are set aside — the export policy read and
+/// unfiltered, every other upstream read, ready, with an epoch and in the
+/// same session as at the last check.
+///
+/// The second question the authority answers each check, for the one
+/// consumer that may act while the authority is still filling
+/// (vpp-offload's seeded fresh door, through
+/// [`packetframe_common::fib::AuthorityObservation::Loading`]). It cannot
+/// be read off the eligibility: that returns the first objection found,
+/// and a loading upstream is found before an epoch move, before an
+/// unreadable upstream, and (in the checker) before the mirror's own
+/// family and seed checks, all of which it would hide.
+///
+/// A loading upstream is set aside only once BOTH its readings answered
+/// and describe one session. Setting the bracket aside on its not-ready
+/// reading alone hid the other one: a read that failed, or an epoch that
+/// moved during the check, which is the same evidence a ready upstream is
+/// refused on (review finding, PR #375).
+///
+/// `prior_epochs` is the checker's `seen_epochs` as it stood before this
+/// check's [`classify_bracketed`] updated it, consumed here: the
+/// set-aside re-classification must compare against the previous check,
+/// not against the readings it is judging.
+pub fn loading_is_the_only_objection(
+    export: Result<ExportPolicy, String>,
+    brackets: &[UpstreamBracket],
+    mut prior_epochs: HashMap<IpAddr, u64>,
+) -> bool {
+    let not_ready = |r: &Result<UpstreamState, String>| matches!(r, Ok(s) if !s.ready());
+    let mut loading = 0usize;
+    let mut rest: Vec<UpstreamBracket> = Vec::new();
+    for b in brackets {
+        if !(not_ready(&b.before) || not_ready(&b.after)) {
+            rest.push(b.clone());
+            continue;
+        }
+        let (Ok(before), Ok(after)) = (&b.before, &b.after) else {
+            return false;
+        };
+        // An upstream not Established has no epoch yet, and one that came
+        // up during the check gains one: neither is a session moving. One
+        // that had an epoch and lost it went down during the check, and
+        // FRR may be withdrawing what it carried (review finding, PR #375).
+        match (before.established_epoch, after.established_epoch) {
+            (Some(e0), Some(e1)) if is_new_session(e0, e1) => return false,
+            (Some(_), None) => return false,
+            _ => {}
+        }
+        loading += 1;
+    }
+    loading > 0 && classify_bracketed(export, &rest, &mut prior_epochs) == Eligibility::Ok
+}
+
 /// Does the feed deliver a family no declared upstream carries?
 ///
 /// The two halves of the comparison must count the same thing. The
@@ -2325,6 +2427,219 @@ router bgp 65000
                 &mut seen,
             );
             assert!(not_ready(&e), "{e:?}");
+        }
+    }
+
+    /// What a check says about loading apart from eligibility: the GC
+    /// hold's [`upstreams_load`] and the fresh door's
+    /// [`loading_is_the_only_objection`].
+    mod loading {
+        use super::*;
+
+        const A: &str = "192.0.2.1";
+        const B: &str = "192.0.2.2";
+        const EPOCH: u64 = 1_790_000_000;
+
+        fn state(peer: &str, established: bool, eor: bool, epoch: Option<u64>) -> UpstreamState {
+            UpstreamState {
+                peer: peer.to_string(),
+                established,
+                missing_eor: if eor {
+                    vec![]
+                } else {
+                    vec![AuthorityFamily::V4]
+                },
+                established_epoch: epoch,
+            }
+        }
+
+        fn both(peer: &str, s: Result<UpstreamState, String>) -> UpstreamBracket {
+            UpstreamBracket {
+                peer: peer.parse().expect("ip"),
+                before: s.clone(),
+                after: s,
+            }
+        }
+
+        fn ready(peer: &str) -> UpstreamBracket {
+            both(peer, Ok(state(peer, true, true, Some(EPOCH))))
+        }
+
+        /// The reboot shape: Established and still filling. A session that
+        /// has not come up yet is the earlier half of the same load.
+        fn filling(peer: &str) -> UpstreamBracket {
+            both(peer, Ok(state(peer, true, false, Some(EPOCH))))
+        }
+
+        fn down(peer: &str) -> UpstreamBracket {
+            both(peer, Ok(state(peer, false, false, None)))
+        }
+
+        fn unreadable(peer: &str) -> UpstreamBracket {
+            both(peer, Err(format!("vtysh neighbor {peer}: timed out")))
+        }
+
+        fn only_objection(export: Result<ExportPolicy, String>, b: &[UpstreamBracket]) -> bool {
+            loading_is_the_only_objection(export, b, HashMap::new())
+        }
+
+        #[test]
+        fn every_upstream_ready_is_loaded() {
+            assert_eq!(
+                upstreams_load(&[ready(A), ready(B)]),
+                Ok(UpstreamsLoad::Loaded)
+            );
+        }
+
+        /// Not ready in EITHER reading is loading: one that lost its
+        /// End-of-RIB during the check is not loaded now, and one that
+        /// gained it during the check was not loaded when it began.
+        #[test]
+        fn not_ready_in_either_reading_is_loading() {
+            for (before, after) in [(false, true), (true, false)] {
+                let b = UpstreamBracket {
+                    peer: A.parse().expect("ip"),
+                    before: Ok(state(A, true, before, Some(EPOCH))),
+                    after: Ok(state(A, true, after, Some(EPOCH))),
+                };
+                assert!(
+                    matches!(upstreams_load(&[b]), Ok(UpstreamsLoad::Loading(_))),
+                    "before {before}, after {after}"
+                );
+            }
+            let l = upstreams_load(&[ready(A), down(B)]);
+            assert!(
+                matches!(&l, Ok(UpstreamsLoad::Loading(why)) if why.contains("not Established")),
+                "{l:?}"
+            );
+        }
+
+        /// A failed read establishes nothing when nothing answered
+        /// "loading", and hides nothing when something did.
+        #[test]
+        fn a_failed_read_is_no_reading_unless_another_shows_loading() {
+            assert!(upstreams_load(&[ready(A), unreadable(B)]).is_err());
+            assert!(matches!(
+                upstreams_load(&[unreadable(A), filling(B)]),
+                Ok(UpstreamsLoad::Loading(_))
+            ));
+        }
+
+        /// The reboot: every transit filling (or not yet up), nothing else
+        /// wrong.
+        #[test]
+        fn upstreams_filling_with_nothing_else_wrong_is_the_only_objection() {
+            let ok = Ok(ExportPolicy::Unfiltered);
+            assert!(only_objection(ok.clone(), &[filling(A), filling(B)]));
+            assert!(only_objection(ok.clone(), &[filling(A), down(B)]));
+            assert!(only_objection(ok, &[filling(A), ready(B)]));
+        }
+
+        /// Nothing loading is no loading objection, whatever else is right.
+        #[test]
+        fn nothing_loading_is_not_a_loading_objection() {
+            assert!(!only_objection(
+                Ok(ExportPolicy::Unfiltered),
+                &[ready(A), ready(B)]
+            ));
+        }
+
+        /// Every other objection the eligibility would have reported, had
+        /// the loading upstream not been found first.
+        #[test]
+        fn any_other_objection_is_not_hidden_behind_a_loading_one() {
+            let filtered = Ok(ExportPolicy::Filtered {
+                why: "neighbor 192.0.2.202 route-map OUT out".into(),
+            });
+            assert!(!only_objection(filtered, &[filling(A)]), "export filtered");
+            assert!(
+                !only_objection(Err("vtysh running-config: timed out".into()), &[filling(A)]),
+                "export unreadable"
+            );
+            assert!(
+                !only_objection(Ok(ExportPolicy::Unfiltered), &[filling(A), unreadable(B)]),
+                "another upstream unreadable"
+            );
+            assert!(
+                !only_objection(
+                    Ok(ExportPolicy::Unfiltered),
+                    &[filling(A), both(B, Ok(state(B, true, true, None)))]
+                ),
+                "a ready upstream with no epoch"
+            );
+            let moved = UpstreamBracket {
+                peer: B.parse().expect("ip"),
+                before: Ok(state(B, true, true, Some(EPOCH))),
+                after: Ok(state(B, true, true, Some(EPOCH + 600))),
+            };
+            assert!(
+                !only_objection(Ok(ExportPolicy::Unfiltered), &[filling(A), moved]),
+                "a ready upstream re-established during the check"
+            );
+        }
+
+        /// The loading upstream's own other reading counts too (review
+        /// finding, PR #375): one side not ready and the other unreadable
+        /// is a failed read, and a loading upstream whose session moved
+        /// during the check is a session that changed under it. A session
+        /// that came up during the check is neither.
+        #[test]
+        fn a_loading_upstreams_other_reading_is_not_hidden_either() {
+            let peer: IpAddr = A.parse().expect("ip");
+            let bracket = |before, after| UpstreamBracket {
+                peer,
+                before,
+                after,
+            };
+            let ok = || Ok(ExportPolicy::Unfiltered);
+            let timed_out = || Err::<UpstreamState, String>("vtysh neighbor: timed out".into());
+            let filling_at = |epoch| Ok(state(A, true, false, Some(epoch)));
+            for (b, why) in [
+                (bracket(filling_at(EPOCH), timed_out()), "unreadable after"),
+                (bracket(timed_out(), filling_at(EPOCH)), "unreadable before"),
+                (
+                    bracket(filling_at(EPOCH), filling_at(EPOCH + 600)),
+                    "re-established during the check",
+                ),
+                (
+                    bracket(filling_at(EPOCH), Ok(state(A, false, false, None))),
+                    "went down during the check",
+                ),
+            ] {
+                assert!(!only_objection(ok(), &[b, ready(B)]), "{why}");
+            }
+            let coming_up = bracket(
+                Ok(state(A, false, false, None)),
+                Ok(state(A, true, false, Some(EPOCH))),
+            );
+            assert!(
+                only_objection(ok(), &[coming_up, ready(B)]),
+                "a session that came up mid-check is still loading"
+            );
+            assert!(
+                only_objection(ok(), &[bracket(filling_at(EPOCH), filling_at(EPOCH - 1))]),
+                "epoch jitter within the tolerance is the same session"
+            );
+        }
+
+        /// The previous check's epochs are what a ready upstream is
+        /// compared against: one that re-established between checks is an
+        /// objection of its own.
+        #[test]
+        fn a_ready_upstream_that_moved_since_the_last_check_is_an_objection() {
+            let b: IpAddr = B.parse().expect("ip");
+            let prior = HashMap::from([(b, EPOCH - 600)]);
+            assert!(!loading_is_the_only_objection(
+                Ok(ExportPolicy::Unfiltered),
+                &[filling(A), ready(B)],
+                prior,
+            ));
+            let prior = HashMap::from([(b, EPOCH)]);
+            assert!(loading_is_the_only_objection(
+                Ok(ExportPolicy::Unfiltered),
+                &[filling(A), ready(B)],
+                prior,
+            ));
         }
     }
 }

@@ -99,14 +99,24 @@ pub struct Comparison {
     pub drift: Option<Drift>,
 }
 
+/// The declared upstreams' load as one readable check found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamsReading {
+    /// When the readings were complete.
+    pub at: Instant,
+    pub load: crate::fib::frr::UpstreamsLoad,
+}
+
 /// Snapshot of the most recent integrity-check result.
 ///
-/// Two readers, asking different questions. The BmpStalled gate wants
+/// Three readers, asking different questions. The BmpStalled gate wants
 /// `authority_established_peers` — "does bird still think there are peers to
 /// hear from?" — before it calls a quiet feed a stall. The health
-/// surface wants the comparison, via [`IntegrityPosture`]. Neither
-/// reads a field the other writes, which is why the counts live inside
-/// [`Comparison`] rather than loose alongside the peer count.
+/// surface wants the comparison, via [`IntegrityPosture`]. The BGP
+/// listener's seed GC hold wants `upstreams`: "has FRR finished learning
+/// its table?". None reads a field another writes, which is why the
+/// counts live inside [`Comparison`] rather than loose alongside the peer
+/// count.
 #[derive(Debug, Clone, Default)]
 pub struct IntegritySnapshot {
     /// The most recent run, whether or not it produced a comparison.
@@ -138,6 +148,11 @@ pub struct IntegritySnapshot {
     /// of every run, so it always describes `last_run` and never an
     /// older one.
     pub last_error: Option<String>,
+    /// The declared upstreams' load at the most recent check that could
+    /// read it. Only the FRR authority sets it. Retained across a check
+    /// whose upstream reads failed, like `last_comparison`, so its `at`
+    /// can be older than `last_run`: the reader ages it.
+    pub upstreams: Option<UpstreamsReading>,
 }
 
 /// A comparison as the health surface reads it: aged, and knowing
@@ -592,6 +607,7 @@ mod tests {
             last_error: None,
             authority: Some("bird"),
             revoked: None,
+            upstreams: None,
         }
     }
 
@@ -861,6 +877,7 @@ mod tests {
             last_error: Some("birdc show route count: spawn /usr/sbin/birdc: No such file".into()),
             authority: None,
             revoked: None,
+            upstreams: None,
         };
         let h = IntegrityPosture::observe(&snap, at + Duration::from_secs(4)).subsystem_health();
         assert_eq!(h.state, HealthState::Degraded);
@@ -888,6 +905,7 @@ mod tests {
             last_error: Some("programmer mirror_counts: channel closed".into()),
             authority: Some("bird"),
             revoked: None,
+            upstreams: None,
         };
         let p = IntegrityPosture::observe(&snap, compared_at + Duration::from_secs(305));
         match &p {

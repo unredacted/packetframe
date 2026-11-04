@@ -159,6 +159,12 @@ pub mod kind {
     /// `replaces`, `additions`, `allowance`); the diff waits for the route
     /// source's replay to go quiet instead.
     pub const SEEDED_DOOR_REFUSED: &str = "seeded_door_refused";
+    /// A fresh VPP's convergence stopped holding verify back: `door`
+    /// `authority` when the completeness authority confirmed the table,
+    /// `seeded` when the seeded fresh door let it go over a whole route
+    /// ledger seed while the authority's only objection was upstreams
+    /// still loading; `routes` the mirror then.
+    pub const FRESH_HOLD_RELEASED: &str = "fresh_hold_released";
 
     // --- fast-path ---
     /// `wan-egress` put back policy rules that had disappeared from the
@@ -175,6 +181,13 @@ pub mod kind {
     /// The route source's first completed initial dump after a seed
     /// garbage-collected what it did not re-advertise.
     pub const ROUTE_LEDGER_RECONCILED: &str = "route_ledger_reconciled";
+    /// The route source's End-of-RIB arrived over an unreconciled seed
+    /// while the FRR authority still read an upstream loading, so the GC
+    /// that reconciles the seed is held (`why`).
+    pub const ROUTE_LEDGER_GC_HELD: &str = "route_ledger_gc_held";
+    /// A held seed GC was let go (`trigger`: `upstreams-loaded`,
+    /// `max-age`, `authority-silent`; `held_secs`).
+    pub const ROUTE_LEDGER_GC_RELEASED: &str = "route_ledger_gc_released";
     /// The neighbour resolver exited or stopped making progress and the
     /// supervisor restarted it (`cause`: `stalled`, `failed`,
     /// `returned`; `detail` the reason).

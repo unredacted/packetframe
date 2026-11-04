@@ -96,8 +96,14 @@ use packetframe_common::module::{HealthState, SubsystemHealth};
 pub const LEDGER_FILE_NAME: &str = "fast-path-route-ledger.bin";
 
 /// Bump on any layout change. A record of another version is refused,
-/// which costs one cold reload and nothing else.
-pub const LEDGER_FORMAT_VERSION: u32 = 1;
+/// which costs one cold reload and nothing else. 2: the header carries
+/// [`LedgerMeta::attested_for`].
+pub const LEDGER_FORMAT_VERSION: u32 = 2;
+
+/// The layout 0.6.0 writes: version 2's without
+/// [`LedgerMeta::attested_for`]. Read as unattested, which is what it
+/// is, so the restart onto this build seeds rather than loading cold.
+const LEDGER_FORMAT_V1: u32 = 1;
 
 const MAGIC: &[u8; 8] = b"PFFIBLGR";
 
@@ -134,7 +140,7 @@ const fn route_max_bytes(addr_len: u64) -> u64 {
 }
 
 /// Everything but the routes, at its widest: magic, format version, the
-/// two strings at their `u16` limit, the two times, the four counts,
+/// three strings at their `u16` limit, the two times, the four counts,
 /// peer and nexthop tables at the NEXTHOPS map's size each (a BGP
 /// listener names one peer; a FIB cannot hold more nexthops than that
 /// map), and the checksum.
@@ -143,6 +149,7 @@ const HEADER_MAX_BYTES: u64 = 8
     + (2 + u16::MAX as u64)
     + 8
     + 8
+    + (2 + u16::MAX as u64)
     + (2 + u16::MAX as u64)
     + 16
     + 4
@@ -190,6 +197,28 @@ pub struct LedgerMeta {
     /// The age check reads this, so a stale route cannot be carried
     /// from ledger to ledger by restarts that never reconcile it.
     pub confirmed_at_unix: u64,
+    /// The authority the writer's attestation was made under
+    /// ([`packetframe_common::config::IntegrityAuthoritySpec::attestation_scope`]),
+    /// or empty when there was none: the writer's completeness authority
+    /// vouched for the mirror it wrote, its current word yes for a mirror
+    /// that size ([`packetframe_common::fib::TableCompleteness::attests`]).
+    ///
+    /// Nothing a start checks tells a whole table from part of one. A
+    /// clean stop during a cold load, or during the refill after a bgpd
+    /// restart's early End-of-RIB, writes the table it had, every route of
+    /// it confirmed. The seed is still worth having for the eBPF tier
+    /// (the replay fills the rest), so such a record seeds as any other;
+    /// this says whether it may also stand in for the authority's count
+    /// while the authority cannot count — vpp-offload's seeded fresh
+    /// door, which needs [`packetframe_common::fib::FeedLiveness::seed_whole`].
+    /// Empty with no authority and no second tier to publish to, and
+    /// whenever the authority's word was anything but yes at the stop.
+    ///
+    /// A scope rather than a flag, because what an attestation vouches for
+    /// depends on what the authority counted: one made with IPv4 upstreams
+    /// alone says nothing of an IPv6 table (review finding, PR #375). A
+    /// start honours it only under the same scope ([`RouteLedger::attested`]).
+    pub attested_for: String,
     /// [`packetframe_common::config::RouteSourceSpec::ledger_identity`]
     /// of the route source the advertisements came from.
     pub identity: String,
@@ -278,6 +307,7 @@ impl LedgerEncoder {
         put_str(&mut out, &meta.writer_version);
         out.extend_from_slice(&meta.written_at_unix.to_le_bytes());
         out.extend_from_slice(&meta.confirmed_at_unix.to_le_bytes());
+        put_str(&mut out, &meta.attested_for);
         put_str(&mut out, &meta.identity);
         for c in [counts.v4, counts.v6] {
             out.extend_from_slice(&c.prefixes.to_le_bytes());
@@ -447,6 +477,10 @@ pub fn encode(meta: &LedgerMeta, routes: &[LedgerRoute]) -> Result<Vec<u8>, Stri
 pub struct RouteLedger {
     pub meta: LedgerMeta,
     pub counts: LedgerCounts,
+    /// The start's reading of [`LedgerMeta::attested_for`]: it names the
+    /// authority this daemon runs. `false` from [`Self::decode`]; set by
+    /// [`judge`], which knows the configuration.
+    pub attested: bool,
     peers: Vec<PeerId>,
     nexthops: Vec<IpAddr>,
     bytes: Vec<u8>,
@@ -496,7 +530,7 @@ impl RouteLedger {
             at: MAGIC.len(),
         };
         let version = r.u32().map_err(corrupt)?;
-        if version != LEDGER_FORMAT_VERSION {
+        if version != LEDGER_FORMAT_VERSION && version != LEDGER_FORMAT_V1 {
             return Err(Refusal::FormatVersion { found: version });
         }
         // After the version, so a future layout is named as such rather
@@ -511,6 +545,11 @@ impl RouteLedger {
             let writer_version = r.string()?;
             let written_at_unix = r.u64()?;
             let confirmed_at_unix = r.u64()?;
+            let attested_for = if version == LEDGER_FORMAT_V1 {
+                String::new()
+            } else {
+                r.string()?
+            };
             let identity = r.string()?;
             let mut counts = LedgerCounts::default();
             for c in [&mut counts.v4, &mut counts.v6] {
@@ -540,6 +579,7 @@ impl RouteLedger {
                     writer_version,
                     written_at_unix,
                     confirmed_at_unix,
+                    attested_for,
                     identity,
                 },
                 counts,
@@ -552,6 +592,7 @@ impl RouteLedger {
         let mut ledger = Self {
             meta,
             counts,
+            attested: false,
             peers,
             nexthops,
             bytes: Vec::new(),
@@ -834,7 +875,8 @@ impl Refusal {
             ),
             Refusal::Corrupt(e) => format!("it is not an intact record: {e}"),
             Refusal::FormatVersion { found } => format!(
-                "it is format version {found} and this binary reads {LEDGER_FORMAT_VERSION}"
+                "it is format version {found} and this binary reads {LEDGER_FORMAT_V1} and \
+                 {LEDGER_FORMAT_VERSION}"
             ),
             Refusal::Identity {
                 recorded,
@@ -895,6 +937,10 @@ pub struct Expectations<'a> {
     /// BMP, whose peer ids are per-peer and only known once the stream
     /// names them.
     pub single_peer: Option<PeerId>,
+    /// The configured authority's
+    /// [`packetframe_common::config::IntegrityAuthoritySpec::attestation_scope`];
+    /// a record attested under any other is seeded unattested.
+    pub attestation_scope: Option<&'a str>,
     pub now_unix: u64,
 }
 
@@ -957,7 +1003,7 @@ pub fn judge(bytes: Vec<u8>, exp: &Expectations<'_>) -> Result<RouteLedger, Refu
     let Some(identity) = exp.identity else {
         return Err(Refusal::NoRouteSource);
     };
-    let ledger = RouteLedger::decode(bytes)?;
+    let mut ledger = RouteLedger::decode(bytes)?;
     if ledger.counts.prefixes() == 0 {
         // Intact, but no stop writes one: a mirror with nothing to
         // preserve preserves nothing.
@@ -1002,6 +1048,11 @@ pub fn judge(bytes: Vec<u8>, exp: &Expectations<'_>) -> Result<RouteLedger, Refu
             });
         }
     }
+    // Not a refusal: an attestation made under another authority says
+    // nothing about this one's table, but the routes seed the eBPF tier
+    // as well as ever.
+    ledger.attested = !ledger.meta.attested_for.is_empty()
+        && exp.attestation_scope == Some(ledger.meta.attested_for.as_str());
     Ok(ledger)
 }
 
@@ -1313,6 +1364,12 @@ pub struct SeedReport {
     pub writer_version: String,
     pub written_at_unix: u64,
     pub confirmed_at_unix: u64,
+    /// [`LedgerMeta::attested`].
+    pub attested: bool,
+    /// The `max-age` the ledger was judged against at this start. It
+    /// bounds the seed after the start too: a GC held over the seed
+    /// ([`GcHeld`]) is let go once the seed's oldest routes reach it.
+    pub max_age_secs: u64,
     pub counts: LedgerCounts,
     /// When the programmer finished applying it; `None` while it is.
     pub applied_at: Option<Instant>,
@@ -1333,9 +1390,34 @@ pub struct SeedReport {
     /// When the first `InitiationComplete` after the seed GC'd the rest,
     /// and how many advertisements that removed.
     pub reconciled: Option<(Instant, u64)>,
+    /// The route source's End-of-RIB has arrived, and the GC that would
+    /// reconcile the seed is being held for the authority's word. Set and
+    /// cleared by the BGP listener.
+    pub gc_held: Option<GcHeld>,
+}
+
+/// A GC the BGP listener is holding over an unreconciled seed: FRR sent
+/// End-of-RIB while an upstream it learns from was still loading, so its
+/// table, and everything it sent before the End-of-RIB, may be part of
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcHeld {
+    /// When the End-of-RIB arrived.
+    pub since: Instant,
+    /// What it is waiting for, as the latest look found it.
+    pub why: String,
 }
 
 impl SeedReport {
+    /// Wall-clock second at which the seed's oldest routes reach
+    /// `max-age`: the age a start would have refused it at, measured from
+    /// the same time [`judge`] measures it from.
+    pub fn expires_at_unix(&self) -> u64 {
+        self.confirmed_at_unix
+            .min(self.written_at_unix)
+            .saturating_add(self.max_age_secs)
+    }
+
     /// Whether a live session has spoken to the seed: its first route
     /// arrived, or its `InitiationComplete` reconciled the seed without
     /// one (see [`LedgerStatus::attestation_blocker`]).
@@ -1439,11 +1521,23 @@ impl LedgerStatus {
                         "; waiting for the route source's first route — forwarding on the seed, \
                          not attested to a second tier until then",
                     ),
-                    (Some(_), Some(_), None) => m.push_str(&format!(
-                        "; the route source is replaying: {} seeded advertisements not yet \
-                         re-advertised (removed at its InitiationComplete if never)",
-                        s.unconfirmed
-                    )),
+                    (Some(_), Some(_), None) => match &s.gc_held {
+                        None => m.push_str(&format!(
+                            "; the route source is replaying: {} seeded advertisements not yet \
+                             re-advertised (removed at its InitiationComplete if never)",
+                            s.unconfirmed
+                        )),
+                        Some(h) => m.push_str(&format!(
+                            "; the route source sent End-of-RIB {} ago with {} seeded \
+                             advertisements not re-advertised, and the GC that would remove them \
+                             is held: {}. It runs once the authority reads every upstream \
+                             loaded, or in {} at most (max-age)",
+                            human_secs(now.saturating_duration_since(h.since).as_secs()),
+                            s.unconfirmed,
+                            h.why,
+                            human_secs(s.expires_at_unix().saturating_sub(now_unix)),
+                        )),
+                    },
                 }
                 if s.failed > 0 {
                     m.push_str(&format!(
@@ -1699,6 +1793,7 @@ mod tests {
     const IDENTITY: &str = "bgp listen 192.0.2.1 port 179 local-as 64512 peer-as 64512 peer-ip any";
     const PEER: PeerId = PeerId(0x5eed_0000_0000_0001);
     const NOW: u64 = 1_790_000_000;
+    const SCOPE: &str = "frr 192.0.2.1=ipv4";
 
     fn tmpdir(tag: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1724,6 +1819,7 @@ mod tests {
             writer_version: "0.6.0".into(),
             written_at_unix: NOW - 120,
             confirmed_at_unix: NOW - 120,
+            attested_for: SCOPE.into(),
             identity: IDENTITY.into(),
         }
     }
@@ -1806,6 +1902,7 @@ mod tests {
             forwarding_mode: ForwardingMode::PacketframeFib,
             identity: Some(IDENTITY),
             single_peer: None,
+            attestation_scope: Some(SCOPE),
             now_unix: NOW,
         }
     }
@@ -1929,6 +2026,86 @@ mod tests {
                 found: LEDGER_FORMAT_VERSION + 1
             }
         );
+    }
+
+    /// A record in 0.6.0's layout: version 2's with no attestation in the
+    /// header.
+    fn encode_v1(meta: &LedgerMeta, routes: &[LedgerRoute]) -> Vec<u8> {
+        let m = LedgerMeta {
+            attested_for: String::new(),
+            ..meta.clone()
+        };
+        let mut bytes = encode(&m, routes).unwrap();
+        bytes[8..12].copy_from_slice(&LEDGER_FORMAT_V1.to_le_bytes());
+        // The empty string's two length bytes, after the writer version
+        // and the two times.
+        let at = 12 + 2 + m.writer_version.len() + 16;
+        assert_eq!(bytes[at..at + 2], [0, 0]);
+        bytes.drain(at..at + 2);
+        let body = bytes.len() - 8;
+        let sum = fnv1a(&bytes[..body]);
+        bytes[body..].copy_from_slice(&sum.to_le_bytes());
+        bytes
+    }
+
+    /// The layout 0.6.0 writes has no attestation in its header. It seeds
+    /// as an unattested record, whatever authority runs now, so the
+    /// restart onto this build does not load cold; nothing in it reads as
+    /// attested.
+    #[test]
+    fn a_version_1_record_seeds_unattested() {
+        let ledger = RouteLedger::decode(encode_v1(&meta(), &routes())).unwrap();
+        assert_eq!(
+            ledger.meta,
+            LedgerMeta {
+                attested_for: String::new(),
+                ..meta()
+            }
+        );
+        assert_eq!(ledger.routes().collect::<Vec<_>>(), routes());
+        let judged = judge(encode_v1(&meta(), &routes()), &expect()).expect("seeds");
+        assert!(!judged.attested);
+        assert_eq!(judged.routes().collect::<Vec<_>>(), routes());
+    }
+
+    /// The attestation's scope survives the trip, empty or not, and a
+    /// start honours it only under the same scope: no authority, another
+    /// authority, or the same one counting other upstreams or families all
+    /// seed the record unattested (review finding, PR #375). None of them
+    /// refuses it.
+    #[test]
+    fn an_attestation_counts_only_under_the_scope_it_was_made_in() {
+        for attested_for in [SCOPE, ""] {
+            let m = LedgerMeta {
+                attested_for: attested_for.into(),
+                ..meta()
+            };
+            let ledger = RouteLedger::decode(encode(&m, &routes()).unwrap()).unwrap();
+            assert_eq!(ledger.meta.attested_for, attested_for);
+            assert!(!ledger.attested, "decode alone attests nothing");
+        }
+        let judged = |attested_for: &str, scope: Option<&str>| {
+            let m = LedgerMeta {
+                attested_for: attested_for.into(),
+                ..meta()
+            };
+            let exp = Expectations {
+                attestation_scope: scope,
+                ..expect()
+            };
+            judge(encode(&m, &routes()).unwrap(), &exp)
+                .expect("seeds either way")
+                .attested
+        };
+        assert!(judged(SCOPE, Some(SCOPE)));
+        assert!(!judged("", Some(SCOPE)), "never attested");
+        assert!(!judged(SCOPE, None), "no authority now");
+        assert!(!judged(SCOPE, Some("birdc")), "another authority");
+        assert!(
+            !judged(SCOPE, Some("frr 192.0.2.1=ipv4 2001:db8::1=ipv6")),
+            "the same authority counting a family it did not"
+        );
+        assert!(!judged("", None), "an empty scope never matches");
     }
 
     /// A record that names a resolver peer is not one this writer could
@@ -2400,6 +2577,8 @@ mod tests {
             writer_version: "0.6.0".into(),
             written_at_unix: NOW - 120,
             confirmed_at_unix: NOW - 120,
+            attested: true,
+            max_age_secs: 1800,
             counts: LedgerCounts::default(),
             applied_at: None,
             apply_took: None,
@@ -2407,6 +2586,7 @@ mod tests {
             unconfirmed: 5,
             stream_started_at: None,
             reconciled: None,
+            gc_held: None,
         });
         assert!(st.attestation_blocker().is_some());
         assert!(st.awaiting_stream());
@@ -2432,6 +2612,8 @@ mod tests {
                 writer_version: "0.6.0".into(),
                 written_at_unix: NOW - 120,
                 confirmed_at_unix: NOW - 120,
+                attested: true,
+                max_age_secs: 1800,
                 counts: LedgerCounts::default(),
                 applied_at: Some(Instant::now()),
                 apply_took: None,
@@ -2439,6 +2621,7 @@ mod tests {
                 unconfirmed: 5,
                 stream_started_at: None,
                 reconciled: None,
+                gc_held: None,
             }),
         };
         assert!(st.attestation_blocker().is_some());
@@ -2479,6 +2662,8 @@ mod tests {
             writer_version: "0.6.0".into(),
             written_at_unix: NOW - 240,
             confirmed_at_unix: NOW - 240,
+            attested: true,
+            max_age_secs: 1800,
             counts: LedgerCounts {
                 v4: FamilyCounts {
                     prefixes: 1_100_000,
@@ -2495,6 +2680,7 @@ mod tests {
             unconfirmed: 900_000,
             stream_started_at: Some(now),
             reconciled: None,
+            gc_held: None,
         });
         let m = row(&st).message.unwrap();
         assert!(
