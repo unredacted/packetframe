@@ -2139,6 +2139,13 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
             );
             "kept"
         }
+        VppDetach::Nothing => {
+            tracing::info!(
+                "--keep-vpp with no vpp-offload configured and no VPP on record: nothing to \
+                 leave running; the route ledger and wan-egress rules stay for the next start"
+            );
+            "none"
+        }
         VppDetach::TearDown => {
             let r = detach_vpp_offload(&state_dir);
             let label = vpp_teardown_label(&r);
@@ -2308,8 +2315,11 @@ fn keep_vpp_preflight(config: Option<&Config>, state_dir: &Path) -> Result<(), S
 #[derive(Debug, PartialEq, Eq)]
 enum VppDetach {
     /// `--keep-vpp`: left running for the next start to adopt, whatever
-    /// `--all` or the config say.
+    /// `--all` says.
     Keep,
+    /// `--keep-vpp` on a config without the offload, which its preflight
+    /// lets through only with no VPP on record: nothing to leave running.
+    Nothing,
     TearDown,
     /// A scoped detach whose config does not declare the module.
     OutOfScope,
@@ -2317,8 +2327,10 @@ enum VppDetach {
 
 #[cfg(feature = "vpp-offload")]
 fn vpp_detach(all: bool, config_has_vpp: bool, keep_vpp: bool) -> VppDetach {
-    if keep_vpp {
+    if keep_vpp && config_has_vpp {
         VppDetach::Keep
+    } else if keep_vpp {
+        VppDetach::Nothing
     } else if all || config_has_vpp {
         VppDetach::TearDown
     } else {
@@ -2389,18 +2401,19 @@ mod keep_vpp_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `--keep-vpp` wins over both `--all` and a config that declares the
-    /// module — it exists for exactly the restart where both are true.
+    /// `--keep-vpp` wins over `--all` — it exists for exactly the restart
+    /// where both are true. Without the module in the config there is no
+    /// VPP to keep (its preflight passes only with none on record), and
+    /// nothing is said to be left running.
     #[test]
     fn keep_vpp_overrides_all_and_the_config() {
         for all in [false, true] {
-            for has in [false, true] {
-                assert_eq!(
-                    vpp_detach(all, has, true),
-                    VppDetach::Keep,
-                    "all={all} has={has}"
-                );
-            }
+            assert_eq!(vpp_detach(all, true, true), VppDetach::Keep, "all={all}");
+            assert_eq!(
+                vpp_detach(all, false, true),
+                VppDetach::Nothing,
+                "all={all}"
+            );
         }
         assert_eq!(vpp_detach(true, false, false), VppDetach::TearDown);
         assert_eq!(vpp_detach(false, true, false), VppDetach::TearDown);
