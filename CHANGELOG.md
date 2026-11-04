@@ -32,9 +32,14 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 ### Changes
 
+**fast-path**
+
+- With `integrity-authority frr`, the first GC after a route-ledger seed waits until every declared upstream has loaded (at most `max-age`), so an FRR End-of-RIB sent at `select-defer-time` no longer empties the seeded mirror after a reboot. The ledger is format version 2, recording whether the authority vouched for it, so the restart onto this release loads cold once. ([runbook](docs/runbooks/packetframe-fib.md#the-gc-after-a-seed-waits-for-frrs-upstreams), [#375](https://github.com/unredacted/packetframe/pull/375))
+
 **vpp-offload**
 
 - An adopted resync's release walks the table 16,384 routes a pass, so a steered VPP keeps being pinged every 500 ms instead of going about 4.9 s unpinged at 1.35M routes. ([runbook](docs/runbooks/vpp-offload.md#the-steered-diff-and-a-seeded-mirror), [#368](https://github.com/unredacted/packetframe/pull/368))
+- A fresh VPP over a whole route-ledger seed verifies and takes its first steer while the completeness authority waits only for upstreams to finish loading, rather than after their End-of-RIB (32.5 minutes after the 2026-10-30 reboot). ([runbook](docs/runbooks/vpp-offload.md#a-fresh-vpp-and-a-seeded-mirror), [#375](https://github.com/unredacted/packetframe/pull/375))
 
 ## [0.6.0] - 2026-10-13
 
