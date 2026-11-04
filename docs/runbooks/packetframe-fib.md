@@ -1272,7 +1272,8 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
   listen address and port, ASNs, peer pin, and the `peer-from` ACL when
   no pin names the speaker) and per-family counts.
 - **Whether the authority vouched for it, and which authority** (format
-  version 2). Attested when the stopping daemon's completeness authority
+  version 2; a version 1 record, written by 0.6.0, is read as
+  unattested). Attested when the stopping daemon's completeness authority
   (the one vpp-offload steers by) currently said yes for a mirror the
   size of the one written; the record then names that authority's scope:
   its kind and, for `frr`, every declared upstream with its families.
@@ -1326,7 +1327,7 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
    | `too-large` | Larger than the largest ledger a FIB at capacity could encode to (about 585 MB; a full table is ~19 MB). Judged from the file's size before a byte is read; removed unread |
    | `unremovable` | It could not be removed, so it cannot be consumed once. Status degrades; remove it by hand |
    | `corrupt` | Truncated, checksum mismatch, structurally wrong, empty, or naming a resolver peer id |
-   | `format-version` | Written by a build with another layout. Version 1, written by 0.6.0 and earlier, has no `attested` field, so the first restart onto a build that reads version 2 loads cold once |
+   | `format-version` | Written by a build with another layout. This build reads versions 1 and 2; version 1, written by 0.6.0, has no attestation and seeds unattested. A downgrade to 0.6.0 refuses version 2 and loads cold once |
    | `identity` | Written for a different route source (mode, address, port, ASNs or peer pin changed, or the `peer-from` ACL wherever no peer pin names the speaker: always for BMP, and for BGP without `peer-ip`). `router-id`, `anyip`, and the ACL under a `peer-ip` pin are not identity |
    | `too-old` | Its oldest routes were last confirmed longer ago than `max-age` (default 30 minutes) |
    | `clock` | Confirmed more than a minute in the future: the clock moved across the restart, so no age can be established |

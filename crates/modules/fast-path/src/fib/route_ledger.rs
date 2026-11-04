@@ -100,6 +100,11 @@ pub const LEDGER_FILE_NAME: &str = "fast-path-route-ledger.bin";
 /// [`LedgerMeta::attested_for`].
 pub const LEDGER_FORMAT_VERSION: u32 = 2;
 
+/// The layout 0.6.0 writes: version 2's without
+/// [`LedgerMeta::attested_for`]. Read as unattested, which is what it
+/// is, so the restart onto this build seeds rather than loading cold.
+const LEDGER_FORMAT_V1: u32 = 1;
+
 const MAGIC: &[u8; 8] = b"PFFIBLGR";
 
 /// How far in the future a write time may be before no age can be
@@ -525,7 +530,7 @@ impl RouteLedger {
             at: MAGIC.len(),
         };
         let version = r.u32().map_err(corrupt)?;
-        if version != LEDGER_FORMAT_VERSION {
+        if version != LEDGER_FORMAT_VERSION && version != LEDGER_FORMAT_V1 {
             return Err(Refusal::FormatVersion { found: version });
         }
         // After the version, so a future layout is named as such rather
@@ -540,7 +545,11 @@ impl RouteLedger {
             let writer_version = r.string()?;
             let written_at_unix = r.u64()?;
             let confirmed_at_unix = r.u64()?;
-            let attested_for = r.string()?;
+            let attested_for = if version == LEDGER_FORMAT_V1 {
+                String::new()
+            } else {
+                r.string()?
+            };
             let identity = r.string()?;
             let mut counts = LedgerCounts::default();
             for c in [&mut counts.v4, &mut counts.v6] {
@@ -866,7 +875,8 @@ impl Refusal {
             ),
             Refusal::Corrupt(e) => format!("it is not an intact record: {e}"),
             Refusal::FormatVersion { found } => format!(
-                "it is format version {found} and this binary reads {LEDGER_FORMAT_VERSION}"
+                "it is format version {found} and this binary reads {LEDGER_FORMAT_V1} and \
+                 {LEDGER_FORMAT_VERSION}"
             ),
             Refusal::Identity {
                 recorded,
@@ -2018,17 +2028,44 @@ mod tests {
         );
     }
 
-    /// The previous layout, which has no attestation in its header, is
-    /// another format: refused by name and costing one cold reload, never
-    /// read as if every record were attested or none were.
+    /// A record in 0.6.0's layout: version 2's with no attestation in the
+    /// header.
+    fn encode_v1(meta: &LedgerMeta, routes: &[LedgerRoute]) -> Vec<u8> {
+        let m = LedgerMeta {
+            attested_for: String::new(),
+            ..meta.clone()
+        };
+        let mut bytes = encode(&m, routes).unwrap();
+        bytes[8..12].copy_from_slice(&LEDGER_FORMAT_V1.to_le_bytes());
+        // The empty string's two length bytes, after the writer version
+        // and the two times.
+        let at = 12 + 2 + m.writer_version.len() + 16;
+        assert_eq!(bytes[at..at + 2], [0, 0]);
+        bytes.drain(at..at + 2);
+        let body = bytes.len() - 8;
+        let sum = fnv1a(&bytes[..body]);
+        bytes[body..].copy_from_slice(&sum.to_le_bytes());
+        bytes
+    }
+
+    /// The layout 0.6.0 writes has no attestation in its header. It seeds
+    /// as an unattested record, whatever authority runs now, so the
+    /// restart onto this build does not load cold; nothing in it reads as
+    /// attested.
     #[test]
-    fn a_version_1_record_is_refused_by_name() {
-        let mut bytes = encode(&meta(), &routes()).unwrap();
-        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    fn a_version_1_record_seeds_unattested() {
+        let ledger = RouteLedger::decode(encode_v1(&meta(), &routes())).unwrap();
         assert_eq!(
-            RouteLedger::decode(bytes).unwrap_err(),
-            Refusal::FormatVersion { found: 1 }
+            ledger.meta,
+            LedgerMeta {
+                attested_for: String::new(),
+                ..meta()
+            }
         );
+        assert_eq!(ledger.routes().collect::<Vec<_>>(), routes());
+        let judged = judge(encode_v1(&meta(), &routes()), &expect()).expect("seeds");
+        assert!(!judged.attested);
+        assert_eq!(judged.routes().collect::<Vec<_>>(), routes());
     }
 
     /// The attestation's scope survives the trip, empty or not, and a

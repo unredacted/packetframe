@@ -34,7 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **fast-path**
 
-- With `integrity-authority frr`, the first GC after a route-ledger seed waits until every declared upstream has loaded (at most `max-age`), so an FRR End-of-RIB sent at `select-defer-time` no longer empties the seeded mirror after a reboot. The ledger is format version 2, recording whether the authority vouched for it, so the restart onto this release loads cold once. ([runbook](docs/runbooks/packetframe-fib.md#the-gc-after-a-seed-waits-for-frrs-upstreams), [#375](https://github.com/unredacted/packetframe/pull/375))
+- With `integrity-authority frr`, the first GC after a route-ledger seed waits until every declared upstream has loaded (at most `max-age`), so an FRR End-of-RIB sent at `select-defer-time` no longer empties the seeded mirror after a reboot. The ledger is format version 2, recording whether the authority vouched for it; a 0.6.0 ledger still seeds, unattested. ([runbook](docs/runbooks/packetframe-fib.md#the-gc-after-a-seed-waits-for-frrs-upstreams), [#375](https://github.com/unredacted/packetframe/pull/375))
 
 **vpp-offload**
 
