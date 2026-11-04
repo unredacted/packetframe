@@ -894,6 +894,12 @@ pub fn upstreams_load(brackets: &[UpstreamBracket]) -> Result<UpstreamsLoad, Str
 /// unreadable upstream, and (in the checker) before the mirror's own
 /// family and seed checks, all of which it would hide.
 ///
+/// A loading upstream is set aside only once BOTH its readings answered
+/// and describe one session. Setting the bracket aside on its not-ready
+/// reading alone hid the other one: a read that failed, or an epoch that
+/// moved during the check, which is the same evidence a ready upstream is
+/// refused on (review finding, PR #375).
+///
 /// `prior_epochs` is the checker's `seen_epochs` as it stood before this
 /// check's [`classify_bracketed`] updated it, consumed here: the
 /// set-aside re-classification must compare against the previous check,
@@ -903,12 +909,27 @@ pub fn loading_is_the_only_objection(
     brackets: &[UpstreamBracket],
     mut prior_epochs: HashMap<IpAddr, u64>,
 ) -> bool {
-    let loading = |r: &Result<UpstreamState, String>| matches!(r, Ok(s) if !s.ready());
-    let (loading, rest): (Vec<UpstreamBracket>, Vec<UpstreamBracket>) = brackets
-        .iter()
-        .cloned()
-        .partition(|b| loading(&b.before) || loading(&b.after));
-    !loading.is_empty() && classify_bracketed(export, &rest, &mut prior_epochs) == Eligibility::Ok
+    let not_ready = |r: &Result<UpstreamState, String>| matches!(r, Ok(s) if !s.ready());
+    let mut loading = 0usize;
+    let mut rest: Vec<UpstreamBracket> = Vec::new();
+    for b in brackets {
+        if !(not_ready(&b.before) || not_ready(&b.after)) {
+            rest.push(b.clone());
+            continue;
+        }
+        let (Ok(before), Ok(after)) = (&b.before, &b.after) else {
+            return false;
+        };
+        // An upstream not Established has no epoch yet, and one that came
+        // up during the check gains one: neither is a session moving.
+        if let (Some(e0), Some(e1)) = (before.established_epoch, after.established_epoch) {
+            if is_new_session(e0, e1) {
+                return false;
+            }
+        }
+        loading += 1;
+    }
+    loading > 0 && classify_bracketed(export, &rest, &mut prior_epochs) == Eligibility::Ok
 }
 
 /// Does the feed deliver a family no declared upstream carries?
@@ -2552,6 +2573,46 @@ router bgp 65000
             assert!(
                 !only_objection(Ok(ExportPolicy::Unfiltered), &[filling(A), moved]),
                 "a ready upstream re-established during the check"
+            );
+        }
+
+        /// The loading upstream's own other reading counts too (review
+        /// finding, PR #375): one side not ready and the other unreadable
+        /// is a failed read, and a loading upstream whose session moved
+        /// during the check is a session that changed under it. A session
+        /// that came up during the check is neither.
+        #[test]
+        fn a_loading_upstreams_other_reading_is_not_hidden_either() {
+            let peer: IpAddr = A.parse().expect("ip");
+            let bracket = |before, after| UpstreamBracket {
+                peer,
+                before,
+                after,
+            };
+            let ok = || Ok(ExportPolicy::Unfiltered);
+            let timed_out = || Err::<UpstreamState, String>("vtysh neighbor: timed out".into());
+            let filling_at = |epoch| Ok(state(A, true, false, Some(epoch)));
+            for (b, why) in [
+                (bracket(filling_at(EPOCH), timed_out()), "unreadable after"),
+                (bracket(timed_out(), filling_at(EPOCH)), "unreadable before"),
+                (
+                    bracket(filling_at(EPOCH), filling_at(EPOCH + 600)),
+                    "re-established during the check",
+                ),
+            ] {
+                assert!(!only_objection(ok(), &[b, ready(B)]), "{why}");
+            }
+            let coming_up = bracket(
+                Ok(state(A, false, false, None)),
+                Ok(state(A, true, false, Some(EPOCH))),
+            );
+            assert!(
+                only_objection(ok(), &[coming_up, ready(B)]),
+                "a session that came up mid-check is still loading"
+            );
+            assert!(
+                only_objection(ok(), &[bracket(filling_at(EPOCH), filling_at(EPOCH - 1))]),
+                "epoch jitter within the tolerance is the same session"
             );
         }
 

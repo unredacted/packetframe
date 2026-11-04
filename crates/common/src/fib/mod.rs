@@ -893,6 +893,22 @@ impl FeedSession {
         );
     }
 
+    /// The first GC after the seed has run, whatever its outcome: clear
+    /// [`Self::MIRROR_SEEDED_BIT`] and [`Self::SEED_WHOLE_BIT`] without
+    /// claiming the epoch reconciled. Reported by the programmer as the GC
+    /// finishes, because the session owner's [`Self::mark_reconciled`]
+    /// follows only a dispatch that succeeded, and a GC whose recompute
+    /// failed has still removed every seeded route it was going to (review
+    /// finding, PR #375: a whole seed then outlived its GC on this word, and
+    /// a fresh VPP's seeded door read it as intact). An atomic AND, so it
+    /// cannot undo a concurrent raise or reconciliation.
+    pub fn mark_seed_ended(&self) {
+        self.state.fetch_and(
+            !(Self::MIRROR_SEEDED_BIT | Self::SEED_WHOLE_BIT),
+            std::sync::atomic::Ordering::AcqRel,
+        );
+    }
+
     /// Liveness, epoch and reconciliation as one observation. Prefer
     /// this wherever more than one is used — see [`FeedLiveness`].
     pub fn liveness(&self) -> FeedLiveness {
@@ -1468,6 +1484,27 @@ mod tests {
         assert!(
             !s.liveness().seed_whole,
             "a report arriving after the GC must not resurrect it"
+        );
+    }
+
+    /// A GC that ran but whose dispatch failed ends the seed without
+    /// reconciling the epoch: the seeded routes are gone either way, and
+    /// only a successful GC says the mirror is this session's.
+    #[test]
+    fn a_seed_ends_at_its_gc_even_unreconciled() {
+        let s = FeedSession::new();
+        s.mark_mirror_seeded();
+        s.mark_seed_whole();
+        s.set_up(true);
+        s.mark_seed_ended();
+        let seen = s.liveness();
+        assert!(
+            !seen.mirror_seeded && !seen.seed_whole && !seen.reconciled,
+            "{seen:?}"
+        );
+        assert!(
+            seen.up && seen.epoch == 1,
+            "the session is untouched: {seen:?}"
         );
     }
 

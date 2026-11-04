@@ -1728,6 +1728,15 @@ impl FibProgrammer {
             return;
         }
         self.seed_open = false;
+        // Told to the second tier HERE, whatever the GC's outcome, and not
+        // left to the session owner's `mark_reconciled`: that follows only
+        // a dispatch that succeeded, and a GC whose recompute failed has
+        // removed the seeded routes all the same. A whole seed reported
+        // past its GC is what a fresh VPP's seeded door would verify and
+        // steer on (review finding, PR #375).
+        if let Some(h) = &self.feed_session {
+            h.mark_seed_ended();
+        }
         // The reconciliation is itself proof that a live session spoke:
         // only a route source dispatches `InitiationComplete`, and only
         // after a stream of its own. A session whose only UPDATE was an

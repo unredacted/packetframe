@@ -4617,6 +4617,22 @@ fn only_an_attested_seed_applied_in_full_is_reported_whole() {
             status.lock().unwrap().seed.as_ref().map(|s| s.attested),
             Some(attested)
         );
+
+        // The first GC ends the seed on the second tier itself, with no
+        // session owner here to `mark_reconciled` (review finding, PR
+        // #375: a dispatch that fails skips that, and the seed outlived
+        // its GC).
+        h.run(async {
+            h.handle
+                .apply_route_event(RouteEvent::InitiationComplete)
+                .await
+                .expect("InitiationComplete")
+        });
+        let l = session.liveness();
+        assert!(
+            !l.mirror_seeded && !l.seed_whole && !l.reconciled,
+            "attested {attested}: {l:?}"
+        );
     }
 }
 
