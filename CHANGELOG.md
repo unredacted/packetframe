@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.2] - UNRELEASED
+
+### Changes
+
+**vpp-offload**
+
+- A neighbour that resolves after the routes through it have drained now hands them back to be installed, on a plain port as on a bridge; until now they stayed unresolvable until the route source changed each one, which held a fresh VPP's first steer for twenty minutes after a reboot. A route VPP already holds through the same paths is not re-sent. ([runbook](docs/runbooks/vpp-offload.md#packetframe_vpp_routesstateunresolvable--0), [#380](https://github.com/unredacted/packetframe/pull/380))
+
 ## [0.6.1] - 2026-11-04
 
 A point release on 0.6.0. A reboot, a restart or an FRR reload no longer throws away a route table FRR is still relearning: with `integrity-authority frr`, the GC at FRR's End-of-RIB waits for FRR's own upstreams, both after a route-ledger seed and after a reconnect, and a fresh VPP can take its first steer on a whole seed instead of waiting for every upstream. A box without vpp-offload now restarts onto its route ledger too. A 0.6.0 config and route ledger carry over unchanged.
