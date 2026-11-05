@@ -194,6 +194,15 @@ pub mod kind {
     /// supervisor restarted it (`cause`: `stalled`, `failed`,
     /// `returned`; `detail` the reason).
     pub const NEIGH_RESOLVER_RESTARTED: &str = "neigh_resolver_restarted";
+    /// A next hop carrying routes has been unresolved for 30 s
+    /// (`nexthop`, `routes`, `cause`, `waited_secs`, `reading`, what was
+    /// asked and what the resolver did with it, what the kernel reported,
+    /// `dev`, `link`). Once per unresolved stretch, at most 16 an hour,
+    /// those with the most routes first.
+    pub const NEXTHOP_RESOLVE_SLOW: &str = "nexthop_resolve_slow";
+    /// A next hop reported by [`NEXTHOP_RESOLVE_SLOW`] resolved: the same
+    /// fields over the whole stretch, and `resolved_dev`.
+    pub const NEXTHOP_RESOLVED_LATE: &str = "nexthop_resolved_late";
 
     // --- the event log itself (module `event-log`) ---
     pub const EVENTS_DROPPED: &str = "events_dropped";

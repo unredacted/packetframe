@@ -111,6 +111,7 @@ use crate::fib::neigh_supervision::{
     SupervisionTiming, DUMP_TIMEOUT, REQUEST_TIMEOUT,
 };
 use crate::fib::programmer::FibProgrammerHandle;
+use crate::fib::resolve_watch::{self, Probe, ProbeLog};
 
 /// Operator-declared local prefix (v0.2.1 connected fast-path). The
 /// resolver walks the kernel neighbour table for IPs falling in `cidr`
@@ -294,6 +295,10 @@ const CONFIRM_BUDGET: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 pub struct NeighborResolveHandle {
     resolve_tx: mpsc::Sender<IpAddr>,
+    /// What the resolver did with the requests it served, per unresolved
+    /// nexthop, for the programmer's slow-resolution events
+    /// ([`super::resolve_watch`]).
+    probes: ProbeLog,
 }
 
 impl NeighborResolveHandle {
@@ -301,10 +306,22 @@ impl NeighborResolveHandle {
     /// its queue. For harnesses that drive a `FibProgrammer` and want
     /// to observe *what* it asks to have resolved (and when) without
     /// running netlink; production always gets its handle from
-    /// [`NetlinkNeighborResolver::new`].
+    /// [`NetlinkNeighborResolver::new`]. Its [`ProbeLog`] is the
+    /// harness's to fill.
     pub fn detached() -> (Self, mpsc::Receiver<IpAddr>) {
         let (resolve_tx, resolve_rx) = mpsc::channel(RESOLVE_QUEUE_CAPACITY);
-        (Self { resolve_tx }, resolve_rx)
+        (
+            Self {
+                resolve_tx,
+                probes: ProbeLog::default(),
+            },
+            resolve_rx,
+        )
+    }
+
+    /// The resolver's per-nexthop account of the requests it served.
+    pub fn probe_log(&self) -> &ProbeLog {
+        &self.probes
     }
 
     /// Request proactive resolution of `ip`. Non-blocking. Returns
@@ -330,6 +347,8 @@ impl NeighborResolveHandle {
 pub struct NetlinkNeighborResolver {
     events_tx: mpsc::Sender<NeighEvent>,
     resolve_rx: mpsc::Receiver<IpAddr>,
+    /// Shared with the handle: what each served request did.
+    probes: ProbeLog,
     shutdown: CancellationToken,
     /// Diagnostic counters (Phase 3.9 debug). Logged periodically so
     /// the operator can see whether register_nexthop calls are
@@ -670,10 +689,12 @@ impl NetlinkNeighborResolver {
     ) -> (Self, mpsc::Receiver<NeighEvent>, NeighborResolveHandle) {
         let (events_tx, events_rx) = mpsc::channel(EVENTS_CAPACITY);
         let (resolve_tx, resolve_rx) = mpsc::channel(RESOLVE_QUEUE_CAPACITY);
+        let probes = ProbeLog::default();
         (
             Self {
                 events_tx,
                 resolve_rx,
+                probes: probes.clone(),
                 shutdown,
                 iface_mac: HashMap::new(),
                 iface_to_ifindex: HashMap::new(),
@@ -714,7 +735,7 @@ impl NetlinkNeighborResolver {
                 subscription: None,
             },
             events_rx,
-            NeighborResolveHandle { resolve_tx },
+            NeighborResolveHandle { resolve_tx, probes },
         )
     }
 
@@ -1156,12 +1177,14 @@ impl NetlinkNeighborResolver {
         // Best-effort proactive resolve. If the route lookup or neighbor
         // add fails, log at debug and fall back to first-packet kernel ARP.
         let Some(handle) = self.requester(Duration::ZERO).await else {
+            self.probes.record(ip, Probe::Skipped, Instant::now());
             self.probe_skipped(ip);
             return;
         };
         let ix_oifs = self.ix_oifs();
         let outcome = issue_proactive_resolve(&handle, ip, &ix_oifs).await;
         self.status.beat();
+        self.tally_probe(ip, outcome);
         match outcome {
             ProbeOutcome::Suppressed { oif } => {
                 let n = self.ix_probe_suppressed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1188,6 +1211,35 @@ impl NetlinkNeighborResolver {
             ProbeOutcome::TimedOut { stage } => self.request_timed_out(stage),
             ProbeOutcome::Failed | ProbeOutcome::NoRoute | ProbeOutcome::Unspecified => {}
         }
+    }
+
+    /// Count one served request in `ip`'s tally, with the egress it named
+    /// and that egress's carrier count, for the programmer's
+    /// slow-resolution events.
+    fn tally_probe(&self, ip: IpAddr, outcome: ProbeOutcome) {
+        let (probe, oif) = match outcome {
+            ProbeOutcome::Kicked { oif } => (Probe::Kicked, Some(oif)),
+            ProbeOutcome::Suppressed { oif } => (Probe::Suppressed, Some(oif)),
+            ProbeOutcome::TimedOut { .. } => (Probe::TimedOut, None),
+            ProbeOutcome::NoRoute => (Probe::NoRoute, None),
+            ProbeOutcome::Failed => (Probe::Failed, None),
+            ProbeOutcome::Unspecified => return,
+        };
+        self.probes.record(ip, probe, Instant::now());
+        if let Some(oif) = oif {
+            let dev = self.ifname(oif);
+            self.probes
+                .egress(ip, &dev, resolve_watch::carrier_changes(&dev));
+        }
+    }
+
+    /// The name of `ifindex`: from the link view, else from the kernel.
+    fn ifname(&self, ifindex: u32) -> String {
+        self.iface_to_ifindex
+            .iter()
+            .find(|(_, &i)| i == ifindex)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| resolve_watch::ifname(ifindex))
     }
 
     /// Housekeeping, every [`HOUSEKEEPING_EVERY`].
@@ -2230,7 +2282,7 @@ impl NetlinkNeighborResolver {
                     NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(n)) => {
                         return Some(Ok(n));
                     }
-                    NetlinkPayload::Error(e) => return Some(Err(e.code)),
+                    NetlinkPayload::Error(e) => return Some(Err(e.raw_code())),
                     _ => {}
                 }
             }
@@ -2238,6 +2290,24 @@ impl NetlinkNeighborResolver {
         })
         .await;
         self.status.beat();
+        // What the kernel holds right after the kick, for the tally: a
+        // solicitation in flight reads `incomplete`; `failed` or `no entry`
+        // here means the kick did not start one.
+        match &first {
+            Err(_) => self.probes.kernel_answer(ip, "timed out"),
+            Ok(Some(Ok(n))) => self
+                .probes
+                .kernel_answer(ip, resolve_watch::nud_name(u16::from(n.header.state))),
+            Ok(Some(Err(code))) => self.probes.kernel_answer(
+                ip,
+                match -code {
+                    libc::ENOENT => "no entry",
+                    libc::EOPNOTSUPP => "unsupported",
+                    _ => "error",
+                },
+            ),
+            Ok(None) => {}
+        }
         match first {
             Err(_) => self.request_timed_out("neighbour read-back"),
             Ok(Some(Ok(n))) => {

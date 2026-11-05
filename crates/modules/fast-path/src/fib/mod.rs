@@ -41,6 +41,11 @@ pub mod route_ledger;
 /// resolver that acts on them is `netlink_neigh`, Linux-gated below.
 pub mod neigh_supervision;
 
+/// Ungated for the same reason: what a slow next hop's events say, and
+/// which ones are reported, is pure, so it is tested on the macOS dev
+/// loop. The resolver and the programmer that feed it are Linux-gated.
+pub mod resolve_watch;
+
 #[cfg(target_os = "linux")]
 pub mod anyip;
 #[cfg(target_os = "linux")]
