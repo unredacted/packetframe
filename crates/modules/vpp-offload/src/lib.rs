@@ -2289,7 +2289,8 @@ mod tests {
         let map = cores::derive_core_map(&online, &[], workers).unwrap();
         assert_eq!(map.workers, vec![8, 9, 10, 11]);
         let sizing = startup_conf::derive_sizing(DEFAULT_EXPECTED_ROUTES, workers, false).unwrap();
-        let conf = startup_conf::render(&sizing, &map.workers, map.main, "/run/pf/api.sock", 0);
+        let conf =
+            startup_conf::render(&sizing, &map.workers, map.main, "/run/pf/api.sock", 0, None);
         assert!(conf.contains("main-core 7\n"), "{conf}");
         assert!(conf.contains("corelist-workers 8,9,10,11\n"), "{conf}");
         // And every worker the conf starts is one the plan places a

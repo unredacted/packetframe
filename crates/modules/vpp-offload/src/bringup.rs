@@ -1027,12 +1027,17 @@ fn finish(
         .api_socket
         .to_str()
         .ok_or_else(|| format!("API socket path {:?} is not UTF-8", paths.api_socket))?;
+    // Where a spawned VPP's output and core go, if `state-dir` gives a
+    // directory no other account can change; decided once, here, so the
+    // rendered `runtime-dir` and each spawn's output file agree.
+    let diagnostics_dir = crate::process::trusted_diagnostics_dir(&paths.sys.state_dir);
     let conf = startup_conf::render(
         sizing,
         &core_map.workers,
         core_map.main,
         api_socket,
         paths.sys.hugepage_bytes,
+        diagnostics_dir.as_deref().and_then(|d| d.to_str()),
     );
     for dir in [paths.startup_conf.parent(), paths.api_socket.parent()]
         .into_iter()
@@ -1549,6 +1554,12 @@ fn finish(
         }
         runtime.drift_accepts6(loop_accepts6);
         runtime.unresolvable_accepts6(loop_unresolvable_accepts6);
+        // What a VPP this loop spawns leaves behind, under `state-dir`,
+        // which outlives a reboot: `crate::process::DIAG_DIR_NAME`. None
+        // when attach did not trust it, and then VPP renders without it.
+        if let Some(dir) = &diagnostics_dir {
+            runtime.diagnostics_dir(dir.clone());
+        }
         // The kernel rx-mode kick — the AllmultiKick doc in `runtime`
         // carries the w6/w8 evidence. Installed unconditionally on
         // Linux: every member VF attach needs it, and the real
