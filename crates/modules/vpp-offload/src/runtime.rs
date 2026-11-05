@@ -597,6 +597,11 @@ struct Core {
     resources: Box<dyn ResourceRelease>,
     vpp_binary: PathBuf,
     startup_conf: PathBuf,
+    /// Where a spawned VPP's stdout and stderr go, one file per start,
+    /// and its working directory, so a core lands there too
+    /// ([`crate::process::DIAG_DIR_NAME`]). `None` (harnesses) leaves
+    /// both nowhere, as they were.
+    diagnostics_dir: Option<PathBuf>,
     /// Whether this convergence adopts interfaces VPP already has.
     /// Set by the attach wiring alongside the injected `Adopted` event;
     /// reset to `Fresh` once the process it described is gone.
@@ -2346,6 +2351,7 @@ impl Runtime {
                 resources,
                 vpp_binary: vpp_binary.into(),
                 startup_conf: startup_conf.into(),
+                diagnostics_dir: None,
                 attach_mode: crate::attach::AttachMode::Fresh,
                 pending: Vec::new(),
                 last_store_error: None,
@@ -2595,6 +2601,14 @@ impl Runtime {
     /// everything else keeps [`crate::kernel_path::NoKernelPath`].
     pub fn kernel_path(&self, k: Box<dyn crate::kernel_path::KernelPath>) {
         self.core.borrow_mut().kernel_path = k;
+    }
+
+    /// Keep what each VPP this runtime spawns leaves behind in `dir`: its
+    /// output, and a core, if it dumps one. See
+    /// [`crate::process::DIAG_DIR_NAME`]. The attach wiring passes a
+    /// directory under `state-dir`.
+    pub fn diagnostics_dir(&self, dir: PathBuf) {
+        self.core.borrow_mut().diagnostics_dir = Some(dir);
     }
 
     /// Point steering at a new set of ports and rules.
@@ -5488,7 +5502,8 @@ impl Effects for EffectsView {
             return Err("refusing to spawn: a supervised process already exists".into());
         }
         let (binary, conf) = (c.vpp_binary.clone(), c.startup_conf.clone());
-        let p = VppProcess::spawn(&binary, &conf).map_err(|e| format!("spawning VPP: {e}"))?;
+        let p = VppProcess::spawn_with(&binary, &conf, c.diagnostics_dir.as_deref())
+            .map_err(|e| format!("spawning VPP: {e}"))?;
 
         // The boot_id is not optional in spirit: `VppProcess::adopt`
         // refuses an identity without one (a `(pid, ticks)` pair is

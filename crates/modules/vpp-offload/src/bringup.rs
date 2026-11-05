@@ -1448,6 +1448,7 @@ fn finish(
             .map(|cp| cp.cpus.clone())
             .unwrap_or_default(),
     );
+    let diagnostics_dir = paths.sys.state_dir.join(crate::process::DIAG_DIR_NAME);
     let factory: LoopFactory = Box::new(move || {
         // What VPP can egress, for the exemption tripwire: the member
         // ports, the kernel bridges `local-route` and `local-route6`
@@ -1549,6 +1550,9 @@ fn finish(
         }
         runtime.drift_accepts6(loop_accepts6);
         runtime.unresolvable_accepts6(loop_unresolvable_accepts6);
+        // What a VPP this loop spawns leaves behind, under `state-dir`,
+        // which outlives a reboot: `crate::process::DIAG_DIR_NAME`.
+        runtime.diagnostics_dir(diagnostics_dir.clone());
         // The kernel rx-mode kick — the AllmultiKick doc in `runtime`
         // carries the w6/w8 evidence. Installed unconditionally on
         // Linux: every member VF attach needs it, and the real

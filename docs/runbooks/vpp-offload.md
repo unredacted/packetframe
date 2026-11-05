@@ -4126,6 +4126,46 @@ anything on current builds. The section after next covers it. If a loop
 like that still shows `event=ConvergenceFailed`, the step was
 *refused*, and the error text says by what.
 
+### VPP died of a signal: its output and its core
+
+A `vpp_teardown` with `cause: ProcessExited { status: None }` is a VPP
+killed by a signal: it has no exit code. The signal, and whether a core
+was dumped, come with a warning in the journal, and in a `vpp_killed`
+event (`signal`, `core_dumped`, `pid`, `output`):
+
+```
+VPP was killed by a signal; its last output is in the file named ...   signal=SIGABRT core_dumped=true output=/<state-dir>/vpp-diag/vpp-1793851726.log
+```
+
+Every VPP the daemon spawns runs in `<state-dir>/vpp-diag/`, with its
+stdout and stderr in `vpp-<unix seconds>.log` there, one file per
+start. `state-dir` survives a reboot; the journal on a UniFi gateway
+does not, and rotates within minutes under boot load. A spawn keeps the
+newest five output files and the newest two cores and removes older
+ones. The directory and files are owner-only.
+
+- **Read the output file first.** VPP prints a panic, a failed assertion
+  or an allocation failure (`clib_panic`, `os_panic`, out of memory) to
+  stderr before it aborts, so the last lines of the file usually say
+  why. Its fatal-signal handler logs `received signal …, PC …` and a
+  backtrace (`#0 0x… <function> + 0x…`) to syslog, and VPP opens syslog
+  with `LOG_PERROR`, so those lines are in the file too.
+- **The core.** The rendered `unix` stanza has `coredump-size
+  unlimited`, which raises VPP's own core limit (a service's is usually
+  0), and no `full-coredump`, so the core leaves out the hugepage-backed
+  heap: hundreds of megabytes with every thread's stack, not gigabytes.
+  Where it lands is the kernel's: `cat /proc/sys/kernel/core_pattern`.
+  A relative pattern (`core`, `core.%p`) puts it in `vpp-diag/`, where
+  the pruning keeps two. A piped one (`|/usr/lib/systemd/systemd-coredump
+  …`) hands it to that program instead. Read it with the VPP build's
+  binary and libraries: `gdb /usr/bin/vpp <core>` then `thread apply
+  all bt`.
+- VPP's own log is unchanged, at `/var/log/packetframe/vpp.log`.
+
+Up to 0.6.1 stdout and stderr went to `/dev/null` and no core could be
+written. A fresh VPP that died twice with SIGABRT while syncing under
+boot load (2026-10-30 and 2026-11-05) left only `status: None` behind.
+
 ### A teardown with `cause=Wedged`
 
 The wedge detector decided VPP had stopped answering its binary API:
