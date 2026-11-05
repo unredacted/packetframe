@@ -34,7 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **vpp-offload**
 
-- A VPP the daemon spawns runs in `<state-dir>/vpp-diag/` with its stdout and stderr in a file per start, may dump a core there (`coredump-size unlimited`, no hugepage heap), and a death by signal is reported by name with whether it dumped core (`vpp_killed`); a fresh VPP that crashed under boot load left nothing behind until now. ([runbook](docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core), [#381](https://github.com/unredacted/packetframe/pull/381))
+- A VPP the daemon spawns keeps its stdout and stderr in `<state-dir>/vpp-diag/`, one file per start, and its runtime directory is there too, so a core can land there (`coredump-size unlimited`, with a core filter that leaves out the hugepage heap). This happens only when no other account can change that path. A death by signal is reported (`vpp_killed`): the signal VPP died of, the fault its own handler logged (`vpp_signal`), and whether it dumped core. Until now, a fresh VPP that crashed under boot load left nothing behind. ([runbook](docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core), [#381](https://github.com/unredacted/packetframe/pull/381))
 
 ## [0.6.1] - 2026-11-04
 

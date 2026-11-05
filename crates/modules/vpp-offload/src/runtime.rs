@@ -597,10 +597,11 @@ struct Core {
     resources: Box<dyn ResourceRelease>,
     vpp_binary: PathBuf,
     startup_conf: PathBuf,
-    /// Where a spawned VPP's stdout and stderr go, one file per start,
-    /// and its working directory, so a core lands there too
-    /// ([`crate::process::DIAG_DIR_NAME`]). `None` (harnesses) leaves
-    /// both nowhere, as they were.
+    /// Where a spawned VPP's stdout and stderr go, one file per start
+    /// ([`crate::process::DIAG_DIR_NAME`]); the rendered `runtime-dir`
+    /// names the same directory, so a core lands there too. `None`
+    /// (harnesses, or a `state-dir` attach did not trust) sends the
+    /// output nowhere, as before.
     diagnostics_dir: Option<PathBuf>,
     /// Whether this convergence adopts interfaces VPP already has.
     /// Set by the attach wiring alongside the injected `Adopted` event;
@@ -2603,10 +2604,10 @@ impl Runtime {
         self.core.borrow_mut().kernel_path = k;
     }
 
-    /// Keep what each VPP this runtime spawns leaves behind in `dir`: its
-    /// output, and a core, if it dumps one. See
-    /// [`crate::process::DIAG_DIR_NAME`]. The attach wiring passes a
-    /// directory under `state-dir`.
+    /// Keep each spawned VPP's output in `dir`. See
+    /// [`crate::process::DIAG_DIR_NAME`]. The attach wiring passes the
+    /// directory under `state-dir` it rendered as VPP's `runtime-dir`,
+    /// when [`crate::process::trusted_diagnostics_dir`] accepted it.
     pub fn diagnostics_dir(&self, dir: PathBuf) {
         self.core.borrow_mut().diagnostics_dir = Some(dir);
     }
