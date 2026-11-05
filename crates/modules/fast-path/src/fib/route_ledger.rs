@@ -1339,11 +1339,30 @@ pub fn shared_status() -> SharedLedgerStatus {
     Arc::new(Mutex::new(LedgerStatus::default()))
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LedgerStatus {
     pub start: StartReport,
     /// Set when the start accepted a ledger.
     pub seed: Option<SeedReport>,
+    /// The `route-ledger max-age` in force: set at attach and on reload,
+    /// whether the ledger is on or off. It bounds a GC held over routes
+    /// an earlier session left ([`GcHeld`]), as it bounds a seed.
+    pub max_age_secs: u64,
+    /// The route source's End-of-RIB has arrived, and the GC that would
+    /// remove what it did not re-send is being held for the authority's
+    /// word. Set and cleared by the BGP listener.
+    pub gc_held: Option<GcHeld>,
+}
+
+impl Default for LedgerStatus {
+    fn default() -> Self {
+        Self {
+            start: StartReport::default(),
+            seed: None,
+            max_age_secs: packetframe_common::config::RouteLedgerSpec::default().max_age_secs,
+            gc_held: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1390,13 +1409,10 @@ pub struct SeedReport {
     /// When the first `InitiationComplete` after the seed GC'd the rest,
     /// and how many advertisements that removed.
     pub reconciled: Option<(Instant, u64)>,
-    /// The route source's End-of-RIB has arrived, and the GC that would
-    /// reconcile the seed is being held for the authority's word. Set and
-    /// cleared by the BGP listener.
-    pub gc_held: Option<GcHeld>,
 }
 
-/// A GC the BGP listener is holding over an unreconciled seed: FRR sent
+/// A GC the BGP listener is holding over routes from before this session
+/// (an unreconciled seed, or what an earlier session sent): FRR sent
 /// End-of-RIB while an upstream it learns from was still loading, so its
 /// table, and everything it sent before the End-of-RIB, may be part of
 /// one.
@@ -1406,6 +1422,30 @@ pub struct GcHeld {
     pub since: Instant,
     /// What it is waiting for, as the latest look found it.
     pub why: String,
+    pub over: HeldOver,
+    /// Wall-clock second at which it runs anyway: the routes it would
+    /// remove reach `max-age`.
+    pub expires_at_unix: u64,
+}
+
+/// Whose routes a held GC would remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldOver {
+    /// A route-ledger seed's, not yet reconciled.
+    Seed,
+    /// An earlier session's of this process, which no GC has reconciled
+    /// since it ended: a reconnect, typically after a bgpd restart.
+    EarlierSession,
+}
+
+impl HeldOver {
+    /// As the `feed_gc_held` event's `over` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeldOver::Seed => "seed",
+            HeldOver::EarlierSession => "earlier-session",
+        }
+    }
 }
 
 impl SeedReport {
@@ -1521,7 +1561,7 @@ impl LedgerStatus {
                         "; waiting for the route source's first route — forwarding on the seed, \
                          not attested to a second tier until then",
                     ),
-                    (Some(_), Some(_), None) => match &s.gc_held {
+                    (Some(_), Some(_), None) => match self.gc_held_over(HeldOver::Seed) {
                         None => m.push_str(&format!(
                             "; the route source is replaying: {} seeded advertisements not yet \
                              re-advertised (removed at its InitiationComplete if never)",
@@ -1535,7 +1575,7 @@ impl LedgerStatus {
                             human_secs(now.saturating_duration_since(h.since).as_secs()),
                             s.unconfirmed,
                             h.why,
-                            human_secs(s.expires_at_unix().saturating_sub(now_unix)),
+                            human_secs(h.expires_at_unix.saturating_sub(now_unix)),
                         )),
                     },
                 }
@@ -1555,12 +1595,28 @@ impl LedgerStatus {
                 )
             }
         };
+        let mut message = message;
+        if let Some(h) = self.gc_held_over(HeldOver::EarlierSession) {
+            message.push_str(&format!(
+                "; the route source reconnected and sent End-of-RIB {} ago, and the GC that \
+                 would remove what the earlier session sent and this one has not is held: {}. It \
+                 runs once the authority reads every upstream loaded, or in {} at most (max-age)",
+                human_secs(now.saturating_duration_since(h.since).as_secs()),
+                h.why,
+                human_secs(h.expires_at_unix.saturating_sub(now_unix)),
+            ));
+        }
         SubsystemHealth {
             name: SUBSYS_ROUTE_LEDGER.to_string(),
             state,
             message: Some(message),
             last_success_age_seconds: None,
         }
+    }
+
+    /// The held GC, if it is held over `over`'s routes.
+    fn gc_held_over(&self, over: HeldOver) -> Option<&GcHeld> {
+        self.gc_held.as_ref().filter(|h| h.over == over)
     }
 
     /// Textfile gauges.
@@ -2586,7 +2642,6 @@ mod tests {
             unconfirmed: 5,
             stream_started_at: None,
             reconciled: None,
-            gc_held: None,
         });
         assert!(st.attestation_blocker().is_some());
         assert!(st.awaiting_stream());
@@ -2621,8 +2676,8 @@ mod tests {
                 unconfirmed: 5,
                 stream_started_at: None,
                 reconciled: None,
-                gc_held: None,
             }),
+            ..LedgerStatus::default()
         };
         assert!(st.attestation_blocker().is_some());
         let s = st.seed.as_mut().unwrap();
@@ -2645,7 +2700,7 @@ mod tests {
                 code: "too-old",
                 detail: "old".into(),
             },
-            seed: None,
+            ..LedgerStatus::default()
         };
         let r = row(&st);
         assert_eq!(r.name, SUBSYS_ROUTE_LEDGER);
@@ -2680,7 +2735,6 @@ mod tests {
             unconfirmed: 900_000,
             stream_started_at: Some(now),
             reconciled: None,
-            gc_held: None,
         });
         let m = row(&st).message.unwrap();
         assert!(
@@ -2699,6 +2753,61 @@ mod tests {
         ));
         assert!(
             out.contains("packetframe_fib_route_ledger_unconfirmed{module=\"fast-path\"} 900000")
+        );
+    }
+
+    /// A held GC is on the row in the clause for whose routes it holds:
+    /// a seed's inside the seed's, an earlier session's after whatever
+    /// the start did with the ledger, `off` included. Each counts down to
+    /// its own `max-age`, and neither is a fault.
+    #[test]
+    fn the_row_reports_a_held_gc_where_it_belongs() {
+        let since = Instant::now();
+        let now = since + Duration::from_secs(90);
+        let held = |over| GcHeld {
+            since,
+            why: "upstream 192.0.2.1 is Established but has not sent End-of-RIB for ipv4".into(),
+            over,
+            expires_at_unix: NOW + 600,
+        };
+        let mut st = LedgerStatus {
+            start: StartReport::Off,
+            gc_held: Some(held(HeldOver::EarlierSession)),
+            ..LedgerStatus::default()
+        };
+        let r = st.subsystem_health(NOW, now);
+        assert_eq!(r.state, HealthState::Healthy);
+        let m = r.message.unwrap();
+        assert!(m.starts_with("off (`route-ledger off`)"), "{m}");
+        assert!(
+            m.contains("reconnected and sent End-of-RIB 1m30s ago")
+                && m.contains("End-of-RIB for ipv4")
+                && m.contains("in 10m00s at most (max-age)"),
+            "{m}"
+        );
+
+        st.start = StartReport::Seeded;
+        st.seed = Some(SeedReport {
+            writer_version: "0.6.0".into(),
+            written_at_unix: NOW - 240,
+            confirmed_at_unix: NOW - 240,
+            attested: true,
+            max_age_secs: 1800,
+            counts: LedgerCounts::default(),
+            applied_at: Some(since),
+            apply_took: None,
+            failed: 0,
+            unconfirmed: 7,
+            stream_started_at: Some(since),
+            reconciled: None,
+        });
+        st.gc_held = Some(held(HeldOver::Seed));
+        let m = st.subsystem_health(NOW, now).message.unwrap();
+        assert!(
+            m.contains("sent End-of-RIB 1m30s ago with 7 seeded advertisements")
+                && m.contains("in 10m00s at most (max-age)")
+                && !m.contains("reconnected"),
+            "{m}"
         );
     }
 

@@ -835,8 +835,9 @@ pub fn classify_bracketed(
 /// Whether the declared upstreams have finished loading, from one
 /// check's two readings of each, apart from eligibility as a whole.
 ///
-/// What the stale-route GC after a route-ledger seed waits for
-/// (`route_source_bgp`'s seed GC hold): FRR's own table is complete only
+/// What the stale-route GC over earlier routes waits for, after a
+/// route-ledger seed or a reconnect (`route_source_bgp`'s GC hold): FRR's
+/// own table is complete only
 /// once every upstream it learns from has delivered its whole table, and
 /// before that FRR's End-of-RIB to packetframe can describe a table still
 /// arriving. Only readiness counts here. The export policy, epochs and

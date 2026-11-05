@@ -1679,7 +1679,6 @@ impl FibProgrammer {
                 unconfirmed: self.unseen_session,
                 stream_started_at: None,
                 reconciled: None,
-                gc_held: None,
             });
         }
     }

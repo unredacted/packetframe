@@ -102,7 +102,7 @@ pub struct Comparison {
 /// The declared upstreams' load as one readable check found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamsReading {
-    /// When the readings were complete.
+    /// When the first of the readings began.
     pub at: Instant,
     pub load: crate::fib::frr::UpstreamsLoad,
 }
@@ -113,8 +113,8 @@ pub struct UpstreamsReading {
 /// `authority_established_peers` — "does bird still think there are peers to
 /// hear from?" — before it calls a quiet feed a stall. The health
 /// surface wants the comparison, via [`IntegrityPosture`]. The BGP
-/// listener's seed GC hold wants `upstreams`: "has FRR finished learning
-/// its table?". None reads a field another writes, which is why the
+/// listener's GC hold wants `upstreams`: "has FRR finished learning its
+/// table?". None reads a field another writes, which is why the
 /// counts live inside [`Comparison`] rather than loose alongside the peer
 /// count.
 #[derive(Debug, Clone, Default)]

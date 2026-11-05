@@ -1274,8 +1274,8 @@ withheld or installing route counted against the first steer, and a
 verify that covers the table.
 
 **What it relies on.** The fast-path holds the route source's first GC
-over the seed until the authority reads every upstream loaded ([the GC
-after a seed](packetframe-fib.md#the-gc-after-a-seed-waits-for-frrs-upstreams)).
+over the seed until the authority reads every upstream loaded ([the held
+GC](packetframe-fib.md#the-gc-over-earlier-routes-waits-for-frrs-upstreams)).
 Without that hold, FRR's End-of-RIB at `select-defer-time` (360 s
 after bgpd starts, in restart mode) would remove every seeded route the
 replay had not reached yet, from the mirror and from a VPP this door had
@@ -1310,8 +1310,8 @@ steering UP: allowlisted traffic is now diverted to VPP ...
 
 The event log reads `route_ledger_seeded` (`attested: true`) →
 `fresh_hold_released` (`door: seeded`) → `verify_passed` → `steering_up`,
-with the fast-path's `route_ledger_gc_held` wherever FRR's early
-End-of-RIB lands among them, and later `route_ledger_gc_released`
+with the fast-path's `feed_gc_held` (`over: seed`) wherever FRR's early
+End-of-RIB lands among them, and later `feed_gc_released`
 (`trigger: upstreams-loaded`) → `route_ledger_reconciled`. The authority's own release records
 `fresh_hold_released` with `door: authority`.
 

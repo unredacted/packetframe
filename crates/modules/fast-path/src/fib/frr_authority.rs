@@ -228,6 +228,18 @@ pub struct FrrAuthorityChecker {
     /// revocation is sticky and an interval of it would hold a second
     /// tier's first steer for nothing.
     seed_blocked_last: bool,
+    /// Requests for a check now: the BGP listener holding a GC for a
+    /// reading of the upstreams taken in its session
+    /// ([`crate::fib::route_source_bgp::FeedGcHold`]).
+    check_requests: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// Resolves when a check is requested; never without a handle.
+async fn requested(requests: Option<&tokio::sync::Notify>) {
+    match requests {
+        Some(n) => n.notified().await,
+        None => std::future::pending().await,
+    }
 }
 
 impl FrrAuthorityChecker {
@@ -265,6 +277,7 @@ impl FrrAuthorityChecker {
             deadline: tokio::time::Instant::now(),
             ledger_status: None,
             seed_blocked_last: false,
+            check_requests: None,
         }
     }
 
@@ -282,6 +295,12 @@ impl FrrAuthorityChecker {
     /// modules.
     pub fn with_completeness(mut self, handle: Arc<TableCompleteness>) -> Self {
         self.completeness = Some(handle);
+        self
+    }
+
+    /// Check as soon as asked, as well as at the interval — see the field.
+    pub fn with_check_requests(mut self, requests: Arc<tokio::sync::Notify>) -> Self {
+        self.check_requests = Some(requests);
         self
     }
 
@@ -319,6 +338,9 @@ impl FrrAuthorityChecker {
                 _ = tokio::time::sleep(delay) => {}
                 _ = crate::fib::route_ledger::stream_started(self.ledger_status.clone()), if early => {
                     debug!("FRR authority: the route source started streaming after a ledger seed; checking now");
+                }
+                _ = requested(self.check_requests.as_deref()) => {
+                    debug!("FRR authority: a held GC asked for a reading of the upstreams; checking now");
                 }
             }
             // The check races shutdown too. With a 30 s subprocess
@@ -445,8 +467,8 @@ impl FrrAuthorityChecker {
         let mut snap = self.snapshot.write().await;
         snap.last_run = Some(at);
         snap.last_error = None;
-        // Retained when this check could not read it: the seed GC hold
-        // ages it rather than mistaking a failed read for a verdict.
+        // Retained when this check could not read it: the GC hold ages
+        // it rather than mistaking a failed read for a verdict.
         if let Some(load) = load {
             snap.upstreams = Some(load);
         }
@@ -657,6 +679,10 @@ impl FrrAuthorityChecker {
     /// brackets the eligibility was, so the three cannot describe
     /// different moments.
     async fn eligibility(&mut self) -> Readings {
+        // A reading is stamped when it began, not when it ended: the GC
+        // hold counts it for a session only if all of it was read after
+        // the session began.
+        let began = Instant::now();
         let before = self.upstreams().await;
         let export = self.export_policy().await;
         let after = self.upstreams().await;
@@ -671,10 +697,9 @@ impl FrrAuthorityChecker {
                 after,
             })
             .collect();
-        let load = upstreams_load(&brackets).ok().map(|load| UpstreamsReading {
-            at: Instant::now(),
-            load,
-        });
+        let load = upstreams_load(&brackets)
+            .ok()
+            .map(|load| UpstreamsReading { at: began, load });
         let prior_epochs = self.seen_epochs.clone();
         let eligibility = classify_bracketed(export.clone(), &brackets, &mut self.seen_epochs);
         Readings {
@@ -938,6 +963,48 @@ mod tests {
         (checker, handle, snapshot)
     }
 
+    /// A held GC's request is answered with a check at once, not at the
+    /// interval (five minutes here), and the reading it publishes is
+    /// stamped no earlier than the request.
+    #[tokio::test]
+    async fn a_requested_check_runs_before_the_interval() {
+        let vtysh = Arc::new(Scripted::default());
+        let (prog, _log) = recording_handle();
+        let snapshot = shared_snapshot();
+        let requests = Arc::new(tokio::sync::Notify::new());
+        let shutdown = CancellationToken::new();
+        let checker = FrrAuthorityChecker::with_vtysh(
+            config(),
+            vtysh.clone(),
+            snapshot.clone(),
+            prog,
+            shutdown.clone(),
+        )
+        .with_check_requests(requests.clone());
+        let running = tokio::spawn(checker.run());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            vtysh.calls.lock().expect("calls").is_empty(),
+            "no check before the interval or a request"
+        );
+        assert!(snapshot.read().await.upstreams.is_none());
+
+        let asked = Instant::now();
+        requests.notify_one();
+        let deadline = asked + Duration::from_secs(5);
+        let reading = loop {
+            if let Some(r) = snapshot.read().await.upstreams.clone() {
+                break r;
+            }
+            assert!(Instant::now() < deadline, "the requested check never ran");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(reading.at >= asked, "{reading:?}");
+        assert_eq!(reading.load, crate::fib::frr::UpstreamsLoad::Loaded);
+        shutdown.cancel();
+        running.await.expect("join");
+    }
+
     /// A timed-out count is an observation failure: the previous report
     /// stands exactly as it was — same sample, same `at` — nothing is
     /// revoked, and the loop is told to retry early. The longer budget
@@ -1186,7 +1253,6 @@ mod tests {
                 unconfirmed: 10,
                 stream_started_at: None,
                 reconciled: None,
-                gc_held: None,
             });
         }
         let mut checker = FrrAuthorityChecker::with_vtysh(
