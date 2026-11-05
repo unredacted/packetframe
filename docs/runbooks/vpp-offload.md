@@ -3890,7 +3890,21 @@ reason is the mapping's own decision:
 | `bridge neighbour …` | the FDB has not placed it behind a member, or it is behind a non-member or a tagged VLAN with no BVI | see [bridge neighbours](#bridge-neighbours-placed-per-neighbour-from-the-fdb) |
 | `… and IPv6 has no steer-exempt, so diverted traffic for it would be dropped in VPP …` | a v6 route via the router outside its subnets and addresses; never left to the kernel (shape 3 is v4 only) | the feed, a `steer-keep6`, or dropping `v6-divert`; for your own announced aggregate with no kernel route, [`unresolvable-accept6`](#accepting-an-unresolvable-ipv6-route-unresolvable-accept6) |
 | `the router's own address, which VPP has no adjacency for; …` | every next hop is the router, and none of the kernel-delivered shapes held. The rest of the reason says how the kernel answered for exactly that prefix: `sends this prefix out <dev>, which VPP can reach` (a transit route under `next-hop-self`: the feed is wrong; or a subnet the router was addressed on in the last few seconds, which clears by itself, see [kernel-delivered routes](#kernel-delivered-routes-the-routers-own-never-unresolvable)), `drops it (blackhole, unreachable or prohibit)` (an aggregate the router originates; VPP would send its traffic down a less-specific route, so it is not left to the kernel), `has no route of its own for exactly this prefix`, `could not be read`, or `was not asked` (the per-walk lookup budget was spent). A trailing `the router's addresses could not be re-read (<error>)` means the 2-second address read is failing, so a subnet addressed since the last good read is not known yet | `ip route get <prefix-address> fibmatch` shows the same entry the module read; `ip -br addr` shows whether the router holds an address in the prefix |
-| `reachable now; …` | the neighbour arrived after the route was classified | nothing: it is re-programmed with the neighbour |
+| `reachable now; …` | the neighbour arrived after the route was classified | nothing: the neighbour's arrival hands every route through it back to the drain, and the count falls as fast as VPP installs them. A count that holds still under this reason is a fault worth reporting |
+
+**A neighbour that resolves late is re-programmed, on every kind of
+port.** Routes drained before their next hop's neighbour was known are
+classified unresolvable; when the neighbour arrives (or comes back
+after a loss, or turns up behind another interface) every route through
+it is handed back to the drain and installs. Up to 0.6.1 only a bridge
+neighbour's placement did that, so on a plain port the routes stayed
+unresolvable until the route source changed each one. After the
+2026-11-05 reboot of the reference gateway, 486,318 routes via a
+transit whose neighbour arrived seconds late recovered at the pace of
+the BGP replay's churn, and the first steer waited on them. A route VPP
+already holds through the same paths (a neighbour re-learned after a
+loss) is not re-sent: the hand-back costs a pass over the routes and
+no VPP call for those.
 
 `packetframe fib dump-v4 --unresolved` is **not** the place to look for
 these. That lists routes whose next hop the fast path has not resolved;
