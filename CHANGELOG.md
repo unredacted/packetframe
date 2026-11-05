@@ -28,23 +28,69 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
-## [0.6.1] - UNRELEASED
+## [0.6.1] - 2026-11-04
+
+A point release on 0.6.0. A reboot, a restart or an FRR reload no longer throws away a route table FRR is still relearning: with `integrity-authority frr`, the GC at FRR's End-of-RIB waits for FRR's own upstreams, both after a route-ledger seed and after a reconnect, and a fresh VPP can take its first steer on a whole seed instead of waiting for every upstream. A box without vpp-offload now restarts onto its route ledger too. A 0.6.0 config and route ledger carry over unchanged.
+
+### Upgrading from 0.6.0
+
+1. Install the 0.6.1 package or tarball. The .deb runs no maintainer scripts, so the running daemon is unaffected.
+2. `systemctl daemon-reload`
+3. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with **0.6.1**'s `detach`, with or without vpp-offload. 0.6.0's `--keep-vpp` refused on a config without vpp-offload; 0.6.1's is the restart that keeps the route ledger there too.
+
+The start seeds from the ledger 0.6.0 wrote at the stop, so the upgrade does not load the mirror cold.
+
+- **The route GC can wait.** With `integrity-authority frr`, the first GC after a seed or a reconnect waits until the authority reads every declared upstream Established with End-of-RIB, or the routes it would remove reach `route-ledger max-age` (30 minutes by default). Meanwhile routes FRR no longer has keep forwarding. An upstream that stays down counts as loading, so keep the authority's `upstream` list to sessions that are up. New events `feed_gc_held` and `feed_gc_released`; the `route-ledger` status row says when a GC is held. [The held GC](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/packetframe-fib.md#the-gc-over-earlier-routes-waits-for-frrs-upstreams)
+- **Route ledger format 2.** It records whether the completeness authority vouched for the mirror, and which authority. A 0.6.0 ledger seeds as unattested. **Downgrading** to 0.6.0 loads cold once: 0.6.0 refuses the new format by name (`format-version`).
+- **`detach --keep-vpp` without vpp-offload** now refuses only when a VPP is on record that the config no longer declares, and the `detach` event's `vpp` field reads `none` there.
+
+### Highlights
+
+- **A table that survives FRR relearning it.** After a reboot or a bgpd restart (every UniFi BGP configuration upload is one), FRR can send End-of-RIB while its transits are still loading: at `select-defer-time` in restart mode, within a second of the session in helper mode. Its GC used to remove most of a mirror that was right, from VPP too. With the FRR authority it now waits for the transits, then removes only what FRR no longer has. [The held GC](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/packetframe-fib.md#the-gc-over-earlier-routes-waits-for-frrs-upstreams)
+- **A fresh VPP steers on a whole seed.** After the 2026-10-30 reboot of the reference deployment, VPP's first steer came 32.5 minutes after the reboot, waiting for both transits' End-of-RIB with the whole table already in the mirror. Over a whole, attested route-ledger seed it now verifies and steers while the authority's only objection is upstreams still loading. [A fresh VPP and a seeded mirror](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/vpp-offload.md#a-fresh-vpp-and-a-seeded-mirror)
+- **Seeded restarts without VPP.** The routine restart keeps the route ledger and the wan-egress rules on a `packetframe-fib` box without vpp-offload, which until now loaded its table cold after every restart. [Restarts and detach](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/packetframe-fib.md#turning-it-off-and-detach)
 
 ### Changes
 
 **fast-path**
 
-- With `integrity-authority frr`, the first GC after a route-ledger seed waits until every declared upstream has loaded (at most `max-age`), so an FRR End-of-RIB sent at `select-defer-time` no longer empties the seeded mirror after a reboot. The ledger is format version 2, recording whether the authority vouched for it; a 0.6.0 ledger still seeds, unattested. ([runbook](docs/runbooks/packetframe-fib.md#the-gc-over-earlier-routes-waits-for-frrs-upstreams), [#375](https://github.com/unredacted/packetframe/pull/375))
-- With `integrity-authority frr`, the GC after a reconnect is held the same way, so a bgpd restart (every UniFi BGP configuration upload) no longer empties the mirror, and a steered VPP, at FRR's early End-of-RIB. ([runbook](docs/runbooks/packetframe-fib.md#the-gc-over-earlier-routes-waits-for-frrs-upstreams), [#376](https://github.com/unredacted/packetframe/pull/376))
+- With `integrity-authority frr`, the first GC after a route-ledger seed waits until every declared upstream has loaded (at most `max-age`), so an FRR End-of-RIB sent at `select-defer-time` no longer empties the seeded mirror after a reboot. The ledger is format version 2, recording whether the authority vouched for it; a 0.6.0 ledger still seeds, unattested. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/packetframe-fib.md#the-gc-over-earlier-routes-waits-for-frrs-upstreams), [#375](https://github.com/unredacted/packetframe/pull/375))
+- With `integrity-authority frr`, the GC after a reconnect is held the same way, so a bgpd restart (every UniFi BGP configuration upload) no longer empties the mirror, and a steered VPP, at FRR's early End-of-RIB. A held GC asks the authority for a check at once, so a reconnect with FRR still up is held for one check. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/packetframe-fib.md#the-gc-over-earlier-routes-waits-for-frrs-upstreams), [#376](https://github.com/unredacted/packetframe/pull/376))
 
 **vpp-offload**
 
-- An adopted resync's release walks the table 16,384 routes a pass, so a steered VPP keeps being pinged every 500 ms instead of going about 4.9 s unpinged at 1.35M routes. ([runbook](docs/runbooks/vpp-offload.md#the-steered-diff-and-a-seeded-mirror), [#368](https://github.com/unredacted/packetframe/pull/368))
-- A fresh VPP over a whole route-ledger seed verifies and takes its first steer while the completeness authority waits only for upstreams to finish loading, rather than after their End-of-RIB (32.5 minutes after the 2026-10-30 reboot). ([runbook](docs/runbooks/vpp-offload.md#a-fresh-vpp-and-a-seeded-mirror), [#375](https://github.com/unredacted/packetframe/pull/375))
+- A fresh VPP over a whole route-ledger seed verifies and takes its first steer while the completeness authority waits only for upstreams to finish loading, rather than after their End-of-RIB. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/vpp-offload.md#a-fresh-vpp-and-a-seeded-mirror), [#375](https://github.com/unredacted/packetframe/pull/375))
+- An adopted resync's release walks the table 16,384 routes a pass, so a steered VPP keeps being pinged every 500 ms instead of going about 4.9 s unpinged at 1.35M routes. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/vpp-offload.md#the-steered-diff-and-a-seeded-mirror), [#368](https://github.com/unredacted/packetframe/pull/368))
+- An adopted VPP's check for an empty preserved ledger no longer copies the whole table to find out. ([#369](https://github.com/unredacted/packetframe/pull/369))
 
 **CLI and operations**
 
-- `packetframe detach --keep-vpp` works without vpp-offload when no VPP is on record, so a restart on such a box keeps the route ledger and the wan-egress rules instead of loading cold. ([runbook](docs/runbooks/packetframe-fib.md#turning-it-off-and-detach), [#378](https://github.com/unredacted/packetframe/pull/378))
+- `packetframe detach --keep-vpp` works without vpp-offload when no VPP is on record, so a restart on such a box keeps the route ledger and the wan-egress rules instead of loading cold. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/packetframe-fib.md#turning-it-off-and-detach), [#378](https://github.com/unredacted/packetframe/pull/378))
+- Development only: three tests in the hardware test bundle no longer misbehave on a router. One ran the live detach path against a real `eth5`, one leaked pinned FIB maps on every run, and one miscounted polls under load. ([#377](https://github.com/unredacted/packetframe/pull/377))
+- Built with Rust 1.99.1. ([#372](https://github.com/unredacted/packetframe/pull/372))
+
+### Known limitations
+
+- While the GC is held, routes FRR withdrew while the box or the session was down keep forwarding, in both tiers, until the upstreams load or `max-age` passes. If `max-age` passes first, the held GC runs and removes routes FRR has not re-sent yet until FRR sends them. Size `max-age` for the longest reboot plus upstream load you expect. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/packetframe-fib.md#the-gc-over-earlier-routes-waits-for-frrs-upstreams))
+- Without the FRR authority (`birdc`, `none`), a bgpd restart's early End-of-RIB still sweeps the mirror, as in 0.6.0. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/packetframe-fib.md#graceful-restart-on-the-feed-session))
+- A gateway firmware upgrade can remove hand-installed packages: on an EFG, firmware 6.0.17 removed packetframe's and VPP's, so reinstall packetframe after one. That firmware also moves the gateway to Debian 13, where the VPP release vpp-offload pins, a Debian 11 build, cannot be installed (it needs `libssl1.1`). PacketFrame runs there without vpp-offload; do not move a gateway that runs vpp-offload to it until a matching VPP build exists.
+- The limitations listed for 0.6.0 otherwise still apply.
+
+### Install and verify
+
+When upgrading, follow steps 1 to 3 above.
+
+```sh
+ARCH=$(dpkg --print-architecture)   # amd64 or arm64
+curl -LO "https://github.com/unredacted/packetframe/releases/download/v0.6.1/packetframe_0.6.1_${ARCH}.deb"
+curl -LO https://github.com/unredacted/packetframe/releases/download/v0.6.1/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+dpkg -i "packetframe_0.6.1_${ARCH}.deb" && systemctl daemon-reload
+```
+
+Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the `aarch64-unknown-linux-gnu` tarball and the arm64 .deb also carry the VPP sampler plugin.
+
+**Full changelog:** https://github.com/unredacted/packetframe/compare/v0.6.0...v0.6.1
 
 ## [0.6.0] - 2026-10-13
 
