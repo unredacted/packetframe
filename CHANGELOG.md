@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.2] - UNRELEASED
+
+### Changes
+
+**vpp-offload**
+
+- A VPP the daemon spawns runs in `<state-dir>/vpp-diag/` with its stdout and stderr in a file per start, may dump a core there (`coredump-size unlimited`, no hugepage heap), and a death by signal is reported by name with whether it dumped core (`vpp_killed`); a fresh VPP that crashed under boot load left nothing behind until now. ([runbook](docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core), [#381](https://github.com/unredacted/packetframe/pull/381))
+
 ## [0.6.1] - 2026-11-04
 
 A point release on 0.6.0. A reboot, a restart or an FRR reload no longer throws away a route table FRR is still relearning: with `integrity-authority frr`, the GC at FRR's End-of-RIB waits for FRR's own upstreams, both after a route-ledger seed and after a reconnect, and a fresh VPP can take its first steer on a whole seed instead of waiting for every upstream. A box without vpp-offload now restarts onto its route ledger too. A 0.6.0 config and route ledger carry over unchanged.
