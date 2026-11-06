@@ -2060,26 +2060,34 @@ sudo packetframe events --module fast-path --since 1d | grep -E 'nexthop_resolve
 sudo packetframe events --module fast-path --json | jq 'select(.event == "nexthop_resolve_slow")'
 ```
 
-`reading` names the first cause that explains the rest:
+`reading` names the first cause that explains the rest. The readings for
+probes that solicited nothing (`ix-mode` through `requests-failed`) are
+used only when every probe had that outcome:
 
 | `reading` | What it means | Check |
 |---|---|---|
 | `queue-full` | Every request the programmer made found the resolver's queue full (`queue_full`) | The `neigh-resolver` row in `packetframe status`: the queue drains only while its loop runs |
 | `not-served` | Requests were queued (`asked`) but the resolver served none | The resolver was still in its startup read of the kernel, or behind. `first_served_secs` on the later `nexthop_resolved_late` says when it started |
+| `not-applied` | Still unresolved, though the resolver answered `cache_hit` requests from a usable neighbour in its own view and sent it on | The programmer did not settle it: `NEXTHOPS update failed` in the journal |
+| `served-late` | (`nexthop_resolved_late` only.) The resolver's first served request, `first_served_secs` in, found the neighbour in its own view | Nothing was wrong with the neighbour; the resolver was late, as for `not-served` |
 | `link-down` | The egress (`dev`) reads `down`, `lowerlayerdown` or similar now | The port, its cable, and on VPP boxes whether the port was being handed over |
 | `link-flapped` | The egress changed carrier `carrier_changes` times since the first probe named it | Same; a bounce flushes the port's neighbours |
 | `unanswered` | The kernel solicited it on `dev` and gave up `kernel_failed` times | The neighbour is not answering ARP/ND: its session or link may be down, or it filters us. Restoring its saved MAC would have pointed traffic at it |
+| `kick-not-started` | Kicked, but the entry read back right after the kick was `failed` or `no entry` (`kernel`): no solicitation started | `ip neigh show <nexthop>` and the device's neighbour settings (`ucast_solicit`, `mcast_solicit`) |
 | `pending` | Kicked, but the kernel reported neither an answer nor a failure | Notifications lost: the resolver's `overruns` and resyncs |
-| `ix-mode` | The egress is `ix-mode`, so it is not solicited; the snooper seeds it | The snooper (neigh-snoop runbook) and the peer's traffic on the fabric |
-| `no-route` | The kernel had no route to it | `ip route get <nexthop>`: the connected route goes with its interface |
+| `ix-mode` | Every probe found the egress `ix-mode`, so it is not solicited; the snooper seeds it | The snooper (neigh-snoop runbook) and the peer's traffic on the fabric |
+| `no-route` | Every probe found no route to it | `ip route get <nexthop>`: the connected route goes with its interface |
 | `probes-skipped` | No request socket: one was stuck on `rtnl_lock` and retired | The `neigh-resolver` row in `packetframe status` ("the request socket was retired … ago"); `request_timeouts` and `probes_skipped` in the resolver's stats line |
 | `probes-timed-out` | Every request hit its timeout | Same: `rtnl_lock` held, or replies dropped |
 | `requests-failed` | The kernel refused every kick | The journal at debug for the error |
+| `not-solicited` | No probe solicited it, for more than one of the reasons above; `detail` lists them (`3 skipped, 1 timed out`) | Each one listed |
 
 Other fields:
 - `kernel` is the read-back right after the last kick. `incomplete` is normal there (a solicitation in flight). `failed` or `no entry` means the kick did not start one.
 - `routes` is how many routes use the next hop at that moment; during a seed, the count so far.
-- `asked` counts the requests the programmer queued. `served` and the per-outcome counts are what the resolver did with them.
+- `asked` counts the requests the programmer queued. `served` and the per-outcome counts are what the resolver did with them; `cache_hit` counts those it answered from its own view without asking the kernel.
+- `kernel_failed` and `kernel_gone` count only reports for the device the probes named (`dev`), once one has.
+- An unspecified next hop (`0.0.0.0`, `::`, a self-originated route) has no neighbour and is never reported.
 
 No `nexthop_resolved_late` follows when the next hop's routes are withdrawn
 first, or the daemon stops. The journal carries the same lines at warn and

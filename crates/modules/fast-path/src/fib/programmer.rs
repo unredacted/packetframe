@@ -2383,7 +2383,10 @@ impl FibProgrammer {
         let mut slow_now = 0usize;
         let mut candidates = Vec::new();
         for (ip, r) in &self.reprobe {
-            if r.episode.waited(now) < self.slow_after {
+            // An unspecified next hop (`0.0.0.0`, `::`: a self-originated
+            // route) has no neighbour to resolve; the resolver answers its
+            // requests with nothing, by design.
+            if ip.is_unspecified() || r.episode.waited(now) < self.slow_after {
                 continue;
             }
             slow_now += 1;
@@ -2414,6 +2417,7 @@ impl FibProgrammer {
                 tally: tally.as_ref(),
                 link: link.as_ref(),
                 now,
+                resolved: false,
             };
             let reading = report.reading();
             warn!(
@@ -2452,6 +2456,7 @@ impl FibProgrammer {
             tally,
             link: link.as_ref(),
             now,
+            resolved: true,
         };
         info!(
             nexthop = %ip,
@@ -2700,6 +2705,10 @@ impl FibProgrammer {
             NeighEvent::Failed { .. } | NeighEvent::Gone { .. } => None,
         };
         let kernel_failed = matches!(evt, NeighEvent::Failed { .. });
+        let event_ifindex = match &evt {
+            NeighEvent::Failed { ifindex, .. } | NeighEvent::Gone { ifindex, .. } => Some(*ifindex),
+            NeighEvent::Learned { .. } => None,
+        };
 
         let entry = match evt {
             NeighEvent::Learned {
@@ -2846,7 +2855,20 @@ impl FibProgrammer {
                 Cause::New
             };
             self.arm_reprobe(ip, cause);
-            if let Some(r) = self.reprobe.get_mut(&ip) {
+            // Counted only for the device the requests are probing. An
+            // unresolved slot has no live device for the guard above to
+            // compare, so a failure for the same address on another
+            // interface (a second bridge, a management port) would
+            // otherwise read as this next hop going unanswered. Before
+            // any probe named an egress, there is nothing to tell them
+            // apart by, and it counts.
+            let probed = self
+                .neigh_handle
+                .as_ref()
+                .and_then(|h| h.probe_log().oif(&ip));
+            let elsewhere = live_before.is_none()
+                && matches!((probed, event_ifindex), (Some(p), Some(e)) if p != e);
+            if let Some(r) = self.reprobe.get_mut(&ip).filter(|_| !elsewhere) {
                 let n = if kernel_failed {
                     &mut r.episode.kernel_failed
                 } else {

@@ -663,9 +663,9 @@ pub enum ProbeOutcome {
     /// `RTM_NEWNEIGH NTF_USE` was accepted for the neighbour on `oif`;
     /// the kernel is soliciting (or already had it, see `read_back`).
     Kicked { oif: u32 },
-    /// The neighbour write failed (logged at debug; first-packet ARP
-    /// remains the fallback).
-    Failed,
+    /// The neighbour write on `oif` failed (logged at debug; first-packet
+    /// ARP remains the fallback).
+    Failed { oif: u32 },
     /// The route lookup found no unicast egress.
     NoRoute,
     /// Unspecified nexthop: nothing to resolve.
@@ -675,7 +675,12 @@ pub enum ProbeOutcome {
     Suppressed { oif: u32 },
     /// A request hit [`REQUEST_TIMEOUT`] at `stage`. The nexthop is left
     /// for the programmer's next re-probe and the request socket retired.
-    TimedOut { stage: &'static str },
+    /// `oif` is the egress when the route lookup had already named one
+    /// (the kick timed out), `None` when the lookup itself did.
+    TimedOut {
+        stage: &'static str,
+        oif: Option<u32>,
+    },
 }
 
 impl NetlinkNeighborResolver {
@@ -1163,6 +1168,11 @@ impl NetlinkNeighborResolver {
             // the Learned that triggers the entry write; the pins map is
             // consulted at write time, so send it first.
             self.maybe_send_pin(ip, ifindex, mac);
+            // Counted even though nothing was asked of the kernel: a
+            // stretch that stays unresolved through cache hits was found
+            // here and not settled by the programmer.
+            self.probes.record(ip, Probe::CacheHit, Instant::now());
+            self.tally_egress(ip, ifindex);
             if self.send_learned(ip, ifindex, mac).await {
                 self.synth_learned_emitted += 1;
             }
@@ -1208,8 +1218,8 @@ impl NetlinkNeighborResolver {
             ProbeOutcome::Kicked { oif } => {
                 self.read_back(&handle, ip, oif).await;
             }
-            ProbeOutcome::TimedOut { stage } => self.request_timed_out(stage),
-            ProbeOutcome::Failed | ProbeOutcome::NoRoute | ProbeOutcome::Unspecified => {}
+            ProbeOutcome::TimedOut { stage, .. } => self.request_timed_out(stage),
+            ProbeOutcome::Failed { .. } | ProbeOutcome::NoRoute | ProbeOutcome::Unspecified => {}
         }
     }
 
@@ -1220,17 +1230,23 @@ impl NetlinkNeighborResolver {
         let (probe, oif) = match outcome {
             ProbeOutcome::Kicked { oif } => (Probe::Kicked, Some(oif)),
             ProbeOutcome::Suppressed { oif } => (Probe::Suppressed, Some(oif)),
-            ProbeOutcome::TimedOut { .. } => (Probe::TimedOut, None),
+            ProbeOutcome::TimedOut { oif, .. } => (Probe::TimedOut, oif),
             ProbeOutcome::NoRoute => (Probe::NoRoute, None),
-            ProbeOutcome::Failed => (Probe::Failed, None),
+            ProbeOutcome::Failed { oif } => (Probe::Failed, Some(oif)),
             ProbeOutcome::Unspecified => return,
         };
         self.probes.record(ip, probe, Instant::now());
         if let Some(oif) = oif {
-            let dev = self.ifname(oif);
-            self.probes
-                .egress(ip, &dev, resolve_watch::carrier_changes(&dev));
+            self.tally_egress(ip, oif);
         }
+    }
+
+    /// Name `oif` as `ip`'s egress in its tally, with that device's
+    /// carrier-change count.
+    fn tally_egress(&self, ip: IpAddr, oif: u32) {
+        let dev = self.ifname(oif);
+        self.probes
+            .egress(ip, oif, &dev, resolve_watch::carrier_changes(&dev));
     }
 
     /// The name of `ifindex`: from the link view, else from the kernel.
@@ -3080,6 +3096,7 @@ async fn issue_proactive_resolve(
     let Ok(oif) = tokio::time::timeout(REQUEST_TIMEOUT, lookup_oif(handle, req)).await else {
         return ProbeOutcome::TimedOut {
             stage: "route lookup",
+            oif: None,
         };
     };
     let oif = match oif {
@@ -3125,10 +3142,11 @@ async fn issue_proactive_resolve(
         }
         Ok(Err(e)) => {
             debug!(?ip, oif, error = %e, "proactive resolve failed");
-            ProbeOutcome::Failed
+            ProbeOutcome::Failed { oif }
         }
         Err(_) => ProbeOutcome::TimedOut {
             stage: "neighbour kick",
+            oif: Some(oif),
         },
     }
 }

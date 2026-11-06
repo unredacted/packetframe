@@ -3506,23 +3506,27 @@ fn a_slow_nexthop_is_recorded_with_its_probes_and_again_when_it_resolves() {
         ifindex: 1,
         src_mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
     };
+    // A self-originated route's unspecified next hop has no neighbour, so
+    // it is never reported, however long it stays unresolved.
+    let unspecified = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     h.run(async { h.handle.register_nexthop(nh).await })
         .expect("register_nexthop");
-    assert_eq!(
-        h.drain_resolves(&mut resolves, Duration::from_millis(200)),
-        vec![nh],
-        "allocation kicks once"
-    );
+    h.run(async { h.handle.register_nexthop(unspecified).await })
+        .expect("register_nexthop 0.0.0.0");
+    let mut first = h.drain_resolves(&mut resolves, Duration::from_millis(200));
+    first.sort();
+    assert_eq!(first, vec![unspecified, nh], "allocation kicks each once");
 
     // Play the resolver and the kernel: the kick went out on `lo`, and the
-    // kernel gave up on the solicitation twice.
+    // kernel gave up on the solicitation twice. A failure for the same
+    // address on another interface is not this next hop's.
     probes.record(nh, Probe::Kicked, std::time::Instant::now());
-    probes.egress(nh, "lo", Some(0));
+    probes.egress(nh, 1, "lo", Some(0));
     probes.kernel_answer(nh, "incomplete");
-    for _ in 0..2 {
+    for ifindex in [1, 1, 4242] {
         h.feed_neigh(NeighEvent::Failed {
             ip: nh,
-            ifindex: 1,
+            ifindex,
             reason: "kernel marked NUD_FAILED".into(),
         });
     }
@@ -3552,6 +3556,10 @@ fn a_slow_nexthop_is_recorded_with_its_probes_and_again_when_it_resolves() {
     assert_eq!(resolved[0].fields["resolved_dev"], "lo");
     assert_eq!(resolved[0].fields["kernel_failed"], 2);
     assert!(probes.get(&nh).is_none(), "the tally ends with the stretch");
+    assert!(
+        nexthop_events(events::kind::NEXTHOP_RESOLVE_SLOW, unspecified).is_empty(),
+        "an unspecified next hop is never reported"
+    );
 
     // Lost and re-learned well inside the threshold: nothing more.
     h.feed_neigh(NeighEvent::Gone { ip: nh, ifindex: 1 });

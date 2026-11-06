@@ -153,6 +153,9 @@ pub enum Probe {
     NoRoute,
     /// The kernel refused the kick.
     Failed,
+    /// The resolver's own view already held a usable neighbour, and it
+    /// sent the programmer a `Learned` without asking the kernel.
+    CacheHit,
 }
 
 /// The resolver's account of the requests it served for one unresolved
@@ -167,7 +170,10 @@ pub struct ProbeTally {
     pub timed_out: u32,
     pub no_route: u32,
     pub failed: u32,
-    /// The egress device the kernel's route lookup last named.
+    pub cache_hit: u32,
+    /// The egress the kernel's route lookup (or the resolver's view, on a
+    /// cache hit) last named: its index and name.
+    pub oif: Option<u32>,
     pub dev: Option<String>,
     /// That device's carrier-change count when it was first named.
     pub carrier_changes_at_first: Option<u64>,
@@ -177,13 +183,37 @@ pub struct ProbeTally {
 }
 
 impl ProbeTally {
+    /// Every request the resolver served.
     pub fn served(&self) -> u32 {
+        self.probes().saturating_add(self.cache_hit)
+    }
+
+    /// The requests it took to the kernel, or meant to: everything served
+    /// but the cache hits.
+    pub fn probes(&self) -> u32 {
         self.kicked
             .saturating_add(self.suppressed)
             .saturating_add(self.skipped)
             .saturating_add(self.timed_out)
             .saturating_add(self.no_route)
             .saturating_add(self.failed)
+    }
+
+    /// The outcomes of probes that solicited nothing, for a mixture:
+    /// `3 skipped, 1 timed out`.
+    fn unsolicited_summary(&self) -> String {
+        [
+            (self.suppressed, "ix-mode"),
+            (self.no_route, "no route"),
+            (self.skipped, "skipped"),
+            (self.timed_out, "timed out"),
+            (self.failed, "refused"),
+        ]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect::<Vec<_>>()
+        .join(", ")
     }
 }
 
@@ -217,22 +247,30 @@ impl ProbeLog {
             Probe::TimedOut => &mut t.timed_out,
             Probe::NoRoute => &mut t.no_route,
             Probe::Failed => &mut t.failed,
+            Probe::CacheHit => &mut t.cache_hit,
         };
         *n = n.saturating_add(1);
     }
 
-    /// The route lookup for `ip` named `dev`. The carrier-change count is
-    /// kept from the first time each device is named, so a later report
-    /// can say whether the link bounced meanwhile.
-    pub fn egress(&self, ip: IpAddr, dev: &str, carrier_changes: Option<u64>) {
+    /// The route lookup for `ip` named egress `oif`, called `dev`. The
+    /// carrier-change count is kept from the first time each device is
+    /// named, so a later report can say whether the link bounced
+    /// meanwhile.
+    pub fn egress(&self, ip: IpAddr, oif: u32, dev: &str, carrier_changes: Option<u64>) {
         let mut map = self.lock();
         let Some(t) = map.get_mut(&ip) else {
             return;
         };
+        t.oif = Some(oif);
         if t.dev.as_deref() != Some(dev) {
             t.dev = Some(dev.to_string());
             t.carrier_changes_at_first = carrier_changes;
         }
+    }
+
+    /// The egress `ip`'s requests last named, if any did.
+    pub fn oif(&self, ip: &IpAddr) -> Option<u32> {
+        self.lock().get(ip).and_then(|t| t.oif)
     }
 
     /// What the read-back after a kick found.
@@ -342,24 +380,37 @@ pub enum Reading {
     QueueFull,
     /// The resolver served no request for it: still starting, or behind.
     NotServed,
+    /// Still unresolved, though the resolver answered this many requests
+    /// from a usable neighbour in its own view: the programmer did not
+    /// settle what it was sent.
+    NotApplied(u32),
+    /// Resolved by the resolver's first answer, from its own view, this
+    /// many seconds in: nothing was slow but the service.
+    ServedLate(u64),
     /// The egress link is not up.
     LinkDown(String),
     /// The egress link changed carrier meanwhile.
     LinkFlapped(u64),
-    /// Every request was skipped for want of a request socket.
-    ProbesSkipped,
-    /// Every request timed out.
-    ProbesTimedOut,
-    /// The kernel had no route to it.
-    NoRoute,
-    /// The egress is `ix-mode`: not solicited, left to the snooper.
-    IxMode,
     /// The kernel solicited it and gave up this many times.
     Unanswered(u32),
+    /// The kernel accepted a kick, but the entry read back right after it
+    /// was `failed` or `no entry`: no solicitation started.
+    KickNotStarted(&'static str),
     /// The kernel was asked to solicit it and reported nothing back.
     Pending,
-    /// Every request to the kernel was refused.
+    /// Every probe found its egress `ix-mode`: not solicited, left to the
+    /// snooper.
+    IxMode,
+    /// Every probe found no route to it.
+    NoRoute,
+    /// Every probe was skipped for want of a request socket.
+    ProbesSkipped,
+    /// Every probe timed out.
+    ProbesTimedOut,
+    /// The kernel refused every kick.
     RequestsFailed,
+    /// No probe solicited it, for more than one reason (listed).
+    NotSolicited(String),
 }
 
 impl Reading {
@@ -367,15 +418,19 @@ impl Reading {
         match self {
             Self::QueueFull => "queue-full",
             Self::NotServed => "not-served",
+            Self::NotApplied(_) => "not-applied",
+            Self::ServedLate(_) => "served-late",
             Self::LinkDown(_) => "link-down",
             Self::LinkFlapped(_) => "link-flapped",
+            Self::Unanswered(_) => "unanswered",
+            Self::KickNotStarted(_) => "kick-not-started",
+            Self::Pending => "pending",
+            Self::IxMode => "ix-mode",
+            Self::NoRoute => "no-route",
             Self::ProbesSkipped => "probes-skipped",
             Self::ProbesTimedOut => "probes-timed-out",
-            Self::NoRoute => "no-route",
-            Self::IxMode => "ix-mode",
-            Self::Unanswered(_) => "unanswered",
-            Self::Pending => "pending",
             Self::RequestsFailed => "requests-failed",
+            Self::NotSolicited(_) => "not-solicited",
         }
     }
 
@@ -385,25 +440,38 @@ impl Reading {
             Self::NotServed => {
                 "the resolver served none of its requests (still starting, or behind)".into()
             }
+            Self::NotApplied(n) => format!(
+                "the resolver answered {n} requests from a usable neighbour on {dev}, but the \
+                 programmer did not settle it"
+            ),
+            Self::ServedLate(secs) => format!(
+                "the resolver served none of its requests for {secs} s, then answered from its \
+                 own view"
+            ),
             Self::LinkDown(state) => format!("its egress {dev} is {state}"),
             Self::LinkFlapped(n) => format!("its egress {dev} changed carrier {n} times meanwhile"),
+            Self::Unanswered(n) => {
+                format!("the kernel solicited it on {dev} and got no answer ({n} NUD_FAILED)")
+            }
+            Self::KickNotStarted(state) => format!(
+                "the kernel accepted the kick on {dev} but read back {state}: no solicitation \
+                 started"
+            ),
+            Self::Pending => {
+                format!("the kernel was asked to solicit it on {dev} and reported nothing back")
+            }
+            Self::IxMode => {
+                format!("its egress {dev} is ix-mode: not solicited, the snooper seeds it")
+            }
+            Self::NoRoute => "the kernel had no route to it".into(),
             Self::ProbesSkipped => {
                 "every probe was skipped: no request socket (one was stuck on rtnl_lock)".into()
             }
             Self::ProbesTimedOut => {
                 "every probe timed out (rtnl_lock held, or the replies dropped)".into()
             }
-            Self::NoRoute => "the kernel had no route to it".into(),
-            Self::IxMode => {
-                format!("its egress {dev} is ix-mode: not solicited, the snooper seeds it")
-            }
-            Self::Unanswered(n) => {
-                format!("the kernel solicited it on {dev} and got no answer ({n} NUD_FAILED)")
-            }
-            Self::Pending => {
-                format!("the kernel was asked to solicit it on {dev} and reported nothing back")
-            }
             Self::RequestsFailed => "the kernel refused every request to solicit it".into(),
+            Self::NotSolicited(mix) => format!("no probe solicited it ({mix})"),
         }
     }
 }
@@ -420,6 +488,9 @@ pub struct Report<'a> {
     /// lookup never named one.
     pub link: Option<&'a LinkNow>,
     pub now: Instant,
+    /// Whether the stretch has ended in a `Learned`: the resolved event's
+    /// report, not the slow one's.
+    pub resolved: bool,
 }
 
 impl Report<'_> {
@@ -437,7 +508,19 @@ impl Report<'_> {
     pub fn reading(&self) -> Reading {
         let e = self.episode;
         let t = self.tally.cloned().unwrap_or_default();
-        if t.served() == 0 {
+        // Still unresolved while the resolver holds a usable neighbour:
+        // whatever else happened, it was found and not settled.
+        if !self.resolved && t.cache_hit > 0 {
+            return Reading::NotApplied(t.cache_hit);
+        }
+        let probes = t.probes();
+        if probes == 0 {
+            if t.cache_hit > 0 {
+                let secs = t
+                    .first_served
+                    .map_or(0, |f| f.saturating_duration_since(e.since).as_secs());
+                return Reading::ServedLate(secs);
+            }
             if e.asked == 0 && e.queue_full > 0 {
                 return Reading::QueueFull;
             }
@@ -450,25 +533,30 @@ impl Report<'_> {
             return Reading::LinkFlapped(n);
         }
         if t.kicked > 0 {
-            return if e.kernel_failed > 0 {
-                Reading::Unanswered(e.kernel_failed)
-            } else {
-                Reading::Pending
-            };
+            if e.kernel_failed > 0 {
+                return Reading::Unanswered(e.kernel_failed);
+            }
+            // The read-back right after the last kick: a solicitation in
+            // flight reads `incomplete`.
+            if let Some(state @ ("failed" | "no entry")) = t.kernel {
+                return Reading::KickNotStarted(state);
+            }
+            return Reading::Pending;
         }
-        if t.suppressed > 0 {
-            return Reading::IxMode;
+        // Nothing was solicited. One reason for every probe is named;
+        // a mixture is listed rather than put down to one of them.
+        for (n, reading) in [
+            (t.suppressed, Reading::IxMode),
+            (t.no_route, Reading::NoRoute),
+            (t.skipped, Reading::ProbesSkipped),
+            (t.timed_out, Reading::ProbesTimedOut),
+            (t.failed, Reading::RequestsFailed),
+        ] {
+            if n == probes {
+                return reading;
+            }
         }
-        if t.no_route > 0 {
-            return Reading::NoRoute;
-        }
-        if t.skipped > 0 && t.skipped >= t.timed_out {
-            return Reading::ProbesSkipped;
-        }
-        if t.timed_out > 0 {
-            return Reading::ProbesTimedOut;
-        }
-        Reading::RequestsFailed
+        Reading::NotSolicited(t.unsolicited_summary())
     }
 
     /// The fields both events carry.
@@ -490,6 +578,7 @@ impl Report<'_> {
             .field("timed_out", t.timed_out)
             .field("no_route", t.no_route)
             .field("probe_failed", t.failed)
+            .field("cache_hit", t.cache_hit)
             .field("kernel_failed", e.kernel_failed)
             .field("kernel_gone", e.kernel_gone)
             .field("kernel", t.kernel.unwrap_or("not read"))
@@ -642,31 +731,34 @@ mod tests {
         let nh = ip(50);
 
         // Facts about a next hop the resolver has not served are dropped.
-        log.egress(nh, "eth3", Some(4));
+        log.egress(nh, 3, "eth3", Some(4));
         log.kernel_answer(nh, "incomplete");
         assert!(log.is_empty());
 
         log.record(nh, Probe::Skipped, t0);
         log.record(nh, Probe::Kicked, t0 + Duration::from_secs(5));
-        log.egress(nh, "eth3", Some(4));
+        log.egress(nh, 3, "eth3", Some(4));
         log.record(nh, Probe::Kicked, t0 + Duration::from_secs(7));
         // Named again with a later count: the first one stays.
-        log.egress(nh, "eth3", Some(9));
+        log.egress(nh, 3, "eth3", Some(9));
         log.kernel_answer(nh, "incomplete");
+        log.record(nh, Probe::CacheHit, t0 + Duration::from_secs(9));
 
         let t = log.get(&nh).expect("a tally");
         assert_eq!(t.first_served, Some(t0));
-        assert_eq!((t.kicked, t.skipped, t.served()), (2, 1, 3));
+        assert_eq!((t.kicked, t.skipped, t.cache_hit), (2, 1, 1));
+        assert_eq!((t.probes(), t.served()), (3, 4));
         assert_eq!(t.dev.as_deref(), Some("eth3"));
+        assert_eq!(log.oif(&nh), Some(3));
         assert_eq!(t.carrier_changes_at_first, Some(4));
         assert_eq!(t.kernel, Some("incomplete"));
 
         // A different egress starts its own carrier count.
-        log.egress(nh, "eth4", Some(1));
+        log.egress(nh, 4, "eth4", Some(1));
         let t = log.get(&nh).unwrap();
         assert_eq!(
-            (t.dev.as_deref(), t.carrier_changes_at_first),
-            (Some("eth4"), Some(1))
+            (t.oif, t.dev.as_deref(), t.carrier_changes_at_first),
+            (Some(4), Some("eth4"), Some(1))
         );
 
         log.record(ip(51), Probe::NoRoute, t0);
@@ -718,6 +810,15 @@ mod tests {
     }
 
     fn reading(e: &Episode, t: Option<&ProbeTally>, link: Option<&LinkNow>) -> Reading {
+        reading_when(false, e, t, link)
+    }
+
+    fn reading_when(
+        resolved: bool,
+        e: &Episode,
+        t: Option<&ProbeTally>,
+        link: Option<&LinkNow>,
+    ) -> Reading {
         Report {
             nexthop: ip(50),
             routes: 1,
@@ -725,6 +826,7 @@ mod tests {
             tally: t,
             link,
             now: Instant::now(),
+            resolved,
         }
         .reading()
     }
@@ -771,24 +873,84 @@ mod tests {
         );
         e.kernel_failed = 0;
         assert_eq!(reading(&e, Some(&kicked), Some(&up)), Reading::Pending);
+        // A lost NUD_FAILED notification does not hide what the read-back
+        // said: the kick started nothing.
+        for state in ["failed", "no entry"] {
+            let read_back = tally(|t| {
+                t.kicked = 4;
+                t.kernel = Some(state);
+            });
+            assert_eq!(
+                reading(&e, Some(&read_back), Some(&up)),
+                Reading::KickNotStarted(state)
+            );
+        }
+        let in_flight = tally(|t| {
+            t.kicked = 4;
+            t.kernel = Some("incomplete");
+        });
+        assert_eq!(reading(&e, Some(&in_flight), Some(&up)), Reading::Pending);
 
-        // Never solicited.
+        // Never solicited, for one reason.
         let ix = tally(|t| t.suppressed = 2);
         assert_eq!(reading(&e, Some(&ix), Some(&up)), Reading::IxMode);
         let unroutable = tally(|t| t.no_route = 2);
         assert_eq!(reading(&e, Some(&unroutable), None), Reading::NoRoute);
-        let skipped = tally(|t| {
-            t.skipped = 3;
-            t.timed_out = 1;
-        });
+        let skipped = tally(|t| t.skipped = 3);
         assert_eq!(reading(&e, Some(&skipped), None), Reading::ProbesSkipped);
-        let timed_out = tally(|t| {
-            t.skipped = 1;
-            t.timed_out = 3;
-        });
+        let timed_out = tally(|t| t.timed_out = 3);
         assert_eq!(reading(&e, Some(&timed_out), None), Reading::ProbesTimedOut);
         let refused = tally(|t| t.failed = 2);
         assert_eq!(reading(&e, Some(&refused), None), Reading::RequestsFailed);
+
+        // Or for several: listed, not put down to the commonest.
+        let mixed = tally(|t| {
+            t.skipped = 3;
+            t.timed_out = 1;
+        });
+        let r = reading(&e, Some(&mixed), None);
+        assert_eq!(r, Reading::NotSolicited("3 skipped, 1 timed out".into()));
+        assert_eq!(r.code(), "not-solicited");
+        assert_eq!(
+            r.sentence("eth3"),
+            "no probe solicited it (3 skipped, 1 timed out)"
+        );
+    }
+
+    #[test]
+    fn a_cache_hit_reads_as_unsettled_while_unresolved_and_as_late_service_after() {
+        let t0 = Instant::now();
+        let mut e = Episode::new(t0, Cause::Seed);
+        e.asked = 3;
+        e.kernel_failed = 2;
+        let up = LinkNow {
+            operstate: Some("up".into()),
+            carrier_changes: Some(4),
+        };
+
+        // Still unresolved though the resolver held a usable neighbour:
+        // that outranks everything the probes said.
+        let held = tally(|t| {
+            t.kicked = 2;
+            t.cache_hit = 2;
+        });
+        assert_eq!(reading(&e, Some(&held), Some(&up)), Reading::NotApplied(2));
+
+        // Resolved by a cache hit after probes: the probes explain it.
+        assert_eq!(
+            reading_when(true, &e, Some(&held), Some(&up)),
+            Reading::Unanswered(2)
+        );
+
+        // Resolved by the first request served, from the resolver's view.
+        let late = ProbeTally {
+            first_served: Some(t0 + Duration::from_secs(95)),
+            cache_hit: 1,
+            ..ProbeTally::default()
+        };
+        let r = reading_when(true, &e, Some(&late), None);
+        assert_eq!(r, Reading::ServedLate(95));
+        assert_eq!(r.code(), "served-late");
     }
 
     #[test]
@@ -817,6 +979,7 @@ mod tests {
             tally: Some(&t),
             link: Some(&link),
             now: t0 + Duration::from_secs(31),
+            resolved: false,
         };
         let ev = r.slow_event(MODULE, 3);
         assert_eq!(ev.kind(), kind::NEXTHOP_RESOLVE_SLOW);
@@ -834,6 +997,7 @@ mod tests {
             ("served", serde_json::json!(7)),
             ("kicked", serde_json::json!(6)),
             ("skipped", serde_json::json!(1)),
+            ("cache_hit", serde_json::json!(0)),
             ("kernel_failed", serde_json::json!(5)),
             ("kernel", serde_json::json!("incomplete")),
             ("dev", serde_json::json!("eth3")),
@@ -861,6 +1025,7 @@ mod tests {
             tally: None,
             link: None,
             now: t0 + Duration::from_secs(40),
+            resolved: false,
         };
         let f = record(r.slow_event(MODULE, 1));
         assert_eq!(f["reading"], "not-served");
@@ -891,6 +1056,7 @@ mod tests {
             tally: Some(&t),
             link: Some(&link),
             now: t0 + Duration::from_secs(301),
+            resolved: true,
         };
         let ev = r.resolved_event(MODULE, "eth3");
         assert_eq!(ev.kind(), kind::NEXTHOP_RESOLVED_LATE);
