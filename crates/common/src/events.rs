@@ -133,6 +133,10 @@ pub mod kind {
     pub const PRESERVED_LEDGER_REJECTED: &str = "preserved_ledger_rejected";
     pub const LEDGER_PRESERVED: &str = "ledger_preserved";
     pub const VPP_TEARDOWN: &str = "vpp_teardown";
+    /// A VPP this daemon spawned died of a signal (warn): `signal` by
+    /// name, `core_dumped`, `pid`, and `output`, the file its stdout and
+    /// stderr went to.
+    pub const VPP_KILLED: &str = "vpp_killed";
     pub const HANDBACK_READY: &str = "handback_ready";
     pub const HANDBACK_HELD_BACK: &str = "handback_held_back";
     /// The set of named unresolvable routes changed (rate-limited at the
