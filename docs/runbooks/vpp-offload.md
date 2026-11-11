@@ -4140,6 +4140,98 @@ anything on current builds. The section after next covers it. If a loop
 like that still shows `event=ConvergenceFailed`, the step was
 *refused*, and the error text says by what.
 
+### VPP died of a signal: its output and its core
+
+A `vpp_teardown` with `cause: ProcessExited { status: None }` is a VPP
+killed by a signal: it has no exit code. Both the journal warning and a
+`vpp_killed` event carry:
+
+- `signal`: the signal it died of;
+- `vpp_signal`: the fault VPP's own handler caught;
+- `core_dumped`: whether a core was dumped;
+- `pid`;
+- `output`: its output file.
+
+```
+VPP died of a signal; vpp_signal is the fault its own handler caught ...   signal=SIGABRT vpp_signal=SIGSEGV core_dumped=true output=/<state-dir>/vpp-diag/vpp-1793851726.log
+```
+
+**Read `vpp_signal`, not `signal`, for the cause.** VPP catches SIGSEGV,
+SIGBUS, SIGILL, SIGFPE and the rest, logs `received signal <NAME>, PC …`,
+and exits through `abort()`. So `signal` is SIGABRT for every VPP fault.
+`vpp_signal` is read back from the last such line in the output file:
+
+| `signal` | `vpp_signal` | Meaning |
+|---|---|---|
+| `SIGABRT` | `SIGSEGV`, `SIGBUS`, … | A fault: VPP's handler caught it. |
+| `SIGABRT` | `SIGABRT` | A panic or a failed assertion (`clib_panic`, `os_panic`, `ASSERT`). |
+| `SIGKILL`, `SIGTERM` | `none` | A kill from outside: the OOM killer, the supervisor, an operator. |
+| any | `none` | No output file to read. In that case `output` reads `none (no diagnostics directory)`. |
+
+**Where the output goes.** At attach the daemon checks
+`<state-dir>/vpp-diag/` and, if it trusts it, uses it:
+
+- each VPP's stdout and stderr go to `vpp-<unix seconds>.log` there, one file per start;
+- the rendered `unix` stanza gets `runtime-dir <state-dir>/vpp-diag` and `coredump-size unlimited`.
+
+`state-dir` survives a reboot. The journal on a UniFi gateway does not,
+and it rotates within minutes under boot load.
+
+After each successful spawn the daemon keeps the newest five output
+files and the newest two `core*` files, and removes older ones. A spawn
+that fails leaves no file. The directory is 0700 and the files are 0600.
+VPP's own runtime files live there too, `stats.sock` among them;
+nothing in PacketFrame reads that socket.
+
+**When it is not used.** The directory is used only on a path no other
+account can change:
+
+- every directory from `/` down to it is owned by root;
+- none of them is writable by group or others, except a sticky directory whose entry under it is root's.
+
+Otherwise the journal says `VPP's diagnostics directory is not one this
+daemon can trust`, and VPP runs as before 0.6.2: its runtime directory
+is `/run/vpp`, its output goes nowhere, and it has no core limit of its
+own. A `state-dir` with a space in it is refused too, because VPP reads
+`runtime-dir` as one word.
+
+**What to read:**
+
+- **Read the output file first.** VPP prints a panic, a failed assertion
+  or an allocation failure (`clib_panic`, `os_panic`, out of memory) to
+  stderr before it aborts, so the last lines of the file usually say
+  why. Its fatal-signal handler's `received signal …, PC …` line and
+  backtrace (`#0 0x… <function> + 0x…`) are in the file too: VPP opens
+  syslog with `LOG_PERROR`, which copies them to stderr.
+- **The core.** `coredump-size unlimited` raises VPP's own core limit; a
+  service's is usually 0.
+  - **Size.** The spawn sets VPP's `coredump_filter` to `0x13`, which
+    leaves hugetlb memory out of the core. VPP's heap lives on hugepages,
+    and the kernel's default filter (`0x33`) would include it, so the
+    core is hundreds of megabytes with every thread's stack rather than
+    gigabytes. `full-coredump` is never rendered: it would put the
+    hugepage heap back. To check a running VPP's filter:
+    `cat /proc/$(pidof vpp)/coredump_filter` should print `00000013`.
+  - **Where it lands.** That is the kernel's choice:
+    `cat /proc/sys/kernel/core_pattern`.
+    - A relative pattern (`core`, `core.%p`) puts the core in
+      `vpp-diag/`, which is VPP's working directory. The pruning keeps
+      two.
+    - A piped pattern (`|/usr/lib/systemd/systemd-coredump …`) hands it
+      to that program instead.
+  - **How to read it.** Use the VPP build's binary and libraries:
+    `gdb /usr/bin/vpp <core>`, then `thread apply all bt`.
+- VPP's own log is unchanged, at `/var/log/packetframe/vpp.log`.
+
+Up to 0.6.1:
+
+- stdout and stderr went to `/dev/null`;
+- no core could be written;
+- the reaper did not report the signal.
+
+A fresh VPP died twice with SIGABRT while syncing under boot load, on
+2026-10-30 and on 2026-11-05. Both times, `status: None` was all it left.
+
 ### A teardown with `cause=Wedged`
 
 The wedge detector decided VPP had stopped answering its binary API:

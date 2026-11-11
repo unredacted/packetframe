@@ -34,6 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **vpp-offload**
 
+- A VPP the daemon spawns keeps its stdout and stderr in `<state-dir>/vpp-diag/`, one file per start, and its runtime directory is there too, so a core can land there (`coredump-size unlimited`, with a core filter that leaves out the hugepage heap). This happens only when no other account can change that path. A death by signal is reported (`vpp_killed`): the signal VPP died of, the fault its own handler logged (`vpp_signal`), and whether it dumped core. Until now, a fresh VPP that crashed under boot load left nothing behind. ([runbook](docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core), [#381](https://github.com/unredacted/packetframe/pull/381))
 - A neighbour that resolves after the routes through it have drained now hands them back to be installed, on a plain port as on a bridge; until now they stayed unresolvable until the route source changed each one, which held a fresh VPP's first steer for twenty minutes after a reboot. A route VPP already holds through the same paths is not re-sent. ([runbook](docs/runbooks/vpp-offload.md#packetframe_vpp_routesstateunresolvable--0), [#380](https://github.com/unredacted/packetframe/pull/380))
 
 ## [0.6.1] - 2026-11-04
