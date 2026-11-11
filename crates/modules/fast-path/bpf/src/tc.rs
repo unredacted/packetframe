@@ -47,6 +47,7 @@ use aya_ebpf::{
     macros::classifier,
     maps::lpm_trie::Key,
     programs::TcContext,
+    EbpfContext,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -119,7 +120,7 @@ fn sample_tc(ctx: &TcContext, stats: StatsPtr, disposition: u32, egress_ifindex:
     if !sample::pending(stats) {
         return;
     }
-    let skb = ctx.skb.skb;
+    let skb = ctx.as_ptr().cast::<aya_ebpf::bindings::__sk_buff>();
     let (len, ifindex, tagged, tci, proto) = unsafe {
         (
             (*skb).len,
@@ -168,7 +169,7 @@ fn tc_try_fast_path(
     // `skb_vlan_untag` before clsact — the inline bytes then hold the
     // untagged frame. The inline parse below only fires when the tag
     // is still in-band (BPF_PROG_TEST_RUN, exotic drivers).
-    let skb = ctx.skb.skb;
+    let skb = ctx.as_ptr().cast::<aya_ebpf::bindings::__sk_buff>();
     let meta_present = unsafe { (*skb).vlan_present } != 0;
     let (inner_ether, ip_offset, ingress_vid) = if meta_present {
         let vid = (unsafe { (*skb).vlan_tci } & 0x0fff) as u16;
@@ -479,7 +480,7 @@ fn tc_forward_success(
     let mut mtu_len: u32 = 0;
     let mtu_rc = unsafe {
         bpf_check_mtu(
-            ctx.skb.skb as *mut core::ffi::c_void,
+            ctx.as_ptr(),
             egress_ifindex,
             &mut mtu_len,
             0,
@@ -578,14 +579,14 @@ pub fn tc_finalize(ctx: TcContext) -> i32 {
     // every packet pointer — nothing below touches packet data.
     if ingress_vid != egress_vid {
         if ingress_vid != VLAN_NONE {
-            let rc = unsafe { bpf_skb_vlan_pop(ctx.skb.skb) };
+            let rc = unsafe { bpf_skb_vlan_pop(ctx.as_ptr().cast()) };
             if rc != 0 {
                 bump(stats, StatIdx::ErrVlan);
                 return TC_ACT_SHOT as i32;
             }
         }
         if egress_vid != VLAN_NONE {
-            let rc = unsafe { bpf_skb_vlan_push(ctx.skb.skb, ETH_P_8021Q_BE, egress_vid) };
+            let rc = unsafe { bpf_skb_vlan_push(ctx.as_ptr().cast(), ETH_P_8021Q_BE, egress_vid) };
             if rc != 0 {
                 bump(stats, StatIdx::ErrVlan);
                 return TC_ACT_SHOT as i32;

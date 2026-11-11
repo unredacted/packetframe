@@ -682,8 +682,9 @@ fn dispatch_fib(
             ip,
             is_v4,
             fib.ifindex,
-            fib.smac,
-            fib.dmac,
+            // SAFETY: a successful kernel lookup filled the MAC union.
+            unsafe { fib.__bindgen_anon_6.__bindgen_anon_2.smac },
+            unsafe { fib.__bindgen_anon_6.__bindgen_anon_2.dmac },
             ingress_vid,
             VLAN_NONE, // kernel-FIB nexthops are never FDB-pinned
         ),
@@ -890,7 +891,8 @@ fn compare_and_bump(
     let agree = if kernel_forwards && packetframe_forwards {
         // Both forward, compare the decision tuple.
         kernel_fib.ifindex == packetframe_fib.egress_ifindex
-            && kernel_fib.dmac == packetframe_fib.dmac
+            // SAFETY: kernel_forwards means the lookup filled the MAC union.
+            && unsafe { kernel_fib.__bindgen_anon_6.__bindgen_anon_2.dmac } == packetframe_fib.dmac
     } else {
         // Both non-forward is "agree" (both defer upstream). Any
         // mix, one forwards while the other doesn't, is disagree.
