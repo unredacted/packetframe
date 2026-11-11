@@ -32,6 +32,10 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 ### Changes
 
+**fast-path**
+
+- A next hop still unresolved 30 s after it was registered or lost is recorded in the event log (`nexthop_resolve_slow`), and again when it resolves (`nexthop_resolved_late`). Each event lists what was asked and what the neighbour resolver did with each request, what the kernel reported, the egress link's state and carrier changes, and the likeliest cause (`reading`). At most 16 an hour, those with the most routes first. On 2026-11-05 a transit next hop resolved minutes late after a reboot, and nothing that said why outlived the journal. ([runbook](docs/runbooks/packetframe-fib.md#slow-next-hops-in-the-event-log), [#382](https://github.com/unredacted/packetframe/pull/382))
+
 **vpp-offload**
 
 - A VPP the daemon spawns keeps its stdout and stderr in `<state-dir>/vpp-diag/`, one file per start, and its runtime directory is there too, so a core can land there (`coredump-size unlimited`, with a core filter that leaves out the hugepage heap). This happens only when no other account can change that path. A death by signal is reported (`vpp_killed`): the signal VPP died of, the fault its own handler logged (`vpp_signal`), and whether it dumped core. Until now, a fresh VPP that crashed under boot load left nothing behind. ([runbook](docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core), [#381](https://github.com/unredacted/packetframe/pull/381))

@@ -2038,6 +2038,61 @@ journalctl -u packetframe | grep "router's own address (local)"
 vpp-offload counts the same routes as kernel-delivered, not unresolvable
 (see the vpp-offload runbook, "Kernel-delivered routes").
 
+#### Slow next hops in the event log
+
+A next hop that stays unresolved for 30 s is recorded in the event log as
+`nexthop_resolve_slow`, and again as `nexthop_resolved_late` when it
+resolves. The clock starts when the next hop is registered (`cause: seed`
+when a route-ledger seed registers it, `new` for a live route) or when a
+resolved one is lost (`lost`). Each unresolved stretch is reported once. At
+most 16 slow events are written an hour, the next hops carrying the most
+routes first, so after a reboot the transits come before small IX peers.
+`slow_nexthops` says how many next hops were past 30 s at the time.
+
+Why: after the 2026-11-05 reboot a transit next hop carrying 486k routes
+resolved minutes late. The programmer had asked for it at the seed's start
+and kept re-probing, but what each request did and what the kernel said
+were only in the journal, which had rotated by morning. Whether restoring
+saved neighbour MACs at a start would be safe depends on that answer.
+
+```sh
+sudo packetframe events --module fast-path --since 1d | grep -E 'nexthop_resolve(_slow|d_late)'
+sudo packetframe events --module fast-path --json | jq 'select(.event == "nexthop_resolve_slow")'
+```
+
+`reading` names the first cause that explains the rest. The readings for
+probes that solicited nothing (`ix-mode` through `requests-failed`) are
+used only when every probe had that outcome:
+
+| `reading` | What it means | Check |
+|---|---|---|
+| `queue-full` | Every request the programmer made found the resolver's queue full (`queue_full`) | The `neigh-resolver` row in `packetframe status`: the queue drains only while its loop runs |
+| `not-served` | Requests were queued (`asked`) but the resolver served none | The resolver was still in its startup read of the kernel, or behind. `first_served_secs` on the later `nexthop_resolved_late` says when it started |
+| `not-applied` | Still unresolved, though the resolver answered `cache_hit` requests from a usable neighbour in its own view and sent it on | The programmer did not settle it: `NEXTHOPS update failed` in the journal |
+| `served-late` | (`nexthop_resolved_late` only.) The resolver's first served request, `first_served_secs` in, found the neighbour in its own view | Nothing was wrong with the neighbour; the resolver was late, as for `not-served` |
+| `link-down` | The egress (`dev`) reads `down`, `lowerlayerdown` or similar now | The port, its cable, and on VPP boxes whether the port was being handed over |
+| `link-flapped` | The egress changed carrier `carrier_changes` times since the first probe named it | Same; a bounce flushes the port's neighbours |
+| `unanswered` | The kernel solicited it on `dev` and gave up `kernel_failed` times | The neighbour is not answering ARP/ND: its session or link may be down, or it filters us. Restoring its saved MAC would have pointed traffic at it |
+| `kick-not-started` | Kicked, but the entry read back right after the kick was `failed` or `no entry` (`kernel`): no solicitation started | `ip neigh show <nexthop>` and the device's neighbour settings (`ucast_solicit`, `mcast_solicit`) |
+| `pending` | Kicked, but the kernel reported neither an answer nor a failure | Notifications lost: the resolver's `overruns` and resyncs |
+| `ix-mode` | Every probe found the egress `ix-mode`, so it is not solicited; the snooper seeds it | The snooper (neigh-snoop runbook) and the peer's traffic on the fabric |
+| `no-route` | Every probe found no route to it | `ip route get <nexthop>`: the connected route goes with its interface |
+| `probes-skipped` | No request socket: one was stuck on `rtnl_lock` and retired | The `neigh-resolver` row in `packetframe status` ("the request socket was retired … ago"); `request_timeouts` and `probes_skipped` in the resolver's stats line |
+| `probes-timed-out` | Every request hit its timeout | Same: `rtnl_lock` held, or replies dropped |
+| `requests-failed` | The kernel refused every kick | The journal at debug for the error |
+| `not-solicited` | No probe solicited it, for more than one of the reasons above; `detail` lists them (`3 skipped, 1 timed out`) | Each one listed |
+
+Other fields:
+- `kernel` is the read-back right after the last kick. `incomplete` is normal there (a solicitation in flight). `failed` or `no entry` means the kick did not start one.
+- `routes` is how many routes use the next hop at that moment; during a seed, the count so far.
+- `asked` counts the requests the programmer queued. `served` and the per-outcome counts are what the resolver did with them; `cache_hit` counts those it answered from its own view without asking the kernel.
+- `kernel_failed` and `kernel_gone` count only reports for the device the probes named (`dev`), once one has.
+- An unspecified next hop (`0.0.0.0`, `::`, a self-originated route) has no neighbour and is never reported.
+
+No `nexthop_resolved_late` follows when the next hop's routes are withdrawn
+first, or the daemon stops. The journal carries the same lines at warn and
+info (`nexthop slow to resolve`).
+
 ### Symptom: nexthops stuck `incomplete` while the kernel neighbour is REACHABLE
 
 What it means: the kernel has resolved the nexthops, but the neighbour

@@ -33,12 +33,14 @@ use std::time::Duration;
 use aya::maps::lpm_trie::Key as LpmKey;
 use aya::maps::{Array, LpmTrie, Map, MapData};
 use aya::Ebpf;
+use packetframe_common::events;
 use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, RouteEvent};
 use packetframe_fast_path::aligned_bpf_copy;
 use packetframe_fast_path::fib::netlink_neigh::NeighborResolveHandle;
 use packetframe_fast_path::fib::programmer::{
     FibProgrammer, ECMP_GROUPS_CAP, RECLAIM_TICK, REPROBE_TICK, WALK_CHUNK,
 };
+use packetframe_fast_path::fib::resolve_watch::{Probe, ProbeLog};
 use packetframe_fast_path::fib::types::{
     EcmpGroup, FibCacheCfg, FibValue, NexthopEntry, NexthopSlotClass, FIB_KIND_ECMP,
     FIB_KIND_SINGLE, NH_FAMILY_V4, NH_FAMILY_V6, NH_STATE_FAILED, NH_STATE_INCOMPLETE,
@@ -456,6 +458,21 @@ impl ProgrammerHarness {
         Arc<RecordingSink>,
         tokio::sync::mpsc::Receiver<IpAddr>,
     ) {
+        let (h, sink, resolves, _) = Self::with_resolver_and_slow_after(None);
+        (h, sink, resolves)
+    }
+
+    /// [`Self::with_sink_and_resolver`], plus the resolver's probe log,
+    /// which the test fills as the resolver would, and the threshold for
+    /// `nexthop_resolve_slow` set to `slow_after` when given.
+    fn with_resolver_and_slow_after(
+        slow_after: Option<Duration>,
+    ) -> (
+        Self,
+        Arc<RecordingSink>,
+        tokio::sync::mpsc::Receiver<IpAddr>,
+        ProbeLog,
+    ) {
         let pins = PinDirs::setup();
         let ebpf = load_and_pin(&pins);
         let nexthops: Array<MapData, NexthopEntry> = open_array(&pins.path("NEXTHOPS"));
@@ -465,6 +482,7 @@ impl ProgrammerHarness {
         let shutdown = CancellationToken::new();
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
         let (resolver, resolve_rx) = NeighborResolveHandle::detached();
+        let probes = resolver.probe_log().clone();
         let (mut programmer, handle) = FibProgrammer::new_with_resolver(
             nexthops,
             fib_v4,
@@ -477,6 +495,9 @@ impl ProgrammerHarness {
         );
         let sink = Arc::new(RecordingSink::default());
         programmer.set_route_sink(sink.clone());
+        if let Some(after) = slow_after {
+            programmer.set_slow_resolve_after(after);
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -494,6 +515,7 @@ impl ProgrammerHarness {
             },
             sink,
             resolve_rx,
+            probes,
         )
     }
 
@@ -3426,6 +3448,127 @@ fn a_reprobe_nudge_asks_again_now_instead_of_at_the_backoff() {
     assert!(
         after.is_empty(),
         "the nudge must not restart the backoff (got {after:?})"
+    );
+}
+
+/// This test binary's event log, installed once in a temp dir. Tests
+/// tell their own events apart by next hop.
+fn event_log() -> &'static Path {
+    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("{TEST_PREFIX}-events-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("event log dir");
+        let path = dir.join("events.log");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            events::install(path.clone(), events::DEFAULT_MAX_BYTES),
+            "nothing else in this binary installs an event log"
+        );
+        path
+    })
+}
+
+/// The recorded events of `kind` about next hop `nh`, oldest first.
+fn nexthop_events(kind: &str, nh: IpAddr) -> Vec<events::Record> {
+    let path = event_log();
+    assert!(
+        events::installed().expect("installed").flush(),
+        "the event log's writer answered"
+    );
+    let want = nh.to_string();
+    let mut out = Vec::new();
+    events::read_each(path, |r| {
+        if r.event == kind && r.fields.get("nexthop").and_then(|v| v.as_str()) == Some(&want) {
+            out.push(r);
+        }
+    })
+    .expect("read the event log");
+    out
+}
+
+/// A next hop the kernel does not answer is recorded once it has waited
+/// past the threshold, with what was asked, what the resolver did and
+/// what the kernel reported; and again when it resolves, with where. A
+/// stretch that resolves in time is never recorded. Why: on 2026-11-05 a
+/// transit next hop stayed unresolved for minutes after a reboot, and
+/// nothing that said why outlived the RAM journal.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_slow_nexthop_is_recorded_with_its_probes_and_again_when_it_resolves() {
+    event_log();
+    let (h, _sink, mut resolves, probes) =
+        ProgrammerHarness::with_resolver_and_slow_after(Some(Duration::from_secs(2)));
+    let nh = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 31));
+    // The loopback is ifindex 1 in every network namespace.
+    let learned = NeighEvent::Learned {
+        ip: nh,
+        mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x31],
+        ifindex: 1,
+        src_mac: [0x02, 0x00, 0x5e, 0x10, 0x00, 0x01],
+    };
+    // A self-originated route's unspecified next hop has no neighbour, so
+    // it is never reported, however long it stays unresolved.
+    let unspecified = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    h.run(async { h.handle.register_nexthop(nh).await })
+        .expect("register_nexthop");
+    h.run(async { h.handle.register_nexthop(unspecified).await })
+        .expect("register_nexthop 0.0.0.0");
+    let mut first = h.drain_resolves(&mut resolves, Duration::from_millis(200));
+    first.sort();
+    assert_eq!(first, vec![unspecified, nh], "allocation kicks each once");
+
+    // Play the resolver and the kernel: the kick went out on `lo`, and the
+    // kernel gave up on the solicitation twice. A failure for the same
+    // address on another interface is not this next hop's.
+    probes.record(nh, Probe::Kicked, std::time::Instant::now());
+    probes.egress(nh, 1, "lo", Some(0));
+    probes.kernel_answer(nh, "incomplete");
+    for ifindex in [1, 1, 4242] {
+        h.feed_neigh(NeighEvent::Failed {
+            ip: nh,
+            ifindex,
+            reason: "kernel marked NUD_FAILED".into(),
+        });
+    }
+
+    // Past the threshold, and several ticks more: reported exactly once.
+    let _ = h.drain_resolves(&mut resolves, Duration::from_millis(3500));
+    let _ = h.drain_resolves(&mut resolves, Duration::from_millis(1500));
+    let slow = nexthop_events(events::kind::NEXTHOP_RESOLVE_SLOW, nh);
+    assert_eq!(slow.len(), 1, "{slow:?}");
+    assert_eq!(slow[0].level, events::Level::Warn);
+    let f = &slow[0].fields;
+    assert_eq!(f["routes"], 1, "{f:?}");
+    assert_eq!(f["cause"], "new", "{f:?}");
+    assert_eq!(f["reading"], "unanswered", "{f:?}");
+    assert_eq!(f["kicked"], 1, "{f:?}");
+    assert_eq!(f["kernel_failed"], 2, "{f:?}");
+    assert_eq!(f["kernel"], "incomplete", "{f:?}");
+    assert_eq!(f["dev"], "lo", "{f:?}");
+    // The kick at allocation, and the re-probe due a second later.
+    assert!(f["asked"].as_u64().unwrap() >= 2, "{f:?}");
+    assert!(f["waited_secs"].as_u64().unwrap() >= 2, "{f:?}");
+
+    // Resolved: recorded with the device, and the tally is ended.
+    h.feed_neigh(learned.clone());
+    let resolved = nexthop_events(events::kind::NEXTHOP_RESOLVED_LATE, nh);
+    assert_eq!(resolved.len(), 1, "{resolved:?}");
+    assert_eq!(resolved[0].fields["resolved_dev"], "lo");
+    assert_eq!(resolved[0].fields["kernel_failed"], 2);
+    assert!(probes.get(&nh).is_none(), "the tally ends with the stretch");
+    assert!(
+        nexthop_events(events::kind::NEXTHOP_RESOLVE_SLOW, unspecified).is_empty(),
+        "an unspecified next hop is never reported"
+    );
+
+    // Lost and re-learned well inside the threshold: nothing more.
+    h.feed_neigh(NeighEvent::Gone { ip: nh, ifindex: 1 });
+    h.feed_neigh(learned);
+    let _ = h.drain_resolves(&mut resolves, Duration::from_millis(3000));
+    assert_eq!(
+        nexthop_events(events::kind::NEXTHOP_RESOLVE_SLOW, nh).len(),
+        1,
+        "a stretch that resolved in time is not reported"
     );
 }
 
