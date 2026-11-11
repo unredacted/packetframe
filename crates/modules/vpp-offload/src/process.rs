@@ -22,8 +22,360 @@
 //! if the pid now belongs to someone else.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// The directory under `state-dir` that holds what each VPP this daemon
+/// spawns leaves behind: its stdout and stderr, one file per start, and
+/// any core it dumps.
+///
+/// Until 2026-11-05 VPP's stdout and stderr went to `/dev/null`, so its
+/// crash backtrace reached only syslog (a RAM journal on the reference
+/// gateway, rotated within minutes under boot load), and no core could
+/// be written. A fresh VPP died twice with SIGABRT while syncing under
+/// load and left nothing to say why. VPP prints a panic, an assertion
+/// or an allocation failure to stderr before it aborts, its fatal-signal
+/// handler's `received signal` line and backtrace reach stderr too (VPP
+/// opens syslog with `LOG_PERROR`), and `state-dir` survives a reboot.
+///
+/// It is also VPP's runtime directory (`unix { runtime-dir … }`), because
+/// VPP `chdir`s into that unconditionally at start: a relative
+/// `core_pattern` drops a core in the process's working directory, which
+/// is therefore here and not `/run/vpp`, a tmpfs gone at the next boot.
+/// Only a directory [`open_diagnostics_dir`] trusts is used for either.
+pub const DIAG_DIR_NAME: &str = "vpp-diag";
+
+/// Output files kept, the newest start's included; older ones are
+/// removed after each successful spawn. A start's file is small (VPP is
+/// quiet on stderr unless something is wrong), so this is a few starts of
+/// history, enough to hold the crash and the start before it.
+pub const DIAG_LOGS_KEPT: usize = 5;
+
+/// Core files kept. With the hugetlb bits cleared from VPP's
+/// `coredump_filter` ([`CORE_FILTER`]) a core is hundreds of megabytes,
+/// not gigabytes, and still holds every thread's stack.
+pub const DIAG_CORES_KEPT: usize = 2;
+
+/// What a spawned VPP's core may hold, written to its
+/// `/proc/<pid>/coredump_filter` (proc(5)): anonymous private and shared
+/// memory and the ELF headers. Not file-backed memory, and not hugetlb,
+/// private or shared: the kernel's default (0x33) includes private
+/// hugetlb, and VPP's heap and buffers live on hugepages, which would make
+/// a core the size of the heap. Leaving `full-coredump` out of the
+/// rendered stanza is not enough on its own.
+pub const CORE_FILTER: &str = "0x13";
+
+/// The entries of a diagnostics directory a pruning removes: output files
+/// beyond the newest [`DIAG_LOGS_KEPT`], and cores beyond the newest
+/// [`DIAG_CORES_KEPT`]. Output files are `vpp-<unix seconds>.log`,
+/// ordered by name; cores are anything named `core*`, ordered by
+/// modification time, whatever the kernel's `core_pattern` appended.
+/// Anything else is left alone: VPP's own runtime files live here too.
+pub fn stale_diagnostics(entries: &[(String, std::time::SystemTime)]) -> Vec<String> {
+    let mut logs: Vec<&String> = entries
+        .iter()
+        .map(|(n, _)| n)
+        .filter(|n| n.starts_with("vpp-") && n.ends_with(".log"))
+        .collect();
+    logs.sort_unstable_by(|a, b| b.cmp(a));
+    let mut cores: Vec<&(String, std::time::SystemTime)> = entries
+        .iter()
+        .filter(|(n, _)| n.starts_with("core"))
+        .collect();
+    cores.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    logs.into_iter()
+        .skip(DIAG_LOGS_KEPT)
+        .chain(cores.into_iter().skip(DIAG_CORES_KEPT).map(|(n, _)| n))
+        .cloned()
+        .collect()
+}
+
+/// The fatal signal VPP's own handler logged, from its output: the last
+/// `received signal <NAME>` line. VPP catches SIGSEGV, SIGBUS, SIGILL,
+/// SIGFPE and the rest, logs them, and ends with `os_exit(1)`, which
+/// calls `abort()`: the wait status reads SIGABRT whatever the fault, so
+/// this is where the original signal survives.
+pub fn received_signal(output: &str) -> Option<String> {
+    let at = output.rfind("received signal ")?;
+    let name: String = output[at + "received signal ".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// A signal's name, for the operator: the ones a crashing or killed VPP
+/// dies of by name, anything else by number.
+pub fn signal_name(sig: i32) -> String {
+    match sig {
+        libc::SIGABRT => "SIGABRT".into(),
+        libc::SIGSEGV => "SIGSEGV".into(),
+        libc::SIGBUS => "SIGBUS".into(),
+        libc::SIGILL => "SIGILL".into(),
+        libc::SIGFPE => "SIGFPE".into(),
+        libc::SIGKILL => "SIGKILL".into(),
+        libc::SIGTERM => "SIGTERM".into(),
+        other => format!("signal {other}"),
+    }
+}
+
+/// A diagnostics directory this root daemon may hand to VPP, held open.
+///
+/// `state-dir` may be a directory an unprivileged user can write
+/// ([`packetframe_common::statefile`]), so a pathname checked once and
+/// used again could be swapped for a link between the two (review
+/// finding, PR #381). The directory is therefore reached by the
+/// state-dir writers' component-wise no-follow walk and used through the
+/// descriptor: listing, pruning and creating the output file are all
+/// relative to it.
+///
+/// VPP itself is given the path (`runtime-dir`), and resolves it again
+/// as root. So the path must also be one no other account can change:
+/// every directory from `/` down to this one owned by root or this
+/// daemon's user, and none writable by anyone else unless it is sticky
+/// and the entry under it is ours (a sticky directory's entries can be
+/// renamed or removed only by their owner). A path like that stays the
+/// same directory for as long as only root and this user change it,
+/// which is why attach checks it once and the spawns that follow reuse
+/// it. Anything else is refused, and VPP runs without diagnostics.
+#[cfg(target_os = "linux")]
+pub struct DiagDir {
+    fd: std::fs::File,
+    path: PathBuf,
+}
+
+/// Open [`DiagDir`] at `dir` (absolute), creating it owner-only, or say
+/// why it is not trusted.
+#[cfg(target_os = "linux")]
+pub fn open_diagnostics_dir(dir: &Path) -> io::Result<DiagDir> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let untrusted = |why: String| io::Error::new(io::ErrorKind::PermissionDenied, why);
+    // SAFETY: geteuid cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let trusted = |uid: u32| uid == 0 || uid == euid;
+    // Created (0755, then 0700 below) before the path is judged: the walk
+    // follows no link, so the worst it does in an untrusted place is make
+    // a directory this function then refuses to use.
+    let fd = packetframe_common::statefile::create_and_open_dir_no_follow(dir)?;
+    // SAFETY: fchmod on a descriptor this function owns.
+    if unsafe { libc::fchmod(fd.as_raw_fd(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut chain = vec![PathBuf::from("/")];
+    for comp in dir.components() {
+        if let std::path::Component::Normal(n) = comp {
+            let next = chain.last().expect("starts with the root").join(n);
+            chain.push(next);
+        }
+    }
+    for pair in chain.windows(2) {
+        let (parent, child) = (&pair[0], &pair[1]);
+        let pm = std::fs::symlink_metadata(parent)?;
+        let cm = std::fs::symlink_metadata(child)?;
+        let others_write = pm.mode() & 0o022 != 0;
+        let sticky = pm.mode() & libc::S_ISVTX != 0;
+        if !trusted(pm.uid()) || (others_write && !(sticky && trusted(cm.uid()))) {
+            return Err(untrusted(format!(
+                "{} can be changed by an account other than root or this daemon's user \
+                 (owner uid {}, mode {:o})",
+                parent.display(),
+                pm.uid(),
+                pm.mode() & 0o7777
+            )));
+        }
+    }
+    let at_path = std::fs::symlink_metadata(dir)?;
+    let held = fd.metadata()?;
+    if !trusted(held.uid()) {
+        return Err(untrusted(format!(
+            "{} is owned by uid {}, not root or this daemon's user",
+            dir.display(),
+            held.uid()
+        )));
+    }
+    if (at_path.dev(), at_path.ino()) != (held.dev(), held.ino()) {
+        return Err(untrusted(format!(
+            "{} changed while it was being checked",
+            dir.display()
+        )));
+    }
+    Ok(DiagDir {
+        fd,
+        path: dir.to_path_buf(),
+    })
+}
+
+/// The diagnostics directory under `state_dir` ([`DIAG_DIR_NAME`]), if
+/// [`open_diagnostics_dir`] trusts it; otherwise `None`, with a warning
+/// saying why. Attach calls this once: the answer decides both the
+/// rendered `unix` stanza (`runtime-dir`, `coredump-size`) and where each
+/// spawn's output goes, so the two always agree.
+pub fn trusted_diagnostics_dir(state_dir: &Path) -> Option<PathBuf> {
+    let dir = state_dir.join(DIAG_DIR_NAME);
+    #[cfg(target_os = "linux")]
+    {
+        // VPP reads `runtime-dir` as one word (`unformat` `%s`).
+        if dir.to_str().is_none_or(|d| d.contains(char::is_whitespace)) {
+            tracing::warn!(
+                dir = %dir.display(),
+                "VPP's diagnostics directory is not a UTF-8 path without spaces, which VPP \
+                 needs; VPP runs without one: its stdout and stderr go nowhere and it dumps \
+                 no core"
+            );
+            return None;
+        }
+        match open_diagnostics_dir(&dir) {
+            Ok(_) => Some(dir),
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "VPP's diagnostics directory is not one this daemon can trust; VPP runs \
+                     without one: its stdout and stderr go nowhere and it dumps no core"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// Run `f` (a spawn) with this process's `coredump_filter` set to
+/// [`CORE_FILTER`], then put the old value back. A child inherits the
+/// filter at fork and keeps it across exec (proc(5)), so VPP starts with
+/// it and no crash, however early, dumps the hugepage heap. Set in the
+/// parent rather than in the child after fork for the reason
+/// `packetframe_common::placement::unplaced` gives. A filter that cannot
+/// be set is a warning: the core may then be the heap's size.
+#[cfg(target_os = "linux")]
+fn with_core_filter<T>(f: impl FnOnce() -> T) -> T {
+    const SELF: &str = "/proc/self/coredump_filter";
+    let old = std::fs::read_to_string(SELF).ok();
+    if let Err(e) = std::fs::write(SELF, CORE_FILTER) {
+        tracing::warn!(
+            error = %e,
+            "could not set the core filter VPP inherits; a core it dumps may include its \
+             hugepage heap"
+        );
+    }
+    let out = f();
+    if let Some(old) = old {
+        // The file reads as bare hex (`00000033`) and is written back
+        // through a base-detecting parse, which takes a leading 0 for
+        // octal: unprefixed, 0x33 would come back as 0x1b.
+        let _ = std::fs::write(SELF, format!("0x{}", old.trim()));
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+impl DiagDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn c_name(name: &str) -> io::Result<std::ffi::CString> {
+        if name.contains('/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a file name",
+            ));
+        }
+        std::ffi::CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "not a file name"))
+    }
+
+    /// Open `vpp-<now_secs>.log` for append, owner-only, relative to the
+    /// directory and never through a link. The name with it. Opened for
+    /// reading too: the reaper reads VPP's last lines from a clone
+    /// ([`received_signal`]).
+    pub fn create_log(&self, now_secs: u64) -> io::Result<(std::fs::File, String)> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let name = format!("vpp-{now_secs}.log");
+        let c = Self::c_name(&name)?;
+        // SAFETY: openat on a directory descriptor we own, with a
+        // NUL-terminated single-component name; the result is a fresh fd.
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: freshly opened above and owned by nothing else.
+        Ok((unsafe { std::fs::File::from_raw_fd(fd) }, name))
+    }
+
+    /// Remove `name` if it is empty: the file of a spawn that failed,
+    /// which would otherwise take a slot from one that holds something
+    /// (review finding, PR #381: a binary that cannot run, retried with
+    /// backoff, made a file a second until the crash's was pruned).
+    pub fn remove_if_empty(&self, name: &str) {
+        if self.stat(name).is_some_and(|st| st.st_size == 0) {
+            self.unlink(name);
+        }
+    }
+
+    /// Remove what [`stale_diagnostics`] names. After a spawn succeeds,
+    /// never before: only a VPP that started takes a slot.
+    pub fn prune(&self) {
+        let Ok(read) = std::fs::read_dir(format!("/proc/self/fd/{}", {
+            use std::os::fd::AsRawFd;
+            self.fd.as_raw_fd()
+        })) else {
+            return;
+        };
+        let entries: Vec<(String, std::time::SystemTime)> = read
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let st = self.stat(&name)?;
+                if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+                    return None;
+                }
+                let mtime = std::time::UNIX_EPOCH
+                    + Duration::from_secs(u64::try_from(st.st_mtime).unwrap_or(0));
+                Some((name, mtime))
+            })
+            .collect();
+        for name in stale_diagnostics(&entries) {
+            self.unlink(&name);
+        }
+    }
+
+    fn stat(&self, name: &str) -> Option<libc::stat> {
+        use std::os::fd::AsRawFd;
+        let c = Self::c_name(name).ok()?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstatat into a zeroed stat, not following a final link.
+        let r = unsafe {
+            libc::fstatat(
+                self.fd.as_raw_fd(),
+                c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        (r == 0).then_some(st)
+    }
+
+    fn unlink(&self, name: &str) {
+        use std::os::fd::AsRawFd;
+        if let Ok(c) = Self::c_name(name) {
+            // SAFETY: unlinkat of one name relative to our descriptor.
+            unsafe { libc::unlinkat(self.fd.as_raw_fd(), c.as_ptr(), 0) };
+        }
+    }
+}
 
 /// Field 22 of `/proc/<pid>/stat` — process start time in clock ticks
 /// since boot. Paired with the pid it is a stable process identity
@@ -189,6 +541,34 @@ mod imp {
         /// reaped and the exit status recovered; an adopted process
         /// has neither.
         child: Option<Child>,
+        /// Where its stdout and stderr go, when we forked it with a
+        /// diagnostics directory ([`super::DIAG_DIR_NAME`]).
+        output: Option<Output>,
+    }
+
+    /// A spawned VPP's output file: its path, for the operator, and a
+    /// descriptor on it, so the reaper reads the last lines without
+    /// resolving the path again.
+    #[derive(Debug)]
+    struct Output {
+        path: std::path::PathBuf,
+        file: fs::File,
+    }
+
+    /// The most of a dead VPP's output read for its handler's line: its
+    /// last words, not a whole long-lived file.
+    const OUTPUT_TAIL: u64 = 64 * 1024;
+
+    impl Output {
+        fn tail(&self) -> String {
+            use std::os::unix::fs::FileExt;
+            let len = self.file.metadata().map_or(0, |m| m.len());
+            let from = len.saturating_sub(OUTPUT_TAIL);
+            let mut buf = vec![0u8; (len - from) as usize];
+            let n = self.file.read_at(&mut buf, from).unwrap_or(0);
+            buf.truncate(n);
+            String::from_utf8_lossy(&buf).into_owned()
+        }
     }
 
     impl VppProcess {
@@ -199,12 +579,73 @@ mod imp {
         /// would signal "exited" immediately and the supervisor would
         /// restart-loop a perfectly healthy VPP.
         pub fn spawn(binary: &Path, conf: &Path) -> io::Result<Self> {
+            Self::spawn_with(binary, conf, None)
+        }
+
+        /// [`Self::spawn`], with its stdout and stderr in a fresh file in
+        /// `diag`, a directory [`super::trusted_diagnostics_dir`] accepted
+        /// at attach ([`super::DIAG_DIR_NAME`]). Its working directory is
+        /// VPP's own business: the rendered `runtime-dir` puts it in the
+        /// same directory, where a relative `core_pattern` drops a core.
+        /// Best effort: a directory that cannot be opened costs the
+        /// output, never the spawn.
+        pub fn spawn_with(binary: &Path, conf: &Path, diag: Option<&Path>) -> io::Result<Self> {
             let mut cmd = command(binary, conf);
+            let mut opened = None;
+            if let Some(dir) = diag {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let ready = super::open_diagnostics_dir(dir).and_then(|d| {
+                    let (file, name) = d.create_log(now)?;
+                    let (out, err) = (file.try_clone()?, file.try_clone()?);
+                    Ok((d, name, file, out, err))
+                });
+                match ready {
+                    Ok((d, name, file, out, err)) => {
+                        cmd.stdout(out).stderr(err);
+                        opened = Some((d, name, file));
+                    }
+                    Err(e) => tracing::warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "VPP's diagnostics directory could not be opened; this VPP's stdout \
+                         and stderr go nowhere"
+                    ),
+                }
+            }
             // This runs on the supervision thread, which may be placed
             // on the control-plane CPUs; VPP must start from the
             // daemon's unplaced mask instead (`placement::unplaced` has
             // why, and why this is not a `pre_exec` hook).
-            let child = packetframe_common::placement::unplaced(|| cmd.spawn())?;
+            // The filter goes with the rendered core limit, which a
+            // diagnostics directory brings, not with whether this spawn's
+            // output file opened: an unlimited limit with the default
+            // filter would dump the hugepage heap.
+            let spawned = if diag.is_some() {
+                super::with_core_filter(|| packetframe_common::placement::unplaced(|| cmd.spawn()))
+            } else {
+                packetframe_common::placement::unplaced(|| cmd.spawn())
+            };
+            // The Command holds the child's copies of the output file;
+            // drop them so the directory is the only thing left open.
+            drop(cmd);
+            let child = match spawned {
+                Ok(c) => c,
+                Err(e) => {
+                    if let Some((d, name, _)) = &opened {
+                        d.remove_if_empty(name);
+                    }
+                    return Err(e);
+                }
+            };
+            let output = opened.map(|(d, name, file)| {
+                d.prune();
+                Output {
+                    path: d.path().join(name),
+                    file,
+                }
+            });
             let pid = child.id() as i32;
 
             // Open the pidfd before anything else can reap the child.
@@ -232,6 +673,7 @@ mod imp {
                 pidfd,
                 origin: Origin::Spawned,
                 child: Some(child),
+                output,
             })
         }
 
@@ -289,6 +731,7 @@ mod imp {
                     pidfd,
                     origin: Origin::Adopted,
                     child: None,
+                    output: None,
                 })),
                 // Recycled pid, or it exited between the two calls.
                 // Refusing costs one restart; accepting would aim
@@ -348,12 +791,65 @@ mod imp {
 
         /// Collect the exit status if we can. Adopted processes return
         /// `None`: init reaped them, and no status is recoverable.
+        ///
+        /// A death by signal is reported here, with the signal and
+        /// whether a core was dumped. The supervisor's
+        /// `ProcessExited { status }` carries the exit code only, which a
+        /// signal death does not have: on 2026-11-05 a fresh VPP's
+        /// `status: None` was all that was left of a SIGABRT.
         fn reap(&mut self) -> Option<i32> {
             let child = self.child.as_mut()?;
             match child.wait() {
-                Ok(status) => status.code(),
+                Ok(status) => {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(sig) = status.signal() {
+                        self.report_signal_death(sig, status.core_dumped());
+                    }
+                    status.code()
+                }
                 Err(_) => None,
             }
+        }
+
+        /// `signal` is the signal the process died of. For a VPP fault
+        /// that is SIGABRT whatever the fault was: VPP's handler catches
+        /// SIGSEGV, SIGBUS and the rest, logs `received signal …`, and
+        /// exits through `abort()` (review finding, PR #381). So the
+        /// signal VPP's handler caught is read back from its output,
+        /// `vpp_signal`, and is `none` when there is no such line (a
+        /// kill, or no output file to read).
+        fn report_signal_death(&self, sig: i32, core_dumped: bool) {
+            let signal = super::signal_name(sig);
+            let output = self.output.as_ref().map_or_else(
+                || "none (no diagnostics directory)".to_string(),
+                |o| o.path.display().to_string(),
+            );
+            let vpp_signal = self
+                .output
+                .as_ref()
+                .and_then(|o| super::received_signal(&o.tail()))
+                .unwrap_or_else(|| "none".to_string());
+            tracing::warn!(
+                pid = self.pid,
+                signal = %signal,
+                vpp_signal = %vpp_signal,
+                core_dumped,
+                output = %output,
+                "VPP died of a signal; vpp_signal is the fault its own handler caught, if \
+                 it logged one. Its last output is in the file named, and a core, if one was \
+                 dumped, in the same directory unless the kernel's core_pattern sends it \
+                 elsewhere"
+            );
+            packetframe_common::events::Event::warn(
+                crate::MODULE_NAME,
+                packetframe_common::events::kind::VPP_KILLED,
+            )
+            .field("pid", i64::from(self.pid))
+            .field("signal", signal)
+            .field("vpp_signal", vpp_signal)
+            .field("core_dumped", core_dumped)
+            .field("output", output)
+            .emit();
         }
 
         /// Send a signal, race-free.
@@ -445,6 +941,9 @@ mod imp {
 
     impl VppProcess {
         pub fn spawn(_binary: &Path, _conf: &Path) -> io::Result<Self> {
+            unsupported()
+        }
+        pub fn spawn_with(_binary: &Path, _conf: &Path, _diag: Option<&Path>) -> io::Result<Self> {
             unsupported()
         }
         pub fn adopt(
@@ -714,5 +1213,229 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let e = got.expect_err("a text file must not spawn");
         assert_eq!(e.raw_os_error(), Some(libc::ENOEXEC), "{e}");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pf-vppdiag-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A pruning keeps the newest output files and the newest cores, by
+    /// name and by age respectively, and touches nothing else in the
+    /// directory (VPP's own runtime files live there too).
+    #[test]
+    fn a_pruning_keeps_the_newest_output_and_cores_and_nothing_else() {
+        let t = |s| std::time::UNIX_EPOCH + Duration::from_secs(s);
+        let mut entries: Vec<(String, std::time::SystemTime)> = (0..7)
+            .map(|i| (format!("vpp-179000000{i}.log"), t(i)))
+            .collect();
+        entries.push(("core.4242".into(), t(100)));
+        entries.push(("core.4243".into(), t(300)));
+        entries.push(("core".into(), t(200)));
+        entries.push(("notes.txt".into(), t(0)));
+        entries.push(("stats.sock".into(), t(0)));
+        let mut gone = stale_diagnostics(&entries);
+        gone.sort();
+        assert_eq!(
+            gone,
+            vec![
+                "core.4242".to_string(),
+                "vpp-1790000000.log".into(),
+                "vpp-1790000001.log".into(),
+            ],
+            "five newest logs kept, the spawn's own among them; two newest cores"
+        );
+        assert!(stale_diagnostics(&entries[..2]).is_empty());
+    }
+
+    /// VPP's fatal-signal handler line, as it reaches stderr through
+    /// syslog's `LOG_PERROR`: the last one wins, and output without one
+    /// (a panic's own text, a kill) names nothing.
+    #[test]
+    fn the_signal_vpp_caught_is_read_from_its_last_handler_line() {
+        let out = "vpp[812]: unix_config:507: couldn't open log '/x'\n\
+                   vpp[812]: received signal SIGBUS, PC 0x7f00, faulting address 0x0\n\
+                   vpp[812]: #0  0x0000ffff8a1c unix_signal_handler + 0x2a4\n\
+                   vpp[812]: received signal SIGSEGV, PC 0xffff, faulting address 0x10\n\
+                   vpp[812]: #0  0x0000ffff8a1c unix_signal_handler + 0x2a4\n";
+        assert_eq!(received_signal(out).as_deref(), Some("SIGSEGV"));
+        assert_eq!(
+            received_signal("vpp[9]: received signal SIGABRT, PC 0x1\n").as_deref(),
+            Some("SIGABRT")
+        );
+        assert_eq!(received_signal("panic: out of memory\n"), None);
+        assert_eq!(received_signal("received signal \n"), None);
+        assert_eq!(received_signal(""), None);
+    }
+
+    #[test]
+    fn a_signal_is_named_when_it_is_a_crash_or_a_kill() {
+        assert_eq!(signal_name(libc::SIGABRT), "SIGABRT");
+        assert_eq!(signal_name(libc::SIGKILL), "SIGKILL");
+        assert_eq!(signal_name(libc::SIGSEGV), "SIGSEGV");
+        assert_eq!(signal_name(64), "signal 64");
+    }
+
+    /// The directory is made owner-only and used through its descriptor:
+    /// the output file is owner-only and opened for append (a second
+    /// spawn in the same second adds to it), an empty one is removed and
+    /// a full one kept, and the pruning works on disk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diagnostics_are_owner_only_and_used_through_the_directory() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("prep");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = root.join(DIAG_DIR_NAME);
+        let d = open_diagnostics_dir(&dir).expect("trusted");
+        assert_eq!(d.path(), dir);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{mode:o}");
+        let (mut f, name) = d.create_log(1_790_000_000).expect("create");
+        assert_eq!(name, "vpp-1790000000.log");
+        f.write_all(b"one\n").unwrap();
+        let path = dir.join(&name);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        let (mut g, again) = d.create_log(1_790_000_000).expect("again");
+        assert_eq!(again, name);
+        g.write_all(b"two\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+
+        d.remove_if_empty(&name);
+        assert!(path.exists(), "a file with output in it is kept");
+        let (_, empty) = d.create_log(1_790_000_001).expect("empty");
+        d.remove_if_empty(&empty);
+        assert!(!dir.join(&empty).exists(), "an empty one is removed");
+
+        for i in 2..8 {
+            std::fs::write(dir.join(format!("vpp-179000000{i}.log")), b"x").unwrap();
+        }
+        std::fs::write(dir.join("stats.sock"), b"").unwrap();
+        d.prune();
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "stats.sock".to_string(),
+                "vpp-1790000003.log".into(),
+                "vpp-1790000004.log".into(),
+                "vpp-1790000005.log".into(),
+                "vpp-1790000006.log".into(),
+                "vpp-1790000007.log".into(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only a path no other account can change is used: a symlink where
+    /// the directory should be is refused rather than followed, and so
+    /// is a parent group or others can write. A sticky one (`/tmp`) is
+    /// fine when the entry under it is ours, which is how these tests
+    /// run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_untrusted_diagnostics_path_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("trust");
+        std::fs::create_dir_all(&root).unwrap();
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("linked");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(open_diagnostics_dir(&link.join(DIAG_DIR_NAME)).is_err());
+        assert!(
+            !real.join(DIAG_DIR_NAME).exists(),
+            "nothing made through the link"
+        );
+
+        let open = root.join("open");
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let e = open_diagnostics_dir(&open.join(DIAG_DIR_NAME))
+            .err()
+            .expect("refused");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert!(trusted_diagnostics_dir(&open).is_none());
+
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            trusted_diagnostics_dir(&open),
+            Some(open.join(DIAG_DIR_NAME)),
+            "the same place, closed to others, is used"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The point of the directory: what a dying VPP prints before it
+    /// aborts survives it, the signal its handler logged can be read
+    /// back, and it starts with the core filter that leaves its hugepage
+    /// heap out, while the daemon's own filter is put back. A stand-in
+    /// shell plays VPP. A spawn prunes only once it has succeeded, and a
+    /// failed one leaves no file behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_spawned_process_writes_its_output_into_the_diagnostics_directory() {
+        let root = scratch("spawn");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = root.join(DIAG_DIR_NAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..6 {
+            std::fs::write(dir.join(format!("vpp-100000000{i}.log")), b"old").unwrap();
+        }
+        let logs = || -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.ends_with(".log"))
+                .collect();
+            v.sort();
+            v
+        };
+
+        let e = VppProcess::spawn_with(Path::new("/nonexistent/vpp"), Path::new("x"), Some(&dir))
+            .expect_err("no such binary");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+        assert_eq!(
+            logs().len(),
+            6,
+            "a failed spawn neither adds a file nor prunes"
+        );
+
+        let filter = || std::fs::read_to_string("/proc/self/coredump_filter").unwrap();
+        let ours = filter();
+        let mut p = VppProcess::spawn_with(
+            Path::new("/bin/sh"),
+            Path::new(
+                "echo panic: out of memory >&2; \
+                 echo 'vpp[1]: received signal SIGSEGV, PC 0x1' >&2; \
+                 cat /proc/self/coredump_filter; kill -ABRT $$",
+            ),
+            Some(&dir),
+        )
+        .expect("spawn a stand-in");
+        assert_eq!(filter(), ours, "the daemon's own filter is put back");
+        let exited = p.poll_exit(Duration::from_secs(10)).expect("poll");
+        assert_eq!(exited, Some(None), "a signal death has no exit code");
+
+        let now = logs();
+        assert_eq!(now.len(), DIAG_LOGS_KEPT, "{now:?}");
+        assert!(!now.contains(&"vpp-1000000000.log".to_string()), "{now:?}");
+        let newest = now.last().unwrap();
+        let out = std::fs::read_to_string(dir.join(newest)).unwrap();
+        assert!(out.contains("panic: out of memory"), "stderr: {out}");
+        assert_eq!(received_signal(&out).as_deref(), Some("SIGSEGV"));
+        assert!(
+            out.lines().any(|l| l.trim() == "00000013"),
+            "VPP starts with the core filter {CORE_FILTER}: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
