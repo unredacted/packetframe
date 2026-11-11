@@ -323,9 +323,16 @@ impl RouteSource for RouteFeed {
     /// back into `pending` — fill-if-absent, and `seq` untouched, for the
     /// reasons [`Self::requeue`] gives: nothing about the source changed.
     /// One pass over the interned sets, then one over the routes that use
-    /// a matching set; bounded by table size, and it runs only when a
-    /// bridge neighbour was placed somewhere new.
+    /// a matching set; bounded by table size, and it runs only when a next
+    /// hop starts reaching a VPP interface it did not reach before (first
+    /// resolution, a return after a loss, a bridge neighbour placed
+    /// somewhere new) or the router's own addresses change.
     fn requeue_via(&self, nexthops: &[IpAddr]) {
+        self.requeue_via_except(nexthops, &|_| false)
+    }
+
+    /// [`Self::requeue_via`], leaving out what `skip` names.
+    fn requeue_via_except(&self, nexthops: &[IpAddr], skip: &dyn Fn(IpPrefix) -> bool) {
         let mut g = self.lock();
         if g.disconnected || nexthops.is_empty() {
             return;
@@ -343,7 +350,7 @@ impl RouteSource for RouteFeed {
         let owed: Vec<(PrefixKey, SetId)> = g
             .routes
             .iter()
-            .filter(|(_, id)| ids.contains(id))
+            .filter(|(k, id)| ids.contains(id) && !skip(IpPrefix::from(**k)))
             .map(|(k, id)| (*k, *id))
             .collect();
         for (key, id) in owed {
@@ -517,6 +524,9 @@ impl RouteSource for std::sync::Arc<RouteFeed> {
     }
     fn requeue_via(&self, nexthops: &[IpAddr]) {
         (**self).requeue_via(nexthops)
+    }
+    fn requeue_via_except(&self, nexthops: &[IpAddr], skip: &dyn Fn(IpPrefix) -> bool) {
+        (**self).requeue_via_except(nexthops, skip)
     }
     fn requeue_within(&self, nets: &[IpPrefix]) {
         (**self).requeue_within(nets)
@@ -1018,6 +1028,23 @@ mod tests {
             f.change_seq(),
             seq + 1,
             "only the withdrawal is source activity"
+        );
+    }
+
+    /// The filtered form leaves out what the engine already owes, and the
+    /// `Arc` the loader boxes forwards it rather than falling back to the
+    /// unfiltered default.
+    #[test]
+    fn requeue_via_except_leaves_out_what_is_already_owed() {
+        let f = std::sync::Arc::new(RouteFeed::new());
+        f.route_resolved(v4(192, 0), &[nh(1)]);
+        f.route_resolved(v4(192, 1), &[nh(1)]);
+        let _ = f.drain_changes(64);
+        let src: &dyn RouteSource = &f;
+        src.requeue_via_except(&[nh(1)], &|p| p == v4(192, 1));
+        assert_eq!(
+            f.drain_changes(64).routes,
+            vec![(v4(192, 0), Some(vec![nh(1)]))]
         );
     }
 

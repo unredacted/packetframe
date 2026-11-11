@@ -8879,3 +8879,161 @@ fn a_reconnect_before_the_release_shuts_the_seeded_fresh_door() {
     assert_eq!(d.state(), State::Syncing, "{seen:?}");
     assert!(!seen.contains(&Event::SyncComplete), "{seen:?}");
 }
+
+/// A neighbour that resolves AFTER the routes through it have drained
+/// (2026-11-05, after a reboot): the drain classified them unresolvable,
+/// and before the fix nothing handed them back when the neighbour arrived
+/// on a plain port — only a bridge placement re-queued — so 486,318 routes
+/// waited for the route source to change each one. The neighbour arriving
+/// must re-queue them, and they install.
+///
+/// And the cheap half: a neighbour lost and re-learned hands back every
+/// route through it again, and the ones VPP still holds through the same
+/// paths must cost no route op at all.
+#[test]
+fn routes_through_a_neighbour_that_resolves_late_are_installed_when_it_does() {
+    use packetframe_vpp_offload::engine::SourceChanges;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type NeighChange = (IpAddr, Option<(String, [u8; 6])>);
+
+    /// The production feed's shape for this: a mirror of routes via one
+    /// next hop, a neighbour the kernel has not resolved yet, and
+    /// `requeue_via` handing the mirror's routes back.
+    struct LateNeighbour {
+        routes: Vec<IpPrefix>,
+        known: Rc<RefCell<bool>>,
+        neigh_pending: Rc<RefCell<Vec<NeighChange>>>,
+        pending: Rc<RefCell<Vec<IpPrefix>>>,
+    }
+    impl RouteSource for LateNeighbour {
+        fn requeue(&self, changes: SourceChanges) {
+            self.neigh_pending.borrow_mut().extend(changes.neighbours);
+            self.pending
+                .borrow_mut()
+                .extend(changes.routes.into_iter().map(|(p, _)| p));
+        }
+        fn requeue_via(&self, nexthops: &[IpAddr]) {
+            if nexthops.contains(&fake_vpp::nh()) {
+                self.pending
+                    .borrow_mut()
+                    .extend(self.routes.iter().copied());
+            }
+        }
+        fn route_count(&self) -> u64 {
+            self.routes.len() as u64
+        }
+        fn change_seq(&self) -> u64 {
+            0
+        }
+        fn backlog(&self) -> u64 {
+            (self.pending.borrow().len() + self.neigh_pending.borrow().len()) as u64
+        }
+        fn drain_changes(&self, max: usize) -> SourceChanges {
+            let neighbours = std::mem::take(&mut *self.neigh_pending.borrow_mut());
+            let mut q = self.pending.borrow_mut();
+            let take = q.len().min(max);
+            SourceChanges {
+                routes: q
+                    .drain(..take)
+                    .map(|p| (p, Some(vec![fake_vpp::nh()])))
+                    .collect(),
+                neighbours,
+            }
+        }
+        fn for_each_route(&self, visit: &mut dyn FnMut(IpPrefix, &[IpAddr])) {
+            for p in &self.routes {
+                visit(*p, &[fake_vpp::nh()]);
+            }
+        }
+        fn for_each_neighbour(&self, visit: &mut dyn FnMut(IpAddr, &str, [u8; 6])) {
+            if *self.known.borrow() {
+                visit(fake_vpp::nh(), "eth4", MAC);
+            }
+        }
+    }
+
+    let routes: Vec<IpPrefix> = (0..6).map(|i| fake_vpp::v4(0, i)).collect();
+    let known = Rc::new(RefCell::new(false));
+    let neigh_pending = Rc::new(RefCell::new(Vec::new()));
+    let fake = Fake::start("late-neighbour");
+    let rt = runtime_with_source(
+        &fake,
+        Box::new(LateNeighbour {
+            routes: routes.clone(),
+            known: Rc::clone(&known),
+            neigh_pending: Rc::clone(&neigh_pending),
+            pending: Rc::new(RefCell::new(Vec::new())),
+        }),
+    );
+    let mut d = Driver::new();
+    let mut now = Instant::now();
+    {
+        let (mut obs, _) = rt.views();
+        use packetframe_vpp_offload::driver::Observe as _;
+        assert!(obs.api_ready());
+    }
+    {
+        let (_, mut fx) = rt.views();
+        d.inject(now, Event::Adopted { steered: false }, &mut fx);
+    }
+    let mut tick_for = |d: &mut Driver, ticks: usize| {
+        let (mut obs, mut fx) = rt.views();
+        for _ in 0..ticks {
+            let t = d.tick(now, &mut obs, &mut fx);
+            for e in rt.take_pending() {
+                d.inject(now, e, &mut fx);
+            }
+            now += t
+                .sleep
+                .unwrap_or(Duration::from_millis(100))
+                .max(Duration::from_millis(1));
+        }
+    };
+    let adds = |fake: &Fake| {
+        fake.drain_events()
+            .into_iter()
+            .filter(|e| matches!(e, fake_vpp::Event::Route(r) if r.is_add))
+            .count()
+    };
+
+    // The table drains with the neighbour unknown: every route
+    // unresolvable — the premise.
+    tick_for(&mut d, 64);
+    let c = rt.status().counts;
+    assert_eq!(c.unresolvable, 6, "the premise: {c:?}");
+    assert_eq!(c.installed, 0, "{c:?}");
+
+    // The kernel resolves it: a plain port, no bridge placement involved.
+    *known.borrow_mut() = true;
+    neigh_pending
+        .borrow_mut()
+        .push((fake_vpp::nh(), Some(("eth4".to_string(), MAC))));
+    let _ = fake.drain_events();
+    tick_for(&mut d, 64);
+    let c = rt.status().counts;
+    assert_eq!(
+        (c.installed, c.unresolvable),
+        (6, 0),
+        "the neighbour arriving must re-queue the routes it makes resolvable: {c:?}"
+    );
+    assert_eq!(adds(&fake), 6, "one add each");
+
+    // Lost and re-learned on the same port and MAC: VPP never stopped
+    // holding the routes through it, so the re-queue sends none of them.
+    neigh_pending.borrow_mut().push((fake_vpp::nh(), None));
+    tick_for(&mut d, 16);
+    neigh_pending
+        .borrow_mut()
+        .push((fake_vpp::nh(), Some(("eth4".to_string(), MAC))));
+    let _ = fake.drain_events();
+    tick_for(&mut d, 64);
+    let c = rt.status().counts;
+    assert_eq!((c.installed, c.unresolvable), (6, 0), "{c:?}");
+    assert_eq!(
+        adds(&fake),
+        0,
+        "a re-learned neighbour re-sent routes VPP already held through it"
+    );
+}

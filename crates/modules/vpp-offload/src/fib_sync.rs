@@ -889,14 +889,14 @@ impl Drainer {
         rest: impl Iterator<Item = (IpPrefix, PendingOp)>,
     ) {
         for f in inflight {
-            ledger.fail_install(f.prefix);
+            ledger.unacknowledged(f.prefix);
             // The ORIGINAL op, so a retry re-classifies from bird's
             // intent rather than replaying a withdrawal we derived
             // from resolution state that may since have changed back.
             pending.requeue(f.prefix, f.original);
         }
         if let Some((prefix, op)) = current {
-            ledger.fail_install(prefix);
+            ledger.unacknowledged(prefix);
             pending.requeue(prefix, op);
         }
         for (prefix, op) in rest {

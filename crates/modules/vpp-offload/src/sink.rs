@@ -1028,7 +1028,7 @@ struct Slot {
     /// through a known path set — its acknowledgement of our own write,
     /// or the previous process's record of the same. Kept across an
     /// in-flight replacement (the old version is still what forwards)
-    /// and cleared by anything that says nothing live remains.
+    /// and cleared if its reply is lost or nothing live remains.
     via: PathSetId,
 }
 
@@ -1464,6 +1464,24 @@ impl RouteLedger {
         match self.state.get(&key).map(|s| s.state) {
             Some(RouteState::Installing { replacing: true }) => {
                 self.set_state(key, RouteState::Installed)
+            }
+            Some(RouteState::Installing { replacing: false }) => {
+                self.clear_state(key);
+            }
+            _ => {}
+        }
+    }
+
+    /// A write lost its acknowledgement: VPP may have applied it before
+    /// the connection failed. Keep an existing route in the verify pool,
+    /// but forget its old paths so neither a delta nor a resync can skip
+    /// the retry based on the last acknowledged version. This includes a
+    /// withdrawal, which leaves the slot `Installed` until its reply.
+    pub fn unacknowledged(&mut self, prefix: IpPrefix) {
+        let key = PrefixKey::from(prefix);
+        match self.state.get(&key).map(|s| s.state) {
+            Some(RouteState::Installed | RouteState::Installing { replacing: true }) => {
+                self.set_slot(key, RouteState::Installed, None, false);
             }
             Some(RouteState::Installing { replacing: false }) => {
                 self.clear_state(key);

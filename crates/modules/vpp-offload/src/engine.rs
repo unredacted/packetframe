@@ -325,6 +325,20 @@ pub trait RouteSource {
     /// inherited a default and silently dropped work.
     fn requeue_via(&self, _nexthops: &[IpAddr]) {}
 
+    /// [`Self::requeue_via`], leaving out every prefix `skip` names: the
+    /// engine passes the prefixes it already owes, which it will judge
+    /// against the new mapping when it drains them anyway. Without it a
+    /// neighbour arriving in the same batch as its own routes queued each
+    /// of them twice.
+    ///
+    /// Defaults to [`Self::requeue_via`] unfiltered, which is correct and
+    /// only less frugal. `Arc<RouteFeed>` forwards it explicitly, for the
+    /// reason `requeue` has no default.
+    fn requeue_via_except(&self, nexthops: &[IpAddr], skip: &dyn Fn(IpPrefix) -> bool) {
+        let _ = skip;
+        self.requeue_via(nexthops)
+    }
+
     /// Queue every route whose prefix lies inside any of `nets` (equal to
     /// one included) to be judged again.
     ///
@@ -1155,9 +1169,12 @@ pub struct ConvergenceEngine {
     bd_members: std::collections::BTreeMap<u16, std::collections::BTreeSet<u32>>,
     /// Neighbours moved behind a different bridge port since start.
     placement_moves: u64,
-    /// Bridge neighbours whose placement the delta path just changed,
-    /// for `apply_changes` to hand to [`RouteSource::requeue_via`].
-    placement_changed: Vec<IpAddr>,
+    /// Next hops the delta path just made reach a VPP interface they did
+    /// not reach before — for the first time, again after a loss, through
+    /// another interface, or (bridge neighbours) behind another port — for
+    /// `apply_changes` to hand to [`RouteSource::requeue_via`]: every route
+    /// through one was judged against the old answer.
+    requeue_nexthops: Vec<IpAddr>,
     /// Static neighbours VPP has ACKNOWLEDGED holding, keyed by
     /// `(sw_if_index, nexthop)` with the MAC as the value.
     ///
@@ -1356,7 +1373,7 @@ impl ConvergenceEngine {
             l2fib_of: std::collections::HashMap::new(),
             bd_members: std::collections::BTreeMap::new(),
             placement_moves: 0,
-            placement_changed: Vec::new(),
+            requeue_nexthops: Vec::new(),
             neighbours_installed: std::collections::HashMap::new(),
             neighbours_unacked: std::collections::HashSet::new(),
             ip6_ready: std::collections::BTreeSet::new(),
@@ -4275,9 +4292,6 @@ impl ConvergenceEngine {
                 return Err(e);
             }
         }
-        if !self.placement_changed.is_empty() {
-            src.requeue_via(&std::mem::take(&mut self.placement_changed));
-        }
         let families = self.drainer.families();
         self.fib_match_budget = FIB_MATCH_BUDGET_DELTA;
         self.fib_match_spent = Duration::ZERO;
@@ -4310,6 +4324,18 @@ impl ConvergenceEngine {
                 Some(v) => {
                     self.kernel_delivered.remove(&prefix);
                     match scope_nexthops(prefix, &v) {
+                        // VPP holds it through exactly these paths already:
+                        // the delta is a replace with itself, and anything
+                        // owed from before is an older intent. Skipped as
+                        // the resync walk skips it, which is what keeps a
+                        // re-queue cheap: a neighbour re-learned after a
+                        // loss hands back every route through it, and the
+                        // ones VPP never stopped holding cost this check,
+                        // not an API call each.
+                        Some(scoped) if self.installed_unchanged(prefix, &scoped) => {
+                            self.link_local_refused.remove(&prefix);
+                            self.pending.discard(prefix);
+                        }
                         Some(scoped) => {
                             self.link_local_refused.remove(&prefix);
                             self.pending.upsert(prefix, scoped.into_owned());
@@ -4329,6 +4355,13 @@ impl ConvergenceEngine {
                     self.pending.withdraw(prefix);
                 }
             }
+        }
+        // After the batch's routes, so the ones it carried are already
+        // owed here and are not handed back a second time.
+        if !self.requeue_nexthops.is_empty() {
+            let nexthops = std::mem::take(&mut self.requeue_nexthops);
+            let pending = &self.pending;
+            src.requeue_via_except(&nexthops, &|p| pending.owes(p));
         }
         Ok(n)
     }
@@ -4388,15 +4421,32 @@ impl ConvergenceEngine {
                 if let Some(idx) = old.filter(|o| Some(*o) != new) {
                     self.moved_from.push((idx, nh));
                 }
+                // Reaching a VPP interface it did not reach before: for the
+                // first time, again after a loss, through another
+                // interface, or (a bridge neighbour) behind another port.
+                // Every route through it was judged against the old
+                // answer — classified unresolvable, or installed on the old
+                // interface — and nothing about the routes themselves
+                // changed, so the route source would never re-announce
+                // them. They are handed back to be judged again.
+                //
+                // Every kind of device, not only bridge placements. Until
+                // 2026-11-05 only a placement re-queued, so a plain port's
+                // next hop that resolved after its routes had drained left
+                // them unresolvable until the route source happened to
+                // change each one: 486,318 routes via a transit whose
+                // neighbour arrived seconds late, after a reboot, recovered
+                // at the pace of the BGP replay's churn (tens to hundreds a
+                // second) and held the first steer for twenty minutes.
+                // Routes VPP already holds through the same paths (a
+                // neighbour re-learned after a loss) cost a map pass and no
+                // VPP op (`apply_changes`).
+                if new.is_some() && old != new {
+                    self.requeue_nexthops.push(nh);
+                }
                 if let Some(port) = placed {
-                    // Placed somewhere new — moved, or seen in the FDB for
-                    // the first time: its routes were installed on the old
-                    // subif or not at all, and need re-programming.
-                    if new.is_some() && old != new {
-                        if old.is_some() {
-                            self.placement_moves += 1;
-                        }
-                        self.placement_changed.push(nh);
+                    if new.is_some() && old != new && old.is_some() {
+                        self.placement_moves += 1;
                     }
                     self.nexthops.place(nh, port);
                 }
