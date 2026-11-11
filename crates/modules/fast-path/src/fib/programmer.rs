@@ -69,6 +69,7 @@ use crate::fib::local_nexthops::{
     awaiting_summary, kernel_local_addrs, LocalNexthops, NeighVerdict, SlotAction,
 };
 use crate::fib::netlink_neigh::NeighborResolveHandle;
+use crate::fib::resolve_watch::{self, ifname, Budget, Cause, Episode, Report};
 use crate::fib::route_ledger::{
     AdvertRef, LedgerAdvert, LedgerCounts, LedgerEncoder, LedgerMeta, RouteCursor, RouteLedger,
     SeedReport, SharedLedgerStatus, StartReport,
@@ -985,6 +986,11 @@ pub struct FibProgrammer {
     reprobe_losses: u64,
     reprobe_recoveries: u64,
     reprobe_last_stats: Instant,
+    /// Rate limit on `nexthop_resolve_slow` events ([`resolve_watch`]).
+    slow_budget: Budget,
+    /// How long a nexthop stays unresolved before it is reported slow:
+    /// [`resolve_watch::SLOW_AFTER`] ([`Self::set_slow_resolve_after`]).
+    slow_after: Duration,
     /// Registered nexthops that are the router's own addresses, which
     /// the kernel never resolves and nothing re-probes
     /// ([`super::local_nexthops`]). Re-read with every re-probe summary.
@@ -995,6 +1001,10 @@ pub struct FibProgrammer {
     /// [`Self::set_seed`]) and applied in [`SEED_CHUNK`]s at the top of
     /// the run loop. `None` once applied.
     seed: Option<PendingSeed>,
+    /// True while [`Self::seed_chunk`] runs, so a nexthop it registers is
+    /// known to be one the last stop saved (the pending seed is taken out
+    /// of `seed` for the chunk's length).
+    seeding: bool,
     /// Route-source advertisements currently `seen_this_session = false`:
     /// seeded and not yet re-advertised, or inherited across a `Resync`.
     /// Maintained at every site that inserts, replaces or removes an
@@ -1094,11 +1104,14 @@ pub struct EncodedLedger {
     pub took: Duration,
 }
 
-/// One pending re-probe. `attempts` drives the backoff.
-#[derive(Debug, Clone, Copy)]
+/// One pending re-probe. `attempts` drives the backoff; `episode` is the
+/// unresolved stretch it belongs to, for the slow-resolution events
+/// ([`resolve_watch`]).
+#[derive(Debug, Clone)]
 struct Reprobe {
     due: Instant,
     attempts: u32,
+    episode: Episode,
 }
 
 impl FibProgrammer {
@@ -1241,8 +1254,11 @@ impl FibProgrammer {
                 reprobe_losses: 0,
                 reprobe_recoveries: 0,
                 reprobe_last_stats: Instant::now(),
+                slow_budget: Budget::default(),
+                slow_after: resolve_watch::SLOW_AFTER,
                 local: LocalNexthops::new(kernel_local_addrs()),
                 seed: None,
+                seeding: false,
                 unseen_session: 0,
                 unconfirmed_since: None,
                 walk: None,
@@ -1323,6 +1339,14 @@ impl FibProgrammer {
     /// every origin programmed before it.
     pub fn set_asn_table(&mut self, table: Arc<packetframe_common::fib::asn::AsnTable>) {
         self.asn_table = Some(table);
+    }
+
+    /// How long a nexthop may stay unresolved before it is reported as
+    /// `nexthop_resolve_slow`. Production keeps
+    /// [`resolve_watch::SLOW_AFTER`]; the integration tests shorten it
+    /// rather than wait half a minute.
+    pub fn set_slow_resolve_after(&mut self, after: Duration) {
+        self.slow_after = after;
     }
 
     /// Main event loop. Drains NeighEvents + Commands + the reclaim
@@ -1522,6 +1546,12 @@ impl FibProgrammer {
     /// Apply the next [`SEED_CHUNK`] routes of the pending seed, finishing
     /// it when the ledger runs out.
     fn seed_chunk(&mut self) {
+        self.seeding = true;
+        self.seed_chunk_inner();
+        self.seeding = false;
+    }
+
+    fn seed_chunk_inner(&mut self) {
         let Some(mut p) = self.seed.take() else {
             return;
         };
@@ -2192,14 +2222,20 @@ impl FibProgrammer {
         // already-stable REACHABLE. Pre-fix, ~95 % of BGP nexthops
         // stayed `incomplete` forever and forwarding silently fell
         // back to XDP_PASS for those routes.
-        if let Some(h) = &self.neigh_handle {
-            h.request_resolve(ip);
-        }
+        let enqueued = self.neigh_handle.as_ref().map(|h| h.request_resolve(ip));
         // And keep asking until the kernel answers. The kick above can
         // land on nothing (no route yet, IX-mode egress, resolver queue
         // full) and the kernel never volunteers a resolution for an
         // address it has no reason to send to.
-        self.arm_reprobe(ip);
+        let cause = if self.seeding {
+            Cause::Seed
+        } else {
+            Cause::New
+        };
+        self.arm_reprobe(ip, cause);
+        if let (Some(enqueued), Some(r)) = (enqueued, self.reprobe.get_mut(&ip)) {
+            r.episode.requested(enqueued);
+        }
 
         Ok(id)
     }
@@ -2208,16 +2244,19 @@ impl FibProgrammer {
     /// existing entry keeps its backoff: a neighbour that flaps
     /// `Failed`→`Incomplete`→`Failed` must not have its timer reset by
     /// each transition, or a dead one would be probed as fast as the
-    /// kernel can report failures.
-    fn arm_reprobe(&mut self, ip: IpAddr) {
+    /// kernel can report failures. It keeps its episode too, so `cause`
+    /// only names a stretch that starts here.
+    fn arm_reprobe(&mut self, ip: IpAddr, cause: Cause) {
         // Never for the router's own address: nothing will answer, and
         // the summary would count it as chronic forever.
         if self.local.is_local(&ip) {
             return;
         }
+        let now = Instant::now();
         self.reprobe.entry(ip).or_insert(Reprobe {
-            due: Instant::now() + REPROBE_INITIAL,
+            due: now + REPROBE_INITIAL,
             attempts: 0,
+            episode: Episode::new(now, cause),
         });
     }
 
@@ -2273,6 +2312,9 @@ impl FibProgrammer {
                 None => true,
             };
             if !enqueued {
+                if let Some(r) = self.reprobe.get_mut(&ip) {
+                    r.episode.requested(false);
+                }
                 debug!(
                     ?ip,
                     "resolver queue full; remaining re-probes stay due for the next tick"
@@ -2280,6 +2322,7 @@ impl FibProgrammer {
                 break;
             }
             if let Some(r) = self.reprobe.get_mut(&ip) {
+                r.episode.requested(true);
                 r.attempts = r.attempts.saturating_add(1);
                 // 1, 2, 4, … s, capped: `min(6)` keeps the shift in
                 // range and 64 s already exceeds the cap.
@@ -2295,6 +2338,7 @@ impl FibProgrammer {
                 );
             }
         }
+        self.report_slow(now);
         // Once a minute: re-read which nexthops are the router's own, then
         // summarise the ones genuinely awaiting resolution. Local ones are
         // not among them — the line used to fire every minute forever on
@@ -2302,6 +2346,12 @@ impl FibProgrammer {
         if now.duration_since(self.reprobe_last_stats) >= REPROBE_STATS_INTERVAL {
             self.reprobe_last_stats = now;
             self.refresh_local();
+            // A request the resolver served after the nexthop resolved or
+            // went leaves a tally nothing will take. Only unresolved
+            // nexthops need one.
+            if let Some(h) = &self.neigh_handle {
+                h.probe_log().retain(|ip| self.reprobe.contains_key(ip));
+            }
             let (pending, chronic) = awaiting_summary(
                 self.reprobe.iter().map(|(ip, r)| (ip, r.attempts)),
                 &self.local,
@@ -2319,6 +2369,111 @@ impl FibProgrammer {
                 );
             }
         }
+    }
+
+    /// Report nexthops unresolved for `slow_after` ([`resolve_watch::SLOW_AFTER`]) as
+    /// `nexthop_resolve_slow`, those carrying the most routes first, within
+    /// the event budget. Each is reported once per unresolved stretch; one
+    /// the budget held back is reported when it allows, with its wait so
+    /// far. See [`resolve_watch`].
+    fn report_slow(&mut self, now: Instant) {
+        if !self.slow_budget.available(now) {
+            return;
+        }
+        let mut slow_now = 0usize;
+        let mut candidates = Vec::new();
+        for (ip, r) in &self.reprobe {
+            // An unspecified next hop (`0.0.0.0`, `::`: a self-originated
+            // route) has no neighbour to resolve; the resolver answers its
+            // requests with nothing, by design.
+            if ip.is_unspecified() || r.episode.waited(now) < self.slow_after {
+                continue;
+            }
+            slow_now += 1;
+            if r.episode.is_slow(now, self.slow_after) {
+                candidates.push((*ip, self.by_ip.get(ip).map_or(0, |rec| rec.refcount)));
+            }
+        }
+        for (ip, routes) in resolve_watch::by_routes(candidates) {
+            if !self.slow_budget.admit(now) {
+                break;
+            }
+            let tally = self
+                .neigh_handle
+                .as_ref()
+                .and_then(|h| h.probe_log().get(&ip));
+            let link = tally
+                .as_ref()
+                .and_then(|t| t.dev.as_deref())
+                .map(resolve_watch::read_link);
+            let Some(r) = self.reprobe.get_mut(&ip) else {
+                continue;
+            };
+            r.episode.reported = true;
+            let report = Report {
+                nexthop: ip,
+                routes,
+                episode: &r.episode,
+                tally: tally.as_ref(),
+                link: link.as_ref(),
+                now,
+                resolved: false,
+            };
+            let reading = report.reading();
+            warn!(
+                nexthop = %ip,
+                routes,
+                waited_secs = r.episode.waited(now).as_secs(),
+                reading = reading.code(),
+                dev = tally.as_ref().and_then(|t| t.dev.as_deref()).unwrap_or("none"),
+                slow_nexthops = slow_now,
+                "nexthop slow to resolve: {}; recorded as nexthop_resolve_slow",
+                reading.sentence(tally.as_ref().and_then(|t| t.dev.as_deref()).unwrap_or("none")),
+            );
+            report.slow_event(crate::MODULE_NAME, slow_now).emit();
+        }
+    }
+
+    /// `nexthop_resolved_late` for a nexthop whose stretch was reported
+    /// slow, now resolved on `ifindex`.
+    fn report_resolved(
+        &self,
+        ip: IpAddr,
+        episode: &Episode,
+        tally: Option<&resolve_watch::ProbeTally>,
+        ifindex: u32,
+    ) {
+        let now = Instant::now();
+        let routes = self.by_ip.get(&ip).map_or(0, |rec| rec.refcount);
+        let link = tally
+            .and_then(|t| t.dev.as_deref())
+            .map(resolve_watch::read_link);
+        let dev = ifname(ifindex);
+        let report = Report {
+            nexthop: ip,
+            routes,
+            episode,
+            tally,
+            link: link.as_ref(),
+            now,
+            resolved: true,
+        };
+        info!(
+            nexthop = %ip,
+            routes,
+            waited_secs = episode.waited(now).as_secs(),
+            reading = report.reading().code(),
+            dev = %dev,
+            "a nexthop reported slow resolved; recorded as nexthop_resolved_late"
+        );
+        report.resolved_event(crate::MODULE_NAME, &dev).emit();
+    }
+
+    /// Take the resolver's tally for `ip`: its unresolved stretch ended.
+    fn take_tally(&self, ip: &IpAddr) -> Option<resolve_watch::ProbeTally> {
+        self.neigh_handle
+            .as_ref()
+            .and_then(|h| h.probe_log().take(ip))
     }
 
     /// Re-read the router's addresses and move nexthops in or out of
@@ -2342,10 +2497,11 @@ impl FibProgrammer {
             match action {
                 SlotAction::ForgetResolution(ip) => self.forget_resolution(ip),
                 SlotAction::Resolve(ip) => {
-                    if let Some(h) = &self.neigh_handle {
-                        h.request_resolve(ip);
+                    let enqueued = self.neigh_handle.as_ref().map(|h| h.request_resolve(ip));
+                    self.arm_reprobe(ip, Cause::New);
+                    if let (Some(enqueued), Some(r)) = (enqueued, self.reprobe.get_mut(&ip)) {
+                        r.episode.requested(enqueued);
                     }
-                    self.arm_reprobe(ip);
                 }
             }
         }
@@ -2374,6 +2530,7 @@ impl FibProgrammer {
     /// the second tier hears it lost, as on `Gone`.
     fn forget_resolution(&mut self, ip: IpAddr) {
         self.reprobe.remove(&ip);
+        self.take_tally(&ip);
         let Some(rec) = self.by_ip.get_mut(&ip) else {
             return;
         };
@@ -2422,8 +2579,10 @@ impl FibProgrammer {
         self.by_id.remove(&id);
         self.seq_by_id.remove(&id);
         self.free_ids.push(id);
-        // Nothing routes through it any more, so nothing to recover.
+        // Nothing routes through it any more, so nothing to recover. A
+        // stretch reported slow ends without `nexthop_resolved_late`.
         self.reprobe.remove(&ip);
+        self.take_tally(&ip);
         self.local.unregister(&ip);
 
         // The second tier's LAST chance to hear about this address.
@@ -2545,6 +2704,11 @@ impl FibProgrammer {
             NeighEvent::Learned { mac, ifindex, .. } => Some((*mac, *ifindex)),
             NeighEvent::Failed { .. } | NeighEvent::Gone { .. } => None,
         };
+        let kernel_failed = matches!(evt, NeighEvent::Failed { .. });
+        let event_ifindex = match &evt {
+            NeighEvent::Failed { ifindex, .. } | NeighEvent::Gone { ifindex, .. } => Some(*ifindex),
+            NeighEvent::Learned { .. } => None,
+        };
 
         let entry = match evt {
             NeighEvent::Learned {
@@ -2637,8 +2801,12 @@ impl FibProgrammer {
         // real waiting, so a GC-cycling neighbour shows up in the
         // journal without owning it; the once-a-minute summary in
         // `fire_due_reprobes` carries the totals.
-        if learned.is_some() {
+        if let Some((_, learned_on)) = learned {
             if written {
+                // The unresolved stretch ends here, and with it the
+                // resolver's tally of it; one reported slow is reported
+                // resolved.
+                let tally = self.take_tally(&ip);
                 if let Some(r) = self.reprobe.remove(&ip) {
                     if r.attempts > 0 {
                         self.reprobe_recoveries += 1;
@@ -2649,6 +2817,9 @@ impl FibProgrammer {
                                 "nexthop re-resolved after re-probing; back on the fast path"
                             );
                         }
+                    }
+                    if r.episode.reported {
+                        self.report_resolved(ip, &r.episode, tally.as_ref(), learned_on);
                     }
                 }
             } else {
@@ -2663,10 +2834,10 @@ impl FibProgrammer {
                 if let Some(rec) = self.by_ip.get_mut(&ip) {
                     rec.live = None;
                 }
-                self.arm_reprobe(ip);
+                self.arm_reprobe(ip, Cause::Lost);
             }
         } else {
-            if live_before.is_some() {
+            let cause = if live_before.is_some() {
                 self.reprobe_losses += 1;
                 if self.reprobe_losses <= 20 {
                     info!(
@@ -2676,8 +2847,35 @@ impl FibProgrammer {
                          a re-probe succeeds (backoff 1 s → 60 s)"
                     );
                 }
+                // A new stretch starts: whatever the resolver counted
+                // before the last `Learned` is not this one's.
+                self.take_tally(&ip);
+                Cause::Lost
+            } else {
+                Cause::New
+            };
+            self.arm_reprobe(ip, cause);
+            // Counted only for the device the requests are probing. An
+            // unresolved slot has no live device for the guard above to
+            // compare, so a failure for the same address on another
+            // interface (a second bridge, a management port) would
+            // otherwise read as this next hop going unanswered. Before
+            // any probe named an egress, there is nothing to tell them
+            // apart by, and it counts.
+            let probed = self
+                .neigh_handle
+                .as_ref()
+                .and_then(|h| h.probe_log().oif(&ip));
+            let elsewhere = live_before.is_none()
+                && matches!((probed, event_ifindex), (Some(p), Some(e)) if p != e);
+            if let Some(r) = self.reprobe.get_mut(&ip).filter(|_| !elsewhere) {
+                let n = if kernel_failed {
+                    &mut r.episode.kernel_failed
+                } else {
+                    &mut r.episode.kernel_gone
+                };
+                *n = n.saturating_add(1);
             }
-            self.arm_reprobe(ip);
         }
 
         // Announced regardless of whether that write landed, which is the

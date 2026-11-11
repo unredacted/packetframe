@@ -111,6 +111,7 @@ use crate::fib::neigh_supervision::{
     SupervisionTiming, DUMP_TIMEOUT, REQUEST_TIMEOUT,
 };
 use crate::fib::programmer::FibProgrammerHandle;
+use crate::fib::resolve_watch::{self, Probe, ProbeLog};
 
 /// Operator-declared local prefix (v0.2.1 connected fast-path). The
 /// resolver walks the kernel neighbour table for IPs falling in `cidr`
@@ -294,6 +295,10 @@ const CONFIRM_BUDGET: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 pub struct NeighborResolveHandle {
     resolve_tx: mpsc::Sender<IpAddr>,
+    /// What the resolver did with the requests it served, per unresolved
+    /// nexthop, for the programmer's slow-resolution events
+    /// ([`super::resolve_watch`]).
+    probes: ProbeLog,
 }
 
 impl NeighborResolveHandle {
@@ -301,10 +306,22 @@ impl NeighborResolveHandle {
     /// its queue. For harnesses that drive a `FibProgrammer` and want
     /// to observe *what* it asks to have resolved (and when) without
     /// running netlink; production always gets its handle from
-    /// [`NetlinkNeighborResolver::new`].
+    /// [`NetlinkNeighborResolver::new`]. Its [`ProbeLog`] is the
+    /// harness's to fill.
     pub fn detached() -> (Self, mpsc::Receiver<IpAddr>) {
         let (resolve_tx, resolve_rx) = mpsc::channel(RESOLVE_QUEUE_CAPACITY);
-        (Self { resolve_tx }, resolve_rx)
+        (
+            Self {
+                resolve_tx,
+                probes: ProbeLog::default(),
+            },
+            resolve_rx,
+        )
+    }
+
+    /// The resolver's per-nexthop account of the requests it served.
+    pub fn probe_log(&self) -> &ProbeLog {
+        &self.probes
     }
 
     /// Request proactive resolution of `ip`. Non-blocking. Returns
@@ -330,6 +347,8 @@ impl NeighborResolveHandle {
 pub struct NetlinkNeighborResolver {
     events_tx: mpsc::Sender<NeighEvent>,
     resolve_rx: mpsc::Receiver<IpAddr>,
+    /// Shared with the handle: what each served request did.
+    probes: ProbeLog,
     shutdown: CancellationToken,
     /// Diagnostic counters (Phase 3.9 debug). Logged periodically so
     /// the operator can see whether register_nexthop calls are
@@ -644,9 +663,9 @@ pub enum ProbeOutcome {
     /// `RTM_NEWNEIGH NTF_USE` was accepted for the neighbour on `oif`;
     /// the kernel is soliciting (or already had it, see `read_back`).
     Kicked { oif: u32 },
-    /// The neighbour write failed (logged at debug; first-packet ARP
-    /// remains the fallback).
-    Failed,
+    /// The neighbour write on `oif` failed (logged at debug; first-packet
+    /// ARP remains the fallback).
+    Failed { oif: u32 },
     /// The route lookup found no unicast egress.
     NoRoute,
     /// Unspecified nexthop: nothing to resolve.
@@ -656,7 +675,12 @@ pub enum ProbeOutcome {
     Suppressed { oif: u32 },
     /// A request hit [`REQUEST_TIMEOUT`] at `stage`. The nexthop is left
     /// for the programmer's next re-probe and the request socket retired.
-    TimedOut { stage: &'static str },
+    /// `oif` is the egress when the route lookup had already named one
+    /// (the kick timed out), `None` when the lookup itself did.
+    TimedOut {
+        stage: &'static str,
+        oif: Option<u32>,
+    },
 }
 
 impl NetlinkNeighborResolver {
@@ -670,10 +694,12 @@ impl NetlinkNeighborResolver {
     ) -> (Self, mpsc::Receiver<NeighEvent>, NeighborResolveHandle) {
         let (events_tx, events_rx) = mpsc::channel(EVENTS_CAPACITY);
         let (resolve_tx, resolve_rx) = mpsc::channel(RESOLVE_QUEUE_CAPACITY);
+        let probes = ProbeLog::default();
         (
             Self {
                 events_tx,
                 resolve_rx,
+                probes: probes.clone(),
                 shutdown,
                 iface_mac: HashMap::new(),
                 iface_to_ifindex: HashMap::new(),
@@ -714,7 +740,7 @@ impl NetlinkNeighborResolver {
                 subscription: None,
             },
             events_rx,
-            NeighborResolveHandle { resolve_tx },
+            NeighborResolveHandle { resolve_tx, probes },
         )
     }
 
@@ -1142,6 +1168,11 @@ impl NetlinkNeighborResolver {
             // the Learned that triggers the entry write; the pins map is
             // consulted at write time, so send it first.
             self.maybe_send_pin(ip, ifindex, mac);
+            // Counted even though nothing was asked of the kernel: a
+            // stretch that stays unresolved through cache hits was found
+            // here and not settled by the programmer.
+            self.probes.record(ip, Probe::CacheHit, Instant::now());
+            self.tally_egress(ip, ifindex);
             if self.send_learned(ip, ifindex, mac).await {
                 self.synth_learned_emitted += 1;
             }
@@ -1156,12 +1187,14 @@ impl NetlinkNeighborResolver {
         // Best-effort proactive resolve. If the route lookup or neighbor
         // add fails, log at debug and fall back to first-packet kernel ARP.
         let Some(handle) = self.requester(Duration::ZERO).await else {
+            self.probes.record(ip, Probe::Skipped, Instant::now());
             self.probe_skipped(ip);
             return;
         };
         let ix_oifs = self.ix_oifs();
         let outcome = issue_proactive_resolve(&handle, ip, &ix_oifs).await;
         self.status.beat();
+        self.tally_probe(ip, outcome);
         match outcome {
             ProbeOutcome::Suppressed { oif } => {
                 let n = self.ix_probe_suppressed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1185,9 +1218,44 @@ impl NetlinkNeighborResolver {
             ProbeOutcome::Kicked { oif } => {
                 self.read_back(&handle, ip, oif).await;
             }
-            ProbeOutcome::TimedOut { stage } => self.request_timed_out(stage),
-            ProbeOutcome::Failed | ProbeOutcome::NoRoute | ProbeOutcome::Unspecified => {}
+            ProbeOutcome::TimedOut { stage, .. } => self.request_timed_out(stage),
+            ProbeOutcome::Failed { .. } | ProbeOutcome::NoRoute | ProbeOutcome::Unspecified => {}
         }
+    }
+
+    /// Count one served request in `ip`'s tally, with the egress it named
+    /// and that egress's carrier count, for the programmer's
+    /// slow-resolution events.
+    fn tally_probe(&self, ip: IpAddr, outcome: ProbeOutcome) {
+        let (probe, oif) = match outcome {
+            ProbeOutcome::Kicked { oif } => (Probe::Kicked, Some(oif)),
+            ProbeOutcome::Suppressed { oif } => (Probe::Suppressed, Some(oif)),
+            ProbeOutcome::TimedOut { oif, .. } => (Probe::TimedOut, oif),
+            ProbeOutcome::NoRoute => (Probe::NoRoute, None),
+            ProbeOutcome::Failed { oif } => (Probe::Failed, Some(oif)),
+            ProbeOutcome::Unspecified => return,
+        };
+        self.probes.record(ip, probe, Instant::now());
+        if let Some(oif) = oif {
+            self.tally_egress(ip, oif);
+        }
+    }
+
+    /// Name `oif` as `ip`'s egress in its tally, with that device's
+    /// carrier-change count.
+    fn tally_egress(&self, ip: IpAddr, oif: u32) {
+        let dev = self.ifname(oif);
+        self.probes
+            .egress(ip, oif, &dev, resolve_watch::carrier_changes(&dev));
+    }
+
+    /// The name of `ifindex`: from the link view, else from the kernel.
+    fn ifname(&self, ifindex: u32) -> String {
+        self.iface_to_ifindex
+            .iter()
+            .find(|(_, &i)| i == ifindex)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| resolve_watch::ifname(ifindex))
     }
 
     /// Housekeeping, every [`HOUSEKEEPING_EVERY`].
@@ -2230,7 +2298,7 @@ impl NetlinkNeighborResolver {
                     NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(n)) => {
                         return Some(Ok(n));
                     }
-                    NetlinkPayload::Error(e) => return Some(Err(e.code)),
+                    NetlinkPayload::Error(e) => return Some(Err(e.raw_code())),
                     _ => {}
                 }
             }
@@ -2238,6 +2306,24 @@ impl NetlinkNeighborResolver {
         })
         .await;
         self.status.beat();
+        // What the kernel holds right after the kick, for the tally: a
+        // solicitation in flight reads `incomplete`; `failed` or `no entry`
+        // here means the kick did not start one.
+        match &first {
+            Err(_) => self.probes.kernel_answer(ip, "timed out"),
+            Ok(Some(Ok(n))) => self
+                .probes
+                .kernel_answer(ip, resolve_watch::nud_name(u16::from(n.header.state))),
+            Ok(Some(Err(code))) => self.probes.kernel_answer(
+                ip,
+                match -code {
+                    libc::ENOENT => "no entry",
+                    libc::EOPNOTSUPP => "unsupported",
+                    _ => "error",
+                },
+            ),
+            Ok(None) => {}
+        }
         match first {
             Err(_) => self.request_timed_out("neighbour read-back"),
             Ok(Some(Ok(n))) => {
@@ -3010,6 +3096,7 @@ async fn issue_proactive_resolve(
     let Ok(oif) = tokio::time::timeout(REQUEST_TIMEOUT, lookup_oif(handle, req)).await else {
         return ProbeOutcome::TimedOut {
             stage: "route lookup",
+            oif: None,
         };
     };
     let oif = match oif {
@@ -3055,10 +3142,11 @@ async fn issue_proactive_resolve(
         }
         Ok(Err(e)) => {
             debug!(?ip, oif, error = %e, "proactive resolve failed");
-            ProbeOutcome::Failed
+            ProbeOutcome::Failed { oif }
         }
         Err(_) => ProbeOutcome::TimedOut {
             stage: "neighbour kick",
+            oif: Some(oif),
         },
     }
 }
