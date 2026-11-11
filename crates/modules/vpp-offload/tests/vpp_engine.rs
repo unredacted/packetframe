@@ -1143,6 +1143,76 @@ impl RouteSource for QueuedSource {
     }
 }
 
+/// VPP applies a write before replying. If that reply is lost, the last
+/// acknowledged paths no longer prove what it holds. Returning to those
+/// paths must send a write, through both the delta and resync doors.
+fn assert_lost_route_write_is_retried(withdraw: bool, resync: bool) {
+    use packetframe_vpp_offload::engine::SourceChanges;
+
+    let fake = Fake::start_behaving(
+        "route-ack",
+        Behaviour {
+            hangup_after: Some(1),
+            track_routes: true,
+            ..Default::default()
+        },
+    );
+    let mut e = engine_for(&fake);
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).unwrap();
+    e.begin_resync(&mirror(1));
+    drain_to_empty(&mut e);
+    let prefix = v4(0, 0);
+    let key = match prefix {
+        IpPrefix::V4 { addr, prefix_len } => (addr, prefix_len),
+        _ => unreachable!(),
+    };
+    let original = fake.routes.lock().unwrap()[&key].clone();
+    let changed = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
+    let update = QueuedSource::with(SourceChanges {
+        neighbours: vec![(changed, Some(("eth4".into(), MAC)))],
+        routes: vec![(prefix, (!withdraw).then_some(vec![changed]))],
+    });
+    e.apply_changes(&update, 64).unwrap();
+    e.drain_batch()
+        .expect_err("VPP applied the write, then lost its reply");
+    assert_ne!(fake.routes.lock().unwrap().get(&key), Some(&original));
+    assert!(e.pending().owes(prefix));
+    assert!(e.api_ready());
+
+    if resync {
+        e.begin_resync(&mirror(1));
+    } else {
+        let reverted = QueuedSource::with(SourceChanges {
+            neighbours: vec![],
+            routes: vec![(prefix, Some(vec![nh()]))],
+        });
+        e.apply_changes(&reverted, 64).unwrap();
+    }
+    drain_to_empty(&mut e);
+    assert_eq!(
+        fake.routes.lock().unwrap()[&key],
+        original,
+        "the current route must replace the unacknowledged write"
+    );
+    assert_eq!(e.counts().installed, 1);
+}
+
+#[test]
+fn a_lost_replacement_reply_cannot_make_a_reverted_delta_look_unchanged() {
+    assert_lost_route_write_is_retried(false, false);
+}
+
+#[test]
+fn a_lost_withdrawal_reply_cannot_make_a_readvertised_route_look_unchanged() {
+    assert_lost_route_write_is_retried(true, false);
+}
+
+#[test]
+fn a_lost_replacement_reply_cannot_make_a_resync_look_unchanged() {
+    assert_lost_route_write_is_retried(false, true);
+}
+
 /// A converged engine against a VPP that will refuse the next `n`
 /// neighbour adds. Its own resync neighbour is already in VPP, so the
 /// refusal lands on the DELTA's nexthop instead of being spent on setup.
