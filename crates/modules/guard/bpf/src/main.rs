@@ -42,6 +42,7 @@ use aya_ebpf::{
     helpers::bpf_ktime_get_ns,
     macros::classifier,
     programs::TcContext,
+    EbpfContext,
 };
 use network_types::eth::{EthHdr, EtherType};
 
@@ -93,7 +94,7 @@ fn classify(ctx: &TcContext, stats: StatsPtr) -> Result<i32, ()> {
     let eth = start as *const EthHdr;
     let outer_ether = unsafe { (*eth).ether_type };
 
-    let skb = ctx.skb.skb;
+    let skb = ctx.as_ptr().cast::<aya_ebpf::bindings::__sk_buff>();
     let ifindex = unsafe { (*skb).ifindex };
     // Held for the whole run; RCU keeps the element alive and
     // internally consistent across a concurrent userspace replace.

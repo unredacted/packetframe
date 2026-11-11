@@ -23,6 +23,7 @@ use aya_ebpf::{
     macros::{classifier, map},
     maps::{Array, PerCpuArray, RingBuf},
     programs::TcContext,
+    EbpfContext,
 };
 
 /// fast-path's `SampleCfg`: written by flow-export alone.
@@ -156,7 +157,7 @@ fn emit(ctx: &TcContext, state: State) {
         unsafe { (*state)[EMIT_FAILED] += 1 };
         return;
     };
-    let skb = ctx.skb.skb;
+    let skb = ctx.as_ptr().cast::<aya_ebpf::bindings::__sk_buff>();
     // SAFETY: the context's skb, valid for the program run.
     let (len, ifindex, tagged, tci, proto) = unsafe {
         (

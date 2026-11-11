@@ -59,7 +59,7 @@ pub fn finalize(ctx: XdpContext) -> u32 {
     // before its tail_call. Always present in production; fail-safe
     // XDP_PASS if missing so traffic falls through to kernel rather
     // than getting dropped silently.
-    let mctx = match unsafe { MUTATION_CTX.get(0) } {
+    let mctx = match MUTATION_CTX.get(0) {
         Some(c) => *c,
         None => {
             bump(stats, StatIdx::ErrMutationCtx);

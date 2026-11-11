@@ -29,7 +29,7 @@ env:
   # via direct `rustup` commands rather than a third-party action. The
   # stable pin is not here: it lives only in rust-toolchain.toml and each
   # job reads it via .github/actions/rust-stable-pin.
-  RUST_NIGHTLY: "nightly-2026-04-14"
+  RUST_NIGHTLY: "nightly-2026-10-30"
   # bpf-linker pin — bump via reviewed PR. SPEC.md §7.1 calls out pinning
   # the BPF toolchain tight because aya/bpf-linker versions move together.
   BPF_LINKER_VERSION: "0.10.3"
