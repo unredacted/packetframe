@@ -45,7 +45,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_NIGHTLY: "nightly-2026-04-14"
+  RUST_NIGHTLY: "nightly-2026-10-30"
   BPF_LINKER_VERSION: "0.10.3"
 
 jobs:
