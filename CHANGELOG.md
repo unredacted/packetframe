@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.4] - UNRELEASED
+
+### Changes
+
+**Packaging**
+
+- The packaged unit runs the daemon at `Nice=-15`, the priority UniFi gives bgpd, zebra and ubios-udapi-server, from its first instruction; VPP inherits it. At nice 0 the route-ledger seed, the FRR feed and the sender of VPP's fresh load all ran at a fraction of their idle rate on a gateway booting into full traffic. Run `systemctl daemon-reload` after installing. ([#PR](https://github.com/unredacted/packetframe/pull/PR))
+
 ## [0.6.3] - 2026-11-12
 
 A point release on 0.6.2 for the first load of a fresh VPP: the step between a gateway's start and VPP steering. On a gateway that boots into full traffic, that load took 3.5 min on 2026-11-05, against about 35 s idle, and VPP died during it on both post-upgrade boots. VPP now has its cores to itself while it loads, stops its workers less often, and every load's length is recorded. A 0.6.2 config and route ledger carry over unchanged.
