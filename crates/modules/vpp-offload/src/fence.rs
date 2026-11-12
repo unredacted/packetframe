@@ -116,6 +116,10 @@ pub struct FenceRecord {
     pub since_unix: u64,
     /// The CPUs the fenced cgroups were given.
     pub allowed: String,
+    /// The online CPUs when the fence began: what an empty `cpuset.cpus`
+    /// inherited, and what one is put back as when the kernel refuses an
+    /// empty list for a cgroup with tasks in it (5.15: `ENOSPC`).
+    pub online: String,
     /// VPP's main and worker cores, kept clear.
     pub vpp_cores: Vec<u16>,
     pub cgroups: Vec<FencedCgroup>,
@@ -134,18 +138,23 @@ pub struct Released {
     pub failures: Vec<String>,
 }
 
-/// Setting a thread's affinity. Behind a trait so the fence's
-/// bookkeeping is testable against fixture directories.
-pub trait Affinity {
-    fn set(&self, tid: i32, cpus: &[u16]) -> std::io::Result<()>;
+/// What the fence changes on the host: a cgroup's `cpuset.cpus` and a
+/// thread's affinity. Behind a trait so the bookkeeping is testable
+/// against fixture directories, including the kernel's refusals.
+pub trait FenceOps {
+    /// Write `cpus` (a CPU list, or empty) to a `cpuset.cpus` file.
+    fn write_cpuset(&self, file: &Path, cpus: &str) -> std::io::Result<()> {
+        std::fs::write(file, format!("{cpus}\n"))
+    }
+    fn set_affinity(&self, tid: i32, cpus: &[u16]) -> std::io::Result<()>;
 }
 
-/// `sched_setaffinity(2)`.
-pub struct LiveAffinity;
+/// The live host: the cgroup files, and `sched_setaffinity(2)`.
+pub struct LiveOps;
 
-impl Affinity for LiveAffinity {
+impl FenceOps for LiveOps {
     #[cfg(target_os = "linux")]
-    fn set(&self, tid: i32, cpus: &[u16]) -> std::io::Result<()> {
+    fn set_affinity(&self, tid: i32, cpus: &[u16]) -> std::io::Result<()> {
         let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         for &c in cpus {
             unsafe { libc::CPU_SET(c as usize, &mut set) };
@@ -160,7 +169,7 @@ impl Affinity for LiveAffinity {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn set(&self, _tid: i32, _cpus: &[u16]) -> std::io::Result<()> {
+    fn set_affinity(&self, _tid: i32, _cpus: &[u16]) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "thread affinity is Linux-only",
@@ -195,7 +204,7 @@ impl FencePaths {
 /// A held fence, or none.
 pub struct CoreFence {
     paths: FencePaths,
-    affinity: Box<dyn Affinity>,
+    ops: Box<dyn FenceOps>,
     boot_id: String,
     vpp_cores: Vec<u16>,
     held: Option<Held>,
@@ -254,7 +263,7 @@ impl CoreFence {
     /// until [`Self::engage`].
     pub fn new(
         paths: FencePaths,
-        affinity: Box<dyn Affinity>,
+        ops: Box<dyn FenceOps>,
         boot_id: impl Into<String>,
         vpp_cores: Vec<u16>,
     ) -> Self {
@@ -263,7 +272,7 @@ impl CoreFence {
         vpp_cores.dedup();
         Self {
             paths,
-            affinity,
+            ops,
             boot_id: boot_id.into(),
             vpp_cores,
             held: None,
@@ -328,6 +337,7 @@ impl CoreFence {
                 boot_id: self.boot_id.clone(),
                 since_unix: now_unix(),
                 allowed: format_cpu_list(&allowed),
+                online: format_cpu_list(&online),
                 vpp_cores: self.vpp_cores.clone(),
                 cgroups: Vec::new(),
                 threads: Vec::new(),
@@ -378,7 +388,7 @@ impl CoreFence {
             if known {
                 if now_cpus != allowed {
                     tracing::info!(cgroup = %name, cpus = %now_cpus, "a fenced cgroup's CPUs were changed back; fencing it again");
-                    if let Err(e) = std::fs::write(&cpus, format!("{allowed}\n")) {
+                    if let Err(e) = self.ops.write_cpuset(&cpus, &allowed) {
                         tracing::warn!(cgroup = %name, error = %e, "could not fence a cgroup again");
                     }
                 }
@@ -427,7 +437,8 @@ impl CoreFence {
         // a daemon that dies between the two leaves something to undo
         // rather than a fence nobody knows about.
         self.persist()?;
-        std::fs::write(dir.join("cpuset.cpus"), format!("{allowed}\n"))
+        self.ops
+            .write_cpuset(&dir.join("cpuset.cpus"), &allowed)
             .map_err(|e| format!("write {}: {e}", dir.join("cpuset.cpus").display()))
     }
 
@@ -442,7 +453,7 @@ impl CoreFence {
     /// nothing is held.
     pub fn release(&mut self) -> Option<Released> {
         let h = self.held.take()?;
-        let released = undo(&self.paths, self.affinity.as_ref(), &h.record);
+        let released = undo(&self.paths, self.ops.as_ref(), &h.record);
         if let Err(e) = std::fs::remove_file(self.paths.record()) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(error = %e, "could not delete the core fence's record");
@@ -463,7 +474,7 @@ fn write_record(path: &Path, record: &FenceRecord) -> Result<(), String> {
 /// Put back each cgroup's CPUs, then each recorded thread's affinity. The
 /// cgroups first: restoring a thread to a CPU its cgroup still excludes
 /// would fail.
-fn undo(paths: &FencePaths, affinity: &dyn Affinity, record: &FenceRecord) -> Released {
+fn undo(paths: &FencePaths, ops: &dyn FenceOps, record: &FenceRecord) -> Released {
     let mut out = Released::default();
     for c in &record.cgroups {
         let cpus = paths.cgroup_root.join(&c.name).join("cpuset.cpus");
@@ -471,7 +482,21 @@ fn undo(paths: &FencePaths, affinity: &dyn Affinity, record: &FenceRecord) -> Re
             // Gone with whatever ran in it: nothing left to undo.
             continue;
         }
-        match std::fs::write(&cpus, format!("{}\n", c.previous)) {
+        let r = match ops.write_cpuset(&cpus, &c.previous) {
+            // Kernel 5.15 refuses an empty list for a cgroup with tasks in
+            // it (`ENOSPC`), though an empty one is what a new cgroup
+            // starts with. The online CPUs are what that empty list
+            // inherited: the same CPUs, written out.
+            Err(e)
+                if c.previous.is_empty()
+                    && e.raw_os_error() == Some(libc::ENOSPC)
+                    && !record.online.is_empty() =>
+            {
+                ops.write_cpuset(&cpus, &record.online)
+            }
+            r => r,
+        };
+        match r {
             Ok(()) => out.cgroups.push(c.name.clone()),
             Err(e) => out.failures.push(format!("{}: {e}", c.name)),
         }
@@ -488,7 +513,7 @@ fn undo(paths: &FencePaths, affinity: &dyn Affinity, record: &FenceRecord) -> Re
         let Ok(cpus) = parse_cpu_list(&t.cpus) else {
             continue;
         };
-        match affinity.set(t.tid, &cpus) {
+        match ops.set_affinity(t.tid, &cpus) {
             Ok(()) => out.threads_restored += 1,
             // Exited between the check and the call.
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => out.threads_gone += 1,
@@ -529,7 +554,7 @@ pub fn report(reason: &str, held: Duration, r: &Released) {
 /// attach and `packetframe detach`.
 pub fn release_stale_live(state_dir: &Path) {
     let boot = crate::process::boot_id().unwrap_or_default();
-    match release_stale(&FencePaths::live(state_dir), &LiveAffinity, &boot) {
+    match release_stale(&FencePaths::live(state_dir), &LiveOps, &boot) {
         None => {}
         Some(Ok((r, since_unix))) => {
             let held = Duration::from_secs(now_unix().saturating_sub(since_unix));
@@ -545,7 +570,7 @@ pub fn release_stale_live(state_dir: &Path) {
 /// back, and when the fence began (Unix seconds).
 pub fn release_stale(
     paths: &FencePaths,
-    affinity: &dyn Affinity,
+    ops: &dyn FenceOps,
     boot_id: &str,
 ) -> Option<Result<(Released, u64), String>> {
     let path = paths.record();
@@ -556,7 +581,7 @@ pub fn release_stale(
     };
     let result = match serde_json::from_slice::<FenceRecord>(&raw) {
         Ok(record) if record.boot_id == boot_id => {
-            Ok((undo(paths, affinity, &record), record.since_unix))
+            Ok((undo(paths, ops, &record), record.since_unix))
         }
         Ok(record) => Ok((Released::default(), record.since_unix)),
         Err(e) => Err(format!(
@@ -581,8 +606,21 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeAffinity(Calls);
 
-    impl Affinity for FakeAffinity {
-        fn set(&self, tid: i32, cpus: &[u16]) -> std::io::Result<()> {
+    impl FenceOps for FakeAffinity {
+        /// As kernel 5.15 does: an empty list is refused for a cgroup
+        /// with threads in it.
+        fn write_cpuset(&self, file: &Path, cpus: &str) -> std::io::Result<()> {
+            let threads = file.with_file_name("cgroup.threads");
+            let populated = std::fs::read_to_string(threads)
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false);
+            if cpus.is_empty() && populated {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            std::fs::write(file, format!("{cpus}\n"))
+        }
+
+        fn set_affinity(&self, tid: i32, cpus: &[u16]) -> std::io::Result<()> {
             self.0.borrow_mut().push((tid, cpus.to_vec()));
             Ok(())
         }
@@ -698,7 +736,13 @@ mod tests {
         assert!(fx.paths.state_dir.join(RECORD_FILE).exists());
 
         let r = f.release().unwrap();
-        assert_eq!(fx.cpus("os.slice"), "");
+        assert!(r.failures.is_empty(), "{:?}", r.failures);
+        assert_eq!(
+            fx.cpus("os.slice"),
+            "0-17",
+            "an empty list with tasks in the cgroup is refused, so the CPUs it inherited are written"
+        );
+        assert_eq!(fx.cpus("system.slice"), "");
         assert_eq!(
             fx.cpus("pinned"),
             "2-3",
@@ -786,7 +830,7 @@ mod tests {
         }
         assert_eq!(fx.cpus("os.slice"), "0-14");
         let (r, _) = release_stale(&fx.paths(), &aff, "boot-a").unwrap().unwrap();
-        assert_eq!(fx.cpus("os.slice"), "");
+        assert_eq!(fx.cpus("os.slice"), "0-17", "the online CPUs it inherited");
         assert_eq!(r.threads_restored, 1);
         assert!(
             release_stale(&fx.paths(), &aff, "boot-a").is_none(),

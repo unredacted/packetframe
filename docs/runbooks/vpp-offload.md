@@ -5583,10 +5583,20 @@ for c in /sys/fs/cgroup/*/cpuset.cpus; do echo "$c: $(cat $c)"; done
 cat /var/lib/packetframe/state/vpp-core-fence.json
 ```
 
-An empty `cpuset.cpus` means unfenced (all CPUs). If a fence outlived
-everything, write back the `previous` value the record lists for each
-cgroup (`echo > /sys/fs/cgroup/os.slice/cpuset.cpus` for an empty one), or
-run `packetframe detach`.
+A cgroup is unfenced when its `cpuset.cpus` is empty or holds every
+online CPU. Kernel 5.15 refuses to set an empty list back on a cgroup
+that has tasks in it (`No space left on device`), so the release writes
+the online CPUs instead, which are the same CPUs an empty list inherited.
+A reboot empties them again. If a fence outlived everything, run
+`packetframe detach`, or write the online CPUs by hand:
+
+```sh
+online=$(cat /sys/fs/cgroup/cpuset.cpus.effective)
+for c in /sys/fs/cgroup/*/cpuset.cpus; do
+  case $c in */system.slice/*) continue ;; esac
+  [ -n "$(cat $c)" ] && echo "$online" > $c
+done
+```
 
 ## IRQ affinity before attach
 

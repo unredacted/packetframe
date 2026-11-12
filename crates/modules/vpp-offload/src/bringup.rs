@@ -1597,7 +1597,7 @@ fn finish(
         match crate::process::boot_id() {
             Ok(boot) => runtime.core_fence(crate::fence::CoreFence::new(
                 crate::fence::FencePaths::live(fence_inputs.0.clone()),
-                Box::new(crate::fence::LiveAffinity),
+                Box::new(crate::fence::LiveOps),
                 boot,
                 fence_inputs.1.clone(),
             )),
