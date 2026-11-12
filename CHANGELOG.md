@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.3] - UNRELEASED
+
+### Changes
+
+**vpp-offload**
+
+- While a fresh VPP loads its table, every top-level cgroup except `system.slice` is kept off VPP's main and worker cores, and self-pinned threads get their affinity back afterwards (`cores_fenced` / `cores_released`). On the lab, six nice -20 hogs on VPP's main core slowed a 170k-route load from 5.5 s to 22 s; fenced, it took 5.5 s. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#the-core-fence-during-a-fresh-load), [#390](https://github.com/unredacted/packetframe/pull/390))
+
 ## [0.6.2] - 2026-11-12
 
 A point release on 0.6.1. After a reboot, a next hop that resolves late no longer leaves its routes out of VPP until the route source happens to re-send each one: on 2026-11-05 that held the reference gateway's first steer for over twenty minutes, with 486,318 routes through one transit judged unresolvable. A VPP that dies now leaves its output, the signal and a core behind, and a next hop slow to resolve is recorded in the event log with the likeliest cause. A 0.6.1 config and route ledger carry over unchanged.
