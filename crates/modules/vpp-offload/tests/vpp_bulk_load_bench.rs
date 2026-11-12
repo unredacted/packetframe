@@ -204,7 +204,11 @@ fn run_drain(
         let stats = drainer
             .drain(pending, ledger, &resolve, ports, t, DRAIN_BATCH)
             .unwrap_or_else(|(_, e)| panic!("drain: {e}"));
-        assert_eq!(stats.rejected + stats.unresolvable, 0, "routes not installed: {stats:?}");
+        assert_eq!(
+            stats.rejected + stats.unresolvable,
+            0,
+            "routes not installed: {stats:?}"
+        );
     }
     let secs = started.elapsed().as_secs_f64();
     Load {

@@ -11,7 +11,7 @@
 //! behaviour — that is gate 0b's job on hardware.
 
 use std::net::IpAddr;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -82,6 +82,37 @@ mod tempdir {
     }
 }
 
+/// Answer `sockclnt_create` with every message we know, at its own CRC
+/// unless `crc_override` names one. False if the client went away.
+fn handshake(sock: &mut UnixStream, crc_override: Option<(&str, &str)>) -> bool {
+    if read_frame(sock).is_none() {
+        return false;
+    }
+    let mut reply = SockclntCreateReply {
+        context: 1,
+        response: 0,
+        index: 7,
+        count: MESSAGE_META.len() as u16,
+        message_table: Vec::new(),
+    };
+    for (i, m) in MESSAGE_META.iter().enumerate() {
+        let crc = match crc_override {
+            Some((n, c)) if n == m.name => c.to_string(),
+            _ => m.crc.trim_start_matches("0x").to_string(),
+        };
+        reply.message_table.push(MessageTableEntry {
+            index: 100 + i as u16,
+            name: format!("{}_{}", m.name, crc),
+        });
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&SOCKCLNT_CREATE_MSG_ID.to_be_bytes());
+    payload.extend_from_slice(&7u32.to_be_bytes()); // client_index prefix
+    reply.encode(&mut payload);
+    write_frame(sock, &payload);
+    true
+}
+
 impl Fake {
     /// Start a fake VPP that completes the handshake, then answers
     /// route requests per `answers` (repeating the last one).
@@ -101,32 +132,9 @@ impl Fake {
                 Ok(v) => v,
                 Err(_) => return,
             };
-            // --- handshake ---
-            let Some(_req) = read_frame(&mut sock) else {
+            if !handshake(&mut sock, crc_override) {
                 return;
-            };
-            let mut reply = SockclntCreateReply {
-                context: 1,
-                response: 0,
-                index: 7,
-                count: MESSAGE_META.len() as u16,
-                message_table: Vec::new(),
-            };
-            for (i, m) in MESSAGE_META.iter().enumerate() {
-                let crc = match crc_override {
-                    Some((n, c)) if n == m.name => c.to_string(),
-                    _ => m.crc.trim_start_matches("0x").to_string(),
-                };
-                reply.message_table.push(MessageTableEntry {
-                    index: 100 + i as u16,
-                    name: format!("{}_{}", m.name, crc),
-                });
             }
-            let mut payload = Vec::new();
-            payload.extend_from_slice(&SOCKCLNT_CREATE_MSG_ID.to_be_bytes());
-            payload.extend_from_slice(&7u32.to_be_bytes()); // client_index prefix
-            reply.encode(&mut payload);
-            write_frame(&mut sock, &payload);
 
             // --- route traffic ---
             let mut i = 0usize;
@@ -168,6 +176,80 @@ impl Fake {
             _dir: dir,
             handled,
         }
+    }
+
+    /// A fake that reads every request the client has written before
+    /// answering any: it takes frames until the socket stays quiet for
+    /// `quiet`, then replies to all of them. `max_outstanding` records the
+    /// largest such burst, which is how many requests the client had on
+    /// the wire unanswered at once. With `trickle`, each reply is written
+    /// one byte at a time, so the client sees frames split across reads.
+    fn start_bursts(tag: &str, quiet: Duration, trickle: bool) -> (Self, Arc<AtomicU32>) {
+        let dir = tempdir::TempDir::new(tag).unwrap();
+        let path = dir.path().join("api.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let handled = Arc::new(AtomicU32::new(0));
+        let max_outstanding = Arc::new(AtomicU32::new(0));
+        let (handled_thread, max_thread) = (handled.clone(), max_outstanding.clone());
+
+        thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            if !handshake(&mut sock, None) {
+                return;
+            }
+            loop {
+                // Block for the first request of a burst, then take the
+                // rest of it under the quiet timeout.
+                sock.set_read_timeout(None).unwrap();
+                let Some(first) = read_frame(&mut sock) else {
+                    return;
+                };
+                let mut burst = vec![first];
+                sock.set_read_timeout(Some(quiet)).unwrap();
+                while let Some(req) = read_frame(&mut sock) {
+                    burst.push(req);
+                }
+                max_thread.fetch_max(burst.len() as u32, Ordering::SeqCst);
+                for req in burst {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&reply_id().to_be_bytes());
+                    IpRouteAddDelReply {
+                        context: request_context(&req),
+                        retval: 0,
+                        stats_index: 0,
+                    }
+                    .encode(&mut payload);
+                    handled_thread.fetch_add(1, Ordering::SeqCst);
+                    if trickle {
+                        let mut framed = Vec::new();
+                        packetframe_vpp_offload::vpp_api::codec::write_frame_header(
+                            &mut framed,
+                            payload.len(),
+                        );
+                        framed.extend_from_slice(&payload);
+                        for b in framed {
+                            use std::io::Write;
+                            if sock.write_all(&[b]).is_err() {
+                                return;
+                            }
+                        }
+                    } else {
+                        write_frame(&mut sock, &payload);
+                    }
+                }
+            }
+        });
+
+        (
+            Self {
+                path,
+                _dir: dir,
+                handled,
+            },
+            max_outstanding,
+        )
     }
 
     fn connect(&self) -> Transport {
@@ -626,4 +708,49 @@ fn ping_round_trips_over_the_same_connection() {
     assert!(Drainer::default()
         .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 10)
         .is_ok());
+}
+
+#[test]
+fn a_full_window_goes_out_before_any_reply_and_never_more() {
+    // The point of pipelining: the drainer must put a whole window on the
+    // wire before it waits, and the window is also the backpressure bound
+    // that caps what a failure has to requeue.
+    let (fake, max_outstanding) = Fake::start_bursts("burst", Duration::from_millis(40), false);
+    let mut t = fake.connect();
+    let (mut pending, mut ledger, ports, map) = fixture();
+    for i in 0..100u8 {
+        pending.upsert(v4(10, i, 0, 0, 16), vec![nh(192, 0, 2, 1)]);
+    }
+    let resolve = resolver(&map);
+    let stats = Drainer::new(8)
+        .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 500)
+        .expect("drain");
+    assert_eq!(stats.installed, 100);
+    assert_eq!(ledger.counts().installing, 0, "nothing left in flight");
+    assert!(pending.is_empty());
+    assert_eq!(fake.handled.load(Ordering::SeqCst), 100);
+    assert_eq!(
+        max_outstanding.load(Ordering::SeqCst),
+        8,
+        "the first burst is the whole window, and no burst exceeds it"
+    );
+}
+
+#[test]
+fn replies_split_across_reads_still_frame() {
+    // The transport reads whatever the socket holds and frames from its
+    // buffer; a reply that arrives a byte at a time must come out whole
+    // and in order, not as a short frame that desynchronises the stream.
+    let (fake, _) = Fake::start_bursts("trickle", Duration::from_millis(20), true);
+    let mut t = fake.connect();
+    let (mut pending, mut ledger, ports, map) = fixture();
+    for i in 0..20u8 {
+        pending.upsert(v4(10, i, 0, 0, 16), vec![nh(192, 0, 2, 1)]);
+    }
+    let resolve = resolver(&map);
+    let stats = Drainer::new(6)
+        .drain(&mut pending, &mut ledger, &resolve, &ports, &mut t, 500)
+        .expect("drain");
+    assert_eq!(stats.installed, 20);
+    assert!(pending.is_empty());
 }

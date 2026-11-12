@@ -103,6 +103,11 @@ pub enum TransportError {
     ContextMismatch { expected: u32, got: u32 },
 }
 
+/// How much more than a frame still needs a read asks the socket for.
+/// A window of `ip_route_add_del` replies is about 30 bytes each, so this
+/// takes a couple of thousand per read.
+const READ_CHUNK: usize = 64 * 1024;
+
 /// A connected, handshaken VPP API client.
 pub struct Transport {
     sock: UnixStream,
@@ -116,10 +121,19 @@ pub struct Transport {
     /// Monotonic request context. Wraps, which is fine: correlation
     /// only needs uniqueness among requests in flight, and we keep one.
     next_context: u32,
-    /// Scratch buffers, reused so a full-table load does not allocate
-    /// per route.
+    /// Scratch buffer a request's payload is encoded into, reused so a
+    /// full-table load does not allocate per route.
     tx: Vec<u8>,
+    /// Framed requests queued by [`Self::queue`] and not yet written.
+    /// [`Self::flush`] writes them in one `write_all`, and every read
+    /// flushes first, so a reply is never awaited for a request still
+    /// sitting here.
+    wbuf: Vec<u8>,
+    /// Bytes read from the socket and not yet consumed, from `rpos` on.
+    /// Reads take whatever the socket holds, up to [`READ_CHUNK`], so a
+    /// window of replies costs a few syscalls rather than two per reply.
     rx: Vec<u8>,
+    rpos: usize,
     /// The read/write deadline in force — see [`Self::waited`].
     timeout: Duration,
     /// Wall time spent blocked in frame I/O since the handshake. See
@@ -167,7 +181,9 @@ impl Transport {
             context_offsets: HashMap::new(),
             next_context: 1,
             tx: Vec::with_capacity(4096),
-            rx: Vec::with_capacity(4096),
+            wbuf: Vec::with_capacity(4096),
+            rx: Vec::with_capacity(READ_CHUNK),
+            rpos: 0,
             timeout,
             waited: Duration::ZERO,
             connect_deadline: Some(deadline),
@@ -221,7 +237,8 @@ impl Transport {
             /* client_index */ 0,
             context,
         );
-        self.write_frame()?;
+        self.frame_tx();
+        self.flush()?;
 
         let payload = self.read_frame()?;
         let mut d = Decoder::new(&payload);
@@ -309,13 +326,45 @@ impl Transport {
     /// The caller is responsible for eventually reading exactly one
     /// reply per send: VPP answers every request, so an unread reply
     /// desynchronises the next read.
-    pub fn send<Req: Message>(&mut self, mut req: Req) -> Result<u32, TransportError> {
+    pub fn send<Req: Message>(&mut self, req: Req) -> Result<u32, TransportError> {
+        let context = self.queue(req)?;
+        self.flush()?;
+        Ok(context)
+    }
+
+    /// Queue a request WITHOUT writing it; returns the context to match
+    /// its reply by.
+    ///
+    /// For a caller sending many: a window of queued requests goes out
+    /// in one [`Self::flush`], one `write` where [`Self::send`] costs one
+    /// per request. Under CPU contention that is most of the sender's
+    /// cost, because every syscall is another chance to lose the CPU.
+    /// Nothing is on the wire until a flush, or until the next read,
+    /// which flushes first; the same one-reply-per-request rule as
+    /// [`Self::send`] applies.
+    pub fn queue<Req: Message>(&mut self, mut req: Req) -> Result<u32, TransportError> {
         let id = self.id_of::<Req>()?;
         let context = self.take_context();
         self.tx.clear();
         encode_request(&mut self.tx, &mut req, id, self.client_index, context);
-        self.write_frame()?;
+        self.frame_tx();
         Ok(context)
+    }
+
+    /// Write every queued request. A no-op with nothing queued.
+    ///
+    /// On an error the queue is dropped with the stream: what part of it
+    /// reached VPP is unknowable, so the caller must treat every request
+    /// it has not had a reply to as unacknowledged, as it already does
+    /// for a failed send.
+    pub fn flush(&mut self) -> Result<(), TransportError> {
+        if self.wbuf.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let r = self.flush_unmetered();
+        self.charge(started);
+        r
     }
 
     /// Read one reply, returning its context alongside the decoded
@@ -472,29 +521,33 @@ impl Transport {
         self.ids.get(name).copied()
     }
 
-    fn write_frame(&mut self) -> Result<(), TransportError> {
-        let started = Instant::now();
-        let r = self.write_frame_unmetered();
-        self.charge(started);
-        r
+    /// Frame the request encoded in `tx` onto the write queue.
+    fn frame_tx(&mut self) {
+        write_frame_header(&mut self.wbuf, self.tx.len());
+        self.wbuf.extend_from_slice(&self.tx);
     }
 
-    fn write_frame_unmetered(&mut self) -> Result<(), TransportError> {
+    fn flush_unmetered(&mut self) -> Result<(), TransportError> {
         self.arm_for_connect()?;
-        let mut framed = Vec::with_capacity(MSG_HEADER_LEN + self.tx.len());
-        write_frame_header(&mut framed, self.tx.len());
-        framed.extend_from_slice(&self.tx);
-        self.sock.write_all(&framed)?;
-        self.sock.flush()?;
+        let r = self
+            .sock
+            .write_all(&self.wbuf)
+            .and_then(|()| self.sock.flush());
+        self.wbuf.clear();
+        r?;
         Ok(())
     }
 
-    /// Read exactly one framed message.
+    /// Read exactly one framed message, flushing any queued requests
+    /// first.
     ///
-    /// `read_exact` rather than a single `read`: a unix stream may
-    /// deliver a frame across several reads, and treating a short read
-    /// as a complete message is how a parser silently desynchronises.
+    /// Framed from a buffer rather than read one frame at a time: a unix
+    /// stream may deliver a frame across several reads, or several frames
+    /// in one, and a frame is only taken once all of its bytes are in.
+    /// Treating a short read as a complete message is how a parser
+    /// silently desynchronises.
     fn read_frame(&mut self) -> Result<Vec<u8>, TransportError> {
+        self.flush()?;
         let started = Instant::now();
         let r = self.read_frame_unmetered();
         self.charge(started);
@@ -505,27 +558,59 @@ impl Transport {
     }
 
     fn read_frame_unmetered(&mut self) -> Result<Vec<u8>, TransportError> {
-        self.arm_for_connect()?;
+        self.fill_to(MSG_HEADER_LEN)?;
         let mut hdr = [0u8; MSG_HEADER_LEN];
-        self.sock.read_exact(&mut hdr).map_err(|e| {
-            // A closed socket mid-frame is VPP exiting, which the
-            // supervisor treats differently from a protocol fault.
-            if e.kind() == ErrorKind::UnexpectedEof {
-                std::io::Error::new(ErrorKind::ConnectionAborted, "VPP closed the API socket")
-            } else {
-                e
-            }
-        })?;
+        hdr.copy_from_slice(&self.rx[self.rpos..self.rpos + MSG_HEADER_LEN]);
         let len = parse_frame_header(&hdr);
 
         if len > MAX_PAYLOAD {
             return Err(TransportError::PayloadTooLarge(len));
         }
-        self.rx.clear();
-        self.rx.resize(len as usize, 0);
-        self.arm_for_connect()?;
-        self.sock.read_exact(&mut self.rx)?;
-        Ok(std::mem::take(&mut self.rx))
+        let len = len as usize;
+        self.fill_to(MSG_HEADER_LEN + len)?;
+        let body = self.rpos + MSG_HEADER_LEN;
+        let payload = self.rx[body..body + len].to_vec();
+        self.rpos = body + len;
+        if self.rpos == self.rx.len() {
+            self.rx.clear();
+            self.rpos = 0;
+        }
+        Ok(payload)
+    }
+
+    /// Make at least `need` unconsumed bytes available in `rx`, reading
+    /// as much as the socket holds each time (up to [`READ_CHUNK`] more
+    /// than is missing).
+    fn fill_to(&mut self, need: usize) -> Result<(), TransportError> {
+        while self.rx.len() - self.rpos < need {
+            if self.rpos > 0 {
+                self.rx.drain(..self.rpos);
+                self.rpos = 0;
+            }
+            let have = self.rx.len();
+            self.rx.resize(have + (need - have).max(READ_CHUNK), 0);
+            self.arm_for_connect()?;
+            let got = self.sock.read(&mut self.rx[have..]);
+            match got {
+                // A closed socket, mid-frame or between frames, is VPP
+                // exiting, which the supervisor treats differently from a
+                // protocol fault.
+                Ok(0) => {
+                    self.rx.truncate(have);
+                    return Err(TransportError::Io(std::io::Error::new(
+                        ErrorKind::ConnectionAborted,
+                        "VPP closed the API socket",
+                    )));
+                }
+                Ok(n) => self.rx.truncate(have + n),
+                Err(e) if e.kind() == ErrorKind::Interrupted => self.rx.truncate(have),
+                Err(e) => {
+                    self.rx.truncate(have);
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -668,7 +753,9 @@ mod tests {
             context_offsets: HashMap::new(),
             next_context: 1,
             tx: Vec::new(),
+            wbuf: Vec::new(),
             rx: Vec::new(),
+            rpos: 0,
             timeout: Duration::from_secs(1),
             waited: Duration::ZERO,
             connect_deadline: None,
@@ -745,7 +832,9 @@ mod tests {
             context_offsets: HashMap::new(),
             next_context: 1,
             tx: Vec::new(),
+            wbuf: Vec::new(),
             rx: Vec::new(),
+            rpos: 0,
             timeout: Duration::from_secs(1),
             waited: Duration::ZERO,
             connect_deadline: None,

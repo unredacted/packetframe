@@ -20,7 +20,7 @@
 //! makes a mid-load transport failure a retry rather than a silently
 //! partial FIB.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 
 use packetframe_common::fib::IpPrefix;
@@ -570,11 +570,17 @@ impl Drainer {
     ) -> Result<DrainStats, (DrainStats, TransportError)> {
         let mut stats = DrainStats::default();
         let batch = pending.drain_batch(max_ops);
-        let mut inflight: Vec<InFlight> = Vec::with_capacity(self.window);
-        let mut iter = batch.into_iter();
+        let mut inflight: VecDeque<InFlight> = VecDeque::with_capacity(self.window);
+        let mut iter = batch.into_iter().peekable();
+        // Top the window up once it has drained to half. A window that is
+        // refilled only when empty lets VPP's queue run dry at every
+        // boundary, so VPP idles for a round trip per window; refilling at
+        // half keeps it fed while the sender still writes in batches.
+        let low = self.window / 2;
 
         loop {
-            // Fill the window.
+            // Fill the window. Requests are queued, and go out together in
+            // the flush below.
             while inflight.len() < self.window {
                 let Some((prefix, op)) = iter.next() else {
                     break;
@@ -585,7 +591,7 @@ impl Drainer {
                         op: sent,
                         derived,
                         via,
-                    }) => inflight.push(InFlight {
+                    }) => inflight.push_back(InFlight {
                         context,
                         prefix,
                         sent,
@@ -611,56 +617,46 @@ impl Drainer {
                     // become when headroom returns.
                     Ok(Begun::Withhold) => pending.withhold(prefix, op),
                     Err(e) => {
-                        self.unwind(pending, ledger, inflight, Some((prefix, op)), iter);
+                        self.unwind(pending, ledger, inflight.into(), Some((prefix, op)), iter);
                         return Err((stats, e));
                     }
                 }
+            }
+            if let Err(e) = transport.flush() {
+                self.unwind(pending, ledger, inflight.into(), None, iter);
+                return Err((stats, e));
             }
             if inflight.is_empty() {
                 break;
             }
 
-            // Read exactly one reply per request sent, recording
-            // answers before applying any of them. Applying as we go
-            // and bailing on the first error would strand the REST of
-            // the window: their reservations would survive and they
-            // would never be requeued — a silently partial FIB, which
-            // is the failure this whole unwind path exists to prevent.
-            let mut answered: Vec<i32> = Vec::with_capacity(inflight.len());
-            let mut failure: Option<TransportError> = None;
-            for f in inflight.iter() {
-                match transport.recv::<IpRouteAddDelReply>() {
-                    Ok((context, reply)) => {
-                        // Contexts are issued in send order and VPP
-                        // replies in order, so a mismatch means the
-                        // stream desynchronised — not something to
-                        // paper over by scanning ahead.
-                        if context != f.context {
-                            failure = Some(TransportError::ContextMismatch {
-                                expected: f.context,
-                                got: context,
-                            });
-                            break;
+            // Read replies down to the low mark, or to empty once there is
+            // nothing left to send. Each reply is applied as it arrives;
+            // on the first failure everything still in flight is unwound,
+            // so no reservation outlives the drain and nothing that VPP
+            // did not acknowledge is counted as installed.
+            let floor = if iter.peek().is_some() { low } else { 0 };
+            while inflight.len() > floor {
+                let expected = inflight.front().map(|f| f.context).unwrap_or_default();
+                let failure = match transport.recv::<IpRouteAddDelReply>() {
+                    // Contexts are issued in send order and VPP replies in
+                    // order, so a mismatch means the stream desynchronised
+                    // — not something to paper over by scanning ahead.
+                    Ok((context, _)) if context != expected => TransportError::ContextMismatch {
+                        expected,
+                        got: context,
+                    },
+                    Ok((_, reply)) => {
+                        if let Some(f) = inflight.pop_front() {
+                            self.finish(&f, reply.retval, pending, ledger, &mut stats);
                         }
-                        answered.push(reply.retval);
+                        continue;
                     }
-                    Err(e) => {
-                        failure = Some(e);
-                        break;
-                    }
-                }
+                    Err(e) => e,
+                };
+                self.unwind(pending, ledger, inflight.into(), None, iter);
+                return Err((stats, failure));
             }
-
-            for (f, retval) in inflight.iter().zip(answered.iter()) {
-                self.finish(f, *retval, pending, ledger, &mut stats);
-            }
-
-            if let Some(e) = failure {
-                let unacked = inflight.split_off(answered.len());
-                self.unwind(pending, ledger, unacked, None, iter);
-                return Err((stats, e));
-            }
-            inflight.clear();
         }
 
         // Withdrawals during this drain may have freed slots. Release
@@ -733,7 +729,7 @@ impl Drainer {
                 // VPP confirms the delete fixes both: rejection retries,
                 // success records the hole.
                 if resolved.is_empty() && was_installed {
-                    let ctx = transport.send(withdraw_msg(prefix))?;
+                    let ctx = transport.queue(withdraw_msg(prefix))?;
                     return Ok(Begun::Sent {
                         context: ctx,
                         op: PendingOp::Withdraw,
@@ -797,7 +793,7 @@ impl Drainer {
                     },
                 };
                 Ok(Begun::Sent {
-                    context: transport.send(msg)?,
+                    context: transport.queue(msg)?,
                     op: PendingOp::Upsert {
                         nexthops: nexthops.clone(),
                     },
@@ -808,7 +804,7 @@ impl Drainer {
             // An authoritative withdrawal: the route source no longer
             // advertises this prefix at all.
             PendingOp::Withdraw => Ok(Begun::Sent {
-                context: transport.send(withdraw_msg(prefix))?,
+                context: transport.queue(withdraw_msg(prefix))?,
                 op: PendingOp::Withdraw,
                 derived: false,
                 via: None,
