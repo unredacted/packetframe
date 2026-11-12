@@ -34,7 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **vpp-offload**
 
-- NIC queue IRQs stay off VPP's cores after attach: a port that is re-opened (a speed change, a udapi reconfig) gets its IRQs back on their default CPUs, VPP's included, so every 2 s the daemon moves any it finds there off again (`nic_irqs_moved`, at most once per 5 min). ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/vpp-offload.md#irq-affinity-before-attach), [#PR](https://github.com/unredacted/packetframe/pull/PR))
+- NIC queue IRQs stay off VPP's cores after attach: a port that is re-opened (a speed change, a udapi reconfig) gets its IRQs back on their default CPUs, VPP's included, so every 2 s the daemon moves any it finds there off again (`nic_irqs_moved`, at most once per 5 min). ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/vpp-offload.md#irq-affinity-before-attach), [#392](https://github.com/unredacted/packetframe/pull/392))
 
 ## [0.6.3] - 2026-11-12
 
