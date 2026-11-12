@@ -689,6 +689,8 @@ struct Core {
     /// ([`crate::fence`]). `None` off Linux, in tests, and where attach
     /// did not install one.
     core_fence: Option<crate::fence::CoreFence>,
+    /// NIC queue IRQs kept off VPP's cores after attach ([`crate::irq_guard`]).
+    irq_guard: Option<crate::irq_guard::IrqGuard>,
     /// What the kernel path has been observed doing, per steered port.
     kernel_watch: KernelWatch,
     /// When the NIC was last audited against the steering ledger, and
@@ -2372,6 +2374,7 @@ impl Runtime {
                 rx_kick: Box::new(NoKick),
                 kernel_path: Box::new(crate::kernel_path::NoKernelPath),
                 core_fence: None,
+                irq_guard: None,
                 kernel_watch: KernelWatch::default(),
                 last_steer_audit: None,
                 last_null_sample: None,
@@ -2641,6 +2644,19 @@ impl Runtime {
             _ => "vpp-down",
         };
         release_fence(f, reason, held);
+    }
+
+    /// Keep NIC queue IRQs off VPP's cores from now on ([`crate::irq_guard`]).
+    pub fn irq_guard(&self, g: crate::irq_guard::IrqGuard) {
+        self.core.borrow_mut().irq_guard = Some(g);
+    }
+
+    /// Once per supervision pass: move NIC queue IRQs a port re-open put
+    /// back on VPP's cores off them again. Paced by the guard.
+    pub fn irq_tick(&self, now: std::time::Instant) {
+        if let Some(g) = self.core.borrow_mut().irq_guard.as_mut() {
+            g.tick(now);
+        }
     }
 
     /// Let a held fence go, whatever VPP is doing: the module's stop.

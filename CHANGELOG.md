@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.4] - UNRELEASED
+
+### Changes
+
+**vpp-offload**
+
+- NIC queue IRQs stay off VPP's cores after attach: a port that is re-opened (a speed change, a udapi reconfig) gets its IRQs back on their default CPUs, VPP's included, so every 2 s the daemon moves any it finds there off again (`nic_irqs_moved`, at most once per 5 min). ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/vpp-offload.md#irq-affinity-before-attach), [#PR](https://github.com/unredacted/packetframe/pull/PR))
+
 ## [0.6.3] - 2026-11-12
 
 A point release on 0.6.2 for the first load of a fresh VPP: the step between a gateway's start and VPP steering. On a gateway that boots into full traffic, that load took 3.5 min on 2026-11-05, against about 35 s idle, and VPP died during it on both post-upgrade boots. VPP now has its cores to itself while it loads, stops its workers less often, and every load's length is recorded. A 0.6.2 config and route ledger carry over unchanged.

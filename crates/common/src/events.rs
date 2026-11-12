@@ -180,6 +180,11 @@ pub mod kind {
     /// `cgroups`, `threads_restored`, `threads_gone`, and `failures` /
     /// `failed` for what could not be put back (a warning then).
     pub const CORES_RELEASED: &str = "cores_released";
+    /// NIC queue IRQs found delivered on VPP's cores after attach had
+    /// moved them off (a port re-opened: a speed change, a reconfig) were
+    /// moved off again. At most one per 5 min, with what was moved since
+    /// the last: `irqs`, `ifaces`, `vpp_cores`.
+    pub const NIC_IRQS_MOVED: &str = "nic_irqs_moved";
 
     // --- fast-path ---
     /// `wan-egress` put back policy rules that had disappeared from the

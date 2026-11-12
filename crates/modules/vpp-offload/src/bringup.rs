@@ -1513,6 +1513,12 @@ fn finish(
     // fenced for (adoption does not load fresh), and when it dies its
     // replacement takes the derived map, so its old cores would only
     // shrink what the rest of the box keeps during the load.
+    let irq_guard_inputs = (
+        paths.sys.sysfs_net.clone(),
+        paths.proc_irq.clone(),
+        paths.sysfs_cpu.clone(),
+        vacate.clone(),
+    );
     let fence_inputs = (
         paths.sys.state_dir.clone(),
         std::iter::once(core_map.main)
@@ -1657,10 +1663,20 @@ fn finish(
             )));
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = (kernel_path_inputs, &fence_inputs);
+        let _ = (kernel_path_inputs, &fence_inputs, &irq_guard_inputs);
         // Other userland off VPP's cores from each spawn until VPP has its
         // table (`crate::fence`). Without a boot_id there is no record a
         // later daemon could trust, so no fence.
+        // NIC queue IRQs a port re-open puts back on VPP's cores are
+        // moved off again, for as long as this loop runs
+        // (`crate::irq_guard`). Every core VPP is on, observed included.
+        #[cfg(target_os = "linux")]
+        runtime.irq_guard(crate::irq_guard::IrqGuard::new(
+            irq_guard_inputs.0.clone(),
+            irq_guard_inputs.1.clone(),
+            irq_guard_inputs.2.clone(),
+            irq_guard_inputs.3.clone(),
+        ));
         #[cfg(target_os = "linux")]
         match crate::process::boot_id() {
             Ok(boot) => runtime.core_fence(crate::fence::CoreFence::new(

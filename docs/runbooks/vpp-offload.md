@@ -5646,6 +5646,17 @@ ports, a kernel that does not follow is a warning (`queue IRQs of ports
 VPP does not own still fire on VPP's cores`), not a refusal: they cost VPP
 time, but refusing would leave the box without VPP.
 
+**The move is kept, not only made once.** A port that is re-opened (a
+speed change, a udapi reconfig at boot, a WAN change) requests its IRQs
+again, and the kernel's default spread puts queue N back on CPU N, VPP's
+cores included. On the lab, udapi's `sfp-auto-detect` did that to an
+empty SFP port three seconds after attach. So every 2 s, whatever state
+VPP is in, the daemon checks every NIC again and moves any queue IRQ it
+finds on VPP's cores, writing nothing when nothing drifted. Moves are
+logged and recorded as `nic_irqs_moved` at most once per 5 minutes, so a
+port that renegotiates every 20 s does not fill the event log. An IRQ the
+kernel will not move is a warning, once per set of such IRQs.
+
 `packetframe feasibility` reports a planned move as a non-blocking
 **WARN** on `vpp.irq-affinity`, not a pass: whether the kernel honours
 the mask is only known once it is written, which a probe never does.
