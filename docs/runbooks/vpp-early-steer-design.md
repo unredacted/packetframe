@@ -132,19 +132,29 @@ gain. Those are traffic properties, not table properties.
 
 ## Recommendation
 
-**Not yet.** Item 3, the bulk-load work in
-`feat/vpp-bulk-load`, shortens the same window with none of these risks.
-It keeps VPP's route queue fed instead of draining it once per window, and
-cuts the sender's syscalls per route. Measure first what is left after
-it:
+**Not yet.** What the load costs is now measured (efg1-lab1-net,
+2026-11-12, [#388](https://github.com/unredacted/packetframe/pull/388)):
 
-- If a fresh load on mci1 under load comes down to about a minute, the
-  early-steer window is a fraction of that. Hazards (1), (3) and (4) are
-  then too much for what it buys.
-- If it stays at several minutes, the next step is evidence, not code. Take
-  mci1's traffic split by destination prefix length from the flow sampler,
-  and measure the hand-back path's packets per second on the lab. Together
-  they say whether a coverage gate would ever open early enough to matter.
+- **Idle:** a million IPv4 routes take about 30 s (about 33,000/s), and
+  the lab's 170,291 take about 5.5 s.
+- **What bounds it:** VPP's main thread, at 100% for the whole load.
+  Sending faster bought 7% idle and nothing under contention.
+- **Under contention:** the load slows in proportion to the main core
+  VPP loses. One equal-priority competitor halves it, and six nice -20
+  hogs on the main core made it 4× slower.
+
+So on mci1 the 3.5 min under load is mostly VPP's main thread not getting
+its core. Keeping other work off that core during the load (cpuset or
+AllowedCPUs for the other slices) would bring it toward the idle
+figure, about 35 s for mci1's table, with none of the hazards above.
+Early steering could save at most a part of that, at the price of (1),
+(3) and (4).
+
+If the core isolation lands and the load is still long, the next step is
+evidence, not code. Take mci1's traffic split by destination prefix
+length from the flow sampler, and measure the hand-back path's packets
+per second on the lab. Together they say whether a coverage gate would
+ever open early enough to matter.
 
 If the operator wants it built regardless, the order would be:
 1. (1), unresolvable → hand-back routes. This is useful on its own: it
