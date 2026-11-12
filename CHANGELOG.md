@@ -34,7 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **fast-path**
 
-- The neighbour resolver keeps serving while a route-ledger seed applies. The routes it makes itself (`local-prefix` host routes, the `fallback-default`, a link's PeerDown) wait for the programmer in an applier of their own, in order, instead of holding the resolver behind the whole seed: on edge1-mci1 after an upgrade, the transit next hop behind 1.1M routes went unserved for the seed's 73 s. Queued neighbour events are also applied between seed chunks, not one per chunk. ([#PR](https://github.com/unredacted/packetframe/pull/PR))
+- The neighbour resolver keeps serving while a route-ledger seed applies. The routes it makes itself (`local-prefix` host routes, the `fallback-default`, a link's PeerDown) wait for the programmer in an applier of their own, in order, instead of holding the resolver behind the whole seed: on edge1-mci1 after an upgrade, the transit next hop behind 1.1M routes went unserved for the seed's 73 s. Queued neighbour events are also applied between seed chunks, not one per chunk. ([#393](https://github.com/unredacted/packetframe/pull/393))
 
 ## [0.6.3] - 2026-11-12
 
