@@ -28,7 +28,28 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
-## [0.6.3] - UNRELEASED
+## [0.6.3] - 2026-11-12
+
+A point release on 0.6.2 for the first load of a fresh VPP: the step between a gateway's start and VPP steering. On a gateway that boots into full traffic, that load took 3.5 min on 2026-11-05, against about 35 s idle, and VPP died during it on both post-upgrade boots. VPP now has its cores to itself while it loads, stops its workers less often, and every load's length is recorded. A 0.6.2 config and route ledger carry over unchanged.
+
+### Upgrading from 0.6.2
+
+1. Install the 0.6.3 package or tarball. The .deb runs no maintainer scripts, so the running daemon is unaffected.
+2. `systemctl daemon-reload`
+3. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with or without vpp-offload, as for 0.6.2.
+
+The start seeds from the ledger 0.6.2 wrote at the stop. Neither ledger format changed, so a downgrade to 0.6.2 seeds too.
+
+- **`startup.conf` gains an `l3fib` stanza.** It preallocates VPP's load-balance and fib-entry pools for the routes `expected-routes` budgets, plus the IPv6 budget under `v6 on`. The memory is inside the heap the same budget already sizes. A VPP kept by `--keep-vpp` gets it at its next start.
+- **Attach moves every NIC's queue IRQs off VPP's cores,** not only the member ports'. The attach log names each move. An IRQ of a port VPP does not own that the kernel will not move is a warning, not a refusal.
+- **The core fence.** While a VPP it spawned loads its table, the daemon writes the `cpuset.cpus` of every top-level cgroup but its own (on a UniFi gateway `os.slice`, `uos.slice`, `app.slice`, `user.slice`, `init.scope`, and UniFi's root cgroups such as `bgpd` and `dpi`), and puts it back when the load is done. A cgroup that started with an empty list gets the online CPUs back, which are the same CPUs, and is empty again after a reboot. The record is `<state-dir>/vpp-core-fence.json`. An adopted VPP is never fenced. [The core fence](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#the-core-fence-during-a-fresh-load)
+- **New events:** `cores_fenced` and `cores_released` (vpp-offload); `fresh_hold_released` gains `load_ms`. [The event log](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/event-log.md)
+
+### Highlights
+
+- **VPP has its cores to itself while it loads.** A fresh VPP's load runs on its main thread at 100%, and slows in step with the main core it loses; UniFi's daemons run on any core, `ubios-udapi-server` at VPP's own priority. From VPP's spawn until it leaves Syncing, every other top-level cgroup is kept off VPP's main and worker cores, and threads that pinned themselves get their affinity back afterwards. On a lab EFG, six nice -20 busy loops on VPP's main core stretched a 170,291-route load from 5.5 s to 22 s; fenced, it took 5.5 s. [The core fence](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#the-core-fence-during-a-fresh-load)
+- **Fewer worker barriers during a load.** VPP aborts when a worker misses a barrier for 1 s (`worker thread deadlock`), and the lab reproduced that abort mid-load from `load_balance_create` with a 3 s stall on a worker core. Preallocated pools take away the barriers pool growth caused, and the largest holds: from 196 to 167 per million routes, longest 16.7 ms to 6.9 ms. Moving every NIC's interrupts off VPP's cores takes away a source of such stalls: on the lab, `eth0`'s queue IRQs were on VPP's main core and both workers. [IRQ affinity before attach](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#irq-affinity-before-attach)
+- **Every fresh load is timed.** `fresh_hold_released` carries `load_ms`, and the hwtest bundle carries `vpp_bulk_load_bench`, which times a bulk load into a scratch VPP and counts its barriers by caller.
 
 ### Changes
 
@@ -37,6 +58,31 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 - A fresh VPP stops its workers less often while it loads: `startup.conf` preallocates the FIB's load-balance and fib-entry pools for the routes `expected-routes` budgets (`l3fib`), and attach moves every NIC's queue IRQs off VPP's cores, not only the member ports'. A worker that misses VPP's barrier for 1 s aborts it, which is how a fresh load died after a reboot. ([#387](https://github.com/unredacted/packetframe/pull/387))
 - `fresh_hold_released` carries `load_ms`, how long a fresh VPP took to take the whole table. The hwtest bundle carries `vpp_bulk_load_bench`, which times a bulk load into a scratch VPP and counts its barriers by caller. ([#388](https://github.com/unredacted/packetframe/pull/388))
 - While a fresh VPP loads its table, every top-level cgroup except the daemon's own (`system.slice` under the packaged unit) is kept off VPP's main and worker cores, and self-pinned threads get their affinity back afterwards (`cores_fenced` / `cores_released`). On the lab, six nice -20 hogs on VPP's main core slowed a 170k-route load from 5.5 s to 22 s; fenced, it took 5.5 s. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#the-core-fence-during-a-fresh-load), [#390](https://github.com/unredacted/packetframe/pull/390))
+
+### Known limitations
+
+- Barriers remain during a load: about 146 per million routes come from VPP growing its per-route counters, which no startup option presizes. A worker stalled for 1 s across one of them still aborts VPP. A `worker thread deadlock` in `<state-dir>/vpp-diag/` says it happened.
+- The fence leaves the daemon's own top-level cgroup alone (`system.slice` under the packaged unit): fencing inside it would unpin VPP's threads on kernel 5.15. On a UniFi gateway it holds only small services.
+- A thread that pins itself while the fence is held keeps the full CPU set afterwards; only pins taken before the fence are restored.
+- VPP's octeon driver can fail a start under load: a port-creation SIGSEGV and a `device init failed [rv -35]` were each seen on the lab, in about 1 of 40 and 1 of 60 starts. The supervisor restarts VPP within seconds.
+- A first load still runs at the main thread's pace, about 33,000 routes a second on the lab's cores: about 35 s for a full table once nothing else takes its core.
+- The limitations listed for 0.6.2 otherwise still apply.
+
+### Install and verify
+
+When upgrading, follow steps 1 to 3 above.
+
+```sh
+ARCH=$(dpkg --print-architecture)   # amd64 or arm64
+curl -LO "https://github.com/unredacted/packetframe/releases/download/v0.6.3/packetframe_0.6.3_${ARCH}.deb"
+curl -LO https://github.com/unredacted/packetframe/releases/download/v0.6.3/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+dpkg -i "packetframe_0.6.3_${ARCH}.deb" && systemctl daemon-reload
+```
+
+Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the `aarch64-unknown-linux-gnu` tarball and the arm64 .deb also carry the VPP sampler plugin.
+
+**Full changelog:** https://github.com/unredacted/packetframe/compare/v0.6.2...v0.6.3
 
 ## [0.6.2] - 2026-11-12
 

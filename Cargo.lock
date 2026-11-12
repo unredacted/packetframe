@@ -711,7 +711,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "packetframe-cli"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "packetframe-common"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "flate2",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "packetframe-fast-path"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "aya",
@@ -776,11 +776,11 @@ dependencies = [
 
 [[package]]
 name = "packetframe-flow-encode"
-version = "0.6.2"
+version = "0.6.3"
 
 [[package]]
 name = "packetframe-flow-export"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "aya",
  "libc",
@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "packetframe-guard"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "aya",
  "libc",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "packetframe-neigh-snoop"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "futures",
  "ipnet",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "packetframe-probe"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "aya",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "packetframe-sampler-core"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "libc",
  "packetframe-sampler-shm",
@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "packetframe-sampler-shm"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "libc",
  "loom",
@@ -856,14 +856,14 @@ dependencies = [
 
 [[package]]
 name = "packetframe-vpp-api-codegen"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "packetframe-vpp-offload"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "libc",
  "netlink-packet-core",
