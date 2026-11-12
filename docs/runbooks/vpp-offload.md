@@ -5538,14 +5538,17 @@ traffic, and UniFi's daemons run wherever they like:
 module keeps them off VPP's cores while it loads.
 
 **What is fenced.** From VPP's spawn until VPP leaves `Syncing`, every
-top-level cgroup except `system.slice` gets a `cpuset.cpus` of the online
-CPUs minus VPP's main and worker cores (`cores_fenced`). On a UniFi
+top-level cgroup except the daemon's own gets a `cpuset.cpus` of the
+online CPUs minus VPP's main and worker cores (`cores_fenced`). The
+daemon's own is `system.slice` under the packaged unit, `user.slice` for
+`sudo packetframe run` from a login, or whatever `Slice=` names. On a UniFi
 gateway that is `os.slice`, `uos.slice`, `app.slice`, `user.slice`,
 `init.scope`, and the cgroups UniFi makes for itself at the root (`bgpd`,
 `zebra`, `dpi`, `udm-v2`, …). On edge1-mci1 (main 11, workers 13–17,
 cpu12 isolated) they keep 0–10 and 12. A top-level cgroup that appears
-during the load is fenced too, and one whose CPUs are changed back is
-fenced again.
+during the load is fenced too, one whose CPUs are changed back is fenced
+again, and one removed and recreated under the same name (a restarted
+service) is fenced as a new one.
 
 **What is not.** `system.slice` holds VPP and this daemon, and a child's
 CPUs must sit inside its parent's. Fencing its other units one by one
@@ -5575,6 +5578,10 @@ full set.
   `<state-dir>/vpp-core-fence.json`, written before each cgroup is changed.
   The next attach and `packetframe detach` undo exactly what it lists. A
   record from an earlier boot is only deleted.
+
+Whatever a release cannot put back stays in the record, which then lists
+only that, for the next attach or `detach` to retry. If the record itself
+cannot be written, nothing is fenced.
 
 To see a fence by hand:
 

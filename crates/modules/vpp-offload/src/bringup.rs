@@ -1448,9 +1448,18 @@ fn finish(
     // attach-time IRQ moves vacated), and the control-plane CPUs, which a
     // queue-0 placement takes only after every other eligible CPU
     // (`cores::plan_queue0_irqs`).
-    // The core fence's inputs: where its record lives, and every core
-    // VPP is on (`crate::fence`).
-    let fence_inputs = (paths.sys.state_dir.clone(), vacate.clone());
+    // The core fence's inputs: where its record lives, and the cores a
+    // VPP this loop SPAWNS will run on (`crate::fence`). The derived map
+    // only, not `vacate`: an adopted VPP observed elsewhere is never
+    // fenced for (adoption does not load fresh), and when it dies its
+    // replacement takes the derived map, so its old cores would only
+    // shrink what the rest of the box keeps during the load.
+    let fence_inputs = (
+        paths.sys.state_dir.clone(),
+        std::iter::once(core_map.main)
+            .chain(core_map.workers.iter().copied())
+            .collect::<Vec<u16>>(),
+    );
     let kernel_path_inputs = (
         paths.sys.sysfs_net.clone(),
         paths.proc_irq.clone(),

@@ -18,15 +18,17 @@
 //! ## What it does
 //!
 //! From VPP's spawn until it leaves `Syncing`, every **top-level cgroup
-//! except `system.slice`** is given a `cpuset.cpus` of the online CPUs
-//! minus VPP's main and worker cores ([`SKIP`]). Those are the systemd
+//! except this daemon's own** ([`own_top_level`]: `system.slice` for the
+//! packaged unit, `user.slice` for `sudo packetframe run`) is given a
+//! `cpuset.cpus` of the online CPUs minus VPP's main and worker cores.
+//! Under the packaged unit those are the systemd
 //! slices (`os.slice`, `uos.slice`, `app.slice`, `user.slice`,
 //! `init.scope`) and the cgroups UniFi makes for itself at the root
 //! (`bgpd`, `zebra`, `dpi`, `udm-v2`, …): everything that competes with
 //! VPP on a UniFi gateway, as measured on 6.0.17. Kernel threads and IRQs
 //! are not in any of them; attach moves the IRQs (`cores::clear_irqs_off`).
 //!
-//! **Why not `system.slice`, and why not systemd's `AllowedCPUs`.**
+//! **Why not the daemon's own, and why not systemd's `AllowedCPUs`.**
 //! VPP and this daemon live in `system.slice/packetframe.service`, and a
 //! child's CPUs must sit inside its parent's, so fencing the slice fences
 //! VPP. Fencing the slice's *other* units would need the cpuset controller
@@ -84,8 +86,42 @@ pub const FENCE_MAX: Duration = Duration::from_secs(600);
 /// were changed back.
 pub const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
-/// Top-level cgroups never fenced: VPP's own, and this daemon's, parent.
-pub const SKIP: &[&str] = &["system.slice"];
+/// The top-level cgroup left unfenced when this daemon's own cannot be
+/// read: where the packaged unit runs it.
+pub const FALLBACK_OWN: &str = "system.slice";
+
+/// The top-level cgroup this daemon, and so the VPP it spawns, runs under:
+/// `system.slice` for the packaged unit, `user.slice` for `sudo packetframe
+/// run` from a login, whatever `Slice=` names otherwise. That one is never
+/// fenced, or VPP could not pin itself to its own cores. `None` for a
+/// daemon in the root cgroup, where fencing the top-level cgroups touches
+/// nothing above it; [`FALLBACK_OWN`] when unreadable.
+pub fn own_top_level(proc_root: &Path) -> Option<String> {
+    let Ok(raw) = std::fs::read_to_string(proc_root.join("self").join("cgroup")) else {
+        return Some(FALLBACK_OWN.to_string());
+    };
+    let Some(path) = raw.lines().find_map(|l| l.strip_prefix("0::")) else {
+        return Some(FALLBACK_OWN.to_string());
+    };
+    path.trim()
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+}
+
+/// A name the fence will touch: one top-level cgroup, nothing that walks.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+}
+
+/// The cgroup directory's inode, so a cgroup removed and recreated under
+/// the same name is never taken for the one the fence recorded.
+fn cgroup_ino(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir).map(|m| m.ino()).unwrap_or(0)
+}
 
 /// One fenced cgroup and what its `cpuset.cpus` held before.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +130,11 @@ pub struct FencedCgroup {
     pub name: String,
     /// Its `cpuset.cpus` before the fence, trimmed; empty means "inherit".
     pub previous: String,
+    /// Its directory's inode when fenced. A cgroup of the same name with
+    /// another inode is a new one: fenced as new while held, and never
+    /// written by a release.
+    #[serde(default)]
+    pub ino: u64,
 }
 
 /// A thread whose affinity the fence will have reset, and what it was.
@@ -207,6 +248,8 @@ pub struct CoreFence {
     ops: Box<dyn FenceOps>,
     boot_id: String,
     vpp_cores: Vec<u16>,
+    /// This daemon's own top-level cgroup, never fenced ([`own_top_level`]).
+    own: Option<String>,
     held: Option<Held>,
 }
 
@@ -270,11 +313,13 @@ impl CoreFence {
         let mut vpp_cores = vpp_cores;
         vpp_cores.sort_unstable();
         vpp_cores.dedup();
+        let own = own_top_level(&paths.proc_root);
         Self {
             paths,
             ops,
             boot_id: boot_id.into(),
             vpp_cores,
+            own,
             held: None,
         }
     }
@@ -295,7 +340,7 @@ impl CoreFence {
         self.held.as_ref().map(|h| &h.record)
     }
 
-    /// Fence every top-level cgroup but [`SKIP`] off VPP's cores.
+    /// Fence every top-level cgroup but this daemon's own off VPP's cores.
     /// Already held: a refresh. `Err` leaves nothing changed that the
     /// record does not list, and the caller carries on unfenced.
     pub fn engage(&mut self, now: Instant) -> Result<(), String> {
@@ -348,7 +393,11 @@ impl CoreFence {
             last_refresh: now,
         };
         self.held = Some(held);
-        self.persist()?;
+        // Nothing is fenced unless the record of it can be written first.
+        if let Err(e) = self.persist() {
+            self.held = None;
+            return Err(e);
+        }
         self.refresh(now, true);
         Ok(())
     }
@@ -371,7 +420,7 @@ impl CoreFence {
             .flatten()
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| !SKIP.contains(&n.as_str()))
+            .filter(|n| plain_name(n) && self.own.as_deref() != Some(n.as_str()))
             .collect();
         names.sort_unstable();
         let allowed = format_cpu_list(&h.allowed);
@@ -381,10 +430,28 @@ impl CoreFence {
                 // No cpuset in this cgroup: nothing to fence with.
                 continue;
             };
-            let known = self
-                .held
-                .as_ref()
-                .is_some_and(|h| h.record.cgroups.iter().any(|c| c.name == name));
+            let ino = cgroup_ino(&self.paths.cgroup_root.join(&name));
+            let recorded = self.held.as_ref().and_then(|h| {
+                h.record
+                    .cgroups
+                    .iter()
+                    .position(|c| c.name == name)
+                    .map(|i| (i, h.record.cgroups[i].ino))
+            });
+            // Removed and recreated under the same name (a service that
+            // restarted): a cgroup the record does not describe. What the
+            // record kept for the old one no longer applies to anything.
+            let known = match recorded {
+                Some((i, was)) if was != 0 && was != ino => {
+                    tracing::info!(cgroup = %name, "a fenced cgroup was recreated; fencing the new one");
+                    if let Some(h) = self.held.as_mut() {
+                        h.record.cgroups.remove(i);
+                    }
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            };
             if known {
                 if now_cpus != allowed {
                     tracing::info!(cgroup = %name, cpus = %now_cpus, "a fenced cgroup's CPUs were changed back; fencing it again");
@@ -394,14 +461,14 @@ impl CoreFence {
                 }
                 continue;
             }
-            if let Err(e) = self.fence_one(&name, now_cpus) {
+            if let Err(e) = self.fence_one(&name, now_cpus, ino) {
                 tracing::warn!(cgroup = %name, error = %e, "could not fence a cgroup off VPP's cores");
             }
         }
     }
 
     /// Record `name` and its pinned threads, persist, then fence it.
-    fn fence_one(&mut self, name: &str, previous: String) -> Result<(), String> {
+    fn fence_one(&mut self, name: &str, previous: String, ino: u64) -> Result<(), String> {
         let dir = self.paths.cgroup_root.join(name);
         let (online, allowed) = match self.held.as_ref() {
             Some(h) => (h.online.clone(), format_cpu_list(&h.allowed)),
@@ -426,17 +493,32 @@ impl CoreFence {
                 cpus: format_cpu_list(&cpus),
             });
         }
-        if let Some(h) = self.held.as_mut() {
-            h.record.cgroups.push(FencedCgroup {
-                name: name.to_string(),
-                previous,
-            });
-            h.record.threads.extend(pinned);
-        }
+        let threads_before = match self.held.as_mut() {
+            Some(h) => {
+                let before = h.record.threads.len();
+                h.record.cgroups.push(FencedCgroup {
+                    name: name.to_string(),
+                    previous,
+                    ino,
+                });
+                h.record.threads.extend(pinned);
+                before
+            }
+            None => return Ok(()),
+        };
         // Write-ahead: the record lists this cgroup before it changes, so
         // a daemon that dies between the two leaves something to undo
-        // rather than a fence nobody knows about.
-        self.persist()?;
+        // rather than a fence nobody knows about. A record that cannot be
+        // written means no fence: the entry comes back out, or a later
+        // refresh would take it for one already fenced and fence it with
+        // nothing on disk to undo it by.
+        if let Err(e) = self.persist() {
+            if let Some(h) = self.held.as_mut() {
+                h.record.cgroups.pop();
+                h.record.threads.truncate(threads_before);
+            }
+            return Err(e);
+        }
         self.ops
             .write_cpuset(&dir.join("cpuset.cpus"), &allowed)
             .map_err(|e| format!("write {}: {e}", dir.join("cpuset.cpus").display()))
@@ -449,37 +531,102 @@ impl CoreFence {
         write_record(&self.paths.record(), &h.record)
     }
 
-    /// Undo everything the record lists and delete it. A no-op when
-    /// nothing is held.
+    /// Undo everything the record lists. The record is deleted once all
+    /// of it is put back; what could not be is kept, for the next attach
+    /// or `packetframe detach` to retry. A no-op when nothing is held.
     pub fn release(&mut self) -> Option<Released> {
         let h = self.held.take()?;
-        let released = undo(&self.paths, self.ops.as_ref(), &h.record);
-        if let Err(e) = std::fs::remove_file(self.paths.record()) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(error = %e, "could not delete the core fence's record");
-            }
-        }
+        let (released, residual) = undo(&self.paths, self.ops.as_ref(), &h.record);
+        settle_record(&self.paths.record(), residual);
         Some(released)
     }
 }
 
+/// Write the record. Through the no-follow writer on Linux: the daemon
+/// writes it as root into `state-dir`, and a symlink planted there must
+/// not redirect the write.
 fn write_record(path: &Path, record: &FenceRecord) -> Result<(), String> {
     let body =
         serde_json::to_vec_pretty(record).map_err(|e| format!("encode fence record: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))
+    #[cfg(target_os = "linux")]
+    let r = packetframe_common::statefile::write_atomic(path, &body);
+    #[cfg(not(target_os = "linux"))]
+    let r = std::fs::write(path, &body);
+    r.map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Read the record, only if this daemon's account owns it and nothing on
+/// its path could have been swapped by another: it decides which cgroups
+/// root writes to.
+fn read_record(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use packetframe_common::statefile::{read_owned_no_follow, OwnedReadError};
+        match read_owned_no_follow(path, 4 << 20) {
+            Ok(r) => Ok(r),
+            Err(OwnedReadError::Untrusted(why)) => Err(format!(
+                "{} is not trusted ({why}); left in place and not acted on",
+                path.display()
+            )),
+            Err(OwnedReadError::TooLarge { len, max }) => Err(format!(
+                "{} is {len} bytes, over {max}; left in place and not acted on",
+                path.display()
+            )),
+            Err(OwnedReadError::Io(e)) => Err(format!("read {}: {e}", path.display())),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    match std::fs::read(path) {
+        Ok(r) => Ok(Some(r)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+fn remove_record(path: &Path) {
+    #[cfg(target_os = "linux")]
+    let r = packetframe_common::statefile::remove_state_record(path);
+    #[cfg(not(target_os = "linux"))]
+    let r = std::fs::remove_file(path);
+    match r {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(error = %e, "could not delete the core fence's record"),
+    }
+}
+
+/// After a release: delete the record when everything was put back, or
+/// keep only what was not, for a later retry.
+fn settle_record(path: &Path, residual: FenceRecord) {
+    if residual.cgroups.is_empty() && residual.threads.is_empty() {
+        remove_record(path);
+    } else if let Err(e) = write_record(path, &residual) {
+        tracing::warn!(error = %e, "could not keep the record of what the core fence could not put back");
+    }
 }
 
 /// Put back each cgroup's CPUs, then each recorded thread's affinity. The
 /// cgroups first: restoring a thread to a CPU its cgroup still excludes
-/// would fail.
-fn undo(paths: &FencePaths, ops: &dyn FenceOps, record: &FenceRecord) -> Released {
+/// would fail. Returns what was done, and the record cut down to what
+/// failed.
+fn undo(paths: &FencePaths, ops: &dyn FenceOps, record: &FenceRecord) -> (Released, FenceRecord) {
     let mut out = Released::default();
+    let mut residual = FenceRecord {
+        cgroups: Vec::new(),
+        threads: Vec::new(),
+        ..record.clone()
+    };
     for c in &record.cgroups {
-        let cpus = paths.cgroup_root.join(&c.name).join("cpuset.cpus");
-        if !cpus.exists() {
-            // Gone with whatever ran in it: nothing left to undo.
+        if !plain_name(&c.name) {
+            out.failures
+                .push(format!("{:?}: not a top-level cgroup name", c.name));
+            continue;
+        }
+        let dir = paths.cgroup_root.join(&c.name);
+        let cpus = dir.join("cpuset.cpus");
+        if !cpus.exists() || (c.ino != 0 && cgroup_ino(&dir) != c.ino) {
+            // Gone with whatever ran in it, or replaced by a cgroup the
+            // fence never touched: nothing of ours left to undo.
             continue;
         }
         let r = match ops.write_cpuset(&cpus, &c.previous) {
@@ -498,7 +645,10 @@ fn undo(paths: &FencePaths, ops: &dyn FenceOps, record: &FenceRecord) -> Release
         };
         match r {
             Ok(()) => out.cgroups.push(c.name.clone()),
-            Err(e) => out.failures.push(format!("{}: {e}", c.name)),
+            Err(e) => {
+                out.failures.push(format!("{}: {e}", c.name));
+                residual.cgroups.push(c.clone());
+            }
         }
     }
     let mut seen = BTreeSet::new();
@@ -517,10 +667,13 @@ fn undo(paths: &FencePaths, ops: &dyn FenceOps, record: &FenceRecord) -> Release
             Ok(()) => out.threads_restored += 1,
             // Exited between the check and the call.
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => out.threads_gone += 1,
-            Err(e) => out.failures.push(format!("thread {}: {e}", t.tid)),
+            Err(e) => {
+                out.failures.push(format!("thread {}: {e}", t.tid));
+                residual.threads.push(t.clone());
+            }
         }
     }
-    out
+    (out, residual)
 }
 
 /// Log a release and record `cores_released`.
@@ -560,7 +713,15 @@ pub fn report(reason: &str, held: Duration, r: &Released) {
 /// [`release_stale`] against the live host, reported as `stale`. For
 /// attach and `packetframe detach`.
 pub fn release_stale_live(state_dir: &Path) {
-    let boot = crate::process::boot_id().unwrap_or_default();
+    // Without the boot_id a record of this boot would read as another
+    // boot's and be deleted unapplied: leave it for a later attempt.
+    let boot = match crate::process::boot_id() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "no boot_id; a core fence a previous daemon left is not checked now");
+            return;
+        }
+    };
     match release_stale(&FencePaths::live(state_dir), &LiveOps, &boot) {
         None => {}
         Some(Ok((r, since_unix))) => {
@@ -581,24 +742,30 @@ pub fn release_stale(
     boot_id: &str,
 ) -> Option<Result<(Released, u64), String>> {
     let path = paths.record();
-    let raw = match std::fs::read(&path) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => return Some(Err(format!("read {}: {e}", path.display()))),
+    let raw = match read_record(&path) {
+        Ok(Some(r)) => r,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
     };
-    let result = match serde_json::from_slice::<FenceRecord>(&raw) {
+    match serde_json::from_slice::<FenceRecord>(&raw) {
         Ok(record) if record.boot_id == boot_id => {
-            Ok((undo(paths, ops, &record), record.since_unix))
+            let (released, residual) = undo(paths, ops, &record);
+            settle_record(&path, residual);
+            Some(Ok((released, record.since_unix)))
         }
-        Ok(record) => Ok((Released::default(), record.since_unix)),
-        Err(e) => Err(format!(
-            "{} is unreadable ({e}); deleted, and any cgroup it fenced keeps its CPUs until \
-             reboot",
-            path.display()
-        )),
-    };
-    let _ = std::fs::remove_file(&path);
-    Some(result)
+        Ok(record) => {
+            remove_record(&path);
+            Some(Ok((Released::default(), record.since_unix)))
+        }
+        Err(e) => {
+            remove_record(&path);
+            Some(Err(format!(
+                "{} is unreadable ({e}); deleted, and any cgroup it fenced keeps its CPUs until \
+                 reboot",
+                path.display()
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -651,7 +818,12 @@ mod tests {
             )
             .unwrap();
             std::fs::write(cg.join("cpuset.cpus.effective"), "0-17\n").unwrap();
-            std::fs::create_dir_all(base.join("proc")).unwrap();
+            std::fs::create_dir_all(base.join("proc").join("self")).unwrap();
+            std::fs::write(
+                base.join("proc/self/cgroup"),
+                "0::/system.slice/packetframe.service\n",
+            )
+            .unwrap();
             std::fs::create_dir_all(base.join("state")).unwrap();
             let paths = FencePaths {
                 cgroup_root: cg,
@@ -803,6 +975,128 @@ mod tests {
         assert_eq!(fx.cpus("app.slice"), "0-14");
         f.release().unwrap();
         assert_eq!(fx.cpus("dpi"), "");
+    }
+
+    #[test]
+    fn the_daemons_own_top_level_cgroup_is_the_one_left_alone() {
+        let fx = Fixture::new("own");
+        // `sudo packetframe run` from a login: VPP will be a child of
+        // user.slice, so user.slice is the one VPP needs its cores in.
+        std::fs::write(
+            fx.paths.proc_root.join("self/cgroup"),
+            "0::/user.slice/user-0.slice/session-1.scope\n",
+        )
+        .unwrap();
+        fx.cgroup("user.slice", "", &[], &[]);
+        fx.cgroup("system.slice", "", &[], &[]);
+        let aff = FakeAffinity::default();
+        let mut f = fence(&fx, &aff);
+        f.engage(Instant::now()).unwrap();
+        assert_eq!(fx.cpus("user.slice"), "");
+        assert_eq!(fx.cpus("system.slice"), "0-14");
+        f.release().unwrap();
+        assert_eq!(
+            own_top_level(Path::new("/nonexistent")).as_deref(),
+            Some("system.slice")
+        );
+    }
+
+    #[test]
+    fn a_cgroup_recreated_under_its_name_is_fenced_as_new_and_never_written_by_release() {
+        let fx = Fixture::new("recreate");
+        fx.cgroup("bgpd", "", &[], &[]);
+        let aff = FakeAffinity::default();
+        let mut f = fence(&fx, &aff);
+        let t0 = Instant::now();
+        f.engage(t0).unwrap();
+        // bgpd restarts: its cgroup is removed and made again. Moved out of
+        // the way rather than deleted, so the new one cannot reuse its
+        // inode, as cgroupfs never does but a fixture filesystem may.
+        std::fs::rename(
+            fx.paths.cgroup_root.join("bgpd"),
+            fx.base.join("old-bgpd-1"),
+        )
+        .unwrap();
+        fx.cgroup("bgpd", "3", &[], &[]);
+        f.refresh(t0 + REFRESH_EVERY, false);
+        assert_eq!(fx.cpus("bgpd"), "0-14", "the new cgroup is fenced");
+        let rec = f.record().unwrap();
+        assert_eq!(rec.cgroups.len(), 1);
+        assert_eq!(rec.cgroups[0].previous, "3", "what the NEW one held");
+        f.release().unwrap();
+        assert_eq!(fx.cpus("bgpd"), "3");
+
+        // After a crash: a cgroup recreated since is not the record's.
+        let mut f = fence(&fx, &aff);
+        f.engage(Instant::now()).unwrap();
+        std::mem::forget(f);
+        std::fs::rename(
+            fx.paths.cgroup_root.join("bgpd"),
+            fx.base.join("old-bgpd-2"),
+        )
+        .unwrap();
+        fx.cgroup("bgpd", "5", &[], &[]);
+        let (r, _) = release_stale(&fx.paths(), &aff, "boot-a").unwrap().unwrap();
+        assert!(r.cgroups.is_empty());
+        assert_eq!(
+            fx.cpus("bgpd"),
+            "5",
+            "a cgroup the fence never touched is left alone"
+        );
+    }
+
+    #[test]
+    fn what_could_not_be_put_back_stays_on_record_for_a_retry() {
+        let fx = Fixture::new("residual");
+        fx.cgroup("os.slice", "", &[10], &[]);
+        fx.cgroup("app.slice", "", &[], &[]);
+        fx.thread(10, 7, "12");
+        let aff = FakeAffinity::default();
+        let mut f = fence(&fx, &aff);
+        f.engage(Instant::now()).unwrap();
+        // The online set has shrunk to nothing writable: os.slice cannot
+        // take its CPUs back (empty is refused, and the fallback fails).
+        let mut rec = f.record().unwrap().clone();
+        rec.online = "99".into();
+        std::mem::forget(f);
+        write_record(&fx.paths.record(), &rec).unwrap();
+        std::fs::write(fx.paths.cgroup_root.join("os.slice/cpuset.cpus"), "0-14\n").unwrap();
+        struct Refusing(FakeAffinity);
+        impl FenceOps for Refusing {
+            fn write_cpuset(&self, file: &Path, cpus: &str) -> std::io::Result<()> {
+                if cpus == "99" {
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                self.0.write_cpuset(file, cpus)
+            }
+            fn set_affinity(&self, tid: i32, cpus: &[u16]) -> std::io::Result<()> {
+                self.0.set_affinity(tid, cpus)
+            }
+        }
+        let ops = Refusing(aff.clone());
+        let (r, _) = release_stale(&fx.paths(), &ops, "boot-a").unwrap().unwrap();
+        assert_eq!(r.failures.len(), 1, "{:?}", r.failures);
+        assert_eq!(r.cgroups, vec!["app.slice".to_string()]);
+        let kept: FenceRecord =
+            serde_json::from_slice(&std::fs::read(fx.paths.record()).unwrap()).unwrap();
+        assert_eq!(kept.cgroups.len(), 1, "only what failed is kept");
+        assert_eq!(kept.cgroups[0].name, "os.slice");
+        assert!(kept.threads.is_empty(), "the thread was put back");
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_written_fences_nothing() {
+        let fx = Fixture::new("nopersist");
+        fx.cgroup("os.slice", "", &[], &[]);
+        // A file where the state directory should be: every write of the
+        // record fails.
+        std::fs::remove_dir_all(&fx.paths.state_dir).unwrap();
+        std::fs::write(&fx.paths.state_dir, "not a directory").unwrap();
+        let aff = FakeAffinity::default();
+        let mut f = fence(&fx, &aff);
+        assert!(f.engage(Instant::now()).is_err());
+        assert!(!f.is_held());
+        assert_eq!(fx.cpus("os.slice"), "");
     }
 
     #[test]
