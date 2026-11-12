@@ -2067,7 +2067,7 @@ used only when every probe had that outcome:
 | `reading` | What it means | Check |
 |---|---|---|
 | `queue-full` | Every request the programmer made found the resolver's queue full (`queue_full`) | The `neigh-resolver` row in `packetframe status`: the queue drains only while its loop runs |
-| `not-served` | Requests were queued (`asked`) but the resolver served none | The resolver was still in its startup read of the kernel, or behind. `first_served_secs` on the later `nexthop_resolved_late` says when it started |
+| `not-served` | Requests were queued (`asked`) but the resolver served none | The resolver was still in its startup read of the kernel, or behind. `first_served_secs` on the later `nexthop_resolved_late` says when it started. Before 0.6.4 it was also how a resolver looked while it waited on the programmer for one of its own routes (a `local-prefix` host route, the `fallback-default`) during a route-ledger seed, which held it for the whole seed; those routes now go through an applier of their own and never hold the resolver |
 | `not-applied` | Still unresolved, though the resolver answered `cache_hit` requests from a usable neighbour in its own view and sent it on | The programmer did not settle it: `NEXTHOPS update failed` in the journal |
 | `served-late` | (`nexthop_resolved_late` only.) The resolver's first served request, `first_served_secs` in, found the neighbour in its own view | Nothing was wrong with the neighbour; the resolver was late, as for `not-served` |
 | `link-down` | The egress (`dev`) reads `down`, `lowerlayerdown` or similar now | The port, its cable, and on VPP boxes whether the port was being handed over |

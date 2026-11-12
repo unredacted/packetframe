@@ -355,19 +355,14 @@ pub struct NetlinkNeighborResolver {
     /// landing on cache hits or fanning out to proactive probes.
     synth_learned_emitted: u64,
     cache_misses: u64,
-    /// v0.2.1: count of /32 RouteEvents emitted for local-prefix hosts,
-    /// split by add and remove. Logged in the same periodic stats line
-    /// as the resolver counters above so operators can see at a glance
-    /// whether the local-prefix sweep is doing useful work.
-    local_arp_routes_added: u64,
-    local_arp_routes_removed: u64,
-    /// Same, for `local-prefix6` /128s resolved via NDP. Kept separate
-    /// from the ARP counters rather than summed: the runbook points
-    /// operators at `local_arp_routes_added` as the "is it working"
-    /// signal, and merging the families would make both numbers
-    /// unreadable on a dual-stack segment.
-    local_nd_routes_added: u64,
-    local_nd_routes_removed: u64,
+    /// Applies the routes this resolver makes (local-prefix host routes,
+    /// the fallback default, a link's PeerDown) without the resolver
+    /// waiting on the programmer ([`super::route_applier`]). Started on
+    /// first use, inside the runtime. Its counts are the
+    /// `local_arp_routes_*` / `local_nd_routes_*` of the stats line: /32s
+    /// and /128s kept apart, since the runbook points operators at
+    /// `local_arp_routes_added` as the "is it working" signal.
+    applier: Option<super::route_applier::RouteApplier>,
     /// Cache mapping ifindex → egress MAC. Populated at startup via
     /// a single `RTM_GETLINK` dump; maintained by `RTM_NEWLINK` /
     /// `RTM_DELLINK` multicast events. Used to attach `src_mac` to
@@ -706,10 +701,7 @@ impl NetlinkNeighborResolver {
                 neigh_cache: HashMap::new(),
                 synth_learned_emitted: 0,
                 cache_misses: 0,
-                local_arp_routes_added: 0,
-                local_arp_routes_removed: 0,
-                local_nd_routes_added: 0,
-                local_nd_routes_removed: 0,
+                applier: None,
                 local_prefixes: Vec::new(),
                 prog_handle: None,
                 fallback_default: None,
@@ -1063,8 +1055,8 @@ impl NetlinkNeighborResolver {
             // Only once: a later incarnation's reconcile already announced
             // every host whose /32 the previous one had not (`learn`), and
             // the ARP scavenge inside the seed is a one-time sweep.
-            if let Some(prog) = self.prog_handle.clone() {
-                self.seed_local_prefix_routes(&prog).await;
+            if self.prog_handle.is_some() {
+                self.seed_local_prefix_routes().await;
             } else if !self.local_prefixes.is_empty() || self.fallback_default.is_some() {
                 warn!(
                     local_prefixes = self.local_prefixes.len(),
@@ -1281,10 +1273,11 @@ impl NetlinkNeighborResolver {
             cache_size = self.neigh_cache.len(),
             synth_learned_emitted = self.synth_learned_emitted,
             cache_misses = self.cache_misses,
-            local_arp_routes_added = self.local_arp_routes_added,
-            local_arp_routes_removed = self.local_arp_routes_removed,
-            local_nd_routes_added = self.local_nd_routes_added,
-            local_nd_routes_removed = self.local_nd_routes_removed,
+            local_arp_routes_added = self.applied(|a| &a.host_v4_added),
+            local_arp_routes_removed = self.applied(|a| &a.host_v4_removed),
+            local_nd_routes_added = self.applied(|a| &a.host_v6_added),
+            local_nd_routes_removed = self.applied(|a| &a.host_v6_removed),
+            synth_routes_pending = self.applied(|a| &a.pending),
             fdb_entries = self.fdb.len(),
             fdb_pins_sent = self.fdb_pins_sent,
             fdb_pins_cleared = self.fdb_pins_cleared,
@@ -2177,13 +2170,26 @@ impl NetlinkNeighborResolver {
     /// answer — which, while it applies a route-ledger seed or a
     /// full-table burst, can be a long wait and is marked as one, for
     /// the reason [`Self::send_event`] gives.
-    async fn apply_route(
-        &mut self,
-        prog: &FibProgrammerHandle,
-        event: RouteEvent,
-    ) -> Result<(), crate::fib::programmer::ProgrammerError> {
-        let _wait = self.status.programmer_wait();
-        prog.apply_route_event(event).await
+    /// Hand a route this resolver made to the applier, which applies it
+    /// in order without the resolver waiting ([`super::route_applier`]).
+    /// No programmer handle wired: nothing to do.
+    fn submit_route(&mut self, event: RouteEvent, kind: super::route_applier::RouteKind) {
+        if self.applier.is_none() {
+            let Some(prog) = self.prog_handle.clone() else {
+                return;
+            };
+            self.applier = Some(super::route_applier::RouteApplier::spawn(prog));
+        }
+        if let Some(a) = self.applier.as_ref() {
+            a.submit(event, kind);
+        }
+    }
+
+    /// One of the applier's counters, 0 before it starts.
+    fn applied(&self, pick: impl Fn(&super::route_applier::ApplierStats) -> &AtomicU64) -> u64 {
+        self.applier
+            .as_ref()
+            .map_or(0, |a| pick(a.stats()).load(Ordering::Relaxed))
     }
 
     /// An `RTM_NEWLINK`, or a link a reconcile found new or changed.
@@ -2527,7 +2533,7 @@ impl NetlinkNeighborResolver {
     /// backpressure and the programmer drains it concurrently. The
     /// queued resolve requests that do survive become harmless
     /// duplicate cache-hits once the select loop starts.
-    async fn seed_local_prefix_routes(&mut self, prog: &FibProgrammerHandle) {
+    async fn seed_local_prefix_routes(&mut self) {
         // Snapshot the cache under a copy so the iteration doesn't
         // borrow self while we call &mut self below for counter
         // updates. Cache is small (low thousands at most on the
@@ -2553,16 +2559,11 @@ impl NetlinkNeighborResolver {
                     local_pref: None,
                     origin_asn: None,
                 };
-                if let Err(e) = self.apply_route(prog, add).await {
-                    warn!(?ip, error = %e, "local-prefix seed RouteEvent::Add dispatch failed");
-                    continue;
-                }
+                self.submit_route(add, super::route_applier::RouteKind::HostAdd { ip });
                 if ip.is_ipv4() {
                     emitted_v4 += 1;
-                    self.local_arp_routes_added += 1;
                 } else {
                     emitted_v6 += 1;
-                    self.local_nd_routes_added += 1;
                 }
                 // Same construction as the resolve queue's cache-hit
                 // arm, including the zeroed src_mac fallback for
@@ -2850,9 +2851,9 @@ impl NetlinkNeighborResolver {
         let Some(spec) = self.fallback_default.clone() else {
             return;
         };
-        let Some(prog) = self.prog_handle.clone() else {
+        if self.prog_handle.is_none() {
             return;
-        };
+        }
         let event = RouteEvent::Add {
             peer_id: PeerId::local_arp(ifindex),
             prefix: IpPrefix::V4 {
@@ -2864,33 +2865,18 @@ impl NetlinkNeighborResolver {
             local_pref: None,
             origin_asn: None,
         };
-        match self.apply_route(&prog, event).await {
-            Ok(()) => {
-                // A re-send under the ifindex already acknowledged is a
-                // no-op in the programmer; a flag or carrier change
-                // must not read as a new injection.
-                if self.fallback_injected_on.replace(ifindex) == Some(ifindex) {
-                    debug!(
-                        iface = %spec.iface,
-                        ifindex,
-                        "fallback-default 0.0.0.0/0 re-sent on RTM_NEWLINK"
-                    );
-                } else {
-                    info!(
-                        iface = %spec.iface,
-                        ifindex,
-                        nexthop = %spec.nexthop,
-                        "v0.2.1 fallback-default 0.0.0.0/0 injected"
-                    );
-                }
-            }
-            Err(e) => warn!(
-                iface = %spec.iface,
-                ifindex,
-                error = %e,
-                "fallback-default injection failed"
-            ),
-        }
+        // A re-send under the ifindex already handed over is a no-op in
+        // the programmer; a flag or carrier change must not read as a new
+        // injection. Recorded when handed over, not when applied: the
+        // applier keeps order, so a later PeerDown still follows it.
+        let resend = self.fallback_injected_on.replace(ifindex) == Some(ifindex);
+        let kind = super::route_applier::RouteKind::Fallback {
+            iface: spec.iface.clone(),
+            ifindex,
+            nexthop: IpAddr::V4(spec.nexthop),
+            resend,
+        };
+        self.submit_route(event, kind);
     }
 
     /// Same as [`Self::seed_local_prefix_routes`] but for a single
@@ -2911,13 +2897,6 @@ impl NetlinkNeighborResolver {
         let Some(peer_id) = self.match_local_prefix(ip, ifindex) else {
             return;
         };
-        // Clone to release the &self borrow on prog_handle before the
-        // mutable counter update below, same pattern as
-        // seed_local_prefix_routes. FibProgrammerHandle is cheap to
-        // clone (mpsc Sender wrapper).
-        let Some(prog) = self.prog_handle.clone() else {
-            return;
-        };
         let add = RouteEvent::Add {
             peer_id,
             prefix: host_prefix(ip),
@@ -2926,13 +2905,7 @@ impl NetlinkNeighborResolver {
             local_pref: None,
             origin_asn: None,
         };
-        if let Err(e) = self.apply_route(&prog, add).await {
-            warn!(?ip, error = %e, "local-prefix RouteEvent::Add dispatch failed");
-        } else if ip.is_ipv4() {
-            self.local_arp_routes_added += 1;
-        } else {
-            self.local_nd_routes_added += 1;
-        }
+        self.submit_route(add, super::route_applier::RouteKind::HostAdd { ip });
     }
 
     /// Symmetric withdrawal for a single (ip, ifindex) on RTM_DELNEIGH.
@@ -2947,21 +2920,12 @@ impl NetlinkNeighborResolver {
         let Some(peer_id) = self.match_local_prefix(ip, ifindex) else {
             return;
         };
-        let Some(prog) = self.prog_handle.clone() else {
-            return;
-        };
         let del = RouteEvent::Del {
             peer_id,
             prefix: host_prefix(ip),
             path_id: None,
         };
-        if let Err(e) = self.apply_route(&prog, del).await {
-            warn!(?ip, error = %e, "local-prefix RouteEvent::Del dispatch failed");
-        } else if ip.is_ipv4() {
-            self.local_arp_routes_removed += 1;
-        } else {
-            self.local_nd_routes_removed += 1;
-        }
+        self.submit_route(del, super::route_applier::RouteKind::HostDel { ip });
     }
 
     /// On RTM_DELLINK, send a single PeerDown for the departed iface's
@@ -2985,23 +2949,14 @@ impl NetlinkNeighborResolver {
         if self.local_prefixes.is_empty() && !carried_fallback {
             return;
         }
-        let Some(prog) = self.prog_handle.clone() else {
-            return;
-        };
         let peer_id = PeerId::local_arp(ifindex);
-        match self
-            .apply_route(&prog, RouteEvent::PeerDown { peer_id })
-            .await
-        {
-            Ok(()) if carried_fallback => info!(
+        self.submit_route(
+            RouteEvent::PeerDown { peer_id },
+            super::route_applier::RouteKind::PeerDown {
                 ifindex,
-                "fallback-default iface deleted; 0.0.0.0/0 withdrawn until its RTM_NEWLINK"
-            ),
-            Ok(()) => {}
-            Err(e) => {
-                warn!(ifindex, error = %e, "local_arp RouteEvent::PeerDown dispatch failed")
-            }
-        }
+                carried_fallback,
+            },
+        );
     }
 
     /// Match `(ip, ifindex)` against the configured `local_prefixes`.
