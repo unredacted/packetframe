@@ -230,6 +230,16 @@ pub fn derive_sizing(expected_routes: u64, workers: u32, v6: bool) -> Result<Siz
     })
 }
 
+/// Entries beyond the route budget that the FIB holds anyway: attached and
+/// connected prefixes, a host route per neighbour, the special entries.
+pub const L3FIB_POOL_SLACK: u64 = 16_384;
+
+/// The `l3fib` pool size [`render`] preallocates: every route the sizing
+/// budgets for, both families, plus [`L3FIB_POOL_SLACK`].
+pub fn l3fib_pool_size(sizing: &Sizing) -> u64 {
+    sizing.expected_routes + sizing.v6_routes + L3FIB_POOL_SLACK
+}
+
 /// Validate a configured hugepage count against the derived need.
 /// `hugepage_bytes == 0` means the page size is unknown (non-Linux
 /// hosts, unreadable meminfo): skip the byte comparison — feasibility
@@ -459,6 +469,23 @@ pub fn render(
         "memory {{\n  main-heap-size {}M\n  main-heap-page-size default-hugepage\n}}\n",
         sizing.main_heap_bytes.div_ceil(1 << 20)
     ));
+    // The FIB's pools, preallocated for the table the heap is sized for.
+    // A route add is mp-safe in VPP 26.06 and takes no worker barrier,
+    // EXCEPT when a pool it draws from has to grow: then it stops every
+    // worker to reallocate (`load_balance_alloc_i`, `fib_entry_alloc`).
+    // During a fresh load that is a few dozen barriers, each copying a
+    // pool of up to a million entries with the workers held, and each one
+    // a chance for VPP to abort if a worker misses it for 1 s (lab,
+    // 2026-11-12: "worker thread deadlock" from `load_balance_create`
+    // under a 3 s stall on a worker core). Preallocated, the pools do not
+    // grow during the load. `pool_alloc` reserves capacity and leaves the
+    // pool growable, so a table past the budget grows as before. The
+    // memory is part of what `HEAP_BYTES_PER_ROUTE` already budgets: 72
+    // bytes an entry and a 64-byte load balance a route, against 1,024.
+    out.push_str(&format!(
+        "l3fib {{\n  load-balance-pool-size {n}\n  fib-entry-pool-size {n}\n}}\n",
+        n = l3fib_pool_size(sizing)
+    ));
     let _ = hugepage_bytes; // recorded in the header comment path later; kept as input for stability
                             // The stats segment. NOT optional and NOT covered by
                             // main-heap-size: VPP keeps per-FIB-entry counters here, the
@@ -682,6 +709,30 @@ mod tests {
         check_hugepage_budget(&sizing, 6, page).unwrap();
         // Unknown page size: byte check skipped.
         check_hugepage_budget(&sizing, 1, 0).unwrap();
+    }
+
+    /// The FIB pools are preallocated for every budgeted route, both
+    /// families, and what they take fits well inside the heap the same
+    /// budget sized: a preallocation the heap cannot hold would stop VPP
+    /// at start.
+    #[test]
+    fn render_preallocates_the_fib_pools_within_the_heap() {
+        for v6 in [false, true] {
+            let sizing = derive_sizing(1_400_000, 2, v6).unwrap();
+            let conf = render(&sizing, &[14, 15], 13, "/run/pf/api.sock", 512 << 20, None);
+            let n = l3fib_pool_size(&sizing);
+            assert_eq!(n, 1_400_000 + sizing.v6_routes + L3FIB_POOL_SLACK);
+            assert!(conf.contains(&format!(
+                "l3fib {{\n  load-balance-pool-size {n}\n  fib-entry-pool-size {n}\n}}\n"
+            )));
+            // 72-byte fib_entry_t and a cache-line load_balance_t (VPP 26.06).
+            let pools = n * (72 + 64);
+            assert!(
+                pools * 4 < sizing.main_heap_bytes,
+                "pools {pools} bytes against a {} byte heap",
+                sizing.main_heap_bytes
+            );
+        }
     }
 
     #[test]
