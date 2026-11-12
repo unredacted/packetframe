@@ -273,7 +273,7 @@ fn bulk_load_rate_against_a_scratch_vpp() {
     t.set_timeout(Duration::from_secs(120)).expect("timeout");
     let sw = setup(&mut t);
     cli(&mut t, "event-logger resize 200000");
-    cli(&mut t, "elog trace barrier on");
+    cli(&mut t, "event-logger trace barrier on");
 
     let mut ports = PortIndex::default();
     ports.insert(PORT, None, sw);
