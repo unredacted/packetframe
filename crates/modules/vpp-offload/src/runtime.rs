@@ -1120,6 +1120,10 @@ enum SteerRequest {
 struct FreshHold {
     /// One log line per hold, not one per tick.
     announced: bool,
+    /// When the fresh resync began, for the release event's `load_ms`:
+    /// how long a fresh VPP took from its first route to holding the
+    /// whole table, the longest step between a start and steering.
+    began: std::time::Instant,
 }
 
 /// The loaded-and-quiet release of a STEERED adopted stage, with the feed
@@ -5527,6 +5531,7 @@ impl ObserveView {
             event_log::Event::info(crate::MODULE_NAME, event_kind::FRESH_HOLD_RELEASED)
                 .field("door", if door { "seeded" } else { "authority" })
                 .field("routes", have)
+                .field("load_ms", hold.began.elapsed().as_millis() as u64)
                 .emit();
             *seeded_fresh = door;
             release_hold = true;
@@ -6130,7 +6135,10 @@ impl Effects for EffectsView {
                  source loads, and verify waits until the authority confirms the \
                  table is complete (require-table-complete)"
             );
-            c.fresh_hold = Some(FreshHold { announced: false });
+            c.fresh_hold = Some(FreshHold {
+                announced: false,
+                began: std::time::Instant::now(),
+            });
         }
         Ok(())
     }
