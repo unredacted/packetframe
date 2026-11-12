@@ -35,6 +35,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 **vpp-offload**
 
 - A fresh VPP stops its workers less often while it loads: `startup.conf` preallocates the FIB's load-balance and fib-entry pools for the routes `expected-routes` budgets (`l3fib`), and attach moves every NIC's queue IRQs off VPP's cores, not only the member ports'. A worker that misses VPP's barrier for 1 s aborts it, which is how a fresh load died after a reboot. ([#387](https://github.com/unredacted/packetframe/pull/387))
+- `fresh_hold_released` carries `load_ms`, how long a fresh VPP took to take the whole table. The hwtest bundle carries `vpp_bulk_load_bench`, which times a bulk load into a scratch VPP and counts its barriers by caller. ([#388](https://github.com/unredacted/packetframe/pull/388))
 
 ## [0.6.2] - 2026-11-12
 
