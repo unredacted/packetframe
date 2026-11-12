@@ -1124,6 +1124,10 @@ struct FreshHold {
     /// how long a fresh VPP took from its first route to holding the
     /// whole table, the longest step between a start and steering.
     began: std::time::Instant,
+    /// VPP's main thread and the sending thread, on CPU and waiting for
+    /// one, from the same start: the release event says which side the
+    /// load's time went to ([`crate::load_clock`]).
+    clock: crate::load_clock::LoadClock,
 }
 
 /// The loaded-and-quiet release of a STEERED adopted stage, with the feed
@@ -5528,11 +5532,32 @@ impl ObserveView {
                      the full table"
                 );
             }
-            event_log::Event::info(crate::MODULE_NAME, event_kind::FRESH_HOLD_RELEASED)
-                .field("door", if door { "seeded" } else { "authority" })
-                .field("routes", have)
-                .field("load_ms", hold.began.elapsed().as_millis() as u64)
-                .emit();
+            let load_ms = hold.began.elapsed().as_millis() as u64;
+            let cpu = hold.clock.read();
+            tracing::info!(
+                load_ms,
+                vpp_main_cpu_ms = ?cpu.vpp_main_cpu_ms,
+                vpp_main_wait_ms = ?cpu.vpp_main_wait_ms,
+                sender_cpu_ms = ?cpu.sender_cpu_ms,
+                sender_wait_ms = ?cpu.sender_wait_ms,
+                "fresh load: where its time went (on CPU, or waiting for one)"
+            );
+            let mut ev =
+                event_log::Event::info(crate::MODULE_NAME, event_kind::FRESH_HOLD_RELEASED)
+                    .field("door", if door { "seeded" } else { "authority" })
+                    .field("routes", have)
+                    .field("load_ms", load_ms);
+            for (k, v) in [
+                ("vpp_main_cpu_ms", cpu.vpp_main_cpu_ms),
+                ("vpp_main_wait_ms", cpu.vpp_main_wait_ms),
+                ("sender_cpu_ms", cpu.sender_cpu_ms),
+                ("sender_wait_ms", cpu.sender_wait_ms),
+            ] {
+                if let Some(v) = v {
+                    ev = ev.field(k, v);
+                }
+            }
+            ev.emit();
             *seeded_fresh = door;
             release_hold = true;
         }
@@ -6135,9 +6160,11 @@ impl Effects for EffectsView {
                  source loads, and verify waits until the authority confirms the \
                  table is complete (require-table-complete)"
             );
+            let vpp_pid = c.process.as_ref().map(|p| p.pid());
             c.fresh_hold = Some(FreshHold {
                 announced: false,
                 began: std::time::Instant::now(),
+                clock: crate::load_clock::LoadClock::start(vpp_pid),
             });
         }
         Ok(())

@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.4] - UNRELEASED
+
+### Changes
+
+**vpp-offload**
+
+- `fresh_hold_released` says where a fresh load's time went: VPP's main thread and the daemon's sending thread, each on CPU and waiting for one (`vpp_main_cpu_ms`, `vpp_main_wait_ms`, `sender_cpu_ms`, `sender_wait_ms`), from `/proc/<pid>/task/<tid>/schedstat`. ([#PR](https://github.com/unredacted/packetframe/pull/PR))
+
 ## [0.6.3] - 2026-11-12
 
 A point release on 0.6.2 for the first load of a fresh VPP: the step between a gateway's start and VPP steering. On a gateway that boots into full traffic, that load took 3.5 min on 2026-11-05, against about 35 s idle, and VPP died during it on both post-upgrade boots. VPP now has its cores to itself while it loads, stops its workers less often, and every load's length is recorded. A 0.6.2 config and route ledger carry over unchanged.

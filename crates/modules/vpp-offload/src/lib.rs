@@ -68,6 +68,7 @@ pub mod handback;
 pub mod kernel_path;
 pub mod ledger_record;
 pub mod liveness;
+pub mod load_clock;
 pub mod nic;
 pub mod ntuple;
 pub mod process;
