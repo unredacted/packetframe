@@ -28,18 +28,69 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
-## [0.6.2] - UNRELEASED
+## [0.6.2] - 2026-11-12
+
+A point release on 0.6.1. After a reboot, a next hop that resolves late no longer leaves its routes out of VPP until the route source happens to re-send each one: on 2026-11-05 that held the reference gateway's first steer for over twenty minutes, with 486,318 routes through one transit judged unresolvable. A VPP that dies now leaves its output, the signal and a core behind, and a next hop slow to resolve is recorded in the event log with the likeliest cause. A 0.6.1 config and route ledger carry over unchanged.
+
+### Upgrading from 0.6.1
+
+1. Install the 0.6.2 package or tarball. The .deb runs no maintainer scripts, so the running daemon is unaffected.
+2. `systemctl daemon-reload`
+3. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with or without vpp-offload, as for 0.6.1.
+
+The start seeds from the ledger 0.6.1 wrote at the stop. Neither ledger format changed, so a downgrade to 0.6.1 seeds too.
+
+- **VPP's diagnostics directory.** A VPP the daemon starts writes its stdout and stderr to `<state-dir>/vpp-diag/` and runs there, with `runtime-dir` and `coredump-size unlimited` added to its `unix` stanza. This happens only if every directory from `/` down is root's and closed to others; otherwise a journal warning says why and VPP starts as before. Either way the stanza no longer sets `full-coredump`. Its stats socket moves there too. A VPP kept by `--keep-vpp` gets this at its next start; then `/proc/$(pidof vpp)/coredump_filter` reads `00000013`, and `/proc/sys/kernel/core_pattern` says where a core goes. [VPP died of a signal](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core)
+- **New events:** `vpp_killed` (vpp-offload), and `nexthop_resolve_slow` and `nexthop_resolved_late` (fast-path). [The event log](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/event-log.md)
+- **Debian 13 gateways.** EFG firmware 6.0.17 moves the gateway to Debian 13, where the Debian 11 VPP build cannot install. vpp-unifi's `vpp-v26.06-octeon9-trixie-arm64` is the same VPP commit PacketFrame binds to (`c3200b88`), with identical API CRCs, and a lab EFG on 6.0.17 ran this release's code with vpp-offload on it: ready, verified, nothing unresolvable. Install that build there instead.
+
+### Highlights
+
+- **A late neighbour no longer holds the steer.** When a neighbour resolves after the drain has judged its routes unresolvable, those routes are queued for VPP again at once, on a plain port as on a bridge. Until now only a bridge neighbour did that; on a plain port, such as a transit's, the routes waited for the route source to change each one. A route VPP already holds through the same paths is not re-sent. [Unresolvable routes](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/vpp-offload.md#packetframe_vpp_routesstateunresolvable--0)
+- **A VPP crash leaves evidence.** A fresh VPP died of SIGABRT under boot load on 2026-10-30 and again on 2026-11-05, and nothing said why: its output went to `/dev/null`, its backtrace to a RAM journal, and no core could be written. Now its output and backtrace are kept, a core can be written without the hugepage heap, and `vpp_killed` names the fault VPP's own handler caught. [VPP died of a signal](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core)
+- **Slow next hops explained.** A next hop still unresolved 30 s after it was registered or lost is recorded, with what each resolve request did, what the kernel answered, the egress link's state and carrier changes, and a `reading` naming the likeliest cause, such as `unanswered`, `probes-skipped` or `link-flapped`. It is recorded again when it resolves. [Slow next hops](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/packetframe-fib.md#slow-next-hops-in-the-event-log)
 
 ### Changes
 
 **fast-path**
 
-- A next hop still unresolved 30 s after it was registered or lost is recorded in the event log (`nexthop_resolve_slow`), and again when it resolves (`nexthop_resolved_late`). Each event lists what was asked and what the neighbour resolver did with each request, what the kernel reported, the egress link's state and carrier changes, and the likeliest cause (`reading`). At most 16 an hour, those with the most routes first. On 2026-11-05 a transit next hop resolved minutes late after a reboot, and nothing that said why outlived the journal. ([runbook](docs/runbooks/packetframe-fib.md#slow-next-hops-in-the-event-log), [#382](https://github.com/unredacted/packetframe/pull/382))
+- A next hop still unresolved 30 s after it was registered or lost is recorded in the event log (`nexthop_resolve_slow`), and again when it resolves (`nexthop_resolved_late`). Each event lists what was asked and what the neighbour resolver did with each request, what the kernel reported, the egress link's state and carrier changes, and the likeliest cause (`reading`). At most 16 an hour, those with the most routes first. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/packetframe-fib.md#slow-next-hops-in-the-event-log), [#382](https://github.com/unredacted/packetframe/pull/382))
 
 **vpp-offload**
 
-- A VPP the daemon spawns keeps its stdout and stderr in `<state-dir>/vpp-diag/`, one file per start, and its runtime directory is there too, so a core can land there (`coredump-size unlimited`, with a core filter that leaves out the hugepage heap). This happens only when no other account can change that path. A death by signal is reported (`vpp_killed`): the signal VPP died of, the fault its own handler logged (`vpp_signal`), and whether it dumped core. Until now, a fresh VPP that crashed under boot load left nothing behind. ([runbook](docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core), [#381](https://github.com/unredacted/packetframe/pull/381))
-- A neighbour that resolves after the routes through it have drained now hands them back to be installed, on a plain port as on a bridge; until now they stayed unresolvable until the route source changed each one, which held a fresh VPP's first steer for twenty minutes after a reboot. A route VPP already holds through the same paths is not re-sent. ([runbook](docs/runbooks/vpp-offload.md#packetframe_vpp_routesstateunresolvable--0), [#380](https://github.com/unredacted/packetframe/pull/380))
+- A neighbour that resolves after the routes through it have drained now hands them back to be installed, on a plain port as on a bridge; until now they stayed unresolvable until the route source changed each one. A route VPP already holds through the same paths is not re-sent. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/vpp-offload.md#packetframe_vpp_routesstateunresolvable--0), [#380](https://github.com/unredacted/packetframe/pull/380))
+- A VPP the daemon spawns keeps its stdout and stderr in `<state-dir>/vpp-diag/`, one file per start, and runs there, so a core can land there (`coredump-size unlimited`, with a core filter that leaves out the hugepage heap). This happens only when no other account can change that path. A death by signal is reported (`vpp_killed`): the signal VPP died of, the fault its own handler logged (`vpp_signal`), and whether it dumped core. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core), [#381](https://github.com/unredacted/packetframe/pull/381))
+
+**Build**
+
+- The eBPF programs are built with Aya 0.3.0 on the `nightly-2026-10-30` toolchain. ([#385](https://github.com/unredacted/packetframe/pull/385))
+- rtnetlink 0.24 and netlink-packet-route 0.34 ([#383](https://github.com/unredacted/packetframe/pull/383)); flate2 1.1.11 and signal-hook 0.4.6 ([#384](https://github.com/unredacted/packetframe/pull/384)).
+
+### Known limitations
+
+- The cause of the SIGABRT is not found; this release makes the next one diagnosable.
+- A neighbour that resolves late still costs a pass over every route through it: each is sent to VPP again, one at a time, so a late transit delays the first steer by however long a table's worth of updates takes under the load at the time.
+- After VPP's package is removed or reinstalled (a firmware upgrade does this), its removal script hands the port's VF back to the kernel, and adopting the running VPP is refused ("recorded port does not match reality") until `packetframe detach --all`, which costs the route ledger.
+- `detach --keep-vpp` refuses when the config newly adds vpp-offload; use `detach --all` for that change, and the next start loads cold.
+- After days of uptime the kernel can fail to grant VPP's hugepages: a lab gateway granted none of 4 × 512 MiB after 8 days. Dropping the page cache and compacting memory (`sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory`) before the start let all four be granted.
+- A gateway firmware upgrade can still remove hand-installed packages: reinstall packetframe, and VPP, after one.
+- The limitations listed for 0.6.1 otherwise still apply.
+
+### Install and verify
+
+When upgrading, follow steps 1 to 3 above.
+
+```sh
+ARCH=$(dpkg --print-architecture)   # amd64 or arm64
+curl -LO "https://github.com/unredacted/packetframe/releases/download/v0.6.2/packetframe_0.6.2_${ARCH}.deb"
+curl -LO https://github.com/unredacted/packetframe/releases/download/v0.6.2/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+dpkg -i "packetframe_0.6.2_${ARCH}.deb" && systemctl daemon-reload
+```
+
+Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the `aarch64-unknown-linux-gnu` tarball and the arm64 .deb also carry the VPP sampler plugin.
+
+**Full changelog:** https://github.com/unredacted/packetframe/compare/v0.6.1...v0.6.2
 
 ## [0.6.1] - 2026-11-04
 
