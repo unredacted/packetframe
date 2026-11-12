@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.3] - UNRELEASED
+
+### Changes
+
+**vpp-offload**
+
+- `fresh_hold_released` carries `load_ms`, how long a fresh VPP took to take the whole table. The hwtest bundle carries `vpp_bulk_load_bench`, which times a bulk load into a scratch VPP and counts its barriers by caller. ([#388](https://github.com/unredacted/packetframe/pull/388))
+
 ## [0.6.2] - 2026-11-12
 
 A point release on 0.6.1. After a reboot, a next hop that resolves late no longer leaves its routes out of VPP until the route source happens to re-send each one: on 2026-11-05 that held the reference gateway's first steer for over twenty minutes, with 486,318 routes through one transit judged unresolvable. A VPP that dies now leaves its output, the signal and a core behind, and a next hop slow to resolve is recorded in the event log with the likeliest cause. A 0.6.1 config and route ledger carry over unchanged.
