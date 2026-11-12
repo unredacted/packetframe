@@ -403,6 +403,99 @@ fn an_irq_on_a_vpp_core_is_moved_and_the_attach_proceeds() {
     assert!(!last.resources_leaked, "{:?}", last.teardown_failures);
 }
 
+/// Ports VPP does not own interrupt too, and their hardirq and softirq
+/// run wherever the IRQ is delivered, which CFS cannot preempt. The lab
+/// (2026-11-12) had eth0's queue IRQs 15, 16 and 17 on VPP's main core and
+/// both workers, and a 3 s stall on a worker core aborted VPP mid-load with
+/// "worker thread deadlock". Attach moves them off VPP's cores as well.
+#[test]
+fn a_non_member_nics_irq_on_a_vpp_core_is_moved_too() {
+    let fake = fake_vpp::Fake::start("bringup-irq-other");
+    let host = Host::new("irqother", &[("eth4", "0002:07:00.0")], fake.path.clone());
+
+    // 18 online, cpu12 isolated, one worker => main 16, worker 17. eth0 is
+    // not a member; its queue IRQ sits on the worker's core.
+    let msi = host
+        .paths
+        .sys
+        .sysfs_net
+        .join("eth0")
+        .join("device")
+        .join("msi_irqs");
+    fs::create_dir_all(&msi).unwrap();
+    fs::write(msi.join("828"), "").unwrap();
+    let d = host.paths.proc_irq.join("828");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("smp_affinity_list"), "17\n").unwrap();
+
+    let cfg = host.cfg(&[("eth4", 1, false)]);
+    let attached = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        None,
+        None,
+        &McamBudget::default(),
+        &[],
+    )
+    .expect("attach");
+
+    let now = fs::read_to_string(d.join("smp_affinity_list")).unwrap();
+    let cpu: u16 = now.trim().parse().expect("one CPU");
+    assert!(
+        cpu != attached.cores.main && !attached.cores.workers.contains(&cpu) && cpu != 12,
+        "eth0's IRQ moved to {cpu}, which is VPP's or isolated"
+    );
+
+    let last = attached.service.stop().published.expect("final status");
+    assert!(!last.resources_leaked, "{:?}", last.teardown_failures);
+}
+
+/// A non-member's IRQ the kernel will not move costs VPP time, not its
+/// start: unlike a member port's, it does not refuse the attach.
+#[test]
+fn a_non_member_irq_the_kernel_will_not_move_does_not_refuse() {
+    let fake = fake_vpp::Fake::start("bringup-irq-other-stuck");
+    let host = Host::new(
+        "irqotherstuck",
+        &[("eth4", "0002:07:00.0")],
+        fake.path.clone(),
+    );
+
+    let msi = host
+        .paths
+        .sys
+        .sysfs_net
+        .join("eth0")
+        .join("device")
+        .join("msi_irqs");
+    fs::create_dir_all(&msi).unwrap();
+    fs::write(msi.join("828"), "").unwrap();
+    let d = host.paths.proc_irq.join("828");
+    fs::create_dir_all(&d).unwrap();
+    // Delivery is read from the effective file, which a write to the mask
+    // does not change: the kernel "will not move" it.
+    fs::write(d.join("effective_affinity_list"), "17\n").unwrap();
+
+    let cfg = host.cfg(&[("eth4", 1, false)]);
+    let attached = bring_up(
+        &cfg,
+        &host.paths,
+        Box::new(Mirror),
+        &ALLOW,
+        None,
+        None,
+        None,
+        &McamBudget::default(),
+        &[],
+    )
+    .expect("a port VPP does not own must not keep VPP from starting");
+    let last = attached.service.stop().published.expect("final status");
+    assert!(!last.resources_leaked, "{:?}", last.teardown_failures);
+}
+
 /// A config that cannot work must cost nothing. The rollback path exists,/// A config that cannot work must cost nothing. The rollback path exists,
 /// but it should not be reachable by an ordinary operator typo — so the
 /// pure checks all run before the first sysfs write.
