@@ -38,10 +38,19 @@ has every more-specific route under it already loaded. So a packet either:
 - matches a loaded route, which is its true longest match; or
 - misses, and the kernel forwards it by the full table.
 
-Live deltas keep that true while the load runs. A new more-specific is
-installed as it arrives, which never breaks the property. A withdrawal
-removes the route from VPP, and its traffic falls to whatever covers it,
-in VPP or in the kernel.
+Live deltas keep that true only if they respect the load's frontier, the
+prefix length the load has reached:
+- **An addition longer than the frontier** is safe to install at once:
+  everything below it is already loaded.
+- **An addition at or shorter than the frontier is not.** While the
+  frontier is /24, a newly advertised /20 installed at once would capture
+  traffic for a /21 beneath it that has not loaded yet, which should still
+  miss to the kernel. Such an addition has to wait in the load's queue
+  until every more-specific route under it is in, or be installed as a
+  hand-back route until then. Today's `ConvergenceEngine::apply_changes`
+  has no such filter: it applies every delta as it comes.
+- **A withdrawal** removes the route from VPP, and its traffic falls to
+  whatever covers it, in VPP or in the kernel.
 
 ## Where it breaks, and what each break would need
 
@@ -102,6 +111,17 @@ it needs one of these:
 - **Hop limit:** VPP decrements TTL / hop limit and the kernel decrements
   it again. A traceroute shows an extra hop, and a packet arriving at TTL 2
   dies one hop early. That is minor, but visible.
+- **Policy routing keyed on ingress.** The kernel picks a table by its
+  rules (RPDB) before it routes. A rule matching the ingress interface
+  (`ip rule iif …`), an l3mdev/VRF, or a mark set from the physical
+  ingress sees `pfpunt0` instead, with no VRF and no mark, and can choose
+  another table: the packet leaves by the wrong egress, silently. UniFi
+  installs such rules, and the drift scanner already walks policy-selected
+  tables and VRFs because supported hosts use them. The hand-back would
+  need either to carry that context (a mark per original port, matched by
+  rules mirroring the ingress ones) or a gate that refuses early steering
+  on any host whose RPDB depends on ingress. Loose `rp_filter` and
+  attention to conntrack/NAT do not cover this.
 
 ### 5. Cost of the hand-back path
 
@@ -124,8 +144,13 @@ Today's verify samples routes from the mirror and checks them in VPP
   installed, and none at the frontier is unresolvable, via the ledger's
   counts per prefix length.
 - **The hand-back default.** It is present, and its path is the veth.
-- **No stale route below a loaded one.** The engine's ledger knows this;
-  verify's sample would need to check it on VPP's side as well.
+- **No stale route below a loaded one.** A sample cannot show this:
+  verify draws its probes from the ledger (`RouteLedger::verifiable_prefixes`),
+  so a prefix that exists only in VPP is never probed. A stale
+  more-specific there would override its loaded covering route and keep
+  the hand-back default from ever being chosen. This needs an exhaustive
+  check: a dump of VPP's FIB diffed against the ledger at the frontier,
+  as the adopted path's readback already does, not a larger sample.
 
 What verify cannot cover is (2) and (5), whether steering early is a net
 gain. Those are traffic properties, not table properties.
@@ -157,11 +182,17 @@ per second on the lab. Together they say whether a coverage gate would
 ever open early enough to matter.
 
 If the operator wants it built regardless, the order would be:
-1. (1), unresolvable → hand-back routes. This is useful on its own: it
-   would also let a late neighbour's routes forward through the kernel
+1. **A forwarding hand-back path.** Today's path exists only under `v6 on`,
+   carries IPv6 only, and its guard admits only replies to the router's own
+   addresses, so it cannot carry forwarded traffic. This step needs an
+   IPv4-capable veth built whatever `v6` says, the kernel settings (4), the
+   ingress-context handling or gate for policy routing (4), and a forwarding
+   guard (3). Everything below routes into this path, so it comes first.
+2. (1), unresolvable → hand-back routes. Useful on its own once step 1
+   exists: a late neighbour's routes would forward through the kernel
    instead of being absent.
-2. The longest-first fresh load.
-3. The hand-back default with its kernel settings (4) and a forwarding
-   guard (3).
-4. The subset verify (6).
-5. A coverage gate (2).
+3. The longest-first fresh load, with additions at or shorter than the
+   frontier held back until what is under them has loaded.
+4. The hand-back default.
+5. The subset verify (6), with the FIB dump.
+6. A coverage gate (2).
