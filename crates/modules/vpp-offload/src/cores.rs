@@ -1027,6 +1027,21 @@ fn queue_irq_delivery(
     Ok(out)
 }
 
+/// Every interface in `sysfs_net` with queue IRQs (a `device/msi_irqs`
+/// directory), sorted. Bridges, VLANs and loopback have none and are left
+/// out.
+pub fn nic_ifaces(sysfs_net: &std::path::Path) -> Result<Vec<String>, String> {
+    let entries =
+        std::fs::read_dir(sysfs_net).map_err(|e| format!("read {}: {e}", sysfs_net.display()))?;
+    let mut ifaces: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|i| sysfs_net.join(i).join("device").join("msi_irqs").is_dir())
+        .collect();
+    ifaces.sort_unstable();
+    Ok(ifaces)
+}
+
 /// Every CPU a queue IRQ of ANY NIC on the host is delivered on.
 ///
 /// Every NIC, not only VPP's member ports: the placement this feeds is
