@@ -178,6 +178,39 @@ fn setup(t: &mut Transport) -> u32 {
 struct Load {
     secs: f64,
     barriers: u64,
+    /// Which VPP functions took those barriers, most first.
+    callers: String,
+}
+
+/// Tally the `bar-trace-<caller>-#<count>` events past `after` in the
+/// event log's last few thousand, by caller.
+fn barrier_callers(t: &mut Transport, after: u64) -> String {
+    let log = cli(t, "show event-logger 4000");
+    let mut tally: std::collections::BTreeMap<String, u64> = Default::default();
+    for line in log.lines() {
+        let Some(at) = line.find("bar-trace-") else {
+            continue;
+        };
+        let rest = &line[at + "bar-trace-".len()..];
+        let Some(hash) = rest.rfind("-#") else {
+            continue;
+        };
+        let count: u64 = rest[hash + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        if count > after {
+            *tally.entry(rest[..hash].to_string()).or_default() += 1;
+        }
+    }
+    let mut v: Vec<_> = tally.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.iter()
+        .map(|(c, n)| format!("{c} {n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn run_drain(
@@ -214,6 +247,7 @@ fn run_drain(
     Load {
         secs,
         barriers: barrier_count(t).saturating_sub(before),
+        callers: barrier_callers(t, before),
     }
 }
 
@@ -278,6 +312,10 @@ fn bulk_load_rate_against_a_scratch_vpp() {
                 del.secs,
                 n as f64 / del.secs,
                 del.barriers,
+            );
+            println!(
+                "bench: barriers by caller: install [{}]; remove [{}]",
+                add.callers, del.callers
             );
             if round == 0 {
                 eprintln!("bench: fib after install:\n{summary}\n{dpo}");
