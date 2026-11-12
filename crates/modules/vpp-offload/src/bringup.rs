@@ -436,6 +436,63 @@ fn completeness_gate(
 }
 
 /// One attach-log line per re-pinned IRQ.
+/// Every OTHER NIC's queue IRQs off VPP's cores: the ports PacketFrame
+/// does not give VPP still interrupt, and their hardirq and NET_RX
+/// softirq (fast-path's xdpgeneric included) run wherever the IRQ is
+/// delivered. CFS cannot preempt either, so a poll-mode worker or VPP's
+/// main thread on such a core can stall for as long as the interrupt load
+/// lasts. VPP aborts if a worker misses the barrier for 1 s ("worker
+/// thread deadlock"), and on a box that boots into full traffic with every
+/// queue IRQ spread one per core that is what a fresh load meets: the lab
+/// reproduced the abort with a 3 s stall on a worker core, and found
+/// eth0's queue IRQs 15, 16 and 17 delivered on VPP's main core and both
+/// workers.
+///
+/// Warns rather than refuses, unlike the member ports' pass: an IRQ of a
+/// port VPP does not own costs VPP some time, while refusing would leave
+/// the box without VPP at all.
+fn clear_other_nic_irqs(paths: &AttachPaths, members: &[String], vpp_cores: &[u16]) {
+    let others: Vec<String> = match cores::nic_ifaces(&paths.sys.sysfs_net) {
+        Ok(all) => all.into_iter().filter(|i| !members.contains(i)).collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not list the host's NICs; only the member ports' queue IRQs were \
+                 moved off VPP's cores"
+            );
+            return;
+        }
+    };
+    if others.is_empty() {
+        return;
+    }
+    match cores::clear_irqs_off(
+        &paths.sys.sysfs_net,
+        &paths.proc_irq,
+        &paths.sysfs_cpu,
+        &others,
+        vpp_cores,
+    ) {
+        Ok(irqs) => {
+            log_irq_moves(&irqs.moved);
+            if !irqs.still.is_empty() {
+                tracing::warn!(
+                    cores = ?vpp_cores,
+                    irqs = %irq_sample(&irqs.still),
+                    "queue IRQs of ports VPP does not own still fire on VPP's cores after a \
+                     re-pin; the kernel did not move delivery. Continuing: they can stall a \
+                     worker, but they are not VPP's ports"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            cores = ?vpp_cores,
+            error = %e,
+            "could not move other NICs' queue IRQs off VPP's cores"
+        ),
+    }
+}
+
 fn log_irq_moves(moved: &[cores::IrqMove]) {
     for m in moved {
         tracing::info!(
@@ -737,6 +794,7 @@ pub fn bring_up(
             irq_sample(still),
         ));
     }
+    clear_other_nic_irqs(paths, &member_ifaces, &vpp_cores);
 
     // VFIO must be IOMMU-isolated. With no active IOMMU the vfio-pci
     // bind either fails outright (no viable iommu_group) or — with the
@@ -1285,6 +1343,7 @@ fn finish(
         .any(|c| *c != core_map.main && !core_map.workers.contains(c));
     if observed_extra {
         let ifaces: Vec<String> = port_vlans.iter().map(|(i, _)| i.clone()).collect();
+        clear_other_nic_irqs(paths, &ifaces, &vacate);
         match cores::clear_irqs_off(
             &paths.sys.sysfs_net,
             &paths.proc_irq,

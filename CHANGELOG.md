@@ -34,6 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **vpp-offload**
 
+- A fresh VPP stops its workers less often while it loads: `startup.conf` preallocates the FIB's load-balance and fib-entry pools for the routes `expected-routes` budgets (`l3fib`), and attach moves every NIC's queue IRQs off VPP's cores, not only the member ports'. A worker that misses VPP's barrier for 1 s aborts it, which is how a fresh load died after a reboot. ([#387](https://github.com/unredacted/packetframe/pull/387))
 - While a fresh VPP loads its table, every top-level cgroup except `system.slice` is kept off VPP's main and worker cores, and self-pinned threads get their affinity back afterwards (`cores_fenced` / `cores_released`). On the lab, six nice -20 hogs on VPP's main core slowed a 170k-route load from 5.5 s to 22 s; fenced, it took 5.5 s. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#the-core-fence-during-a-fresh-load), [#390](https://github.com/unredacted/packetframe/pull/390))
 
 ## [0.6.2] - 2026-11-12

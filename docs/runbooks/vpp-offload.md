@@ -5634,6 +5634,18 @@ outside the derived map, it runs the same move against those too; there
 a kernel that does not follow is a warning, not a refusal, because
 refusing after adoption would leave that VPP unsupervised.
 
+**Every other NIC's queue IRQs are moved too**, ports VPP does not own
+included. Their hardirq and NET_RX softirq, fast-path's xdpgeneric among
+it, run wherever the IRQ is delivered, and CFS cannot preempt them. A
+worker or main thread sharing a core with that load can be stalled for as
+long as it lasts. VPP aborts when a worker misses its barrier for 1 s
+(`worker thread deadlock`, then SIGABRT). The lab reproduced exactly
+that with a 3 s stall on a worker core during a fresh load, with `eth0`'s
+queue IRQs delivered on VPP's main core and both workers. For these
+ports, a kernel that does not follow is a warning (`queue IRQs of ports
+VPP does not own still fire on VPP's cores`), not a refusal: they cost VPP
+time, but refusing would leave the box without VPP.
+
 `packetframe feasibility` reports a planned move as a non-blocking
 **WARN** on `vpp.irq-affinity`, not a pass: whether the kernel honours
 the mask is only known once it is written, which a probe never does.
