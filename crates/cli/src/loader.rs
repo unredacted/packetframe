@@ -2851,6 +2851,8 @@ fn detach_vpp_offload_with(
         // exactly that. No VPP to kill first: there is no record of one.
         // A queue-0 IRQ placement whose restore failed outlives it too.
         restore_queue0_irqs(state_dir);
+        // And a core fence a daemon died holding, which needs no VPP.
+        packetframe_vpp_offload::fence::release_stale_live(state_dir);
         // So can the sampler's tmpfs, when a teardown released everything
         // else but could not unmount it: its record is its own file, kept
         // for exactly this.
@@ -2940,6 +2942,9 @@ fn detach_vpp_offload_with(
     // No keep rule is left to pin traffic to queue 0, so any queue-0 IRQ
     // the daemon placed for one goes back to what it was.
     restore_queue0_irqs(state_dir);
+    // The rest of the box gets VPP's cores back if a daemon died while its
+    // fresh VPP loaded (`packetframe_vpp_offload::fence`).
+    packetframe_vpp_offload::fence::release_stale_live(state_dir);
 
     // Kill the recorded VPP first, if it is still the process we recorded.
     //

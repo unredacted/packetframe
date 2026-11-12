@@ -538,6 +538,12 @@ pub fn bring_up(
     budget: &McamBudget,
     local_routes: &[crate::LocalRoute],
 ) -> Result<Attached, String> {
+    // A core fence a previous daemon left, set while its VPP loaded and
+    // never let go (it died, or was killed, first): released before
+    // anything else, refusals included, so a box never keeps its other
+    // userland off cores no VPP is loading on (`crate::fence`).
+    #[cfg(target_os = "linux")]
+    crate::fence::release_stale_live(&paths.sys.state_dir);
     // `require-table-complete on` with nothing publishing completeness
     // is refused at attach rather than discovered at the first canary
     // step. The gate would never pass — every steer would be declined
@@ -1442,6 +1448,9 @@ fn finish(
     // attach-time IRQ moves vacated), and the control-plane CPUs, which a
     // queue-0 placement takes only after every other eligible CPU
     // (`cores::plan_queue0_irqs`).
+    // The core fence's inputs: where its record lives, and every core
+    // VPP is on (`crate::fence`).
+    let fence_inputs = (paths.sys.state_dir.clone(), vacate.clone());
     let kernel_path_inputs = (
         paths.sys.sysfs_net.clone(),
         paths.proc_irq.clone(),
@@ -1580,7 +1589,23 @@ fn finish(
             )));
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = kernel_path_inputs;
+        let _ = (kernel_path_inputs, &fence_inputs);
+        // Other userland off VPP's cores from each spawn until VPP has its
+        // table (`crate::fence`). Without a boot_id there is no record a
+        // later daemon could trust, so no fence.
+        #[cfg(target_os = "linux")]
+        match crate::process::boot_id() {
+            Ok(boot) => runtime.core_fence(crate::fence::CoreFence::new(
+                crate::fence::FencePaths::live(fence_inputs.0.clone()),
+                Box::new(crate::fence::LiveAffinity),
+                boot,
+                fence_inputs.1.clone(),
+            )),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "no boot_id; a fresh VPP loads without the core fence"
+            ),
+        }
         // The exemption tripwire, installed whenever this box could
         // steer at all — the hole it names opens the instant a port
         // does, so an operator wants it BEFORE the canary rather than

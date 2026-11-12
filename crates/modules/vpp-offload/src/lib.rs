@@ -62,6 +62,7 @@ pub mod engine;
 pub mod executor;
 pub mod fdb;
 pub mod feed;
+pub mod fence;
 pub mod fib_sync;
 pub mod handback;
 pub mod kernel_path;

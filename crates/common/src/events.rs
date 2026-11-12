@@ -169,6 +169,16 @@ pub mod kind {
     /// ledger seed while the authority's only objection was upstreams
     /// still loading; `routes` the mirror then.
     pub const FRESH_HOLD_RELEASED: &str = "fresh_hold_released";
+    /// A fresh VPP's cores were fenced: every top-level cgroup but
+    /// `system.slice` was given `allowed` (the online CPUs minus
+    /// `vpp_cores`) until the load is done (`cgroups`, `threads_pinned`:
+    /// the self-pinned threads whose affinity the release puts back).
+    pub const CORES_FENCED: &str = "cores_fenced";
+    /// The core fence was let go and what it changed put back: `reason`
+    /// `loaded` (VPP left Syncing with its table), `vpp-down`, `deadline`,
+    /// `shutdown`, or `stale` (a fence a previous daemon left); `held_ms`,
+    /// `cgroups`, `threads_restored`, `threads_gone`.
+    pub const CORES_RELEASED: &str = "cores_released";
 
     // --- fast-path ---
     /// `wan-egress` put back policy rules that had disappeared from the
