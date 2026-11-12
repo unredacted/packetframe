@@ -96,6 +96,7 @@ running badly.
 - [Install and upgrade on the router](#install-and-upgrade-on-the-router)
 - [The kernel path for exempt traffic](#the-kernel-path-for-exempt-traffic)
 - [IRQ affinity before attach](#irq-affinity-before-attach)
+- [The core fence during a fresh load](#the-core-fence-during-a-fresh-load)
 - [Constraints worth knowing before you debug](#constraints-worth-knowing-before-you-debug)
 
 ## Supported hardware
@@ -5524,6 +5525,85 @@ An older daemon reads an RSS keep as somebody else's rule: its teardown
 would leave the keeps in the MCAM and its planner would route around
 their slots. Run **this** release's `packetframe detach --all` before
 installing an older one.
+
+## The core fence during a fresh load
+
+A fresh VPP's first route load runs on VPP's **main thread**, which is at
+100% for the whole load, and nothing else bounds it. On the lab rig a
+million routes took about 30 s idle, and the load slowed in proportion to
+the main core VPP lost: half with one equal-priority competitor, 4× with
+six nice -20 hogs on it. After an upgrade a gateway boots into full
+traffic, and UniFi's daemons run wherever they like:
+`ubios-udapi-server` alone runs at nice -15, VPP's own priority. So the
+module keeps them off VPP's cores while it loads.
+
+**What is fenced.** From VPP's spawn until VPP leaves `Syncing`, every
+top-level cgroup except the daemon's own gets a `cpuset.cpus` of the
+online CPUs minus VPP's main and worker cores (`cores_fenced`). The
+daemon's own is `system.slice` under the packaged unit, `user.slice` for
+`sudo packetframe run` from a login, or whatever `Slice=` names. On a UniFi
+gateway that is `os.slice`, `uos.slice`, `app.slice`, `user.slice`,
+`init.scope`, and the cgroups UniFi makes for itself at the root (`bgpd`,
+`zebra`, `dpi`, `udm-v2`, …). On edge1-mci1 (main 11, workers 13–17,
+cpu12 isolated) they keep 0–10 and 12. A top-level cgroup that appears
+during the load is fenced too, one whose CPUs are changed back is fenced
+again, and one removed and recreated under the same name (a restarted
+service) is fenced as a new one.
+
+**What is not.** `system.slice` holds VPP and this daemon, and a child's
+CPUs must sit inside its parent's. Fencing its other units one by one
+would need the cpuset controller enabled inside it, which on kernel 5.15
+resets the CPU affinity of every task below it, unpinning VPP's threads
+from their cores. What it holds on a UniFi gateway is small. Kernel
+threads and IRQs are not in any cgroup; attach moves the IRQs ([IRQ
+affinity before attach](#irq-affinity-before-attach)). If the cgroup root
+does not have the cpuset controller enabled, the fence is skipped with a
+warning rather than enable it, which would migrate every task on the host.
+
+**Pinned threads are put back.** On 5.15 a cpuset change also resets the
+affinity of every task in the cgroup, and widening it again does not
+restore what a task asked for. UniFi pins threads: rabbitmq's schedulers
+one per CPU, unifi-core's every thread to one CPU. Every thread narrower
+than the online set is recorded before its cgroup is fenced, and gets its
+affinity back at release if the same thread (same id and start time) is
+still running. A thread that pins itself during the load is left with the
+full set.
+
+**Release** (`cores_released`), with `reason`:
+- `loaded`: VPP left `Syncing` with its table;
+- `vpp-down`: it went to Backoff or Stopped instead;
+- `deadline`: 10 min passed;
+- `shutdown`: the module stopped, preserving or not;
+- `stale`: a fence a daemon died holding. The record is in
+  `<state-dir>/vpp-core-fence.json`, written before each cgroup is changed.
+  The next attach and `packetframe detach` undo exactly what it lists. A
+  record from an earlier boot is only deleted.
+
+Whatever a release cannot put back stays in the record, which then lists
+only that, for the next attach or `detach` to retry. If the record itself
+cannot be written, nothing is fenced.
+
+To see a fence by hand:
+
+```sh
+for c in /sys/fs/cgroup/*/cpuset.cpus; do echo "$c: $(cat $c)"; done
+cat /var/lib/packetframe/state/vpp-core-fence.json
+```
+
+A cgroup is unfenced when its `cpuset.cpus` is empty or holds every
+online CPU. Kernel 5.15 refuses to set an empty list back on a cgroup
+that has tasks in it (`No space left on device`), so the release writes
+the online CPUs instead, which are the same CPUs an empty list inherited.
+A reboot empties them again. If a fence outlived everything, run
+`packetframe detach`, or write the online CPUs by hand:
+
+```sh
+online=$(cat /sys/fs/cgroup/cpuset.cpus.effective)
+for c in /sys/fs/cgroup/*/cpuset.cpus; do
+  case $c in */system.slice/*) continue ;; esac
+  [ -n "$(cat $c)" ] && echo "$online" > $c
+done
+```
 
 ## IRQ affinity before attach
 

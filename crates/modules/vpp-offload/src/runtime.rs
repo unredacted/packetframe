@@ -685,6 +685,10 @@ struct Core {
     /// [`crate::kernel_path::NoKernelPath`] until the attach wiring
     /// installs the live one on Linux.
     kernel_path: Box<dyn crate::kernel_path::KernelPath>,
+    /// Other userland kept off VPP's cores while a fresh VPP loads
+    /// ([`crate::fence`]). `None` off Linux, in tests, and where attach
+    /// did not install one.
+    core_fence: Option<crate::fence::CoreFence>,
     /// What the kernel path has been observed doing, per steered port.
     kernel_watch: KernelWatch,
     /// When the NIC was last audited against the steering ledger, and
@@ -2367,6 +2371,7 @@ impl Runtime {
                 seeded_fresh: false,
                 rx_kick: Box::new(NoKick),
                 kernel_path: Box::new(crate::kernel_path::NoKernelPath),
+                core_fence: None,
                 kernel_watch: KernelWatch::default(),
                 last_steer_audit: None,
                 last_null_sample: None,
@@ -2606,6 +2611,47 @@ impl Runtime {
     /// everything else keeps [`crate::kernel_path::NoKernelPath`].
     pub fn kernel_path(&self, k: Box<dyn crate::kernel_path::KernelPath>) {
         self.core.borrow_mut().kernel_path = k;
+    }
+
+    /// Fence other userland off VPP's cores from each spawn until VPP
+    /// leaves `Syncing` ([`crate::fence`]).
+    pub fn core_fence(&self, f: crate::fence::CoreFence) {
+        self.core.borrow_mut().core_fence = Some(f);
+    }
+
+    /// Once per supervision pass: let a held fence go when VPP has left
+    /// `Starting`/`Syncing` or the fence has been held [`crate::fence::FENCE_MAX`],
+    /// and otherwise fence what appeared or was changed back since.
+    pub fn fence_tick(&self, state: crate::supervisor::State, now: std::time::Instant) {
+        use crate::supervisor::State;
+        let mut c = self.core.borrow_mut();
+        let Some(f) = c.core_fence.as_mut() else {
+            return;
+        };
+        let Some(held) = f.held_for(now) else {
+            return;
+        };
+        let reason = match state {
+            State::Starting | State::Syncing if held >= crate::fence::FENCE_MAX => "deadline",
+            State::Starting | State::Syncing => {
+                f.refresh(now, false);
+                return;
+            }
+            State::Verifying | State::Ready | State::Steered => "loaded",
+            _ => "vpp-down",
+        };
+        release_fence(f, reason, held);
+    }
+
+    /// Let a held fence go, whatever VPP is doing: the module's stop.
+    pub fn release_core_fence(&self, reason: &str) {
+        let now = std::time::Instant::now();
+        let mut c = self.core.borrow_mut();
+        if let Some(f) = c.core_fence.as_mut() {
+            if let Some(held) = f.held_for(now) {
+                release_fence(f, reason, held);
+            }
+        }
     }
 
     /// Keep each spawned VPP's output in `dir`. See
@@ -5508,6 +5554,43 @@ impl Effects for EffectsView {
             return Err("refusing to spawn: a supervised process already exists".into());
         }
         let (binary, conf) = (c.vpp_binary.clone(), c.startup_conf.clone());
+        // Before VPP exists, so its first route already has its cores to
+        // itself. A fence that cannot be set is logged and skipped: VPP
+        // loads more slowly without it, not wrongly.
+        if let Some(f) = c.core_fence.as_mut() {
+            let was_held = f.is_held();
+            match f.engage(std::time::Instant::now()) {
+                Ok(()) if !was_held => {
+                    if let Some(r) = f.record() {
+                        tracing::info!(
+                            allowed = %r.allowed,
+                            cgroups = r.cgroups.len(),
+                            threads_pinned = r.threads.len(),
+                            "fenced other userland off VPP's cores for the fresh load"
+                        );
+                        event_log::Event::info(crate::MODULE_NAME, event_kind::CORES_FENCED)
+                            .field("allowed", r.allowed.clone())
+                            .field("vpp_cores", crate::cores::format_cpu_list(&r.vpp_cores))
+                            .field(
+                                "cgroups",
+                                r.cgroups
+                                    .iter()
+                                    .map(|g| g.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            )
+                            .field("threads_pinned", r.threads.len() as u64)
+                            .emit();
+                    }
+                }
+                Ok(()) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not fence other userland off VPP's cores; the fresh load runs \
+                     unfenced"
+                ),
+            }
+        }
         let p = VppProcess::spawn_with(&binary, &conf, c.diagnostics_dir.as_deref())
             .map_err(|e| format!("spawning VPP: {e}"))?;
 
@@ -6211,6 +6294,13 @@ impl Effects for EffectsView {
             );
         }
         c.resources.release()
+    }
+}
+
+/// Release `f` and report it ([`crate::fence::report`]).
+fn release_fence(f: &mut crate::fence::CoreFence, reason: &str, held: std::time::Duration) {
+    if let Some(r) = f.release() {
+        crate::fence::report(reason, held, &r);
     }
 }
 

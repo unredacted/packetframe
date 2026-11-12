@@ -1686,6 +1686,7 @@ fn run_loop(
             last_verify_at = Some(Instant::now());
         }
         runtime.set_steered(driver.supervisor().is_steered());
+        runtime.fence_tick(driver.state(), Instant::now());
         // Retained BEFORE the terminal check below, which `break`s.
         //
         // With the assignment after it, a tick whose failures coincided
@@ -1796,6 +1797,10 @@ fn run_loop(
             None => std::thread::sleep(STOP_POLL_CAP),
         }
     }
+
+    // However supervision ends, preserving or not, the rest of the box
+    // gets VPP's cores back now: a fence is for a load this loop watches.
+    runtime.release_core_fence("shutdown");
 
     // Orderly teardown: hand the machine the stop, then keep working until
     // the resources are actually released or the bounded patience expires.
