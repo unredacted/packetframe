@@ -177,7 +177,8 @@ pub mod kind {
     /// The core fence was let go and what it changed put back: `reason`
     /// `loaded` (VPP left Syncing with its table), `vpp-down`, `deadline`,
     /// `shutdown`, or `stale` (a fence a previous daemon left); `held_ms`,
-    /// `cgroups`, `threads_restored`, `threads_gone`.
+    /// `cgroups`, `threads_restored`, `threads_gone`, and `failures` /
+    /// `failed` for what could not be put back (a warning then).
     pub const CORES_RELEASED: &str = "cores_released";
 
     // --- fast-path ---

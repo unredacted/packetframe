@@ -526,6 +526,11 @@ fn undo(paths: &FencePaths, ops: &dyn FenceOps, record: &FenceRecord) -> Release
 /// Log a release and record `cores_released`.
 pub fn report(reason: &str, held: Duration, r: &Released) {
     use packetframe_common::events::{self as event_log, kind as event_kind};
+    let event = if r.failures.is_empty() {
+        event_log::Event::info
+    } else {
+        event_log::Event::warn
+    };
     if r.failures.is_empty() {
         tracing::info!(
             reason,
@@ -541,12 +546,14 @@ pub fn report(reason: &str, held: Duration, r: &Released) {
             "let the core fence go, but could not put everything back"
         );
     }
-    event_log::Event::info(crate::MODULE_NAME, event_kind::CORES_RELEASED)
+    event(crate::MODULE_NAME, event_kind::CORES_RELEASED)
         .field("reason", reason.to_string())
         .field("held_ms", held.as_millis() as u64)
         .field("cgroups", r.cgroups.join(","))
         .field("threads_restored", r.threads_restored as u64)
         .field("threads_gone", r.threads_gone as u64)
+        .field("failures", r.failures.len() as u64)
+        .field("failed", r.failures.join("; "))
         .emit();
 }
 
