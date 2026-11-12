@@ -271,8 +271,9 @@ jobs:
       #
       # Two profiles (see Cargo.toml): the test binaries on `hwtest`,
       # and on `release` what ships or times userspace — the CLI that
-      # the .deb packages, and vpp_convergence_bench. Staging takes the
-      # bench from the release build (RELEASE_TESTS).
+      # the .deb packages, and the two VPP benches (vpp_convergence_bench,
+      # vpp_bulk_load_bench). Staging takes the benches from the release
+      # build (RELEASE_TESTS).
       - name: Cross-build test binaries + CLI
         run: |
           set -euo pipefail
@@ -284,7 +285,8 @@ jobs:
             --message-format=json > build-tests.json
           cross build --release --target "${TARGET}" \
             --bins -p packetframe-cli \
-            --test vpp_convergence_bench -p packetframe-vpp-offload \
+            --test vpp_convergence_bench --test vpp_bulk_load_bench \
+            -p packetframe-vpp-offload \
             --message-format=json > build-release.json
 
       - name: Stage bundle
@@ -317,7 +319,7 @@ jobs:
           # Integration tests whose staged copy comes from the release
           # build: the hwtest build compiles them too (`--tests` takes
           # every test target), and that copy is skipped.
-          RELEASE_TESTS = {"vpp_convergence_bench"}
+          RELEASE_TESTS = {"vpp_convergence_bench", "vpp_bulk_load_bench"}
 
           def artifacts(path):
               for line in open(path):
@@ -370,7 +372,7 @@ jobs:
           # silently absent rather than failing anything. The convergence
           # bench measures the plan's ≤60 s budget and is hardware-only,
           # so an empty bundle would be discovered on the router.
-          for required in ("vpp_convergence_bench", "guard_fixtures"):
+          for required in ("vpp_convergence_bench", "vpp_bulk_load_bench", "guard_fixtures"):
               if required not in staged_tests:
                   sys.exit(
                       f"{required} missing from the bundle — is its package "
