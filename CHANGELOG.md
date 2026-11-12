@@ -34,7 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **Packaging**
 
-- The packaged unit runs the daemon at `Nice=-15`, the priority UniFi gives bgpd, zebra and ubios-udapi-server, from its first instruction; VPP inherits it. At nice 0 the route-ledger seed, the FRR feed and the sender of VPP's fresh load all ran at a fraction of their idle rate on a gateway booting into full traffic. Run `systemctl daemon-reload` after installing. ([#PR](https://github.com/unredacted/packetframe/pull/PR))
+- The packaged unit runs the daemon at `Nice=-15`, the priority UniFi gives bgpd, zebra and ubios-udapi-server, from its first instruction; VPP inherits it. At nice 0 the route-ledger seed, the FRR feed and the sender of VPP's fresh load all ran at a fraction of their idle rate on a gateway booting into full traffic. Run `systemctl daemon-reload` after installing. ([#395](https://github.com/unredacted/packetframe/pull/395))
 
 ## [0.6.3] - 2026-11-12
 
