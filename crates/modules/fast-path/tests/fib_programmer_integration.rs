@@ -2839,7 +2839,8 @@ fn a_failed_add_is_owed_until_it_reconciles() {
         }
         None
     });
-    let refused = refused.expect("the ECMP pool never filled — this test cannot inject its failure");
+    let refused =
+        refused.expect("the ECMP pool never filled — this test cannot inject its failure");
 
     let first = h.run(async {
         h.handle
