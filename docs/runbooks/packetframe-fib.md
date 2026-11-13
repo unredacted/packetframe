@@ -1337,6 +1337,18 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
    registers resolve while it runs. The resolver's own `fallback-default`
    and `local-prefix` routes wait for it, too.) The second tier hears
    every seeded route like any install. Event `route_ledger_seeded`.
+
+   **Longest prefix first.** The seed writes into the live FIB that XDP
+   reads, so the order matters while it runs: it seeds every IPv4 route
+   and then every IPv6 route, each from the longest prefix to the
+   shortest, whatever order the record holds them in. Every route in the
+   FIB then has every more-specific route under it in already, so at any
+   instant a packet matches its true route or misses and goes to the
+   kernel. A covering route, or a transit's default, never carries
+   traffic meant for a more-specific route still waiting its turn. That
+   window was the whole seed: 73 s under load on edge1-mci1
+   (2026-11-12). The order is taken at read, so a record any version
+   wrote seeds this way, and the record's format is unchanged.
 4. **Lets the live session reconcile it.** A re-advertisement of an
    identical route marks it seen and changes nothing else: no FIB
    write, no destination-cache flush, no route delta to VPP. A route
