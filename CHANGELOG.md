@@ -34,7 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **fast-path**
 
-- A route-ledger seed goes into the live FIB longest prefix first (IPv4, then IPv6), whatever order the record holds, so a partial seed is correct by longest match at every instant: a covering route never forwards traffic meant for a more-specific route not yet in. The record format is unchanged. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/packetframe-fib.md#what-the-next-start-does-with-it), [#PR](https://github.com/unredacted/packetframe/pull/PR))
+- A route-ledger seed goes into the live FIB longest prefix first (IPv4, then IPv6), whatever order the record holds, so a partial seed is correct by longest match at every instant: a covering route never forwards traffic meant for a more-specific route not yet in. The record format is unchanged. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/packetframe-fib.md#what-the-next-start-does-with-it), [#396](https://github.com/unredacted/packetframe/pull/396))
 
 ## [0.6.3] - 2026-11-12
 
