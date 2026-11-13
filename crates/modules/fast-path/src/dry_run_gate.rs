@@ -21,10 +21,16 @@
 //!   daemon's completeness authority. The seed goes in longest prefix
 //!   first, so the table was correct by longest match all along; this is
 //!   the point it is also complete.
-//! - **`initiation-complete`**: otherwise (a cold start, an unattested or
-//!   partial seed), the route source's first `InitiationComplete` (FRR's
-//!   End-of-RIB, or the quiescence that stands in for it) and the GC that
-//!   follows it: the mirror then holds exactly what the source holds.
+//! - **`authority-attested`**: otherwise (a cold start, an unattested or
+//!   partial seed), with a completeness authority: the first time it
+//!   attests the mirror, i.e. the routing daemon's own table and the
+//!   mirror agree within the steering drift bound with nothing loading.
+//!   Not the route source's End-of-RIB: on the lab rig (2026-11-13) a cold
+//!   start's first `InitiationComplete` came with the mirror at 133,699 of
+//!   FRR's 161,297 routes, because FRR was still loading its upstream.
+//! - **`initiation-complete`**: with no authority, the route source's
+//!   first `InitiationComplete` and the GC that follows it, the best a
+//!   daemon with nothing to compare against can do.
 //!
 //! The release is a write of `CFG.dry_run = 0`, made under
 //! `CFG_WRITE_LOCK` by whoever learns the mirror is whole, and recorded
@@ -68,6 +74,7 @@ impl DryRunMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     SeedWhole,
+    AuthorityAttested,
     InitiationComplete,
 }
 
@@ -75,6 +82,7 @@ impl Trigger {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SeedWhole => "seed-whole",
+            Self::AuthorityAttested => "authority-attested",
             Self::InitiationComplete => "initiation-complete",
         }
     }
@@ -98,6 +106,9 @@ struct State {
     ready: Option<(Trigger, Instant)>,
     /// When `until-seeded` let go, wall clock for the row.
     released: Option<(Trigger, SystemTime, Duration)>,
+    /// A completeness authority decides when a mirror that did not seed
+    /// whole is whole; only for the row's "waiting for".
+    authority: bool,
 }
 
 /// Shared by the load, the programmer and the reload.
@@ -111,6 +122,7 @@ impl DryRunGate {
             since: Instant::now(),
             ready: None,
             released: None,
+            authority: false,
         })))
     }
 
@@ -120,6 +132,20 @@ impl DryRunGate {
 
     pub fn mode(&self) -> DryRunMode {
         self.lock().mode
+    }
+
+    /// Whether the mirror has been whole yet.
+    pub fn is_ready(&self) -> bool {
+        self.lock().ready.is_some()
+    }
+
+    /// Whether a completeness authority decides it (see the module docs).
+    pub fn set_authority(&self, on: bool) {
+        self.lock().authority = on;
+    }
+
+    pub fn authority(&self) -> bool {
+        self.lock().authority
     }
 
     /// `CFG.dry_run` as the mode and the latch say it should be.

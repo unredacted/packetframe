@@ -563,9 +563,19 @@ pub fn dry_run_health(state: &ActiveState) -> Option<packetframe_common::module:
             Some(seed) if seed.attested && seed.failed == 0 => {
                 "the route-ledger seed's last step".to_string()
             }
+            Some(_) if state.dry_run_gate.authority() => {
+                "the completeness authority to attest the mirror (the seed was not whole: \
+                 unattested, short or with failed installs; `fib-integrity` shows the count)"
+                    .to_string()
+            }
             Some(_) => "the route source's first End-of-RIB (the seed was not whole: \
                         unattested, short or with failed installs)"
                 .to_string(),
+            None if state.dry_run_gate.authority() => {
+                "the completeness authority to attest the mirror (a cold start; \
+                 `fib-integrity` shows the count)"
+                    .to_string()
+            }
             None => "the route source's first End-of-RIB (a cold start)".to_string(),
         }
     };

@@ -1316,11 +1316,17 @@ otherwise: without them nothing could tell when the mirror is whole.
   completeness authority. The seed went in longest prefix first, so the
   table was correct by longest match while it applied; this is the point
   it is also complete.
-- `initiation-complete`: the route source's first End-of-RIB, or the
-  quiescence that stands in for it, and the GC after it. This covers a
-  cold start, and a seed that was not whole (unattested, short, or with
-  failed installs). Over a seed with the FRR authority, that GC waits for
-  the authority as described below (`feed_gc_held`).
+- `authority-attested`: otherwise (a cold start, or a seed that was not
+  whole: unattested, short, or with failed installs), with a completeness
+  authority: the first time it attests the mirror. That is the routing
+  daemon's own table and the mirror agreeing within the steering drift
+  bound, with nothing loading, as in the `fib-integrity` row. Not the
+  route source's End-of-RIB: on the lab rig a cold start's first
+  End-of-RIB came with the mirror at 133,699 of FRR's 161,297 routes,
+  because FRR was still loading its upstream.
+- `initiation-complete`: with no authority, the route source's first
+  End-of-RIB, or the quiescence that stands in for it, and the GC after
+  it. That is the best a daemon with nothing to compare against can do.
 
 The release writes `CFG.dry_run = 0` and records `dry_run_released`
 (`trigger`, `held_ms`).
@@ -1333,8 +1339,9 @@ forwards at once.
 **What status shows.** The `dry-run` row, present for `on` and
 `until-seeded`:
 - `until-seeded: holding for Ns, every packet passes to the kernel;
-  waiting for …`, naming the seed still applying or the route source's
-  first End-of-RIB (a cold start, or a seed that was not whole);
+  waiting for …`, naming the seed still applying, the completeness
+  authority's attestation, or (with no authority) the route source's
+  first End-of-RIB;
 - `until-seeded: released at <UTC> (<trigger>) after Ns; forwarding`.
 
 Both are Healthy: a hold is designed. A hold that outlives the route

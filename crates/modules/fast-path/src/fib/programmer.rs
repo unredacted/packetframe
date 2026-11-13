@@ -1315,7 +1315,28 @@ impl FibProgrammer {
         gate: crate::dry_run_gate::DryRunGate,
         cfg: Array<MapData, crate::linux_impl::FpCfg>,
     ) {
+        gate.set_authority(self.completeness.is_some());
         self.dry_run = Some((gate, cfg));
+    }
+
+    /// With a completeness authority, the mirror is whole the first time
+    /// the authority attests it (`dry-run until-seeded`). Not while a seed
+    /// or walk is half applied. Each reprobe tick, until it has latched.
+    fn check_authority_whole(&mut self) {
+        let Some((gate, _)) = self.dry_run.as_ref() else {
+            return;
+        };
+        if gate.is_ready() || self.mid_chunked_work() {
+            return;
+        }
+        let mirror = (self.routes_v4.len() + self.routes_v6.len()) as u64;
+        if self
+            .completeness
+            .as_ref()
+            .is_some_and(|h| h.attests(mirror))
+        {
+            self.mirror_whole(crate::dry_run_gate::Trigger::AuthorityAttested);
+        }
     }
 
     /// The mirror is whole: latch it on the gate, and if that ends a
@@ -1432,6 +1453,7 @@ impl FibProgrammer {
                     tokio::task::yield_now().await;
                 }
                 _ = reprobe_tick.tick() => {
+                    self.check_authority_whole();
                     self.fire_due_reprobes();
                 }
                 evt = self.events_rx.recv(), if events_open => {
@@ -1807,10 +1829,14 @@ impl FibProgrammer {
     /// nothing is unconfirmed. The first such GC after a seed closes it.
     /// `unseen` is the GC's recount over every record it visited.
     fn after_gc(&mut self, removed: Option<usize>, unseen: u64) {
-        // The first `InitiationComplete` GC, seed or no seed: the mirror now
-        // holds what the route source holds. Latched once; after a whole
-        // seed it has latched already and this changes nothing.
-        self.mirror_whole(crate::dry_run_gate::Trigger::InitiationComplete);
+        // The first `InitiationComplete` GC, seed or no seed, when nothing
+        // better can say the mirror is whole: with a completeness authority
+        // the authority's attestation decides instead
+        // (`check_authority_whole`), because an End-of-RIB can come while
+        // the routing daemon is still loading its upstream. Latched once.
+        if self.completeness.is_none() {
+            self.mirror_whole(crate::dry_run_gate::Trigger::InitiationComplete);
+        }
         self.unseen_session = unseen;
         if self.unseen_session == 0 {
             self.unconfirmed_since = None;
