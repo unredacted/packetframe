@@ -34,7 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **fast-path**
 
-- `dry-run until-seeded` holds like `dry-run on` until the route mirror is whole (a whole, attested route-ledger seed applied, or the route source's first End-of-RIB), then forwards like `off` by itself and records `dry_run_released`. A reload never holds again; `on`/`off` win as before. The `dry-run` row in `packetframe status` says whether it is holding, and for what, or when it let go. Needs `forwarding-mode packetframe-fib` and a `route-source`. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/packetframe-fib.md#dry-run-until-seeded), [#PR](https://github.com/unredacted/packetframe/pull/PR))
+- `dry-run until-seeded` holds like `dry-run on` until the route mirror is whole (a whole, attested route-ledger seed applied, or the route source's first End-of-RIB), then forwards like `off` by itself and records `dry_run_released`. A reload never holds again; `on`/`off` win as before. The `dry-run` row in `packetframe status` says whether it is holding, and for what, or when it let go. Needs `forwarding-mode packetframe-fib` and a `route-source`. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/packetframe-fib.md#dry-run-until-seeded), [#398](https://github.com/unredacted/packetframe/pull/398))
 
 ## [0.6.3] - 2026-11-12
 
