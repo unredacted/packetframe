@@ -6,11 +6,11 @@
 //! With `dry-run off` the XDP program forwards on whatever the FIB holds
 //! from the first route in. While a route-ledger seed applies, or a cold
 //! mirror fills from the route source, that is a partial table, and the
-//! upgrade playbook kept `dry-run on` through it and switched it off by
+//! upgrade procedure kept `dry-run on` through it and switched it off by
 //! hand once the route-ledger row said the seed had applied: one more step
-//! with something on the box watching, 1:43 under load on edge1-mci1 after
-//! the 6.0.17 upgrade (2026-11-12). `until-seeded` makes that switch the
-//! daemon's own.
+//! with something on the box watching, 1:43 under load on the reference
+//! deployment after the 6.0.17 upgrade (2026-11-12). `until-seeded` makes
+//! that switch the daemon's own.
 //!
 //! ## When it lets go
 //!

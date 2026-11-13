@@ -3,12 +3,13 @@
 //!
 //! A fresh VPP's first load is VPP's main thread installing routes as fast
 //! as this daemon's sending thread hands them over. On the lab, idle, the
-//! main thread was the limit (about 33,000 routes/s). On edge1-mci1 after
-//! the 6.0.17 upgrade (2026-11-12) the load ran at about 8,000 routes/s
-//! with VPP's cores fenced, and nothing said which side was short. This
-//! reads each thread's `/proc/<pid>/task/<tid>/schedstat` (time on CPU and
-//! time runnable but waiting for one, in ns) when the load starts and when
-//! it is done, and `fresh_hold_released` carries the differences:
+//! main thread was the limit (about 33,000 routes/s). On the reference
+//! deployment after the 6.0.17 upgrade (2026-11-12) the load ran at about
+//! 8,000 routes/s with VPP's cores fenced, and nothing said which side was
+//! short. This reads each thread's `/proc/<pid>/task/<tid>/schedstat`
+//! (time on CPU and time runnable but waiting for one, in ns) when the load
+//! starts and when it is done, and `fresh_hold_released` carries the
+//! differences:
 //!
 //! - `vpp_main_cpu_ms` near `load_ms`: VPP's main thread was the limit;
 //! - `sender_cpu_ms` near `load_ms`: this daemon's sender was;
