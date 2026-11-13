@@ -486,6 +486,10 @@ pub struct RouteLedger {
     bytes: Vec<u8>,
     routes_at: usize,
     routes_end: usize,
+    /// Every route's byte offset, in seed order: all IPv4 then all IPv6,
+    /// each longest prefix first ([`Self::seed_cursor`]). Built by
+    /// [`Self::decode`]'s walk, four bytes a route.
+    seed_order: Vec<u32>,
 }
 
 // Hand-written so a debug print never dumps the encoded routes, which
@@ -510,6 +514,33 @@ pub struct RouteCursor {
     at: usize,
     v4_left: u32,
     v6_left: u32,
+}
+
+/// Where a seed is in a [`RouteLedger`]'s seed order
+/// ([`RouteLedger::seed_cursor`]).
+#[derive(Debug, Clone, Copy)]
+pub struct SeedCursor {
+    next: usize,
+}
+
+/// `offsets` (each with its prefix length) ordered longest prefix first,
+/// stable within a length: a counting sort over the lengths, so a full
+/// table costs one pass and no comparisons.
+fn longest_first(routes: &[(u32, u8)], max_len: u8) -> Vec<u32> {
+    let mut counts = vec![0usize; max_len as usize + 2];
+    for &(_, len) in routes {
+        counts[(max_len - len.min(max_len)) as usize + 1] += 1;
+    }
+    for i in 1..counts.len() {
+        counts[i] += counts[i - 1];
+    }
+    let mut out = vec![0u32; routes.len()];
+    for &(at, len) in routes {
+        let slot = &mut counts[(max_len - len.min(max_len)) as usize];
+        out[*slot] = at;
+        *slot += 1;
+    }
+    out
 }
 
 impl RouteLedger {
@@ -598,10 +629,13 @@ impl RouteLedger {
             bytes: Vec::new(),
             routes_at,
             routes_end: body_len,
+            seed_order: Vec::new(),
         };
         // The walk: every route read and checked, the counts compared.
         let mut cursor = ledger.cursor();
         let mut seen = LedgerCounts::default();
+        let mut v4_at: Vec<(u32, u8)> = Vec::with_capacity(ledger.counts.v4.prefixes as usize);
+        let mut v6_at: Vec<(u32, u8)> = Vec::with_capacity(ledger.counts.v6.prefixes as usize);
         {
             let mut r = Reader {
                 buf: &bytes[..body_len],
@@ -609,8 +643,18 @@ impl RouteLedger {
             };
             while cursor.v4_left > 0 || cursor.v6_left > 0 {
                 let v4 = cursor.v4_left > 0;
+                let at = u32::try_from(r.at)
+                    .map_err(|_| corrupt("a route past 4 GiB into the record".into()))?;
                 let route =
                     read_route(&mut r, v4, &ledger.peers, &ledger.nexthops).map_err(corrupt)?;
+                let len = match route.prefix {
+                    IpPrefix::V4 { prefix_len, .. } | IpPrefix::V6 { prefix_len, .. } => prefix_len,
+                };
+                if v4 {
+                    v4_at.push((at, len));
+                } else {
+                    v6_at.push((at, len));
+                }
                 let c = if v4 {
                     cursor.v4_left -= 1;
                     &mut seen.v4
@@ -631,8 +675,49 @@ impl RouteLedger {
                 ledger.counts
             )));
         }
+        let mut order = longest_first(&v4_at, 32);
+        order.extend(longest_first(&v6_at, 128));
+        ledger.seed_order = order;
         ledger.bytes = bytes;
         Ok(ledger)
+    }
+
+    /// A cursor at the first route in seed order: every IPv4 route, then
+    /// every IPv6 route, each longest prefix first.
+    ///
+    /// Why not record order: a seed writes into the live FIB that XDP
+    /// reads, a chunk at a time, and the record holds routes in the
+    /// writer's hash-map order. A covering route could then forward
+    /// traffic meant for a more-specific one still waiting its turn. On
+    /// edge1-mci1 a seed took 73 s under load (2026-11-12). Longest
+    /// first, every route in the FIB has every more-specific route under
+    /// it in already, so a partial seed is correct by longest match at
+    /// every instant: a packet matches its true route, or misses and
+    /// goes to the kernel. Ordered at read, so a record any earlier
+    /// version wrote seeds this way too.
+    pub fn seed_cursor(&self) -> SeedCursor {
+        SeedCursor { next: 0 }
+    }
+
+    /// The route at `cursor` in seed order, advancing it; `None` past the
+    /// last. As [`Self::next_route`], the record was walked whole by
+    /// [`Self::decode`], so a read cannot fail here.
+    pub fn next_seed_route(&self, cursor: &mut SeedCursor) -> Option<LedgerRoute> {
+        let at = *self.seed_order.get(cursor.next)? as usize;
+        let v4 = cursor.next < self.counts.v4.prefixes as usize;
+        let mut r = Reader {
+            buf: &self.bytes[..self.routes_end],
+            at,
+        };
+        let route = read_route(&mut r, v4, &self.peers, &self.nexthops).ok()?;
+        cursor.next += 1;
+        Some(route)
+    }
+
+    /// Every route, in seed order ([`Self::seed_cursor`]).
+    pub fn seed_routes(&self) -> impl Iterator<Item = LedgerRoute> + '_ {
+        let mut cursor = self.seed_cursor();
+        std::iter::from_fn(move || self.next_seed_route(&mut cursor))
     }
 
     /// Every distinct peer the record names.
@@ -2070,6 +2155,53 @@ mod tests {
                 other => panic!("bit flipped at {i}: {other:?}"),
             }
         }
+    }
+
+    /// A seed reads longest prefix first within each family, IPv4 before
+    /// IPv6, whatever order the writer used, so a covering route never
+    /// reaches the live FIB before the more-specific routes under it.
+    /// Record order is left as written.
+    #[test]
+    fn the_seed_reads_longest_prefix_first_whatever_the_record_order() {
+        let mut rs = routes();
+        // A few more lengths, out of order, so every bucket is exercised.
+        for (addr, len) in [([10, 0, 0, 0], 8), ([10, 1, 0, 0], 16), ([10, 1, 2, 3], 32)] {
+            rs.insert(
+                0,
+                LedgerRoute {
+                    prefix: IpPrefix::V4 {
+                        addr,
+                        prefix_len: len,
+                    },
+                    adverts: vec![advert(v4nh(1))],
+                },
+            );
+        }
+        let ledger = RouteLedger::decode(encode(&meta(), &rs).unwrap()).unwrap();
+        assert_eq!(ledger.routes().collect::<Vec<_>>(), rs, "record order kept");
+
+        let seed: Vec<LedgerRoute> = ledger.seed_routes().collect();
+        assert_eq!(seed.len(), rs.len(), "every route, once");
+        for r in &rs {
+            assert!(seed.contains(r), "{:?} missing from the seed", r.prefix);
+        }
+        let lens: Vec<(bool, u8)> = seed
+            .iter()
+            .map(|r| match r.prefix {
+                IpPrefix::V4 { prefix_len, .. } => (true, prefix_len),
+                IpPrefix::V6 { prefix_len, .. } => (false, prefix_len),
+            })
+            .collect();
+        let v6_from = lens.iter().position(|(v4, _)| !v4).unwrap_or(lens.len());
+        assert!(lens[v6_from..].iter().all(|(v4, _)| !v4), "IPv4, then IPv6");
+        for fam in [&lens[..v6_from], &lens[v6_from..]] {
+            assert!(
+                fam.windows(2).all(|w| w[0].1 >= w[1].1),
+                "longest prefix first: {fam:?}"
+            );
+        }
+        assert_eq!(lens[0], (true, 32));
+        assert_eq!(lens[v6_from - 1], (true, 0), "the default route last");
     }
 
     #[test]

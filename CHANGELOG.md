@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.4] - UNRELEASED
+
+### Changes
+
+**fast-path**
+
+- A route-ledger seed goes into the live FIB longest prefix first (IPv4, then IPv6), whatever order the record holds, so a partial seed is correct by longest match at every instant: a covering route never forwards traffic meant for a more-specific route not yet in. The record format is unchanged. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/packetframe-fib.md#what-the-next-start-does-with-it), [#PR](https://github.com/unredacted/packetframe/pull/PR))
+
 ## [0.6.3] - 2026-11-12
 
 A point release on 0.6.2 for the first load of a fresh VPP: the step between a gateway's start and VPP steering. On a gateway that boots into full traffic, that load took 3.5 min on 2026-11-05, against about 35 s idle, and VPP died during it on both post-upgrade boots. VPP now has its cores to itself while it loads, stops its workers less often, and every load's length is recorded. A 0.6.2 config and route ledger carry over unchanged.

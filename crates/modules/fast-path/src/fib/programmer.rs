@@ -71,7 +71,7 @@ use crate::fib::local_nexthops::{
 use crate::fib::netlink_neigh::NeighborResolveHandle;
 use crate::fib::resolve_watch::{self, ifname, Budget, Cause, Episode, Report};
 use crate::fib::route_ledger::{
-    AdvertRef, LedgerAdvert, LedgerCounts, LedgerEncoder, LedgerMeta, RouteCursor, RouteLedger,
+    AdvertRef, LedgerAdvert, LedgerCounts, LedgerEncoder, LedgerMeta, RouteLedger, SeedCursor,
     SeedReport, SharedLedgerStatus, StartReport,
 };
 use crate::fib::types::{
@@ -1048,7 +1048,7 @@ pub struct FibProgrammer {
 /// has cost so far.
 struct PendingSeed {
     ledger: RouteLedger,
-    cursor: RouteCursor,
+    cursor: SeedCursor,
     started: Instant,
     advertisements: u64,
     failed: u64,
@@ -1286,7 +1286,7 @@ impl FibProgrammer {
     /// mark them seen, and its `InitiationComplete` GCs the rest.
     pub fn set_seed(&mut self, ledger: RouteLedger) {
         self.seed = Some(PendingSeed {
-            cursor: ledger.cursor(),
+            cursor: ledger.seed_cursor(),
             ledger,
             started: Instant::now(),
             advertisements: 0,
@@ -1556,7 +1556,7 @@ impl FibProgrammer {
             return;
         };
         for _ in 0..SEED_CHUNK {
-            let Some(route) = p.ledger.next_route(&mut p.cursor) else {
+            let Some(route) = p.ledger.next_seed_route(&mut p.cursor) else {
                 self.finish_seed(p);
                 return;
             };
