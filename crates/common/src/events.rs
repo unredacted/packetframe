@@ -190,6 +190,10 @@ pub mod kind {
     pub const ROUTE_LEDGER_PRESERVED: &str = "route_ledger_preserved";
     /// A start seeded the route mirror from the route ledger.
     pub const ROUTE_LEDGER_SEEDED: &str = "route_ledger_seeded";
+    /// `dry-run until-seeded` let go: the route mirror was whole
+    /// (`trigger` `seed-whole` or `initiation-complete`) after `held_ms`,
+    /// and the fast path forwards from here.
+    pub const DRY_RUN_RELEASED: &str = "dry_run_released";
     /// A start found no usable route ledger; `reason` says why
     /// (`missing` included), and the mirror loads cold.
     pub const ROUTE_LEDGER_REFUSED: &str = "route_ledger_refused";

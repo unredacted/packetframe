@@ -1023,6 +1023,13 @@ pub struct FibProgrammer {
     walk: Option<PendingWalk>,
     /// Where the seed's progress is reported. `None` in harnesses.
     ledger_status: Option<SharedLedgerStatus>,
+    /// `dry-run`'s gate and a handle on the pinned CFG map, to let an
+    /// `until-seeded` hold go when the mirror is whole
+    /// ([`Self::mirror_whole`]).
+    dry_run: Option<(
+        crate::dry_run_gate::DryRunGate,
+        Array<MapData, crate::linux_impl::FpCfg>,
+    )>,
     /// A seed was applied and the first `InitiationComplete` after it has
     /// not run yet: its progress is still worth reporting.
     seed_open: bool,
@@ -1263,6 +1270,7 @@ impl FibProgrammer {
                 unconfirmed_since: None,
                 walk: None,
                 ledger_status: None,
+                dry_run: None,
                 seed_open: false,
                 seed_stream_started: false,
                 completeness: None,
@@ -1299,6 +1307,34 @@ impl FibProgrammer {
     /// caller has already recorded there) through `status`.
     pub fn set_ledger_status(&mut self, status: SharedLedgerStatus) {
         self.ledger_status = Some(status);
+    }
+
+    /// See [`Self::mirror_whole`].
+    pub fn set_dry_run_gate(
+        &mut self,
+        gate: crate::dry_run_gate::DryRunGate,
+        cfg: Array<MapData, crate::linux_impl::FpCfg>,
+    ) {
+        self.dry_run = Some((gate, cfg));
+    }
+
+    /// The mirror is whole: latch it on the gate, and if that ends a
+    /// `dry-run until-seeded` hold, write `CFG.dry_run = 0` and record it.
+    /// One-shot; a later call changes nothing.
+    fn mirror_whole(&mut self, trigger: crate::dry_run_gate::Trigger) {
+        let Some((gate, cfg)) = self.dry_run.as_mut() else {
+            return;
+        };
+        match crate::linux_impl::set_cfg_dry_run_in(cfg, gate, |g| g.mark_ready(trigger)) {
+            Ok(Some(r)) => crate::dry_run_gate::report(r),
+            Ok(None) => {}
+            Err(e) => warn!(
+                error = %e,
+                trigger = trigger.as_str(),
+                "dry-run: the mirror is whole but CFG could not be written; still holding \
+                 until a reload writes it"
+            ),
+        }
     }
 
     /// The second tier's handles: what a preserving stop consults to
@@ -1670,6 +1706,7 @@ impl FibProgrammer {
         let attested = p.ledger.attested;
         let whole = attested && p.advertisements >= counts.advertisements() && p.failed == 0;
         if whole {
+            self.mirror_whole(crate::dry_run_gate::Trigger::SeedWhole);
             if let Some(h) = &self.feed_session {
                 let expires = meta
                     .confirmed_at_unix
@@ -1770,6 +1807,10 @@ impl FibProgrammer {
     /// nothing is unconfirmed. The first such GC after a seed closes it.
     /// `unseen` is the GC's recount over every record it visited.
     fn after_gc(&mut self, removed: Option<usize>, unseen: u64) {
+        // The first `InitiationComplete` GC, seed or no seed: the mirror now
+        // holds what the route source holds. Latched once; after a whole
+        // seed it has latched already and this changes nothing.
+        self.mirror_whole(crate::dry_run_gate::Trigger::InitiationComplete);
         self.unseen_session = unseen;
         if self.unseen_session == 0 {
             self.unconfirmed_since = None;

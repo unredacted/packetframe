@@ -20,6 +20,7 @@ pub use probe_authority::run_frr_authority_probes;
 
 pub mod breaker;
 pub mod coalesce;
+pub mod dry_run_gate;
 pub mod fib;
 pub mod metrics;
 pub mod pin;
@@ -423,6 +424,12 @@ impl Module for FastPathModule {
         {
             subsystems
                 .push(l.subsystem_health(fib::route_ledger::now_unix(), std::time::Instant::now()));
+        }
+        // `dry-run`, for `on` and `until-seeded`: whether the fast path is
+        // forwarding, and for `until-seeded` what the hold waits for or
+        // when it let go.
+        if let Some(d) = self.state.as_ref().and_then(linux_impl::dry_run_health) {
+            subsystems.push(d);
         }
         if let Some(n) = self
             .state

@@ -1300,6 +1300,47 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
   1.35M routes; writing it ~10 ms; reading, removing and validating it
   ~70 ms; seeding 1.35M routes into the real BPF maps 1.55 s.
 
+### dry-run until-seeded
+
+`dry-run until-seeded` passes every packet to the kernel, as `dry-run on`
+does, until the route mirror is known whole, then forwards, as `dry-run
+off` does, by itself. It replaces the step of switching dry-run off by
+hand once the seed has applied (1:43 under load on edge1-mci1 after the
+6.0.17 upgrade, 2026-11-12). It needs `forwarding-mode packetframe-fib`
+(or `compare`) and a `route-source`, and the config check refuses it
+otherwise: without them nothing could tell when the mirror is whole.
+
+**When it lets go.** Once per process, at the first of:
+- `seed-whole`: a route-ledger seed applied every advertisement it holds,
+  with no failed install, from a ledger attested by this daemon's
+  completeness authority. The seed went in longest prefix first, so the
+  table was correct by longest match while it applied; this is the point
+  it is also complete.
+- `initiation-complete`: the route source's first End-of-RIB, or the
+  quiescence that stands in for it, and the GC after it. This covers a
+  cold start, and a seed that was not whole (unattested, short, or with
+  failed installs). Over a seed with the FRR authority, that GC waits for
+  the authority as described below (`feed_gc_held`).
+
+The release writes `CFG.dry_run = 0` and records `dry_run_released`
+(`trigger`, `held_ms`).
+
+**What a reload does.** A reload of the same file never holds again once
+the mirror has been whole. An explicit `dry-run on` or `off` wins, as it
+always has. Switching back to `until-seeded` after the mirror was whole
+forwards at once.
+
+**What status shows.** The `dry-run` row, present for `on` and
+`until-seeded`:
+- `until-seeded: holding for Ns, every packet passes to the kernel;
+  waiting for …`, naming the seed still applying or the route source's
+  first End-of-RIB (a cold start, or a seed that was not whole);
+- `until-seeded: released at <UTC> (<trigger>) after Ns; forwarding`.
+
+Both are Healthy: a hold is designed. A hold that outlives the route
+source's load is the route source's problem, and the `route-ledger` and
+`fib-integrity` rows say what that is.
+
 ### What the next start does with it
 
 1. **Consumes it**, in every forwarding mode: read, then removed,

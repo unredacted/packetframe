@@ -321,15 +321,8 @@ fn reconcile_wan_egress(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> Modu
 }
 
 fn reconcile_cfg(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResult<()> {
-    let dry_run = cfg
-        .section
-        .directives
-        .iter()
-        .find_map(|d| match d {
-            ModuleDirective::DryRun(v) => Some(*v),
-            _ => None,
-        })
-        .unwrap_or(false);
+    let mode = crate::dry_run_gate::DryRunMode::of(&cfg.section.directives);
+    let gate = state.dry_run_gate.clone();
 
     let forwarding = cfg
         .section
@@ -370,6 +363,12 @@ fn reconcile_cfg(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     // thread for bit 6. `CFG_WRITE_LOCK` keeps them from interleaving —
     // see its doc for what an interleaving would have lost.
     let _serialized = CFG_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // The mode and the latch decide the byte, under the same lock the
+    // programmer's release takes: a reload of an `until-seeded` file never
+    // holds again once the mirror has been whole, and an explicit `on` or
+    // `off` wins as it always has.
+    let released = gate.set_mode(mode);
+    let dry_run = gate.byte() != 0;
     let current: FpCfg = cfg_arr
         .get(&0, 0)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;
@@ -400,6 +399,9 @@ fn reconcile_cfg(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
         .set(0, new_cfg, 0)
         .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG set: {e}")))?;
     info!(dry_run, forwarding = ?forwarding, "CFG reconciled");
+    if let Some(r) = released {
+        crate::dry_run_gate::report(r);
+    }
     Ok(())
 }
 

@@ -36,6 +36,7 @@ These directives can be added, removed, or changed under SIGHUP without re-attac
 | `allow-prefix`, `allow-prefix6` | `ALLOW_V4`, `ALLOW_V6` | Delta diff vs in-kernel state |
 | `block-prefix` | `BLOCK_V4` | v0.2.4+; wired up alongside reconfigure |
 | `dry-run on/off` | `CFG.dry_run` | Single-byte write |
+| `dry-run until-seeded` | `CFG.dry_run` | Held (1) until the route mirror has been whole once, then 0; a reload of the same file never holds again, and `on`/`off` win as before |
 | `forwarding-mode {kernel-fib\|packetframe-fib\|compare}` | `CFG.flags` bits 3-4 | Atomic |
 | `mss-clamp …` (all four grammars) | `MSS_CLAMP_V4/V6` + `MSS_CLAMP_BY_IFACE` + `CFG.mss_clamp_global` | v0.2.4+; value changes also pick up |
 | `wan-egress …` | (none — kernel policy rules, `proto 199`) | Added, changed or removed; the keep set also follows `allow-prefix` and `local-prefix` edits. Reconciled before the reload returns; the outcome is on the `wan-egress` status row (see [packetframe-fib.md](packetframe-fib.md#wan-egress)) |

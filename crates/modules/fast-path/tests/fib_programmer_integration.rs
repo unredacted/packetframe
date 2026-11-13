@@ -4978,6 +4978,7 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
             seed: Some(ledger(&routes, now_unix())),
             status: status.clone(),
             identity: Some(IDENTITY.into()),
+            dry_run: None,
         },
     )
     .expect("RouteController::start");
@@ -5117,6 +5118,7 @@ fn a_preserving_stop_finishes_a_gc_under_way() {
             seed: Some(ledger(&routes, now_unix())),
             status: packetframe_fast_path::fib::route_ledger::shared_status(),
             identity: Some(IDENTITY.into()),
+            dry_run: None,
         },
     )
     .expect("RouteController::start");
@@ -5218,6 +5220,7 @@ fn a_preserving_stop_mid_gc_writes_the_mirror_the_gc_leaves() {
             seed: Some(ledger(&routes, now_unix())),
             status: packetframe_fast_path::fib::route_ledger::shared_status(),
             identity: Some(IDENTITY.into()),
+            dry_run: None,
         },
     )
     .expect("RouteController::start");
