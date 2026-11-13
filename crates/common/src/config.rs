@@ -2198,6 +2198,34 @@ impl Config {
                      forever. Use `dry-run on` or `off` instead",
                 ));
             }
+            // Without a completeness authority the release is the route
+            // source's first End-of-RIB. BMP has none: its stand-in is five
+            // seconds of quiet, which can fall between two batches of a
+            // slow dump, and the release is one-shot, so it would forward a
+            // partial table for good. With BMP, only an authority may say
+            // the mirror is whole: vpp-offload's completeness handle and an
+            // integrity authority that is not `none` (absent is birdc).
+            let bmp = fp
+                .directives
+                .iter()
+                .any(|d| matches!(d, ModuleDirective::RouteSource(RouteSourceSpec::Bmp { .. })));
+            let authority = self.modules.iter().any(|m| m.name == "vpp-offload")
+                && !fp.directives.iter().any(|d| {
+                    matches!(
+                        d,
+                        ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::None)
+                    )
+                });
+            if bmp && !authority {
+                return Err(ConfigError::parse(
+                    0,
+                    "`dry-run until-seeded` with `route-source bmp` needs a completeness \
+                     authority (vpp-offload configured, and an `integrity-authority` other \
+                     than `none`): BMP has no End-of-RIB, and the quiet period that stands in \
+                     for one can fall mid-dump, so it cannot be what lets the hold go. Use \
+                     `dry-run on` and switch it off by hand, or `route-source bgp`",
+                ));
+            }
         }
 
         let frr = fp.directives.iter().find_map(|d| match d {
@@ -8913,6 +8941,42 @@ module fast-path
             .unwrap()
             .validate_fast_path()
             .unwrap();
+    }
+
+    /// BMP has no End-of-RIB, only a quiet period that can fall mid-dump,
+    /// so with BMP only a completeness authority may let the hold go.
+    #[test]
+    fn dry_run_until_seeded_with_bmp_needs_a_completeness_authority() {
+        let fp = "\
+module fast-path
+  attach eth2 generic
+  allow-prefix 203.0.113.0/24
+  forwarding-mode packetframe-fib
+  route-source bmp 127.0.0.1:1179
+  dry-run until-seeded
+";
+        let vpp = "
+module vpp-offload
+  loopback-address 198.51.100.1/32
+  port eth2 cores 1 steer off
+";
+        let e = Config::parse(fp).unwrap().validate_fast_path().unwrap_err();
+        assert!(format!("{e}").contains("route-source bmp"), "{e}");
+
+        let none = fp.replace(
+            "  dry-run until-seeded\n",
+            "  integrity-authority none\n  dry-run until-seeded\n",
+        );
+        let e = Config::parse(&format!("{none}{vpp}"))
+            .unwrap()
+            .validate_fast_path()
+            .unwrap_err();
+        assert!(format!("{e}").contains("route-source bmp"), "{e}");
+
+        Config::parse(&format!("{fp}{vpp}"))
+            .unwrap()
+            .validate_fast_path()
+            .expect("vpp-offload with the default authority attests");
     }
 
     #[test]

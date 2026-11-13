@@ -527,14 +527,26 @@ where
     F: FnOnce(&crate::dry_run_gate::DryRunGate) -> Option<crate::dry_run_gate::Released>,
 {
     let _serialized = CFG_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // The decision is made before the write, and undone if the write
+    // fails: otherwise the row would say forwarding while `CFG` still
+    // holds, and the one-shot latch would refuse every later trigger.
+    let before = gate.checkpoint();
     let released = decide(gate);
-    let mut cur: FpCfg = arr
+    let written = arr
         .get(&0, 0)
-        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;
-    cur.dry_run = gate.byte();
-    arr.set(0, cur, 0)
-        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG set: {e}")))?;
-    Ok(released)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))
+        .and_then(|mut cur: FpCfg| {
+            cur.dry_run = gate.byte();
+            arr.set(0, cur, 0)
+                .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG set: {e}")))
+        });
+    match written {
+        Ok(()) => Ok(released),
+        Err(e) => {
+            gate.restore(before);
+            Err(e)
+        }
+    }
 }
 
 /// Open the pinned `CFG` map, for a thread other than the one holding
@@ -560,6 +572,11 @@ pub fn dry_run_health(state: &ActiveState) -> Option<packetframe_common::module:
             Some(seed) if seed.applied_at.is_none() => {
                 "the route-ledger seed to finish applying".to_string()
             }
+            _ if state.dry_run_gate.repairs_owed() > 0 => format!(
+                "{} route(s) whose FIB install failed to be repaired (retried at the next \
+                 End-of-RIB GC, or by the prefix's next update)",
+                state.dry_run_gate.repairs_owed()
+            ),
             Some(seed) if seed.attested && seed.failed == 0 => {
                 "the route-ledger seed's last step".to_string()
             }

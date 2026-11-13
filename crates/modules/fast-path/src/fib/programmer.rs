@@ -902,9 +902,9 @@ pub struct FibProgrammer {
 
     /// Prefixes whose recompute failed and has not since succeeded.
     ///
-    /// Both producers drain the advertisements BEFORE recomputing, so
-    /// neither failure is retryable by re-running the operation that
-    /// caused it:
+    /// Every producer changes the advertisements BEFORE recomputing, so
+    /// no failure is retryable by re-running the operation that caused
+    /// it:
     ///
     /// - `gc_prefix` removes the unseen advertisements first, so the
     ///   next GC collects no victims and would report a vacuous `Ok`
@@ -918,9 +918,14 @@ pub struct FibProgrammer {
     ///   advertisement (a `local_arp` /32) keeps the record alive and
     ///   the mirror keeps its pre-failure `nexthop_ips`.
     ///
-    /// Both are review findings, and they are one shape: the ledger
-    /// says the route source is gone while the installed state says
-    /// otherwise. Retried at the next GC, cleared by any successful
+    /// - an `Add` or `Del` (or a seeded route): the mirror holds the new
+    ///   advertisements and the FIB the old entry, or none, and the route
+    ///   source will not send the route again. Owed so the next GC
+    ///   retries it, and so `dry-run until-seeded` does not call the
+    ///   mirror whole over it (review finding on #398).
+    ///
+    /// All are review findings, and they are one shape: the mirror says
+    /// one thing while the installed state says otherwise. Retried at the next GC, cleared by any successful
     /// recompute of the prefix. While non-empty the GC is not complete
     /// and says so, and [`FibProgrammerHandle::has_session_routes`]
     /// answers yes.
@@ -1030,6 +1035,14 @@ pub struct FibProgrammer {
         crate::dry_run_gate::DryRunGate,
         Array<MapData, crate::linux_impl::FpCfg>,
     )>,
+    /// A completeness authority runs and publishes: its attestation, not
+    /// the route source's End-of-RIB, says the mirror is whole. False
+    /// under `integrity-authority none`, where nothing would ever attest.
+    dry_run_authority: bool,
+    /// A trigger that fired while the mirror still owed repairs
+    /// ([`Self::recompute_owed`]), or whose `CFG` write failed: retried on
+    /// the reprobe tick ([`Self::check_whole`]).
+    whole_retry: Option<crate::dry_run_gate::Trigger>,
     /// A seed was applied and the first `InitiationComplete` after it has
     /// not run yet: its progress is still worth reporting.
     seed_open: bool,
@@ -1271,6 +1284,8 @@ impl FibProgrammer {
                 walk: None,
                 ledger_status: None,
                 dry_run: None,
+                dry_run_authority: false,
+                whole_retry: None,
                 seed_open: false,
                 seed_stream_started: false,
                 completeness: None,
@@ -1309,24 +1324,38 @@ impl FibProgrammer {
         self.ledger_status = Some(status);
     }
 
-    /// See [`Self::mirror_whole`].
+    /// See [`Self::mirror_whole`]. `authority`: a completeness authority
+    /// will publish (vpp-offload's handle is wired and the integrity
+    /// authority is not `none`); call after [`Self::set_second_tier`].
     pub fn set_dry_run_gate(
         &mut self,
         gate: crate::dry_run_gate::DryRunGate,
         cfg: Array<MapData, crate::linux_impl::FpCfg>,
+        authority: bool,
     ) {
-        gate.set_authority(self.completeness.is_some());
+        self.dry_run_authority = authority && self.completeness.is_some();
+        gate.set_authority(self.dry_run_authority);
         self.dry_run = Some((gate, cfg));
     }
 
-    /// With a completeness authority, the mirror is whole the first time
-    /// the authority attests it (`dry-run until-seeded`). Not while a seed
-    /// or walk is half applied. Each reprobe tick, until it has latched.
-    fn check_authority_whole(&mut self) {
+    /// Each reprobe tick, until the mirror has been whole once
+    /// (`dry-run until-seeded`), and never while a seed or walk is half
+    /// applied: retry a trigger that was deferred, and with a completeness
+    /// authority, release the first time it attests the mirror.
+    fn check_whole(&mut self) {
         let Some((gate, _)) = self.dry_run.as_ref() else {
             return;
         };
         if gate.is_ready() || self.mid_chunked_work() {
+            return;
+        }
+        gate.set_repairs_owed(self.recompute_owed.len());
+        match self.whole_retry.take() {
+            // The authority's word is read afresh below, not replayed.
+            Some(crate::dry_run_gate::Trigger::AuthorityAttested) | None => {}
+            Some(t) => return self.mirror_whole(t),
+        }
+        if !self.dry_run_authority {
             return;
         }
         let mirror = (self.routes_v4.len() + self.routes_v6.len()) as u64;
@@ -1342,19 +1371,49 @@ impl FibProgrammer {
     /// The mirror is whole: latch it on the gate, and if that ends a
     /// `dry-run until-seeded` hold, write `CFG.dry_run = 0` and record it.
     /// One-shot; a later call changes nothing.
+    ///
+    /// Not while any route is owed a repair: the mirror may be whole, but
+    /// the FIB the XDP program reads is not. The trigger is kept and
+    /// retried on the reprobe tick once the debt is paid, as it is when
+    /// the `CFG` write fails (the gate is put back then, see
+    /// `set_cfg_dry_run_in`).
     fn mirror_whole(&mut self, trigger: crate::dry_run_gate::Trigger) {
         let Some((gate, cfg)) = self.dry_run.as_mut() else {
             return;
         };
+        if gate.is_ready() {
+            return;
+        }
+        let owed = self.recompute_owed.len();
+        gate.set_repairs_owed(owed);
+        if owed > 0 {
+            // Said once, and only where it holds traffic: in `on` and
+            // `off` the latch is bookkeeping for a later reload.
+            if self.whole_retry.is_none()
+                && gate.mode() == crate::dry_run_gate::DryRunMode::UntilSeeded
+            {
+                info!(
+                    trigger = trigger.as_str(),
+                    owed,
+                    "dry-run: the mirror is whole but routes are owed a repair; holding until \
+                     they are repaired"
+                );
+            }
+            self.whole_retry = Some(trigger);
+            return;
+        }
         match crate::linux_impl::set_cfg_dry_run_in(cfg, gate, |g| g.mark_ready(trigger)) {
             Ok(Some(r)) => crate::dry_run_gate::report(r),
             Ok(None) => {}
-            Err(e) => warn!(
-                error = %e,
-                trigger = trigger.as_str(),
-                "dry-run: the mirror is whole but CFG could not be written; still holding \
-                 until a reload writes it"
-            ),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    trigger = trigger.as_str(),
+                    "dry-run: the mirror is whole but CFG could not be written; still holding, \
+                     retried on the next tick"
+                );
+                self.whole_retry = Some(trigger);
+            }
         }
     }
 
@@ -1453,7 +1512,7 @@ impl FibProgrammer {
                     tokio::task::yield_now().await;
                 }
                 _ = reprobe_tick.tick() => {
-                    self.check_authority_whole();
+                    self.check_whole();
                     self.fire_due_reprobes();
                 }
                 evt = self.events_rx.recv(), if events_open => {
@@ -1624,9 +1683,10 @@ impl FibProgrammer {
                     p.advertisements += 1;
                 }
             }
-            if let Err(e) = self.recompute_fib_entry(prefix) {
+            if let Err(e) = self.recompute_owing(prefix) {
                 // Left in the mirror exactly as a failed live install
-                // would be; the next change to the prefix retries it.
+                // would be, and owed: the next GC or the next change to
+                // the prefix retries it.
                 p.failed += 1;
                 if p.first_error.is_none() {
                     p.first_error = Some(format!("{prefix:?}: {e}"));
@@ -1831,10 +1891,11 @@ impl FibProgrammer {
     fn after_gc(&mut self, removed: Option<usize>, unseen: u64) {
         // The first `InitiationComplete` GC, seed or no seed, when nothing
         // better can say the mirror is whole: with a completeness authority
-        // the authority's attestation decides instead
-        // (`check_authority_whole`), because an End-of-RIB can come while
-        // the routing daemon is still loading its upstream. Latched once.
-        if self.completeness.is_none() {
+        // the authority's attestation decides instead (`check_whole`),
+        // because an End-of-RIB can come while the routing daemon is still
+        // loading its upstream. A GC whose recompute failed left the prefix
+        // owed, and `mirror_whole` holds until it is repaired. Latched once.
+        if !self.dry_run_authority {
             self.mirror_whole(crate::dry_run_gate::Trigger::InitiationComplete);
         }
         self.unseen_session = unseen;
@@ -3069,7 +3130,7 @@ impl FibProgrammer {
             return Ok(());
         }
         self.upsert_advertisement(peer_id, prefix, path_id, nexthops, attrs);
-        self.recompute_fib_entry(prefix)
+        self.recompute_owing(prefix)
     }
 
     fn del_route(
@@ -3082,7 +3143,18 @@ impl FibProgrammer {
             // Idempotent: nothing was advertised under this key.
             return Ok(());
         }
-        self.recompute_fib_entry(prefix)
+        self.recompute_owing(prefix)
+    }
+
+    /// Recompute after a route event changed `prefix`'s advertisements,
+    /// owing it ([`Self::recompute_owed`]) on failure: the route source
+    /// will not send it again.
+    fn recompute_owing(&mut self, prefix: IpPrefix) -> Result<(), ProgrammerError> {
+        let outcome = self.recompute_fib_entry(prefix);
+        if outcome.is_err() {
+            self.recompute_owed.insert(prefix);
+        }
+        outcome
     }
 
     // --- Resync, InitiationComplete and PeerDown walks ---

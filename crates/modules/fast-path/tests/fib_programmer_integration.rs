@@ -2695,6 +2695,16 @@ fn a_failed_gc_recompute_is_owed_until_it_reconciles() {
                 .await
                 .is_err()
             {
+                // The refused Add is owed a repair of its own; withdraw
+                // it so the target is the only debt this test watches.
+                h.handle
+                    .apply_route_event(RouteEvent::Del {
+                        peer_id: peer_new,
+                        prefix,
+                        path_id: None,
+                    })
+                    .await
+                    .expect("withdraw the refused filler");
                 return true;
             }
             filler.push(prefix);
@@ -2787,6 +2797,89 @@ fn a_failed_gc_recompute_is_owed_until_it_reconciles() {
     );
 }
 
+/// An `Add` whose install failed is owed until it reconciles: the route
+/// source will not send it again, so without the debt the mirror would
+/// hold the route while the FIB never did, and the GC after End-of-RIB
+/// would report success over it (and let `dry-run until-seeded` go).
+/// Same failure injection as the GC's test above.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_failed_add_is_owed_until_it_reconciles() {
+    let (h, sink) = ProgrammerHarness::with_sink();
+    let peer = PeerId(0x5350);
+    let add = |prefix: IpPrefix, nexthops: Vec<IpAddr>| RouteEvent::Add {
+        peer_id: peer,
+        prefix,
+        nexthops,
+        path_id: None,
+        local_pref: None,
+        origin_asn: None,
+    };
+    let pair = |i: u32| {
+        (
+            IpAddr::V4(Ipv4Addr::from(0x0a90_0000 + i * 2)),
+            IpAddr::V4(Ipv4Addr::from(0x0a90_0000 + i * 2 + 1)),
+        )
+    };
+    let prefix_of = |i: u32| IpPrefix::V4 {
+        addr: [100, 65, (i >> 8) as u8, (i & 0xff) as u8],
+        prefix_len: 32,
+    };
+
+    let refused = h.run(async {
+        for i in 0..(ECMP_GROUPS_CAP + 8) {
+            let (n1, n2) = pair(i);
+            if h.handle
+                .apply_route_event(add(prefix_of(i), vec![n1, n2]))
+                .await
+                .is_err()
+            {
+                return Some(i);
+            }
+        }
+        None
+    });
+    let refused = refused.expect("the ECMP pool never filled — this test cannot inject its failure");
+
+    let first = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(
+        first.is_err(),
+        "the GC retries the owed Add, which still has nowhere to allocate"
+    );
+
+    h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Del {
+                peer_id: peer,
+                prefix: prefix_of(0),
+                path_id: None,
+            })
+            .await
+            .expect("free one filler");
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    });
+    let settled = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(
+        settled.is_ok(),
+        "with a group free the owed Add must install: {settled:?}"
+    );
+    let (n1, n2) = pair(refused);
+    assert!(
+        sink.calls()
+            .contains(&SinkCall::Resolved(prefix_of(refused), vec![n1, n2])),
+        "the second tier must hear the repaired route: {:?}",
+        sink.calls()
+    );
+}
+
 /// A `PeerDown` whose recompute failed leaves the prefix owed, so the
 /// departed session still counts until the prefix reconciles.
 ///
@@ -2848,6 +2941,15 @@ fn a_failed_peer_down_recompute_is_owed_until_it_reconciles() {
                 .await
                 .is_err()
             {
+                // As in the GC's test: the refused Add is owed too.
+                h.handle
+                    .apply_route_event(RouteEvent::Del {
+                        peer_id: local,
+                        prefix,
+                        path_id: None,
+                    })
+                    .await
+                    .expect("withdraw the refused filler");
                 return true;
             }
             filler.push(prefix);

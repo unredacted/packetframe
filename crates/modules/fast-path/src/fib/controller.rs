@@ -454,7 +454,13 @@ impl RouteController {
         // open it is said loudly; the reload can still let it go.
         if let Some(gate) = dry_run {
             match crate::linux_impl::open_cfg_pin(bpffs_root) {
-                Ok(cfg) => programmer.set_dry_run_gate(gate, cfg),
+                // `integrity-authority none` runs no checker, so nothing
+                // would ever attest: the End-of-RIB decides there.
+                Ok(cfg) => programmer.set_dry_run_gate(
+                    gate,
+                    cfg,
+                    !matches!(integrity_authority, IntegrityAuthoritySpec::None),
+                ),
                 Err(e) => tracing::error!(
                     error = %e,
                     "dry-run: cannot open the CFG map for the programmer; an `until-seeded` \

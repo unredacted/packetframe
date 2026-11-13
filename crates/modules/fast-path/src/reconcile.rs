@@ -366,12 +366,18 @@ fn reconcile_cfg(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     // The mode and the latch decide the byte, under the same lock the
     // programmer's release takes: a reload of an `until-seeded` file never
     // holds again once the mirror has been whole, and an explicit `on` or
-    // `off` wins as it always has.
+    // `off` wins as it always has. A failed read or write puts the gate
+    // back as `CFG` still has it.
+    let before = gate.checkpoint();
     let released = gate.set_mode(mode);
     let dry_run = gate.byte() != 0;
-    let current: FpCfg = cfg_arr
-        .get(&0, 0)
-        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))?;
+    let current: FpCfg = match cfg_arr.get(&0, 0) {
+        Ok(c) => c,
+        Err(e) => {
+            gate.restore(before);
+            return Err(ModuleError::other(MODULE_NAME, format!("CFG get: {e}")));
+        }
+    };
     let head_shift = current.flags & FP_CFG_FLAG_HEAD_SHIFT_128;
     let vlan_present = current.flags & FP_CFG_FLAG_VLAN_PRESENT;
 
@@ -395,9 +401,10 @@ fn reconcile_cfg(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
         version: FP_CFG_VERSION_V2,
     };
 
-    cfg_arr
-        .set(0, new_cfg, 0)
-        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG set: {e}")))?;
+    if let Err(e) = cfg_arr.set(0, new_cfg, 0) {
+        gate.restore(before);
+        return Err(ModuleError::other(MODULE_NAME, format!("CFG set: {e}")));
+    }
     info!(dry_run, forwarding = ?forwarding, "CFG reconciled");
     if let Some(r) = released {
         crate::dry_run_gate::report(r);

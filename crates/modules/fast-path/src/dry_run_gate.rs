@@ -30,7 +30,13 @@
 //!   FRR's 161,297 routes, because FRR was still loading its upstream.
 //! - **`initiation-complete`**: with no authority, the route source's
 //!   first `InitiationComplete` and the GC that follows it, the best a
-//!   daemon with nothing to compare against can do.
+//!   daemon with nothing to compare against can do. Never BMP's: its
+//!   stand-in is a quiet period that can fall mid-dump, so the config
+//!   check refuses `until-seeded` with BMP and no authority.
+//!
+//! None of them while a route is owed a repair (an install or recompute
+//! that failed, `FibProgrammer::recompute_owed`): the trigger is kept and
+//! the hold ends on the reprobe tick after the last repair.
 //!
 //! The release is a write of `CFG.dry_run = 0`, made under
 //! `CFG_WRITE_LOCK` by whoever learns the mirror is whole, and recorded
@@ -95,10 +101,12 @@ pub struct Released {
     pub held: Duration,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct State {
     mode: DryRunMode,
-    /// When the process began holding: the gate's creation at load.
+    /// When `until-seeded` began: the gate's creation at load, or the
+    /// reload that switched to it, so `held` never counts time spent
+    /// forwarding under `off` before that reload.
     since: Instant,
     /// The mirror was known whole, and how. One-shot, whatever the mode,
     /// so a reload that turns `until-seeded` on after it does not hold for
@@ -109,7 +117,16 @@ struct State {
     /// A completeness authority decides when a mirror that did not seed
     /// whole is whole; only for the row's "waiting for".
     authority: bool,
+    /// Routes whose FIB install or recompute failed and has not been
+    /// repaired since. The mirror is not whole while any is owed; only
+    /// for the row's "waiting for".
+    repairs_owed: usize,
 }
+
+/// The gate as it was before a decision, to put back when the `CFG` write
+/// that would have made the decision real fails.
+#[derive(Debug)]
+pub struct Checkpoint(State);
 
 /// Shared by the load, the programmer and the reload.
 #[derive(Debug, Clone)]
@@ -123,6 +140,7 @@ impl DryRunGate {
             ready: None,
             released: None,
             authority: false,
+            repairs_owed: 0,
         })))
     }
 
@@ -146,6 +164,33 @@ impl DryRunGate {
 
     pub fn authority(&self) -> bool {
         self.lock().authority
+    }
+
+    /// How many routes are owed a repair (see the field).
+    pub fn set_repairs_owed(&self, n: usize) {
+        self.lock().repairs_owed = n;
+    }
+
+    pub fn repairs_owed(&self) -> usize {
+        self.lock().repairs_owed
+    }
+
+    /// The latch and the release as they are now. Taken before a decision
+    /// under `CFG_WRITE_LOCK`, and handed to [`Self::restore`] if the
+    /// write fails, so the row never says forwarding while `CFG` still
+    /// holds and a later trigger can still let go.
+    pub fn checkpoint(&self) -> Checkpoint {
+        Checkpoint(self.lock().clone())
+    }
+
+    /// Put back the mode, the latch and the release from `cp`, as `CFG`
+    /// still has them. The row's notes stay as they are now.
+    pub fn restore(&self, cp: Checkpoint) {
+        let mut s = self.lock();
+        s.ready = cp.0.ready;
+        s.released = cp.0.released;
+        s.since = cp.0.since;
+        s.mode = cp.0.mode;
     }
 
     /// `CFG.dry_run` as the mode and the latch say it should be.
@@ -176,8 +221,13 @@ impl DryRunGate {
     /// write [`Self::byte`].
     pub fn set_mode(&self, mode: DryRunMode) -> Option<Released> {
         let mut s = self.lock();
-        s.mode = mode;
         let now = Instant::now();
+        if mode == DryRunMode::UntilSeeded && s.mode != DryRunMode::UntilSeeded {
+            // The hold starts here, not at load; over a mirror already
+            // whole it ends here too, held for nothing.
+            s.since = now;
+        }
+        s.mode = mode;
         Self::release_locked(&mut s, now)
     }
 
@@ -326,6 +376,29 @@ mod tests {
             .expect("released by the reload");
         assert_eq!(r.trigger, Trigger::InitiationComplete);
         assert_eq!(g.byte(), 0);
+    }
+
+    #[test]
+    fn a_reload_from_off_counts_the_hold_from_the_reload_not_the_load() {
+        let g = DryRunGate::new(DryRunMode::Off);
+        assert!(g.mark_ready(Trigger::InitiationComplete).is_none());
+        std::thread::sleep(Duration::from_millis(30));
+        let r = g.set_mode(DryRunMode::UntilSeeded).expect("released");
+        assert!(r.held < Duration::from_millis(30), "held {:?}", r.held);
+    }
+
+    #[test]
+    fn a_failed_write_puts_the_latch_back_so_a_later_trigger_still_lets_go() {
+        let g = DryRunGate::new(DryRunMode::UntilSeeded);
+        let cp = g.checkpoint();
+        assert!(g.mark_ready(Trigger::SeedWhole).is_some());
+        g.restore(cp);
+        assert!(!g.is_ready());
+        assert_eq!(g.byte(), 1);
+        let msg = g.health("x").unwrap().message.unwrap();
+        assert!(msg.starts_with("until-seeded: holding"), "{msg}");
+        let r = g.mark_ready(Trigger::AuthorityAttested).expect("released");
+        assert_eq!(r.trigger, Trigger::AuthorityAttested);
     }
 
     #[test]
