@@ -1687,6 +1687,7 @@ fn run_loop(
         }
         runtime.set_steered(driver.supervisor().is_steered());
         runtime.fence_tick(driver.state(), Instant::now());
+        runtime.irq_tick(Instant::now());
         // Retained BEFORE the terminal check below, which `break`s.
         //
         // With the assignment after it, a tick whose failures coincided

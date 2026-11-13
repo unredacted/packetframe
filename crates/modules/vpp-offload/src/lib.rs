@@ -65,6 +65,7 @@ pub mod feed;
 pub mod fence;
 pub mod fib_sync;
 pub mod handback;
+pub mod irq_guard;
 pub mod kernel_path;
 pub mod ledger_record;
 pub mod liveness;
