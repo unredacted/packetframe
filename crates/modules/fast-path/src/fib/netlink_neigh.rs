@@ -1278,6 +1278,7 @@ impl NetlinkNeighborResolver {
             local_nd_routes_added = self.applied(|a| &a.host_v6_added),
             local_nd_routes_removed = self.applied(|a| &a.host_v6_removed),
             synth_routes_pending = self.applied(|a| &a.pending),
+            synth_routes_coalesced = self.applied(|a| &a.coalesced),
             fdb_entries = self.fdb.len(),
             fdb_pins_sent = self.fdb_pins_sent,
             fdb_pins_cleared = self.fdb_pins_cleared,
@@ -2174,15 +2175,22 @@ impl NetlinkNeighborResolver {
     /// in order without the resolver waiting ([`super::route_applier`]).
     /// No programmer handle wired: nothing to do.
     fn submit_route(&mut self, event: RouteEvent, kind: super::route_applier::RouteKind) {
-        if self.applier.is_none() {
-            let Some(prog) = self.prog_handle.clone() else {
-                return;
-            };
-            self.applier = Some(super::route_applier::RouteApplier::spawn(prog));
-        }
-        if let Some(a) = self.applier.as_ref() {
+        if let Some(a) = self.route_applier() {
             a.submit(event, kind);
         }
+    }
+
+    /// The applier, started on first use. `None` with no programmer
+    /// handle wired.
+    fn route_applier(&mut self) -> Option<&super::route_applier::RouteApplier> {
+        if self.applier.is_none() {
+            let prog = self.prog_handle.clone()?;
+            self.applier = Some(super::route_applier::RouteApplier::spawn(
+                prog,
+                self.events_tx.clone(),
+            ));
+        }
+        self.applier.as_ref()
     }
 
     /// One of the applier's counters, 0 before it starts.
@@ -2514,8 +2522,9 @@ impl NetlinkNeighborResolver {
 
     /// Walk the seeded `neigh_cache` once at startup and, for each
     /// entry that falls in a configured local-prefix CIDR + ifindex
-    /// pair, emit a `RouteEvent::Add` followed directly by a synthetic
-    /// `NeighEvent::Learned` carrying the cached MAC. v0.2.1.
+    /// pair, emit a `RouteEvent::Add` followed by a synthetic
+    /// `NeighEvent::Learned` carrying the cached MAC, which the route
+    /// applier sends once the Add is applied. v0.2.1.
     ///
     /// The direct `Learned` is load-bearing, not an optimization. The
     /// Add makes the programmer register the nexthop, which fires a
@@ -2529,8 +2538,9 @@ impl NetlinkNeighborResolver {
     /// (slow-path fallback) until NUD churn happened to touch them.
     /// Emitting the `Learned` here uses the MAC we already hold from
     /// the dump, mirrors what the resolve queue's cache-hit arm would
-    /// have done, and scales to any snapshot size: `events_tx` applies
-    /// backpressure and the programmer drains it concurrently. The
+    /// have done, and scales to any snapshot size: the route applier
+    /// sends each one after its Add, and the programmer drains them
+    /// concurrently. The
     /// queued resolve requests that do survive become harmless
     /// duplicate cache-hits once the select loop starts.
     async fn seed_local_prefix_routes(&mut self) {
@@ -2559,7 +2569,6 @@ impl NetlinkNeighborResolver {
                     local_pref: None,
                     origin_asn: None,
                 };
-                self.submit_route(add, super::route_applier::RouteKind::HostAdd { ip });
                 if ip.is_ipv4() {
                     emitted_v4 += 1;
                 } else {
@@ -2567,11 +2576,20 @@ impl NetlinkNeighborResolver {
                 }
                 // Same construction as the resolve queue's cache-hit
                 // arm, including the zeroed src_mac fallback for
-                // MAC-less ifaces.
-                if self.send_learned(ip, ifindex, mac).await {
+                // MAC-less ifaces. Sent by the applier once the Add is
+                // applied: the programmer discards a Learned for a
+                // nexthop the Add has not registered yet (review
+                // finding on #393).
+                let learned = NeighEvent::Learned {
+                    ip,
+                    mac,
+                    ifindex,
+                    src_mac: self.iface_mac.get(&ifindex).copied().unwrap_or([0; 6]),
+                };
+                let kind = super::route_applier::RouteKind::HostAdd { ip };
+                if let Some(a) = self.route_applier() {
+                    a.submit_then(add, kind, learned);
                     self.synth_learned_emitted += 1;
-                } else {
-                    warn!(?ip, "seed synthetic Learned send failed");
                 }
             }
         }
