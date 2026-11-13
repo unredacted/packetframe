@@ -34,7 +34,19 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **fast-path**
 
+- A route-ledger seed goes into the live FIB longest prefix first (IPv4, then IPv6), whatever order the record holds, so a partial seed is correct by longest match at every instant: a covering route never forwards traffic meant for a more-specific route not yet in. The record format is unchanged. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/packetframe-fib.md#what-the-next-start-does-with-it), [#396](https://github.com/unredacted/packetframe/pull/396))
+- `dry-run until-seeded` holds like `dry-run on` until the route mirror is whole (a whole, attested route-ledger seed applied; otherwise the completeness authority attesting the mirror, or with no authority the route source's first End-of-RIB), then forwards like `off` by itself and records `dry_run_released`. A reload never holds again; `on`/`off` win as before. The `dry-run` row says whether it holds, and for what, or when it let go. It holds while a failed route install is unrepaired. Needs `forwarding-mode packetframe-fib` and a `route-source`, and with BMP a completeness authority. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/packetframe-fib.md#dry-run-until-seeded), [#398](https://github.com/unredacted/packetframe/pull/398))
 - The neighbour resolver keeps serving while a route-ledger seed applies. The routes it makes itself (`local-prefix` host routes, the `fallback-default`, a link's PeerDown) wait for the programmer in an applier of their own, in order, instead of holding the resolver behind the whole seed: on edge1-mci1 after an upgrade, the transit next hop behind 1.1M routes went unserved for the seed's 73 s. Queued neighbour events are also applied between seed chunks, not one per chunk. ([#393](https://github.com/unredacted/packetframe/pull/393))
+
+**vpp-offload**
+
+- `steer-at-start on` makes a port at `steer on` a steering want from the start, so the first convergence steers once every gate passes (verify, the completeness authority or seeded door, the first-steer hold, no dark member in use) without an operator moving the lever. The `steering` row reads `steer-at-start: wanted from the start …` with what it is waiting for: Healthy while that clears by itself, Degraded when it will not. Default `off`. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/vpp-offload.md#the-canary-ladder), [#397](https://github.com/unredacted/packetframe/pull/397))
+- NIC queue IRQs stay off VPP's cores after attach: a port that is re-opened (a speed change, a udapi reconfig) gets its IRQs back on their default CPUs, VPP's included, so every 2 s the daemon moves any it finds there off again (`nic_irqs_moved`, at most once per 5 min). ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/vpp-offload.md#irq-affinity-before-attach), [#392](https://github.com/unredacted/packetframe/pull/392))
+- `fresh_hold_released` says where a fresh load's time went: VPP's main thread and the daemon's sending thread, each on CPU and waiting for one (`vpp_main_cpu_ms`, `vpp_main_wait_ms`, `sender_cpu_ms`, `sender_wait_ms`), from `/proc/<pid>/task/<tid>/schedstat`. ([#394](https://github.com/unredacted/packetframe/pull/394))
+
+**Packaging**
+
+- The packaged unit runs the daemon at `Nice=-15`, the priority UniFi gives bgpd, zebra and ubios-udapi-server, from its first instruction; VPP inherits it. At nice 0 the route-ledger seed, the FRR feed and the sender of VPP's fresh load all ran at a fraction of their idle rate on a gateway booting into full traffic. Run `systemctl daemon-reload` after installing. ([#395](https://github.com/unredacted/packetframe/pull/395))
 
 ## [0.6.3] - 2026-11-12
 
