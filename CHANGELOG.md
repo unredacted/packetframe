@@ -28,7 +28,31 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
-## [0.6.4] - UNRELEASED
+## [0.6.4] - 2026-11-13
+
+A point release on 0.6.3 for the minutes between a gateway's start and the fast path forwarding on a whole table, then VPP steering. After the 6.0.17 upgrade on edge1-mci1 (2026-11-12), the upgrade playbook switched `dry-run` off by hand once the seed had applied (1:43 under load) and moved the steering lever once VPP was ready (22 s). The daemon can now do both itself. A route-ledger seed goes into the live FIB longest prefix first, the neighbour resolver keeps serving while the seed applies, and the daemon runs at bgpd's priority. A 0.6.3 config and route ledger carry over unchanged. Both new behaviours are opt-in.
+
+### Upgrading from 0.6.3
+
+1. Install the 0.6.4 package or tarball. The .deb runs no maintainer scripts, so the running daemon is unaffected.
+2. `systemctl daemon-reload`. The packaged unit now sets `Nice=-15`, and it takes effect only after a reload and the next start.
+3. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with or without vpp-offload, as for 0.6.3.
+
+The start seeds from the ledger 0.6.3 wrote at the stop. Neither ledger format changed, so a downgrade to 0.6.3 seeds too.
+
+- **`dry-run until-seeded`** (fast-path, opt-in) holds like `dry-run on` and lets go by itself once the route mirror is whole. It needs `forwarding-mode packetframe-fib` (or `compare`) and a `route-source`. With `route-source bmp` it also needs a completeness authority. The config check refuses it otherwise. [dry-run until-seeded](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/packetframe-fib.md#dry-run-until-seeded)
+- **`steer-at-start on`** (vpp-offload, opt-in, default `off`) makes a port at `steer on` a steering want from the start. Every gate the lever meets still applies. [The canary ladder](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/vpp-offload.md#the-canary-ladder)
+- **New status row** `dry-run` (present for `on` and `until-seeded`). The `steering` row starts `steer-at-start: wanted from the start` while that want is unmet.
+- **New events:** `dry_run_released` (fast-path) and `nic_irqs_moved` (vpp-offload). `fresh_hold_released` gains `vpp_main_cpu_ms`, `vpp_main_wait_ms`, `sender_cpu_ms` and `sender_wait_ms`. [The event log](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/event-log.md)
+
+### Highlights
+
+- **The fast path lets go of `dry-run` by itself.** `dry-run until-seeded` releases when a whole, attested route-ledger seed has applied (`seed-whole`), or else when the completeness authority attests the mirror (`authority-attested`). The route source's End-of-RIB is not enough. On the lab, a cold start's first End-of-RIB came with the mirror 17% short of FRR, because FRR was still loading its upstream. It does not release while a failed route install is unrepaired. On the lab it released 3.8 s into a seeded start and 18 s into a cold one.
+- **A seed is correct by longest match while it applies.** The ledger is applied longest prefix first, so a covering route never carries traffic meant for a more-specific route not yet in.
+- **The steer needs no operator at start.** `steer-at-start on` steers at the first convergence whose gates pass, from a fresh or an adopted VPP. A dark member in use still refuses it, and the row says so (Degraded) rather than waiting.
+- **The resolver serves through a seed.** The routes the resolver makes itself (`local-prefix` hosts, the `fallback-default`, a link's PeerDown) queue for the programmer in order, instead of holding the resolver behind the seed. On edge1-mci1 the transit next hop behind 1.1M routes went unserved for the seed's 73 s. On the lab, 0.6.3's resolver waited out the whole 1.6 s seed; 0.6.4's finished at once.
+- **The daemon runs at bgpd's priority,** `Nice=-15`, and VPP inherits it. On a gateway booting into full traffic, nice 0 left the seed, the FRR feed and VPP's loader at a fraction of their idle rate.
+- **IRQs stay off VPP's cores.** A port re-opened by a speed change or a udapi reconfig gets its queue IRQs back on VPP's cores. They are now moved off again within 2 s, every time, not only at attach.
 
 ### Changes
 
@@ -47,6 +71,31 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 **Packaging**
 
 - The packaged unit runs the daemon at `Nice=-15`, the priority UniFi gives bgpd, zebra and ubios-udapi-server, from its first instruction; VPP inherits it. At nice 0 the route-ledger seed, the FRR feed and the sender of VPP's fresh load all ran at a fraction of their idle rate on a gateway booting into full traffic. Run `systemctl daemon-reload` after installing. ([#395](https://github.com/unredacted/packetframe/pull/395))
+
+### Known limitations
+
+- `dry-run until-seeded` holds for as long as the completeness authority does not attest. An authority that never publishes (FRR unreachable, `vtysh` failing) keeps it holding: safe, because the kernel forwards, but nothing moves to the fast path. The `fib-integrity` row says why. `dry-run off` and a reload end the hold.
+- With BMP and no completeness authority there is no `until-seeded`: BMP has no End-of-RIB, and the quiet period that stands in for one can fall mid-dump.
+- `steer-at-start` has not steered on the lab: its members are dark, so it reached only the refusal. The supervisor's tests cover the steer.
+- The lab could not reproduce the resolver's 73 s stall on edge1-mci1: its only next hop is always in the neighbour cache, and its seed takes 1.6 s. It showed that the resolver no longer waits for the seed.
+- The control-plane thread placement is still computed at attach only. A udapi re-spread while VPP runs can move IRQs onto those CPUs.
+- The limitations listed for 0.6.3 otherwise still apply.
+
+### Install and verify
+
+When upgrading, follow steps 1 to 3 above.
+
+```sh
+ARCH=$(dpkg --print-architecture)   # amd64 or arm64
+curl -LO "https://github.com/unredacted/packetframe/releases/download/v0.6.4/packetframe_0.6.4_${ARCH}.deb"
+curl -LO https://github.com/unredacted/packetframe/releases/download/v0.6.4/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+dpkg -i "packetframe_0.6.4_${ARCH}.deb" && systemctl daemon-reload
+```
+
+Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the `aarch64-unknown-linux-gnu` tarball and the arm64 .deb also carry the VPP sampler plugin.
+
+**Full changelog:** https://github.com/unredacted/packetframe/compare/v0.6.3...v0.6.4
 
 ## [0.6.3] - 2026-11-12
 
