@@ -5655,7 +5655,11 @@ VPP is in, the daemon checks every NIC again and moves any queue IRQ it
 finds on VPP's cores, writing nothing when nothing drifted. Moves are
 logged and recorded as `nic_irqs_moved` at most once per 5 minutes, so a
 port that renegotiates every 20 s does not fill the event log. An IRQ the
-kernel will not move is a warning, once per set of such IRQs.
+kernel will not move is a warning, once per set of such IRQs, and so is
+a check that cannot move one at all (an affinity write the kernel
+refused, or no CPU left to move to). When this loop replaces an adopted
+VPP, the guard stops excluding the cores the adopted one was observed
+on: the replacement runs on the derived map.
 
 `packetframe feasibility` reports a planned move as a non-blocking
 **WARN** on `vpp.irq-affinity`, not a pass: whether the kernel honours
@@ -5687,11 +5691,9 @@ cat /proc/irq/<N>/effective_affinity_list
 
 If the effective CPU does not change, the IRQ is not movable from
 userspace and VPP cannot share that host's cores with it. The affinity
-write does not persist across reboot; attach re-applies it every time.
-(udapi provision cycles and ring resizes can also re-spread affinities
-**while VPP is running** — attach only corrects them at attach, so a
-long-lived VPP can end up sharing a core with a re-spread IRQ until the
-next restart.)
+write does not persist across reboot; attach re-applies it every time,
+and while VPP runs the 2 s check above re-applies it after a udapi
+provision cycle or a ring resize re-spreads it.
 
 **A refusal no longer takes the fast-path down with it.** It used to.
 Any module that failed to come up made the loader unwind every module
@@ -5746,10 +5748,10 @@ on the primary (2026-08-14): a diagnostic ring resize on eth3 the
 previous evening put all seven of its queue IRQs back on the VPP
 cores, and the next attach refused fifteen times under systemd
 auto-restart until the operator re-pinned. Attach now re-pins at every
-attach, so a resize no longer blocks the next start — but a resize
-while VPP is running re-spreads its IRQs under a live VPP until the
-next restart, so a window harness that touches ring sizes should still
-restart packetframe (stop → `detach --all` → start) afterwards.
+attach, so a resize no longer blocks the next start, and a resize while
+VPP is running is repaired by the next 2 s check (`nic_irqs_moved`), so
+no restart is needed after one. Until that check, up to 2 s, the
+re-spread IRQs share VPP's cores.
 
 **The daemon's control-plane threads go where the interrupts are
 not.** Moving member IRQs off VPP's cores concentrates them, and the
@@ -5796,9 +5798,11 @@ INFO no CPU is free of NIC queue IRQs outside VPP's cores, cpu0 and the isolated
 
 It is not an error and never blocks attach. To give the control plane
 a CPU of its own there, free one of interrupts first: fewer queues
-(`ethtool -L`) or an IRQ layout that leaves a CPU empty. Like the IRQ
-moves, the placement is computed at attach only. A udapi re-spread
-while VPP runs is not followed until the next restart.
+(`ethtool -L`) or an IRQ layout that leaves a CPU empty. Unlike the IRQ
+moves, which the 2 s check keeps, this placement is computed at attach
+only: a udapi re-spread while VPP runs can move IRQs onto the
+control-plane CPUs, and the threads are not re-placed until the next
+restart.
 
 ## Constraints worth knowing before you debug
 

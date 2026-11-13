@@ -1676,6 +1676,7 @@ fn finish(
             irq_guard_inputs.1.clone(),
             irq_guard_inputs.2.clone(),
             irq_guard_inputs.3.clone(),
+            fence_inputs.1.clone(),
         ));
         #[cfg(target_os = "linux")]
         match crate::process::boot_id() {

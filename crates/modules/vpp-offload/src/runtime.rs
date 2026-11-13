@@ -5609,6 +5609,11 @@ impl Effects for EffectsView {
         }
         let p = VppProcess::spawn_with(&binary, &conf, c.diagnostics_dir.as_deref())
             .map_err(|e| format!("spawning VPP: {e}"))?;
+        // This VPP runs on the derived map; an adopted predecessor's
+        // observed cores are not VPP's any more.
+        if let Some(g) = c.irq_guard.as_mut() {
+            g.vpp_spawned();
+        }
 
         // The boot_id is not optional in spirit: `VppProcess::adopt`
         // refuses an identity without one (a `(pid, ticks)` pair is

@@ -47,6 +47,11 @@ pub struct IrqGuard {
     sysfs_cpu: PathBuf,
     /// Every CPU VPP is on: main and workers, derived or observed.
     vpp_cores: Vec<u16>,
+    /// The derived map alone: the cores a VPP this loop spawns runs on.
+    /// An adopted VPP observed elsewhere adds its own cores to
+    /// `vpp_cores`; once it is replaced they are VPP's no more
+    /// ([`Self::vpp_spawned`]).
+    spawn_cores: Vec<u16>,
     last_check: Option<Instant>,
     last_report: Option<Instant>,
     /// Moves since the last report: how many, and of which ports' IRQs.
@@ -55,6 +60,10 @@ pub struct IrqGuard {
     /// The IRQs last found stuck on VPP's cores, so the warning is said
     /// once per set, not every pass.
     stuck: BTreeSet<u32>,
+    /// The last error the check ran into (an affinity write the kernel
+    /// refused, no CPU left to move to), so it is warned once per error,
+    /// not every pass.
+    failing: Option<String>,
 }
 
 /// What one check did, for tests and the caller's log.
@@ -64,28 +73,68 @@ pub struct Checked {
     pub stuck: usize,
     /// Whether this check reported (logged and recorded) its moves.
     pub reported: bool,
+    /// Whether the check could not run or a move was refused.
+    pub failed: bool,
 }
 
 impl IrqGuard {
+    /// `vpp_cores`: every core VPP is on now, observed included.
+    /// `spawn_cores`: the derived map, what a spawned VPP runs on.
     pub fn new(
         sysfs_net: impl Into<PathBuf>,
         proc_irq: impl Into<PathBuf>,
         sysfs_cpu: impl Into<PathBuf>,
         vpp_cores: Vec<u16>,
+        spawn_cores: Vec<u16>,
     ) -> Self {
-        let mut vpp_cores = vpp_cores;
-        vpp_cores.sort_unstable();
-        vpp_cores.dedup();
+        let norm = |mut v: Vec<u16>| {
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let vpp_cores = norm(vpp_cores);
+        let spawn_cores = norm(spawn_cores);
         Self {
             sysfs_net: sysfs_net.into(),
             proc_irq: proc_irq.into(),
             sysfs_cpu: sysfs_cpu.into(),
             vpp_cores,
+            spawn_cores,
             last_check: None,
             last_report: None,
             pending_moves: 0,
             pending_ifaces: BTreeSet::new(),
             stuck: BTreeSet::new(),
+            failing: None,
+        }
+    }
+
+    /// This loop spawned VPP: it runs on the derived map, and the cores
+    /// an adopted predecessor was observed on are free again. Without
+    /// this the guard kept excluding them for good, and on a host where
+    /// that union left no CPU to move to it could move nothing.
+    pub fn vpp_spawned(&mut self) {
+        if self.vpp_cores != self.spawn_cores {
+            tracing::info!(
+                was = %cores::format_cpu_list(&self.vpp_cores),
+                now = %cores::format_cpu_list(&self.spawn_cores),
+                "IRQ guard: VPP respawned on its derived cores; guarding those"
+            );
+            self.vpp_cores = self.spawn_cores.clone();
+            self.stuck.clear();
+        }
+    }
+
+    /// Warn once per distinct error; a pass that runs clears it.
+    fn note_failure(&mut self, error: String) {
+        if self.failing.as_deref() != Some(error.as_str()) {
+            tracing::warn!(
+                cores = ?self.vpp_cores,
+                error = %error,
+                "the NIC IRQ check could not move IRQs off VPP's cores; any left there can \
+                 stall a worker into VPP's barrier timeout"
+            );
+            self.failing = Some(error);
         }
     }
 
@@ -103,7 +152,7 @@ impl IrqGuard {
         let ifaces = match cores::nic_ifaces(&self.sysfs_net) {
             Ok(i) => i,
             Err(e) => {
-                tracing::debug!(error = %e, "could not list the host's NICs for the IRQ check");
+                self.note_failure(format!("could not list the host's NICs: {e}"));
                 return Some(out);
             }
         };
@@ -116,10 +165,14 @@ impl IrqGuard {
         ) {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!(error = %e, "the IRQ check could not run");
+                // An affinity write the kernel refused lands here, before
+                // the `still` set below is built: warned here instead.
+                out.failed = true;
+                self.note_failure(e);
                 return Some(out);
             }
         };
+        self.failing = None;
         out.moved = clearing.moved.len();
         for m in &clearing.moved {
             tracing::debug!(iface = %m.iface, irq = m.irq, was = %m.was, now = %m.now, "moved a NIC queue IRQ back off VPP's cores");
@@ -233,6 +286,7 @@ mod tests {
                 self.irq(),
                 self.base.join("cpu"),
                 vec![15, 16, 17],
+                vec![15, 16, 17],
             )
         }
     }
@@ -293,6 +347,42 @@ mod tests {
             "the moves since the last report go out together"
         );
         assert_eq!(g.pending_moves, 0);
+    }
+
+    #[test]
+    fn a_respawned_vpp_frees_the_cores_its_adopted_predecessor_was_on() {
+        let fx = Fixture::new("respawn");
+        // Adopted on 3 as well as the derived 15-17.
+        let mut g = IrqGuard::new(
+            fx.net(),
+            fx.irq(),
+            fx.base.join("cpu"),
+            vec![3, 15, 16, 17],
+            vec![15, 16, 17],
+        );
+        fx.irq_on("eth1", 900, "3");
+        let t0 = Instant::now();
+        assert_eq!(g.tick(t0).unwrap().moved, 1, "3 is the adopted VPP's");
+        assert_ne!(fx.cpu_of(900), "3");
+
+        g.vpp_spawned();
+        fx.irq_on("eth1", 900, "3");
+        let c = g.tick(t0 + CHECK_EVERY).unwrap();
+        assert_eq!(c.moved, 0, "3 is no longer VPP's");
+        assert_eq!(fx.cpu_of(900), "3");
+    }
+
+    #[test]
+    fn a_check_that_cannot_move_says_so() {
+        let fx = Fixture::new("nocpu");
+        // Every online CPU but the isolated one is VPP's: nowhere to go.
+        let all: Vec<u16> = (0..=17).filter(|c| *c != 12).collect();
+        let mut g = IrqGuard::new(fx.net(), fx.irq(), fx.base.join("cpu"), all.clone(), all);
+        fx.irq_on("eth0", 800, "5");
+        let c = g.tick(Instant::now()).unwrap();
+        assert!(c.failed);
+        assert_eq!(fx.cpu_of(800), "5");
+        assert!(g.failing.is_some(), "warned, once");
     }
 
     #[test]
