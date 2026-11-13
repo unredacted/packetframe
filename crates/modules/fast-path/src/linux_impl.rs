@@ -513,6 +513,92 @@ pub(crate) fn set_cfg_flag(ebpf: &mut Ebpf, bit: u8, on: bool) -> ModuleResult<(
     set_cfg_flag_in(&mut arr, bit, on)
 }
 
+/// Set `CFG.dry_run` to what `gate` says once `decide` has run, both
+/// under [`CFG_WRITE_LOCK`], so the decision and the write cannot
+/// interleave with a reload's. Returns `decide`'s release, if any, which
+/// the caller reports only when the write landed.
+pub(crate) fn set_cfg_dry_run_in<T, F>(
+    arr: &mut Array<T, FpCfg>,
+    gate: &crate::dry_run_gate::DryRunGate,
+    decide: F,
+) -> ModuleResult<Option<crate::dry_run_gate::Released>>
+where
+    T: std::borrow::BorrowMut<aya::maps::MapData>,
+    F: FnOnce(&crate::dry_run_gate::DryRunGate) -> Option<crate::dry_run_gate::Released>,
+{
+    let _serialized = CFG_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // The decision is made before the write, and undone if the write
+    // fails: otherwise the row would say forwarding while `CFG` still
+    // holds, and the one-shot latch would refuse every later trigger.
+    let before = gate.checkpoint();
+    let released = decide(gate);
+    let written = arr
+        .get(&0, 0)
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG get: {e}")))
+        .and_then(|mut cur: FpCfg| {
+            cur.dry_run = gate.byte();
+            arr.set(0, cur, 0)
+                .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG set: {e}")))
+        });
+    match written {
+        Ok(()) => Ok(released),
+        Err(e) => {
+            gate.restore(before);
+            Err(e)
+        }
+    }
+}
+
+/// Open the pinned `CFG` map, for a thread other than the one holding
+/// the `Ebpf` (the programmer, which lets `dry-run until-seeded` go).
+pub(crate) fn open_cfg_pin(
+    bpffs_root: &std::path::Path,
+) -> ModuleResult<Array<aya::maps::MapData, FpCfg>> {
+    let data = aya::maps::MapData::from_pin(crate::pin::map_path(bpffs_root, "CFG"))
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG pin open: {e}")))?;
+    Array::try_from(aya::maps::Map::Array(data))
+        .map_err(|e| ModuleError::other(MODULE_NAME, format!("CFG Array::try_from: {e}")))
+}
+
+/// The `dry-run` health row, with what an `until-seeded` hold waits for
+/// read from the route-ledger state.
+pub fn dry_run_health(state: &ActiveState) -> Option<packetframe_common::module::SubsystemHealth> {
+    let waiting_on = {
+        let s = state
+            .ledger_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match &s.seed {
+            Some(seed) if seed.applied_at.is_none() => {
+                "the route-ledger seed to finish applying".to_string()
+            }
+            _ if state.dry_run_gate.repairs_owed() > 0 => format!(
+                "{} route(s) whose FIB install failed to be repaired (retried at the next \
+                 End-of-RIB GC, or by the prefix's next update)",
+                state.dry_run_gate.repairs_owed()
+            ),
+            Some(seed) if seed.attested && seed.failed == 0 => {
+                "the route-ledger seed's last step".to_string()
+            }
+            Some(_) if state.dry_run_gate.authority() => {
+                "the completeness authority to attest the mirror (the seed was not whole: \
+                 unattested, short or with failed installs; `fib-integrity` shows the count)"
+                    .to_string()
+            }
+            Some(_) => "the route source's first End-of-RIB (the seed was not whole: \
+                        unattested, short or with failed installs)"
+                .to_string(),
+            None if state.dry_run_gate.authority() => {
+                "the completeness authority to attest the mirror (a cold start; \
+                 `fib-integrity` shows the count)"
+                    .to_string()
+            }
+            None => "the route source's first End-of-RIB (a cold start)".to_string(),
+        }
+    };
+    state.dry_run_gate.health(&waiting_on)
+}
+
 /// Serializes every read-modify-write of `CFG[0]` in this process.
 ///
 /// `CFG[0]` is one struct, and every writer — the SIGHUP reconcile
@@ -773,6 +859,10 @@ pub struct ActiveState {
     /// What this start did with the route ledger, and the seed's
     /// progress since — shared with the control plane that applies it.
     pub ledger_status: crate::fib::route_ledger::SharedLedgerStatus,
+    /// `dry-run`'s mode and, for `until-seeded`, whether the mirror has
+    /// been whole yet ([`crate::dry_run_gate`]). Shared with the
+    /// programmer, which lets the hold go, and the reload.
+    pub dry_run_gate: crate::dry_run_gate::DryRunGate,
 }
 
 /// One XDP attach. `effective_mode` records what actually stuck in
@@ -900,6 +990,9 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         wan_egress: None,
         route_ledger: route_ledger_spec_from_cfg(cfg),
         ledger_status: crate::fib::route_ledger::shared_status(),
+        dry_run_gate: crate::dry_run_gate::DryRunGate::new(crate::dry_run_gate::DryRunMode::of(
+            &cfg.section.directives,
+        )),
     })
 }
 
@@ -1290,15 +1383,10 @@ pub(crate) fn fib_flags_from_forwarding_mode(
 }
 
 fn populate_cfg(ebpf: &mut Ebpf, mcfg: &ModuleConfig<'_>) -> ModuleResult<()> {
-    let dry_run = mcfg
-        .section
-        .directives
-        .iter()
-        .find_map(|d| match d {
-            ModuleDirective::DryRun(v) => Some(*v),
-            _ => None,
-        })
-        .unwrap_or(false);
+    // `until-seeded` starts held, like `on`; the programmer lets it go
+    // when the mirror is whole (`crate::dry_run_gate`).
+    let dry_run = crate::dry_run_gate::DryRunMode::of(&mcfg.section.directives)
+        != crate::dry_run_gate::DryRunMode::Off;
 
     // Option F forwarding-mode → CFG flag bits 3-4. See
     // fib_flags_from_forwarding_mode for the mapping.
@@ -2347,6 +2435,7 @@ pub fn attach(
                     .route_source_spec
                     .as_ref()
                     .map(|s| s.ledger_identity()),
+                dry_run: Some(state.dry_run_gate.clone()),
             },
         )
         .map_err(|e| {
@@ -4431,6 +4520,9 @@ mod tests {
             wan_egress: None,
             route_ledger: packetframe_common::config::RouteLedgerSpec::default(),
             ledger_status: crate::fib::route_ledger::shared_status(),
+            dry_run_gate: crate::dry_run_gate::DryRunGate::new(
+                crate::dry_run_gate::DryRunMode::Off,
+            ),
         };
 
         let bridge_idx = if_nametoindex(BRIDGE).unwrap();

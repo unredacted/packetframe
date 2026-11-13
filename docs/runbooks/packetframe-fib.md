@@ -1300,6 +1300,67 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
   1.35M routes; writing it ~10 ms; reading, removing and validating it
   ~70 ms; seeding 1.35M routes into the real BPF maps 1.55 s.
 
+### dry-run until-seeded
+
+`dry-run until-seeded` passes every packet to the kernel, as `dry-run on`
+does, until the route mirror is known whole, then forwards, as `dry-run
+off` does, by itself. It replaces the step of switching dry-run off by
+hand once the seed has applied (1:43 under load on edge1-mci1 after the
+6.0.17 upgrade, 2026-11-12). It needs `forwarding-mode packetframe-fib`
+(or `compare`) and a `route-source`, and the config check refuses it
+otherwise: without them nothing could tell when the mirror is whole.
+With `route-source bmp` it also needs a completeness authority
+(vpp-offload configured, and an `integrity-authority` other than `none`).
+BMP has no End-of-RIB, and the five quiet seconds that stand in for one
+can fall between two batches of a slow dump.
+
+**When it lets go.** Once per process, at the first of:
+- `seed-whole`: a route-ledger seed applied every advertisement it holds,
+  with no failed install, from a ledger attested by this daemon's
+  completeness authority. The seed went in longest prefix first, so the
+  table was correct by longest match while it applied; this is the point
+  it is also complete.
+- `authority-attested`: otherwise (a cold start, or a seed that was not
+  whole: unattested, short, or with failed installs), with a completeness
+  authority: the first time it attests the mirror. That is the routing
+  daemon's own table and the mirror agreeing within the steering drift
+  bound, with nothing loading, as in the `fib-integrity` row. Not the
+  route source's End-of-RIB: on the lab rig a cold start's first
+  End-of-RIB came with the mirror at 133,699 of FRR's 161,297 routes,
+  because FRR was still loading its upstream.
+- `initiation-complete`: with no authority (no vpp-offload, or
+  `integrity-authority none`), the route source's first End-of-RIB and
+  the GC after it. That is the best a daemon with nothing to compare
+  against can do.
+
+None of these lets go while a route is owed a repair: an install or
+recompute that failed (a full ECMP pool, a map write error) leaves the
+mirror holding a route the FIB does not. The failed route is retried at
+the next End-of-RIB GC and by the prefix's next update, and the hold
+ends at the first tick after the last one is repaired.
+
+The release writes `CFG.dry_run = 0` and records `dry_run_released`
+(`trigger`, `held_ms`). `held_ms` counts from when `until-seeded` began:
+the start, or the reload that switched to it. If that write fails, the
+gate stays holding and the release is retried on the next tick.
+
+**What a reload does.** A reload of the same file never holds again once
+the mirror has been whole. An explicit `dry-run on` or `off` wins, as it
+always has. Switching back to `until-seeded` after the mirror was whole
+forwards at once.
+
+**What status shows.** The `dry-run` row, present for `on` and
+`until-seeded`:
+- `until-seeded: holding for Ns, every packet passes to the kernel;
+  waiting for …`, naming the seed still applying, routes owed a repair,
+  the completeness authority's attestation, or (with no authority) the
+  route source's first End-of-RIB;
+- `until-seeded: released at <UTC> (<trigger>) after Ns; forwarding`.
+
+Both are Healthy: a hold is designed. A hold that outlives the route
+source's load is the route source's problem, and the `route-ledger` and
+`fib-integrity` rows say what that is.
+
 ### What the next start does with it
 
 1. **Consumes it**, in every forwarding mode: read, then removed,

@@ -585,6 +585,12 @@ pub enum ModuleDirective {
         line: usize,
     },
     DryRun(bool),
+    /// `dry-run until-seeded`: pass every packet to the kernel, as `on`,
+    /// until the route mirror is known whole (a route-ledger seed applied
+    /// whole, or the route source's first End-of-RIB), then forward, as
+    /// `off`, without a reload. Needs `forwarding-mode packetframe-fib`
+    /// (or `compare`) and a `route-source`.
+    DryRunUntilSeeded,
     /// `fib-cache on|off` — destination cache in front of the
     /// PacketFrame FIB LPM lookups (default off; an experiment with an explicit
     /// kill criterion, see docs). Caches the FibValue keyed on the
@@ -2168,6 +2174,67 @@ impl Config {
         let Some(fp) = self.modules.iter().find(|m| m.name == "fast-path") else {
             return Ok(());
         };
+
+        // `dry-run until-seeded` lets go when the route mirror is whole,
+        // which only a programmer fed by a route source can tell. Under
+        // kernel-fib no programmer runs, and with no route source no
+        // End-of-RIB ever comes: the hold would never end.
+        let until_seeded = fp.directives.iter().find_map(|d| match d {
+            ModuleDirective::DryRun(_) => Some(false),
+            ModuleDirective::DryRunUntilSeeded => Some(true),
+            _ => None,
+        }) == Some(true);
+        if until_seeded {
+            let mode = fp.directives.iter().find_map(|d| match d {
+                ModuleDirective::ForwardingMode(f) => Some(*f),
+                _ => None,
+            });
+            let fib = matches!(
+                mode,
+                Some(ForwardingMode::PacketframeFib | ForwardingMode::Compare)
+            );
+            let source = fp
+                .directives
+                .iter()
+                .any(|d| matches!(d, ModuleDirective::RouteSource(_)));
+            if !fib || !source {
+                return Err(ConfigError::parse(
+                    0,
+                    "`dry-run until-seeded` needs `forwarding-mode packetframe-fib` (or \
+                     compare) and a `route-source bgp|bmp`: it lets go when the route mirror \
+                     is whole, which nothing else can tell, so without them it would hold \
+                     forever. Use `dry-run on` or `off` instead",
+                ));
+            }
+            // Without a completeness authority the release is the route
+            // source's first End-of-RIB. BMP has none: its stand-in is five
+            // seconds of quiet, which can fall between two batches of a
+            // slow dump, and the release is one-shot, so it would forward a
+            // partial table for good. With BMP, only an authority may say
+            // the mirror is whole: vpp-offload's completeness handle and an
+            // integrity authority that is not `none` (absent is birdc).
+            let bmp = fp
+                .directives
+                .iter()
+                .any(|d| matches!(d, ModuleDirective::RouteSource(RouteSourceSpec::Bmp { .. })));
+            let authority = self.modules.iter().any(|m| m.name == "vpp-offload")
+                && !fp.directives.iter().any(|d| {
+                    matches!(
+                        d,
+                        ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::None)
+                    )
+                });
+            if bmp && !authority {
+                return Err(ConfigError::parse(
+                    0,
+                    "`dry-run until-seeded` with `route-source bmp` needs a completeness \
+                     authority (vpp-offload configured, and an `integrity-authority` other \
+                     than `none`): BMP has no End-of-RIB, and the quiet period that stands in \
+                     for one can fall mid-dump, so it cannot be what lets the hold go. Use \
+                     `dry-run on` and switch it off by hand, or `route-source bgp`",
+                ));
+            }
+        }
 
         let frr = fp.directives.iter().find_map(|d| match d {
             ModuleDirective::IntegrityAuthority(IntegrityAuthoritySpec::Frr {
@@ -4622,17 +4689,18 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
         "dry-run" => {
             let v = rest
                 .next()
-                .ok_or_else(|| ConfigError::parse(line, "dry-run requires on|off"))?;
+                .ok_or_else(|| ConfigError::parse(line, "dry-run requires on|off|until-seeded"))?;
             if rest.next().is_some() {
                 return Err(ConfigError::parse(line, "dry-run takes one argument"));
             }
             let on = match v {
                 "on" => true,
                 "off" => false,
+                "until-seeded" => return Ok(ModuleDirective::DryRunUntilSeeded),
                 other => {
                     return Err(ConfigError::parse(
                         line,
-                        format!("dry-run expects on|off, got `{other}`"),
+                        format!("dry-run expects on|off|until-seeded, got `{other}`"),
                     ))
                 }
             };
@@ -8890,6 +8958,72 @@ module vpp-offload
             }
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dry_run_until_seeded_parses_and_needs_a_fib_and_a_route_source() {
+        let ok = "\
+module fast-path
+  attach eth2 generic
+  forwarding-mode packetframe-fib
+  route-source bgp 127.0.0.1:1179 local-as 65000 peer-as 65000
+  dry-run until-seeded
+";
+        let cfg = Config::parse(ok).unwrap();
+        assert!(cfg.modules[0]
+            .directives
+            .contains(&ModuleDirective::DryRunUntilSeeded));
+        cfg.validate_fast_path()
+            .expect("packetframe-fib with a route source");
+
+        for bad in [
+            "module fast-path\n  attach eth2 generic\n  dry-run until-seeded\n",
+            "module fast-path\n  attach eth2 generic\n  forwarding-mode packetframe-fib\n  dry-run until-seeded\n",
+        ] {
+            let e = Config::parse(bad).unwrap().validate_fast_path().unwrap_err();
+            assert!(format!("{e}").contains("dry-run until-seeded"), "{e}");
+        }
+        // An explicit `on` or `off` needs neither.
+        Config::parse("module fast-path\n  attach eth2 generic\n  dry-run on\n")
+            .unwrap()
+            .validate_fast_path()
+            .unwrap();
+    }
+
+    /// BMP has no End-of-RIB, only a quiet period that can fall mid-dump,
+    /// so with BMP only a completeness authority may let the hold go.
+    #[test]
+    fn dry_run_until_seeded_with_bmp_needs_a_completeness_authority() {
+        let fp = "\
+module fast-path
+  attach eth2 generic
+  allow-prefix 203.0.113.0/24
+  forwarding-mode packetframe-fib
+  route-source bmp 127.0.0.1:1179
+  dry-run until-seeded
+";
+        let vpp = "
+module vpp-offload
+  loopback-address 198.51.100.1/32
+  port eth2 cores 1 steer off
+";
+        let e = Config::parse(fp).unwrap().validate_fast_path().unwrap_err();
+        assert!(format!("{e}").contains("route-source bmp"), "{e}");
+
+        let none = fp.replace(
+            "  dry-run until-seeded\n",
+            "  integrity-authority none\n  dry-run until-seeded\n",
+        );
+        let e = Config::parse(&format!("{none}{vpp}"))
+            .unwrap()
+            .validate_fast_path()
+            .unwrap_err();
+        assert!(format!("{e}").contains("route-source bmp"), "{e}");
+
+        Config::parse(&format!("{fp}{vpp}"))
+            .unwrap()
+            .validate_fast_path()
+            .expect("vpp-offload with the default authority attests");
     }
 
     #[test]

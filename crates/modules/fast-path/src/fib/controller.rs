@@ -275,6 +275,9 @@ pub struct LedgerWiring {
     pub status: SharedLedgerStatus,
     /// See [`RouteController::preserve_route_ledger`].
     pub identity: Option<String>,
+    /// `dry-run`'s gate: the programmer lets an `until-seeded` hold go when
+    /// the mirror is whole ([`crate::dry_run_gate`]). `None` in harnesses.
+    pub dry_run: Option<crate::dry_run_gate::DryRunGate>,
 }
 
 /// What a preserving stop did with the ledger, for the caller's log and
@@ -365,6 +368,7 @@ impl RouteController {
             seed,
             status: ledger_status,
             identity: ledger_identity,
+            dry_run,
         } = ledger;
         let RouteFeed {
             source: route_source,
@@ -445,6 +449,25 @@ impl RouteController {
             feed_session.clone(),
             integrity_authority.attestation_scope(),
         );
+        // The gate and its own handle on the pinned CFG map. Without the
+        // handle an `until-seeded` hold would never end, so a failure to
+        // open it is said loudly; the reload can still let it go.
+        if let Some(gate) = dry_run {
+            match crate::linux_impl::open_cfg_pin(bpffs_root) {
+                // `integrity-authority none` runs no checker, so nothing
+                // would ever attest: the End-of-RIB decides there.
+                Ok(cfg) => programmer.set_dry_run_gate(
+                    gate,
+                    cfg,
+                    !matches!(integrity_authority, IntegrityAuthoritySpec::None),
+                ),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "dry-run: cannot open the CFG map for the programmer; an `until-seeded` \
+                     hold will not end on its own (a reload with `dry-run off` ends it)"
+                ),
+            }
+        }
         if let Some(seed) = seed {
             programmer.set_seed(seed);
             // Told to the second tier before the route source can
