@@ -7,7 +7,7 @@
 //! kernel the default hugepage size is 512 MiB, so the same file is a
 //! 512 GiB reservation — on the 64 GB reference EFG the first reboot after
 //! install reserved essentially all RAM before userspace came up and
-//! recovery required a factory reset (2026-08-21, edge1-mci1-net). Every
+//! recovery required a factory reset (2026-08-21, the reference deployment). Every
 //! install-time check passed; only a boot could reveal it. This probe
 //! prices the EFFECTIVE boot-time `vm.nr_hugepages` at the RUNNING
 //! kernel's default hugepage size so feasibility reveals it without the

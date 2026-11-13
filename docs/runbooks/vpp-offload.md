@@ -2249,8 +2249,8 @@ do IPSec, so the kernel path is these flows' permanent, correct home:
 one `steer-exempt` per tunnel-bound prefix.
 
 Found the hard way on the reference primary (w26, 2026-08-16): the
-inter-site IPSec (vti64) carried ord1's prefix plus seven host routes
-INSIDE mci1's own service /24, and every steered window since w23 had
+inter-site IPSec (vti64) carried the other site's prefix plus seven host routes
+INSIDE the local site's own service /24, and every steered window since w23 had
 been silently dropping ~50+ pps of real inter-site traffic — a
 ONE-WAY blackhole (the reverse direction arrives as ESP on unsteered
 transit ports and kept working), invisible to every watchdog, visible
@@ -4475,7 +4475,7 @@ Be precise about this when reasoning about an incident.
 | Third steer (bridge MAC as the member's PRIMARY) | VPP forwarded **~500M packets in 27 min**, split by best path (266M eth3, 236k eth2), zero loop, no drops on the forwarding path — **but ~300 kpps arrived from ATTACH, with the lever off** | 2026-08-14 w22. Forwarding quality proven; staging isolation broken. The primary MAC is a hardware filter on this NIC, so it must stay the port's own — acceptance belongs in secondary addresses. Undeclared trunk VLANs (`unknown vlan` 180k) were blackholed for the window. |
 | Fourth steer (secondary MAC + `.254` loopback — the clean pass) | Leak gate ~50 pps noise (lever off); 95.9M rx / 95.8M tx at +300 s; ARP replies **zero**; steered minutes ~0.1% remote loss vs 4–7%/min on the unsteered rung-0 stretch of the same window | 2026-08-14 w23. Rung 1 validated; **the steered path beat the XDP path by >10× under coexistence**. Residual: 110,917 locally-terminating packets blackholed in 5 min — the number `steer-exempt` exists to zero. |
 | Fifth steer (exemptions live — w24) and hours-scale soaks (w25/w26) | w24: `rules-installed=6`, svc-pinger survived the steer for the first time, steered minutes ≈ zero remote loss. w25: 105 min steered, heap flat at 844.6M/2.5G across every snapshot, one daemon pid, SIGHUP auto-rollback exercised live. w26: full 2 h + the B1 delivery gate (`.7/32` via `octeon4/0.1337` before any steer) | 2026-08-14→16. The w25 SSH drop proved the trap rollback unattended; harnesses run detached since. |
-| The default-route drop counter under steering — decomposed by destination profile | Pre-exemption ~365 pps; **~50+ pps of it was live inter-site traffic** (vti64-bound: ord1's /24 + seven host routes inside the local /24), silently one-way-blackholed in EVERY steered window w23→w26; the remaining **~155 pps is the junk floor** (misdirected VPN/overlay to RFC1918/CGNAT, SSDP, bogons — dies on the kernel path too, upstream and invisibly) | 2026-08-16/17 w26/w26b. Exemptions zeroed the real-traffic share: w26b held 153–170 pps flat for 30 min with 14 rules, tcpdump proofs 5/5 on eth2 (inter-site) and 5/5 on vti64 (tunnel /32s) WHILE steered. The floor is expected; alarm on rate CHANGE. |
+| The default-route drop counter under steering — decomposed by destination profile | Pre-exemption ~365 pps; **~50+ pps of it was live inter-site traffic** (vti64-bound: the other site's /24 + seven host routes inside the local /24), silently one-way-blackholed in EVERY steered window w23→w26; the remaining **~155 pps is the junk floor** (misdirected VPN/overlay to RFC1918/CGNAT, SSDP, bogons — dies on the kernel path too, upstream and invisibly) | 2026-08-16/17 w26/w26b. Exemptions zeroed the real-traffic share: w26b held 153–170 pps flat for 30 min with 14 rules, tcpdump proofs 5/5 on eth2 (inter-site) and 5/5 on vti64 (tunnel /32s) WHILE steered. The floor is expected; alarm on rate CHANGE. |
 | Idle draw with VPP polling one worker | 33.56 W, 38/49/42 °C, fan 3780 RPM | 2026-08-11 shadow, chassis total — NOT a VPP attribution, no VPP-off baseline was taken. |
 | VPP software forwarding cost, one worker | **123 ns/packet** (~8.1 Mpps per core); the same at 64, 750 and 1400 B | 2026-09-28, dev rig (same SoC, 5.15 vendor kernel and VPP 26.06 octeon build as the reference deployment). `packet-generator` into `ip4-input`, 14,643 /24 routes, full 256-packet vectors, active nodes only. **Excludes NIC receive and transmit.** Method: [Per-core forwarding capacity](#per-core-forwarding-capacity-packet-generator-method). |
 | Per-node split of the 123 ns | ip4-input **27**, ip4-lookup **27** (14.6k routes), ip4-rewrite **35**, interface output **12**, generator-interface tx **23** (stands in for the NIC) | Same run. Each node is rounded, so the parts sum to 124. |
@@ -5569,7 +5569,7 @@ daemon's own is `system.slice` under the packaged unit, `user.slice` for
 `sudo packetframe run` from a login, or whatever `Slice=` names. On a UniFi
 gateway that is `os.slice`, `uos.slice`, `app.slice`, `user.slice`,
 `init.scope`, and the cgroups UniFi makes for itself at the root (`bgpd`,
-`zebra`, `dpi`, `udm-v2`, …). On edge1-mci1 (main 11, workers 13–17,
+`zebra`, `dpi`, `udm-v2`, …). On the reference deployment (main 11, workers 13–17,
 cpu12 isolated) they keep 0–10 and 12. A top-level cgroup that appears
 during the load is fenced too, one whose CPUs are changed back is fenced
 again, and one removed and recreated under the same name (a restarted

@@ -1950,7 +1950,7 @@ pub fn attach(
     // after enough attach/detach cycles the driver's queue sizing
     // drifts and the page allocator's freelist gets a NULL write,
     // producing the `get_page_from_freelist` NULL deref crash signature
-    // seen on edge1-mci1-net 2026-04-22 (SPEC §11.1(c)). This
+    // seen on the reference deployment 2026-04-22 (SPEC §11.1(c)). This
     // preprocessor runs *before* `try_attach_with_fallback` so we
     // don't leak even once.
     //

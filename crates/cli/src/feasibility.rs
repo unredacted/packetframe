@@ -638,8 +638,8 @@ pub fn probe_and_render(inputs: &FeasibilityInputs, human: bool) -> Rendered {
     // a verdict required exactly when its attach refuses the same
     // condition — and their names are remembered so the summary can
     // say "vpp-offload attach BLOCKED" instead of a bare FAIL (or,
-    // worse, the bare PASS an operator on edge1-mci1-net read over a
-    // failing `vpp.irq-affinity` line on 2026-08-21).
+    // worse, the bare PASS an operator on the reference deployment read
+    // over a failing `vpp.irq-affinity` line on 2026-08-21).
     // Read before the graft consumes `vpp`: the boot-sysctl promotion
     // below needs it whether or not this binary carries the module.
     let vpp_configured = !vpp.ports.is_empty();
@@ -961,7 +961,7 @@ fn print_human(report: &FeasibilityReport, vpp_cap_names: &[String]) {
 /// fast-path but would refuse the vpp-offload attach must say exactly
 /// that. The previous summary said "PASS, all required capabilities
 /// present." over a failing (then-advisory) `vpp.irq-affinity` on
-/// edge1-mci1-net (2026-08-21), and the operator met the refusal at
+/// the reference deployment (2026-08-21), and the operator met the refusal at
 /// attach instead of before the window.
 ///
 /// `vpp_cap_names` is the set of capability names grafted from
@@ -1344,7 +1344,7 @@ module flow-export
         );
     }
 
-    /// The edge1-mci1-net case (2026-08-21): every core capability
+    /// The reference deployment's case (2026-08-21): every core capability
     /// passes, a required vpp gate fails. The summary must not contain
     /// the sentence an operator reads as "the box is ready".
     #[test]

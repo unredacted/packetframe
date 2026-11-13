@@ -1302,13 +1302,14 @@ the route mirror was not preserved; the next start loads it cold ... reason=...
 
 ### dry-run until-seeded
 
-`dry-run until-seeded` passes every packet to the kernel, as `dry-run on`
-does, until the route mirror is known whole, then forwards, as `dry-run
-off` does, by itself. It replaces the step of switching dry-run off by
-hand once the seed has applied (1:43 under load on edge1-mci1 after the
-6.0.17 upgrade, 2026-11-12). It needs `forwarding-mode packetframe-fib`
-(or `compare`) and a `route-source`, and the config check refuses it
-otherwise: without them nothing could tell when the mirror is whole.
+`dry-run until-seeded` passes every packet to the kernel, as `dry-run
+on` does, until the route mirror is known whole, then forwards, as
+`dry-run off` does, by itself. It replaces the step of switching dry-run
+off by hand once the seed has applied (1:43 under load on the reference
+deployment after the 6.0.17 upgrade, 2026-11-12). It needs
+`forwarding-mode packetframe-fib` (or `compare`) and a `route-source`,
+and the config check refuses it otherwise: without them nothing could
+tell when the mirror is whole.
 With `route-source bmp` it also needs a completeness authority
 (vpp-offload configured, and an `integrity-authority` other than `none`).
 BMP has no End-of-RIB, and the five quiet seconds that stand in for one
@@ -1407,9 +1408,9 @@ source's load is the route source's problem, and the `route-ledger` and
    instant a packet matches its true route or misses and goes to the
    kernel. A covering route, or a transit's default, never carries
    traffic meant for a more-specific route still waiting its turn. That
-   window was the whole seed: 73 s under load on edge1-mci1
-   (2026-11-12). The order is taken at read, so a record any version
-   wrote seeds this way, and the record's format is unchanged.
+   window was the whole seed: 73 s under load on the reference
+   deployment (2026-11-12). The order is taken at read, so a record any
+   version wrote seeds this way, and the record's format is unchanged.
 4. **Lets the live session reconcile it.** A re-advertisement of an
    identical route marks it seen and changes nothing else: no FIB
    write, no destination-cache flush, no route delta to VPP. A route

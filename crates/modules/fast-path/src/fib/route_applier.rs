@@ -11,8 +11,8 @@
 //! may overtake either. The resolver used to await each one, so the first
 //! such route at start parked it behind the whole seed. It answered no
 //! resolve request meanwhile, and every next hop the seed registered sat
-//! unresolved until the seed ended. On edge1-mci1 after the 6.0.17
-//! upgrade (2026-11-12) that was 73 s, with 1.1M routes behind one
+//! unresolved until the seed ended. On the reference deployment after the
+//! 6.0.17 upgrade (2026-11-12) that was 73 s, with 1.1M routes behind one
 //! transit next hop the resolver never got to (`nexthop_resolve_slow`,
 //! `not-served`).
 //!

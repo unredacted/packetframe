@@ -702,7 +702,7 @@ mod tests {
     const MODULE: &str = "fast-path";
 
     fn ip(last: u8) -> IpAddr {
-        IpAddr::V4(Ipv4Addr::new(194, 110, 60, last))
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, last))
     }
 
     fn record(ev: Event) -> serde_json::Map<String, serde_json::Value> {
@@ -987,7 +987,7 @@ mod tests {
         assert_eq!(rec.level, packetframe_common::events::Level::Warn);
         let f = rec.fields;
         for (k, v) in [
-            ("nexthop", serde_json::json!("194.110.60.50")),
+            ("nexthop", serde_json::json!("203.0.113.50")),
             ("routes", serde_json::json!(486_318)),
             ("cause", serde_json::json!("seed")),
             ("waited_secs", serde_json::json!(31)),
@@ -1009,7 +1009,7 @@ mod tests {
             assert_eq!(f.get(k), Some(&v), "{k}");
         }
         let detail = f["detail"].as_str().unwrap();
-        assert!(detail.contains("194.110.60.50 (486318 routes) unresolved for 31 s"));
+        assert!(detail.contains("203.0.113.50 (486318 routes) unresolved for 31 s"));
         assert!(detail.contains("got no answer (5 NUD_FAILED)"), "{detail}");
     }
 
@@ -1069,7 +1069,7 @@ mod tests {
         let detail = rec.fields["detail"].as_str().unwrap();
         assert!(
             detail
-                .starts_with("next hop 194.110.60.50 (486318 routes) resolved on eth3 after 301 s"),
+                .starts_with("next hop 203.0.113.50 (486318 routes) resolved on eth3 after 301 s"),
             "{detail}"
         );
     }

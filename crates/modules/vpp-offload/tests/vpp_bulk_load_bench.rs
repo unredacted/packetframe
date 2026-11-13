@@ -2,7 +2,7 @@
 //!
 //! What a fresh VPP's first load costs is the longest step between a
 //! router's start and VPP steering, and on a box whose cores are already
-//! busy it is several times its idle figure (11-05 on edge1-mci1: about
+//! busy it is several times its idle figure (11-05 on the reference deployment: about
 //! 3.5 min under load against about 65 s idle). This measures the step
 //! on its own: the production [`Drainer`] and [`Transport`] pushing
 //! `ip_route_add_del` at a VPP, timed, with VPP's own barrier trace read

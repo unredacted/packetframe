@@ -36,12 +36,13 @@ Group=root
 # bgpd's priority, from the first instruction. On UniFi, bgpd, zebra and
 # ubios-udapi-server run at nice -15, and a gateway that boots into full
 # traffic keeps every core busy; at nice 0 this daemon gets a fraction of
-# the CPU it needs exactly when it has the most to do. On edge1-mci1 the
-# route-ledger seed took 73 s under load against ~18 s idle (2026-11-12),
-# the feed ran ~1,100 routes/s at 0 against ~3,300 at -15 (2026-10-30),
-# and VPP's fresh load, fed by this daemon, ran at a quarter of its idle
-# rate. The playbook reniced the daemon to -15 only once it was up,
-# after the seed had begun. VPP is this daemon's child and inherits it.
+# the CPU it needs exactly when it has the most to do. On the reference
+# deployment the route-ledger seed took 73 s under load against ~18 s idle
+# (2026-11-12), the feed ran ~1,100 routes/s at 0 against ~3,300 at -15
+# (2026-10-30), and VPP's fresh load, fed by this daemon, ran at a quarter
+# of its idle rate. The upgrade procedure reniced the daemon to -15 only
+# once it was up, after the seed had begun. VPP is this daemon's child and
+# inherits it.
 Nice=-15
 StateDirectory=packetframe
 StateDirectoryMode=0750

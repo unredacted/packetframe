@@ -687,12 +687,12 @@ impl RouteLedger {
     ///
     /// Why not record order: a seed writes into the live FIB that XDP
     /// reads, a chunk at a time, and the record holds routes in the
-    /// writer's hash-map order. A covering route could then forward
-    /// traffic meant for a more-specific one still waiting its turn. On
-    /// edge1-mci1 a seed took 73 s under load (2026-11-12). Longest
-    /// first, every route in the FIB has every more-specific route under
-    /// it in already, so a partial seed is correct by longest match at
-    /// every instant: a packet matches its true route, or misses and
+    /// writer's hash-map order. A covering route could then forward traffic
+    /// meant for a more-specific one still waiting its turn. On the
+    /// reference deployment a seed took 73 s under load (2026-11-12).
+    /// Longest first, every route in the FIB has every more-specific route
+    /// under it in already, so a partial seed is correct by longest match
+    /// at every instant: a packet matches its true route, or misses and
     /// goes to the kernel. Ordered at read, so a record any earlier
     /// version wrote seeds this way too.
     pub fn seed_cursor(&self) -> SeedCursor {
