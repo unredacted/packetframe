@@ -3157,7 +3157,7 @@ pub fn neigh_get_request(ip: IpAddr, oif: u32) -> NetlinkMessage<RouteNetlinkMes
 /// NUD_NONE` there is not merely useless: it replaces the kernel's
 /// implicit NUD_NOARP handling for that key on the loopback device,
 /// queueing all subsequent local delivery for that address behind an
-/// ARP that can never resolve (2026-08-20 edge1-mci1 incident — the
+/// ARP that can never resolve (2026-08-20 reference-deployment incident — the
 /// FRR feed carries nexthop 0.0.0.0 / update-source for
 /// self-originated routes, and each probe of one poisoned `lo`).
 async fn lookup_oif(

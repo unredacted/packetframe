@@ -11,7 +11,7 @@
 //! that boots into full traffic every core is busy, and the UniFi daemons
 //! that keep it busy (`ubios-udapi-server` runs at nice -15, VPP's own
 //! priority) are scheduled wherever they like, VPP's cores included. So
-//! edge1-mci1's fresh load took about 3.5 min after an upgrade, against
+//! the reference deployment's fresh load took about 3.5 min after an upgrade, against
 //! about 35 s idle. RT priority would fix it and is not available: the
 //! service's cgroup has no RT budget (`chrt` returns EPERM).
 //!
@@ -78,7 +78,7 @@ use crate::cores::{format_cpu_list, parse_cpu_list};
 pub const RECORD_FILE: &str = "vpp-core-fence.json";
 
 /// The longest a fence is held. A fresh load on a saturated gateway took
-/// about 3.5 min unfenced (edge1-mci1, 2026-11-05); past this the fence is
+/// about 3.5 min unfenced (the reference deployment, 2026-11-05); past this the fence is
 /// costing the box more than it can be buying VPP.
 pub const FENCE_MAX: Duration = Duration::from_secs(600);
 

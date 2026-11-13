@@ -584,7 +584,7 @@ mod tests {
     /// prefix count, while packetframe's mirror holds one entry per
     /// prefix.
     ///
-    /// Captured from edge1-mci1-net on 2026-08-12, where the checker
+    /// Captured from the reference deployment on 2026-08-12, where the checker
     /// had been comparing 2,594,691 against a 1,303,120-entry mirror
     /// and logging a 49.78% drift every five minutes — an alarm pinned
     /// at half by construction, unable to detect any real drift, and

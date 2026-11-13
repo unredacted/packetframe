@@ -9,8 +9,8 @@
 //! config declares the module, and each one probes a condition
 //! `bring_up`/`acquire` refuses or cannot survive — so they are
 //! `required`, and a FAIL is an attach refusal the operator has not
-//! hit yet. They were advisory once, and an operator on edge1-mci1-net
-//! (2026-08-21) read the summary's "PASS" over a failing
+//! hit yet. They were advisory once, and an operator on the reference
+//! deployment (2026-08-21) read the summary's "PASS" over a failing
 //! `vpp.irq-affinity` line and met the refusal at attach instead. The
 //! one exception is per-verdict: steering-budget verdicts gate only
 //! when a port is configured `steer on`, because attach queries and
@@ -1427,7 +1427,7 @@ mod steering_probe_tests {
     ///
     /// Each one probes a condition attach refuses (`bring_up`'s named
     /// checks) or cannot survive (acquire's vfio bind, VF creation).
-    /// They were advisory once, and on edge1-mci1-net (2026-08-21) an
+    /// They were advisory once, and on the reference deployment (2026-08-21) an
     /// operator read the summary's "PASS" over a failing
     /// `vpp.irq-affinity` line and met the refusal at attach — so the
     /// invariant is asserted on the flag alone, independent of what

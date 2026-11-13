@@ -7,8 +7,8 @@ go wrong.
 ## The problem
 
 After a reboot or upgrade, a fresh VPP's first route load is the longest
-step between PacketFrame's start and VPP steering. On edge1-mci1 (11-05)
-it took about 3.5 min under load, against about 65 s idle. During that time
+step between PacketFrame's start and VPP steering. On the reference deployment
+(11-05) it took about 3.5 min under load, against about 65 s idle. During that time
 every packet goes through the eBPF tier. On that box the tier runs in
 xdpgeneric mode, because rvu-nicpf on kernel 5.15 has no native XDP, so it
 saves little CPU and every core stays near 100%.
@@ -56,7 +56,7 @@ prefix length the load has reached:
 
 ### 1. A route that is advertised but not installed (unresolvable)
 
-This is the 11-05 case, with 486k routes via 194.110.60.50 unresolvable for
+This is the 11-05 case, with 486k routes via one transit next hop unresolvable for
 minutes.
 - Today such a route is simply absent from VPP.
 - Under early steering, its traffic would match a **shorter loaded route**
@@ -84,7 +84,7 @@ The benefit begins only when the loaded subset covers most of the traffic.
 That needs a coverage gate, for example "the loaded subset matches at least
 X% of the flow sampler's recent destinations". Its estimate is noisy
 straight after a reboot, when the sampler has little history. Without
-traffic data from mci1 the size of the window is unknown. It may be a small
+traffic data from the reference deployment the size of the window is unknown. It may be a small
 fraction of the load time.
 
 ### 3. Handed-back traffic bypasses the vendor firewall
@@ -132,7 +132,7 @@ The hand-back is VPP af_packet → veth → kernel stack forwarding:
   even xdpgeneric.
 - af_packet in VPP is one queue on one worker.
 
-At mci1's packet rates this path would saturate a core well before the
+At the reference deployment's packet rates this path would saturate a core well before the
 eBPF tier does. Early steering would then have to stop at the hand-back
 path's own limit. That limit is unmeasured.
 
@@ -157,7 +157,7 @@ gain. Those are traffic properties, not table properties.
 
 ## Recommendation
 
-**Not yet.** What the load costs is now measured (efg1-lab1-net,
+**Not yet.** What the load costs is now measured (the lab,
 2026-11-12, [#388](https://github.com/unredacted/packetframe/pull/388)):
 
 - **Idle:** a million IPv4 routes take about 30 s (about 33,000/s), and
@@ -168,15 +168,15 @@ gain. Those are traffic properties, not table properties.
   VPP loses. One equal-priority competitor halves it, and six nice -20
   hogs on the main core made it 4× slower.
 
-So on mci1 the 3.5 min under load is mostly VPP's main thread not getting
+So on the reference deployment the 3.5 min under load is mostly VPP's main thread not getting
 its core. Keeping other work off that core during the load (cpuset or
 AllowedCPUs for the other slices) would bring it toward the idle
-figure, about 35 s for mci1's table, with none of the hazards above.
+figure, about 35 s for its table, with none of the hazards above.
 Early steering could save at most a part of that, at the price of (1),
 (3) and (4).
 
 If the core isolation lands and the load is still long, the next step is
-evidence, not code. Take mci1's traffic split by destination prefix
+evidence, not code. Take the reference deployment's traffic split by destination prefix
 length from the flow sampler, and measure the hand-back path's packets
 per second on the lab. Together they say whether a coverage gate would
 ever open early enough to matter.

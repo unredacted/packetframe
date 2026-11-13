@@ -438,7 +438,7 @@ fn resolver_emits_gone_on_neigh_delete() {
     });
 }
 
-/// Regression: 2026-08-20 edge1-mci1 loopback poisoning. FRR's iBGP
+/// Regression: 2026-08-20 reference-deployment loopback poisoning. FRR's iBGP
 /// feed carries nexthops that are not neighbors at all — 0.0.0.0 for
 /// self-originated routes, and its update-source, an address the box
 /// itself owns. Both route-look-up to the loopback local route, and
@@ -950,8 +950,8 @@ fn a_stuck_resolver_is_restarted_and_recovers_what_it_missed() {
 /// A programmer busy with a route-ledger seed or a full-table load takes
 /// no command, so the routes the resolver makes (here a `local-prefix`
 /// host's /32) wait for it. The resolver must not wait with them: it keeps
-/// serving resolve requests meanwhile. On edge1-mci1 (2026-11-12) the
-/// first such route at start parked the resolver behind a 73 s seed, and
+/// serving resolve requests meanwhile. On the reference deployment
+/// (2026-11-12) the first such route at start parked the resolver behind a 73 s seed, and
 /// the transit next hop behind 1.1M routes went unserved for all of it.
 /// The routes still reach the programmer, in the order they were made,
 /// once it answers. Nor is the backlog a stuck resolver.
