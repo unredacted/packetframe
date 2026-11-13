@@ -38,15 +38,17 @@ exclude = [
 # then 0.5.0 (vpp-offload, neigh-snoop, guard, tc datapath, event log),
 # then 0.6.0 (flow-export, wan-egress, the fast-path route ledger),
 # 0.6.1 (the route GC waits for FRR's upstreams), 0.6.2 (a late
-# neighbour re-queues its routes; VPP crash and slow next hop evidence)
-# and 0.6.3 (a fresh VPP loads with its cores to itself).
+# neighbour re-queues its routes; VPP crash and slow next hop evidence),
+# 0.6.3 (a fresh VPP loads with its cores to itself) and 0.6.4 (dry-run
+# and steering let go by themselves at start; the resolver serves
+# through a seed).
 # Code comments that cite 0.2.8/0.2.9/0.2.10 name versions that never
 # shipped; that work is part of 0.5.0 (see CHANGELOG.md).
 #
 # Every crate inherits this via `version.workspace = true`, and the
 # release workflow refuses a tag that disagrees with it or with the
 # root `VERSION` file — keep all three in step.
-version = "0.6.3"
+version = "0.6.4"
 edition = "2021"
 # MSRV. Never below a compiler CI has actually run: CI only builds with
 # the stable pin (which lives in `rust-toolchain.toml`), and the old
