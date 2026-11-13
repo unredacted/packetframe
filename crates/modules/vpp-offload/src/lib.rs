@@ -114,6 +114,9 @@ pub struct VppOffloadConfig {
     /// converged against bird. See
     /// [`packetframe_common::fib::TableCompleteness`].
     pub require_table_complete: bool,
+    /// `steer-at-start`: a configured `steer on` is a want from the start
+    /// ([`crate::supervisor::Event::SteerWantedAtStart`]). Read at attach.
+    pub steer_at_start: bool,
     /// The address VPP's loopback holds; every member port is
     /// unnumbered to it.
     ///
@@ -317,6 +320,7 @@ impl VppOffloadConfig {
                 ModuleDirective::VppHugepages(n) => out.hugepages = Some(*n),
                 ModuleDirective::VppSteerCapacity(n) => out.steer_capacity = Some(*n),
                 ModuleDirective::VppRequireTableComplete(v) => out.require_table_complete = *v,
+                ModuleDirective::VppSteerAtStart(v) => out.steer_at_start = *v,
                 ModuleDirective::VppV6(v) => out.v6 = *v,
                 ModuleDirective::VppLoopbackAddress(p) => out.loopback_address = Some(*p),
                 ModuleDirective::VppLoopbackAddress6(a) => out.loopback_address6 = Some(*a),
@@ -2736,6 +2740,7 @@ mod tests {
             expected_routes: routes,
             hugepages: None,
             require_table_complete: true,
+            steer_at_start: false,
             steer_exempts: vec![],
             local_routes: vec![],
             local_routes6: vec![],

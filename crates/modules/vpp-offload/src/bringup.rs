@@ -1001,6 +1001,7 @@ pub fn bring_up(
             cfg.unresolvable_accepts6.clone(),
         )),
         sampler_dir,
+        cfg.steer_at_start,
     ) {
         Ok(attached) => Ok(attached),
         // A supervision panic is the one failure that must NOT roll back.
@@ -1083,6 +1084,7 @@ fn finish(
     drift_accepts6: Arc<crate::drift::DriftAccepts6>,
     unresolvable_accepts6: Arc<crate::engine::UnresolvableAccepts6>,
     sampler_dir: crate::sampler::SamplerDir,
+    steer_at_start: bool,
 ) -> Result<Attached, String> {
     // --- startup.conf. Written before any process could read it, and
     // rewritten on every attach: it is a pure function of config, and
@@ -1430,6 +1432,11 @@ fn finish(
         use crate::runtime::Steering as _;
         steering.configured_ports() > 0
     };
+    // `steer-at-start on` with a port at `steer on`: the want is recorded
+    // before VPP is up, and the end of the first convergence steers once
+    // every gate passes (`Event::SteerWantedAtStart`). Not after inherited
+    // rules, which carry the want already when the config still asks.
+    let want_from_start = steer_at_start && config_wants_steer;
     let adopted_process = adopted.is_some();
 
     // Take ownership of the rules the record names, so `unsteer` can
@@ -1787,7 +1794,15 @@ fn finish(
                     runtime.seed_ledger(rec);
                 }
                 runtime.adopt_process(p, steered);
-                vec![Event::Adopted { steered }]
+                if want_from_start && !steered {
+                    tracing::info!(
+                        "steer-at-start: an unsteered adopted VPP steers once its resync \
+                         verifies and every gate passes"
+                    );
+                    vec![Event::Adopted { steered }, Event::SteerWantedAtStart]
+                } else {
+                    vec![Event::Adopted { steered }]
+                }
             }
             // Nothing to hand over: VPP does not exist yet, so there is no
             // API to handshake with. The loop's `Start` spawns it and the
@@ -1826,6 +1841,14 @@ fn finish(
                     },
                     Event::StartRequested,
                 ]
+            }
+            None if want_from_start => {
+                tracing::info!(
+                    "steer-at-start: steering is wanted from the start; it goes in once the \
+                     first convergence verifies and the completeness gate, the first-steer \
+                     hold and the member checks pass"
+                );
+                vec![Event::SteerWantedAtStart, Event::StartRequested]
             }
             None => vec![Event::StartRequested],
         };
@@ -2033,6 +2056,7 @@ mod completeness_gate_tests {
             expected_routes: 1_600_000,
             hugepages: None,
             require_table_complete: require,
+            steer_at_start: false,
             steer_exempts: vec![],
             local_routes: vec![],
             local_routes6: vec![],

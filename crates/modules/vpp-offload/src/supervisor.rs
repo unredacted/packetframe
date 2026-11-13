@@ -478,6 +478,22 @@ pub enum Event {
         /// 2026-08-07).
         still_configured: bool,
     },
+    /// The config asks for steering from the start (`steer-at-start on`
+    /// with a port at `steer on`): record the want before VPP is up, so
+    /// the end of the first convergence steers without an operator's
+    /// lever move.
+    ///
+    /// The want and nothing else, exactly what a lever move that a gate
+    /// declined leaves ([`Self::SteerDeferred`]): every gate still
+    /// applies. A verify that is not clean parks in `Ready`; the
+    /// completeness or seeded door, the first-steer hold and the dark
+    /// member check refuse inside the effect and keep the want; and
+    /// [`Self::SteerUnblocked`] retries once nothing refuses. What changes
+    /// is only who moved the lever: the config, at start, where the
+    /// operator would otherwise do it once VPP is ready. Legal before the
+    /// first convergence ends, never after: from `Ready` it would be a
+    /// lever move by config edit, which this module refuses to make.
+    SteerWantedAtStart,
     /// The operator turned the canary lever ON: a `steer on` appeared,
     /// or the allowlist changed under a port that is already steering.
     ///
@@ -635,6 +651,11 @@ pub struct Supervisor {
     /// is not another hold, and by an operator's `steer off`; only read
     /// in `Steered`, which is entered only through `Event::Steered`.
     addition_held: bool,
+    /// The want came from `steer-at-start`, not an operator, and steering
+    /// has not been in place since. Only for the health row, which tells
+    /// "holding as designed" from "intended and broken" with it. Cleared
+    /// when steering lands and when the want is withdrawn.
+    steer_from_start: bool,
     /// Whether a resync or verify task is still running.
     ///
     /// A field for the same reason `steered` is one: derived from the
@@ -679,6 +700,7 @@ impl Supervisor {
             steered: false,
             steer_wanted: false,
             addition_held: false,
+            steer_from_start: false,
             converging: false,
             undead: false,
             interrupted: None,
@@ -706,6 +728,12 @@ impl Supervisor {
     /// `steer on` port that has never yet steered and never failed to
     /// reads as not-wanted here. The distinction is real — one is the
     /// designed staging state, the other is a rollout that broke.
+    /// A steer wanted since the start by `steer-at-start`, not yet in
+    /// place: the designed hold the health row reports as such.
+    pub fn steer_from_start(&self) -> bool {
+        self.steer_from_start && self.steer_wanted && !self.steered
+    }
+
     pub fn steer_intended(&self) -> bool {
         self.steered || self.steer_wanted
     }
@@ -1013,6 +1041,7 @@ impl Supervisor {
                 self.steered = true;
                 self.steer_wanted = true;
                 self.addition_held = false;
+                self.steer_from_start = false;
                 vec![]
             }
             // A reconcile of a port already steered landed — the held
@@ -1030,6 +1059,16 @@ impl Supervisor {
             // Only from `Stopped`: this is an attach-time fact, injected
             // before the first `StartRequested`. Anywhere else it would
             // be describing a process that exists.
+            // A want from the config, before the first convergence ends.
+            // See `Event::SteerWantedAtStart`.
+            (
+                Stopped | Backoff | Starting | Syncing | AdoptedResyncing | Verifying,
+                SteerWantedAtStart,
+            ) => {
+                self.steer_wanted = true;
+                self.steer_from_start = true;
+                vec![]
+            }
             (Stopped, InheritedSteering { still_configured }) => {
                 self.steered = true;
                 // The *want* survives a crash — a restart nobody watched
@@ -1144,6 +1183,7 @@ impl Supervisor {
             // a refused removal keeps the VF withheld.
             (Ready | State::Steered, UnsteerRequested) => {
                 self.steer_wanted = false;
+                self.steer_from_start = false;
                 self.addition_held = false;
                 self.state = Ready;
                 if self.steered {
@@ -1173,6 +1213,7 @@ impl Supervisor {
             // the VF withheld and keep every later teardown trying.
             (Syncing | AdoptedResyncing | Verifying, UnsteerRequested) => {
                 self.steer_wanted = false;
+                self.steer_from_start = false;
                 self.addition_held = false;
                 if self.steered {
                     vec![Action::Unsteer]
@@ -1266,6 +1307,7 @@ impl Supervisor {
             (_, NothingToSteer) => {
                 self.steered = false;
                 self.steer_wanted = false;
+                self.steer_from_start = false;
                 self.addition_held = false;
                 vec![]
             }
@@ -1298,6 +1340,7 @@ impl Supervisor {
                 self.state = Stopped;
                 self.interrupted = None;
                 self.steer_wanted = false;
+                self.steer_from_start = false;
                 self.failures = 0;
                 actions
             }
@@ -1464,6 +1507,80 @@ mod tests {
         let actions = s.on(Event::ProcessExited { status: Some(139) });
         assert_eq!(actions[0], Action::Unsteer, "unsteer must come first");
         assert!(!s.addition_held());
+    }
+
+    /// `steer-at-start`: the want is the config's, recorded before VPP is
+    /// up, and the end of the first convergence steers through the same
+    /// gates a lever move would. A verify that is not clean parks in
+    /// `Ready` with the want kept; the retry steers once it clears.
+    #[test]
+    fn a_want_from_the_start_steers_at_the_first_clean_verify() {
+        let mut s = Supervisor::new();
+        assert_eq!(s.on(Event::SteerWantedAtStart), vec![]);
+        assert!(s.steer_intended() && s.steer_from_start());
+        s.on(Event::StartRequested);
+        s.on(Event::Spawned);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        assert!(
+            s.on(Event::VerifyPassed).contains(&Action::Steer),
+            "the first clean verify steers"
+        );
+        // The completeness gate or the hold refuses inside the effect:
+        // the want survives, and the retry is the next attempt.
+        s.on(Event::SteerFailed {
+            rules_remain: false,
+        });
+        assert_eq!(s.state(), State::Ready);
+        assert!(
+            s.steer_from_start(),
+            "still the start's want, not yet in place"
+        );
+        assert_eq!(s.on(Event::SteerUnblocked), vec![Action::Steer]);
+        s.on(Event::Steered);
+        assert_eq!(s.state(), State::Steered);
+        assert!(
+            !s.steer_from_start(),
+            "in place: an ordinary steered state now"
+        );
+
+        // A verify that is not clean parks in `Ready` with the want kept.
+        let mut s = Supervisor::new();
+        s.on(Event::SteerWantedAtStart);
+        s.on(Event::StartRequested);
+        s.on(Event::Spawned);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        assert!(!s.on(Event::VerifyIncomplete).contains(&Action::Steer));
+        assert_eq!(s.state(), State::Ready);
+        assert_eq!(s.on(Event::SteerUnblocked), vec![Action::Steer]);
+
+        // An operator's `steer off` withdraws it.
+        let mut s = Supervisor::new();
+        s.on(Event::SteerWantedAtStart);
+        s.on(Event::StartRequested);
+        s.on(Event::Spawned);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        s.on(Event::VerifyIncomplete);
+        s.on(Event::UnsteerRequested);
+        assert!(!s.steer_intended() && !s.steer_from_start());
+        assert_eq!(s.on(Event::SteerUnblocked), vec![]);
+    }
+
+    /// Never after the first convergence: from `Ready` it would be a lever
+    /// move made by a config edit.
+    #[test]
+    fn a_want_from_the_start_is_ignored_once_converged() {
+        let mut s = Supervisor::new();
+        s.on(Event::StartRequested);
+        s.on(Event::Spawned);
+        s.on(Event::ApiUp);
+        s.on(Event::SyncComplete);
+        s.on(Event::VerifyPassed);
+        assert_eq!(s.state(), State::Ready);
+        assert_eq!(s.on(Event::SteerWantedAtStart), vec![]);
+        assert!(!s.steer_intended());
     }
 
     #[test]

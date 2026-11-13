@@ -344,6 +344,10 @@ pub struct StatusSnapshot {
     /// state, which is the designed rollback landing zone rather than a
     /// fault.
     pub steer_intended: bool,
+    /// The want is `steer-at-start`'s and steering has not been in place
+    /// since ([`crate::supervisor::Supervisor::steer_from_start`]): the
+    /// designed hold, reported as such rather than as a broken steer.
+    pub steer_from_start: bool,
     /// The config asks at least one port to steer.
     ///
     /// Separate from `steer_intended`, which is the supervisor's belief
@@ -708,6 +712,7 @@ impl StatusSnapshot {
             state: sup.state(),
             steered: sup.is_steered(),
             steer_intended: sup.steer_intended(),
+            steer_from_start: sup.steer_from_start(),
             steer_configured,
             steer_missing: audit.missing,
             steer_stray: audit.stray,
@@ -2539,6 +2544,11 @@ impl StatusSnapshot {
             // (VPP catching up with the mirror, the verify re-run). Carried
             // from the runtime, never re-derived: it is the accessor the
             // steer and the retry refuse on (`Core::steer_hold`).
+            // `steer-at-start`: wanted since the start, never in place yet.
+            // Healthy while it waits on something that clears by itself,
+            // with what that is, so a reader can tell holding as designed
+            // from stuck; Degraded only for what waiting will not clear.
+            (false, true) if self.steer_from_start => self.steering_wanted_at_start(),
             (false, true) => (
                 HealthState::Degraded,
                 Some(if matches!(self.state, State::Ready) {
@@ -2617,6 +2627,73 @@ impl StatusSnapshot {
             state,
             message,
             last_success_age_seconds: None,
+        }
+    }
+
+    /// The steering row for a want `steer-at-start` made, not yet in
+    /// place. Every message starts `steer-at-start: wanted` so a parser
+    /// keys on it, then says what it is waiting for.
+    fn steering_wanted_at_start(&self) -> (HealthState, Option<String>) {
+        const HEAD: &str = "steer-at-start: wanted from the start, not yet in place; traffic \
+                            is on the eBPF tier";
+        let waiting = |what: String| {
+            (
+                HealthState::Healthy,
+                Some(format!("{HEAD}. Waiting for {what}")),
+            )
+        };
+        match self.state {
+            State::Stopped | State::Backoff => (
+                HealthState::Degraded,
+                Some(format!(
+                    "{HEAD}. VPP is not running; the want is kept and the steer follows the next \
+                     convergence that verifies"
+                )),
+            ),
+            State::Starting | State::Syncing | State::AdoptedResyncing => waiting(
+                "VPP's first convergence: the table to load, then verify, the completeness \
+                 gate and the first-steer hold"
+                    .into(),
+            ),
+            State::Verifying => {
+                waiting("verify, then the completeness gate and the first-steer hold".into())
+            }
+            _ => {
+                let dead: Vec<&str> = self
+                    .ports
+                    .iter()
+                    .filter(|p| p.blackhole())
+                    .map(|p| p.port.as_str())
+                    .collect();
+                if !dead.is_empty() {
+                    return (
+                        HealthState::Degraded,
+                        Some(format!(
+                            "{HEAD}. Refused: member port(s) {} are dark and routes egress \
+                             them, so steering would blackhole that traffic; waiting does not \
+                             clear this, the link must come up",
+                            dead.join(", ")
+                        )),
+                    );
+                }
+                match &self.steer_hold {
+                    Some(h) if h.clears_itself() => {
+                        waiting(format!("the first-steer hold to clear: {h}"))
+                    }
+                    Some(h) => (
+                        HealthState::Degraded,
+                        Some(format!(
+                            "{HEAD}. Held because {h} — waiting does not clear this, so it \
+                             will not steer by itself"
+                        )),
+                    ),
+                    None => waiting(format!(
+                        "the next retry, at most every {}s; a refusal names its gate in the \
+                         journal (`steer refused`)",
+                        crate::driver::STEER_RETRY_EVERY.as_secs()
+                    )),
+                }
+            }
         }
     }
 
@@ -4908,6 +4985,80 @@ mod tests {
     /// nothing is armed and the repair rides the next convergence —
     /// promising a paced retry there would be the same overclaim this
     /// file has now made four times.
+    /// `steer-at-start`'s want is a designed hold, and its row says so:
+    /// Healthy while it waits on something that clears by itself, with
+    /// what that is, and Degraded only for a dark member routes egress,
+    /// which the steer refuses for and waiting does not clear. Every line
+    /// starts the same way so a parser can key on it.
+    #[test]
+    fn a_want_from_the_start_reads_as_a_hold_not_a_fault() {
+        let mut sup = Supervisor::new();
+        sup.on(Event::SteerWantedAtStart);
+        sup.on(Event::StartRequested);
+        sup.on(Event::Spawned);
+        sup.on(Event::ApiUp);
+        let row = |sup: &Supervisor, state: Option<State>, ports: Vec<PortLink>| {
+            let mut snap = snap_of(
+                sup,
+                &ledger_with(10, 0, 0),
+                ApiHealth::Answering {
+                    silent_for: Duration::ZERO,
+                },
+                verified(1),
+                ports,
+            );
+            snap.steer_configured = true;
+            if let Some(st) = state {
+                snap.state = st;
+            }
+            snap.report()
+                .subsystems
+                .into_iter()
+                .find(|x| x.name == SUBSYS_STEERING)
+                .expect("steering row")
+        };
+
+        let syncing = row(&sup, None, ports_up());
+        assert_eq!(syncing.state, HealthState::Healthy, "{:?}", syncing.message);
+        let msg = syncing.message.unwrap_or_default();
+        assert!(msg.starts_with("steer-at-start: wanted"), "{msg}");
+        assert!(msg.contains("first convergence"), "{msg}");
+
+        sup.on(Event::SyncComplete);
+        sup.on(Event::VerifyPassed);
+        sup.on(Event::SteerFailed {
+            rules_remain: false,
+        });
+        let ready = row(&sup, None, ports_up());
+        assert_eq!(ready.state, HealthState::Healthy, "{:?}", ready.message);
+        let msg = ready.message.unwrap_or_default();
+        assert!(
+            msg.starts_with("steer-at-start: wanted") && msg.contains("Waiting for"),
+            "{msg}"
+        );
+        assert!(!msg.contains("intended but not in place"), "{msg}");
+
+        let dark = row(&sup, None, port_down_in_use());
+        assert_eq!(dark.state, HealthState::Degraded, "{:?}", dark.message);
+        let msg = dark.message.unwrap_or_default();
+        assert!(
+            msg.contains("eth4") && msg.contains("waiting does not clear this"),
+            "{msg}"
+        );
+
+        // A dark member nothing routes through refuses nothing.
+        let idle = row(&sup, None, port_down());
+        assert_eq!(idle.state, HealthState::Healthy, "{:?}", idle.message);
+
+        // Without `steer-at-start`, the same want is the old complaint.
+        let mut lever = ready_supervisor();
+        lever.on(Event::SteerFailed {
+            rules_remain: false,
+        });
+        let msg = row(&lever, None, ports_up()).message.unwrap_or_default();
+        assert!(msg.contains("intended but not in place"), "{msg}");
+    }
+
     #[test]
     fn the_retry_is_named_only_where_it_is_armed() {
         let mut sup = ready_supervisor();

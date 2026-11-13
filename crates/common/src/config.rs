@@ -366,6 +366,14 @@ pub enum ModuleDirective {
     /// compare against — the shadow has no bird of its own — and it
     /// means the operator owns the completeness judgement instead.
     VppRequireTableComplete(bool),
+    /// `steer-at-start on|off` — whether a port configured `steer on` is
+    /// a steering *want* from the start, so the first convergence steers
+    /// once every gate passes, without an operator moving the lever.
+    ///
+    /// Default `off`: a first attach waits for the operator's lever move
+    /// (the canary ladder). Read at attach only; a reload that changes it
+    /// takes effect at the next start.
+    VppSteerAtStart(bool),
     /// `v6 on|off` — whether VPP carries IPv6 routes and neighbours.
     ///
     /// Default `off`, which is VPP as it has always been: IPv4 only.
@@ -4935,6 +4943,11 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
             }
             Ok(ModuleDirective::VppUnresolvableAccept6 { prefix, line })
         }),
+        "steer-at-start" => parse_single_arg(line, rest, "steer-at-start", |t| match t {
+            "on" => Ok(ModuleDirective::VppSteerAtStart(true)),
+            "off" => Ok(ModuleDirective::VppSteerAtStart(false)),
+            _ => Err("steer-at-start expects on|off".to_string()),
+        }),
         "require-table-complete" => {
             parse_single_arg(line, rest, "require-table-complete", |t| match t {
                 "on" => Ok(ModuleDirective::VppRequireTableComplete(true)),
@@ -7565,6 +7578,40 @@ module vpp-offload
         assert!(
             Config::parse(cfg).is_ok(),
             "an FRR authority must satisfy require-table-complete"
+        );
+    }
+
+    #[test]
+    fn steer_at_start_parses_and_refuses_anything_but_on_or_off() {
+        let base = "\
+module fast-path
+  attach eth2 generic
+  allow-prefix 203.0.113.0/24
+  forwarding-mode packetframe-fib
+  integrity-authority frr upstream 192.0.2.1 families v4,v6
+
+module vpp-offload
+  loopback-address 198.51.100.1/32
+  port eth2 cores 1 steer on
+";
+        for (v, want) in [("on", true), ("off", false)] {
+            let cfg = Config::parse(&format!("{base}  steer-at-start {v}\n")).unwrap();
+            let vpp = cfg
+                .modules
+                .iter()
+                .find(|m| m.name == "vpp-offload")
+                .unwrap();
+            assert!(
+                vpp.directives
+                    .contains(&ModuleDirective::VppSteerAtStart(want)),
+                "{:?}",
+                vpp.directives
+            );
+        }
+        let e = Config::parse(&format!("{base}  steer-at-start yes\n")).unwrap_err();
+        assert!(
+            format!("{e}").contains("steer-at-start expects on|off"),
+            "{e}"
         );
     }
 
