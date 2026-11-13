@@ -419,4 +419,3 @@ mod tests {
         let _ = learned;
     }
 }
-
