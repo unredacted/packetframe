@@ -947,14 +947,17 @@ fn a_stuck_resolver_is_restarted_and_recovers_what_it_missed() {
     });
 }
 
-/// A long wait on the programmer — its queue full during a route-ledger
-/// seed or a full-table load — is not a stuck resolver: restarting the
-/// resolver could not shorten it, and a new one would wait on the same
-/// programmer. The row reports the wait for what it is, and the work goes
-/// through once the programmer answers.
+/// A programmer busy with a route-ledger seed or a full-table load takes
+/// no command, so the routes the resolver makes (here a `local-prefix`
+/// host's /32) wait for it. The resolver must not wait with them: it keeps
+/// serving resolve requests meanwhile. On edge1-mci1 (2026-11-12) the
+/// first such route at start parked the resolver behind a 73 s seed, and
+/// the transit next hop behind 1.1M routes went unserved for all of it.
+/// The routes still reach the programmer, in the order they were made,
+/// once it answers. Nor is the backlog a stuck resolver.
 #[test]
 #[ignore = "needs CAP_NET_ADMIN + CAP_SYS_ADMIN; run via sudo -E cargo test -- --ignored"]
-fn a_long_wait_on_the_programmer_is_not_a_stall() {
+fn a_busy_programmer_does_not_hold_the_resolver() {
     let names = Names::new();
     let _guard = NetnsGuard::setup(&names);
     let netns = names.netns.clone();
@@ -969,7 +972,7 @@ fn a_long_wait_on_the_programmer_is_not_a_stall() {
     rt.block_on(async move {
         let shutdown = CancellationToken::new();
         let (prog, held) = held_handle();
-        let (resolver, mut events_rx, _resolve) = NetlinkNeighborResolver::new(shutdown.clone());
+        let (resolver, mut events_rx, resolve) = NetlinkNeighborResolver::new(shutdown.clone());
         let stall_after = Duration::from_secs(2);
         let resolver = resolver
             .with_local_prefixes(
@@ -990,48 +993,68 @@ fn a_long_wait_on_the_programmer_is_not_a_stall() {
         .await;
 
         // A host inside the local prefix: its /32 goes to a programmer
-        // that answers nothing yet.
-        let host: IpAddr = "198.51.100.10".parse().unwrap();
+        // that answers nothing.
         neigh_permanent(&netns, "198.51.100.10", "02:00:00:00:03:10", &veth_a);
-        await_status(
-            &status,
-            Duration::from_secs(5),
-            "the wait on the programmer",
-            |s| s.programmer_wait_since.is_some(),
-        )
-        .await;
-        // Hold it well past the stall threshold.
         tokio::time::sleep(stall_after * 3).await;
         let s = status.snapshot();
         assert_eq!(
             s.counters.restarts, 0,
             "a programmer backlog is not a stuck resolver: {s:?}"
         );
-        let row = s.subsystem_health(std::time::Instant::now());
-        assert_eq!(row.state, HealthState::Degraded, "{:?}", row.message);
-        let msg = row.message.unwrap_or_default();
-        assert!(msg.contains("FibProgrammer"), "{msg}");
+        let msg = s
+            .subsystem_health(std::time::Instant::now())
+            .message
+            .unwrap_or_default();
         assert!(!msg.contains("no progress"), "{msg}");
 
-        // The programmer answers; the route and the Learned go through.
-        let log = held.release();
+        // The programmer still answers nothing, and a resolve request is
+        // served all the same.
+        let known: IpAddr = "198.51.100.30".parse().unwrap();
+        neigh_permanent(&netns, "198.51.100.30", "02:00:00:00:03:30", &veth_a);
+        while events_rx.try_recv().is_ok() {}
+        assert!(resolve.request_resolve(known));
         let missing = await_learned(
             &mut events_rx,
-            [host].into_iter().collect(),
+            [known].into_iter().collect(),
             Duration::from_secs(3),
         )
         .await;
-        assert!(missing.is_empty(), "the Learned follows the route");
-        let host_route = IpPrefix::V4 {
-            addr: [198, 51, 100, 10],
+        assert!(
+            missing.is_empty(),
+            "a resolve request must be served while the programmer is busy; status: {:?}",
+            status.snapshot()
+        );
+
+        // The programmer answers; both /32s reach it, in order.
+        let log = held.release();
+        let host_route = |d: u8| IpPrefix::V4 {
+            addr: [198, 51, 100, d],
             prefix_len: 32,
         };
-        assert!(
-            log.events()
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let order = loop {
+            let adds: Vec<IpPrefix> = log
+                .events()
                 .iter()
-                .any(|e| matches!(e, RouteEvent::Add { prefix, .. } if *prefix == host_route)),
-            "{:?}",
-            log.events()
+                .filter_map(|e| match e {
+                    RouteEvent::Add { prefix, .. } => Some(*prefix),
+                    _ => None,
+                })
+                .collect();
+            let first = |p: IpPrefix| adds.iter().position(|a| *a == p);
+            if let (Some(a), Some(b)) = (first(host_route(10)), first(host_route(30))) {
+                break (a, b);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "both host routes must reach the programmer: {:?}",
+                log.events()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            order.0 < order.1,
+            "routes are applied in the order they were made"
         );
         assert_eq!(status.snapshot().counters.restarts, 0);
 

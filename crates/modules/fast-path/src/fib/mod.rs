@@ -66,6 +66,9 @@ pub mod integrity;
 pub mod netlink_neigh;
 
 #[cfg(target_os = "linux")]
+pub mod route_applier;
+
+#[cfg(target_os = "linux")]
 pub mod programmer;
 
 #[cfg(target_os = "linux")]

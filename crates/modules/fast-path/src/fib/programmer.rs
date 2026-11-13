@@ -86,6 +86,11 @@ use crate::pin;
 /// to the BMP reader which is correct.
 const COMMAND_CAPACITY: usize = 8_192;
 
+/// Neighbour events applied between two seed or walk chunks, at most.
+/// Each is a hash lookup and at most a few map writes, so 4,096 cost a
+/// few milliseconds, against a chunk's ~0.1 s under load.
+const NEIGH_EVENTS_PER_CHUNK: usize = 4_096;
+
 // The map capacities live with the other BPF mirrors in `types` (the
 // route ledger's size bound reads them on every platform); re-exported
 // here, where their users have always found them.
@@ -1387,6 +1392,23 @@ impl FibProgrammer {
                         self.seed_chunk();
                     } else {
                         self.walk_chunk();
+                    }
+                    // Every neighbour event already queued, not one per
+                    // chunk. `select!` picks among ready branches at
+                    // random and the chunk branch is always ready, so
+                    // left to it a queued `Learned` waited about a chunk
+                    // per event ahead of it: under boot load a chunk is
+                    // ~0.1 s, and a transit next hop carrying a million
+                    // routes stayed unresolved behind the IX neighbours
+                    // learned before it. Events never had to wait for a
+                    // seed (only commands do); this only stops them
+                    // queueing behind it. Bounded per chunk so a storm
+                    // cannot starve the seed.
+                    for _ in 0..NEIGH_EVENTS_PER_CHUNK {
+                        match self.events_rx.try_recv() {
+                            Ok(e) => self.on_neigh_event(e),
+                            Err(_) => break,
+                        }
                     }
                     // Give the worker back between chunks. This branch is
                     // always ready, so `select!` itself returns `Pending`
