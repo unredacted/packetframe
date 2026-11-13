@@ -34,7 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **vpp-offload**
 
-- `steer-at-start on` makes a port at `steer on` a steering want from the start, so the first convergence steers once every gate passes (verify, the completeness authority or seeded door, the first-steer hold, no dark member in use) without an operator moving the lever. The `steering` row reads `steer-at-start: wanted from the start …` with what it is waiting for: Healthy while that clears by itself, Degraded when it will not. Default `off`. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/vpp-offload.md#the-canary-ladder), [#PR](https://github.com/unredacted/packetframe/pull/PR))
+- `steer-at-start on` makes a port at `steer on` a steering want from the start, so the first convergence steers once every gate passes (verify, the completeness authority or seeded door, the first-steer hold, no dark member in use) without an operator moving the lever. The `steering` row reads `steer-at-start: wanted from the start …` with what it is waiting for: Healthy while that clears by itself, Degraded when it will not. Default `off`. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/vpp-offload.md#the-canary-ladder), [#397](https://github.com/unredacted/packetframe/pull/397))
 
 ## [0.6.3] - 2026-11-12
 
