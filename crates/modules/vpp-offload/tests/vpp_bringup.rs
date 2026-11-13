@@ -187,6 +187,7 @@ impl Host {
             // against, and none of them steers; the gate is exercised
             // where it lives, in `runtime`.
             require_table_complete: false,
+            steer_at_start: false,
             steer_direction: Default::default(),
             loopback_address6: None,
             loopback_address: Some(packetframe_common::config::Ipv4Prefix {

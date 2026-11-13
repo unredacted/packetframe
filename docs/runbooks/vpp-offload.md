@@ -460,6 +460,31 @@ restart of an already-steered deployment, and it is deliberate: a SIGHUP
 raised for an unrelated edit must never divert traffic as a side
 effect.
 
+**`steer-at-start on` moves the lever for you, once, at start.** With it,
+a port at `steer on` is a steering *want* from the moment the daemon
+starts. The first convergence then steers by itself once every gate
+passes. Those are the same gates a lever move goes through:
+- a verify with nothing withheld, unresolvable or still installing;
+- the completeness authority, or the seeded fresh door;
+- the first-steer hold, until VPP has caught up and its verify covers the
+  table;
+- no dark member that routes egress.
+
+A refusal keeps the want, and the module retries on its own at most every
+`STEER_RETRY_EVERY`. It acts only at attach, on a fresh VPP or an adopted
+one that is not steering; a reload that changes it takes effect at the
+next start, and editing other lines never steers anything. The
+`steering` row then reads `steer-at-start: wanted from the start, not
+yet in place …`, followed by what it is waiting for:
+- **Healthy** while that clears by itself: the first convergence, verify,
+  the first-steer hold, the next retry.
+- **Degraded** when waiting will not clear it: a dark member routes
+  egress, or a hold that waiting does not clear, both of which it names.
+
+Once steering lands it is an ordinary steered deployment, and `steer off`
+withdraws the want as it always has. Default `off`, which keeps the
+canary ladder: steer a new deployment by hand first.
+
 **Rung 0 — membership, everything off.** Every fast-path attach port
 gets a `port` line; every one is `steer off`.
 
