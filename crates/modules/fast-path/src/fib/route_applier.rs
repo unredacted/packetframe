@@ -30,14 +30,15 @@
 //! The resolver must never block on the applier, and a queue that kept
 //! every transition would grow for as long as a seed holds the programmer,
 //! by however much neighbour churn the segment produces (review finding on
-//! #393). So the queue keeps one job per route: a host route's `ip`, the
-//! fallback default, a link's `PeerDown`. A newer job for the same route
-//! replaces the waiting one and goes to the back, behind everything handed
-//! over before it. Only the latest state of a route matters (an Add
-//! upserts, a Del withdraws), and moving it to the back keeps it after
-//! every other route's job that came before it, a `PeerDown` included. The
-//! queue is then bounded by the routes the resolver can make: one per
-//! neighbour in a `local-prefix`, plus one per link.
+//! #393). Every transition is applied in order while the queue is short.
+//! Once it backs up (4,096 jobs, then twice what the last compaction
+//! left) it is compacted to one job per route, a host route's `ip`, the
+//! fallback default or a link's `PeerDown`: the last one, where it stands.
+//! Only the latest state of a route matters (an Add upserts, a Del
+//! withdraws), and the kept job stays after every other route's job that
+//! came before it, a `PeerDown` included. The queue is then bounded by
+//! twice the routes the resolver can make: one per neighbour in a
+//! `local-prefix`, plus one per link.
 //!
 //! ## A Learned after its Add
 //!
@@ -114,39 +115,93 @@ struct Job {
     then: Option<NeighEvent>,
 }
 
-/// The waiting jobs, one per key, in hand-over order.
-#[derive(Debug, Default)]
+/// Jobs waiting before the queue is first compacted.
+const COMPACT_AT: usize = 4096;
+
+/// The waiting jobs, in hand-over order.
+#[derive(Debug)]
 struct Queue {
-    order: VecDeque<Key>,
-    jobs: HashMap<Key, Job>,
+    jobs: VecDeque<Job>,
+    /// The length at which the next push compacts. Never below the floor,
+    /// and twice what the last compaction left, so a queue of mostly
+    /// distinct routes is not rescanned on every push.
+    compact_at: usize,
+    floor: usize,
     closed: bool,
 }
 
+impl Default for Queue {
+    fn default() -> Self {
+        Self::with_floor(COMPACT_AT)
+    }
+}
+
 impl Queue {
-    /// Queue `job`, replacing a waiting one for the same route and moving
-    /// it to the back. Returns whether one was replaced.
-    fn push(&mut self, mut job: Job) -> bool {
-        let key = job.kind.key();
-        let replaced = match self.jobs.remove(&key) {
-            Some(old) => {
-                // A re-add keeps the seed's Learned: it is still the
-                // nexthop's only resolution until the queue drains.
-                if job.then.is_none() && matches!(job.kind, RouteKind::HostAdd { .. }) {
-                    job.then = old.then;
-                }
-                self.order.retain(|k| *k != key);
-                true
-            }
-            None => false,
+    fn with_floor(floor: usize) -> Self {
+        Self {
+            jobs: VecDeque::new(),
+            compact_at: floor,
+            floor,
+            closed: false,
+        }
+    }
+
+    /// Queue `job` at the back. Returns how many waiting jobs a
+    /// compaction dropped (0 unless the queue had backed up).
+    fn push(&mut self, job: Job) -> usize {
+        let dropped = if self.jobs.len() >= self.compact_at {
+            self.compact()
+        } else {
+            0
         };
-        self.order.push_back(key);
-        self.jobs.insert(key, job);
-        replaced
+        self.jobs.push_back(job);
+        dropped
+    }
+
+    /// Keep only the last job for each route, where it stands. That is
+    /// the same as replacing each earlier one and moving it to the back:
+    /// only a route's latest state matters (an Add upserts, a Del
+    /// withdraws), and the kept job stays after every other route's job
+    /// that came before it, a `PeerDown` included.
+    ///
+    /// A host route's kept Add takes the seed's `Learned` from an earlier
+    /// Add it replaces, unless a Del came between: the Learned is still
+    /// the nexthop's only resolution.
+    fn compact(&mut self) -> usize {
+        let before = self.jobs.len();
+        let mut last: HashMap<Key, usize> = HashMap::with_capacity(before);
+        for (i, j) in self.jobs.iter().enumerate() {
+            last.insert(j.kind.key(), i);
+        }
+        let mut learned: HashMap<Key, NeighEvent> = HashMap::new();
+        let mut kept = VecDeque::with_capacity(last.len());
+        for (i, mut j) in std::mem::take(&mut self.jobs).into_iter().enumerate() {
+            let key = j.kind.key();
+            match j.kind {
+                RouteKind::HostAdd { .. } => {
+                    if let Some(t) = j.then.take() {
+                        learned.insert(key, t);
+                    }
+                }
+                RouteKind::HostDel { .. } => {
+                    learned.remove(&key);
+                }
+                _ => {}
+            }
+            if last.get(&key) == Some(&i) {
+                if matches!(j.kind, RouteKind::HostAdd { .. }) {
+                    j.then = learned.remove(&key);
+                }
+                kept.push_back(j);
+            }
+        }
+        self.jobs = kept;
+        self.compact_at = self.floor.max(self.jobs.len() * 2);
+        before - self.jobs.len()
     }
 
     fn pop(&mut self) -> Option<Job> {
-        let key = self.order.pop_front()?;
-        self.jobs.remove(&key)
+        self.jobs.pop_front()
     }
 }
 
@@ -159,7 +214,8 @@ pub struct ApplierStats {
     pub host_v6_removed: AtomicU64,
     /// Waiting or being applied.
     pub pending: AtomicU64,
-    /// Jobs a newer one for the same route replaced before they ran.
+    /// Jobs a newer one for the same route replaced before they ran, in a
+    /// backed-up queue.
     pub coalesced: AtomicU64,
     pub failed: AtomicU64,
 }
@@ -210,8 +266,9 @@ impl RouteApplier {
         Self { queue, wake, stats }
     }
 
-    /// Queue `event` behind every route handed over before it, replacing a
-    /// waiting job for the same route. Never waits.
+    /// Queue `event` behind every route handed over before it. Never
+    /// waits; a backed-up queue drops the waiting jobs a newer one for the
+    /// same route supersedes.
     pub fn submit(&self, event: RouteEvent, kind: RouteKind) {
         self.push(Job {
             event,
@@ -231,14 +288,14 @@ impl RouteApplier {
     }
 
     fn push(&self, job: Job) {
-        let replaced = {
+        let dropped = {
             let mut g = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             g.push(job)
-        };
-        if replaced {
-            self.stats.coalesced.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.stats.pending.fetch_add(1, Ordering::Relaxed);
+        } as u64;
+        self.stats.pending.fetch_add(1, Ordering::Relaxed);
+        if dropped > 0 {
+            self.stats.pending.fetch_sub(dropped, Ordering::Relaxed);
+            self.stats.coalesced.fetch_add(dropped, Ordering::Relaxed);
         }
         self.wake.notify_one();
     }
@@ -378,44 +435,75 @@ mod tests {
     }
 
     #[test]
-    fn churn_on_one_neighbour_keeps_one_job_for_it() {
+    fn a_short_queue_applies_every_transition_in_order() {
         let mut q = Queue::default();
-        for _ in 0..10_000 {
-            q.push(add(7));
-            q.push(del(7));
-        }
-        assert_eq!(q.jobs.len(), 1);
-        assert_eq!(drain(&mut q), vec!["del 192.0.2.7"]);
+        q.push(add(7));
+        q.push(del(7));
+        q.push(add(7));
+        assert_eq!(
+            drain(&mut q),
+            vec!["add 192.0.2.7", "del 192.0.2.7", "add 192.0.2.7"]
+        );
     }
 
     #[test]
-    fn a_replaced_job_goes_behind_what_came_before_it() {
+    fn churn_in_a_backed_up_queue_stays_bounded() {
+        let mut q = Queue::default();
+        let mut dropped = 0;
+        for _ in 0..10_000 {
+            dropped += q.push(add(7));
+            dropped += q.push(del(7));
+        }
+        assert!(q.jobs.len() <= COMPACT_AT + 1, "{}", q.jobs.len());
+        assert_eq!(dropped + q.jobs.len(), 20_000);
+        assert_eq!(drain(&mut q).last().unwrap(), "del 192.0.2.7");
+    }
+
+    #[test]
+    fn compaction_keeps_each_routes_last_job_where_it_stands() {
         // Del, then the link goes, then the host comes back: the Add must
         // land after the PeerDown or the PeerDown would withdraw it.
-        let mut q = Queue::default();
+        let mut q = Queue::with_floor(3);
         q.push(del(7));
         q.push(peer_down(3));
         q.push(add(7));
-        assert_eq!(drain(&mut q), vec!["down 3", "add 192.0.2.7"]);
+        q.push(add(8));
+        assert_eq!(
+            drain(&mut q),
+            vec!["down 3", "add 192.0.2.7", "add 192.0.2.8"]
+        );
     }
 
     #[test]
-    fn a_re_add_keeps_the_seeds_learned_and_a_del_drops_it() {
-        let learned = NeighEvent::Learned {
-            ip: ip(7),
+    fn compaction_keeps_the_seeds_learned_on_a_re_add_but_not_past_a_del() {
+        let learned = |n| NeighEvent::Learned {
+            ip: ip(n),
             mac: [2; 6],
             ifindex: 3,
             src_mac: [0; 6],
         };
-        let mut q = Queue::default();
+        let mut q = Queue::with_floor(4);
         q.push(Job {
-            then: Some(learned.clone()),
+            then: Some(learned(7)),
             ..add(7)
         });
         q.push(add(7));
-        assert!(q.jobs[&Key::Host(ip(7))].then.is_some());
-        q.push(del(7));
-        assert!(q.jobs[&Key::Host(ip(7))].then.is_none());
-        let _ = learned;
+        q.push(Job {
+            then: Some(learned(8)),
+            ..add(8)
+        });
+        q.push(del(8));
+        q.push(add(8)); // compacts the four before it
+        let jobs: Vec<Job> = std::iter::from_fn(|| q.pop()).collect();
+        let then_of = |n: u8| {
+            jobs.iter()
+                .find(|j| matches!(j.kind, RouteKind::HostAdd { ip: i } if i == ip(n)))
+                .map(|j| j.then.is_some())
+        };
+        assert_eq!(then_of(7), Some(true), "a re-add keeps it");
+        // 8's Add after its Del stands alone, behind it; the Learned that
+        // came before the Del is gone.
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(then_of(8), Some(false));
     }
 }
