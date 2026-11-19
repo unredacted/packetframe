@@ -19,9 +19,10 @@ crate-type = ["cdylib"]
 # Our fork: the fixes this plugin needs, upstream's as PRs (VPP 26.06, the
 # baseline node variant, the x4 feature-next fix, version_required:
 # rshearman/vpp-plugin-rs#11-#14) and the fork's own (VPP_BUILD_VER read
-# past a line marker, SwIfIndex Display, the WARNING severity). Pinned by
-# commit; the tag pf/2026-10-05 keeps it reachable.
-vpp-plugin = { git = "https://github.com/unredacted/vpp-plugin-rs", rev = "36c14ef09ffaef6474828fd1bb22de1bd4b4783c", features = ["process-node"] }
+# past a line marker, SwIfIndex Display, the WARNING severity, a build
+# script that reruns when the VPP headers it compiled against change).
+# Pinned by commit; the tag pf/2026-11-19 keeps it reachable.
+vpp-plugin = { git = "https://github.com/unredacted/vpp-plugin-rs", rev = "363009582592076e74e1f15dcb4a2e5c001d0e7a", features = ["process-node"] }
 packetframe-sampler-core = { path = "../pf-sampler-core" }
 packetframe-sampler-shm = { path = "../../sampler-shm" }
 arrayvec = "0.7.6"
