@@ -20,19 +20,35 @@ description: >-
 # runner (a tmpfs mount for the sampler directory, and VPP itself), after
 # actions/checkout. The container has no git at checkout time, so the
 # checkout is the REST download; nothing here needs a repository.
+#
+# unredacted/vpp-unifi runs it too, before it publishes a VPP: with
+# `vpp-debs` naming the packages it just built, in a container of each of
+# its pins' distros. A VPP this plugin does not build against, or whose
+# smoke test fails, is never published, so no release this repo can
+# vendor is one the plugin does not work with.
+inputs:
+  vpp-debs:
+    description: >-
+      A directory of VPP .debs to build and smoke-test against, instead of
+      the release SOURCE.json names (vpp-unifi's pre-publish check of a
+      candidate VPP). Empty: the release.
+    required: false
+    default: ''
 runs:
   using: composite
   steps:
     - name: System packages
       shell: bash
       # Bullseye left LTS on 2026-08-31; archive.debian.org is where every
-      # bullseye suite lives now.
+      # bullseye suite lives now. Other distros keep their own sources.
       run: |
-        printf '%s\n' \
-          'deb http://archive.debian.org/debian bullseye main' \
-          'deb http://archive.debian.org/debian bullseye-updates main' \
-          'deb http://archive.debian.org/debian-security bullseye-security main' \
-          > /etc/apt/sources.list
+        if grep -qx 'VERSION_CODENAME=bullseye' /etc/os-release; then
+          printf '%s\n' \
+            'deb http://archive.debian.org/debian bullseye main' \
+            'deb http://archive.debian.org/debian bullseye-updates main' \
+            'deb http://archive.debian.org/debian-security bullseye-security main' \
+            > /etc/apt/sources.list
+        fi
         apt-get update
         apt-get install -y --no-install-recommends \
           build-essential clang libclang-dev pkg-config curl ca-certificates git jq procps
@@ -48,6 +64,7 @@ runs:
         "$HOME/.cargo/bin/rustup" toolchain install
 
     - name: VPP from the release SOURCE.json names
+      if: inputs.vpp-debs == ''
       shell: bash
       run: |
         set -eu
@@ -70,7 +87,27 @@ runs:
         rm -f /etc/sysctl.d/80-vpp.conf
         vpp --version
 
+    - name: VPP from the candidate debs
+      if: inputs.vpp-debs != ''
+      shell: bash
+      env:
+        VPP_DEBS: ${{ inputs.vpp-debs }}
+      run: |
+        set -eu
+        debs=()
+        for p in vpp libvppinfra libvppinfra-dev vpp-dev vpp-plugin-core; do
+          f=$(find "$VPP_DEBS" -name "${p}_*.deb" -print -quit)
+          [ -n "$f" ] || { echo "::error::no ${p}_*.deb under $VPP_DEBS"; exit 1; }
+          debs+=("$f")
+        done
+        VPP_INSTALL_SKIP_SYSCTL=1 apt-get install -y --no-install-recommends "${debs[@]}"
+        rm -f /etc/sysctl.d/80-vpp.conf
+        vpp --version
+
+    # Not for a candidate VPP: its target/ would be keyed by nothing that
+    # names it, and a cold build is the honest test anyway.
     - uses: actions/cache@v6
+      if: inputs.vpp-debs == ''
       with:
         path: |
           ~/.cargo/registry/index/
