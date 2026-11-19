@@ -592,7 +592,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "vpp-plugin"
 version = "0.2.2"
-source = "git+https://github.com/unredacted/vpp-plugin-rs?rev=363009582592076e74e1f15dcb4a2e5c001d0e7a#363009582592076e74e1f15dcb4a2e5c001d0e7a"
+source = "git+https://github.com/unredacted/vpp-plugin-rs?rev=1ae9776eaaa5d4099a2caa0b05c2ce5b7d01731d#1ae9776eaaa5d4099a2caa0b05c2ce5b7d01731d"
 dependencies = [
  "arrayvec",
  "bindgen",
@@ -611,7 +611,7 @@ dependencies = [
 [[package]]
 name = "vpp-plugin-macros"
 version = "0.2.1"
-source = "git+https://github.com/unredacted/vpp-plugin-rs?rev=363009582592076e74e1f15dcb4a2e5c001d0e7a#363009582592076e74e1f15dcb4a2e5c001d0e7a"
+source = "git+https://github.com/unredacted/vpp-plugin-rs?rev=1ae9776eaaa5d4099a2caa0b05c2ce5b7d01731d#1ae9776eaaa5d4099a2caa0b05c2ce5b7d01731d"
 dependencies = [
  "proc-macro2",
  "quote",
