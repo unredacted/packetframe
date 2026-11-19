@@ -78,9 +78,14 @@ runs:
           ~/.cargo/git/db/
           target/
           crates/vpp-plugins/pf-sampler/target/
-        key: bullseye-arm64-sampler-plugin-${{ hashFiles('**/Cargo.lock', 'crates/modules/vpp-offload/vpp-api/SOURCE.json') }}
+        # The VPP is part of every key, restore-keys included. vpp-plugin's
+        # build script reruns only when its own wrapper files change, never
+        # when the installed VPP headers do, so a target/ built against one
+        # VPP and restored for another keeps the old bindings and the old
+        # VPP_BUILD_VER (a v26.10 run linked a plugin requiring 26.06).
+        key: bullseye-arm64-sampler-plugin-${{ hashFiles('crates/modules/vpp-offload/vpp-api/SOURCE.json') }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          bullseye-arm64-sampler-plugin-
+          bullseye-arm64-sampler-plugin-${{ hashFiles('crates/modules/vpp-offload/vpp-api/SOURCE.json') }}-
 
     - name: Plugin fmt, clippy, build
       shell: bash
