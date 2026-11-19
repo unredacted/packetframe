@@ -1,6 +1,7 @@
 {
-  "vpp_ref": "v26.06",
-  "vpp_commit": "c3200b88dc46bd380f00a49ca3392a102cc1980b",
+  "vpp_ref": "v26.10",
+  "vpp_branch": "stable/2610",
+  "vpp_commit": "b4caea9817032447f0ee29ffecec35b46a7143dd",
   "platform": "octeon9",
   "gateway": "efg",
   "distro": "debian-bullseye",
@@ -8,6 +9,6 @@
   "octeon_pmd": "dev_octeon,net_cn10k,net_cn20k,net_cn9k",
   "patches": "none (upstream verbatim)",
   "packaging": "etc/sysctl.d/80-vpp.conf removed from the vpp .deb — applied at every boot, its vm.nr_hugepages=1024 is a 512 GiB hugepage request on 64K-page kernels (bricked a 64 GB EFG 2026-08-21); hugepage sizing belongs to the consumer at attach",
-  "built_by": "unredacted/vpp-unifi@ca06310b9e35a95bc856db2c6b369880b6c91fab",
-  "workflow_run": "https://github.com/unredacted/vpp-unifi/actions/runs/37196016516"
+  "built_by": "unredacted/vpp-unifi@1dbd75d2230d05158ccf4f954bec490c47b10e5c",
+  "workflow_run": "https://github.com/unredacted/vpp-unifi/actions/runs/44602223647"
 }

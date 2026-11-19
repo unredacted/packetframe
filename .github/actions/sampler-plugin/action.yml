@@ -54,7 +54,10 @@ runs:
         src=crates/modules/vpp-offload/vpp-api/SOURCE.json
         repo=$(jq -r '.built_by' "$src" | cut -d@ -f1)
         distro=$(jq -r '.distro' "$src" | sed 's/^debian-//')
-        tag="vpp-$(jq -r .vpp_ref "$src")-$(jq -r .platform "$src")-$distro-$(jq -r .arch "$src")"
+        # Same tag rule as ci.yml's byte-binding: a stable-branch build
+        # names its commit.
+        build=$(jq -r 'if (.vpp_branch // "") != "" then "-" + .vpp_commit[0:9] else "" end' "$src")
+        tag="vpp-$(jq -r .vpp_ref "$src")$build-$(jq -r .platform "$src")-$distro-$(jq -r .arch "$src")"
         dl=$(mktemp -d) && cd "$dl"
         base="https://github.com/$repo/releases/download/$tag"
         curl -fsSLO "$base/SHA256SUMS"

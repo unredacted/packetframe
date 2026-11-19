@@ -2143,6 +2143,107 @@
                 "options": {},
                 "comment": "/** \\brief Reply for sw_interface_get_default_rx_mode\n    @param context - sender context, to match reply w/ request\n    @param retval - return value\n    @param mode - polling=1, interrupt=2, adaptive=3\n*/"
             }
+        ],
+        [
+            "sw_interface_set_link_speed",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            [
+                "u32",
+                "link_speed"
+            ],
+            {
+                "crc": "0x2f0867fa",
+                "options": {},
+                "comment": "/** \\brief Set interface link speed (override)\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - index of the interface\n    @param link_speed - link speed in Kbps (0 means unknown / auto)\n*/"
+            }
+        ],
+        [
+            "sw_interface_set_link_speed_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            {
+                "crc": "0xe8d4e804",
+                "options": {}
+            }
+        ],
+        [
+            "sw_interface_get_speed_capa",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "client_index"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "vl_api_interface_index_t",
+                "sw_if_index"
+            ],
+            {
+                "crc": "0xf9e6675e",
+                "options": {},
+                "comment": "/** \\brief Get interface speed capabilities\n    @param client_index - opaque cookie to identify the sender\n    @param context - sender context, to match reply w/ request\n    @param sw_if_index - index of the interface\n*/"
+            }
+        ],
+        [
+            "sw_interface_get_speed_capa_reply",
+            [
+                "u16",
+                "_vl_msg_id"
+            ],
+            [
+                "u32",
+                "context"
+            ],
+            [
+                "i32",
+                "retval"
+            ],
+            [
+                "u32",
+                "count"
+            ],
+            [
+                "u32",
+                "speeds",
+                0,
+                "count"
+            ],
+            {
+                "crc": "0x20b21417",
+                "options": {},
+                "comment": "/** \\brief Reply for sw_interface_get_speed_capa\n    @param context - sender context, to match reply w/ request\n    @param retval - return value\n    @param count - number of supported speeds\n    @param speeds - supported speeds in Kbps\n*/"
+            }
         ]
     ],
     "unions": [
@@ -2657,10 +2758,16 @@
         },
         "sw_interface_get_default_rx_mode": {
             "reply": "sw_interface_get_default_rx_mode_reply"
+        },
+        "sw_interface_set_link_speed": {
+            "reply": "sw_interface_set_link_speed_reply"
+        },
+        "sw_interface_get_speed_capa": {
+            "reply": "sw_interface_get_speed_capa_reply"
         }
     },
     "options": {
-        "version": "3.2.4"
+        "version": "3.2.5"
     },
     "aliases": {
         "interface_index": {
@@ -2688,7 +2795,7 @@
             "type": "vl_api_ip6_prefix_t"
         }
     },
-    "vl_api_version": "0xcf7004cc",
+    "vl_api_version": "0x98d849f6",
     "imports": [
         "vnet/interface_types.api",
         "vnet/ethernet/ethernet_types.api",
