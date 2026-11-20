@@ -37,6 +37,8 @@ A point release on 0.6.4 for VPP v26.10, and for VPPs other than the vpp-unifi b
 1. Install the 0.6.5 package or tarball. The .deb runs no maintainer scripts, so the running daemon is unaffected.
 2. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with or without vpp-offload, as for 0.6.4.
 
+- **flow-export on a gateway already running VPP 26.10:** step 2 adopts the running VPP, and VPP reads its plugin directory only at start, so it keeps the plugin it loaded (0.6.4's, built for 26.06, which never sampled there). To load 0.6.5's, restart VPP too: `systemctl stop packetframe && packetframe detach --all && systemctl start packetframe`. While VPP restarts, steered traffic falls back to the kernel and XDP path. Then check `show pf-sampler` reads `active`.
+
 - **flow-export on a gateway still running VPP 26.06:** the packaged plugin is built for VPP `26.10.0-16~gb4caea981-octeon9`, so VPP 26.06 refuses it or leaves it inert. Forwarding and vpp-offload are unaffected; VPP just stops sampling. `packetframe feasibility`'s `flow-export.vpp.plugin` row and vppctl's `show pf-sampler` say which applies. To sample through VPP, do one of these:
   - Install VPP v26.10 first: unredacted/vpp-unifi `vpp-v26.10-b4caea981-octeon9-{bullseye,trixie}-arm64`, detach, install, attach. [Install and upgrade on the router](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/vpp-offload.md#install-and-upgrade-on-the-router)
   - Build the plugin for the VPP you run. ["Another VPP"](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/flow-export.md#vpp)
