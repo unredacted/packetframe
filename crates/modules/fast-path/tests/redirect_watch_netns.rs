@@ -301,7 +301,9 @@ impl Drop for LinksGuard {
 /// at watcher start, then moved by the `RTM_NEWLINK` a MAC change or a
 /// bridge enslavement emits — the port's own MAC while it is plain, its
 /// bridge's once it is a member, on a VLAN of the bridge once it has an
-/// L3 device there, and none once the bridge filters by VLAN.
+/// L3 device there; once the bridge filters by VLAN, on what its tables
+/// admit, following a `bridge vlan` add and delete; and none once it
+/// filters on 802.1ad.
 ///
 /// Runs in the HOST namespace (of the qemu VM), unlike the test above:
 /// `receive_macs` reads `/sys/class/net`, which is not remounted
@@ -412,9 +414,52 @@ fn rx_macs_follow_a_port_mac_change_and_its_bridge() {
         "vlan_filtering",
         "1",
     ]);
+    // The kernel's defaults: the port and the bridge itself both in
+    // VLAN 1, the port's PVID, which the bridge passes up untagged. VLAN
+    // 100 is in neither table, so its L3 device stops counting.
+    let rx_vlans = |vids: &'static [u16]| {
+        move || p.rx_macs() == vids.iter().map(|v| (ifindex, *v, BRIDGE)).collect()
+    };
     poll(
         &pins,
-        "a bridge that filters by VLAN leaves its member no entries",
+        "a bridge that filters by VLAN admits by its tables",
+        Duration::from_secs(5),
+        rx_vlans(&[0, 1]),
+    );
+
+    run(&["bridge", "vlan", "add", "dev", &port, "vid", "100"]);
+    run(&[
+        "bridge", "vlan", "add", "dev", &bridge, "vid", "100", "self",
+    ]);
+    poll(
+        &pins,
+        "VLAN 100 added to the port and the bridge reaches its L3 device",
+        Duration::from_secs(5),
+        rx_vlans(&[0, 1, 100]),
+    );
+
+    run(&["bridge", "vlan", "del", "dev", &port, "vid", "100"]);
+    poll(
+        &pins,
+        "VLAN 100 removed from the port is revoked",
+        Duration::from_secs(5),
+        rx_vlans(&[0, 1]),
+    );
+
+    run(&[
+        "ip",
+        "link",
+        "set",
+        "dev",
+        &bridge,
+        "type",
+        "bridge",
+        "vlan_protocol",
+        "802.1ad",
+    ]);
+    poll(
+        &pins,
+        "a bridge filtering on 802.1ad leaves its member no entries",
         Duration::from_secs(5),
         || p.rx_macs().is_empty(),
     );

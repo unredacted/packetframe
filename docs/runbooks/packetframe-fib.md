@@ -2499,11 +2499,21 @@ rules, each keyed on the VLANs it is received on
   device on a VLAN of the port. A VLAN sub-interface there with a MAC
   of its own is left out, so frames addressed to it take the kernel
   path;
-- a member of a bridge with `vlan_filtering` on (or unreadable):
-  nothing. The bridge admits frames by the port's VLAN table and PVID,
-  which the fast path does not read, so every frame on that port takes
-  the kernel path. Attach, and the watcher when the setting changes,
-  log `port's bridge filters by VLAN` by name;
+- a member of a bridge with `vlan_filtering` on (UniFi's `switch0`):
+  the same MACs, keyed by the VID on the wire, for each frame the
+  bridge admits and passes up to its own stack, read from one AF_BRIDGE
+  dump per refresh (`bridge vlan show`). An untagged or priority-tagged
+  frame takes the port's PVID; a VLAN must be in the port's table and
+  be one of the bridge's own (`bridge vlan show dev switch0`). Passed up
+  untagged it reaches the bridge's MAC; passed up tagged, the MACs of
+  that VLAN's L3 device as above. So on a gateway where each port has
+  VLAN 1 as PVID and 3900 tagged, the port's keys are VIDs 0, 1 and
+  3900. A `bridge vlan` add or delete is followed like any link change;
+- a member of a bridge filtering in a way that rule does not model
+  (`vlan_protocol 802.1ad`, or a setting that cannot be read): nothing,
+  so every frame on that port takes the kernel path. Attach, and the
+  watcher when the setting changes, log `port's bridge filters by VLAN
+  in a way RX_MACS does not model` with the reason;
 - a bond: its entries, keyed on the bond's ifindex and on each slave's
   (native XDP on a bond reports the slave as the ingress interface).
 
@@ -2531,9 +2541,11 @@ router MAC is missing from the map. Check:
 - `journalctl -u packetframe | grep -E 'RX_MACS|receive MACs'`: attach
   logs `RX_MACS populated`, the watcher logs `RX_MACS refreshed from
   link events`, and a port whose MACs could not be read logs `receive
-  MACs unreadable` by name.
+  MACs unreadable` by name (a failed `bridge VLAN dump` makes every
+  filtering bridge's member unreadable for that pass).
 - `bpftool map dump pinned /sys/fs/bpf/packetframe/fast-path/maps/RX_MACS`
-  against `ip -br link` and `cat /proc/net/vlan/config`. Each key is the
+  against `ip -br link`, `cat /proc/net/vlan/config` and, for a member
+  of a filtering bridge, `bridge vlan show`. Each key is the
   port's ifindex (4 bytes, little-endian), the MAC, and the VID (2
   bytes, little-endian; 0 for untagged). Every attached port should have
   its own MAC (plain port) or its bridge's MAC (bridge member) untagged,

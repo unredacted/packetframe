@@ -9,7 +9,10 @@
 //! - [`placement`]: the CPUs the daemon's control-plane threads run on
 //! - [`probe`]: kernel capability probes (see SPEC.md §2.1)
 //! - [`topology`]: kernel link shapes and the MACs the router receives on
+//! - `bridge_vlan` (`bridge-vlan` feature, Linux): every bridge port's VLAN table
 
+#[cfg(all(target_os = "linux", feature = "bridge-vlan"))]
+pub mod bridge_vlan;
 pub mod config;
 pub mod ethtool;
 pub mod events;
@@ -19,6 +22,8 @@ pub mod flow_coverage;
 pub mod frr;
 pub mod malloc;
 pub mod module;
+#[cfg(all(target_os = "linux", feature = "netlink"))]
+mod nl;
 pub mod placement;
 pub mod probe;
 pub mod sampler_ports;

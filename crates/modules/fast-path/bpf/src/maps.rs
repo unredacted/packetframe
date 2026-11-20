@@ -704,8 +704,9 @@ pub static VLAN_RESOLVE: HashMap<u32, VlanResolve> =
 /// Destination MACs the router receives on, per ingress port and VLAN:
 /// the port's own MAC for a plain port; its bridge's plus the bridge's
 /// VLAN L3 devices' for a bridge member, each on the VLANs it has an L3
-/// device for (`packetframe_common::topology::receive_vlan_macs`). A
-/// member of a bridge that filters by VLAN gets none. An attached bond's
+/// device for (`packetframe_common::topology::receive_vlan_macs`); on a
+/// bridge that filters by VLAN, on the VIDs its tables admit from the
+/// port and pass up (`BridgeVlans`). An attached bond's
 /// entries are keyed on each slave's ifindex as well, since that is the
 /// `ingress_ifindex` native XDP on a bond reports. A matched frame whose
 /// `(ingress ifindex, dst MAC, ingress VID)` is absent is not one the

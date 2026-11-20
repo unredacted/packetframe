@@ -6,9 +6,10 @@
 //! receive_vlan_macs`: the MACs of `receive_macs`, the rule vpp-offload
 //! scopes its divert rules by, each on the VLANs the router has an L3
 //! device for. This module adds what the fast path needs on top: an
-//! explicit *unknown* (a port whose state could not be read), a port
-//! *refused* because its bridge filters by VLAN, the ifindexes a port's
-//! frames can arrive under (a bond's slaves), and the plan that turns
+//! explicit *unknown* (a port whose state could not be read), the VLAN
+//! tables of a bridge that filters by VLAN, a port *refused* because its
+//! bridge filters in a way those tables do not model, the ifindexes a
+//! port's frames can arrive under (a bond's slaves), and the plan that turns
 //! desired sets into map writes without ever leaving a port's entries
 //! emptier than the truth.
 //!
@@ -22,8 +23,10 @@
 //! port's entries as they are — an unreadable sysfs is not evidence the
 //! MACs moved, and the stale entries are all MACs the router owned.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+
+use packetframe_common::topology::{BridgeVlanMode, BridgeVlans, VlanRecord};
 
 /// Layout mirror of `RxMacKey` in `bpf/src/maps.rs`: 12 bytes, no
 /// padding, so a userspace key matches the one the program builds
@@ -61,7 +64,8 @@ pub fn port_receive_macs(
     port: &str,
 ) -> Result<Vec<(u16, [u8; 6])>, String> {
     let vlans = packetframe_common::topology::read_vlan_config(vlan_config)?;
-    let macs = packetframe_common::topology::sysfs_receive_vlan_macs(sysfs_net, &vlans, None, port);
+    let macs =
+        packetframe_common::topology::sysfs_receive_vlan_macs(sysfs_net, &vlans, None, None, port);
     if macs.is_empty() {
         return Err(format!(
             "{port}: no address readable for the port or its bridge"
@@ -75,17 +79,46 @@ pub fn port_receive_macs(
 /// bridge that filters by VLAN.
 ///
 /// Such a bridge admits a frame by the port's VLAN table and PVID, and
-/// drops one the table excludes before anything routes it. Nothing here
-/// reads that table, so the port gets no entries at all and every frame
-/// on it takes the kernel path, which applies it. The bridge egress
-/// short-circuit and FDB pinning refuse these bridges for the same
-/// reason.
-pub fn port_receives(sysfs_net: &Path, vlan_config: &Path, port: &str) -> Result<Receives, String> {
-    if let Some(bridge) = packetframe_common::topology::sysfs_vlan_filtering_bridge(sysfs_net, port)
-    {
-        return Ok(Receives::Refused { bridge });
+/// passes it up to its own stack only on a VLAN of its own, so the pairs
+/// come from those tables (`tables(port, bridge)`, [`BridgeVlans`]): a
+/// frame the bridge would drop has no entry and takes the kernel path,
+/// which drops it. A filtering bridge the tables do not model (802.1ad,
+/// or a setting that cannot be read) refuses the port: no entries at
+/// all. The bridge egress short-circuit and FDB pinning still refuse
+/// every filtering bridge.
+///
+/// `Err` when the answer is not known: the VLAN table, the bridge's
+/// tables or the bridge's address could not be read. An empty set on a
+/// filtering bridge is an answer: the port is in no VLAN the router
+/// routes.
+pub fn port_receives(
+    sysfs_net: &Path,
+    vlan_config: &Path,
+    port: &str,
+    tables: impl FnOnce(&str, &str) -> Result<BridgeVlans, String>,
+) -> Result<Receives, String> {
+    use packetframe_common::topology as t;
+    match t::sysfs_bridge_vlan_mode(sysfs_net, port) {
+        BridgeVlanMode::Unfiltered => {
+            port_receive_macs(sysfs_net, vlan_config, port).map(Receives::On)
+        }
+        BridgeVlanMode::Unsupported { bridge, why } => Ok(Receives::Refused { bridge, why }),
+        BridgeVlanMode::Filtering { bridge } => {
+            let filter = tables(port, &bridge)?;
+            let vlans = t::read_vlan_config(vlan_config)?;
+            std::fs::read_to_string(sysfs_net.join(&bridge).join("address"))
+                .ok()
+                .and_then(|a| t::parse_mac(&a))
+                .ok_or_else(|| format!("{port}: bridge {bridge}'s address unreadable"))?;
+            Ok(Receives::On(t::sysfs_receive_vlan_macs(
+                sysfs_net,
+                &vlans,
+                None,
+                Some(&filter),
+                port,
+            )))
+        }
     }
-    port_receive_macs(sysfs_net, vlan_config, port).map(Receives::On)
 }
 
 /// What a port receives on.
@@ -93,8 +126,9 @@ pub fn port_receives(sysfs_net: &Path, vlan_config: &Path, port: &str) -> Result
 pub enum Receives {
     /// These `(vid, mac)` pairs.
     On(Vec<(u16, [u8; 6])>),
-    /// Nothing: a member of `bridge`, which filters by VLAN.
-    Refused { bridge: String },
+    /// Nothing: a member of `bridge`, which filters by VLAN in a way
+    /// [`BridgeVlans`] does not model (`why`).
+    Refused { bridge: String, why: String },
 }
 
 impl Receives {
@@ -106,17 +140,56 @@ impl Receives {
     }
 }
 
+/// Every bridge device's and port's VLAN records, dumped the first time
+/// a pass needs them and shared by every port of that pass: one
+/// AF_BRIDGE dump per pass, and none on a box with no filtering bridge.
+/// A failed dump makes every filtering bridge's member unknown for the
+/// pass.
+#[derive(Debug, Default)]
+pub struct BridgeTables(Option<Result<HashMap<String, Vec<VlanRecord>>, String>>);
+
+impl BridgeTables {
+    /// `port`'s and `bridge`'s tables. A device the dump does not name
+    /// has no VLANs.
+    pub fn lookup(&mut self, port: &str, bridge: &str) -> Result<BridgeVlans, String> {
+        let records = self
+            .0
+            .get_or_insert_with(dump_vlan_records)
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let of = |dev: &str| records.get(dev).map(Vec::as_slice).unwrap_or_default();
+        Ok(BridgeVlans::from_records(of(port), of(bridge)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn dump_vlan_records() -> Result<HashMap<String, Vec<VlanRecord>>, String> {
+    packetframe_common::bridge_vlan::dump_vlan_records()
+        .map_err(|e| format!("bridge VLAN dump: {e}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dump_vlan_records() -> Result<HashMap<String, Vec<VlanRecord>>, String> {
+    Err("bridge VLAN dump: Linux only".to_string())
+}
+
 /// [`port_receives`] against the live kernel. The VLAN table is the
 /// calling thread's (`/proc/thread-self/net`), as `linux_impl::
 /// read_vlan_config` reads it and for the same reason: the watcher
-/// calls this from its own thread.
-pub fn kernel_port_receives(port: &str) -> Result<Receives, String> {
+/// calls this from its own thread; the bridge tables' netlink socket is
+/// that thread's too.
+pub fn kernel_port_receives(port: &str, tables: &mut BridgeTables) -> Result<Receives, String> {
     let vlan_config = if Path::new("/proc/thread-self/net").is_dir() {
         "/proc/thread-self/net/vlan/config"
     } else {
         "/proc/net/vlan/config"
     };
-    port_receives(Path::new("/sys/class/net"), Path::new(vlan_config), port)
+    port_receives(
+        Path::new("/sys/class/net"),
+        Path::new(vlan_config),
+        port,
+        |p, b| tables.lookup(p, b),
+    )
 }
 
 /// The slave ifindexes of `port` if it is a bond (`bonding/slaves` under
@@ -153,9 +226,9 @@ pub struct PortRx {
 }
 
 /// [`kernel_port_receives`] plus [`bond_slaves`].
-pub fn kernel_port_rx(port: &str) -> Result<PortRx, String> {
+pub fn kernel_port_rx(port: &str, tables: &mut BridgeTables) -> Result<PortRx, String> {
     Ok(PortRx {
-        receives: kernel_port_receives(port)?,
+        receives: kernel_port_receives(port, tables)?,
         slaves: bond_slaves(Path::new("/sys/class/net"), port)?,
     })
 }
@@ -184,8 +257,8 @@ pub struct PortPlan {
     /// VLAN the router no longer routes must stop matching, and nothing in
     /// `add` replaces it.
     pub revoke: Vec<RxMacKey>,
-    /// The VLAN-filtering bridge the port is refused for, if it is.
-    pub refused: Option<String>,
+    /// `(bridge, why)` if the port is refused for its bridge.
+    pub refused: Option<(String, String)>,
 }
 
 /// What to write to bring `RX_MACS` to the desired sets.
@@ -240,7 +313,7 @@ pub fn plan(current: &[RxMacKey], desired: &[PortMacs]) -> RxMacPlan {
         out.ports.push(PortPlan {
             iface: port.iface.clone(),
             refused: match &rx.receives {
-                Receives::Refused { bridge } => Some(bridge.clone()),
+                Receives::Refused { bridge, why } => Some((bridge.clone(), why.clone())),
                 Receives::On(_) => None,
             },
             add: want.difference(&current).copied().collect(),
@@ -483,7 +556,7 @@ mod tests {
         );
     }
 
-    /// A port refused for its VLAN-filtering bridge loses every entry,
+    /// A port refused for its bridge (one filtering on 802.1ad, say) loses every entry,
     /// its bond slaves' too, and the plan names the bridge. Unlike an
     /// unknown port, nothing is kept: the refusal is an answer.
     #[test]
@@ -501,6 +574,7 @@ mod tests {
                 rx: Ok(PortRx {
                     receives: Receives::Refused {
                         bridge: "switch0".to_string(),
+                        why: "vlan_protocol 0x88a8".to_string(),
                     },
                     slaves: vec![6],
                 }),
@@ -508,7 +582,10 @@ mod tests {
         );
         assert!(adds(&p).is_empty() && removes(&p).is_empty());
         assert_eq!(revokes(&p), cur.to_vec());
-        assert_eq!(p.ports[0].refused.as_deref(), Some("switch0"));
+        assert_eq!(
+            p.ports[0].refused,
+            Some(("switch0".to_string(), "vlan_protocol 0x88a8".to_string()))
+        );
         let mut map: BTreeSet<RxMacKey> = cur.iter().copied().collect();
         run(&mut map, &p, &[]);
         assert!(map.is_empty());
@@ -601,8 +678,9 @@ mod tests {
     }
 
     /// The live reads on a sysfs fixture: a bridge member takes its
-    /// bridge's MAC; a port with nothing readable, or an unreadable VLAN
-    /// table, is unknown rather than empty; a bond's slaves resolve to
+    /// bridge's MAC, or what its filtering bridge's tables admit; a port
+    /// with nothing readable, or an unreadable VLAN table, is unknown
+    /// rather than empty; a bond's slaves resolve to
     /// ifindexes, and an unresolvable slave makes the bond unknown.
     #[test]
     fn sysfs_reads_are_unknown_rather_than_empty() {
@@ -622,19 +700,74 @@ mod tests {
         let no_vlans = root.join("absent-vlan-config");
 
         assert_eq!(port_receive_macs(&net, &no_vlans, "eth4"), Ok(vec![(0, A)]));
-        // A bridge that filters by VLAN refuses its member; so does one
-        // whose setting cannot be read. One that does not, does not.
-        let bridge = Receives::Refused {
-            bridge: "switch0".to_string(),
+        let no_tables = |_: &str, _: &str| -> Result<BridgeVlans, String> {
+            panic!("tables read for a bridge that does not filter")
         };
-        assert_eq!(port_receives(&net, &no_vlans, "eth4"), Ok(bridge.clone()));
+        // A bridge whose filtering setting cannot be read refuses its
+        // member; one that does not filter does not read the tables.
+        assert_eq!(
+            port_receives(&net, &no_vlans, "eth4", no_tables),
+            Ok(Receives::Refused {
+                bridge: "switch0".to_string(),
+                why: "vlan_filtering unreadable".to_string()
+            })
+        );
         let filtering = net.join("switch0").join("bridge").join("vlan_filtering");
-        std::fs::write(&filtering, "1\n").unwrap();
-        assert_eq!(port_receives(&net, &no_vlans, "eth4"), Ok(bridge));
         std::fs::write(&filtering, "0\n").unwrap();
         assert_eq!(
-            port_receives(&net, &no_vlans, "eth4"),
+            port_receives(&net, &no_vlans, "eth4", no_tables),
             Ok(Receives::On(vec![(0, A)]))
+        );
+        // One that filters by 802.1Q VLAN: its tables decide. VLAN 1 is
+        // the PVID and passed up untagged, to the bridge itself; VLAN 7
+        // is the port's but not the bridge's own.
+        std::fs::write(&filtering, "1\n").unwrap();
+        std::fs::write(
+            net.join("switch0").join("bridge").join("vlan_protocol"),
+            "0x8100\n",
+        )
+        .unwrap();
+        let rec = |vid, pvid, untagged| VlanRecord {
+            vid,
+            pvid,
+            untagged,
+            range_begin: false,
+            range_end: false,
+        };
+        let tables = |port: &str, bridge: &str| {
+            assert_eq!((port, bridge), ("eth4", "switch0"));
+            Ok(BridgeVlans::from_records(
+                &[rec(1, true, true), rec(7, false, false)],
+                &[rec(1, true, true)],
+            ))
+        };
+        assert_eq!(
+            port_receives(&net, &no_vlans, "eth4", tables),
+            Ok(Receives::On(vec![(0, A), (1, A)]))
+        );
+        assert_eq!(
+            port_receives(&net, &no_vlans, "eth4", |_, _| Ok(BridgeVlans::default())),
+            Ok(Receives::On(vec![])),
+            "a port in no VLAN receives nothing, and that is an answer"
+        );
+        assert_eq!(
+            port_receives(&net, &no_vlans, "eth4", |_, _| Err(
+                "dump failed".to_string()
+            )),
+            Err("dump failed".to_string()),
+            "unreadable tables leave the port unknown"
+        );
+        std::fs::write(
+            net.join("switch0").join("bridge").join("vlan_protocol"),
+            "0x88a8\n",
+        )
+        .unwrap();
+        assert_eq!(
+            port_receives(&net, &no_vlans, "eth4", no_tables),
+            Ok(Receives::Refused {
+                bridge: "switch0".to_string(),
+                why: "vlan_protocol 0x88a8".to_string()
+            })
         );
         assert!(port_receive_macs(&net, &no_vlans, "eth9").is_err());
         // A directory where the VLAN table should be: present, unreadable.

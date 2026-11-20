@@ -698,10 +698,10 @@ pub(crate) struct RxMacSync {
     /// Ports whose state could not be read this pass; their entries were
     /// left alone. The watcher retries while any of them still exists.
     pub unknown: Vec<(String, u32)>,
-    /// `(port, bridge)` for each port refused because its bridge filters
-    /// by VLAN: it has no entries, so every frame on it takes the kernel
-    /// path.
-    pub refused: Vec<(String, String)>,
+    /// `(port, bridge, why)` for each port refused because its bridge
+    /// filters by VLAN in a way `RX_MACS` does not model: it has no
+    /// entries, so every frame on it takes the kernel path.
+    pub refused: Vec<(String, String, String)>,
 }
 
 /// Bring `RX_MACS` to what each attached XDP port (`(iface, ifindex)`)
@@ -718,33 +718,39 @@ pub(crate) fn sync_rx_macs<T: std::borrow::BorrowMut<aya::maps::MapData>>(
     reported: &std::collections::HashSet<u32>,
 ) -> RxMacSync {
     let current: Vec<RxMacKey> = map.keys().filter_map(Result::ok).collect();
+    let mut tables = crate::rx_macs::BridgeTables::default();
     let desired: Vec<crate::rx_macs::PortMacs> = ports
         .iter()
         .map(|(iface, ifindex)| crate::rx_macs::PortMacs {
             iface: iface.clone(),
             ifindex: *ifindex,
-            rx: crate::rx_macs::kernel_port_rx(iface),
+            rx: crate::rx_macs::kernel_port_rx(iface, &mut tables),
         })
         .collect();
     let plan = crate::rx_macs::plan(&current, &desired);
     // Reported here when a refusal removes entries, i.e. when the bridge
-    // starts filtering under a running daemon; attach reports the ports
-    // it starts refused.
+    // changes how it filters under a running daemon; attach reports the
+    // ports it starts refused.
     for port in &plan.ports {
-        if let (Some(bridge), false) = (&port.refused, port.revoke.is_empty()) {
+        if let (Some((bridge, why)), false) = (&port.refused, port.revoke.is_empty()) {
             warn!(
                 iface = %port.iface,
                 %bridge,
+                reason = %why,
                 removed = port.revoke.len(),
-                "port's bridge filters by VLAN: its RX_MACS entries are removed and every \
-                 frame on it takes the kernel path, which applies the bridge's VLAN table"
+                "port's bridge filters by VLAN in a way RX_MACS does not model: its entries \
+                 are removed and every frame on it takes the kernel path, which applies the \
+                 bridge's filtering"
             );
         }
     }
-    let refused: Vec<(String, String)> = plan
+    let refused: Vec<(String, String, String)> = plan
         .ports
         .iter()
-        .filter_map(|p| Some((p.iface.clone(), p.refused.clone()?)))
+        .filter_map(|p| {
+            let (bridge, why) = p.refused.clone()?;
+            Some((p.iface.clone(), bridge, why))
+        })
         .collect();
     for (iface, ifindex, why) in &plan.unknown {
         if reported.contains(ifindex) {
@@ -2078,12 +2084,13 @@ pub fn attach(
             .map_err(|e| ModuleError::other(MODULE_NAME, format!("RX_MACS try_from: {e}")))?;
         let sync = sync_rx_macs(&mut rx, &ports, &Default::default());
         info!(entries = sync.added, "RX_MACS populated");
-        for (iface, bridge) in &sync.refused {
+        for (iface, bridge, why) in &sync.refused {
             warn!(
                 iface = %iface,
                 %bridge,
-                "port's bridge filters by VLAN: no RX_MACS entries, so every frame on it \
-                 takes the kernel path, which applies the bridge's VLAN table"
+                reason = %why,
+                "port's bridge filters by VLAN in a way RX_MACS does not model: no entries, so \
+                 every frame on it takes the kernel path, which applies the bridge's filtering"
             );
         }
     }

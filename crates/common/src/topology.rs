@@ -102,10 +102,11 @@ pub fn receive_macs(
     master_of: impl Fn(&str) -> Option<String>,
     mac_of: impl Fn(&str) -> Option<[u8; 6]>,
 ) -> Vec<[u8; 6]> {
-    let mut macs: Vec<[u8; 6]> = receive_vlan_macs(facts, devs, port, carried, master_of, mac_of)
-        .into_iter()
-        .map(|(_, mac)| mac)
-        .collect();
+    let mut macs: Vec<[u8; 6]> =
+        receive_vlan_macs(facts, devs, port, carried, None, master_of, mac_of)
+            .into_iter()
+            .map(|(_, mac)| mac)
+            .collect();
     macs.sort_unstable();
     macs.dedup();
     macs
@@ -124,6 +125,13 @@ pub fn receive_macs(
 /// - **A bridge member**: the bridge's MAC untagged, and on the VID of
 ///   each L3 device on a VLAN of the bridge the port carries (`carried`,
 ///   as for [`receive_macs`]), the bridge's MAC and that device's.
+/// - **A member of a bridge that filters by VLAN** (`filter`, which then
+///   replaces `carried`): the same MACs, keyed by the VID the frame
+///   carries on the wire, for the frames [`BridgeVlans::passes_up`] says
+///   the bridge admits from the port and passes up. A frame passed up
+///   untagged reaches the bridge's own MAC, one passed up on VLAN `v`
+///   the MACs of `v` above. `filter` is ignored for a port no bridge
+///   has enslaved.
 ///
 /// Sorted and deduplicated.
 pub fn receive_vlan_macs(
@@ -131,6 +139,7 @@ pub fn receive_vlan_macs(
     devs: &[String],
     port: &str,
     carried: Option<&[u16]>,
+    filter: Option<&BridgeVlans>,
     master_of: impl Fn(&str) -> Option<String>,
     mac_of: impl Fn(&str) -> Option<[u8; 6]>,
 ) -> Vec<(u16, [u8; 6])> {
@@ -154,25 +163,154 @@ pub fn receive_vlan_macs(
         }
         Some(master) => {
             let bridge_mac = mac_of(&master);
-            out.extend(bridge_mac.map(|m| (0, m)));
+            // Each VLAN of the bridge with an L3 device: the MACs a frame
+            // passed up tagged with it is addressed to the router by.
+            let mut l3: HashMap<u16, Vec<[u8; 6]>> = HashMap::new();
             for d in devs {
                 let Some(DevKind::BridgeVlan { bridge, vid }) = classify(facts, d) else {
                     continue;
                 };
-                if bridge != master
-                    || !carried.is_none_or(|c| c.contains(&vid))
-                    || bridge_of(d).is_some()
-                {
+                if bridge != master || bridge_of(d).is_some() {
                     continue;
                 }
-                out.extend(bridge_mac.map(|m| (vid, m)));
-                out.extend(mac_of(d).map(|m| (vid, m)));
+                let macs = l3.entry(vid).or_default();
+                macs.extend(bridge_mac);
+                macs.extend(mac_of(d));
+            }
+            match filter {
+                None => {
+                    out.extend(bridge_mac.map(|m| (0, m)));
+                    for (vid, macs) in &l3 {
+                        if carried.is_none_or(|c| c.contains(vid)) {
+                            out.extend(macs.iter().map(|m| (*vid, *m)));
+                        }
+                    }
+                }
+                Some(filter) => {
+                    for wire in std::iter::once(0).chain(filter.port.iter().copied()) {
+                        match filter.passes_up(wire) {
+                            None => {}
+                            Some(PassedUp::Untagged) => {
+                                out.extend(bridge_mac.map(|m| (wire, m)));
+                            }
+                            Some(PassedUp::Tagged(vid)) => {
+                                let macs = l3.get(&vid).map(Vec::as_slice).unwrap_or_default();
+                                out.extend(macs.iter().map(|m| (wire, *m)));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// One `IFLA_BRIDGE_VLAN_INFO` record of an AF_BRIDGE dump, as `bridge
+/// vlan show` prints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VlanRecord {
+    pub vid: u16,
+    pub pvid: bool,
+    /// Egress untagged: for a port, sent out of it without a tag; for a
+    /// bridge's own entry, passed up to its stack without one.
+    pub untagged: bool,
+    pub range_begin: bool,
+    pub range_end: bool,
+}
+
+/// `(vid, pvid, untagged)` for every VLAN `records` name, a
+/// `RANGE_BEGIN`…`RANGE_END` pair expanded into each VID between with the
+/// first record's flags. The `RTEXT_FILTER_BRVLAN` dump reports one VLAN
+/// per record today (ranges are `RTEXT_FILTER_BRVLAN_COMPRESSED`'s); a
+/// range is expanded rather than assumed away, and one left open is
+/// dropped, which only leaves VLANs out.
+pub fn expand_vlan_records(records: &[VlanRecord]) -> Vec<(u16, bool, bool)> {
+    let mut out = Vec::new();
+    let mut begin: Option<VlanRecord> = None;
+    for r in records {
+        match (begin, r.range_end) {
+            (Some(b), true) => {
+                out.extend((b.vid..=r.vid).map(|vid| (vid, b.pvid && vid == b.vid, b.untagged)));
+                begin = None;
+            }
+            _ if r.range_begin => begin = Some(*r),
+            _ => {
+                begin = None;
+                out.push((r.vid, r.pvid, r.untagged));
+            }
+        }
+    }
+    out
+}
+
+/// What a bridge that filters by VLAN admits from one of its ports and
+/// passes up to its own stack: the port's VLAN table and PVID, and the
+/// bridge's own ("self") VLANs. Read from an AF_BRIDGE dump
+/// (`crate::bridge_vlan`, Linux).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BridgeVlans {
+    /// The port's VLANs, sorted.
+    pub port: Vec<u16>,
+    /// The VLAN an untagged or priority-tagged frame from the port is
+    /// assigned; `None` drops them.
+    pub pvid: Option<u16>,
+    /// The bridge's own VLANs, sorted, each with whether a frame on it is
+    /// passed up untagged.
+    pub bridge: Vec<(u16, bool)>,
+}
+
+/// How a bridge passes a frame up to its own stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassedUp {
+    /// Without a tag: to the bridge device itself.
+    Untagged,
+    /// Tagged with this VID: to the bridge's VLAN device for it, if any.
+    Tagged(u16),
+}
+
+impl BridgeVlans {
+    /// From the port's and the bridge's records ([`VlanRecord`]).
+    pub fn from_records(port: &[VlanRecord], bridge: &[VlanRecord]) -> Self {
+        let port_vlans = expand_vlan_records(port);
+        let mut out = Self {
+            port: port_vlans.iter().map(|(vid, _, _)| *vid).collect(),
+            pvid: port_vlans
+                .iter()
+                .find(|(_, pvid, _)| *pvid)
+                .map(|(vid, _, _)| *vid),
+            bridge: expand_vlan_records(bridge)
+                .into_iter()
+                .map(|(vid, _, untagged)| (vid, untagged))
+                .collect(),
+        };
+        out.port.sort_unstable();
+        out.port.dedup();
+        out.bridge.sort_unstable();
+        out.bridge.dedup_by_key(|(vid, _)| *vid);
+        out
+    }
+
+    /// How a frame from the port carrying `wire` (its 802.1Q VID, 0 for
+    /// an untagged or priority-tagged frame) is passed up, or `None` if
+    /// the bridge does not pass it up. Ingress assigns an untagged frame
+    /// the PVID and admits a VLAN only if it is in the port's table; the
+    /// bridge then passes a frame up only on a VLAN of its own, untagged
+    /// if that entry says so (`br_allowed_ingress`, `br_pass_frame_up`).
+    pub fn passes_up(&self, wire: u16) -> Option<PassedUp> {
+        let vid = if wire == 0 { self.pvid? } else { wire };
+        if self.port.binary_search(&vid).is_err() {
+            return None;
+        }
+        let i = self.bridge.binary_search_by_key(&vid, |(v, _)| *v).ok()?;
+        Some(if self.bridge[i].1 {
+            PassedUp::Untagged
+        } else {
+            PassedUp::Tagged(vid)
+        })
+    }
 }
 
 /// Link facts read from a sysfs `class/net` root, with the VLAN table
@@ -210,7 +348,7 @@ pub fn sysfs_receive_macs(
     carried: Option<&[u16]>,
     port: &str,
 ) -> Vec<[u8; 6]> {
-    let mut macs: Vec<[u8; 6]> = sysfs_receive_vlan_macs(sysfs_net, vlans, carried, port)
+    let mut macs: Vec<[u8; 6]> = sysfs_receive_vlan_macs(sysfs_net, vlans, carried, None, port)
         .into_iter()
         .map(|(_, mac)| mac)
         .collect();
@@ -220,11 +358,12 @@ pub fn sysfs_receive_macs(
 }
 
 /// [`receive_vlan_macs`] read from a sysfs `class/net` root, as
-/// [`sysfs_receive_macs`].
+/// [`sysfs_receive_macs`], with the bridge's VLAN `filter` handed in.
 pub fn sysfs_receive_vlan_macs(
     sysfs_net: &Path,
     vlans: &HashMap<String, (u16, String)>,
     carried: Option<&[u16]>,
+    filter: Option<&BridgeVlans>,
     port: &str,
 ) -> Vec<(u16, [u8; 6])> {
     let master_of = |dev: &str| {
@@ -243,24 +382,51 @@ pub fn sysfs_receive_vlan_macs(
         root: sysfs_net,
         vlans,
     };
-    receive_vlan_macs(&facts, &devs, port, carried, master_of, mac_of)
+    receive_vlan_macs(&facts, &devs, port, carried, filter, master_of, mac_of)
 }
 
-/// The bridge `port` is a member of, if that bridge filters by VLAN
-/// (`bridge/vlan_filtering` not `0`), or if whether it does cannot be
-/// read. Such a bridge admits a frame by the port's VLAN table and PVID,
-/// which nothing here reads.
-pub fn sysfs_vlan_filtering_bridge(sysfs_net: &Path, port: &str) -> Option<String> {
-    let link = std::fs::read_link(sysfs_net.join(port).join("master")).ok()?;
-    let master = link.file_name()?.to_str()?.to_string();
+/// How `port`'s bridge, if it has one, admits frames from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeVlanMode {
+    /// No bridge enslaves the port, or its bridge does not filter by
+    /// VLAN: every VLAN passes, and only the VLAN devices decide.
+    Unfiltered,
+    /// `bridge` filters by 802.1Q VLAN: its VLAN tables decide
+    /// ([`BridgeVlans`]).
+    Filtering { bridge: String },
+    /// `bridge` filters in a way [`BridgeVlans`] does not model: whether
+    /// it filters cannot be read, or it filters by 802.1ad S-VLAN, where
+    /// a frame's 802.1Q tag is not the VLAN it is admitted on.
+    Unsupported { bridge: String, why: String },
+}
+
+/// [`BridgeVlanMode`] of `port`, from a sysfs `class/net` root:
+/// `bridge/vlan_filtering` and `bridge/vlan_protocol` of its master.
+pub fn sysfs_bridge_vlan_mode(sysfs_net: &Path, port: &str) -> BridgeVlanMode {
+    let Some(master) = std::fs::read_link(sysfs_net.join(port).join("master"))
+        .ok()
+        .and_then(|l| Some(l.file_name()?.to_str()?.to_string()))
+    else {
+        return BridgeVlanMode::Unfiltered;
+    };
     let bridge = sysfs_net.join(&master).join("bridge");
     if !bridge.is_dir() {
-        return None;
+        return BridgeVlanMode::Unfiltered;
     }
-    let filtering = std::fs::read_to_string(bridge.join("vlan_filtering"))
-        .map(|s| s.trim() != "0")
-        .unwrap_or(true);
-    filtering.then_some(master)
+    let unsupported = |why: &str| BridgeVlanMode::Unsupported {
+        bridge: master.clone(),
+        why: why.to_string(),
+    };
+    match std::fs::read_to_string(bridge.join("vlan_filtering")).map(|s| s.trim() == "0") {
+        Ok(true) => return BridgeVlanMode::Unfiltered,
+        Ok(false) => {}
+        Err(_) => return unsupported("vlan_filtering unreadable"),
+    }
+    match std::fs::read_to_string(bridge.join("vlan_protocol")) {
+        Ok(p) if p.trim() == "0x8100" => BridgeVlanMode::Filtering { bridge: master },
+        Ok(p) => unsupported(&format!("vlan_protocol {}", p.trim())),
+        Err(_) => unsupported("vlan_protocol unreadable"),
+    }
 }
 
 /// Read and parse `/proc/net/vlan/config` (or a fixture). A missing file
@@ -443,7 +609,7 @@ mod tests {
             })
         };
         let rx = |port: &str, carried: Option<&[u16]>| {
-            receive_vlan_macs(&edge(), &devs, port, carried, master_of, mac_of)
+            receive_vlan_macs(&edge(), &devs, port, carried, None, master_of, mac_of)
         };
         assert_eq!(
             rx("eth4", None),
@@ -476,6 +642,184 @@ mod tests {
                 "{port}: the same MACs as receive_macs"
             );
         }
+    }
+
+    fn rec(vid: u16, pvid: bool, untagged: bool) -> VlanRecord {
+        VlanRecord {
+            vid,
+            pvid,
+            untagged,
+            range_begin: false,
+            range_end: false,
+        }
+    }
+
+    /// The UniFi shape, as `bridge vlan show` prints it on a gateway:
+    /// each `switch0` port has VLAN 1 as PVID and 3900 tagged, and
+    /// `switch0`'s own entries are both tagged, so a frame on either is
+    /// passed up to `switch0.1` or `switch0.3900`, each the only member
+    /// of an L3 bridge (`br0`, `br3900`).
+    fn unifi_switch0() -> BridgeVlans {
+        BridgeVlans::from_records(
+            &[rec(1, true, true), rec(3900, false, false)],
+            &[rec(1, false, false), rec(3900, false, false)],
+        )
+    }
+
+    #[test]
+    fn a_filtering_bridge_admits_by_the_port_table_and_passes_up_by_its_own() {
+        let f = unifi_switch0();
+        assert_eq!(f.port, vec![1, 3900]);
+        assert_eq!(f.pvid, Some(1));
+        assert_eq!(
+            f.passes_up(0),
+            Some(PassedUp::Tagged(1)),
+            "untagged takes the PVID"
+        );
+        assert_eq!(f.passes_up(1), Some(PassedUp::Tagged(1)));
+        assert_eq!(f.passes_up(3900), Some(PassedUp::Tagged(3900)));
+        assert_eq!(f.passes_up(3901), None, "not in the port's table");
+
+        let no_pvid = BridgeVlans::from_records(&[rec(10, false, false)], &[rec(10, false, true)]);
+        assert_eq!(no_pvid.passes_up(0), None, "no PVID drops untagged frames");
+        assert_eq!(
+            no_pvid.passes_up(10),
+            Some(PassedUp::Untagged),
+            "the bridge's own entry passes VLAN 10 up untagged"
+        );
+
+        let port_only = BridgeVlans::from_records(
+            &[rec(1, true, true), rec(20, false, false)],
+            &[rec(1, true, true)],
+        );
+        assert_eq!(
+            port_only.passes_up(20),
+            None,
+            "admitted from the port but not a VLAN of the bridge's own"
+        );
+        assert_eq!(port_only.passes_up(0), Some(PassedUp::Untagged));
+    }
+
+    #[test]
+    fn vlan_ranges_are_expanded() {
+        let begin = VlanRecord {
+            range_begin: true,
+            ..rec(10, false, false)
+        };
+        let end = VlanRecord {
+            range_end: true,
+            ..rec(12, false, false)
+        };
+        assert_eq!(
+            expand_vlan_records(&[rec(1, true, true), begin, end]),
+            vec![
+                (1, true, true),
+                (10, false, false),
+                (11, false, false),
+                (12, false, false)
+            ]
+        );
+        assert_eq!(
+            expand_vlan_records(&[begin]),
+            vec![],
+            "a range left open is dropped"
+        );
+    }
+
+    /// On a filtering bridge, each MAC is keyed by the VID the frame
+    /// carries on the wire: an untagged frame on the PVID reaches the
+    /// PVID's L3 device, and a VLAN the port is not in, or the bridge
+    /// does not pass up, or that has no L3 device, gets nothing.
+    #[test]
+    fn a_filtering_bridge_member_receives_by_its_vlan_table() {
+        let mac = |b: u8| [0x02, 0, 0, 0, 0, b];
+        let facts = Facts {
+            vlans: [
+                ("switch0.1", (1, "switch0")),
+                ("switch0.3900", (3900, "switch0")),
+                ("switch0.20", (20, "switch0")),
+            ]
+            .into(),
+            bridges: [
+                ("switch0", vec!["eth2", "eth3"]),
+                ("br0", vec!["switch0.1"]),
+                ("br3900", vec!["switch0.3900"]),
+                ("br20", vec!["switch0.20"]),
+            ]
+            .into(),
+        };
+        let devs: Vec<String> = [
+            "switch0",
+            "switch0.1",
+            "switch0.3900",
+            "switch0.20",
+            "br0",
+            "br3900",
+            "br20",
+            "eth2",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let master_of = |d: &str| match d {
+            "eth2" | "eth3" => Some("switch0".to_string()),
+            "switch0.1" => Some("br0".to_string()),
+            "switch0.3900" => Some("br3900".to_string()),
+            "switch0.20" => Some("br20".to_string()),
+            _ => None,
+        };
+        let mac_of = |d: &str| {
+            Some(match d {
+                "br20" => mac(0x20),
+                d if d.starts_with("eth") => return None,
+                _ => mac(1),
+            })
+        };
+        let rx = |filter: &BridgeVlans| {
+            receive_vlan_macs(&facts, &devs, "eth2", None, Some(filter), master_of, mac_of)
+        };
+        assert_eq!(
+            rx(&unifi_switch0()),
+            vec![(0, mac(1)), (1, mac(1)), (3900, mac(1))],
+            "untagged and VLAN 1 reach br0, VLAN 3900 br3900; br20's VLAN is not the port's"
+        );
+
+        let with_20 = BridgeVlans::from_records(
+            &[rec(1, true, true), rec(20, false, false)],
+            &[rec(1, false, false), rec(20, false, false)],
+        );
+        assert_eq!(
+            rx(&with_20),
+            vec![(0, mac(1)), (1, mac(1)), (20, mac(1)), (20, mac(0x20))],
+            "VLAN 20 reaches br20 by its own MAC and the bridge's"
+        );
+
+        let untagged_up = BridgeVlans::from_records(
+            &[rec(1, true, true), rec(3900, false, false)],
+            &[rec(1, true, true), rec(3900, false, false)],
+        );
+        assert_eq!(
+            rx(&untagged_up),
+            vec![(0, mac(1)), (1, mac(1)), (3900, mac(1))],
+            "VLAN 1 passed up untagged reaches switch0 itself"
+        );
+
+        assert_eq!(
+            rx(&BridgeVlans::default()),
+            vec![],
+            "a port in no VLAN receives nothing"
+        );
+        assert_eq!(
+            receive_vlan_macs(&facts, &devs, "eth2", None, None, master_of, mac_of),
+            vec![
+                (0, mac(1)),
+                (1, mac(1)),
+                (20, mac(1)),
+                (20, mac(0x20)),
+                (3900, mac(1))
+            ],
+            "without the tables, every L3 VLAN of the bridge"
+        );
     }
 
     /// A master that is not a bridge (a VRF) routes rather than bridges:
@@ -565,7 +909,7 @@ mod tests {
         );
         assert!(sysfs_receive_macs(&root, &vlans, None, "eth9").is_empty());
         assert_eq!(
-            sysfs_receive_vlan_macs(&root, &vlans, None, "eth4"),
+            sysfs_receive_vlan_macs(&root, &vlans, None, None, "eth4"),
             vec![
                 (0, [0x02, 0, 0, 0, 0x69, 0xc7]),
                 (100, [0x02, 0, 0, 0, 0x01, 0x00]),
@@ -573,21 +917,63 @@ mod tests {
             ]
         );
 
-        // A bridge that filters by VLAN, or whose setting cannot be read,
-        // is named; one that does not, and a port with no bridge, are not.
+        // A filtering bridge's tables replace the VLAN devices alone:
+        // VLAN 100 passed up tagged reaches br100, and VLAN 1, the PVID,
+        // has no L3 device.
+        let filter = BridgeVlans {
+            port: vec![1, 100],
+            pvid: Some(1),
+            bridge: vec![(1, false), (100, false)],
+        };
         assert_eq!(
-            sysfs_vlan_filtering_bridge(&root, "eth4"),
-            Some("switch0".to_string()),
-            "unreadable counts as filtering"
+            sysfs_receive_vlan_macs(&root, &vlans, None, Some(&filter), "eth4"),
+            vec![
+                (100, [0x02, 0, 0, 0, 0x01, 0x00]),
+                (100, [0x02, 0, 0, 0, 0x69, 0xc7]),
+            ]
+        );
+
+        // The bridge's filtering mode, from its sysfs settings.
+        assert_eq!(
+            sysfs_bridge_vlan_mode(&root, "eth4"),
+            BridgeVlanMode::Unsupported {
+                bridge: "switch0".to_string(),
+                why: "vlan_filtering unreadable".to_string()
+            },
         );
         std::fs::write(root.join("switch0/bridge/vlan_filtering"), "0\n").unwrap();
-        assert_eq!(sysfs_vlan_filtering_bridge(&root, "eth4"), None);
+        assert_eq!(
+            sysfs_bridge_vlan_mode(&root, "eth4"),
+            BridgeVlanMode::Unfiltered
+        );
         std::fs::write(root.join("switch0/bridge/vlan_filtering"), "1\n").unwrap();
         assert_eq!(
-            sysfs_vlan_filtering_bridge(&root, "eth4"),
-            Some("switch0".to_string())
+            sysfs_bridge_vlan_mode(&root, "eth4"),
+            BridgeVlanMode::Unsupported {
+                bridge: "switch0".to_string(),
+                why: "vlan_protocol unreadable".to_string()
+            },
         );
-        assert_eq!(sysfs_vlan_filtering_bridge(&root, "eth2"), None);
+        std::fs::write(root.join("switch0/bridge/vlan_protocol"), "0x88a8\n").unwrap();
+        assert_eq!(
+            sysfs_bridge_vlan_mode(&root, "eth4"),
+            BridgeVlanMode::Unsupported {
+                bridge: "switch0".to_string(),
+                why: "vlan_protocol 0x88a8".to_string()
+            },
+            "an 802.1ad bridge admits on the S-tag, which RX_MACS does not key on"
+        );
+        std::fs::write(root.join("switch0/bridge/vlan_protocol"), "0x8100\n").unwrap();
+        assert_eq!(
+            sysfs_bridge_vlan_mode(&root, "eth4"),
+            BridgeVlanMode::Filtering {
+                bridge: "switch0".to_string()
+            }
+        );
+        assert_eq!(
+            sysfs_bridge_vlan_mode(&root, "eth2"),
+            BridgeVlanMode::Unfiltered
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
