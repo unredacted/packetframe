@@ -44,6 +44,8 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 - The route mirror is bounded by the FIB map's capacity: per family, a new prefix is refused once every slot is held, and advertisements are bounded per prefix and in aggregate. At the limit, installed routes keep forwarding and refreshes and withdrawals still apply; readiness is withheld and a full feed replay is requested after 60 s. A withdrawal whose map delete failed keeps its slot and fails every GC until a retried delete lands, where a retry used to report it done while the route stayed installed. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.6/docs/runbooks/packetframe-fib.md#route-capacity), [#417](https://github.com/unredacted/packetframe/pull/417))
 
+- The XDP program routes a frame only on a VLAN the router has an L3 device for on its ingress port, as the kernel would. A member of a bridge with `vlan_filtering` on gets no receive entries, so its frames take the kernel path. [#418](https://github.com/unredacted/packetframe/pull/418)
+
 ## [0.6.4] - 2026-11-13
 
 A point release on 0.6.3 for the minutes between a gateway's start and the fast path forwarding on a whole table, then VPP steering. After the 6.0.17 upgrade of the reference deployment (2026-11-12), the operator switched `dry-run` off by hand once the seed had applied (1:43 under load) and moved the steering lever once VPP was ready (22 s). The daemon can now do both itself. A route-ledger seed goes into the live FIB longest prefix first, the neighbour resolver keeps serving while the seed applies, and the daemon runs at bgpd's priority. A 0.6.3 config and route ledger carry over unchanged. Both new behaviours are opt-in.

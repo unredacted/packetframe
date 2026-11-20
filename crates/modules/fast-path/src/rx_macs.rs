@@ -1,14 +1,16 @@
-//! The destination MACs each attached port receives on, for the XDP
-//! program's `RX_MACS` check (see `bpf/src/main.rs`,
+//! The destination MACs each attached port receives on, and on which
+//! VLANs, for the XDP program's `RX_MACS` check (see `bpf/src/main.rs`,
 //! `addressed_to_router`).
 //!
 //! What the set is comes from `packetframe_common::topology::
-//! receive_macs`, the rule vpp-offload scopes its divert rules by. This
-//! module adds what the fast path needs on top: an explicit *unknown* (a
-//! port whose state could not be read), the ifindexes a port's frames can
-//! arrive under (a bond's slaves), and the plan that turns desired sets
-//! into map writes without ever leaving a port's entries emptier than the
-//! truth.
+//! receive_vlan_macs`: the MACs of `receive_macs`, the rule vpp-offload
+//! scopes its divert rules by, each on the VLANs the router has an L3
+//! device for. This module adds what the fast path needs on top: an
+//! explicit *unknown* (a port whose state could not be read), a port
+//! *refused* because its bridge filters by VLAN, the ifindexes a port's
+//! frames can arrive under (a bond's slaves), and the plan that turns
+//! desired sets into map writes without ever leaving a port's entries
+//! emptier than the truth.
 //!
 //! Policy, because the map fails in one direction only: a port with no
 //! entries passes every frame to the kernel, which is correct but is
@@ -23,47 +25,43 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
-/// Layout mirror of `RxMacKey` in `bpf/src/maps.rs`: 12 bytes, the pad
-/// explicit and always zero so a userspace key matches the one the
-/// program builds byte-for-byte.
+/// Layout mirror of `RxMacKey` in `bpf/src/maps.rs`: 12 bytes, no
+/// padding, so a userspace key matches the one the program builds
+/// byte-for-byte. `vid` is the frame's 802.1Q VID, 0 for untagged.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RxMacKey {
     pub ifindex: u32,
     pub mac: [u8; 6],
-    pub _pad: u16,
+    pub vid: u16,
 }
 
 const _: () = assert!(std::mem::size_of::<RxMacKey>() == 12);
 
 impl RxMacKey {
-    pub fn new(ifindex: u32, mac: [u8; 6]) -> Self {
-        Self {
-            ifindex,
-            mac,
-            _pad: 0,
-        }
+    pub fn new(ifindex: u32, vid: u16, mac: [u8; 6]) -> Self {
+        Self { ifindex, mac, vid }
     }
 }
 
-/// The MACs `port` receives on, read from a sysfs `class/net` root and a
-/// `/proc/net/vlan/config`. VLAN membership is not read (`carried =
-/// None`), so a bridge member takes every VLAN L3 device's MAC on its
-/// bridge: each is a MAC the router owns, so the extra entries route
-/// only frames addressed to the router.
+/// The `(vid, mac)` pairs `port` receives on, read from a sysfs
+/// `class/net` root and a `/proc/net/vlan/config`. VLAN membership is
+/// not read (`carried = None`), so a bridge member takes every VLAN L3
+/// device on its bridge: a MAC the router owns on a VLAN the router
+/// routes, so the extra entries route only frames the kernel would.
 ///
 /// `Err` when the answer is not known: the VLAN table could not be read
-/// (a partial set would silently leave out VLAN L3 MACs), or no address
-/// could be read for the port or its bridge (a port always has one, so
-/// an empty set means the read failed, not that the port receives on
+/// (a partial set would silently leave out VLANs), or no address could
+/// be read for the port or its bridge (a port always has one, so an
+/// empty set means the read failed, not that the port receives on
 /// nothing).
 pub fn port_receive_macs(
     sysfs_net: &Path,
     vlan_config: &Path,
     port: &str,
-) -> Result<Vec<[u8; 6]>, String> {
+) -> Result<Vec<(u16, [u8; 6])>, String> {
     let vlans = packetframe_common::topology::read_vlan_config(vlan_config)?;
-    let macs = packetframe_common::topology::sysfs_receive_macs(sysfs_net, &vlans, None, port);
+    let macs = packetframe_common::topology::sysfs_receive_vlan_macs(sysfs_net, &vlans, None, port);
     if macs.is_empty() {
         return Err(format!(
             "{port}: no address readable for the port or its bridge"
@@ -72,17 +70,53 @@ pub fn port_receive_macs(
     Ok(macs)
 }
 
-/// [`port_receive_macs`] against the live kernel. The VLAN table is the
+/// What `port` receives on, or that it is refused, from a sysfs root and
+/// a VLAN table: [`port_receive_macs`], unless the port is a member of a
+/// bridge that filters by VLAN.
+///
+/// Such a bridge admits a frame by the port's VLAN table and PVID, and
+/// drops one the table excludes before anything routes it. Nothing here
+/// reads that table, so the port gets no entries at all and every frame
+/// on it takes the kernel path, which applies it. The bridge egress
+/// short-circuit and FDB pinning refuse these bridges for the same
+/// reason.
+pub fn port_receives(sysfs_net: &Path, vlan_config: &Path, port: &str) -> Result<Receives, String> {
+    if let Some(bridge) = packetframe_common::topology::sysfs_vlan_filtering_bridge(sysfs_net, port)
+    {
+        return Ok(Receives::Refused { bridge });
+    }
+    port_receive_macs(sysfs_net, vlan_config, port).map(Receives::On)
+}
+
+/// What a port receives on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Receives {
+    /// These `(vid, mac)` pairs.
+    On(Vec<(u16, [u8; 6])>),
+    /// Nothing: a member of `bridge`, which filters by VLAN.
+    Refused { bridge: String },
+}
+
+impl Receives {
+    pub fn pairs(&self) -> &[(u16, [u8; 6])] {
+        match self {
+            Self::On(p) => p,
+            Self::Refused { .. } => &[],
+        }
+    }
+}
+
+/// [`port_receives`] against the live kernel. The VLAN table is the
 /// calling thread's (`/proc/thread-self/net`), as `linux_impl::
 /// read_vlan_config` reads it and for the same reason: the watcher
 /// calls this from its own thread.
-pub fn kernel_port_receive_macs(port: &str) -> Result<Vec<[u8; 6]>, String> {
+pub fn kernel_port_receives(port: &str) -> Result<Receives, String> {
     let vlan_config = if Path::new("/proc/thread-self/net").is_dir() {
         "/proc/thread-self/net/vlan/config"
     } else {
         "/proc/net/vlan/config"
     };
-    port_receive_macs(Path::new("/sys/class/net"), Path::new(vlan_config), port)
+    port_receives(Path::new("/sys/class/net"), Path::new(vlan_config), port)
 }
 
 /// The slave ifindexes of `port` if it is a bond (`bonding/slaves` under
@@ -106,11 +140,11 @@ pub fn bond_slaves(sysfs_net: &Path, port: &str) -> Result<Vec<u32>, String> {
         .collect()
 }
 
-/// What an attached port receives on: its MACs, and every other ifindex
-/// a frame for it can arrive under.
+/// What an attached port receives on: its `(vid, mac)` pairs, and every
+/// other ifindex a frame for it can arrive under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortRx {
-    pub macs: Vec<[u8; 6]>,
+    pub receives: Receives,
     /// A bond's slaves. Native XDP on a bond runs the program on each
     /// slave, where `ingress_ifindex` is the slave's; generic XDP runs it
     /// on the bond itself. Keys for both cost nothing and keep the check
@@ -118,10 +152,10 @@ pub struct PortRx {
     pub slaves: Vec<u32>,
 }
 
-/// [`kernel_port_receive_macs`] plus [`bond_slaves`].
+/// [`kernel_port_receives`] plus [`bond_slaves`].
 pub fn kernel_port_rx(port: &str) -> Result<PortRx, String> {
     Ok(PortRx {
-        macs: kernel_port_receive_macs(port)?,
+        receives: kernel_port_receives(port)?,
         slaves: bond_slaves(Path::new("/sys/class/net"), port)?,
     })
 }
@@ -141,10 +175,17 @@ pub struct PortPlan {
     pub iface: String,
     /// Keys to insert, before any of `remove`.
     pub add: Vec<RxMacKey>,
-    /// MACs the port no longer receives on. Deleted only once every key
-    /// in `add` is in the map: a failed replacement must not leave the
-    /// port with neither MAC.
+    /// MACs the port no longer receives on, on a VLAN it still does.
+    /// Deleted only once every key in `add` is in the map: a failed
+    /// replacement must not leave the port with neither MAC.
     pub remove: Vec<RxMacKey>,
+    /// Keys on a VLAN the port no longer receives on at all, or every key
+    /// of a refused port. Deleted whatever the additions do: a frame on a
+    /// VLAN the router no longer routes must stop matching, and nothing in
+    /// `add` replaces it.
+    pub revoke: Vec<RxMacKey>,
+    /// The VLAN-filtering bridge the port is refused for, if it is.
+    pub refused: Option<String>,
 }
 
 /// What to write to bring `RX_MACS` to the desired sets.
@@ -184,16 +225,27 @@ pub fn plan(current: &[RxMacKey], desired: &[PortMacs]) -> RxMacPlan {
         claimed.extend(idx.iter().copied());
         let want: BTreeSet<RxMacKey> = idx
             .iter()
-            .flat_map(|i| rx.macs.iter().map(|m| RxMacKey::new(*i, *m)))
+            .flat_map(|i| {
+                rx.receives
+                    .pairs()
+                    .iter()
+                    .map(|(vid, mac)| RxMacKey::new(*i, *vid, *mac))
+            })
             .collect();
+        let vids: BTreeSet<u16> = rx.receives.pairs().iter().map(|(vid, _)| *vid).collect();
+        let (remove, revoke): (Vec<RxMacKey>, Vec<RxMacKey>) = current
+            .iter()
+            .filter(|k| idx.contains(&k.ifindex) && !want.contains(k))
+            .partition(|k| vids.contains(&k.vid));
         out.ports.push(PortPlan {
             iface: port.iface.clone(),
+            refused: match &rx.receives {
+                Receives::Refused { bridge } => Some(bridge.clone()),
+                Receives::On(_) => None,
+            },
             add: want.difference(&current).copied().collect(),
-            remove: current
-                .iter()
-                .filter(|k| idx.contains(&k.ifindex) && !want.contains(k))
-                .copied()
-                .collect(),
+            remove,
+            revoke,
         });
     }
     if out.unknown.is_empty() {
@@ -218,8 +270,8 @@ pub struct Applied {
 }
 
 /// Carry out `plan` through `insert` / `remove`: per port, every
-/// addition, then its removals only if every addition landed; stale keys
-/// last.
+/// addition, then its removals only if every addition landed, and its
+/// revocations whatever happened; stale keys last.
 pub fn apply(
     plan: &RxMacPlan,
     mut insert: impl FnMut(&RxMacKey) -> Result<(), String>,
@@ -243,6 +295,7 @@ pub fn apply(
         } else if !port.remove.is_empty() {
             out.held.push(port.iface.clone());
         }
+        removals.extend(port.revoke.iter().copied());
     }
     removals.extend(plan.stale.iter().copied());
     for k in &removals {
@@ -272,7 +325,7 @@ mod tests {
             iface: name.to_string(),
             ifindex,
             rx: Ok(PortRx {
-                macs: macs.to_vec(),
+                receives: Receives::On(macs.iter().map(|m| (0, *m)).collect()),
                 slaves: slaves.to_vec(),
             }),
         }
@@ -292,6 +345,10 @@ mod tests {
 
     fn removes(p: &RxMacPlan) -> Vec<RxMacKey> {
         p.ports.iter().flat_map(|q| q.remove.clone()).collect()
+    }
+
+    fn revokes(p: &RxMacPlan) -> Vec<RxMacKey> {
+        p.ports.iter().flat_map(|q| q.revoke.clone()).collect()
     }
 
     /// Run `plan` against an in-memory map, failing the inserts of
@@ -320,9 +377,9 @@ mod tests {
         assert_eq!(
             adds(&p),
             vec![
-                RxMacKey::new(4, A),
-                RxMacKey::new(4, B),
-                RxMacKey::new(2, C)
+                RxMacKey::new(4, 0, A),
+                RxMacKey::new(4, 0, B),
+                RxMacKey::new(2, 0, C)
             ]
         );
         assert!(removes(&p).is_empty() && p.stale.is_empty() && p.unknown.is_empty());
@@ -331,16 +388,16 @@ mod tests {
     #[test]
     fn a_changed_mac_is_added_and_the_old_one_removed() {
         let p = plan(
-            &[RxMacKey::new(4, A), RxMacKey::new(4, B)],
+            &[RxMacKey::new(4, 0, A), RxMacKey::new(4, 0, B)],
             &[port("eth4", 4, &[B, C])],
         );
-        assert_eq!(adds(&p), vec![RxMacKey::new(4, C)]);
-        assert_eq!(removes(&p), vec![RxMacKey::new(4, A)]);
+        assert_eq!(adds(&p), vec![RxMacKey::new(4, 0, C)]);
+        assert_eq!(removes(&p), vec![RxMacKey::new(4, 0, A)]);
     }
 
     #[test]
     fn a_converged_map_plans_nothing() {
-        let p = plan(&[RxMacKey::new(4, A)], &[port("eth4", 4, &[A])]);
+        let p = plan(&[RxMacKey::new(4, 0, A)], &[port("eth4", 4, &[A])]);
         assert!(adds(&p).is_empty() && removes(&p).is_empty() && p.stale.is_empty());
     }
 
@@ -349,10 +406,14 @@ mod tests {
     /// the kernel path on a read error — and is reported by name.
     #[test]
     fn an_unknown_port_keeps_its_entries() {
-        let cur = [RxMacKey::new(4, A), RxMacKey::new(2, C)];
+        let cur = [RxMacKey::new(4, 0, A), RxMacKey::new(2, 0, C)];
         let p = plan(&cur, &[unknown("eth4", 4), port("eth2", 2, &[B])]);
-        assert_eq!(adds(&p), vec![RxMacKey::new(2, B)]);
-        assert_eq!(removes(&p), vec![RxMacKey::new(2, C)], "eth4's entry stays");
+        assert_eq!(adds(&p), vec![RxMacKey::new(2, 0, B)]);
+        assert_eq!(
+            removes(&p),
+            vec![RxMacKey::new(2, 0, C)],
+            "eth4's entry stays"
+        );
         assert!(p.stale.is_empty());
         assert_eq!(
             p.unknown,
@@ -362,13 +423,13 @@ mod tests {
 
     #[test]
     fn keys_of_unclaimed_ifindexes_are_stale() {
-        let p = plan(&[RxMacKey::new(9, A)], &[port("eth4", 4, &[A])]);
-        assert_eq!(adds(&p), vec![RxMacKey::new(4, A)]);
-        assert_eq!(p.stale, vec![RxMacKey::new(9, A)]);
+        let p = plan(&[RxMacKey::new(9, 0, A)], &[port("eth4", 4, &[A])]);
+        assert_eq!(adds(&p), vec![RxMacKey::new(4, 0, A)]);
+        assert_eq!(p.stale, vec![RxMacKey::new(9, 0, A)]);
         // With any port unknown, an unclaimed ifindex may be that port's
         // bond slave: it stays.
         let p = plan(
-            &[RxMacKey::new(9, A)],
+            &[RxMacKey::new(9, 0, A)],
             &[port("eth4", 4, &[A]), unknown("bond0", 5)],
         );
         assert!(p.stale.is_empty(), "{p:?}");
@@ -382,19 +443,113 @@ mod tests {
         assert_eq!(
             adds(&p),
             vec![
-                RxMacKey::new(5, A),
-                RxMacKey::new(6, A),
-                RxMacKey::new(7, A)
+                RxMacKey::new(5, 0, A),
+                RxMacKey::new(6, 0, A),
+                RxMacKey::new(7, 0, A)
             ]
         );
         let cur = [
-            RxMacKey::new(5, A),
-            RxMacKey::new(6, A),
-            RxMacKey::new(7, A),
+            RxMacKey::new(5, 0, A),
+            RxMacKey::new(6, 0, A),
+            RxMacKey::new(7, 0, A),
         ];
         let p = plan(&cur, &[bond("bond0", 5, &[A], &[6])]);
         assert!(adds(&p).is_empty());
-        assert_eq!(p.stale, vec![RxMacKey::new(7, A)]);
+        assert_eq!(p.stale, vec![RxMacKey::new(7, 0, A)]);
+    }
+
+    /// Each MAC is keyed on the VLAN it is received on, so a frame
+    /// tagged with another VID misses.
+    #[test]
+    fn pairs_are_keyed_by_vlan() {
+        let p = plan(
+            &[],
+            &[PortMacs {
+                iface: "eth4".to_string(),
+                ifindex: 4,
+                rx: Ok(PortRx {
+                    receives: Receives::On(vec![(0, A), (100, A), (100, B)]),
+                    slaves: vec![],
+                }),
+            }],
+        );
+        assert_eq!(
+            adds(&p),
+            vec![
+                RxMacKey::new(4, 0, A),
+                RxMacKey::new(4, 100, A),
+                RxMacKey::new(4, 100, B)
+            ]
+        );
+    }
+
+    /// A port refused for its VLAN-filtering bridge loses every entry,
+    /// its bond slaves' too, and the plan names the bridge. Unlike an
+    /// unknown port, nothing is kept: the refusal is an answer.
+    #[test]
+    fn a_refused_port_loses_every_entry() {
+        let cur = [
+            RxMacKey::new(5, 0, A),
+            RxMacKey::new(5, 100, A),
+            RxMacKey::new(6, 0, A),
+        ];
+        let p = plan(
+            &cur,
+            &[PortMacs {
+                iface: "bond0".to_string(),
+                ifindex: 5,
+                rx: Ok(PortRx {
+                    receives: Receives::Refused {
+                        bridge: "switch0".to_string(),
+                    },
+                    slaves: vec![6],
+                }),
+            }],
+        );
+        assert!(adds(&p).is_empty() && removes(&p).is_empty());
+        assert_eq!(revokes(&p), cur.to_vec());
+        assert_eq!(p.ports[0].refused.as_deref(), Some("switch0"));
+        let mut map: BTreeSet<RxMacKey> = cur.iter().copied().collect();
+        run(&mut map, &p, &[]);
+        assert!(map.is_empty());
+    }
+
+    /// A VLAN the port no longer routes loses its keys even when another
+    /// key's insert fails (a full map, say). Withholding removals keeps a
+    /// MAC change from leaving a port with neither MAC; a VLAN gone from
+    /// the port has nothing to keep, and its key would go on routing a
+    /// VLAN the kernel drops.
+    #[test]
+    fn a_vlan_no_longer_routed_is_revoked_even_when_an_insert_fails() {
+        let on = |pairs: &[(u16, [u8; 6])]| PortMacs {
+            iface: "eth4".to_string(),
+            ifindex: 4,
+            rx: Ok(PortRx {
+                receives: Receives::On(pairs.to_vec()),
+                slaves: vec![],
+            }),
+        };
+        let cur = [
+            RxMacKey::new(4, 0, A),
+            RxMacKey::new(4, 100, A),
+            RxMacKey::new(4, 300, A),
+        ];
+        // VLAN 100 gone, 200 new, 300's MAC replaced; 200 and B refused.
+        let p = plan(&cur, &[on(&[(0, A), (200, A), (300, B)])]);
+        assert_eq!(revokes(&p), vec![RxMacKey::new(4, 100, A)]);
+        assert_eq!(removes(&p), vec![RxMacKey::new(4, 300, A)]);
+        let mut map: BTreeSet<RxMacKey> = cur.iter().copied().collect();
+        let applied = run(
+            &mut map,
+            &p,
+            &[RxMacKey::new(4, 200, A), RxMacKey::new(4, 300, B)],
+        );
+        assert_eq!(applied.held, vec!["eth4".to_string()]);
+        assert_eq!(
+            map,
+            BTreeSet::from([RxMacKey::new(4, 0, A), RxMacKey::new(4, 300, A)]),
+            "100 revoked; 300 keeps its old MAC until the new one lands"
+        );
     }
 
     /// A replacement MAC that cannot be inserted (map full, a transient
@@ -402,15 +557,15 @@ mod tests {
     /// removals are withheld, other ports proceed.
     #[test]
     fn a_failed_replacement_keeps_the_old_mac() {
-        let cur = [RxMacKey::new(4, A), RxMacKey::new(2, A)];
+        let cur = [RxMacKey::new(4, 0, A), RxMacKey::new(2, 0, A)];
         let p = plan(&cur, &[port("eth4", 4, &[B]), port("eth2", 2, &[C])]);
         let mut map: BTreeSet<RxMacKey> = cur.iter().copied().collect();
-        let applied = run(&mut map, &p, &[RxMacKey::new(4, B)]);
+        let applied = run(&mut map, &p, &[RxMacKey::new(4, 0, B)]);
         assert_eq!(applied.held, vec!["eth4".to_string()]);
         assert_eq!(applied.failed.len(), 1);
         assert_eq!(
             map,
-            BTreeSet::from([RxMacKey::new(4, A), RxMacKey::new(2, C)]),
+            BTreeSet::from([RxMacKey::new(4, 0, A), RxMacKey::new(2, 0, C)]),
             "eth4 keeps A; eth2 moves to C"
         );
     }
@@ -419,7 +574,7 @@ mod tests {
     #[test]
     fn additions_precede_removals() {
         let p = plan(
-            &[RxMacKey::new(4, A), RxMacKey::new(2, A)],
+            &[RxMacKey::new(4, 0, A), RxMacKey::new(2, 0, A)],
             &[port("eth4", 4, &[B]), port("eth2", 2, &[C])],
         );
         let log = RefCell::new(Vec::new());
@@ -437,10 +592,10 @@ mod tests {
         assert_eq!(
             log.into_inner(),
             vec![
-                ("add", RxMacKey::new(4, B)),
-                ("add", RxMacKey::new(2, C)),
-                ("del", RxMacKey::new(4, A)),
-                ("del", RxMacKey::new(2, A)),
+                ("add", RxMacKey::new(4, 0, B)),
+                ("add", RxMacKey::new(2, 0, C)),
+                ("del", RxMacKey::new(4, 0, A)),
+                ("del", RxMacKey::new(2, 0, A)),
             ]
         );
     }
@@ -466,7 +621,21 @@ mod tests {
         std::fs::create_dir_all(net.join("eth9")).unwrap();
         let no_vlans = root.join("absent-vlan-config");
 
-        assert_eq!(port_receive_macs(&net, &no_vlans, "eth4"), Ok(vec![A]));
+        assert_eq!(port_receive_macs(&net, &no_vlans, "eth4"), Ok(vec![(0, A)]));
+        // A bridge that filters by VLAN refuses its member; so does one
+        // whose setting cannot be read. One that does not, does not.
+        let bridge = Receives::Refused {
+            bridge: "switch0".to_string(),
+        };
+        assert_eq!(port_receives(&net, &no_vlans, "eth4"), Ok(bridge.clone()));
+        let filtering = net.join("switch0").join("bridge").join("vlan_filtering");
+        std::fs::write(&filtering, "1\n").unwrap();
+        assert_eq!(port_receives(&net, &no_vlans, "eth4"), Ok(bridge));
+        std::fs::write(&filtering, "0\n").unwrap();
+        assert_eq!(
+            port_receives(&net, &no_vlans, "eth4"),
+            Ok(Receives::On(vec![(0, A)]))
+        );
         assert!(port_receive_macs(&net, &no_vlans, "eth9").is_err());
         // A directory where the VLAN table should be: present, unreadable.
         assert!(port_receive_macs(&net, &net, "eth4").is_err());

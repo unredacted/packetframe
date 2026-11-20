@@ -143,14 +143,14 @@ impl Pins {
             .collect()
     }
 
-    /// `RX_MACS` as `(ifindex, mac)` pairs.
-    fn rx_macs(&self) -> HashSet<(u32, [u8; 6])> {
+    /// `RX_MACS` as `(ifindex, vid, mac)`.
+    fn rx_macs(&self) -> HashSet<(u32, u16, [u8; 6])> {
         let rm = MapData::from_pin(pin::map_path(&self.root, "RX_MACS")).expect("pin");
         let rx: AyaHashMap<MapData, RxMacKey, u8> =
             AyaHashMap::try_from(Map::HashMap(rm)).expect("rx");
         rx.keys()
             .filter_map(Result::ok)
-            .map(|k| (k.ifindex, k.mac))
+            .map(|k| (k.ifindex, k.vid, k.mac))
             .collect()
     }
 
@@ -300,7 +300,8 @@ impl Drop for LinksGuard {
 /// `RX_MACS` follows the attached port's receive MACs at runtime: filled
 /// at watcher start, then moved by the `RTM_NEWLINK` a MAC change or a
 /// bridge enslavement emits — the port's own MAC while it is plain, its
-/// bridge's once it is a member.
+/// bridge's once it is a member, on a VLAN of the bridge once it has an
+/// L3 device there, and none once the bridge filters by VLAN.
 ///
 /// Runs in the HOST namespace (of the qemu VM), unlike the test above:
 /// `receive_macs` reads `/sys/class/net`, which is not remounted
@@ -343,7 +344,7 @@ fn rx_macs_follow_a_port_mac_change_and_its_bridge() {
         RedirectTargetWatcher::start(&pins.root, Vec::new(), vec![(port.clone(), ifindex)])
             .expect("watcher start");
     let p = &pins;
-    let rx_is = |want: [u8; 6]| move || p.rx_macs() == HashSet::from([(ifindex, want)]);
+    let rx_is = |want: [u8; 6]| move || p.rx_macs() == HashSet::from([(ifindex, 0, want)]);
 
     poll(
         &pins,
@@ -378,12 +379,44 @@ fn rx_macs_follow_a_port_mac_change_and_its_bridge() {
         "type",
         "bridge",
     ]);
+    // Up, as a real bridge is: the kernel announces a change to a
+    // bridge's settings (`vlan_filtering` below) only on an up device.
+    run(&["ip", "link", "set", &bridge, "up"]);
     run(&["ip", "link", "set", &port, "master", &bridge]);
     poll(
         &pins,
         "a bridge member receives on its bridge's MAC",
         Duration::from_secs(5),
         rx_is(BRIDGE),
+    );
+
+    let vlan = format!("{bridge}.100");
+    run(&[
+        "ip", "link", "add", "link", &bridge, "name", &vlan, "type", "vlan", "id", "100",
+    ]);
+    poll(
+        &pins,
+        "a VLAN L3 device on the bridge adds its VLAN",
+        Duration::from_secs(5),
+        || p.rx_macs() == HashSet::from([(ifindex, 0, BRIDGE), (ifindex, 100, BRIDGE)]),
+    );
+
+    run(&[
+        "ip",
+        "link",
+        "set",
+        "dev",
+        &bridge,
+        "type",
+        "bridge",
+        "vlan_filtering",
+        "1",
+    ]);
+    poll(
+        &pins,
+        "a bridge that filters by VLAN leaves its member no entries",
+        Duration::from_secs(5),
+        || p.rx_macs().is_empty(),
     );
 
     watcher.shutdown();
