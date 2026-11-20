@@ -279,21 +279,31 @@ fast-path accepts, never one it refused.
 - **Installing the plugin.** The arm64 `.deb` installs it at
   `/usr/lib/packetframe/vpp_plugins/pf_sampler_plugin.so`, and the arm64
   gnu tarball carries it under `vpp_plugins/`. `packetframe feasibility`
-  says whether it was built for the VPP that runs. VPP refuses a
-  mismatched plugin without failing to start.
+  says whether it was built for the VPP that runs. A plugin built for
+  another VPP never samples, and VPP still starts:
+  - VPP's loader may refuse it.
+  - If the loader accepts it (VPP compares versions by prefix), the
+    plugin stays inert.
+  - `show pf-sampler` in vppctl says `active` or `INERT:` and why.
+    `show plugins` listing it proves nothing.
 - **Another VPP.** The packaged plugin is built against the VPP release
-  that `crates/modules/vpp-offload/vpp-api/SOURCE.json` names, and VPP
-  loads a plugin only for the version it was built for. Any other VPP
-  gets its own build:
-  - On a host with that VPP's `vpp-dev` and `libvppinfra-dev`
-    installed, plus clang, libclang and the Rust toolchain that
-    `rust-toolchain.toml` names, run
-    `cargo build --release --locked` in `crates/vpp-plugins/pf-sampler`.
-    The build takes the version it requires from those headers.
+  that `crates/modules/vpp-offload/vpp-api/SOURCE.json` names. Any
+  other VPP gets its own build:
+  - Install that VPP's `vpp-dev` and `libvppinfra-dev`, plus
+    `build-essential`, clang, libclang and the Rust toolchain that
+    `rust-toolchain.toml` names.
+  - Run `cargo build --release --locked` in
+    `crates/vpp-plugins/pf-sampler`. The build takes the version it
+    requires from those headers, and rebuilds when they change.
+  - The pinned `vpp-plugin` fork builds against the VPP releases its
+    pin comment in `crates/vpp-plugins/pf-sampler/Cargo.toml` names.
+    A release that changes the headers it uses needs the fork adapted
+    first, as 26.10 did.
   - Install `target/release/libpf_sampler.so` as the packaged plugin's
-    path above.
-  - `packetframe feasibility` compares that version with dpkg's `vpp`
-    package, so it only warns for a VPP that dpkg doesn't know.
+    path above, then restart VPP: it reads that directory only at
+    start. Check `show pf-sampler`.
+  - `packetframe feasibility` compares the plugin's version with dpkg's
+    `vpp` package, so it only warns for a VPP that dpkg doesn't know.
 
 ## Kernel sampler
 
