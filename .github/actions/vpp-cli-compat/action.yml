@@ -17,7 +17,7 @@ description: >-
 # job runs it against the release SOURCE.json names; unredacted/vpp-unifi
 # runs it with `vpp-debs` on every VPP it is about to publish, so no
 # release this repo can vendor is one whose CLI it misreads. ci.yml's
-# `vpp-fdio-arm64` job runs it on fd.io's own Ubuntu packages too.
+# `vpp-fdio` job runs it on fd.io's own Ubuntu packages too.
 inputs:
   vpp-debs:
     description: >-
