@@ -84,7 +84,7 @@
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -306,6 +306,9 @@ pub struct BgpListener {
     read_hold: ReadHold,
     /// The constants outside tests; see [`QuietWindows`].
     quiet: QuietWindows,
+    /// A route event has been dispatched since the last `Resync` was
+    /// queued, so the next one would change something; see `serve`.
+    resync_owed: AtomicBool,
 }
 
 /// What lets the listener hold the GC at End-of-RIB until FRR has
@@ -686,6 +689,7 @@ impl BgpListener {
             gc_hold: None,
             read_hold: ReadHold::default(),
             quiet: QuietWindows::default(),
+            resync_owed: AtomicBool::new(false),
         }
     }
 
@@ -743,8 +747,9 @@ impl BgpListener {
         self.serve(listener).await
     }
 
-    /// Accept loop. One session at a time; on disconnect emit `Resync`
-    /// and re-accept.
+    /// Accept loop. One session at a time; on disconnect emit `Resync`,
+    /// if any route event was dispatched since the last one, and
+    /// re-accept.
     ///
     /// While a session runs, the peer's later connections wait in the
     /// kernel's accept queue, handshaken and with the peer's OPEN in
@@ -797,14 +802,30 @@ impl BgpListener {
             if let Some(hold) = &self.gc_hold {
                 hold.session_ended(crate::fib::route_ledger::now_unix());
             }
+            // Only when a route event has been dispatched since the last
+            // one. A Resync marks the route source's advertisements unseen,
+            // and only a route event (an UPDATE's Add or Del, End-of-RIB's
+            // GC) changes what is marked. After a failed handshake or a
+            // session that sent nothing, another would re-mark what is
+            // already marked, at the cost of a walk over the whole mirror
+            // that everything queued behind it waits out, the next
+            // session's table included: any local process able to reach
+            // the port could keep queueing them while no session was up
+            // (Codex Security finding occ_3b034ce6). A mirror seeded from
+            // the route ledger starts unseen, so nothing is owed before the
+            // first session.
+            //
             // Queued, not awaited. The programmer applies commands in
             // order, so the Resync lands ahead of everything the next
             // session sends whenever it is applied; waiting for it would
             // only hold the next handshake behind whatever the programmer
             // is still working through, such as a GC of a million routes,
             // while the peer's new connection waits unanswered.
-            if let Err(e) = self.prog_handle.queue_route_event(RouteEvent::Resync).await {
-                warn!(error = %e, "Resync dispatch failed");
+            if self.resync_owed.swap(false, Ordering::AcqRel) {
+                if let Err(e) = self.prog_handle.queue_route_event(RouteEvent::Resync).await {
+                    warn!(error = %e, "Resync dispatch failed");
+                    self.resync_owed.store(true, Ordering::Release);
+                }
             }
         }
     }
@@ -1255,6 +1276,9 @@ impl BgpListener {
             .field("held_secs", held_secs)
             .emit();
         }
+        // Owed before the dispatch: one that fails partway can have
+        // removed routes all the same.
+        self.resync_owed.store(true, Ordering::Release);
         let dispatched = self
             .prog_handle
             .apply_route_event(RouteEvent::InitiationComplete)
@@ -1422,6 +1446,7 @@ impl BgpListener {
                 Some(e) => e,
                 None => continue,
             };
+            self.resync_owed.store(true, Ordering::Release);
             if let Err(e) = self.prog_handle.apply_route_event(event).await {
                 warn!(error = %e, "route event dispatch failed");
             }
@@ -4264,6 +4289,89 @@ mod tests {
         serving.await.expect("join").expect("serve");
     }
 
+    /// The peer's half of the OPEN exchange on a connection `serve`
+    /// took.
+    async fn handshake(peer: &mut TcpStream, caps: PeerCaps) {
+        assert_eq!(read_type(peer).await.expect("OPEN"), MSG_TYPE_OPEN);
+        peer.write_all(&peer_open(caps)).await.expect("send OPEN");
+        assert_eq!(
+            read_type(peer).await.expect("KEEPALIVE"),
+            MSG_TYPE_KEEPALIVE
+        );
+        for family in caps.end_of_rib_we_send().iter() {
+            let msg = read_message(peer).await.expect("End-of-RIB");
+            assert_eq!(end_of_rib_in(&msg), Some(family));
+        }
+    }
+
+    /// A connection `serve` took that fails the OPEN exchange: our OPEN,
+    /// then a header with no marker in place of the peer's, then whatever
+    /// we answer until we close. Returns once we have closed, which is
+    /// after the session's end was handled up to the next accept.
+    async fn fail_open_exchange(addr: SocketAddr) {
+        let mut conn = TcpStream::connect(addr).await.expect("connect");
+        assert_eq!(read_type(&mut conn).await.expect("OPEN"), MSG_TYPE_OPEN);
+        conn.write_all(&[0u8; BGP_HEADER_LEN])
+            .await
+            .expect("send a broken header");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while read_message(&mut conn).await.is_ok() {}
+        })
+        .await
+        .expect("a broken OPEN exchange is closed");
+    }
+
+    /// A Resync only after a session that dispatched a route event. One
+    /// after connections that never got past the OPEN exchange, or after a
+    /// session that came up and sent nothing, would re-mark a mirror
+    /// already marked, with a walk over all of it (Codex Security finding
+    /// occ_3b034ce6). A session that sends an UPDATE owes exactly one,
+    /// and failed attempts after it owe none more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_session_that_dispatched_a_route_event_queues_a_resync() {
+        let (prog, log) = recording_handle();
+        let (lst, listener, addr) = unserved(prog.clone()).await;
+        let shutdown = listener.shutdown.clone();
+        let serving = tokio::spawn(listener.serve(lst));
+
+        fail_open_exchange(addr).await;
+        fail_open_exchange(addr).await;
+        let mut quiet = TcpStream::connect(addr).await.expect("connect");
+        handshake(&mut quiet, PLAIN_PEER).await;
+        drop(quiet);
+        // Served only once the quiet session's end has been handled.
+        fail_open_exchange(addr).await;
+        // A round trip behind anything the listener queued.
+        prog.mirror_counts().await.expect("mirror counts");
+        assert!(
+            log.is_empty(),
+            "nothing was dispatched, so nothing is owed: {:?}",
+            log.events()
+        );
+
+        let mut live = TcpStream::connect(addr).await.expect("connect");
+        handshake(&mut live, PLAIN_PEER).await;
+        live.write_all(&test_update()).await.expect("UPDATE");
+        wait_until("the UPDATE is applied", Duration::from_secs(5), || {
+            !log.is_empty()
+        })
+        .await;
+        drop(live);
+        fail_open_exchange(addr).await;
+        fail_open_exchange(addr).await;
+        prog.mirror_counts().await.expect("mirror counts");
+        let events = log.events();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [RouteEvent::Add { .. }, RouteEvent::Resync]
+            ),
+            "one Resync, for the session that sent a route: {events:?}"
+        );
+        shutdown.cancel();
+        serving.await.expect("join").expect("serve");
+    }
+
     // --- End-of-RIB (2026-10-12) ---------------------------------------
 
     /// 384 UPDATEs into a 1.3M-route dump, an FRR starved for CPU went
@@ -5020,21 +5128,6 @@ mod tests {
                 wr.write_all(&encode_end_of_rib(family))
                     .await
                     .expect("End-of-RIB");
-            }
-        }
-
-        /// The peer's half of the OPEN exchange on a connection `serve`
-        /// took.
-        async fn handshake(peer: &mut TcpStream, caps: PeerCaps) {
-            assert_eq!(read_type(peer).await.expect("OPEN"), MSG_TYPE_OPEN);
-            peer.write_all(&peer_open(caps)).await.expect("send OPEN");
-            assert_eq!(
-                read_type(peer).await.expect("KEEPALIVE"),
-                MSG_TYPE_KEEPALIVE
-            );
-            for family in caps.end_of_rib_we_send().iter() {
-                let msg = read_message(peer).await.expect("End-of-RIB");
-                assert_eq!(end_of_rib_in(&msg), Some(family));
             }
         }
 

@@ -61,7 +61,7 @@ use tracing::{debug, info, warn};
 
 use packetframe_common::fib::{IpPrefix, PeerId, RouteEvent, RouteSourceError};
 
-use crate::fib::programmer::FibProgrammerHandle;
+use crate::fib::programmer::{FibProgrammerHandle, ProgrammerError};
 
 /// Cap on a single BMP message size. Per RFC 7854 §4.1 the
 /// `msg_length` is a 32-bit unsigned field; bird in practice emits
@@ -170,6 +170,10 @@ pub struct BmpStation {
     /// the socket's lifetime; review finding) while neither an old
     /// silence nor another peer's stragglers can.
     pulses_at_lower: std::sync::atomic::AtomicU64,
+    /// A route event has been dispatched since the last `Resync`, so the
+    /// next one would change something. As the BGP listener's: see its
+    /// `serve`.
+    resync_owed: std::sync::atomic::AtomicBool,
 }
 
 /// Re-export for callers building the station.
@@ -203,7 +207,17 @@ impl BmpStation {
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
             stale_state_possible: std::sync::atomic::AtomicBool::new(false),
             pulses_at_lower: std::sync::atomic::AtomicU64::new(0),
+            resync_owed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Dispatch a route event that changes the mirror, owing the next
+    /// `Resync` first: one that fails partway can have changed it all
+    /// the same.
+    async fn apply_owing_resync(&self, event: RouteEvent) -> Result<(), ProgrammerError> {
+        self.resync_owed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.prog_handle.apply_route_event(event).await
     }
 
     /// Lower the session and remember how much stream had been seen:
@@ -405,13 +419,24 @@ impl BmpStation {
                             // route-source advertisement (never the
                             // resolver's local_arp routes); the next Add
                             // storm clears marks; still-marked entries
-                            // get GC'd on InitiationComplete.
-                            if let Err(e) = self
-                                .prog_handle
-                                .apply_route_event(RouteEvent::Resync)
-                                .await
+                            // get GC'd on InitiationComplete. Only when a
+                            // route event was dispatched since the last
+                            // one: otherwise it re-marks what is already
+                            // marked, with a walk over the whole mirror
+                            // (Codex Security finding occ_3b034ce6).
+                            if self
+                                .resync_owed
+                                .swap(false, std::sync::atomic::Ordering::AcqRel)
                             {
-                                warn!(error = %e, "Resync dispatch failed");
+                                if let Err(e) = self
+                                    .prog_handle
+                                    .apply_route_event(RouteEvent::Resync)
+                                    .await
+                                {
+                                    warn!(error = %e, "Resync dispatch failed");
+                                    self.resync_owed
+                                        .store(true, std::sync::atomic::Ordering::Release);
+                                }
                             }
                         }
                         Err(e) => {
@@ -546,8 +571,7 @@ impl BmpStation {
                     // epoch unable to re-establish it (review finding).
                     if !init_complete_fired {
                         if let Err(e) = self
-                            .prog_handle
-                            .apply_route_event(RouteEvent::InitiationComplete)
+                            .apply_owing_resync(RouteEvent::InitiationComplete)
                             .await
                         {
                             warn!(error = %e, "InitiationComplete dispatch failed");
@@ -704,8 +728,7 @@ impl BmpStation {
                 let peer_id = peer_id_from_header(pph);
                 info!(?peer_id, peer_ip = %pph.peer_ip, "PeerDown");
                 if let Err(e) = self
-                    .prog_handle
-                    .apply_route_event(RouteEvent::PeerDown { peer_id })
+                    .apply_owing_resync(RouteEvent::PeerDown { peer_id })
                     .await
                 {
                     warn!(?peer_id, error = %e, "PeerDown dispatch failed");
@@ -846,7 +869,7 @@ impl BmpStation {
                             path_id: None,
                         },
                     };
-                    if let Err(e) = self.prog_handle.apply_route_event(event).await {
+                    if let Err(e) = self.apply_owing_resync(event).await {
                         warn!(?peer_id, error = %e, "route event dispatch failed");
                     }
                 }
@@ -1082,4 +1105,46 @@ fn bind_with_reuseaddr(addr: SocketAddr) -> std::io::Result<TcpListener> {
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
     socket.listen(8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fib::programmer::recording_handle;
+    use tokio::io::AsyncWriteExt;
+
+    /// Connections that end without a frame dispatch no route event, so
+    /// they owe no Resync: before, each queued a walk over the whole
+    /// mirror (Codex Security finding occ_3b034ce6).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_that_sent_nothing_queues_no_resync() {
+        let (prog, log) = recording_handle();
+        // A free loopback port: `run` binds its own.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port");
+        let shutdown = CancellationToken::new();
+        let station = BmpStation::new(addr, prog.clone(), shutdown.clone());
+        let serving = tokio::spawn(station.run());
+        for _ in 0..3 {
+            let mut conn = loop {
+                match TcpStream::connect(addr).await {
+                    Ok(c) => break c,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            };
+            conn.shutdown().await.expect("close");
+            // Our end closes once the station has handled the connection.
+            let mut byte = [0u8; 1];
+            tokio::time::timeout(Duration::from_secs(5), conn.read(&mut byte))
+                .await
+                .expect("the station closes its end")
+                .ok();
+        }
+        // A round trip behind anything the station dispatched.
+        prog.mirror_counts().await.expect("mirror counts");
+        assert!(log.is_empty(), "{:?}", log.events());
+        shutdown.cancel();
+        serving.await.expect("join").expect("run");
+    }
 }
