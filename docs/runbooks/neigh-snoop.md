@@ -33,7 +33,9 @@ BGP upload. **It never transmits.**
   (`mac_conflict`) and ignored: a second router leaking on that
   participant's port is more likely than a real move, and NUD will
   fail the entry if the held MAC stops answering — FAILED *is*
-  repaired.
+  repaired. PacketFrame checks all addresses asserted by a frame before
+  learning a MAC. It checks a declared router’s protected bindings before
+  deriving a MAC for another address.
 - **Participants that never resolve anyone.** Passive learning makes
   an unresolved next-hop rare, not impossible. The FRR next-hop gate
   (below) makes it harmless.
@@ -349,6 +351,11 @@ purpose:
 - `<persist-dir>/<bridge>.json` — the next start's seed (`rm` it to
   forget a bridge's table; a wrong MAC in it costs one failed unicast
   probe and is corrected on the next sighting).
+
+When upgrading to version 2 neighbor snapshots, PacketFrame imports a version 1
+entry only if the kernel independently holds its MAC in a REACHABLE, PERMANENT,
+or NOARP binding for that address. Other legacy entries must be learned again.
+Later starts use the version 2 snapshot for normal warm seeding.
 
 `packetframe status` prints each bridge's persisted table size and
 age without a daemon. Startup and status accept a regular snapshot up to
