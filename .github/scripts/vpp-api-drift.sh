@@ -14,7 +14,19 @@
 #
 # Run from the repo root. unredacted/vpp-unifi runs it on every VPP it is
 # about to publish; see crates/modules/vpp-offload/vpp-api/README.md.
+#
+# DRIFT_LEVEL=notice reports a drift as information and exits 0: ci.yml's
+# fd.io job, comparing against an upstream release other than the one
+# SOURCE.json names, where a drift is a fact about that release, not a
+# failure of this checkout. A bundle the codegen cannot read still fails.
 set -euo pipefail
+
+level=${DRIFT_LEVEL:-error}
+case "$level" in error | notice) ;; *) echo "::error::DRIFT_LEVEL must be error or notice, not '$level'"; exit 1 ;; esac
+drift() {
+  echo "::$level::$1"
+  [ "$level" = notice ] || exit 1
+}
 
 bundle=${1:?usage: $0 <vpp-api-json.tar.gz>}
 vendored=crates/modules/vpp-offload/vpp-api
@@ -27,15 +39,18 @@ tar xzf "$bundle" -C "$work/bundle"
 for f in "$vendored"/*.api.json; do
   name=$(basename "$f")
   src=$(find "$work/bundle" -name "$name" -print -quit)
-  [ -n "$src" ] || { echo "::error::$name is vendored here but absent from the candidate's API bundle"; exit 1; }
+  if [ -z "$src" ]; then
+    drift "$name is vendored here but absent from the candidate's API bundle"
+    exit 0
+  fi
   cp "$src" "$work/api/$name"
 done
 
 cargo run -q -p packetframe-vpp-api-codegen -- "$work/api" "$work/generated.rs"
 
 if ! diff -u "$generated" "$work/generated.rs" > "$work/drift.diff"; then
-  echo "::error::wire drift: the candidate VPP changed messages vpp-offload speaks, so this PacketFrame would refuse it at attach. Re-vendor against it first (crates/modules/vpp-offload/vpp-api/README.md)."
   head -200 "$work/drift.diff"
-  exit 1
+  drift "wire drift: the candidate VPP changed messages vpp-offload speaks, so this PacketFrame would refuse it at attach. Re-vendor against it first (crates/modules/vpp-offload/vpp-api/README.md)."
+  exit 0
 fi
 echo "no wire drift: generated.rs regenerates byte-identical from the candidate's $(ls "$work/api" | wc -l | tr -d " ") vendored .api.json files"
