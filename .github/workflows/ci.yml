@@ -423,6 +423,10 @@ jobs:
       image: ubuntu:noble
       # A tmpfs mount for the sampler directory, and VPP itself.
       options: --privileged
+    defaults:
+      run:
+        # A container's default is sh, which has no pipefail.
+        shell: bash
     env:
       FDIO_VPP: 26.10-release
       FDIO_DEBS: /fdio-debs
