@@ -356,10 +356,12 @@ const VLAN_RESOLVE_MAX_ENTRIES: u32 = 256;
 /// `mss-clamp <cidr> [via <iface>] <mtu>` directive becomes one entry.
 const MSS_CLAMP_PREFIX_MAX_ENTRIES: u32 = 1024;
 
-/// Max `(ingress ifindex, destination MAC)` pairs in `RX_MACS`. A port
-/// has one MAC, or its bridge's plus one per VLAN L3 device with a MAC
-/// of its own; 1024 covers every attached port on a box whose VLAN
-/// bridges all carry distinct MACs.
+/// Max `(ingress ifindex, destination MAC, VID)` entries in `RX_MACS`.
+/// A port has its MAC untagged plus one entry per L3 VLAN, two where
+/// the VLAN's L3 device has a MAC of its own: on a box whose VLAN
+/// devices share the bridge's MAC (UniFi) that is one per VLAN. A port
+/// that cannot fit keeps its previous entries and its frames on the
+/// missing VLANs take the kernel path.
 const RX_MACS_MAX_ENTRIES: u32 = 1024;
 
 /// Max per-egress mss-clamp entries. Sized like the redirect devmap
@@ -411,14 +413,15 @@ pub struct VlanResolve {
 }
 
 /// Key of `RX_MACS`: a destination MAC the router receives on at one
-/// ingress port. 12 bytes with the pad explicit, so the stack key the
-/// program builds is fully written and matches userspace byte-for-byte.
+/// ingress port, on one VLAN (`vid`, 0 for untagged). 12 bytes with no
+/// padding, so the stack key the program builds is fully written and
+/// matches userspace byte-for-byte.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct RxMacKey {
     pub ifindex: u32,
     pub mac: [u8; 6],
-    pub _pad: u16,
+    pub vid: u16,
 }
 
 const _: () = assert!(core::mem::size_of::<RxMacKey>() == 12);
@@ -698,17 +701,19 @@ pub static REDIRECT_DEVMAP: DevMapHash =
 pub static VLAN_RESOLVE: HashMap<u32, VlanResolve> =
     HashMap::with_max_entries(VLAN_RESOLVE_MAX_ENTRIES, 0);
 
-/// Destination MACs the router receives on, per ingress port: the
-/// port's own MAC for a plain port; its bridge's plus the bridge's VLAN
-/// L3 devices' for a bridge member (`packetframe_common::topology::
-/// receive_macs`). An attached bond's MACs are keyed on each slave's
-/// ifindex as well, since that is the `ingress_ifindex` native XDP on a
-/// bond reports. A matched frame whose `(ingress ifindex, dst MAC)`
-/// is absent is not addressed to the router and is XDP_PASSed untouched
-/// (`PassNotForUs`). A port with no entries therefore passes
-/// everything, which is the kernel path and always correct; userspace
-/// fills the map before any XDP attach and follows MAC changes from
-/// the redirect-target watcher. The value is unused.
+/// Destination MACs the router receives on, per ingress port and VLAN:
+/// the port's own MAC for a plain port; its bridge's plus the bridge's
+/// VLAN L3 devices' for a bridge member, each on the VLANs it has an L3
+/// device for (`packetframe_common::topology::receive_vlan_macs`). A
+/// member of a bridge that filters by VLAN gets none. An attached bond's
+/// entries are keyed on each slave's ifindex as well, since that is the
+/// `ingress_ifindex` native XDP on a bond reports. A matched frame whose
+/// `(ingress ifindex, dst MAC, ingress VID)` is absent is not one the
+/// kernel would route and is XDP_PASSed untouched (`PassNotForUs`). A
+/// port with no entries therefore passes everything, which is the kernel
+/// path and always correct; userspace fills the map before any XDP
+/// attach and follows changes from the redirect-target watcher. The
+/// value is unused.
 #[map]
 pub static RX_MACS: HashMap<RxMacKey, u8> = HashMap::with_max_entries(RX_MACS_MAX_ENTRIES, 0);
 

@@ -302,7 +302,7 @@ fn handle_ipv4(
     // Only a frame addressed to the router is routed. Ahead of the
     // bogon drop and dry-run: a frame the kernel is only bridging is
     // neither ours to drop nor one the fast path would forward.
-    if !addressed_to_router(ctx, eth) {
+    if !addressed_to_router(ctx, eth, ingress_vid) {
         bump(stats, StatIdx::PassNotForUs);
         return Ok(xdp_action::XDP_PASS);
     }
@@ -529,7 +529,7 @@ fn handle_ipv6(
     bump_match_subset(stats, src_hit, dst_hit);
 
     // See handle_ipv4.
-    if !addressed_to_router(ctx, eth) {
+    if !addressed_to_router(ctx, eth, ingress_vid) {
         bump(stats, StatIdx::PassNotForUs);
         return Ok(xdp_action::XDP_PASS);
     }
@@ -645,15 +645,20 @@ fn handle_ipv6(
 /// its TTL and rewrite its source MAC where the kernel would have
 /// bridged it untouched. Broadcast and multicast MACs are never in the
 /// map, so those frames — which the fast path must not route either —
-/// take the same exit. A port with no entries (not yet populated, or
-/// its MACs unreadable) passes everything: the kernel path, which is
-/// always correct.
+/// take the same exit. A port with no entries (not yet populated, its
+/// MACs unreadable, or its bridge filtering by VLAN) passes everything:
+/// the kernel path, which is always correct.
+///
+/// Keyed on the ingress VID as well (0 untagged, a priority tag
+/// included): a frame tagged with a VLAN the router has no L3 device for
+/// on this port is one the kernel drops, so routing it would carry a
+/// VLAN the router does not route into one it does.
 #[inline(always)]
-fn addressed_to_router(ctx: &XdpContext, eth: *const EthHdr) -> bool {
+fn addressed_to_router(ctx: &XdpContext, eth: *const EthHdr, ingress_vid: u16) -> bool {
     let key = RxMacKey {
         ifindex: unsafe { (*ctx.ctx).ingress_ifindex },
         mac: unsafe { (*eth).dst_addr },
-        _pad: 0,
+        vid: ingress_vid,
     };
     unsafe { RX_MACS.get(&key) }.is_some()
 }

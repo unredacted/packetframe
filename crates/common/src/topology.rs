@@ -102,27 +102,77 @@ pub fn receive_macs(
     master_of: impl Fn(&str) -> Option<String>,
     mac_of: impl Fn(&str) -> Option<[u8; 6]>,
 ) -> Vec<[u8; 6]> {
-    // Only a bridge master makes a port a bridge member; any other
-    // master (a VRF) leaves it a routed port with its own MAC.
-    let bridge_of = |dev: &str| master_of(dev).filter(|m| facts.is_bridge(m));
-    let Some(master) = bridge_of(port) else {
-        return mac_of(port).into_iter().collect();
-    };
-    let mut macs: Vec<[u8; 6]> = mac_of(&master).into_iter().collect();
-    for d in devs {
-        let on_carried_vlan = match classify(facts, d) {
-            Some(DevKind::BridgeVlan { bridge, vid }) => {
-                bridge == master && carried.is_none_or(|c| c.contains(&vid))
-            }
-            _ => false,
-        };
-        if on_carried_vlan && bridge_of(d).is_none() {
-            macs.extend(mac_of(d));
-        }
-    }
+    let mut macs: Vec<[u8; 6]> = receive_vlan_macs(facts, devs, port, carried, master_of, mac_of)
+        .into_iter()
+        .map(|(_, mac)| mac)
+        .collect();
     macs.sort_unstable();
     macs.dedup();
     macs
+}
+
+/// [`receive_macs`] with the VLAN each MAC is received on: `(vid, mac)`,
+/// vid 0 for untagged. The MACs are the same; what this adds is that a
+/// tagged frame is addressed to the router only on a VLAN the router has
+/// an L3 device for on that port. A frame tagged with any other VID is
+/// one the kernel drops (no VLAN device takes it), so routing it would
+/// carry a VLAN the router does not route into one it does.
+///
+/// - **A plain port**: its own MAC untagged, and on the VID of each L3
+///   device on a VLAN of the port (`eth2.100`, or `br100` over it, never
+///   an enslaved lower).
+/// - **A bridge member**: the bridge's MAC untagged, and on the VID of
+///   each L3 device on a VLAN of the bridge the port carries (`carried`,
+///   as for [`receive_macs`]), the bridge's MAC and that device's.
+///
+/// Sorted and deduplicated.
+pub fn receive_vlan_macs(
+    facts: &dyn LinkFacts,
+    devs: &[String],
+    port: &str,
+    carried: Option<&[u16]>,
+    master_of: impl Fn(&str) -> Option<String>,
+    mac_of: impl Fn(&str) -> Option<[u8; 6]>,
+) -> Vec<(u16, [u8; 6])> {
+    // Only a bridge master makes a port a bridge member; any other
+    // master (a VRF) leaves it a routed port with its own MAC.
+    let bridge_of = |dev: &str| master_of(dev).filter(|m| facts.is_bridge(m));
+    let mut out: Vec<(u16, [u8; 6])> = Vec::new();
+    match bridge_of(port) {
+        None => {
+            let Some(own) = mac_of(port) else {
+                return out;
+            };
+            out.push((0, own));
+            for d in devs {
+                if let Some(DevKind::PortVlan { port: lower, vid }) = classify(facts, d) {
+                    if lower == port && bridge_of(d).is_none() {
+                        out.push((vid, own));
+                    }
+                }
+            }
+        }
+        Some(master) => {
+            let bridge_mac = mac_of(&master);
+            out.extend(bridge_mac.map(|m| (0, m)));
+            for d in devs {
+                let Some(DevKind::BridgeVlan { bridge, vid }) = classify(facts, d) else {
+                    continue;
+                };
+                if bridge != master
+                    || !carried.is_none_or(|c| c.contains(&vid))
+                    || bridge_of(d).is_some()
+                {
+                    continue;
+                }
+                out.extend(bridge_mac.map(|m| (vid, m)));
+                out.extend(mac_of(d).map(|m| (vid, m)));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Link facts read from a sysfs `class/net` root, with the VLAN table
@@ -160,6 +210,23 @@ pub fn sysfs_receive_macs(
     carried: Option<&[u16]>,
     port: &str,
 ) -> Vec<[u8; 6]> {
+    let mut macs: Vec<[u8; 6]> = sysfs_receive_vlan_macs(sysfs_net, vlans, carried, port)
+        .into_iter()
+        .map(|(_, mac)| mac)
+        .collect();
+    macs.sort_unstable();
+    macs.dedup();
+    macs
+}
+
+/// [`receive_vlan_macs`] read from a sysfs `class/net` root, as
+/// [`sysfs_receive_macs`].
+pub fn sysfs_receive_vlan_macs(
+    sysfs_net: &Path,
+    vlans: &HashMap<String, (u16, String)>,
+    carried: Option<&[u16]>,
+    port: &str,
+) -> Vec<(u16, [u8; 6])> {
     let master_of = |dev: &str| {
         let link = std::fs::read_link(sysfs_net.join(dev).join("master")).ok()?;
         Some(link.file_name()?.to_str()?.to_string())
@@ -176,7 +243,24 @@ pub fn sysfs_receive_macs(
         root: sysfs_net,
         vlans,
     };
-    receive_macs(&facts, &devs, port, carried, master_of, mac_of)
+    receive_vlan_macs(&facts, &devs, port, carried, master_of, mac_of)
+}
+
+/// The bridge `port` is a member of, if that bridge filters by VLAN
+/// (`bridge/vlan_filtering` not `0`), or if whether it does cannot be
+/// read. Such a bridge admits a frame by the port's VLAN table and PVID,
+/// which nothing here reads.
+pub fn sysfs_vlan_filtering_bridge(sysfs_net: &Path, port: &str) -> Option<String> {
+    let link = std::fs::read_link(sysfs_net.join(port).join("master")).ok()?;
+    let master = link.file_name()?.to_str()?.to_string();
+    let bridge = sysfs_net.join(&master).join("bridge");
+    if !bridge.is_dir() {
+        return None;
+    }
+    let filtering = std::fs::read_to_string(bridge.join("vlan_filtering"))
+        .map(|s| s.trim() != "0")
+        .unwrap_or(true);
+    filtering.then_some(master)
 }
 
 /// Read and parse `/proc/net/vlan/config` (or a fixture). A missing file
@@ -318,6 +402,82 @@ mod tests {
         assert!(receive_macs(&edge(), &devs, "eth9", None, master_of, mac_of).is_empty());
     }
 
+    /// The same MACs, each on the VLANs it is received on: untagged, and
+    /// the VID of each L3 device on the port's (or its bridge's) VLANs.
+    /// A VID with no L3 device there is on no entry, since the kernel
+    /// drops a frame tagged with it.
+    #[test]
+    fn each_mac_is_received_on_the_vlans_with_an_l3_device() {
+        let mac = |b: u8| [0x02, 0, 0, 0, 0, b];
+        let devs: Vec<String> = [
+            "switch0",
+            "switch0.3998",
+            "switch0.1337",
+            "br3998",
+            "br1337",
+            "eth2",
+            "eth2.100",
+            "br100",
+            "eth3",
+            "eth4",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let master_of = |d: &str| match d {
+            "eth4" | "eth5" => Some("switch0".to_string()),
+            "switch0.3998" => Some("br3998".to_string()),
+            "switch0.1337" => Some("br1337".to_string()),
+            "eth2.100" => Some("br100".to_string()),
+            _ => None,
+        };
+        let mac_of = |d: &str| {
+            Some(match d {
+                "br1337" => mac(2),
+                "switch0.1337" => mac(3),
+                "switch0" | "switch0.3998" | "br3998" => mac(1),
+                "eth2" => mac(0x20),
+                "eth2.100" | "br100" => mac(0x21),
+                "eth3" => mac(0x30),
+                _ => return None,
+            })
+        };
+        let rx = |port: &str, carried: Option<&[u16]>| {
+            receive_vlan_macs(&edge(), &devs, port, carried, master_of, mac_of)
+        };
+        assert_eq!(
+            rx("eth4", None),
+            vec![(0, mac(1)), (1337, mac(1)), (1337, mac(2)), (3998, mac(1))],
+            "the bridge's MAC untagged; on each L3 VLAN the bridge's and that device's"
+        );
+        assert_eq!(
+            rx("eth4", Some(&[3998])),
+            vec![(0, mac(1)), (3998, mac(1))],
+            "only the VLANs the port carries"
+        );
+        assert_eq!(
+            rx("eth2", None),
+            vec![(0, mac(0x20)), (100, mac(0x20))],
+            "a plain port's own MAC, untagged and on its L3 VLAN"
+        );
+        assert_eq!(
+            rx("eth3", None),
+            vec![(0, mac(0x30))],
+            "no VLAN, untagged only"
+        );
+        assert!(rx("eth9", None).is_empty());
+        for port in ["eth4", "eth2", "eth3"] {
+            let mut macs: Vec<[u8; 6]> = rx(port, None).into_iter().map(|(_, m)| m).collect();
+            macs.sort_unstable();
+            macs.dedup();
+            assert_eq!(
+                macs,
+                receive_macs(&edge(), &devs, port, None, master_of, mac_of),
+                "{port}: the same MACs as receive_macs"
+            );
+        }
+    }
+
     /// A master that is not a bridge (a VRF) routes rather than bridges:
     /// a port under it is a routed port with its own MAC, and a VLAN L3
     /// device under it is still an L3 device of its bridge.
@@ -404,6 +564,30 @@ mod tests {
             vec![[0x02, 0, 0, 0, 0x69, 0xc8]]
         );
         assert!(sysfs_receive_macs(&root, &vlans, None, "eth9").is_empty());
+        assert_eq!(
+            sysfs_receive_vlan_macs(&root, &vlans, None, "eth4"),
+            vec![
+                (0, [0x02, 0, 0, 0, 0x69, 0xc7]),
+                (100, [0x02, 0, 0, 0, 0x01, 0x00]),
+                (100, [0x02, 0, 0, 0, 0x69, 0xc7]),
+            ]
+        );
+
+        // A bridge that filters by VLAN, or whose setting cannot be read,
+        // is named; one that does not, and a port with no bridge, are not.
+        assert_eq!(
+            sysfs_vlan_filtering_bridge(&root, "eth4"),
+            Some("switch0".to_string()),
+            "unreadable counts as filtering"
+        );
+        std::fs::write(root.join("switch0/bridge/vlan_filtering"), "0\n").unwrap();
+        assert_eq!(sysfs_vlan_filtering_bridge(&root, "eth4"), None);
+        std::fs::write(root.join("switch0/bridge/vlan_filtering"), "1\n").unwrap();
+        assert_eq!(
+            sysfs_vlan_filtering_bridge(&root, "eth4"),
+            Some("switch0".to_string())
+        );
+        assert_eq!(sysfs_vlan_filtering_bridge(&root, "eth2"), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

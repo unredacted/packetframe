@@ -698,6 +698,10 @@ pub(crate) struct RxMacSync {
     /// Ports whose state could not be read this pass; their entries were
     /// left alone. The watcher retries while any of them still exists.
     pub unknown: Vec<(String, u32)>,
+    /// `(port, bridge)` for each port refused because its bridge filters
+    /// by VLAN: it has no entries, so every frame on it takes the kernel
+    /// path.
+    pub refused: Vec<(String, String)>,
 }
 
 /// Bring `RX_MACS` to what each attached XDP port (`(iface, ifindex)`)
@@ -723,6 +727,25 @@ pub(crate) fn sync_rx_macs<T: std::borrow::BorrowMut<aya::maps::MapData>>(
         })
         .collect();
     let plan = crate::rx_macs::plan(&current, &desired);
+    // Reported here when a refusal removes entries, i.e. when the bridge
+    // starts filtering under a running daemon; attach reports the ports
+    // it starts refused.
+    for port in &plan.ports {
+        if let (Some(bridge), false) = (&port.refused, port.remove.is_empty()) {
+            warn!(
+                iface = %port.iface,
+                %bridge,
+                removed = port.remove.len(),
+                "port's bridge filters by VLAN: its RX_MACS entries are removed and every \
+                 frame on it takes the kernel path, which applies the bridge's VLAN table"
+            );
+        }
+    }
+    let refused: Vec<(String, String)> = plan
+        .ports
+        .iter()
+        .filter_map(|p| Some((p.iface.clone(), p.refused.clone()?)))
+        .collect();
     for (iface, ifindex, why) in &plan.unknown {
         if reported.contains(ifindex) {
             continue;
@@ -771,6 +794,7 @@ pub(crate) fn sync_rx_macs<T: std::borrow::BorrowMut<aya::maps::MapData>>(
             .into_iter()
             .map(|(iface, ifindex, _)| (iface, ifindex))
             .collect(),
+        refused,
     }
 }
 
@@ -2018,6 +2042,14 @@ pub fn attach(
             .map_err(|e| ModuleError::other(MODULE_NAME, format!("RX_MACS try_from: {e}")))?;
         let sync = sync_rx_macs(&mut rx, &ports, &Default::default());
         info!(entries = sync.added, "RX_MACS populated");
+        for (iface, bridge) in &sync.refused {
+            warn!(
+                iface = %iface,
+                %bridge,
+                "port's bridge filters by VLAN: no RX_MACS entries, so every frame on it \
+                 takes the kernel path, which applies the bridge's VLAN table"
+            );
+        }
     }
 
     let prog: &mut Xdp = state
