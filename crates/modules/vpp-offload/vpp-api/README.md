@@ -77,8 +77,17 @@ packetframe checkout (`main` unless the run names another ref):
 - **The binary API** has not drifted (`.github/scripts/vpp-api-drift.sh`
   on the candidate's `vpp-api-json.tar.gz`): `generated.rs` regenerates
   byte-identical from it.
+- **The CLI text** still parses (`.github/actions/vpp-cli-compat` with
+  `vpp-debs`, running `.github/scripts/vpp-cli-compat.sh`). vpp-offload
+  reads `show ip[6] fib summary` (keep-VPP adoption's fingerprint),
+  `show errors`, `show ip neighbor-stats` and `show interface` over
+  `cli_inband`, and a release can reword those with no API change. A
+  scratch VPP is given routes in two tables and both families, glean and
+  null-node traffic, and each parser must recover exactly what went in
+  (`crates/modules/vpp-offload/tests/vpp_cli_compat.rs`, whose header
+  lists every parse site; a new one goes there).
 
-Both live here, so what "works with packetframe" means changes with
+All three live here, so what "works with packetframe" means changes with
 packetframe, not with a copy in vpp-unifi. A bump PR there (the weekly
 watch's or a hand-made one) runs the same check with publishing off,
 and its result is on the PR.

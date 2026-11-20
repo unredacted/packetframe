@@ -857,7 +857,7 @@ pub enum EngineError {
 /// positions only (count, node, reason...), so a reason with spaces
 /// parses fine; any line that does not shape up is skipped rather
 /// than guessed at.
-pub(crate) fn parse_null_drops(text: &str) -> u64 {
+pub fn parse_null_drops(text: &str) -> u64 {
     text.lines()
         .filter_map(|line| {
             let mut tok = line.split_whitespace();
@@ -905,7 +905,7 @@ pub struct NeighbourCounters {
 /// severity column — the reason strings are v26.06's, from the
 /// vendored `ip_neighbor.api.json` counter definitions. Malformed rows
 /// are skipped, the null-drop parser's rule.
-pub(crate) fn parse_glean_counters(text: &str) -> NeighbourCounters {
+pub fn parse_glean_counters(text: &str) -> NeighbourCounters {
     let mut c = NeighbourCounters::default();
     for line in text.lines() {
         let mut tok = line.split_whitespace();
@@ -936,7 +936,7 @@ pub(crate) fn parse_glean_counters(text: &str) -> NeighbourCounters {
 /// `    arp: rx:[reply:N request:N gratuitous:N ] tx:[reply:N ...]`
 /// (`format_ip_neighbor_counters`). `None` when no `arp:` line parsed —
 /// an answer that is not this shape is unknown, not zero.
-pub(crate) fn parse_arp_replies_sent(text: &str) -> Option<u64> {
+pub fn parse_arp_replies_sent(text: &str) -> Option<u64> {
     let mut total = None;
     for line in text.lines() {
         let Some(rest) = line.trim_start().strip_prefix("arp:") else {
