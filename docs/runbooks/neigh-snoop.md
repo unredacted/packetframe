@@ -162,15 +162,17 @@ Attribution notes:
   table dirty; the persist debounce (3 s) coalesces it.
 - `mac_conflict` climbing on one address is a participant with two
   routers on its port, or spoofing. Nothing is installed; look at who.
-- An install for an address the kernel mirror holds no row for is
-  written without `NLM_F_REPLACE`: the kernel creates the entry, or
-  fills one it holds unresolved (INCOMPLETE, FAILED), but keeps a valid
-  MAC it holds, a confirmed one included. The mirror can miss a live
-  entry (a neighbour dump taken during churn can skip one, and the
-  kernel does not flag it), and this is what keeps such a miss from
-  overwriting it. Such a write changes nothing and so counts
+- An install for an address the kernel mirror holds no row for, or holds
+  unresolved (INCOMPLETE, FAILED), is written without `NLM_F_REPLACE`:
+  the kernel creates the entry, or fills one it holds unresolved, but
+  keeps a valid MAC it holds, a confirmed one included. The mirror can
+  miss a live entry (a neighbour dump taken during churn can skip one,
+  and the kernel does not flag it), or the entry can resolve between
+  the decision and the write, and this is what keeps either from being
+  overwritten. Such a write changes nothing and so counts
   `unconfirmed`; the next sighting decides again on the row the
-  kernel's next notification or re-read brings.
+  kernel's next notification or re-read brings. Only a STALE row with
+  another MAC is replaced.
 - `frames_outgoing_dropped_total` should be zero. Non-zero means the
   socket filter is not attached.
 - `recreated` link events during a provision or BGP upload are normal;
