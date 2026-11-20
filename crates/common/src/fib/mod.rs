@@ -793,8 +793,29 @@ impl FeedSession {
     /// first GC clears both.
     const SEED_WHOLE_BIT: u64 = 1 << 3;
 
-    /// The epoch occupies the remaining 60 bits.
-    const EPOCH_SHIFT: u32 = 4;
+    /// Bit 4 holds readiness during route admission recovery.
+    const ADMISSION_BLOCKED: u64 = 1 << 4;
+    /// The epoch occupies the remaining 59 bits.
+    const EPOCH_SHIFT: u32 = 5;
+
+    /// Hold readiness while an advertisement is missing. Carry the hold in
+    /// the liveness word so a concurrent session raise cannot undo it.
+    pub fn set_admission_blocked(&self, blocked: bool) {
+        use std::sync::atomic::Ordering;
+        self.state
+            .update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                if blocked {
+                    (state
+                        & !(Self::UP_BIT
+                            | Self::RECONCILED_BIT
+                            | Self::MIRROR_SEEDED_BIT
+                            | Self::SEED_WHOLE_BIT))
+                        | Self::ADMISSION_BLOCKED
+                } else {
+                    state & !Self::ADMISSION_BLOCKED
+                }
+            });
+    }
 
     pub fn new() -> Self {
         Self::default()
@@ -816,6 +837,9 @@ impl FeedSession {
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
             |cur| {
+                if cur & Self::ADMISSION_BLOCKED != 0 {
+                    return cur;
+                }
                 let was_up = cur & Self::UP_BIT != 0;
                 let mut epoch = cur >> Self::EPOCH_SHIFT;
                 let mut reconciled = cur & Self::RECONCILED_BIT != 0;
@@ -843,8 +867,17 @@ impl FeedSession {
     /// is not "~all withdrawals" — but neither is it current. Pair it with
     /// the completeness authority's word before acting on it.
     pub fn mark_mirror_seeded(&self) {
-        self.state
-            .fetch_or(Self::MIRROR_SEEDED_BIT, std::sync::atomic::Ordering::AcqRel);
+        self.state.update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| {
+                if cur & Self::ADMISSION_BLOCKED == 0 {
+                    cur | Self::MIRROR_SEEDED_BIT
+                } else {
+                    cur
+                }
+            },
+        );
     }
 
     /// The seed is whole: the ledger's writer recorded that its
@@ -905,7 +938,13 @@ impl FeedSession {
         self.state.update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
-            |cur| (cur | Self::RECONCILED_BIT) & !(Self::MIRROR_SEEDED_BIT | Self::SEED_WHOLE_BIT),
+            |cur| {
+                if cur & Self::ADMISSION_BLOCKED == 0 {
+                    (cur | Self::RECONCILED_BIT) & !(Self::MIRROR_SEEDED_BIT | Self::SEED_WHOLE_BIT)
+                } else {
+                    cur
+                }
+            },
         );
     }
 
@@ -1356,6 +1395,25 @@ mod tests {
             verdict.authority_is_at_fault(),
             "an empty authority against a full mirror must classify as a fault: {verdict:?}"
         );
+    }
+
+    #[test]
+    fn admission_hold_blocks_all_readiness_publishers() {
+        let session = FeedSession::default();
+        session.set_up(true);
+        session.mark_reconciled();
+        session.set_admission_blocked(true);
+        session.mark_mirror_seeded();
+        session.mark_seed_whole(999);
+        session.set_up(true);
+        session.mark_reconciled();
+        let held = session.liveness();
+        assert!(!held.up && !held.reconciled && !held.mirror_seeded && !held.seed_whole);
+        session.set_admission_blocked(false);
+        assert!(!session.liveness().up);
+        session.set_up(true);
+        session.mark_reconciled();
+        assert!(session.liveness().up && session.liveness().reconciled);
     }
 
     /// The epoch counts down-to-up transitions and rides in the same

@@ -69,7 +69,7 @@ Cutting over to the PacketFrame FIB adds:
 
 ```
   forwarding-mode packetframe-fib
-  route-source bgp 127.0.0.1:1179 local-as 64500 peer-as 64500
+  route-source bgp 127.0.0.1:1179 local-as 64500 peer-as 64500 peer-uid <routing-service-uid>
 ```
 
 Other directives cover connected hosts (`local-prefix`,

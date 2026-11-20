@@ -322,7 +322,9 @@ fn add_path_two_updates_yield_ecmp_via_bgp_listener() {
     let listen_addr: SocketAddr = format!("127.0.0.1:{listen_port}").parse().unwrap();
     let our_as = 65000u32;
     let peer_as = 65001u32;
-    let bgp_cfg = BgpListenerConfig::new(listen_addr, our_as, peer_as, Ipv4Addr::new(127, 0, 0, 1));
+    let mut bgp_cfg =
+        BgpListenerConfig::new(listen_addr, our_as, peer_as, Ipv4Addr::new(127, 0, 0, 1));
+    bgp_cfg.peer_uid = Some(unsafe { libc::geteuid() });
     let listener = BgpListener::new(bgp_cfg, prog_handle.clone(), shutdown.clone());
     let listener_task = rt.spawn(listener.run());
 

@@ -54,10 +54,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aya::maps::{lpm_trie::Key as LpmKey, Array, LpmTrie, Map, MapData};
+use aya::maps::{lpm_trie::Key as LpmKey, Array, IterableMap, LpmTrie, Map, MapData};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
@@ -216,8 +217,276 @@ pub enum ProgrammerError {
     MapWrite(String),
     #[error("BPF map open failed: {0}")]
     MapOpen(String),
+    #[error("route admission refused: {0}")]
+    Admission(&'static str),
+    #[error("route admission requires a full feed replay: {0}")]
+    ReplayRequired(&'static str),
     #[error("programmer task has shut down")]
     Shutdown,
+}
+
+/// Coalesce replay requests across the actor and its single session owner.
+#[derive(Default)]
+struct FeedRecovery {
+    incomplete: AtomicBool,
+    retry_at: std::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+impl FeedRecovery {
+    fn request(&self) {
+        self.retry_at
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(60));
+    }
+
+    fn clear_deadline(&self) {
+        *self.retry_at.lock().unwrap() = None;
+    }
+
+    fn take_if_due(&self, now: tokio::time::Instant) -> bool {
+        if !self.incomplete.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut at = self.retry_at.lock().unwrap();
+        if at.is_some_and(|deadline| deadline <= now) {
+            *at = None;
+            return true;
+        }
+        false
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        if !self.incomplete.load(Ordering::Acquire) {
+            return None;
+        }
+        *self.retry_at.lock().unwrap()
+    }
+}
+
+/// A refused key is never retained. Only a complete later replay can vouch
+/// for the table again. A sweep of the incomplete replay can still free room.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum ReplayState {
+    #[default]
+    Complete,
+    Missed,
+    Replaying,
+}
+
+impl ReplayState {
+    fn begin(&mut self) {
+        if *self != Self::Complete {
+            *self = Self::Replaying;
+        }
+    }
+
+    fn finish(&mut self, repaired: bool) -> Result<(), ProgrammerError> {
+        if *self == Self::Missed {
+            return Err(ProgrammerError::ReplayRequired(
+                "routes were refused during this replay",
+            ));
+        }
+        if repaired {
+            *self = Self::Complete;
+        }
+        Ok(())
+    }
+}
+
+// Allow alternate peers and preference tiers beyond the installed ECMP width.
+const MAX_ADVERTS_PER_PREFIX: usize = 256;
+
+fn family_index(prefix: &IpPrefix) -> usize {
+    usize::from(matches!(prefix, IpPrefix::V6 { .. }))
+}
+
+/// Per-family ownership, including failed installs and withdrawals awaiting GC.
+struct FamilyBudget {
+    limit: usize,
+    prefixes: usize,
+    adverts: usize,
+}
+
+impl FamilyBudget {
+    fn new(limit: u32) -> Self {
+        Self {
+            limit: limit as usize,
+            prefixes: 0,
+            adverts: 0,
+        }
+    }
+
+    /// Reserve only growth. A prefix keeps one slot while either its mirror
+    /// row or its retry key exists. Refreshing an existing path costs nothing.
+    fn reserve(
+        &mut self,
+        new_prefix: bool,
+        new_advert: bool,
+        paths: usize,
+    ) -> Result<(), &'static str> {
+        if new_prefix && self.prefixes >= self.limit {
+            return Err("prefix budget exhausted");
+        }
+        if new_advert
+            && (self.adverts >= self.limit.saturating_mul(MAX_ECMP_PATHS)
+                || paths >= MAX_ADVERTS_PER_PREFIX)
+        {
+            return Err("advertisement budget exhausted");
+        }
+        self.prefixes += usize::from(new_prefix);
+        self.adverts += usize::from(new_advert);
+        Ok(())
+    }
+
+    /// A failed delete can outlive its mirror row. Keep its reservation
+    /// until a successful recompute retires the last reference to the key.
+    fn finish_recompute(
+        &mut self,
+        owed: &mut HashSet<IpPrefix>,
+        prefix: IpPrefix,
+        had_record: bool,
+        has_record: bool,
+        success: bool,
+    ) -> bool {
+        if success {
+            let had_debt = owed.remove(&prefix);
+            if !has_record && (had_record || had_debt) {
+                self.prefixes -= 1;
+                return true;
+            }
+        } else {
+            debug_assert!(had_record || has_record || owed.contains(&prefix));
+            owed.insert(prefix);
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn prefix(n: u8) -> IpPrefix {
+        IpPrefix::V4 {
+            addr: [192, 0, 2, n],
+            prefix_len: 32,
+        }
+    }
+
+    #[test]
+    fn small_fib_keeps_one_slot_per_mirrored_or_owed_prefix() {
+        // Two userspace slots and one writable kernel slot. Use the same
+        // reservation and error accounting the live programmer uses.
+        let mut budget = FamilyBudget::new(2);
+        let mut mirror = HashSet::new();
+        let mut owed = HashSet::new();
+        let mut fib = HashSet::new();
+        for p in (1..=12).map(prefix) {
+            if budget.reserve(true, true, 0).is_err() {
+                continue;
+            }
+            mirror.insert(p);
+            let written = fib.is_empty();
+            if written {
+                fib.insert(p);
+            }
+            budget.finish_recompute(&mut owed, p, true, true, written);
+        }
+        assert_eq!(mirror, HashSet::from([prefix(1), prefix(2)]));
+        assert_eq!(fib, HashSet::from([prefix(1)]));
+        assert_eq!(owed, HashSet::from([prefix(2)]));
+        assert_eq!((budget.prefixes, budget.adverts), (2, 2));
+        assert!(
+            budget.reserve(false, false, 1).is_ok(),
+            "existing key refresh"
+        );
+        assert!(mirror.remove(&prefix(1)));
+        budget.adverts -= 1;
+        budget.finish_recompute(&mut owed, prefix(1), true, false, false);
+        assert_eq!(owed.len(), 2);
+        assert!(budget.reserve(true, true, 0).is_err(), "delete still owed");
+        // A reannouncement of that same key uses its existing reservation.
+        budget.reserve(false, true, 0).unwrap();
+        assert!(mirror.insert(prefix(1)));
+        assert!(fib.contains(&prefix(1)));
+        budget.finish_recompute(&mut owed, prefix(1), true, true, true);
+        assert_eq!(budget.prefixes, 2);
+        assert!(mirror.remove(&prefix(1)));
+        assert!(fib.remove(&prefix(1)));
+        budget.finish_recompute(&mut owed, prefix(1), true, false, true);
+        budget.adverts -= 1;
+        assert!(budget.reserve(true, true, 0).is_ok());
+        mirror.insert(prefix(3));
+        fib.insert(prefix(2));
+        assert_eq!(mirror.len(), budget.prefixes);
+        assert_eq!(fib.len(), 1);
+        budget.finish_recompute(&mut owed, prefix(2), true, true, true);
+        assert!(owed.is_empty());
+    }
+
+    #[test]
+    fn successful_gc_of_an_orphan_releases_a_slot_without_a_withdrawal() {
+        let p = prefix(1);
+        let mut budget = FamilyBudget::new(1);
+        let mut owed = HashSet::new();
+        budget.reserve(true, true, 0).unwrap();
+        budget.adverts -= 1;
+        assert!(!budget.finish_recompute(&mut owed, p, true, false, false));
+        assert!(budget.reserve(true, true, 0).is_err());
+        assert!(budget.finish_recompute(&mut owed, p, false, false, true));
+        budget.reserve(true, true, 0).unwrap();
+        assert!(owed.is_empty());
+    }
+
+    #[test]
+    fn add_path_and_backup_tiers_have_finite_ownership() {
+        let mut budget = FamilyBudget::new(1);
+        for count in 0..MAX_ECMP_PATHS {
+            budget.reserve(count == 0, true, count).unwrap();
+        }
+        assert!(budget.reserve(false, true, MAX_ECMP_PATHS).is_err());
+        assert!(budget.reserve(false, false, MAX_ECMP_PATHS).is_ok());
+        assert_eq!(budget.adverts, MAX_ECMP_PATHS);
+        let mut larger = FamilyBudget::new(500);
+        for count in 0..MAX_ADVERTS_PER_PREFIX {
+            larger.reserve(count == 0, true, count).unwrap();
+        }
+        assert!(larger.reserve(false, true, MAX_ADVERTS_PER_PREFIX).is_err());
+        // Room for another prefix even though this prefix reached its own cap.
+        assert!(larger.reserve(true, true, 0).is_ok());
+    }
+
+    #[test]
+    fn one_replay_deadline_is_shared_across_connections() {
+        let recovery = FeedRecovery::default();
+        recovery.incomplete.store(true, Ordering::Release);
+        recovery.request();
+        let at = recovery.deadline().unwrap();
+        recovery.request();
+        assert_eq!(recovery.deadline(), Some(at));
+        assert!(!recovery.take_if_due(at - Duration::from_secs(1)));
+        assert!(recovery.take_if_due(at));
+        assert!(!recovery.take_if_due(at));
+        recovery.request();
+        recovery.clear_deadline();
+        assert_eq!(recovery.deadline(), None);
+    }
+
+    #[test]
+    fn a_sweep_frees_space_but_only_a_clean_replay_restores_completeness() {
+        let mut state = ReplayState::Missed;
+        assert!(state.finish(true).is_err());
+        state.begin();
+        assert_eq!(state, ReplayState::Replaying);
+        state = ReplayState::Missed;
+        assert!(state.finish(true).is_err());
+        state.begin();
+        state.finish(false).unwrap();
+        assert_eq!(state, ReplayState::Replaying);
+        state.finish(true).unwrap();
+        assert_eq!(state, ReplayState::Complete);
+    }
 }
 
 /// Cloneable handle for issuing commands to a running programmer.
@@ -225,10 +494,23 @@ pub enum ProgrammerError {
 /// RouteController in Phase 3+.
 #[derive(Clone)]
 pub struct FibProgrammerHandle {
+    recovery: Arc<FeedRecovery>,
     tx: mpsc::Sender<Command>,
 }
 
 impl FibProgrammerHandle {
+    pub(crate) fn admission_incomplete(&self) -> bool {
+        self.recovery.incomplete.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn replay_deadline(&self) -> Option<tokio::time::Instant> {
+        self.recovery.deadline()
+    }
+
+    pub(crate) fn take_replay_if_due(&self) -> bool {
+        self.recovery.take_if_due(tokio::time::Instant::now())
+    }
+
     /// Register a nexthop IP. Returns the [`NexthopId`] the FIB
     /// trie should point at. If the same IP is already registered,
     /// returns the existing ID and bumps its refcount so the caller
@@ -492,7 +774,13 @@ pub fn recording_handle() -> (FibProgrammerHandle, RouteEventLog) {
 #[doc(hidden)]
 pub fn recording_handle_reporting(counts: (usize, usize)) -> (FibProgrammerHandle, RouteEventLog) {
     let (tx, rx) = mpsc::channel::<Command>(256);
-    (FibProgrammerHandle { tx }, spawn_recorder(rx, counts, None))
+    (
+        FibProgrammerHandle {
+            tx,
+            recovery: Arc::default(),
+        },
+        spawn_recorder(rx, counts, None),
+    )
 }
 
 /// Holds a [`gated_recording_handle`]'s applies until opened.
@@ -525,7 +813,14 @@ pub(crate) fn gated_recording_handle() -> (FibProgrammerHandle, RouteEventLog, A
     let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (tx, rx) = mpsc::channel::<Command>(256);
     let log = spawn_recorder(rx, (0, 0), Some((open_rx, arrived.clone())));
-    (FibProgrammerHandle { tx }, log, ApplyGate { open, arrived })
+    (
+        FibProgrammerHandle {
+            tx,
+            recovery: Arc::default(),
+        },
+        log,
+        ApplyGate { open, arrived },
+    )
 }
 
 /// A [`recording_handle`] whose commands nobody answers until
@@ -535,7 +830,13 @@ pub(crate) fn gated_recording_handle() -> (FibProgrammerHandle, RouteEventLog, A
 #[doc(hidden)]
 pub fn held_handle() -> (FibProgrammerHandle, HeldCommands) {
     let (tx, rx) = mpsc::channel::<Command>(256);
-    (FibProgrammerHandle { tx }, HeldCommands(rx))
+    (
+        FibProgrammerHandle {
+            tx,
+            recovery: Arc::default(),
+        },
+        HeldCommands(rx),
+    )
 }
 
 /// See [`held_handle`].
@@ -894,6 +1195,13 @@ pub struct FibProgrammer {
     /// `true` = v4, `false` = v6.
     routes_by_peer: HashMap<PeerId, HashSet<(bool, [u8; 16], u8)>>,
 
+    /// Indexed by address family (v4 first). No retry key for a refused prefix.
+    route_budgets: [FamilyBudget; 2],
+    replay: ReplayState,
+    recovery: Arc<FeedRecovery>,
+    // Local synth routes are replayed from the kernel at daemon startup.
+    local_admission_incomplete: bool,
+
     // --- ECMP state (Phase 3) ---
     /// Dedup map: signature → group ID.
     ecmp_by_signature: HashMap<EcmpSignature, EcmpGroupId>,
@@ -1243,6 +1551,19 @@ impl FibProgrammer {
         shutdown: CancellationToken,
         neigh_handle: Option<NeighborResolveHandle>,
     ) -> (Self, FibProgrammerHandle) {
+        // The pinned tries may be smaller than the compiled maxima.
+        let capacity = |map: &MapData, ceiling| match map.info() {
+            Ok(info) => info.max_entries().min(ceiling),
+            Err(error) => {
+                warn!(%error, "cannot read FIB map capacity; disabling new prefixes for this family");
+                0
+            }
+        };
+        let recovery = Arc::new(FeedRecovery::default());
+        let route_budgets = [
+            FamilyBudget::new(capacity(fib_v4.map(), FIB_V4_CAP)),
+            FamilyBudget::new(capacity(fib_v6.map(), FIB_V6_CAP)),
+        ];
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CAPACITY);
         (
             Self {
@@ -1262,6 +1583,10 @@ impl FibProgrammer {
                 routes_v4: HashMap::new(),
                 routes_v6: HashMap::new(),
                 routes_by_peer: HashMap::new(),
+                route_budgets,
+                replay: ReplayState::Complete,
+                recovery: recovery.clone(),
+                local_admission_incomplete: false,
                 ecmp_by_signature: HashMap::new(),
                 ecmp_by_id: HashMap::new(),
                 free_ecmp_ids: Vec::new(),
@@ -1297,7 +1622,10 @@ impl FibProgrammer {
                 attestation_scope: None,
                 feed_session: None,
             },
-            FibProgrammerHandle { tx: cmd_tx },
+            FibProgrammerHandle {
+                tx: cmd_tx,
+                recovery,
+            },
         )
     }
 
@@ -1343,6 +1671,11 @@ impl FibProgrammer {
         self.dry_run = Some((gate, cfg));
     }
 
+    fn outstanding_repairs(&self) -> usize {
+        self.recompute_owed.len()
+            + usize::from(self.replay != ReplayState::Complete || self.local_admission_incomplete)
+    }
+
     /// Each reprobe tick, until the mirror has been whole once
     /// (`dry-run until-seeded`), and never while a seed or walk is half
     /// applied: retry a trigger that was deferred, and with a completeness
@@ -1354,7 +1687,7 @@ impl FibProgrammer {
         if gate.is_ready() || self.mid_chunked_work() {
             return;
         }
-        gate.set_repairs_owed(self.recompute_owed.len());
+        gate.set_repairs_owed(self.outstanding_repairs());
         match self.whole_retry.take() {
             // The authority's word is read afresh below, not replayed.
             Some(crate::dry_run_gate::Trigger::AuthorityAttested) | None => {}
@@ -1383,13 +1716,13 @@ impl FibProgrammer {
     /// the `CFG` write fails (the gate is put back then, see
     /// `set_cfg_dry_run_in`).
     fn mirror_whole(&mut self, trigger: crate::dry_run_gate::Trigger) {
+        let owed = self.outstanding_repairs();
         let Some((gate, cfg)) = self.dry_run.as_mut() else {
             return;
         };
         if gate.is_ready() {
             return;
         }
-        let owed = self.recompute_owed.len();
         gate.set_repairs_owed(owed);
         if owed > 0 {
             // Said once, and only where it holds traffic: in `on` and
@@ -1639,7 +1972,8 @@ impl FibProgrammer {
                 // already removed that peer's key here (review
                 // finding). Anything owed a repair counts as session
                 // state until the repair lands.
-                let any = !self.recompute_owed.is_empty()
+                let any = self.replay != ReplayState::Complete
+                    || !self.recompute_owed.is_empty()
                     || self.routes_by_peer.keys().any(|p| is_session_peer(*p));
                 let _ = reply.send(any);
             }
@@ -1700,19 +2034,25 @@ impl FibProgrammer {
                 return;
             };
             let prefix = route.prefix;
+            let mut error = None;
             for a in route.adverts {
-                if self.seed_advertisement(prefix, a) {
-                    p.advertisements += 1;
+                match self.seed_advertisement(prefix, a) {
+                    Ok(true) => p.advertisements += 1,
+                    Ok(false) => {}
+                    Err(e) => {
+                        error.get_or_insert(e);
+                    }
                 }
             }
-            if let Err(e) = self.recompute_owing(prefix) {
-                // Left in the mirror exactly as a failed live install
-                // would be, and owed: the next GC or the next change to
-                // the prefix retries it.
-                p.failed += 1;
-                if p.first_error.is_none() {
-                    p.first_error = Some(format!("{prefix:?}: {e}"));
+            if self.lookup_mirror(&prefix).is_some() {
+                if let Err(e) = self.recompute_fib_entry(prefix) {
+                    error.get_or_insert(e);
                 }
+            }
+            if let Some(e) = error {
+                p.failed += 1;
+                p.first_error
+                    .get_or_insert_with(|| format!("{prefix:?}: {e}"));
             }
         }
         self.seed = Some(p);
@@ -1721,29 +2061,34 @@ impl FibProgrammer {
     /// Insert one seeded advertisement, unseen. Never over an existing
     /// one: nothing can precede the seed today (commands wait for it),
     /// and if anything ever did it would be fresher than the ledger.
-    fn seed_advertisement(&mut self, prefix: IpPrefix, a: LedgerAdvert) -> bool {
+    fn seed_advertisement(
+        &mut self,
+        prefix: IpPrefix,
+        a: LedgerAdvert,
+    ) -> Result<bool, ProgrammerError> {
         let key = (a.peer, a.path_id);
-        let rec = self.upsert_empty_record(prefix);
-        let inserted = match rec.advertisements.entry(key) {
-            std::collections::btree_map::Entry::Occupied(_) => false,
-            std::collections::btree_map::Entry::Vacant(v) => {
-                v.insert(Advertisement {
-                    nexthops: a.nexthops,
-                    local_pref: a.local_pref,
-                    origin_asn: None,
-                    seen_this_session: false,
-                });
-                true
-            }
-        };
+        if self
+            .lookup_mirror(&prefix)
+            .is_some_and(|r| r.advertisements.contains_key(&key))
+        {
+            return Ok(false);
+        }
+        let nexthops = self.admit_advertisement(prefix, a.peer, a.path_id, a.nexthops)?;
+        self.upsert_empty_record(prefix).advertisements.insert(
+            key,
+            Advertisement {
+                nexthops,
+                local_pref: a.local_pref,
+                origin_asn: None,
+                seen_this_session: false,
+            },
+        );
         self.routes_by_peer
             .entry(a.peer)
             .or_default()
             .insert(prefix_peer_key(&prefix));
-        if inserted {
-            self.unseen_session += 1;
-        }
-        inserted
+        self.unseen_session += 1;
+        Ok(true)
     }
 
     fn finish_seed(&mut self, p: PendingSeed) {
@@ -1763,9 +2108,8 @@ impl FibProgrammer {
         // records.
         self.seed_open = true;
         if p.advertisements < counts.advertisements() {
-            // `decode` walked the whole record, so this means the record
-            // changed under us or a read failed regardless — say so
-            // rather than report a whole seed.
+            // A larger ledger, an incomplete read or a repeated key can
+            // leave the seed partial. Its recorded count cannot attest it.
             warn!(
                 seeded = p.advertisements,
                 recorded = counts.advertisements(),
@@ -1979,6 +2323,11 @@ impl FibProgrammer {
         identity: String,
         written_at_unix: u64,
     ) -> Result<EncodedLedger, String> {
+        if self.replay != ReplayState::Complete || self.local_admission_incomplete {
+            return Err(
+                "route admission lost an advertisement; waiting for a complete replay".into(),
+            );
+        }
         let started = Instant::now();
         let session = |p: &PeerId, a: &Advertisement| is_session_peer(*p) && !a.nexthops.is_empty();
         let mut peers: Vec<PeerId> = Vec::new();
@@ -3102,6 +3451,9 @@ impl FibProgrammer {
                 Ok(())
             }
             RouteEvent::PeerDown { peer_id } => {
+                if self.replay == ReplayState::Missed {
+                    self.recovery.request();
+                }
                 return self.start_walk(WalkKind::PeerDown { peer_id }, reply);
             }
             RouteEvent::Add {
@@ -3111,10 +3463,7 @@ impl FibProgrammer {
                 path_id,
                 local_pref,
                 origin_asn,
-            } => {
-                self.note_session_route(peer_id);
-                self.add_route(peer_id, prefix, nexthops, path_id, (local_pref, origin_asn))
-            }
+            } => self.add_route(peer_id, prefix, nexthops, path_id, (local_pref, origin_asn)),
             RouteEvent::Del {
                 peer_id,
                 prefix,
@@ -3151,8 +3500,10 @@ impl FibProgrammer {
             // Defensive. An empty announce should arrive as Del.
             return Ok(());
         }
+        let nexthops = self.admit_advertisement(prefix, peer_id, path_id, nexthops)?;
+        self.note_session_route(peer_id);
         self.upsert_advertisement(peer_id, prefix, path_id, nexthops, attrs);
-        self.recompute_owing(prefix)
+        self.recompute_fib_entry(prefix)
     }
 
     fn del_route(
@@ -3161,22 +3512,15 @@ impl FibProgrammer {
         prefix: IpPrefix,
         path_id: Option<u32>,
     ) -> Result<(), ProgrammerError> {
+        // A withdrawal can retire an omitted key. Only a replay can confirm it.
+        if self.replay == ReplayState::Missed {
+            self.recovery.request();
+        }
         if !self.remove_advertisement(peer_id, &prefix, path_id) {
             // Idempotent: nothing was advertised under this key.
             return Ok(());
         }
-        self.recompute_owing(prefix)
-    }
-
-    /// Recompute after a route event changed `prefix`'s advertisements,
-    /// owing it ([`Self::recompute_owed`]) on failure: the route source
-    /// will not send it again.
-    fn recompute_owing(&mut self, prefix: IpPrefix) -> Result<(), ProgrammerError> {
-        let outcome = self.recompute_fib_entry(prefix);
-        if outcome.is_err() {
-            self.recompute_owed.insert(prefix);
-        }
-        outcome
+        self.recompute_fib_entry(prefix)
     }
 
     // --- Resync, InitiationComplete and PeerDown walks ---
@@ -3330,7 +3674,6 @@ impl FibProgrammer {
         });
         if removed > 0 || self.recompute_owed.contains(&prefix) {
             if let Err(e) = self.recompute_fib_entry(prefix) {
-                self.recompute_owed.insert(prefix);
                 first_err.get_or_insert(e);
             }
         }
@@ -3352,7 +3695,6 @@ impl FibProgrammer {
             // nexthops — and it does, whenever another advertisement
             // (a `local_arp` /32) keeps the record alive and the
             // mirror keeps its pre-failure `nexthop_ips`.
-            self.recompute_owed.insert(prefix);
             warn!(?peer_id, ?prefix, error = %e, "recompute after PeerDown failed");
         }
     }
@@ -3363,6 +3705,8 @@ impl FibProgrammer {
         let took_ms = w.started.elapsed().as_millis() as u64;
         let outcome = match w.kind {
             WalkKind::Mark { marked } => {
+                self.replay.begin();
+                self.recovery.clear_deadline();
                 self.after_resync(marked as u64);
                 info!(
                     marked,
@@ -3385,8 +3729,21 @@ impl FibProgrammer {
                 // The bookkeeping runs whatever the GC's outcome: a failed
                 // recompute leaves the prefix owed, but the unseen
                 // advertisements are already out of the mirror.
-                self.after_gc(first_err.is_none().then_some(removed), unseen);
-                match first_err {
+                let replay = self.replay.finish(first_err.is_none());
+                if replay.is_err() && removed > 0 {
+                    self.recovery.request();
+                } else if self.replay == ReplayState::Complete {
+                    self.recovery.clear_deadline();
+                    if let Some(session) = &self.feed_session {
+                        session.set_admission_blocked(self.local_admission_incomplete);
+                    }
+                }
+                self.recovery
+                    .incomplete
+                    .store(self.replay != ReplayState::Complete, Ordering::Release);
+                let error = replay.err().or(first_err);
+                self.after_gc(error.is_none().then_some(removed), unseen);
+                match error {
                     Some(e) => Err(e),
                     None => {
                         info!(
@@ -3414,6 +3771,70 @@ impl FibProgrammer {
     }
 
     // --- Advertisement bookkeeping (slice 4) ---
+
+    // Replacements and ledger restoration enter by the same admission rule.
+    fn admit_advertisement(
+        &mut self,
+        prefix: IpPrefix,
+        peer: PeerId,
+        path: Option<u32>,
+        mut nexthops: Vec<IpAddr>,
+    ) -> Result<Vec<IpAddr>, ProgrammerError> {
+        if nexthops.len() > MAX_ECMP_PATHS {
+            nexthops.sort_unstable();
+            nexthops.dedup();
+        }
+        let record = self.lookup_mirror(&prefix);
+        let new_prefix = record.is_none() && !self.recompute_owed.contains(&prefix);
+        let paths = record.map_or(0, |r| r.advertisements.len());
+        let new_advert = record.is_none_or(|r| !r.advertisements.contains_key(&(peer, path)));
+        let budget = &mut self.route_budgets[family_index(&prefix)];
+        let admitted = if nexthops.is_empty() {
+            Err("advertisement has no nexthops")
+        } else if nexthops.len() > MAX_ECMP_PATHS {
+            Err("advertisement exceeds the supported nexthop width")
+        } else {
+            budget.reserve(new_prefix, new_advert, paths)
+        };
+        if let Err(reason) = admitted {
+            // A replacement confirms the key still exists, even if its new
+            // value cannot be represented. Keep its last accepted value at GC.
+            if let Some(a) = self
+                .lookup_mirror_mut(&prefix)
+                .and_then(|r| r.advertisements.get_mut(&(peer, path)))
+            {
+                let was_unseen = !a.seen_this_session;
+                a.seen_this_session = true;
+                self.note_unseen_cleared(peer, was_unseen);
+            }
+            if is_session_peer(peer) {
+                // A seed is followed by a fresh stream without an intervening
+                // Resync. Its first complete live pass can therefore recover it.
+                if self.replay == ReplayState::Complete && !self.seeding {
+                    self.recovery.request();
+                }
+                self.replay = if self.seeding {
+                    ReplayState::Replaying
+                } else {
+                    ReplayState::Missed
+                };
+                if !self.recovery.incomplete.swap(true, Ordering::AcqRel) {
+                    warn!(
+                        reason,
+                        "route admission limit reached; awaiting a complete feed replay"
+                    );
+                }
+            } else {
+                self.local_admission_incomplete = true;
+            }
+            if let Some(session) = &self.feed_session {
+                session.set_admission_blocked(true);
+            }
+            return Err(ProgrammerError::Admission(reason));
+        }
+        nexthops.shrink_to_fit();
+        Ok(nexthops)
+    }
 
     /// Insert or replace `advertisements[(peer_id, path_id)]` on
     /// `prefix`'s record, creating the record if absent. Keeps the
@@ -3460,6 +3881,7 @@ impl FibProgrammer {
         let Some(removed) = removed else {
             return false;
         };
+        self.route_budgets[family_index(prefix)].adverts -= 1;
         self.maybe_clear_peer_index(peer_id, prefix);
         self.note_unseen_cleared(peer_id, !removed.seen_this_session);
         true
@@ -3485,6 +3907,7 @@ impl FibProgrammer {
             }
             None => (0, 0),
         };
+        self.route_budgets[family_index(prefix)].adverts -= drained;
         if unseen > 0 && is_session_peer(peer_id) {
             self.unseen_session = self.unseen_session.saturating_sub(unseen as u64);
             self.publish_unconfirmed();
@@ -3503,10 +3926,17 @@ impl FibProgrammer {
         if peer_still_has_prefix {
             return;
         }
+        self.remove_peer_key(peer_id, prefix_peer_key(prefix));
+    }
+
+    fn remove_peer_key(&mut self, peer_id: PeerId, key: (bool, [u8; 16], u8)) {
         if let Some(set) = self.routes_by_peer.get_mut(&peer_id) {
-            set.remove(&prefix_peer_key(prefix));
+            set.remove(&key);
             if set.is_empty() {
                 self.routes_by_peer.remove(&peer_id);
+            } else if set.capacity() / 4 > set.len().max(8) {
+                // Sparse peers must not keep every peer's historical peak.
+                set.shrink_to(set.len() * 2);
             }
         }
     }
@@ -3530,9 +3960,20 @@ impl FibProgrammer {
     /// commit and the sink announcement have no fallible call between
     /// them, so the second tier is current whenever it does.
     fn recompute_fib_entry(&mut self, prefix: IpPrefix) -> Result<(), ProgrammerError> {
+        let had_record = self.lookup_mirror(&prefix).is_some();
         let outcome = self.recompute_fib_entry_inner(prefix);
-        if outcome.is_ok() {
-            self.recompute_owed.remove(&prefix);
+        let has_record = self.lookup_mirror(&prefix).is_some();
+        let released = self.route_budgets[family_index(&prefix)].finish_recompute(
+            &mut self.recompute_owed,
+            prefix,
+            had_record,
+            has_record,
+            outcome.is_ok(),
+        );
+        if released && self.replay == ReplayState::Missed {
+            // An orphaned delete debt can release a slot during GC even when
+            // the sweep removed no advertisements.
+            self.recovery.request();
         }
         outcome
     }
@@ -3833,12 +4274,7 @@ impl FibProgrammer {
         let peers: BTreeSet<PeerId> = rec.advertisements.keys().map(|(p, _)| *p).collect();
         let key = prefix_peer_key(prefix);
         for peer in peers {
-            if let Some(set) = self.routes_by_peer.get_mut(&peer) {
-                set.remove(&key);
-                if set.is_empty() {
-                    self.routes_by_peer.remove(&peer);
-                }
-            }
+            self.remove_peer_key(peer, key);
         }
         Some(rec)
     }
@@ -3860,22 +4296,12 @@ impl FibProgrammer {
     ) -> Result<(), ProgrammerError> {
         let result = match prefix {
             IpPrefix::V4 { addr, prefix_len } => {
-                if self.routes_v4.len() as u32 >= FIB_V4_CAP
-                    && !self.routes_v4.contains_key(&(*addr, *prefix_len))
-                {
-                    return Err(ProgrammerError::FibV4Full(FIB_V4_CAP));
-                }
                 let key = LpmKey::new(u32::from(*prefix_len), *addr);
                 self.fib_v4
                     .insert(&key, value, 0)
                     .map_err(|e| ProgrammerError::MapWrite(format!("FIB_V4 insert: {e}")))
             }
             IpPrefix::V6 { addr, prefix_len } => {
-                if self.routes_v6.len() as u32 >= FIB_V6_CAP
-                    && !self.routes_v6.contains_key(&(*addr, *prefix_len))
-                {
-                    return Err(ProgrammerError::FibV6Full(FIB_V6_CAP));
-                }
                 let key = LpmKey::new(u32::from(*prefix_len), *addr);
                 self.fib_v6
                     .insert(&key, value, 0)

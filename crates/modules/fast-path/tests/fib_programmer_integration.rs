@@ -5058,6 +5058,7 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
             // definition, which is not the restart under test.
             source: Some(
                 packetframe_fast_path::fib::controller::RouteSourceConfig::Bgp {
+                    peer_uid: Some(unsafe { libc::geteuid() }),
                     listen: "127.0.0.1:0".parse().unwrap(),
                     local_as: 64512,
                     peer_as: 64512,
@@ -5197,6 +5198,7 @@ fn a_preserving_stop_finishes_a_gc_under_way() {
             // A listener nothing dials, as in the round trip above.
             source: Some(
                 packetframe_fast_path::fib::controller::RouteSourceConfig::Bgp {
+                    peer_uid: Some(unsafe { libc::geteuid() }),
                     listen: "127.0.0.1:0".parse().unwrap(),
                     local_as: 64512,
                     peer_as: 64512,
@@ -5300,6 +5302,7 @@ fn a_preserving_stop_mid_gc_writes_the_mirror_the_gc_leaves() {
         RouteFeed {
             source: Some(
                 packetframe_fast_path::fib::controller::RouteSourceConfig::Bgp {
+                    peer_uid: Some(unsafe { libc::geteuid() }),
                     listen: "127.0.0.1:0".parse().unwrap(),
                     local_as: 64512,
                     peer_as: 64512,

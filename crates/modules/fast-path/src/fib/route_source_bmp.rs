@@ -54,7 +54,7 @@ use bgpkit_parser::parser::bmp::parse_bmp_msg;
 use bgpkit_parser::Elementor;
 use bytes::Bytes;
 use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -123,6 +123,7 @@ pub struct BmpStation {
     /// source IP must fall within at least one entry or the
     /// connection is dropped before the BMP framing starts.
     peer_acl: Vec<ipnet::IpNet>,
+    peer_uid: Option<u32>,
     /// Session-liveness handle, reported to the second tier. See
     /// [`packetframe_common::fib::FeedSession`].
     session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
@@ -198,6 +199,7 @@ impl BmpStation {
             stall_gate: None,
             require_loc_rib: false,
             peer_acl: Vec::new(),
+            peer_uid: None,
             session: None,
             up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
@@ -294,6 +296,11 @@ impl BmpStation {
         self
     }
 
+    pub fn with_peer_uid(mut self, uid: Option<u32>) -> Self {
+        self.peer_uid = uid;
+        self
+    }
+
     /// Set the CIDR ACL applied at `accept()` time. Empty (the
     /// default) means loopback-only. The config parser enforces the
     /// "non-loopback listen requires non-empty ACL" invariant; this
@@ -311,13 +318,22 @@ impl BmpStation {
     /// (emitted by a quiescence timer inside `handle_connection`)
     /// GCs whatever never reappeared.
     pub async fn run(self) -> Result<(), RouteSourceError> {
-        let listener = bind_with_reuseaddr(self.listen_addr)
-            .map_err(|e| RouteSourceError::fatal(format!("bind {}: {e}", self.listen_addr)))?;
-        let loopback_only = self.listen_addr.ip().is_loopback() && self.peer_acl.is_empty();
+        let (listener, _local_guard) =
+            super::local_feed::LocalFeedGuard::bind(self.listen_addr, self.peer_uid).map_err(
+                |e| {
+                    RouteSourceError::fatal(format!(
+                        "bind {} with route-feed UID policy: {e}",
+                        self.listen_addr
+                    ))
+                },
+            )?;
+        let loopback_only =
+            self.listen_addr.ip().to_canonical().is_loopback() && self.peer_acl.is_empty();
         info!(
             addr = %self.listen_addr,
             peer_acl_entries = self.peer_acl.len(),
-            auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
+            peer_uid = ?self.peer_uid,
+            auth_posture = if loopback_only { "local UID" } else if self.peer_uid.is_none() { "remote ACL only" } else { "remote ACL, local UID" },
             "BMP station listening"
         );
         // The station's own start is a stream boundary too, and the
@@ -500,7 +516,7 @@ impl BmpStation {
                                     self.saw_peer_up.load(Ordering::Relaxed);
                                 let peers_up =
                                     !self.up_peers.lock().expect("up_peers lock").is_empty();
-                                if first_stream && (!peers_speak || peers_up) {
+                                if first_stream && !self.prog_handle.admission_incomplete() && (!peers_speak || peers_up) {
                                     if let Some(sess) = &self.session {
                                         sess.set_up(true);
                                         // Reconciled by the same fact
@@ -533,6 +549,10 @@ impl BmpStation {
                     }
                 }
                 _ = tick.tick() => {
+                    if self.prog_handle.take_replay_if_due() {
+                        reader.abort();
+                        return Err(RouteSourceError::recoverable("route admission needs a full replay"));
+                    }
                     let quiesced = last_route_monitoring
                         .is_some_and(|last| last.elapsed() >= INIT_COMPLETE_QUIESCENCE);
                     if !quiesced {
@@ -550,6 +570,10 @@ impl BmpStation {
                             .apply_route_event(RouteEvent::InitiationComplete)
                             .await
                         {
+                            if matches!(e, super::programmer::ProgrammerError::ReplayRequired(_)) {
+                                init_complete_fired = true;
+                                continue;
+                            }
                             warn!(error = %e, "InitiationComplete dispatch failed");
                             continue;
                         }
@@ -565,6 +589,7 @@ impl BmpStation {
                         self.stale_state_possible
                             .store(false, std::sync::atomic::Ordering::Relaxed);
                     }
+                    if self.prog_handle.admission_incomplete() { continue; }
                     // Re-armable raise: quiescence counts only when the
                     // stream it followed is NEWER than the last
                     // lowering — frames since, not silence since — so a
@@ -847,7 +872,9 @@ impl BmpStation {
                         },
                     };
                     if let Err(e) = self.prog_handle.apply_route_event(event).await {
-                        warn!(?peer_id, error = %e, "route event dispatch failed");
+                        if !matches!(e, super::programmer::ProgrammerError::Admission(_)) {
+                            warn!(?peer_id, error = %e, "route event dispatch failed");
+                        }
                     }
                 }
             }
@@ -1065,21 +1092,21 @@ fn asn_to_u32(asn: bgpkit_parser::models::Asn) -> u32 {
 /// a misconstructed in-process config.
 fn source_ip_permitted(addr: IpAddr, peer_acl: &[ipnet::IpNet]) -> bool {
     if peer_acl.is_empty() {
-        addr.is_loopback()
+        addr.to_canonical().is_loopback()
     } else {
         peer_acl.iter().any(|net| net.contains(&addr))
     }
 }
 
-/// Bind a `TcpListener` with `SO_REUSEADDR` enabled (v0.2.2 fix). See
-/// the `bind_with_reuseaddr` doc in `route_source_bgp.rs` for the
-/// rationale, same problem class on both listeners.
-fn bind_with_reuseaddr(addr: SocketAddr) -> std::io::Result<TcpListener> {
-    let socket = match addr {
-        SocketAddr::V4(_) => TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => TcpSocket::new_v6()?,
-    };
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-    socket.listen(8)
+#[cfg(test)]
+#[test]
+fn mapped_local_peer_passes_the_local_address_check() {
+    assert!(source_ip_permitted(
+        "::ffff:127.0.0.1".parse().unwrap(),
+        &[]
+    ));
+    assert!(!source_ip_permitted(
+        "::ffff:192.0.2.1".parse().unwrap(),
+        &[]
+    ));
 }

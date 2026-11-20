@@ -40,6 +40,40 @@ how to roll back to the kernel-FIB path if something goes wrong.
              XDP_REDIRECT / XDP_PASS
 ```
 
+For each address family, the userspace route mirror can retain one prefix per
+slot in the pinned FIB map, up to the compiled maximum. A prefix awaiting
+repair still occupies its slot, including after a failed withdrawal. Each
+family can retain eight advertisements per prefix slot in aggregate, with a
+maximum of 256 peer/path advertisements for any one prefix and eight distinct
+nexthops per advertisement. Refreshing an existing path uses its current slot.
+
+At the limit, PacketFrame preserves installed forwarding and continues
+processing refreshes and withdrawals. It withholds readiness and requests a
+full feed replay after 60 seconds. If that replay also exceeds capacity, the
+session keeps processing updates. A withdrawal, peer departure, or sweep that
+releases stale routes schedules another replay, with the same delay. A clean
+replay restores readiness. A persistently oversized feed requires reducing
+its exported routes or paths. A refused local synthesized route requires a
+fresh kernel route seed on daemon restart before readiness can return.
+
+Local BGP and BMP feeds require `peer-uid <UID>`. Before upgrading, identify
+the dedicated account that creates the routing daemon's TCP sockets and add
+its numeric UID to the route source. The examples use 107 as a placeholder.
+This also applies to a local FRR connection to an AnyIP address. Unrelated
+services must have separate UIDs. The local UID check covers connections that
+originate in Packetframe’s network namespace. Connections from another namespace
+or machine use the configured remote source ACL and BGP peer checks. Omitting
+`peer-uid` on a concrete non-loopback or AnyIP listener selects remote-only access. Specify a
+concrete listener address when migrating a wildcard configuration. Restart
+Packetframe after changing the route-source identity, including its UID.
+
+Packetframe installs a socket-owned nftables table in its network namespace
+before listening. It requires CAP_NET_ADMIN and kernel support for nftables
+inet filter chains and owned tables. If policy installation fails, the listener logs
+the error and retries. The kernel removes the table when its owning socket
+closes. The first start with this policy rebuilds the mirrored routes from the
+feed because the old ledger predates UID enforcement.
+
 - **BgpListener** (the recommended forwarding feed) accepts the
   routing daemon's iBGP session — FRR on the reference router,
   through a phantom AnyIP listen address (see "Feeding from FRR
@@ -169,7 +203,7 @@ packetframe at the unused host address with `anyip`:
 
 ```
 route-source bgp 192.0.2.202:1179 local-as 65551 peer-as 65551 \
-  allow-remote peer-from 192.0.2.201/32 anyip
+  allow-remote peer-from 192.0.2.201/32 anyip peer-uid 107
 ```
 
 `anyip` makes packetframe install `local 192.0.2.202/32 dev lo`
@@ -746,7 +780,7 @@ to climb from ~30% to >95% once kernel ARP populates.
 ```
 module fast-path
   forwarding-mode packetframe-fib
-  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551
+  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551 peer-uid 107
 
   # One line per local prefix you want fast-pathed inbound:
   local-prefix 198.51.100.0/24 via br1337    # customer LAN
@@ -1662,7 +1696,7 @@ restart that seeds.
 2. Pathvector `global-config` injects the `protocol bgp packetframe
    { ... }` block (see "Phase 4 bird + pathvector config" below).
 3. Add `forwarding-mode packetframe-fib` + `route-source bgp
-   127.0.0.1:1179 local-as <ASN> peer-as <ASN>` under `module
+   127.0.0.1:1179 local-as <ASN> peer-as <ASN> peer-uid <UID>` under `module
    fast-path` in `/etc/packetframe/packetframe.conf`.
 4. Confirm bird's `kernel.export: false` (or equivalent) so no BGP
    routes flow to the kernel FIB. Customer /32s, connected, static
@@ -1871,7 +1905,7 @@ NLRI decodes without `path_id`.
 ```
 module fast-path
   forwarding-mode packetframe-fib              # or `compare` for the soak window
-  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551 router-id 198.51.100.7
+  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551 router-id 198.51.100.7 peer-uid 107
 ```
 
 `router-id` is optional; defaults to the listen-address (v4) or
@@ -1963,13 +1997,13 @@ will try again.
 The BMP route source is useful when:
 
 - Your routing daemon emits **RFC 9069 Loc-RIB BMP** (peer_type 3).
-  FRR has this today; bird does not. Set `require-loc-rib` on the
-  `route-source bmp` line; the BmpStation will refuse any
-  non-Loc-RIB frame and tear the session down with an error,
-  preventing silent wrong-forwarding from pre/post-policy streams:
+  In `packetframe-fib` mode, the BMP station closes the session on
+  any non-Loc-RIB RouteMonitoring frame. Set `require-loc-rib` in
+  `compare` mode as well to prepare for a live cutover. An unfiltered
+  compare feed needs a restart before it can drive forwarding.
 
   ```
-  route-source bmp 127.0.0.1:6543 require-loc-rib
+  route-source bmp 127.0.0.1:6543 require-loc-rib peer-uid 107
   ```
 
 - You want a **pure observability** feed (analytics, anomaly

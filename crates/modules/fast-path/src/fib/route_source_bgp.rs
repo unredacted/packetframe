@@ -97,7 +97,7 @@ use bgpkit_parser::Elementor;
 use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -239,6 +239,7 @@ pub struct BgpListenerConfig {
     /// within at least one entry or the connection is dropped before
     /// the BGP OPEN exchange.
     pub peer_acl: Vec<ipnet::IpNet>,
+    pub peer_uid: Option<u32>,
     /// Optional pin on the peer's source IP. When `Some(_)`, an
     /// accepted connection whose source IP differs is closed
     /// immediately. The pre-existing `peer_as` cross-check inside
@@ -262,6 +263,7 @@ impl BgpListenerConfig {
             router_id,
             hold_time: DEFAULT_HOLD_TIME,
             peer_acl: Vec::new(),
+            peer_uid: None,
             expected_peer_ip: None,
             session: None,
         }
@@ -277,7 +279,7 @@ impl BgpListenerConfig {
 /// config can't slip past.
 fn source_ip_permitted(addr: IpAddr, peer_acl: &[ipnet::IpNet]) -> bool {
     if peer_acl.is_empty() {
-        addr.is_loopback()
+        addr.to_canonical().is_loopback()
     } else {
         peer_acl.iter().any(|net| net.contains(&addr))
     }
@@ -726,9 +728,15 @@ impl BgpListener {
 
     /// Bind, then [`Self::serve`].
     pub async fn run(self) -> Result<(), RouteSourceError> {
-        let listener = bind_with_reuseaddr(self.cfg.listen_addr)
-            .map_err(|e| RouteSourceError::fatal(format!("bind {}: {e}", self.cfg.listen_addr)))?;
-        let loopback_only = self.cfg.listen_addr.ip().is_loopback()
+        let (listener, _local_guard) =
+            super::local_feed::LocalFeedGuard::bind(self.cfg.listen_addr, self.cfg.peer_uid)
+                .map_err(|e| {
+                    RouteSourceError::fatal(format!(
+                        "bind {} with route-feed UID policy: {e}",
+                        self.cfg.listen_addr
+                    ))
+                })?;
+        let loopback_only = self.cfg.listen_addr.ip().to_canonical().is_loopback()
             && self.cfg.peer_acl.is_empty()
             && self.cfg.expected_peer_ip.is_none();
         info!(
@@ -737,7 +745,8 @@ impl BgpListener {
             peer_as = self.cfg.peer_as,
             peer_acl_entries = self.cfg.peer_acl.len(),
             peer_ip_pin = ?self.cfg.expected_peer_ip,
-            auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
+            peer_uid = ?self.cfg.peer_uid,
+            auth_posture = if loopback_only { "local UID" } else if self.cfg.peer_uid.is_none() { "remote ACL only" } else { "remote ACL, local UID" },
             "BGP listener started"
         );
         self.serve(listener).await
@@ -1080,15 +1089,36 @@ impl BgpListener {
             }};
         }
         loop {
-            let frame = match or_end!(next_frame(
-                &mut frame_rx,
-                held.as_ref().map(|h| h.next_look)
-            )) {
+            // A local withdrawal can make room while the peer is idle. Poll
+            // only while incomplete so a newly armed deadline is observed.
+            let retry = self.prog_handle.replay_deadline().or_else(|| {
+                self.prog_handle
+                    .admission_incomplete()
+                    .then(|| tokio::time::Instant::now() + Duration::from_secs(60))
+            });
+            if self.prog_handle.take_replay_if_due() {
+                return Err(RouteSourceError::recoverable(
+                    "route admission needs a full replay",
+                ));
+            }
+            let wake = held
+                .as_ref()
+                .map(|h| h.next_look)
+                .into_iter()
+                .chain(retry)
+                .min();
+            let frame = match or_end!(next_frame(&mut frame_rx, wake)) {
                 Next::Frame(frame) => frame,
                 Next::HoldPoll => {
                     let Some(since) = held.as_ref().map(|h| h.since) else {
                         continue;
                     };
+                    if held
+                        .as_ref()
+                        .is_some_and(|h| h.next_look > tokio::time::Instant::now())
+                    {
+                        continue;
+                    }
                     match self.gc_hold_verdict(session_started, since).await {
                         GcHold::Hold { why, earlier } => {
                             if let Some(h) = held.as_mut() {
@@ -1255,6 +1285,7 @@ impl BgpListener {
             .field("held_secs", held_secs)
             .emit();
         }
+        let recovering = self.prog_handle.admission_incomplete();
         let dispatched = self
             .prog_handle
             .apply_route_event(RouteEvent::InitiationComplete)
@@ -1266,6 +1297,11 @@ impl BgpListener {
             hold.gc_ran();
         }
         if let Err(e) = dispatched {
+            if matches!(e, super::programmer::ProgrammerError::ReplayRequired(_)) {
+                // The sweep completed. Keep accepting withdrawals while the
+                // feed is held; repeating this sweep cannot restore omitted keys.
+                return true;
+            }
             warn!(error = %e, "InitiationComplete dispatch failed");
             return false;
         }
@@ -1299,6 +1335,9 @@ impl BgpListener {
         // and `set_up` clears it a moment later (review finding, on the
         // BMP path). Do not move this above the raise.
         if let Some(sess) = &self.cfg.session {
+            if recovering {
+                sess.set_up(true);
+            }
             sess.mark_reconciled();
         }
         true
@@ -1363,7 +1402,36 @@ impl BgpListener {
                 .as_secs() as i64,
             Ordering::Relaxed,
         );
-        if *updates_seen == 1 {
+        if let Some(sess) = &self.cfg.session {
+            // Stream activity in ROUTE-ELEMENT units, changed
+            // or not: a reconnect reannounces an unchanged
+            // table, the mirror never moves, and the gate
+            // compares activity against route-scaled quiet
+            // rates — counting frames instead of the elements
+            // they fan out to let a batched million-route dump
+            // read as quiet (review finding). Floored at one
+            // unit so an empty UPDATE (End-of-RIB shape) still
+            // counts as stream evidence — one unit against
+            // route-scaled rates is noise.
+            sess.pulse_n((elems.len() as u64).max(1));
+        }
+        let mut carried = Families::default();
+        for elem in elems {
+            carried.insert(match elem.prefix.prefix {
+                ipnet::IpNet::V4(_) => Family::V4,
+                ipnet::IpNet::V6(_) => Family::V6,
+            });
+            let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
+                Some(e) => e,
+                None => continue,
+            };
+            if let Err(e) = self.prog_handle.apply_route_event(event).await {
+                if !matches!(e, super::programmer::ProgrammerError::Admission(_)) {
+                    warn!(error = %e, "route event dispatch failed");
+                }
+            }
+        }
+        if *updates_seen == 1 && !self.prog_handle.admission_incomplete() {
             // The stream has started; see the handshake note
             // for why this — and not post-stream silence — is
             // where the session becomes live.
@@ -1397,33 +1465,6 @@ impl BgpListener {
             // releasing it on stale credit.
             if let Some(sess) = &self.cfg.session {
                 sess.set_up(true);
-            }
-        }
-        if let Some(sess) = &self.cfg.session {
-            // Stream activity in ROUTE-ELEMENT units, changed
-            // or not: a reconnect reannounces an unchanged
-            // table, the mirror never moves, and the gate
-            // compares activity against route-scaled quiet
-            // rates — counting frames instead of the elements
-            // they fan out to let a batched million-route dump
-            // read as quiet (review finding). Floored at one
-            // unit so an empty UPDATE (End-of-RIB shape) still
-            // counts as stream evidence — one unit against
-            // route-scaled rates is noise.
-            sess.pulse_n((elems.len() as u64).max(1));
-        }
-        let mut carried = Families::default();
-        for elem in elems {
-            carried.insert(match elem.prefix.prefix {
-                ipnet::IpNet::V4(_) => Family::V4,
-                ipnet::IpNet::V6(_) => Family::V6,
-            });
-            let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
-                Some(e) => e,
-                None => continue,
-            };
-            if let Err(e) = self.prog_handle.apply_route_event(event).await {
-                warn!(error = %e, "route event dispatch failed");
             }
         }
         Ok(carried)
@@ -2430,31 +2471,6 @@ fn synthetic_peer_id(listen: SocketAddr, peer_asn: u32) -> PeerId {
     PeerId::route_source(&(listen.ip(), peer_asn))
 }
 
-/// Bind a `TcpListener` with `SO_REUSEADDR` enabled. v0.2.2 fix for the
-/// silent-failure scenario observed in production: when packetframe is
-/// killed and quickly restarted, the prior listener's socket can sit
-/// in `TIME_WAIT` for ~60 s, and the default `tokio::net::TcpListener::bind`
-/// fails the new bind during that window. The error currently propagates
-/// out of `BgpListener::run` and the controller's `JoinHandle` swallows
-/// it, leaving the rest of packetframe running with a dead BGP feed
-/// and no operator-visible signal short of bird's "Connection refused"
-/// state. `SO_REUSEADDR` lets the new bind succeed even with lingering
-/// TIME_WAIT state.
-///
-/// Returns the listener on success. Bind failures are still real (port
-/// conflict with another process, etc.) and propagate via the `io::Error`.
-fn bind_with_reuseaddr(addr: SocketAddr) -> std::io::Result<TcpListener> {
-    let socket = match addr {
-        SocketAddr::V4(_) => TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => TcpSocket::new_v6()?,
-    };
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-    // Backlog of 8: only one BGP peer ever connects, but TCP semantics
-    // mean we still need a non-zero backlog for the listen queue.
-    socket.listen(8)
-}
-
 fn network_prefix_to_ip_prefix(np: &NetworkPrefix) -> Option<IpPrefix> {
     use ipnet::IpNet;
     match np.prefix {
@@ -3250,7 +3266,7 @@ mod tests {
     /// A listener for `prog` on an ephemeral loopback port, configured
     /// as the session tests run it but not serving yet, and its address.
     async fn unserved(prog: FibProgrammerHandle) -> (TcpListener, BgpListener, SocketAddr) {
-        let lst = bind_with_reuseaddr("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let lst = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = lst.local_addr().expect("local addr");
         let mut cfg = BgpListenerConfig::new(addr, TEST_AS, TEST_AS, Ipv4Addr::new(192, 0, 2, 1));
         cfg.hold_time = TEST_HOLD.as_secs() as u16;
@@ -4215,7 +4231,7 @@ mod tests {
         let shutdown = listener.shutdown.clone();
         let mut peer = TcpStream::connect(addr).await.expect("connect");
         peer.write_all(&peer_open(GR_PEER)).await.expect("OPEN");
-        let outsider = TcpSocket::new_v4().expect("socket");
+        let outsider = tokio::net::TcpSocket::new_v4().expect("socket");
         outsider
             .bind("127.0.0.2:0".parse().expect("addr"))
             .expect("bind");
@@ -5272,4 +5288,17 @@ mod tests {
         assert!(LIVENESS_THREAD.len() <= 15, "comm keeps 15 bytes");
         assert!(packetframe_common::placement::CONTROL_PLANE_THREADS.contains(&LIVENESS_THREAD));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn mapped_local_peer_passes_the_local_address_check() {
+    assert!(source_ip_permitted(
+        "::ffff:127.0.0.1".parse().unwrap(),
+        &[]
+    ));
+    assert!(!source_ip_permitted(
+        "::ffff:192.0.2.1".parse().unwrap(),
+        &[]
+    ));
 }

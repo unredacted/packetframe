@@ -72,6 +72,9 @@ pub mod route_applier;
 pub mod programmer;
 
 #[cfg(target_os = "linux")]
+mod local_feed;
+
+#[cfg(target_os = "linux")]
 pub mod route_source_bgp;
 
 #[cfg(target_os = "linux")]

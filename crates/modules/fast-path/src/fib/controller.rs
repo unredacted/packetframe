@@ -164,6 +164,7 @@ pub enum RouteSourceConfig {
         /// parser only permits empty when the listen address is
         /// itself loopback).
         peer_acl: Vec<ipnet::IpNet>,
+        peer_uid: Option<u32>,
     },
     Bgp {
         listen: SocketAddr,
@@ -172,6 +173,7 @@ pub enum RouteSourceConfig {
         router_id: Ipv4Addr,
         /// CIDR ACL, same semantics as the BMP variant.
         peer_acl: Vec<ipnet::IpNet>,
+        peer_uid: Option<u32>,
         /// Optional pin on the peer's source IP. When set, an
         /// accepted connection whose source IP differs is closed
         /// before the BGP OPEN exchange.
@@ -538,6 +540,7 @@ impl RouteController {
                 listen,
                 require_loc_rib,
                 peer_acl,
+                peer_uid,
             }) => {
                 let snapshot = shared_snapshot();
                 // Spawn the checker only when a LOCAL authority is named.
@@ -583,6 +586,7 @@ impl RouteController {
                         let mut station = BmpStation::new(listen, prog.clone(), shut.clone())
                             .with_feed_session(feed_session.clone())
                             .with_stall_gate(stall.clone())
+                            .with_peer_uid(peer_uid)
                             .with_peer_acl(peer_acl_for_spawn.clone());
                         if require_loc_rib {
                             station = station.with_require_loc_rib();
@@ -607,12 +611,13 @@ impl RouteController {
 
                 integrity = Some(snapshot);
 
-                let loopback_only = listen.ip().is_loopback() && peer_acl.is_empty();
+                let loopback_only = listen.ip().to_canonical().is_loopback() && peer_acl.is_empty();
                 info!(
                     bmp_addr = %listen,
                     require_loc_rib,
                     peer_acl_entries = peer_acl.len(),
-                    auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
+                    peer_uid = ?peer_uid,
+                    auth_posture = if loopback_only { "local UID" } else if peer_uid.is_none() { "remote ACL only" } else { "remote ACL, local UID" },
                     "RouteController started: NetlinkNeighborResolver + FibProgrammer + BmpStation + IntegrityChecker"
                 );
             }
@@ -622,6 +627,7 @@ impl RouteController {
                 peer_as,
                 router_id,
                 peer_acl,
+                peer_uid,
                 expected_peer_ip,
                 anyip,
             }) => {
@@ -683,6 +689,7 @@ impl RouteController {
                 // v0.2.2: same retry-with-backoff pattern as BmpStation
                 // above. See that comment for rationale.
                 let mut cfg = BgpListenerConfig::new(listen, local_as, peer_as, router_id);
+                cfg.peer_uid = peer_uid;
                 cfg.session = feed_session.clone();
                 cfg.peer_acl = peer_acl;
                 cfg.expected_peer_ip = expected_peer_ip;
@@ -692,8 +699,9 @@ impl RouteController {
                 // the move.
                 let peer_acl_entries = cfg.peer_acl.len();
                 let peer_ip_log = cfg.expected_peer_ip;
-                let loopback_only =
-                    listen.ip().is_loopback() && peer_acl_entries == 0 && peer_ip_log.is_none();
+                let loopback_only = listen.ip().to_canonical().is_loopback()
+                    && peer_acl_entries == 0
+                    && peer_ip_log.is_none();
                 let prog = prog_handle.clone();
                 let shut = shutdown_token.clone();
                 let stall = snapshot.clone();
@@ -782,7 +790,8 @@ impl RouteController {
                     peer_as,
                     peer_acl_entries,
                     peer_ip = ?peer_ip_log,
-                    auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
+                    peer_uid = ?peer_uid,
+                    auth_posture = if loopback_only { "local UID" } else if peer_uid.is_none() { "remote ACL only" } else { "remote ACL, local UID" },
                     "RouteController started: NetlinkNeighborResolver + FibProgrammer + BgpListener + IntegrityChecker"
                 );
             }

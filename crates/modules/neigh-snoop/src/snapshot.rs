@@ -103,10 +103,12 @@ pub enum InstallOutcome {
     /// else between our request and its answer.
     Overridden,
     Skipped(SkipReason),
+    /// Pending work was refused at capacity or lost its supporting evidence.
+    QueueDropped,
 }
 
 impl InstallOutcome {
-    pub const COUNT: usize = 5 + SkipReason::COUNT;
+    pub const COUNT: usize = 6 + SkipReason::COUNT;
     pub const LABELS: [&'static str; Self::COUNT] = [
         "requested",
         "confirmed",
@@ -119,6 +121,7 @@ impl InstallOutcome {
         "skipped_unknown_state",
         "skipped_holddown",
         "mac_conflict",
+        "queue_dropped",
     ];
     pub fn index(self) -> usize {
         match self {
@@ -128,6 +131,7 @@ impl InstallOutcome {
             Self::Failed => 3,
             Self::Overridden => 4,
             Self::Skipped(s) => 5 + s.index(),
+            Self::QueueDropped => Self::COUNT - 1,
         }
     }
 }

@@ -2256,6 +2256,7 @@ pub fn attach(
                 addr,
                 port,
                 require_loc_rib,
+                peer_uid,
                 peer_from,
                 // `allow_remote` is informational here, the config
                 // parser already rejected the unsafe shape (non-loopback
@@ -2269,6 +2270,7 @@ pub fn attach(
                 .map(|listen| crate::fib::controller::RouteSourceConfig::Bmp {
                     listen,
                     require_loc_rib: *require_loc_rib,
+                    peer_uid: *peer_uid,
                     peer_acl: peer_from.clone(),
                 }),
             ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bgp {
@@ -2277,6 +2279,7 @@ pub fn attach(
                 local_as,
                 peer_as,
                 router_id,
+                peer_uid,
                 peer_from,
                 peer_ip,
                 anyip,
@@ -2296,6 +2299,7 @@ pub fn attach(
                     local_as: *local_as,
                     peer_as: *peer_as,
                     router_id: rid,
+                    peer_uid: *peer_uid,
                     peer_acl: peer_from.clone(),
                     expected_peer_ip: *peer_ip,
                     anyip: *anyip,

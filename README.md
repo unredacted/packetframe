@@ -241,7 +241,7 @@ Add these lines to the `fast-path` module.
 
 ```
 forwarding-mode packetframe-fib
-route-source bgp 192.0.2.202:1179 local-as 65551 peer-as 65551 allow-remote peer-from 192.0.2.201/32 anyip
+route-source bgp 192.0.2.202:1179 local-as 65551 peer-as 65551 allow-remote peer-from 192.0.2.201/32 anyip peer-uid <routing-service-uid>
 integrity-authority frr upstream 192.0.2.1 families v4,v6
 ```
 
@@ -252,7 +252,7 @@ integrity-authority frr upstream 192.0.2.1 families v4,v6
 
 ```
 forwarding-mode packetframe-fib
-route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551
+route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551 peer-uid <routing-service-uid>
 ```
 
 The listener is passive: the routing daemon connects out and exports its best paths, so PacketFrame receives one UPDATE per prefix (or one per path, with ADD-PATH). With BIRD, `integrity-authority` defaults to the local `birdc`.
