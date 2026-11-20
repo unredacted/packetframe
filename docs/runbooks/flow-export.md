@@ -281,6 +281,19 @@ fast-path accepts, never one it refused.
   gnu tarball carries it under `vpp_plugins/`. `packetframe feasibility`
   says whether it was built for the VPP that runs. VPP refuses a
   mismatched plugin without failing to start.
+- **Another VPP.** The packaged plugin is built against the VPP release
+  that `crates/modules/vpp-offload/vpp-api/SOURCE.json` names, and VPP
+  loads a plugin only for the version it was built for. Any other VPP
+  gets its own build:
+  - On a host with that VPP's `vpp-dev` and `libvppinfra-dev`
+    installed, plus clang, libclang and the Rust toolchain that
+    `rust-toolchain.toml` names, run
+    `cargo build --release --locked` in `crates/vpp-plugins/pf-sampler`.
+    The build takes the version it requires from those headers.
+  - Install `target/release/libpf_sampler.so` as the packaged plugin's
+    path above.
+  - `packetframe feasibility` compares that version with dpkg's `vpp`
+    package, so it only warns for a VPP that dpkg doesn't know.
 
 ## Kernel sampler
 
