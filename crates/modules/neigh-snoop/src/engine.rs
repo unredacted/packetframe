@@ -57,7 +57,7 @@ use crate::snapshot::{
 };
 use crate::table::{
     admit, install_decision, Decision, FilterReject, InstallMode, KernelMirror, LearnedTable,
-    MirrorEntry, Observe, DEFAULT_HOLDDOWN,
+    MirrorEntry, Observe, SkipReason, DEFAULT_HOLDDOWN,
 };
 
 pub type SharedSnapshot = Arc<RwLock<Snapshot>>;
@@ -376,6 +376,61 @@ impl IfaceState {
         }
     }
 
+    /// A matching protected direct row establishes this address independently.
+    /// Otherwise the observation must agree with the declared router's bindings.
+    fn conflict(&self, mirror: &KernelMirror, ip: IpAddr, mac: [u8; 6]) -> Option<SkipReason> {
+        let ifindex = self.ifindex?;
+        let protected = |ip| {
+            let row = mirror.get(ifindex, &ip)?;
+            Some((row.mac, row.protection()?))
+        };
+        if let Some((held, reason)) = protected(ip) {
+            return (held != Some(mac)).then_some(reason);
+        }
+        self.cfg.siblings_of(&ip)?.iter().find_map(|&sibling| {
+            let (held, reason) = protected(sibling)?;
+            (held != Some(mac)).then_some(reason)
+        })
+    }
+
+    fn retire_conflict(&mut self, ip: IpAddr, reason: SkipReason, now: Instant) {
+        self.table.remove(&ip);
+        self.forget_evidence(ip);
+        self.mark_dirty(now);
+        self.counters.install(InstallOutcome::Skipped(reason));
+    }
+
+    fn purge_conflicts(&mut self, mirror: &KernelMirror, now: Instant) {
+        let rejected: Vec<_> = self
+            .table
+            .iter()
+            .filter_map(|(&ip, e)| self.conflict(mirror, ip, e.mac).map(|why| (ip, why)))
+            .collect();
+        for (ip, why) in rejected {
+            self.retire_conflict(ip, why, now);
+        }
+    }
+
+    /// A binding change can invalidate evidence for this address and its peers.
+    fn reconcile_binding(&mut self, mirror: &KernelMirror, ip: IpAddr, now: Instant) {
+        let affected = self
+            .cfg
+            .siblings_of(&ip)
+            .unwrap_or(std::slice::from_ref(&ip));
+        let rejected: Vec<_> = affected
+            .iter()
+            .filter_map(|&addr| {
+                self.table
+                    .get(&addr)
+                    .and_then(|e| self.conflict(mirror, addr, e.mac))
+                    .map(|why| (addr, why))
+            })
+            .collect();
+        for (addr, why) in rejected {
+            self.retire_conflict(addr, why, now);
+        }
+    }
+
     fn observe(&mut self, learned: frame::Learned, wall: SystemTime, now: Instant) -> Observe {
         let (outcome, evicted) =
             self.table
@@ -477,6 +532,16 @@ impl IfaceState {
     ) -> Option<InstallJob> {
         while let Some((_, &(ip, intent))) = self.pending.order.first_key_value() {
             if let Some((origin, ifindex, mac, mode)) = self.install_job(ip, intent, mirror, now) {
+                let conflict = match origin {
+                    Origin::Derived(source) => self.conflict(mirror, source, mac),
+                    _ => None,
+                }
+                .or_else(|| self.conflict(mirror, ip, mac));
+                if let Some(why) = conflict {
+                    self.counters.install(InstallOutcome::Skipped(why));
+                    self.pending.remove(&ip);
+                    continue;
+                }
                 return Some(InstallJob {
                     bridge_idx,
                     ifindex,
@@ -489,6 +554,89 @@ impl IfaceState {
             self.pending.remove(&ip);
         }
         None
+    }
+
+    fn learn_observations(
+        &mut self,
+        pairs: &[frame::Learned],
+        mirror: &KernelMirror,
+        deny_macs: &[[u8; 6]],
+        wall: SystemTime,
+        now: Instant,
+    ) {
+        self.last_frame = Some(now);
+        self.counters.frame(pairs[0].source);
+        // An NA can assert both a target and a source with one MAC.
+        // Decide on the frame before either pair reaches the learning table.
+        if let Some(why) = pairs
+            .iter()
+            .find_map(|l| self.conflict(mirror, l.ip, l.mac))
+        {
+            self.counters.install(InstallOutcome::Skipped(why));
+            return;
+        }
+        for &l in pairs {
+            if let Err(why) = admit(
+                l.ip,
+                l.mac,
+                &self.cfg.prefixes,
+                &self.own_addrs,
+                self.own_mac,
+                deny_macs,
+            ) {
+                self.counters.filter_reject(why);
+                continue;
+            }
+            let outcome = self.observe(l, wall, now);
+            // Any admitted observation counts as hearing a peer: a peer
+            // restored from disk refreshes rather than appears, and a
+            // peer added by hot reload may already be in the table.
+            if self.cfg.peer_addrs().any(|a| a == l.ip) && self.heard_peers.insert(l.ip) {
+                info!(bridge = %self.cfg.name, ip = %l.ip, "configured peer first heard");
+            }
+            match outcome {
+                Observe::New => {
+                    self.counters.learn(LearnOutcome::New);
+                    self.mark_dirty(now);
+                }
+                Observe::Refreshed => {
+                    self.counters.learn(LearnOutcome::Refreshed);
+                    self.mark_dirty(now);
+                }
+                Observe::MacChanged { old } => {
+                    self.counters.learn(LearnOutcome::MacChanged);
+                    self.mark_dirty(now);
+                    info!(
+                        bridge = %self.cfg.name,
+                        ip = %l.ip,
+                        old = %packetframe_common::config::format_mac(old),
+                        new = %packetframe_common::config::format_mac(l.mac),
+                        "learned MAC changed"
+                    );
+                }
+            }
+            self.consider_install(l.ip, Origin::Learn, mirror, now);
+            // One MAC per member port: a MAC learned for one address of
+            // a declared router applies to its other addresses too.
+            let Some(peers) = self.cfg.siblings_of(&l.ip) else {
+                continue;
+            };
+            // Direct bindings may legitimately differ. Derive only when every
+            // protected address of this router agrees with the observation.
+            if let Some(why) = peers.iter().find_map(|peer| {
+                let row = mirror.get(self.ifindex?, peer)?;
+                (row.mac != Some(l.mac)).then(|| row.protection()).flatten()
+            }) {
+                self.counters.install(InstallOutcome::Skipped(why));
+                continue;
+            }
+            let siblings: Vec<_> = peers.iter().copied().filter(|ip| *ip != l.ip).collect();
+            for s in siblings {
+                if self.consider_install(s, Origin::Derived(l.ip), mirror, now) {
+                    self.counters.learn(LearnOutcome::Derived);
+                }
+            }
+        }
     }
 
     fn mark_dirty(&mut self, now: Instant) {
@@ -720,57 +868,14 @@ impl Engine {
         let now = Instant::now();
         let wall = SystemTime::now();
         let cap = config.hot.table_max as usize;
-        let mut bridges: Vec<IfaceState> = config
+        let bridges: Vec<IfaceState> = config
             .bridges
             .iter()
             .cloned()
             .map(|b| IfaceState::new(b, cap))
             .collect();
 
-        // 1. Persisted tables (the seed source), age-filtered.
-        for b in &mut bridges {
-            let path = persist::file_path(&persist_dir, &b.cfg.name);
-            match persist::load(&path, &b.cfg.name, wall, now, config.hot.seed_max_age) {
-                LoadOutcome::Loaded {
-                    entries,
-                    expired,
-                    bad_entries,
-                    written_at,
-                } => {
-                    let n = entries.len();
-                    for (ip, e) in entries {
-                        if b.table.insert_restored(ip, e).is_some() {
-                            b.counters.learn(LearnOutcome::Evicted);
-                        }
-                    }
-                    for _ in 0..expired {
-                        b.counters.seed(SeedOutcome::Expired);
-                    }
-                    for _ in 0..bad_entries {
-                        b.counters.seed(SeedOutcome::BadEntry);
-                    }
-                    if expired > 0 || bad_entries > 0 {
-                        b.mark_dirty(now);
-                    }
-                    info!(
-                        bridge = %b.cfg.name,
-                        entries = n,
-                        expired,
-                        bad_entries,
-                        age_secs = wall.duration_since(written_at).map(|d| d.as_secs()).unwrap_or(0),
-                        "persisted neighbour table loaded"
-                    );
-                }
-                LoadOutcome::Missing => {
-                    info!(bridge = %b.cfg.name, "no persisted neighbour table; starting empty");
-                }
-                LoadOutcome::Unusable(why) => {
-                    warn!(bridge = %b.cfg.name, %why, "persisted neighbour table ignored");
-                }
-            }
-        }
-
-        // 2. Subscribe BEFORE dumping: events raised during the dumps
+        // Subscribe BEFORE dumping: events raised during the dumps
         //    queue on the socket and replay through the loop, and every
         //    handler is last-write-wins, so nothing is lost in between.
         let messages = netlink::subscribe(multicast_rcvbuf)
@@ -803,7 +908,7 @@ impl Engine {
             ticks: 0,
         };
 
-        // 3. Links: which configured bridges exist, their MACs, state.
+        // Links: which configured bridges exist, their MACs, state.
         let links = engine.dump_links().await?;
         let mut present: Vec<(usize, LinkInfo)> = Vec::new();
         for l in links {
@@ -817,10 +922,67 @@ impl Engine {
                 }
             }
         }
-        // 4. Own addresses and 5. neighbours for the tracked ifindexes.
+        // Own addresses and neighbours for the tracked ifindexes.
         engine.refresh_addrs_and_neighs(None).await?;
 
-        // 6. Capture + seed for every bridge that is up.
+        // Legacy records need independent corroboration from the initial dump.
+        for b in &mut engine.bridges {
+            let path = persist::file_path(&engine.persist_dir, &b.cfg.name);
+            match persist::load_with_legacy_check(
+                &path,
+                &b.cfg.name,
+                wall,
+                now,
+                engine.hot.seed_max_age,
+                |ip, mac| {
+                    b.ifindex
+                        .and_then(|i| engine.mirror.get(i, &ip))
+                        .is_some_and(|e| e.corroborates_legacy(mac))
+                },
+            ) {
+                LoadOutcome::Loaded {
+                    entries,
+                    expired,
+                    bad_entries,
+                    written_at,
+                    unconfirmed_legacy,
+                } => {
+                    let n = entries.len();
+                    for (ip, e) in entries {
+                        if b.table.insert_restored(ip, e).is_some() {
+                            b.counters.learn(LearnOutcome::Evicted);
+                        }
+                    }
+                    for _ in 0..expired {
+                        b.counters.seed(SeedOutcome::Expired);
+                    }
+                    for _ in 0..bad_entries {
+                        b.counters.seed(SeedOutcome::BadEntry);
+                    }
+                    b.purge_conflicts(&engine.mirror, now);
+                    if unconfirmed_legacy.is_some() || expired > 0 || bad_entries > 0 {
+                        b.mark_dirty(now);
+                    }
+                    info!(
+                        bridge = %b.cfg.name,
+                        entries = n,
+                        ?unconfirmed_legacy,
+                        expired,
+                        bad_entries,
+                        age_secs = wall.duration_since(written_at).map(|d| d.as_secs()).unwrap_or(0),
+                        "persisted neighbour table loaded"
+                    );
+                }
+                LoadOutcome::Missing => {
+                    info!(bridge = %b.cfg.name, "no persisted neighbour table; starting empty");
+                }
+                LoadOutcome::Unusable(why) => {
+                    warn!(bridge = %b.cfg.name, %why, "persisted neighbour table ignored");
+                }
+            }
+        }
+
+        // Capture + seed for every bridge that is up.
         for (bi, l) in present {
             if l.up {
                 engine.bring_up(bi, now).await;
@@ -921,6 +1083,9 @@ impl Engine {
             if tracked.contains_key(&ifindex) {
                 self.mirror.upsert(ifindex, ip, entry);
             }
+        }
+        for &bi in tracked.values() {
+            self.bridges[bi].purge_conflicts(&self.mirror, Instant::now());
         }
         Ok(())
     }
@@ -1049,6 +1214,7 @@ impl Engine {
             // still queued can find the kernel holding that MAC in FAILED,
             // the very state it was sent to repair.
             let b = &mut self.bridges[bi];
+            b.purge_conflicts(&self.mirror, Instant::now());
             let heard: Vec<IpAddr> = b
                 .in_flight
                 .iter()
@@ -1421,6 +1587,13 @@ impl Engine {
         let Some(bi) = self.bridges.iter().position(|b| b.ifindex == Some(ifindex)) else {
             return;
         };
+        let protected_mac = |row: MirrorEntry| row.protection().map(|_| row.mac);
+        let old = self
+            .mirror
+            .get(ifindex, &ip)
+            .copied()
+            .and_then(protected_mac);
+        let new = entry.and_then(protected_mac);
         match entry {
             None => {
                 self.mirror.remove(ifindex, &ip);
@@ -1440,6 +1613,9 @@ impl Engine {
                     }
                 }
             }
+        }
+        if old != new {
+            self.bridges[bi].reconcile_binding(&self.mirror, ip, Instant::now());
         }
     }
 
@@ -1670,63 +1846,7 @@ impl Engine {
                 return;
             }
         };
-        b.last_frame = Some(now);
-        b.counters.frame(pairs[0].source);
-        for l in pairs {
-            let b = &mut self.bridges[bi];
-            if let Err(why) = admit(
-                l.ip,
-                l.mac,
-                &b.cfg.prefixes,
-                &b.own_addrs,
-                b.own_mac,
-                &self.deny_macs,
-            ) {
-                b.counters.filter_reject(why);
-                continue;
-            }
-            let outcome = b.observe(l, wall, now);
-            // Any admitted observation counts as hearing a peer: a peer
-            // restored from disk refreshes rather than appears, and a
-            // peer added by hot reload may already be in the table.
-            if b.cfg.peer_addrs().any(|a| a == l.ip) && b.heard_peers.insert(l.ip) {
-                info!(bridge = %b.cfg.name, ip = %l.ip, "configured peer first heard");
-            }
-            match outcome {
-                Observe::New => {
-                    b.counters.learn(LearnOutcome::New);
-                    b.mark_dirty(now);
-                }
-                Observe::Refreshed => {
-                    b.counters.learn(LearnOutcome::Refreshed);
-                    b.mark_dirty(now);
-                }
-                Observe::MacChanged { old } => {
-                    b.counters.learn(LearnOutcome::MacChanged);
-                    b.mark_dirty(now);
-                    info!(
-                        bridge = %b.cfg.name,
-                        ip = %l.ip,
-                        old = %packetframe_common::config::format_mac(old),
-                        new = %packetframe_common::config::format_mac(l.mac),
-                        "learned MAC changed"
-                    );
-                }
-            }
-            b.consider_install(l.ip, Origin::Learn, &self.mirror, now);
-            // One MAC per member port: a MAC learned for one address of
-            // a declared router applies to its other addresses too.
-            let siblings: Vec<IpAddr> = b
-                .cfg
-                .siblings_of(&l.ip)
-                .map(|s| s.iter().copied().filter(|s| *s != l.ip).collect())
-                .unwrap_or_default();
-            for s in siblings {
-                if b.consider_install(s, Origin::Derived(l.ip), &self.mirror, now) {
-                    b.counters.learn(LearnOutcome::Derived);
-                }
-            }
-        }
+        b.learn_observations(&pairs, &self.mirror, &self.deny_macs, wall, now);
     }
 
     /// One paced install: round-robin across bridges so a seed on one
@@ -1921,6 +2041,7 @@ impl Engine {
         for bi in 0..self.bridges.len() {
             self.purge_inadmissible(bi, now);
             let b = &mut self.bridges[bi];
+            b.purge_conflicts(&self.mirror, now);
             // A regrouped peer no longer vouches for a former sibling.
             // Keep any independent evidence for the target itself.
             for (target, intent) in b.pending.order.values_mut() {
@@ -2336,6 +2457,125 @@ mod pending_tests {
             SystemTime::now(),
             now,
         );
+    }
+
+    mod conflicts {
+        use super::*;
+        use crate::table::NudState;
+
+        fn observation(n: u8, mac: [u8; 6]) -> Learned {
+            Learned {
+                ip: ip(n),
+                mac,
+                source: Source::ArpReply,
+            }
+        }
+
+        fn row(state: NudState, mac: [u8; 6]) -> MirrorEntry {
+            MirrorEntry {
+                state,
+                mac: Some(mac),
+            }
+        }
+
+        #[test]
+        fn rejected_observation_preserves_sibling_and_next_seed() {
+            let now = Instant::now();
+            let wall = SystemTime::now();
+            for state in [
+                NudState::Reachable,
+                NudState::Delay,
+                NudState::Probe,
+                NudState::Permanent,
+                NudState::Noarp,
+            ] {
+                let mut b = bridge(4, &[1, 2]);
+                let mut mirror = KernelMirror::default();
+                mirror.upsert(1, ip(1), row(state, MAC));
+                b.learn_observations(&[observation(1, MAC)], &mirror, &[], wall, now);
+                let before = persist::to_json(&b.table, "br0", wall);
+                let later = now + Duration::from_secs(1);
+                for addr in [1, 2] {
+                    b.learn_observations(
+                        &[observation(addr, NEW_MAC)],
+                        &mirror,
+                        &[],
+                        wall + Duration::from_secs(1),
+                        later,
+                    );
+                }
+                assert_eq!(persist::to_json(&b.table, "br0", wall), before);
+                assert_eq!(b.heard_peers, HashSet::from([ip(1)]));
+                let sibling = b.next_install(0, &mirror, later).unwrap();
+                assert_eq!(
+                    (sibling.ip, sibling.mac, sibling.origin),
+                    (ip(2), MAC, Origin::Derived(ip(1)))
+                );
+                b.pending.remove(&sibling.ip);
+                assert!(b.next_install(0, &mirror, later).is_none());
+                mirror.remove(1, &ip(1));
+                assert!(b.consider_install(ip(1), Origin::Seed, &mirror, later));
+                assert_eq!(b.next_install(0, &mirror, later).unwrap().mac, MAC);
+            }
+        }
+
+        #[test]
+        fn paired_observations_are_admitted_together() {
+            let mut b = bridge(4, &[]);
+            b.cfg.prefixes.push("2001:db8::/64".parse().unwrap());
+            let mut mirror = KernelMirror::default();
+            let claim = |ip: &str| Learned {
+                ip: ip.parse().unwrap(),
+                mac: NEW_MAC,
+                source: Source::NeighborAdvertisement,
+            };
+            let a = claim("2001:db8::1");
+            let b2 = claim("2001:db8::2");
+            mirror.upsert(1, a.ip, row(NudState::Reachable, MAC));
+            for pairs in [[a, b2], [b2, a]] {
+                b.learn_observations(&pairs, &mirror, &[], SystemTime::now(), Instant::now());
+                assert!(b.table.is_empty());
+                assert_eq!(b.pending.len(), 0);
+                assert!(b.dirty_since.is_none());
+            }
+        }
+
+        #[test]
+        fn binding_change_retires_evidence_until_a_fresh_observation() {
+            let now = Instant::now();
+            let wall = SystemTime::now();
+            let mut b = bridge(4, &[1, 2]);
+            let mut mirror = KernelMirror::default();
+            b.learn_observations(&[observation(1, MAC)], &mirror, &[], wall, now);
+            mirror.upsert(1, ip(2), row(NudState::Reachable, NEW_MAC));
+            assert!(b.next_install(0, &mirror, now).is_none());
+            b.reconcile_binding(&mirror, ip(2), now);
+            assert!(b.table.is_empty());
+            mirror.upsert(1, ip(2), row(NudState::Failed, NEW_MAC));
+            assert!(!b.consider_install(ip(1), Origin::Seed, &mirror, now));
+            b.learn_observations(&[observation(1, MAC)], &mirror, &[], wall, now);
+            assert_eq!(b.table.get(&ip(1)).unwrap().mac, MAC);
+            assert_eq!(b.pending.len(), 2);
+        }
+
+        #[test]
+        fn legacy_requires_positive_direct_corroboration() {
+            for state in [NudState::Reachable, NudState::Permanent, NudState::Noarp] {
+                assert!(row(state, MAC).corroborates_legacy(MAC));
+                assert!(!row(state, NEW_MAC).corroborates_legacy(MAC));
+                assert!(!MirrorEntry { state, mac: None }.corroborates_legacy(MAC));
+            }
+            for state in [
+                NudState::Delay,
+                NudState::Probe,
+                NudState::Stale,
+                NudState::Failed,
+                NudState::Incomplete,
+                NudState::None,
+            ] {
+                assert!(!row(state, MAC).corroborates_legacy(MAC));
+            }
+        }
     }
 
     #[test]

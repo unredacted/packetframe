@@ -23,7 +23,8 @@ use packetframe_common::statefile::{
 use crate::frame::Source;
 use crate::table::{LearnedEntry, LearnedTable};
 
-pub const PERSIST_VERSION: u32 = 1;
+// Version 1 used the same wire fields but could retain rejected observations.
+pub const PERSIST_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistFileV1 {
@@ -53,6 +54,8 @@ pub enum LoadOutcome {
         entries: Vec<(IpAddr, LearnedEntry)>,
         expired: usize,
         bad_entries: usize,
+        /// For v1 input, the number of rows lacking kernel corroboration.
+        unconfirmed_legacy: Option<usize>,
         written_at: SystemTime,
     },
     /// No file: a first start.
@@ -165,12 +168,23 @@ pub fn load(
     now_mono: Instant,
     max_age: Duration,
 ) -> LoadOutcome {
+    load_with_legacy_check(path, ifname, now, now_mono, max_age, |_, _| false)
+}
+
+pub(crate) fn load_with_legacy_check(
+    path: &Path,
+    ifname: &str,
+    now: SystemTime,
+    now_mono: Instant,
+    max_age: Duration,
+    corroborated: impl Fn(IpAddr, [u8; 6]) -> bool,
+) -> LoadOutcome {
     let file = match read_snapshot(path) {
         Ok(Some(file)) => file,
         Ok(None) => return LoadOutcome::Missing,
         Err(why) => return LoadOutcome::Unusable(why),
     };
-    if file.version != PERSIST_VERSION {
+    if file.version != 1 && file.version != PERSIST_VERSION {
         return LoadOutcome::Unusable(format!(
             "unsupported persisted version {} (expected {PERSIST_VERSION}); starting empty",
             file.version
@@ -190,6 +204,7 @@ pub fn load(
     let mut entries = Vec::with_capacity(file.entries.len());
     let mut expired = 0usize;
     let mut bad_entries = 0usize;
+    let mut unconfirmed_legacy = (file.version == 1).then_some(0);
     for e in file.entries {
         let (Ok(ip), Ok(mac), Some(source), Some(first_seen), Some(last_seen)) = (
             e.ip.parse::<IpAddr>(),
@@ -204,6 +219,12 @@ pub fn load(
         if e.last_seen < cutoff {
             expired += 1;
             continue;
+        }
+        if let Some(count) = &mut unconfirmed_legacy {
+            if !corroborated(ip, mac) {
+                *count += 1;
+                continue;
+            }
         }
         let age = Duration::from_secs(now_secs.saturating_sub(e.last_seen));
         entries.push((
@@ -222,6 +243,7 @@ pub fn load(
         entries,
         expired,
         bad_entries,
+        unconfirmed_legacy,
         written_at,
     }
 }
@@ -383,6 +405,43 @@ mod tests {
     }
 
     #[test]
+    fn version_one_restores_only_independently_corroborated_entries() {
+        let dir = scratch();
+        let path = file_path(&dir, "br0");
+        let wall = SystemTime::now();
+        let now = Instant::now();
+        let age = Duration::from_secs(60);
+        let mut table = LearnedTable::new(4);
+        for addr in [ip(1), ip(2)] {
+            table.observe(addr, A, Source::ArpReply, wall, now);
+        }
+        let current = to_json(&table, "br0", wall);
+        let mut legacy: PersistFileV1 = serde_json::from_str(&current).unwrap();
+        legacy.version = 1;
+        save(&path, &serde_json::to_string(&legacy).unwrap()).unwrap();
+        let allowed = |addr, mac| addr == ip(1) && mac == A;
+        match load_with_legacy_check(&path, "br0", wall, now, age, allowed) {
+            LoadOutcome::Loaded {
+                entries,
+                unconfirmed_legacy: Some(1),
+                ..
+            } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!((entries[0].0, entries[0].1.mac), (ip(1), A));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(load(&path, "br0", wall, now, age), LoadOutcome::Loaded { entries, .. } if entries.is_empty())
+        );
+        save(&path, &current).unwrap();
+        assert!(
+            matches!(load(&path, "br0", wall, now, age), LoadOutcome::Loaded { entries, unconfirmed_legacy: None, .. } if entries.len() == 2)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn missing_version_and_ifname_mismatch() {
         let dir = scratch();
         let path = file_path(&dir, "br0");
@@ -393,7 +452,7 @@ mod tests {
             LoadOutcome::Missing
         ));
         let mut f = PersistFileV1 {
-            version: 2,
+            version: PERSIST_VERSION + 1,
             ifname: "br0".into(),
             written_at: 0,
             entries: vec![],
@@ -401,7 +460,7 @@ mod tests {
         save(&path, &serde_json::to_string(&f).unwrap()).unwrap();
         match load(&path, "br0", now, mono, Duration::from_secs(1)) {
             LoadOutcome::Unusable(m) => {
-                assert!(m.contains("unsupported persisted version 2"), "{m}")
+                assert!(m.contains("unsupported persisted version 3"), "{m}")
             }
             other => panic!("{other:?}"),
         }

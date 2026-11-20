@@ -259,6 +259,27 @@ pub struct MirrorEntry {
 }
 
 impl MirrorEntry {
+    /// Passive evidence must respect an established or operator-managed binding.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn protection(self) -> Option<SkipReason> {
+        match self.state {
+            NudState::Permanent => Some(SkipReason::Permanent),
+            NudState::Noarp => Some(SkipReason::Noarp),
+            state if state.is_confirmed() => Some(SkipReason::MacConflict),
+            _ => None,
+        }
+    }
+
+    /// DELAY and PROBE may still be testing a STALE entry from an old seed.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn corroborates_legacy(self, mac: [u8; 6]) -> bool {
+        self.mac == Some(mac)
+            && matches!(
+                self.state,
+                NudState::Reachable | NudState::Permanent | NudState::Noarp
+            )
+    }
+
     /// The entry resolves: a MAC in a valid state.
     pub fn resolves(&self) -> bool {
         self.mac.is_some() && self.state.is_valid()
