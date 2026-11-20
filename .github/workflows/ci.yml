@@ -410,7 +410,9 @@ jobs:
     # format), so a drift there says which release needs a re-vendor, not
     # that PacketFrame is broken. For the same release it fails: a drift
     # between fd.io's build and vpp-unifi's of one release means the API
-    # this checkout was generated from is not upstream's.
+    # this checkout was generated from is not upstream's. The CLI-parser
+    # leg checks only cli_inband's CRC (Transport::connect_speaking), so a
+    # drift this leg permits cannot fail that one at connect.
     #
     # No privileged-tests.sh row: like vpp-cli-compat-arm64, it runs its
     # #[ignore]d test through cargo in its own container.

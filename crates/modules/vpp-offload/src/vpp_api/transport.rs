@@ -148,7 +148,34 @@ impl Transport {
     /// supervision loop for good — no ping, no wedge verdict, steering
     /// left on a dead dataplane. See [`connect_within`].
     pub fn connect(path: impl AsRef<Path>, timeout: Duration) -> Result<Self, TransportError> {
-        let path = path.as_ref();
+        Self::connect_inner(path.as_ref(), timeout, None)
+    }
+
+    /// [`Self::connect`], but checking only the named messages, and
+    /// forgetting every other id so nothing unchecked can be sent or
+    /// decoded (it fails as [`TransportError::MessageUnknown`]). `names`
+    /// is every message the caller speaks, replies included.
+    ///
+    /// Not for attaching: the eager whole-whitelist check is what keeps a
+    /// version skew from surfacing halfway through a FIB load. This is for
+    /// checks of other surfaces that speak a known few messages, against a
+    /// VPP whose other messages may have drifted: the CLI-parser test
+    /// (`tests/vpp_cli_compat.rs`) speaks only `cli_inband`, and CI runs it
+    /// on fd.io releases other than the one `vpp-api/SOURCE.json` names,
+    /// where a drift elsewhere is permitted and reported separately.
+    pub fn connect_speaking(
+        path: impl AsRef<Path>,
+        timeout: Duration,
+        names: &[&str],
+    ) -> Result<Self, TransportError> {
+        Self::connect_inner(path.as_ref(), timeout, Some(names))
+    }
+
+    fn connect_inner(
+        path: &Path,
+        timeout: Duration,
+        only: Option<&[&str]>,
+    ) -> Result<Self, TransportError> {
         let deadline = Instant::now() + timeout;
         let sock = connect_within(path, timeout).map_err(|source| TransportError::Connect {
             path: path.display().to_string(),
@@ -173,7 +200,7 @@ impl Transport {
             connect_deadline: Some(deadline),
             answers: 0,
         };
-        t.handshake()?;
+        t.handshake(only)?;
         t.connect_deadline = None;
         // The meter starts after the handshake: a connect that fails
         // leaves no transport to read it from, so the caller times the
@@ -207,7 +234,7 @@ impl Transport {
     /// The bootstrap chicken-and-egg: this one message's id cannot be
     /// looked up, because the lookup table arrives in its reply. See
     /// [`SOCKCLNT_CREATE_MSG_ID`].
-    fn handshake(&mut self) -> Result<(), TransportError> {
+    fn handshake(&mut self, only: Option<&[&str]>) -> Result<(), TransportError> {
         let mut req = SockclntCreate {
             context: 0,
             name: CLIENT_NAME.to_string(),
@@ -240,7 +267,10 @@ impl Transport {
                 self.ids.insert(name.to_string(), entry.index);
             }
         }
-        self.verify_against(&reply)?;
+        self.verify_against(&reply, only)?;
+        if let Some(only) = only {
+            self.ids.retain(|name, _| only.contains(&name.as_str()));
+        }
 
         // Now that ids are known, index the per-message context offsets.
         for meta in MESSAGE_META {
@@ -251,20 +281,29 @@ impl Transport {
         Ok(())
     }
 
-    /// Every message we speak must exist with our CRC.
+    /// Every message we speak must exist with our CRC: the whole
+    /// whitelist, or only `only`'s names of it (see
+    /// [`Transport::connect_speaking`]).
     ///
     /// Checked eagerly at connect rather than lazily at first use: a
     /// version skew discovered halfway through installing a million
     /// routes is a half-populated FIB, while one discovered here is a
     /// clean failure the supervisor can report and back off from.
-    fn verify_against(&self, reply: &SockclntCreateReply) -> Result<(), TransportError> {
+    fn verify_against(
+        &self,
+        reply: &SockclntCreateReply,
+        only: Option<&[&str]>,
+    ) -> Result<(), TransportError> {
         let mut theirs: HashMap<&str, &str> = HashMap::new();
         for entry in &reply.message_table {
             if let Some((name, crc)) = entry.name.rsplit_once('_') {
                 theirs.insert(name, crc);
             }
         }
-        for meta in MESSAGE_META {
+        for meta in MESSAGE_META
+            .iter()
+            .filter(|m| only.is_none_or(|only| only.contains(&m.name)))
+        {
             let Some(their_crc) = theirs.get(meta.name) else {
                 return Err(TransportError::MessageUnknown(meta.name));
             };
@@ -648,6 +687,14 @@ mod tests {
     }
 
     fn verify(entries: &[(String, String, u16)], response: i32) -> Result<(), TransportError> {
+        verify_only(entries, response, None)
+    }
+
+    fn verify_only(
+        entries: &[(String, String, u16)],
+        response: i32,
+        only: Option<&[&str]>,
+    ) -> Result<(), TransportError> {
         let owned: Vec<(&str, &str, u16)> = entries
             .iter()
             .map(|(n, c, i)| (n.as_str(), c.as_str(), *i))
@@ -674,7 +721,7 @@ mod tests {
             connect_deadline: None,
             answers: 0,
         };
-        t.verify_against(&reply)
+        t.verify_against(&reply, only)
     }
 
     #[test]
@@ -690,6 +737,22 @@ mod tests {
                 assert_eq!(name, "ip_route_add_del");
                 assert_eq!(theirs, "deadbeef");
             }
+            other => panic!("expected a CRC mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_narrowed_check_ignores_drift_outside_its_names() {
+        let mut entries = all_ours(Some(("ip_route_add_del", "deadbeef")));
+        entries.retain(|(n, _, _)| n != "dev_attach");
+        assert!(verify_only(&entries, 0, Some(&["cli_inband", "cli_inband_reply"])).is_ok());
+    }
+
+    #[test]
+    fn a_narrowed_check_still_refuses_its_own_names() {
+        let entries = all_ours(Some(("cli_inband", "deadbeef")));
+        match verify_only(&entries, 0, Some(&["cli_inband"])) {
+            Err(TransportError::CrcMismatch { name, .. }) => assert_eq!(name, "cli_inband"),
             other => panic!("expected a CRC mismatch, got {other:?}"),
         }
     }
