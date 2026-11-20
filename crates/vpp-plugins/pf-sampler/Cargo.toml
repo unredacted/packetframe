@@ -20,10 +20,12 @@ crate-type = ["cdylib"]
 # baseline node variant, the x4 feature-next fix, version_required:
 # rshearman/vpp-plugin-rs#11-#14) and the fork's own (VPP_BUILD_VER read
 # past a line marker, SwIfIndex Display, the WARNING severity, a build
-# script that reruns when the VPP headers it compiled against change, and
-# 26.10's chain-length slow path, so it builds against 26.06 and 26.10).
-# Pinned by commit; the tag pf/2026-11-19.2 keeps it reachable.
-vpp-plugin = { git = "https://github.com/unredacted/vpp-plugin-rs", rev = "1ae9776eaaa5d4099a2caa0b05c2ce5b7d01731d", features = ["process-node"] }
+# script that reruns when the VPP headers it compiled against change,
+# 26.10's chain-length slow path, so it builds against 26.06 and 26.10, and
+# node functions registered only for the march variants each VPP defines,
+# so it builds on x86 against 26.06 and later).
+# Pinned by commit; the tag pf/2026-11-19.3 keeps it reachable.
+vpp-plugin = { git = "https://github.com/unredacted/vpp-plugin-rs", rev = "51d531dfc17ecd93611d61749ef71b9fb11d869f", features = ["process-node"] }
 packetframe-sampler-core = { path = "../pf-sampler-core" }
 packetframe-sampler-shm = { path = "../../sampler-shm" }
 arrayvec = "0.7.6"
