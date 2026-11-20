@@ -500,7 +500,7 @@ impl BmpStation {
                                     self.saw_peer_up.load(Ordering::Relaxed);
                                 let peers_up =
                                     !self.up_peers.lock().expect("up_peers lock").is_empty();
-                                if first_stream && (!peers_speak || peers_up) {
+                                if first_stream && !self.prog_handle.admission_incomplete() && (!peers_speak || peers_up) {
                                     if let Some(sess) = &self.session {
                                         sess.set_up(true);
                                         // Reconciled by the same fact
@@ -533,6 +533,10 @@ impl BmpStation {
                     }
                 }
                 _ = tick.tick() => {
+                    if self.prog_handle.take_replay_if_due() {
+                        reader.abort();
+                        return Err(RouteSourceError::recoverable("route admission needs a full replay"));
+                    }
                     let quiesced = last_route_monitoring
                         .is_some_and(|last| last.elapsed() >= INIT_COMPLETE_QUIESCENCE);
                     if !quiesced {
@@ -550,6 +554,10 @@ impl BmpStation {
                             .apply_route_event(RouteEvent::InitiationComplete)
                             .await
                         {
+                            if matches!(e, super::programmer::ProgrammerError::ReplayRequired(_)) {
+                                init_complete_fired = true;
+                                continue;
+                            }
                             warn!(error = %e, "InitiationComplete dispatch failed");
                             continue;
                         }
@@ -565,6 +573,7 @@ impl BmpStation {
                         self.stale_state_possible
                             .store(false, std::sync::atomic::Ordering::Relaxed);
                     }
+                    if self.prog_handle.admission_incomplete() { continue; }
                     // Re-armable raise: quiescence counts only when the
                     // stream it followed is NEWER than the last
                     // lowering — frames since, not silence since — so a
@@ -847,7 +856,9 @@ impl BmpStation {
                         },
                     };
                     if let Err(e) = self.prog_handle.apply_route_event(event).await {
-                        warn!(?peer_id, error = %e, "route event dispatch failed");
+                        if !matches!(e, super::programmer::ProgrammerError::Admission(_)) {
+                            warn!(?peer_id, error = %e, "route event dispatch failed");
+                        }
                     }
                 }
             }
