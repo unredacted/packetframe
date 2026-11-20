@@ -368,6 +368,21 @@ jobs:
           path: crates/vpp-plugins/pf-sampler/target/release/libpf_sampler.so
           if-no-files-found: error
 
+  vpp-cli-compat-arm64:
+    name: vpp CLI compat (arm64, VPP)
+    # vpp-offload's CLI-text parsers against the release SOURCE.json names,
+    # in a real VPP (.github/actions/vpp-cli-compat, which vpp-unifi runs
+    # on every candidate VPP too). Same container as the sampler plugin's.
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:bullseye
+      # VPP itself.
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/vpp-cli-compat
+
   cross-build:
     name: cross-build ${{ matrix.target }}
     runs-on: ubuntu-latest

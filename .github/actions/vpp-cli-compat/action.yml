@@ -1,0 +1,59 @@
+name: vpp-offload's CLI parsers against a real VPP
+description: >-
+  Start a scratch VPP and check that vpp-offload reads its CLI output
+  (FIB summaries, show errors, neighbor stats, interface counters) as it
+  means.
+
+# vpp-offload parses the text of a few VPP CLI commands, which a release
+# can reword with no binary-API change: the attach handshake and
+# .github/scripts/vpp-api-drift.sh would both pass a VPP whose `show ip
+# fib summary` keep-VPP adoption can no longer read. This runs
+# .github/scripts/vpp-cli-compat.sh, which programs routes and traffic
+# into a VPP with no NIC and asserts each parser recovers them
+# (crates/modules/vpp-offload/tests/vpp_cli_compat.rs).
+#
+# The caller runs it in a privileged Debian container on an arm64 runner
+# (VPP itself), after actions/checkout. CI's `vpp CLI compat (arm64, VPP)`
+# job runs it against the release SOURCE.json names; unredacted/vpp-unifi
+# runs it with `vpp-debs` on every VPP it is about to publish, so no
+# release this repo can vendor is one whose CLI it misreads.
+inputs:
+  vpp-debs:
+    description: >-
+      A directory of VPP .debs to test instead of the release SOURCE.json
+      names (vpp-unifi's pre-publish check of a candidate VPP). Empty: the
+      release.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/install-vpp
+      with:
+        vpp-debs: ${{ inputs.vpp-debs }}
+
+    - name: Distro
+      id: distro
+      shell: bash
+      run: echo "codename=$(. /etc/os-release && echo "$VERSION_CODENAME")" >> "$GITHUB_OUTPUT"
+
+    # Pure Rust, built against no VPP header, so any VPP may restore it.
+    # Not in vpp-unifi's runs all the same: that job runs whatever
+    # packetframe ref a dispatch names, and should leave nothing behind in
+    # that repo's cache for a later run to restore. A cold build is about
+    # a minute.
+    - uses: actions/cache@v6
+      if: inputs.vpp-debs == ''
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ steps.distro.outputs.codename }}-arm64-vpp-cli-compat-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        restore-keys: |
+          ${{ steps.distro.outputs.codename }}-arm64-vpp-cli-compat-
+
+    - name: vpp-offload reads this VPP's CLI output
+      shell: bash
+      run: bash .github/scripts/vpp-cli-compat.sh
