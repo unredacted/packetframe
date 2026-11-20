@@ -383,6 +383,97 @@ jobs:
 
       - uses: ./.github/actions/vpp-cli-compat
 
+  vpp-fdio-arm64:
+    name: fd.io VPP (arm64)
+    # PacketFrame works with any VPP and never depends on vpp-unifi, but
+    # every other VPP check here runs vpp-unifi's build of the release
+    # SOURCE.json names. This runs the same checks against a VPP vpp-unifi
+    # never touched: fd.io's own release packages (packagecloud
+    # fdio/release) on Ubuntu, a different distro, toolchain and libclang
+    # from the gateways' bullseye. The sampler plugin builds and passes its
+    # live smoke test, vpp-offload's CLI parsers read its output, and the
+    # binary API is compared with what this checkout was generated from.
+    #
+    # FDIO_VPP pins the release so a new fd.io one cannot turn unrelated
+    # PRs red; the fetch step warns when fd.io publishes a newer one, and
+    # bumping it is this job's whole upkeep.
+    #
+    # arm64 only, for now: on amd64 the plugin does not build against
+    # 26.10, whose x86 march variants are scalar/x86_64_v3/x86_64_v4 where
+    # the vpp-plugin fork's #[vlib_node] still names hsw/skx/icl. x86 is not
+    # a VPP platform PacketFrame supports; an amd64 leg returns with the
+    # fork fix.
+    #
+    # The binary-API leg reports drift as information when FDIO_VPP is a
+    # different release from SOURCE.json's: the CRC handshake refuses that
+    # VPP at attach by design (one PacketFrame build speaks one wire
+    # format), so a drift there says which release needs a re-vendor, not
+    # that PacketFrame is broken. For the same release it fails: a drift
+    # between fd.io's build and vpp-unifi's of one release means the API
+    # this checkout was generated from is not upstream's. The CLI-parser
+    # leg checks only cli_inband's CRC (Transport::connect_speaking), so a
+    # drift this leg permits cannot fail that one at connect.
+    #
+    # No privileged-tests.sh row: like vpp-cli-compat-arm64, it runs its
+    # #[ignore]d test through cargo in its own container.
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: ubuntu:noble
+      # A tmpfs mount for the sampler directory, and VPP itself.
+      options: --privileged
+    defaults:
+      run:
+        # A container's default is sh, which has no pipefail.
+        shell: bash
+    env:
+      FDIO_VPP: 26.10-release
+      FDIO_DEBS: /fdio-debs
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: fd.io's VPP debs
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl gpg
+          key=/usr/share/keyrings/fdio-release.gpg
+          curl -fsSL https://packagecloud.io/fdio/release/gpgkey | gpg --dearmor > "$key"
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          echo "deb [signed-by=$key] https://packagecloud.io/fdio/release/ubuntu $codename main" \
+            > /etc/apt/sources.list.d/fdio-release.list
+          apt-get update
+          newest=$(apt-cache madison vpp | awk '$3 ~ /-release$/ { print $3 }' | sort -V | tail -1)
+          if [ "$newest" != "$FDIO_VPP" ]; then
+            echo "::warning::fd.io publishes vpp $newest for $codename; this job pins $FDIO_VPP (bump FDIO_VPP in ci.yml)"
+          fi
+          # apt checks each deb against the repository's signed index.
+          mkdir -p "$FDIO_DEBS" && chown _apt "$FDIO_DEBS" && cd "$FDIO_DEBS"
+          apt-get download $(for p in vpp libvppinfra libvppinfra-dev vpp-dev vpp-plugin-core; do echo "$p=$FDIO_VPP"; done)
+          ls -l
+
+      - uses: ./.github/actions/sampler-plugin
+        with:
+          vpp-debs: ${{ env.FDIO_DEBS }}
+
+      - uses: ./.github/actions/vpp-cli-compat
+        with:
+          vpp-debs: ${{ env.FDIO_DEBS }}
+
+      - name: Binary API against fd.io's .api.json
+        run: |
+          set -euo pipefail
+          # The vpp and vpp-plugin-core debs install every .api.json here.
+          bundle=$(mktemp -d)/fdio-api.tar.gz
+          tar czf "$bundle" -C /usr/share/vpp/api .
+          attested=$(jq -r .vpp_ref crates/modules/vpp-offload/vpp-api/SOURCE.json)
+          if [ "v${FDIO_VPP%-release}" = "$attested" ]; then
+            level=error
+          else
+            level=notice
+            echo "fd.io $FDIO_VPP is not SOURCE.json's $attested: a drift is reported, not failed"
+          fi
+          DRIFT_LEVEL=$level bash .github/scripts/vpp-api-drift.sh "$bundle"
+
   cross-build:
     name: cross-build ${{ matrix.target }}
     runs-on: ubuntu-latest

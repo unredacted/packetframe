@@ -43,7 +43,7 @@ use packetframe_vpp_offload::engine::{
 use packetframe_vpp_offload::handback::parse_tx_packets;
 use packetframe_vpp_offload::ledger_record::FibFingerprint;
 use packetframe_vpp_offload::vpp_api::generated::{CliInband, CliInbandReply};
-use packetframe_vpp_offload::vpp_api::Transport;
+use packetframe_vpp_offload::vpp_api::{Message, Transport};
 
 const SOCK_ENV: &str = "PACKETFRAME_VPP_CLI_SOCK";
 const PG: &str = "pg0";
@@ -424,8 +424,15 @@ fn errors_settled(t: &mut Transport, before: &str) -> String {
 fn vpp_cli_output_parses() {
     let sock = std::env::var(SOCK_ENV)
         .unwrap_or_else(|_| panic!("{SOCK_ENV} must name a scratch VPP's API socket"));
-    let mut t = Transport::connect(&sock, Duration::from_secs(5))
-        .unwrap_or_else(|e| panic!("connect {sock}: {e}"));
+    // Only cli_inband and its reply are checked: this tests the CLI text,
+    // and CI runs it on fd.io releases whose other messages may have
+    // drifted (that is vpp-api-drift.sh's to report).
+    let mut t = Transport::connect_speaking(
+        &sock,
+        Duration::from_secs(5),
+        &[CliInband::NAME, CliInbandReply::NAME],
+    )
+    .unwrap_or_else(|e| panic!("connect {sock}: {e}"));
     println!("{}", cli(&mut t, "show version").trim());
 
     setup(&mut t);

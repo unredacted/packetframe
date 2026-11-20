@@ -92,6 +92,13 @@ packetframe, not with a copy in vpp-unifi. A bump PR there (the weekly
 watch's or a hand-made one) runs the same check with publishing off,
 and its result is on the PR.
 
+None of this makes packetframe depend on vpp-unifi: the dependency runs
+only vpp-unifi → packetframe. This repo's CI runs the same three checks
+on fd.io's own release packages (`vpp-fdio-arm64` in
+`.github/workflows/ci.yml`, Ubuntu, the release pinned by `FDIO_VPP`
+there), so a
+VPP built by neither this repo nor vpp-unifi is checked on every PR.
+
 When the candidate fails, packetframe is fixed first, on a branch:
 the vpp-plugin fork for a header change (as v26.10 needed), or a
 re-vendor for wire drift. Take the candidate's bundle from the failing

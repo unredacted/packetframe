@@ -7,7 +7,8 @@ description: >-
 # (.github/actions/sampler-plugin, .github/actions/vpp-cli-compat), so
 # each installs the same packages the same way, and vpp-unifi's content
 # check (the installed files are its build's) holds for all of them.
-# Runs in a Debian container as root, after actions/checkout.
+# Runs in a Debian or Ubuntu container as root, after actions/checkout
+# (ci.yml's `vpp-fdio-arm64` job passes fd.io's own Ubuntu debs as `vpp-debs`).
 inputs:
   vpp-debs:
     description: >-
