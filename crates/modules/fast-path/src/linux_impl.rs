@@ -1274,6 +1274,39 @@ fn anyip_addr_from_cfg(cfg: &ModuleConfig<'_>) -> Option<std::net::Ipv4Addr> {
         })
 }
 
+/// The accounts that may feed the `route-source` from this host, or
+/// `None` without one. Run in `attach`'s preflight, before anything
+/// attaches or pins: it asks the kernel once each question the listener
+/// asks at every `accept()`, and looks up `peer-user`, so a kernel with
+/// no socket diagnostics or an account this host lacks fails the start
+/// cleanly. From `RouteController::start` the same failure came after
+/// `pin_program_and_maps` and left orphaned pins (review finding,
+/// PR #419), the trap the anyip preflight was moved ahead of (#196).
+fn local_peers_preflight(
+    cfg: &ModuleConfig<'_>,
+) -> ModuleResult<Option<crate::fib::local_peer::LocalPeers>> {
+    let Some(spec) = cfg.section.directives.iter().find_map(|d| match d {
+        ModuleDirective::RouteSource(spec) => Some(spec),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let peer_user = match spec {
+        packetframe_common::config::RouteSourceSpec::Bgp { peer_user, .. }
+        | packetframe_common::config::RouteSourceSpec::Bmp { peer_user, .. } => peer_user,
+    };
+    let fail = |e: String| {
+        ModuleError::other(
+            MODULE_NAME,
+            format!("route-source local peer preflight: {e}"),
+        )
+    };
+    crate::fib::local_peer::self_test().map_err(|e| fail(e.to_string()))?;
+    crate::fib::local_peer::LocalPeers::resolve(peer_user.as_deref())
+        .map(Some)
+        .map_err(fail)
+}
+
 /// Advisory exclusive lock serializing the anyip preflight and the
 /// unwind window across concurrent `packetframe run` invocations.
 /// Blocking by design: the loser of a double-start race waits out
@@ -1888,11 +1921,14 @@ pub fn attach(
     // removal happens while the lock is still held.
     let mut _anyip_lock: Option<std::fs::File> = None;
     let mut anyip_guard = AnyipUnwindGuard::new(None);
+    let mut local_peers: Option<crate::fib::local_peer::LocalPeers> = None;
     if matches!(
         forwarding_mode_from_cfg(cfg),
         packetframe_common::config::ForwardingMode::PacketframeFib
             | packetframe_common::config::ForwardingMode::Compare
     ) {
+        // Ahead of the anyip route too: a failure here installs nothing.
+        local_peers = local_peers_preflight(cfg)?;
         if let Some(addr) = anyip_addr_from_cfg(cfg) {
             // Serialize preflight→ownership across concurrent starts.
             // Created-vs-Adopted alone cannot transfer ownership
@@ -2295,6 +2331,8 @@ pub fn attach(
                 // the `peer_from` ACL is either non-empty or the listen
                 // is loopback.
                 allow_remote: _,
+                // Resolved into `local_peers` by the preflight.
+                peer_user: _,
             }) => format!("{addr}:{port}")
                 .parse::<std::net::SocketAddr>()
                 .ok()
@@ -2302,6 +2340,9 @@ pub fn attach(
                     listen,
                     require_loc_rib: *require_loc_rib,
                     peer_acl: peer_from.clone(),
+                    local_peers: local_peers
+                        .clone()
+                        .expect("the preflight resolves local peers for every route-source"),
                 }),
             ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bgp {
                 addr,
@@ -2313,6 +2354,7 @@ pub fn attach(
                 peer_ip,
                 anyip,
                 allow_remote: _,
+                peer_user: _,
             }) => {
                 let listen: std::net::SocketAddr = format!("{addr}:{port}").parse().ok()?;
                 // Default router-id: lowest 32 bits of the listen
@@ -2331,6 +2373,9 @@ pub fn attach(
                     peer_acl: peer_from.clone(),
                     expected_peer_ip: *peer_ip,
                     anyip: *anyip,
+                    local_peers: local_peers
+                        .clone()
+                        .expect("the preflight resolves local peers for every route-source"),
                 })
             }
             _ => None,
