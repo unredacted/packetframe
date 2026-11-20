@@ -383,8 +383,8 @@ jobs:
 
       - uses: ./.github/actions/vpp-cli-compat
 
-  vpp-fdio:
-    name: fd.io VPP (${{ matrix.arch }})
+  vpp-fdio-arm64:
+    name: fd.io VPP (arm64)
     # PacketFrame works with any VPP and never depends on vpp-unifi, but
     # every other VPP check here runs vpp-unifi's build of the release
     # SOURCE.json names. This runs the same checks against a VPP vpp-unifi
@@ -396,9 +396,13 @@ jobs:
     #
     # FDIO_VPP pins the release so a new fd.io one cannot turn unrelated
     # PRs red; the fetch step warns when fd.io publishes a newer one, and
-    # bumping it is this job's whole upkeep. arm64 is what the gateways
-    # run; amd64 shows the plugin and parsers are not arm64-only by
-    # accident.
+    # bumping it is this job's whole upkeep.
+    #
+    # arm64 only, for now: on amd64 the plugin does not build against
+    # 26.10, whose x86 march variants are scalar/x86_64_v3/x86_64_v4 where
+    # the vpp-plugin fork's #[vlib_node] still names hsw/skx/icl. x86 is not
+    # a VPP platform PacketFrame supports; an amd64 leg returns with the
+    # fork fix.
     #
     # The binary-API leg reports drift as information when FDIO_VPP is a
     # different release from SOURCE.json's: the CRC handshake refuses that
@@ -410,15 +414,7 @@ jobs:
     #
     # No privileged-tests.sh row: like vpp-cli-compat-arm64, it runs its
     # #[ignore]d test through cargo in its own container.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-          - arch: amd64
-            runner: ubuntu-latest
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04-arm
     container:
       image: ubuntu:noble
       # A tmpfs mount for the sampler directory, and VPP itself.

@@ -94,8 +94,9 @@ and its result is on the PR.
 
 None of this makes packetframe depend on vpp-unifi: the dependency runs
 only vpp-unifi → packetframe. This repo's CI runs the same three checks
-on fd.io's own release packages (`vpp-fdio` in `.github/workflows/ci.yml`,
-Ubuntu, arm64 and amd64, the release pinned by `FDIO_VPP` there), so a
+on fd.io's own release packages (`vpp-fdio-arm64` in
+`.github/workflows/ci.yml`, Ubuntu, the release pinned by `FDIO_VPP`
+there), so a
 VPP built by neither this repo nor vpp-unifi is checked on every PR.
 
 When the candidate fails, packetframe is fixed first, on a branch:

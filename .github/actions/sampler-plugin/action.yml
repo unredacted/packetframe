@@ -25,7 +25,7 @@ description: >-
 # `vpp-debs` naming the packages it just built, in a container of each of
 # its pins' distros. A VPP this plugin does not build against, or whose
 # smoke test fails, is never published, so no release this repo can
-# vendor is one the plugin does not work with. ci.yml's `vpp-fdio` job
+# vendor is one the plugin does not work with. ci.yml's `vpp-fdio-arm64` job
 # runs it on fd.io's own Ubuntu packages, so the plugin is shown to build
 # against a VPP vpp-unifi did not build.
 inputs:
