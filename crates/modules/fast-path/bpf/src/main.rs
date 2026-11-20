@@ -653,8 +653,19 @@ fn handle_ipv6(
 /// included): a frame tagged with a VLAN the router has no L3 device for
 /// on this port is one the kernel drops, so routing it would carry a
 /// VLAN the router does not route into one it does.
+///
+/// An 802.1ad (S-tagged) frame is never addressed to the router here.
+/// The kernel delivers a tagged frame only to a VLAN device of its own
+/// TPID, and userspace cannot say which TPID a VLAN device has
+/// (`/proc/net/vlan/config` lists both alike), so its entries are
+/// 802.1Q's, the standing assumption of `VLAN_RESOLVE`. Keying an
+/// S-tagged frame on its VID would route it on an 802.1Q device's entry
+/// the kernel would never give it to.
 #[inline(always)]
 fn addressed_to_router(ctx: &XdpContext, eth: *const EthHdr, ingress_vid: u16) -> bool {
+    if unsafe { (*eth).ether_type } == EtherType::Ieee8021ad as u16 {
+        return false;
+    }
     let key = RxMacKey {
         ifindex: unsafe { (*ctx.ctx).ingress_ifindex },
         mac: unsafe { (*eth).dst_addr },

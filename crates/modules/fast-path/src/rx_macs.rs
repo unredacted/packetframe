@@ -175,10 +175,15 @@ pub struct PortPlan {
     pub iface: String,
     /// Keys to insert, before any of `remove`.
     pub add: Vec<RxMacKey>,
-    /// MACs the port no longer receives on. Deleted only once every key
-    /// in `add` is in the map: a failed replacement must not leave the
-    /// port with neither MAC.
+    /// MACs the port no longer receives on, on a VLAN it still does.
+    /// Deleted only once every key in `add` is in the map: a failed
+    /// replacement must not leave the port with neither MAC.
     pub remove: Vec<RxMacKey>,
+    /// Keys on a VLAN the port no longer receives on at all, or every key
+    /// of a refused port. Deleted whatever the additions do: a frame on a
+    /// VLAN the router no longer routes must stop matching, and nothing in
+    /// `add` replaces it.
+    pub revoke: Vec<RxMacKey>,
     /// The VLAN-filtering bridge the port is refused for, if it is.
     pub refused: Option<String>,
 }
@@ -227,6 +232,11 @@ pub fn plan(current: &[RxMacKey], desired: &[PortMacs]) -> RxMacPlan {
                     .map(|(vid, mac)| RxMacKey::new(*i, *vid, *mac))
             })
             .collect();
+        let vids: BTreeSet<u16> = rx.receives.pairs().iter().map(|(vid, _)| *vid).collect();
+        let (remove, revoke): (Vec<RxMacKey>, Vec<RxMacKey>) = current
+            .iter()
+            .filter(|k| idx.contains(&k.ifindex) && !want.contains(k))
+            .partition(|k| vids.contains(&k.vid));
         out.ports.push(PortPlan {
             iface: port.iface.clone(),
             refused: match &rx.receives {
@@ -234,11 +244,8 @@ pub fn plan(current: &[RxMacKey], desired: &[PortMacs]) -> RxMacPlan {
                 Receives::On(_) => None,
             },
             add: want.difference(&current).copied().collect(),
-            remove: current
-                .iter()
-                .filter(|k| idx.contains(&k.ifindex) && !want.contains(k))
-                .copied()
-                .collect(),
+            remove,
+            revoke,
         });
     }
     if out.unknown.is_empty() {
@@ -263,8 +270,8 @@ pub struct Applied {
 }
 
 /// Carry out `plan` through `insert` / `remove`: per port, every
-/// addition, then its removals only if every addition landed; stale keys
-/// last.
+/// addition, then its removals only if every addition landed, and its
+/// revocations whatever happened; stale keys last.
 pub fn apply(
     plan: &RxMacPlan,
     mut insert: impl FnMut(&RxMacKey) -> Result<(), String>,
@@ -288,6 +295,7 @@ pub fn apply(
         } else if !port.remove.is_empty() {
             out.held.push(port.iface.clone());
         }
+        removals.extend(port.revoke.iter().copied());
     }
     removals.extend(plan.stale.iter().copied());
     for k in &removals {
@@ -337,6 +345,10 @@ mod tests {
 
     fn removes(p: &RxMacPlan) -> Vec<RxMacKey> {
         p.ports.iter().flat_map(|q| q.remove.clone()).collect()
+    }
+
+    fn revokes(p: &RxMacPlan) -> Vec<RxMacKey> {
+        p.ports.iter().flat_map(|q| q.revoke.clone()).collect()
     }
 
     /// Run `plan` against an in-memory map, failing the inserts of
@@ -494,12 +506,50 @@ mod tests {
                 }),
             }],
         );
-        assert!(adds(&p).is_empty());
-        assert_eq!(removes(&p), cur.to_vec());
+        assert!(adds(&p).is_empty() && removes(&p).is_empty());
+        assert_eq!(revokes(&p), cur.to_vec());
         assert_eq!(p.ports[0].refused.as_deref(), Some("switch0"));
         let mut map: BTreeSet<RxMacKey> = cur.iter().copied().collect();
         run(&mut map, &p, &[]);
         assert!(map.is_empty());
+    }
+
+    /// A VLAN the port no longer routes loses its keys even when another
+    /// key's insert fails (a full map, say). Withholding removals keeps a
+    /// MAC change from leaving a port with neither MAC; a VLAN gone from
+    /// the port has nothing to keep, and its key would go on routing a
+    /// VLAN the kernel drops.
+    #[test]
+    fn a_vlan_no_longer_routed_is_revoked_even_when_an_insert_fails() {
+        let on = |pairs: &[(u16, [u8; 6])]| PortMacs {
+            iface: "eth4".to_string(),
+            ifindex: 4,
+            rx: Ok(PortRx {
+                receives: Receives::On(pairs.to_vec()),
+                slaves: vec![],
+            }),
+        };
+        let cur = [
+            RxMacKey::new(4, 0, A),
+            RxMacKey::new(4, 100, A),
+            RxMacKey::new(4, 300, A),
+        ];
+        // VLAN 100 gone, 200 new, 300's MAC replaced; 200 and B refused.
+        let p = plan(&cur, &[on(&[(0, A), (200, A), (300, B)])]);
+        assert_eq!(revokes(&p), vec![RxMacKey::new(4, 100, A)]);
+        assert_eq!(removes(&p), vec![RxMacKey::new(4, 300, A)]);
+        let mut map: BTreeSet<RxMacKey> = cur.iter().copied().collect();
+        let applied = run(
+            &mut map,
+            &p,
+            &[RxMacKey::new(4, 200, A), RxMacKey::new(4, 300, B)],
+        );
+        assert_eq!(applied.held, vec!["eth4".to_string()]);
+        assert_eq!(
+            map,
+            BTreeSet::from([RxMacKey::new(4, 0, A), RxMacKey::new(4, 300, A)]),
+            "100 revoked; 300 keeps its old MAC until the new one lands"
+        );
     }
 
     /// A replacement MAC that cannot be inserted (map full, a transient

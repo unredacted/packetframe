@@ -731,11 +731,11 @@ pub(crate) fn sync_rx_macs<T: std::borrow::BorrowMut<aya::maps::MapData>>(
     // starts filtering under a running daemon; attach reports the ports
     // it starts refused.
     for port in &plan.ports {
-        if let (Some(bridge), false) = (&port.refused, port.remove.is_empty()) {
+        if let (Some(bridge), false) = (&port.refused, port.revoke.is_empty()) {
             warn!(
                 iface = %port.iface,
                 %bridge,
-                removed = port.remove.len(),
+                removed = port.revoke.len(),
                 "port's bridge filters by VLAN: its RX_MACS entries are removed and every \
                  frame on it takes the kernel path, which applies the bridge's VLAN table"
             );

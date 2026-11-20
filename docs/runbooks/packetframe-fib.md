@@ -2423,7 +2423,11 @@ rules, each keyed on the VLANs it is received on
 
 A frame tagged with a VID that has no L3 device on its port (or the
 port's bridge) is one the kernel drops, since no VLAN device takes it,
-so the fast path passes it too.
+so the fast path passes it too. An 802.1ad (S-tagged) frame always takes
+the kernel path: `/proc/net/vlan/config` does not say which TPID a VLAN
+device has, so the entries are 802.1Q's, as for `VLAN_RESOLVE`. A VLAN
+that leaves a port loses its entries at once, even when another entry
+of that refresh cannot be inserted.
 
 Attach fills the map before the first XDP attach. From then on the
 redirect-target watcher refreshes it on every `RTM_NEWLINK`, so a bridge

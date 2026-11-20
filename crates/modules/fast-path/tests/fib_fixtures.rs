@@ -1026,6 +1026,22 @@ fn a_frame_on_a_vlan_the_router_does_not_route_passes() {
     assert_passed_not_for_us(&h, &v4, StatIdx::MatchedV4, "untagged, routed only on 100");
 }
 
+/// An 802.1ad (S-tagged) frame never matches. The kernel hands a tagged
+/// frame only to a VLAN device of its own TPID, and the VLAN table
+/// userspace reads does not say which a device has, so its entries are
+/// 802.1Q's: an S-tag with a routed VID is not one of them.
+#[test]
+#[ignore = "needs CAP_BPF + BPF build; run via `sudo -E cargo test ... -- --ignored`"]
+fn an_s_tagged_frame_is_not_matched_on_its_vid() {
+    let mut h = dst_mac_harness();
+    h.add_rx_mac_on(TEST_RUN_INGRESS_IFINDEX, 100, BUILDER_DST_MAC);
+    let c_tagged = insert_vlan_tag(&v4_to(BUILDER_DST_MAC, [192, 0, 2, 2]), 100);
+    assert_forwarded(&h, &c_tagged, "precondition: 802.1Q on the routed VLAN");
+    let mut s_tagged = c_tagged.clone();
+    s_tagged[12..14].copy_from_slice(&[0x88, 0xa8]);
+    assert_passed_not_for_us(&h, &s_tagged, StatIdx::MatchedV4, "802.1ad, same VID");
+}
+
 /// A bridged frame is not the router's to drop: the check runs ahead of
 /// the bogon block, and of dry-run's forward accounting.
 #[test]
