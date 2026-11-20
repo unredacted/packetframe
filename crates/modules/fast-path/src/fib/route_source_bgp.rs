@@ -104,6 +104,7 @@ use tracing::{debug, info, warn};
 
 use packetframe_common::fib::{IpPrefix, PeerId, RouteEvent, RouteSourceError};
 
+use crate::fib::local_peer::{LocalPeers, Peer};
 use crate::fib::programmer::FibProgrammerHandle;
 use crate::fib::route_source_bmp::SharedIntegritySnapshot;
 
@@ -247,6 +248,11 @@ pub struct BgpListenerConfig {
     /// checks are the only identity binding available in the
     /// absence of TCP-MD5 / TCP-AO.
     pub expected_peer_ip: Option<IpAddr>,
+    /// The accounts whose sockets on this host may connect, checked
+    /// after the source-IP gates. A loopback or AnyIP listen is
+    /// reachable by every local process, and the address checks cannot
+    /// tell them apart. See [`crate::fib::local_peer`].
+    pub local_peers: LocalPeers,
     /// Session-liveness handle, reported to the second tier. See
     /// [`packetframe_common::fib::FeedSession`] for why this travels
     /// out-of-band of the route events.
@@ -263,6 +269,7 @@ impl BgpListenerConfig {
             hold_time: DEFAULT_HOLD_TIME,
             peer_acl: Vec::new(),
             expected_peer_ip: None,
+            local_peers: LocalPeers::root_only(),
             session: None,
         }
     }
@@ -737,6 +744,7 @@ impl BgpListener {
             peer_as = self.cfg.peer_as,
             peer_acl_entries = self.cfg.peer_acl.len(),
             peer_ip_pin = ?self.cfg.expected_peer_ip,
+            local_peer_uids = ?self.cfg.local_peers.uids(),
             auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
             "BGP listener started"
         );
@@ -878,7 +886,8 @@ impl BgpListener {
         }
     }
 
-    /// The connection, if its source may speak BGP to us.
+    /// The connection, if its source may speak BGP to us: its address,
+    /// and, when it comes from this host, the account that owns it.
     fn admit(&self, (stream, addr): (TcpStream, SocketAddr)) -> Option<(TcpStream, SocketAddr)> {
         // Source-IP gating runs before any byte is read: an unauthorized
         // peer must not reach BGP framing because that's the surface the
@@ -898,6 +907,28 @@ impl BgpListener {
                     %addr,
                     %expected,
                     "BGP accept rejected: source IP does not match peer-ip pin"
+                );
+                return None;
+            }
+        }
+        // Then who owns the other end, when it is on this host: an
+        // address any local process may connect from says nothing about
+        // which one did (Codex Security occ_d9beffd5).
+        let local = match stream.local_addr() {
+            Ok(local) => local,
+            Err(e) => {
+                warn!(%addr, error = %e, "BGP accept rejected: no local address to judge it by");
+                return None;
+            }
+        };
+        match self.cfg.local_peers.check(local, addr) {
+            Ok(Peer::Local { uid }) => debug!(%addr, uid, "BGP connection from a local peer"),
+            Ok(Peer::Remote) => {}
+            Err(refusal) => {
+                warn!(
+                    %addr,
+                    allowed_uids = ?self.cfg.local_peers.uids(),
+                    "BGP accept rejected: {refusal}"
                 );
                 return None;
             }
@@ -3254,6 +3285,8 @@ mod tests {
         let addr = lst.local_addr().expect("local addr");
         let mut cfg = BgpListenerConfig::new(addr, TEST_AS, TEST_AS, Ipv4Addr::new(192, 0, 2, 1));
         cfg.hold_time = TEST_HOLD.as_secs() as u16;
+        // The tests are the peer, from this process's own sockets.
+        cfg.local_peers = LocalPeers::root_only().and_uid(unsafe { libc::geteuid() });
         let mut listener = BgpListener::new(cfg, prog, CancellationToken::new());
         listener.quiet = TEST_QUIET;
         (lst, listener, addr)
@@ -4235,6 +4268,47 @@ mod tests {
         assert!(log.is_empty(), "{:?}", log.events());
         shutdown.cancel();
         serving.await.expect("join").expect("serve");
+    }
+
+    /// A local process of an account that may not feed routes is
+    /// refused at admission, before it hears our OPEN, while the allowed
+    /// peer's connection is admitted (Codex Security occ_d9beffd5). Being
+    /// refused at admission is also what keeps it from displacing the
+    /// peer in [`BgpListener::newest_live`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_refuses_a_local_connection_from_another_account() {
+        let me = unsafe { libc::geteuid() };
+        if me == 0 {
+            // Root is always admitted, so a root test process has no
+            // other account to be.
+            return;
+        }
+        let (prog, log) = recording_handle();
+        let (lst, mut listener, addr) = unserved(prog).await;
+        let peer = TcpStream::connect(addr).await.expect("connect");
+        let mut intruder = TcpStream::connect(addr).await.expect("connect");
+        intruder.write_all(&peer_open(GR_PEER)).await.expect("OPEN");
+        // Both connections are this process's, so judge each as it is
+        // accepted: the peer's as an allowed account, the newer one as
+        // one that is not.
+        let peer_port = peer.local_addr().expect("peer addr").port();
+        let (stream, from) = lst.accept().await.expect("accept");
+        assert_eq!(from.port(), peer_port);
+        assert!(
+            listener.admit((stream, from)).is_some(),
+            "the allowed peer is admitted"
+        );
+        listener.cfg.local_peers = LocalPeers::root_only();
+        let (stream, from) = lst.accept().await.expect("accept");
+        assert!(
+            listener.admit((stream, from)).is_none(),
+            "a local socket of an account outside the allowed set must be refused"
+        );
+        assert!(
+            ends_unanswered(&mut intruder).await,
+            "the refused connection must be closed without our OPEN"
+        );
+        assert!(log.is_empty(), "{:?}", log.events());
     }
 
     /// Nor to a newer one its own client has already closed, as a port

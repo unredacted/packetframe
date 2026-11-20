@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.6] - UNRELEASED
+
+### Changes
+
+**fast-path**
+
+- A route-source listener admits a connection from this host only if root owns it, or the account `peer-user <name|uid>` names (by default `frr` and `bird`, where they exist), so no other local process can feed the route mirror. Existing configs keep working; the start needs the kernel's TCP socket diagnostics (`CONFIG_INET_DIAG`), which UniFi gateways have. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.6/docs/runbooks/packetframe-fib.md#who-may-connect-to-the-route-source-listener), [#419](https://github.com/unredacted/packetframe/pull/419))
+
 ## [0.6.4] - 2026-11-13
 
 A point release on 0.6.3 for the minutes between a gateway's start and the fast path forwarding on a whole table, then VPP steering. After the 6.0.17 upgrade of the reference deployment (2026-11-12), the operator switched `dry-run` off by hand once the seed had applied (1:43 under load) and moved the steering lever once VPP was ready (22 s). The daemon can now do both itself. A route-ledger seed goes into the live FIB longest prefix first, the neighbour resolver keeps serving while the seed applies, and the daemon runs at bgpd's priority. A 0.6.3 config and route ledger carry over unchanged. Both new behaviours are opt-in.

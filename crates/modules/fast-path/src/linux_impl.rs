@@ -2263,6 +2263,7 @@ pub fn attach(
                 // the `peer_from` ACL is either non-empty or the listen
                 // is loopback.
                 allow_remote: _,
+                peer_user,
             }) => format!("{addr}:{port}")
                 .parse::<std::net::SocketAddr>()
                 .ok()
@@ -2270,6 +2271,7 @@ pub fn attach(
                     listen,
                     require_loc_rib: *require_loc_rib,
                     peer_acl: peer_from.clone(),
+                    peer_user: peer_user.clone(),
                 }),
             ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bgp {
                 addr,
@@ -2281,6 +2283,7 @@ pub fn attach(
                 peer_ip,
                 anyip,
                 allow_remote: _,
+                peer_user,
             }) => {
                 let listen: std::net::SocketAddr = format!("{addr}:{port}").parse().ok()?;
                 // Default router-id: lowest 32 bits of the listen
@@ -2299,6 +2302,7 @@ pub fn attach(
                     peer_acl: peer_from.clone(),
                     expected_peer_ip: *peer_ip,
                     anyip: *anyip,
+                    peer_user: peer_user.clone(),
                 })
             }
             _ => None,
