@@ -165,9 +165,10 @@ pub enum RouteSourceConfig {
         /// parser only permits empty when the listen address is
         /// itself loopback).
         peer_acl: Vec<ipnet::IpNet>,
-        /// The `peer-user` account, or `None` for the default set. See
-        /// [`crate::fib::local_peer::LocalPeers::resolve`].
-        peer_user: Option<String>,
+        /// The accounts whose sockets on this host may connect, resolved
+        /// by the caller before anything is attached, since the
+        /// resolution can fail. See [`crate::fib::local_peer`].
+        local_peers: LocalPeers,
     },
     Bgp {
         listen: SocketAddr,
@@ -181,7 +182,7 @@ pub enum RouteSourceConfig {
         /// before the BGP OPEN exchange.
         expected_peer_ip: Option<IpAddr>,
         /// Same as the BMP variant's.
-        peer_user: Option<String>,
+        local_peers: LocalPeers,
         /// Install a `local <listen>/32 dev lo` kernel route (AnyIP)
         /// before binding, remove it on shutdown. See the `anyip`
         /// module docs for the FRR pairing this exists for.
@@ -229,17 +230,6 @@ pub enum ControllerError {
     Programmer(#[from] ProgrammerError),
     #[error("anyip listen-address setup failed: {0}")]
     Anyip(#[from] crate::fib::anyip::AnyipError),
-    #[error("route-source local peer check: {0}")]
-    LocalPeers(String),
-}
-
-/// The accounts that may feed `route-source` from this host, after
-/// asking the kernel once each question the listener will ask at every
-/// `accept()`: a kernel that cannot answer, or a `peer-user` with no
-/// account here, fails the start instead of refusing every connection.
-fn resolve_local_peers(peer_user: Option<&str>) -> Result<LocalPeers, ControllerError> {
-    crate::fib::local_peer::self_test().map_err(|e| ControllerError::LocalPeers(e.to_string()))?;
-    LocalPeers::resolve(peer_user).map_err(ControllerError::LocalPeers)
 }
 
 pub struct RouteController {
@@ -401,14 +391,6 @@ impl RouteController {
             completeness,
             feed_session,
         } = signals;
-        // Before anything is started, so a failure leaves nothing to
-        // unwind.
-        let local_peers = match &route_source {
-            Some(
-                RouteSourceConfig::Bmp { peer_user, .. } | RouteSourceConfig::Bgp { peer_user, .. },
-            ) => resolve_local_peers(peer_user.as_deref())?,
-            None => LocalPeers::root_only(),
-        };
         // Dedicated runtime. `worker_threads(2)` keeps task count to
         // what Phase 3 actually needs; the resolver, programmer, and
         // BMP station are all I/O-bound so CPU is never the limit.
@@ -563,7 +545,7 @@ impl RouteController {
                 listen,
                 require_loc_rib,
                 peer_acl,
-                peer_user: _,
+                local_peers,
             }) => {
                 let snapshot = shared_snapshot();
                 // Spawn the checker only when a LOCAL authority is named.
@@ -653,7 +635,7 @@ impl RouteController {
                 peer_acl,
                 expected_peer_ip,
                 anyip,
-                peer_user: _,
+                local_peers,
             }) => {
                 let snapshot = shared_snapshot();
                 // The GC hold's way of asking the FRR authority for a
