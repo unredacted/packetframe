@@ -369,7 +369,8 @@ pub enum InstallMode {
     /// drops `NEIGH_UPDATE_F_OVERRIDE`, and `__neigh_update` then answers
     /// a different MAC for a valid entry with success and no change.
     NoOverride,
-    /// `NLM_F_CREATE | NLM_F_REPLACE`: over the entry the mirror holds.
+    /// `NLM_F_CREATE | NLM_F_REPLACE`: over the STALE entry the mirror
+    /// holds, whatever the kernel holds by the time the write lands.
     Replace,
 }
 
@@ -380,12 +381,23 @@ impl InstallReason {
     /// `NLM_F_DUMP_INTR`, nor notifies an entry it creates unresolved. So
     /// an absent install never overrides: if the kernel does hold a valid
     /// MAC, a confirmed one included, it stays, while an unresolved entry
-    /// the mirror never heard of is still filled. The other reasons rest
-    /// on a row the mirror holds and must replace it.
+    /// the mirror never heard of is still filled.
+    ///
+    /// "Unusable" needs no override either: `__neigh_update` weighs
+    /// `NEIGH_UPDATE_F_OVERRIDE` only for an entry in a `NUD_VALID` state,
+    /// so an unresolved one is filled all the same. Replacing would only
+    /// matter if the entry had resolved between the decision and the
+    /// write, and then it would overwrite a MAC the kernel had just
+    /// confirmed (Codex Security finding occ_4bacbca3).
+    ///
+    /// Only "MacDiffers" replaces: the newer MAC heard over a STALE row
+    /// is the point of the install. The kernel has no conditional
+    /// neighbour write, so a row confirmed in the same moment can still
+    /// be overwritten, with STALE, which the kernel then probes.
     pub fn mode(self) -> InstallMode {
         match self {
-            Self::Absent => InstallMode::NoOverride,
-            Self::Unusable | Self::MacDiffers => InstallMode::Replace,
+            Self::Absent | Self::Unusable => InstallMode::NoOverride,
+            Self::MacDiffers => InstallMode::Replace,
         }
     }
 }
@@ -557,13 +569,15 @@ mod tests {
         MirrorEntry { state, mac }
     }
 
-    /// Only an install over a row the mirror holds may replace; one the
-    /// mirror believes absent must not, since a wrong "absent" would then
-    /// overwrite whatever the kernel holds.
+    /// Only an install over a STALE row the mirror holds may replace. One
+    /// the mirror believes absent must not, since a wrong "absent" would
+    /// then overwrite whatever the kernel holds. Nor may one over an
+    /// unresolved row, which the kernel fills without it, and which may
+    /// have resolved by the time the write lands.
     #[test]
-    fn an_absent_install_never_overrides() {
+    fn only_an_install_over_a_stale_row_replaces() {
         assert_eq!(InstallReason::Absent.mode(), InstallMode::NoOverride);
-        assert_eq!(InstallReason::Unusable.mode(), InstallMode::Replace);
+        assert_eq!(InstallReason::Unusable.mode(), InstallMode::NoOverride);
         assert_eq!(InstallReason::MacDiffers.mode(), InstallMode::Replace);
     }
 
