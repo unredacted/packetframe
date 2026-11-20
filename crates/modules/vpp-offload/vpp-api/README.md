@@ -68,12 +68,15 @@ packetframe's (this is why VPP was never bundled into packetframe's
 Order matters — the artifact must exist before this repo can bind to
 it:
 
-1. Bump the gateway pin in vpp-unifi (`pins/efg.toml`), merge; its CI
-   builds, verifies and publishes the new tag (~45 min).
-2. Here, from the repo root:
+1. Bump the gateway pins in vpp-unifi (`pins/efg-bullseye.toml` and
+   `pins/efg-trixie.toml`, together), merge; its CI builds, verifies
+   and publishes the new tags (~45 min).
+2. Here, from the repo root. A pin that builds a commit on a release's
+   stable branch publishes `vpp-<ref>-<commit:9>-<platform>-...`; one
+   that builds the bare tag publishes `vpp-<ref>-<platform>-...`:
 
    ```sh
-   tag=vpp-<ref>-<platform>-bullseye-arm64
+   tag=vpp-<ref>-<commit:9>-<platform>-bullseye-arm64
    dir=$(mktemp -d)
    gh release download "$tag" -R unredacted/vpp-unifi -D "$dir" \
      -p vpp-api-json.tar.gz -p manifest.json -p SHA256SUMS
@@ -101,7 +104,7 @@ does not change. Take the file from the SAME release it names, so CI's
 byte-binding still holds:
 
 ```sh
-tag=$(jq -r '"vpp-\(.vpp_ref)-\(.platform)-\(.distro|sub("^debian-";""))-\(.arch)"' \
+tag=$(jq -r '"vpp-\(.vpp_ref)\(if (.vpp_branch // "") != "" then "-" + .vpp_commit[0:9] else "" end)-\(.platform)-\(.distro|sub("^debian-";""))-\(.arch)"' \
   crates/modules/vpp-offload/vpp-api/SOURCE.json)
 dir=$(mktemp -d)
 gh release download "$tag" -R unredacted/vpp-unifi -D "$dir" \

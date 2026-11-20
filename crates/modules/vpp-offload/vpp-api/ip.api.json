@@ -5428,6 +5428,13 @@
                     "description": "neighbor advertisements received"
                 },
                 {
+                    "name": "neighbor_advertisement_target_local",
+                    "severity": "error",
+                    "type": "counter64",
+                    "units": "packets",
+                    "description": "neighbor advertisements for local targets"
+                },
+                {
                     "name": "router_solicitation_source_not_on_link",
                     "severity": "error",
                     "type": "counter64",

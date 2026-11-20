@@ -54,7 +54,10 @@ runs:
         src=crates/modules/vpp-offload/vpp-api/SOURCE.json
         repo=$(jq -r '.built_by' "$src" | cut -d@ -f1)
         distro=$(jq -r '.distro' "$src" | sed 's/^debian-//')
-        tag="vpp-$(jq -r .vpp_ref "$src")-$(jq -r .platform "$src")-$distro-$(jq -r .arch "$src")"
+        # Same tag rule as ci.yml's byte-binding: a stable-branch build
+        # names its commit.
+        build=$(jq -r 'if (.vpp_branch // "") != "" then "-" + .vpp_commit[0:9] else "" end' "$src")
+        tag="vpp-$(jq -r .vpp_ref "$src")$build-$(jq -r .platform "$src")-$distro-$(jq -r .arch "$src")"
         dl=$(mktemp -d) && cd "$dl"
         base="https://github.com/$repo/releases/download/$tag"
         curl -fsSLO "$base/SHA256SUMS"
@@ -75,9 +78,14 @@ runs:
           ~/.cargo/git/db/
           target/
           crates/vpp-plugins/pf-sampler/target/
-        key: bullseye-arm64-sampler-plugin-${{ hashFiles('**/Cargo.lock', 'crates/modules/vpp-offload/vpp-api/SOURCE.json') }}
+        # The VPP is part of every key, restore-keys included. vpp-plugin's
+        # build script reruns only when its own wrapper files change, never
+        # when the installed VPP headers do, so a target/ built against one
+        # VPP and restored for another keeps the old bindings and the old
+        # VPP_BUILD_VER (a v26.10 run linked a plugin requiring 26.06).
+        key: bullseye-arm64-sampler-plugin-${{ hashFiles('crates/modules/vpp-offload/vpp-api/SOURCE.json') }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          bullseye-arm64-sampler-plugin-
+          bullseye-arm64-sampler-plugin-${{ hashFiles('crates/modules/vpp-offload/vpp-api/SOURCE.json') }}-
 
     - name: Plugin fmt, clippy, build
       shell: bash

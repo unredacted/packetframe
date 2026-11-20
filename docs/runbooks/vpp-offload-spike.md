@@ -430,7 +430,9 @@ release the running binaries were codegen'd against:
 src=crates/modules/vpp-offload/vpp-api/SOURCE.json
 ref=$(jq -r .vpp_ref "$src"); plat=$(jq -r .platform "$src")
 repo=$(jq -r .built_by "$src" | cut -d@ -f1)
-gh release download "vpp-${ref}-${plat}-bullseye-arm64" \
+# A stable-branch build names its commit in the tag (vpp-<ref>-<commit:9>-...).
+build=$(jq -r 'if (.vpp_branch // "") != "" then "-" + .vpp_commit[0:9] else "" end' "$src")
+gh release download "vpp-${ref}${build}-${plat}-bullseye-arm64" \
   --repo "$repo" --dir /tmp/vpp
 ```
 

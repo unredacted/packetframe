@@ -144,7 +144,11 @@ jobs:
           # bare name. Same tag construction as the publisher's.
           src_distro=$(jq -r '.distro' "$vendored/SOURCE.json" | sed 's/^debian-//')
           src_arch=$(jq -r '.arch' "$vendored/SOURCE.json")
-          tag="vpp-${src_ref}-${src_platform}-${src_distro}-${src_arch}"
+          # A build from a release's stable branch names its commit in the
+          # tag (vpp-<ref>-<commit:9>-...); manifests from before vpp-unifi
+          # recorded vpp_branch have none and keep the short form.
+          src_build=$(jq -r 'if (.vpp_branch // "") != "" then "-" + .vpp_commit[0:9] else "" end' "$vendored/SOURCE.json")
+          tag="vpp-${src_ref}${src_build}-${src_platform}-${src_distro}-${src_arch}"
           dl=$(mktemp -d)
           gh release download "$tag" --repo "$src_repo" --dir "$dl" \
             --pattern 'vpp-api-json.tar.gz' --pattern 'manifest.json' --pattern 'SHA256SUMS'

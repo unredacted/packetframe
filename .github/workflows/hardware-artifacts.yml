@@ -415,6 +415,9 @@ jobs:
             VPP_PLATFORM=$(jq -r '.platform' "$SRC")
             VPP_DISTRO=$(jq -r '.distro' "$SRC" | sed 's/^debian-//')
             VPP_ARCH=$(jq -r '.arch' "$SRC")
+            # Same tag rule as ci.yml's byte-binding: a stable-branch
+            # build names its commit.
+            VPP_BUILD=$(jq -r 'if (.vpp_branch // "") != "" then "-" + .vpp_commit[0:9] else "" end' "$SRC")
             # The packaging note is the release's own statement about
             # what the deb contains — NOT a sentence pinned here. A
             # hardcoded warning goes stale the moment a release changes
@@ -430,7 +433,7 @@ jobs:
             # it rather than degrade it.
             VPP_PACKAGING=$(jq -er '.packaging' "$SRC")
             cat > "dist/packetframe-hwtest-${TARGET}/vpp-pin.txt" <<EOF
-          VPP for the vpp-offload module: ${VPP_REF} (${VPP_PLATFORM}, ${VPP_DISTRO}/${VPP_ARCH})
+          VPP for the vpp-offload module: ${VPP_REF}${VPP_BUILD} (${VPP_PLATFORM}, ${VPP_DISTRO}/${VPP_ARCH})
 
           Not bundled here on purpose — the .debs are ~100 MB and change a
           couple of times a year, while this bundle rebuilds on every push.
@@ -438,7 +441,7 @@ jobs:
           bundle were generated against (the CRC handshake at attach
           refuses any VPP that disagrees):
 
-            gh release download vpp-${VPP_REF}-${VPP_PLATFORM}-${VPP_DISTRO}-${VPP_ARCH} \\
+            gh release download vpp-${VPP_REF}${VPP_BUILD}-${VPP_PLATFORM}-${VPP_DISTRO}-${VPP_ARCH} \\
               -R ${VPP_REPO} -D vpp/
 
           then install per the "Installing on a gateway" section of
