@@ -1303,12 +1303,8 @@ pub enum RouteSourceSpec {
     /// `require_loc_rib`: when true, only RouteMonitoring frames
     /// with peer_type = 3 (RFC 9069 Loc-RIB Instance Peer) are
     /// accepted; pre/post-policy frames cause the session to be
-    /// torn down with an error. **This is required for safe use
-    /// against pre/post-policy emitters** like bird 2.x, without
-    /// it, multiple peers' Adj-RIB-In streams would race-overwrite
-    /// per-prefix nexthops in the FIB and produce silent
-    /// wrong-forwarding. See module docs in
-    /// `route_source_bmp.rs`.
+    /// torn down with an error. The parser sets this for packetframe-fib
+    /// forwarding and for an explicit `require-loc-rib` in compare mode.
     Bmp {
         addr: String,
         port: u16,
@@ -4053,6 +4049,26 @@ fn parse(input: &str) -> Result<Config, ConfigError> {
                     modules[i].directives.push(d);
                 }
             },
+        }
+    }
+
+    // Resolve the policy once, after both directives are known. The listener,
+    // the restart-only reload guard, and the route ledger all use this spec.
+    // An unfiltered compare mirror or saved ledger cannot become a forwarding FIB.
+    if let Some(fp) = modules.iter_mut().find(|m| m.name == "fast-path") {
+        let mode = fp.directives.iter().find_map(|d| match d {
+            ModuleDirective::ForwardingMode(mode) => Some(*mode),
+            _ => None,
+        });
+        if mode == Some(ForwardingMode::PacketframeFib) {
+            for directive in &mut fp.directives {
+                if let ModuleDirective::RouteSource(RouteSourceSpec::Bmp {
+                    require_loc_rib, ..
+                }) = directive
+                {
+                    *require_loc_rib = true;
+                }
+            }
         }
     }
 
@@ -9283,6 +9299,29 @@ module fast-path
             } => assert!(require_loc_rib),
             other => panic!("expected Bmp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bmp_forwarding_requires_loc_rib_even_when_the_flag_is_omitted() {
+        let bmp = "route-source bmp 127.0.0.1:6543";
+        let strict = extract_route_source(&format!("{bmp} require-loc-rib"));
+        let observational = extract_route_source(&format!("forwarding-mode compare\n{bmp}"));
+        assert_ne!(observational.ledger_identity(), strict.ledger_identity());
+
+        for mode in ["packetframe-fib", "custom-fib"] {
+            for body in [
+                format!("{bmp}\nforwarding-mode {mode}"),
+                format!("forwarding-mode {mode}\n{bmp}"),
+            ] {
+                let source = extract_route_source(&body);
+                assert_eq!(source, strict, "{body}");
+                assert_eq!(source.ledger_identity(), strict.ledger_identity());
+            }
+        }
+        assert_eq!(
+            extract_route_source(&format!("forwarding-mode compare\n{bmp} require-loc-rib")),
+            strict
+        );
     }
 
     #[test]
