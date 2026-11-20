@@ -63,6 +63,37 @@ published, and VPP's cadence is deliberately decoupled from
 packetframe's (this is why VPP was never bundled into packetframe's
 .deb).
 
+## The gate: no VPP is published that packetframe does not work with
+
+vpp-unifi publishes a VPP only after packetframe has been checked
+against it, in the same workflow run, before the publish job and
+gating it. For each pin, on the debs it just built, against a
+packetframe checkout (`main` unless the run names another ref):
+
+- **The sampler plugin** builds and passes its live-VPP smoke test
+  (`.github/actions/sampler-plugin` with `vpp-debs`: real packets
+  through both feature arcs, reconfigure, a VPP restart, and a plugin
+  for another VPP refused while VPP still starts).
+- **The binary API** has not drifted (`.github/scripts/vpp-api-drift.sh`
+  on the candidate's `vpp-api-json.tar.gz`): `generated.rs` regenerates
+  byte-identical from it.
+
+Both live here, so what "works with packetframe" means changes with
+packetframe, not with a copy in vpp-unifi. A bump PR there (the weekly
+watch's or a hand-made one) runs the same check with publishing off,
+and its result is on the PR.
+
+When the candidate fails, packetframe is fixed first, on a branch:
+the vpp-plugin fork for a header change (as v26.10 needed), or a
+re-vendor for wire drift. Take the candidate's bundle from the failing
+run's workflow artifact instead of a release (step 2 below, with
+`gh run download <run> -R unredacted/vpp-unifi -n <tag>` in place of
+`gh release download`, and that artifact's `manifest.json` as
+`SOURCE.json`). Then dispatch vpp-unifi's build with
+`packetframe-ref=<that branch>`: once the gate passes against it, the
+release publishes, this repo's CI byte-binding passes, and the branch
+can merge. Until then no gateway can be given that VPP from a release.
+
 ## Re-vendoring (a VPP version bump)
 
 Order matters — the artifact must exist before this repo can bind to
