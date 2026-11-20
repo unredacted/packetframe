@@ -61,6 +61,36 @@ how to roll back to the kernel-FIB path if something goes wrong.
   `FP_CFG_FLAG_PACKETFRAME_FIB` bit in the CFG map; kernel-FIB mode bypasses
   all of the above and calls `bpf_fib_lookup()` as before.
 
+### Route capacity
+
+Per address family, the route mirror admits at most as many prefixes as
+the pinned FIB map has slots (never more than the compiled maximum). A
+prefix holds its slot while it is in the mirror, and also after a
+withdrawal whose map delete failed: the kernel entry is still there and
+still forwarding, so the slot, the repair debt and the IDs it points at
+stay until a retried delete lands. Each family also admits at most eight
+advertisements per prefix slot in aggregate, 256 peer/path
+advertisements for any one prefix, and eight distinct nexthops per
+advertisement. Refreshing an advertisement that already exists, or
+adding one to a prefix that already holds a slot, uses no new slot.
+
+At the limit, PacketFrame keeps forwarding what is installed and keeps
+applying refreshes and withdrawals. It refuses the new route, logs
+`route admission limit reached; awaiting a complete feed replay` once,
+withholds readiness, and after 60 seconds requests a full replay of the
+feed. If the replay also exceeds capacity, the session keeps applying
+updates, and a withdrawal, peer departure or sweep that frees a slot
+schedules another replay after the same delay. A clean replay restores
+readiness. A feed that stays too large needs fewer exported routes or
+paths. A refused local route (`local-prefix`, `fallback-default`) needs
+a daemon restart, which seeds them from the kernel again, before
+readiness returns.
+
+A failed withdrawal delete fails every GC that retries it, which is what
+keeps the route source from reporting the session reconciled; the
+`GC recompute failed; prefixes retained for the next GC` warning names
+it.
+
 ## Healthy operation
 
 Indicators that the PacketFrame FIB path is working:

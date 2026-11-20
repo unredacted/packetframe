@@ -1101,15 +1101,36 @@ impl BgpListener {
             }};
         }
         loop {
-            let frame = match or_end!(next_frame(
-                &mut frame_rx,
-                held.as_ref().map(|h| h.next_look)
-            )) {
+            // A local withdrawal can make room while the peer is idle. Poll
+            // only while incomplete so a newly armed deadline is observed.
+            let retry = self.prog_handle.replay_deadline().or_else(|| {
+                self.prog_handle
+                    .admission_incomplete()
+                    .then(|| tokio::time::Instant::now() + Duration::from_secs(60))
+            });
+            if self.prog_handle.take_replay_if_due() {
+                return Err(RouteSourceError::recoverable(
+                    "route admission needs a full replay",
+                ));
+            }
+            let wake = held
+                .as_ref()
+                .map(|h| h.next_look)
+                .into_iter()
+                .chain(retry)
+                .min();
+            let frame = match or_end!(next_frame(&mut frame_rx, wake)) {
                 Next::Frame(frame) => frame,
                 Next::HoldPoll => {
                     let Some(since) = held.as_ref().map(|h| h.since) else {
                         continue;
                     };
+                    if held
+                        .as_ref()
+                        .is_some_and(|h| h.next_look > tokio::time::Instant::now())
+                    {
+                        continue;
+                    }
                     match self.gc_hold_verdict(session_started, since).await {
                         GcHold::Hold { why, earlier } => {
                             if let Some(h) = held.as_mut() {
@@ -1279,6 +1300,7 @@ impl BgpListener {
         // Owed before the dispatch: one that fails partway can have
         // removed routes all the same.
         self.resync_owed.store(true, Ordering::Release);
+        let recovering = self.prog_handle.admission_incomplete();
         let dispatched = self
             .prog_handle
             .apply_route_event(RouteEvent::InitiationComplete)
@@ -1290,6 +1312,11 @@ impl BgpListener {
             hold.gc_ran();
         }
         if let Err(e) = dispatched {
+            if matches!(e, super::programmer::ProgrammerError::ReplayRequired(_)) {
+                // The sweep completed. Keep accepting withdrawals while the
+                // feed is held; repeating this sweep cannot restore omitted keys.
+                return true;
+            }
             warn!(error = %e, "InitiationComplete dispatch failed");
             return false;
         }
@@ -1323,6 +1350,9 @@ impl BgpListener {
         // and `set_up` clears it a moment later (review finding, on the
         // BMP path). Do not move this above the raise.
         if let Some(sess) = &self.cfg.session {
+            if recovering {
+                sess.set_up(true);
+            }
             sess.mark_reconciled();
         }
         true
@@ -1387,7 +1417,37 @@ impl BgpListener {
                 .as_secs() as i64,
             Ordering::Relaxed,
         );
-        if *updates_seen == 1 {
+        if let Some(sess) = &self.cfg.session {
+            // Stream activity in ROUTE-ELEMENT units, changed
+            // or not: a reconnect reannounces an unchanged
+            // table, the mirror never moves, and the gate
+            // compares activity against route-scaled quiet
+            // rates — counting frames instead of the elements
+            // they fan out to let a batched million-route dump
+            // read as quiet (review finding). Floored at one
+            // unit so an empty UPDATE (End-of-RIB shape) still
+            // counts as stream evidence — one unit against
+            // route-scaled rates is noise.
+            sess.pulse_n((elems.len() as u64).max(1));
+        }
+        let mut carried = Families::default();
+        for elem in elems {
+            carried.insert(match elem.prefix.prefix {
+                ipnet::IpNet::V4(_) => Family::V4,
+                ipnet::IpNet::V6(_) => Family::V6,
+            });
+            let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
+                Some(e) => e,
+                None => continue,
+            };
+            self.resync_owed.store(true, Ordering::Release);
+            if let Err(e) = self.prog_handle.apply_route_event(event).await {
+                if !matches!(e, super::programmer::ProgrammerError::Admission(_)) {
+                    warn!(error = %e, "route event dispatch failed");
+                }
+            }
+        }
+        if *updates_seen == 1 && !self.prog_handle.admission_incomplete() {
             // The stream has started; see the handshake note
             // for why this — and not post-stream silence — is
             // where the session becomes live.
@@ -1421,34 +1481,6 @@ impl BgpListener {
             // releasing it on stale credit.
             if let Some(sess) = &self.cfg.session {
                 sess.set_up(true);
-            }
-        }
-        if let Some(sess) = &self.cfg.session {
-            // Stream activity in ROUTE-ELEMENT units, changed
-            // or not: a reconnect reannounces an unchanged
-            // table, the mirror never moves, and the gate
-            // compares activity against route-scaled quiet
-            // rates — counting frames instead of the elements
-            // they fan out to let a batched million-route dump
-            // read as quiet (review finding). Floored at one
-            // unit so an empty UPDATE (End-of-RIB shape) still
-            // counts as stream evidence — one unit against
-            // route-scaled rates is noise.
-            sess.pulse_n((elems.len() as u64).max(1));
-        }
-        let mut carried = Families::default();
-        for elem in elems {
-            carried.insert(match elem.prefix.prefix {
-                ipnet::IpNet::V4(_) => Family::V4,
-                ipnet::IpNet::V6(_) => Family::V6,
-            });
-            let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
-                Some(e) => e,
-                None => continue,
-            };
-            self.resync_owed.store(true, Ordering::Release);
-            if let Err(e) = self.prog_handle.apply_route_event(event).await {
-                warn!(error = %e, "route event dispatch failed");
             }
         }
         Ok(carried)
