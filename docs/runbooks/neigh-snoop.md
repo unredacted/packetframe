@@ -351,7 +351,12 @@ purpose:
   probe and is corrected on the next sighting).
 
 `packetframe status` prints each bridge's persisted table size and
-age without a daemon.
+age without a daemon. Startup and status accept a regular snapshot up to
+256 MiB. The file and its directory must belong to the reader's effective
+user (normally root) and allow writes only by their owner. Ancestors must
+belong to root or the reader and may allow group or other writes only if
+the sticky bit is set. Symlinks are refused throughout the path. Startup
+logs a rejected snapshot and learns the bridge's neighbours from scratch.
 
 ## Customer VLANs behind a vpp-offload `local-route6`
 

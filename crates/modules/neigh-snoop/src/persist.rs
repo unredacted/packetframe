@@ -15,6 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use packetframe_common::config::{format_mac, parse_mac_literal};
+#[cfg(unix)]
+use packetframe_common::statefile::{
+    read_owned_no_follow, remove_state_record as remove_record, write_atomic as write_record,
+};
 
 use crate::frame::Source;
 use crate::table::{LearnedEntry, LearnedTable};
@@ -112,17 +116,7 @@ pub fn save(path: &Path, json: &str) -> std::io::Result<()> {
     })
 }
 
-// The daemon writing these is root and the persist directory may be
-// writable by someone who is not, so on Linux the writes and the probe's
-// unlink go through `packetframe_common::statefile`'s no-follow
-// directory walk, as fast-path's records do. The non-Linux arms exist
-// for the macOS dev loop's unit tests only.
-#[cfg(target_os = "linux")]
-fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    packetframe_common::statefile::write_atomic(path, contents)
-}
-
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -132,14 +126,33 @@ fn write_record(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-#[cfg(target_os = "linux")]
-fn remove_record(path: &Path) -> std::io::Result<()> {
-    packetframe_common::statefile::remove_state_record(path)
-}
-
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn remove_record(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
+}
+
+/// The largest supported bridge has 1,048,576 entries. Even with a full
+/// IPv6 address and two 20-digit timestamps, a pretty-printed v1 row
+/// takes less than 256 bytes, leaving room for the file header.
+#[cfg(unix)]
+const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Startup and daemonless status must read the same trusted snapshot.
+#[cfg(unix)]
+fn read_snapshot(path: &Path) -> Result<Option<PersistFileV1>, String> {
+    let Some(bytes) = read_owned_no_follow(path, MAX_SNAPSHOT_BYTES)
+        .map_err(|e| format!("read {}: {e}", path.display()))?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn read_snapshot(_path: &Path) -> Result<Option<PersistFileV1>, String> {
+    Err("neighbour snapshot ownership checks require Unix".into())
 }
 
 /// Read and validate a file, dropping entries older than `max_age`.
@@ -152,14 +165,10 @@ pub fn load(
     now_mono: Instant,
     max_age: Duration,
 ) -> LoadOutcome {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LoadOutcome::Missing,
-        Err(e) => return LoadOutcome::Unusable(format!("read {}: {e}", path.display())),
-    };
-    let file: PersistFileV1 = match serde_json::from_str(&raw) {
-        Ok(f) => f,
-        Err(e) => return LoadOutcome::Unusable(format!("parse {}: {e}", path.display())),
+    let file = match read_snapshot(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return LoadOutcome::Missing,
+        Err(why) => return LoadOutcome::Unusable(why),
     };
     if file.version != PERSIST_VERSION {
         return LoadOutcome::Unusable(format!(
@@ -227,8 +236,7 @@ fn unix_time(secs: u64) -> Option<SystemTime> {
 /// `(entry count, file age)` for `packetframe status`, which runs
 /// without a daemon. `None` when the file is absent or unreadable.
 pub fn summarize(path: &Path, now: SystemTime) -> Option<(usize, Duration)> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let file: PersistFileV1 = serde_json::from_str(&raw).ok()?;
+    let file = read_snapshot(path).ok()??;
     let age = Duration::from_secs(unix_secs(now).saturating_sub(file.written_at));
     Some((file.entries.len(), age))
 }
@@ -256,7 +264,7 @@ mod tests {
     static N: AtomicU64 = AtomicU64::new(0);
 
     fn scratch() -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "pf-neigh-snoop-persist-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
@@ -314,6 +322,49 @@ mod tests {
         assert_eq!(count, 2);
         assert!(age < Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_and_status_reject_a_writable_snapshot_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let ancestor = scratch();
+        let path = file_path(&ancestor.join("cache"), "br0");
+        let now = SystemTime::now();
+        let mono = Instant::now();
+        let mut table = LearnedTable::new(16);
+        table.observe(ip(1), A, Source::ArpReply, now, mono);
+        save(&path, &to_json(&table, "br0", now)).unwrap();
+        let restore = || load(&path, "br0", now, mono, Duration::from_secs(60));
+
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(matches!(restore(), LoadOutcome::Unusable(why) if why.contains("ancestor")));
+        assert_eq!(summarize(&path, now), None);
+
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(restore(), LoadOutcome::Loaded { entries, .. } if entries.len() == 1));
+        assert_eq!(summarize(&path, now), Some((1, Duration::ZERO)));
+        std::fs::remove_dir_all(ancestor).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_snapshot_is_refused_before_json_parsing() {
+        let dir = scratch();
+        let path = file_path(&dir, "br0");
+        save(&path, "{}").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_SNAPSHOT_BYTES + 1)
+            .unwrap();
+        let now = SystemTime::now();
+        let outcome = load(&path, "br0", now, Instant::now(), Duration::from_secs(60));
+        assert!(matches!(outcome, LoadOutcome::Unusable(why) if why.contains("byte bound")));
+        assert_eq!(summarize(&path, now), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -479,7 +530,7 @@ mod tests {
     /// and nothing is written through it or renamed into place. By
     /// pathname, `fs::write` truncated the link's target and the rename
     /// then moved the link itself to `<bridge>.json`.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn save_refuses_a_symlink_at_the_temp_name() {
         let dir = scratch();
@@ -514,7 +565,7 @@ mod tests {
     /// the save and the load-time probe, and nothing is made or written
     /// where it points. By pathname, `create_dir_all` and the writes
     /// followed an intermediate link, and the probe passed through one.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn save_and_the_probe_refuse_a_symlink_in_the_dir_path() {
         let base = scratch();

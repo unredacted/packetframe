@@ -22,7 +22,7 @@ pub mod module;
 pub mod placement;
 pub mod probe;
 pub mod sampler_ports;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod statefile;
 #[cfg(all(target_os = "linux", feature = "tc"))]
 pub mod tc_filter;
