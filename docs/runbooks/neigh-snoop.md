@@ -177,6 +177,13 @@ Attribution notes:
   socket filter is not attached.
 - `recreated` link events during a provision or BGP upload are normal;
   a re-seed follows each.
+- A bridge counts as up only while it is administratively up **and**
+  has carrier. When a bridge that stays up loses carrier (its only
+  port, or every port, goes down), the kernel flushes its neighbours
+  (`arp_evict_nocarrier`, `ndisc_evict_nocarrier`, on by default). So a
+  carrier loss counts as `down` and the bridge is re-seeded when carrier
+  returns. A bridge that is up but has never had carrier waits for
+  carrier before it is seeded.
 
 ## The FRR next-hop gate
 

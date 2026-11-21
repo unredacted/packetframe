@@ -54,7 +54,7 @@ pub fn health(s: &Snapshot) -> HealthReport {
                 LinkState::Down => row(
                     name,
                     HealthState::Degraded,
-                    "link down; will re-seed when it comes up".into(),
+                    "link down or without carrier; will re-seed when it comes back".into(),
                     None,
                 ),
                 LinkState::Up => match b.silent_secs {

@@ -14,6 +14,7 @@ pub enum LinkState {
     /// No device of that name exists (yet). Normal during a provision.
     #[default]
     Absent,
+    /// Administratively down, or up without carrier.
     Down,
     Up,
 }
