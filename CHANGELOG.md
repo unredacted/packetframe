@@ -97,7 +97,7 @@ A point release on 0.6.4 with fixes from a security review, and support for VPP 
 ### Known limitations
 
 - Traffic through a NIC into VPP v26.10 is not yet verified: NIC receive, transmit and steering on 26.10 are unproven.
-- The VLAN check [#418](https://github.com/unredacted/packetframe/pull/418) cannot see a VLAN tag a NIC strips before generic XDP sees the frame (`rx-vlan-offload`): on such a port it cannot tell tagged frames apart, which leaves it as permissive as 0.6.4.
+- The VLAN check [#418](https://github.com/unredacted/packetframe/pull/418) is not yet verified with traffic. It cannot see a VLAN tag a NIC strips before generic XDP sees the frame (`rx-vlan-offload`): on such a port it cannot tell tagged frames apart, which leaves it as permissive as 0.6.4.
 - neigh-snoop's rewritten install queue [#413](https://github.com/unredacted/packetframe/pull/413) is not yet verified on an IX-facing bridge.
 - The Debian 11 (bullseye) build of VPP v26.10 has passed CI only; it is not yet verified on a gateway.
 - The limitations listed for 0.6.4 otherwise still apply.
@@ -286,7 +286,7 @@ The start seeds from the ledger 0.6.1 wrote at the stop. Neither ledger format c
 - A neighbour that resolves late still costs a pass over every route through it: each is sent to VPP again, one at a time, so a late transit delays the first steer by however long a table's worth of updates takes under the load at the time.
 - After VPP's package is removed or reinstalled (a firmware upgrade does this), its removal script hands the port's VF back to the kernel, and adopting the running VPP is refused ("recorded port does not match reality") until `packetframe detach --all`, which costs the route ledger.
 - `detach --keep-vpp` refuses when the config newly adds vpp-offload; use `detach --all` for that change, and the next start loads cold.
-- After days of uptime the kernel can fail to grant any of VPP's hugepages. Dropping the page cache and compacting memory (`sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory`) before the start lets them be granted.
+- After days of uptime the kernel can fail to grant any of VPP's hugepages. Dropping the page cache and compacting memory (`sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory`) before the start may let them be granted; check the allocation before starting VPP.
 - A gateway firmware upgrade can still remove hand-installed packages: reinstall packetframe, and VPP, after one.
 - The limitations listed for 0.6.1 otherwise still apply.
 
@@ -391,7 +391,7 @@ The first start after 0.5.0 loads the route mirror from the route source, becaus
 ### Highlights
 
 - **Flow export (experimental).** The new `flow-export` module sends sampled packets as sFlow v5, or flow records as IPFIX with privacy profiles and origin AS numbers, to collectors such as Akvorado and FastNetMon. Samples come from the XDP and tc programs, from VPP's sampler plugin on steered ports, and from a kernel tc sampler on interfaces neither sees. Off until configured. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/flow-export.md)
-- **Restarts in seconds.** A clean stop saves the route mirror and the next start seeds it before the route source connects; an adopted VPP then diffs against it once the completeness authority attests it, rather than after the BGP replay. No BGP session is reset. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/vpp-offload.md#the-steered-diff-and-a-seeded-mirror)
+- **Restarts in seconds.** A clean stop saves the route mirror and the next start seeds it before the route source connects; an adopted VPP then diffs against it once the completeness authority attests it, rather than after the BGP replay. FRR's upstream BGP sessions are not reset. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/vpp-offload.md#the-steered-diff-and-a-seeded-mirror)
 - **Exempt traffic spread over RSS.** vpp-offload's keep rules sent every exempt frame to queue 0, which could hold one core at full softirq while the others idled. Keeps are now RSS rules, with a `kernel-path` status row per steered port. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/vpp-offload.md#rss-keeps-and-the-queue-0-fallback)
 - **`wan-egress`** sends private sources past a full-table `main` to the platform's own WAN policy and NAT. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/packetframe-fib.md#wan-egress)
 - **A route feed that rides out an FRR reload.** A BGP config upload that restarts FRR on a saturated gateway could break the feed three ways. The listener now keeps the session alive from a thread of its own, ends it at the peer's close, and sweeps stale routes at End-of-RIB rather than after a pause. A sweep of a full table no longer holds the control plane for a second. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/packetframe-fib.md#symptom-the-feed-session-drops-during-a-full-table-load)
@@ -537,7 +537,7 @@ The first release since 0.2.7 (2026-05-20). It adds three modules (vpp-offload, 
 - `fib-cache on`: a destination cache in front of custom-FIB lookups. Default off. ([#79](https://github.com/unredacted/packetframe/pull/79))
 - `coalesce …`: NIC interrupt coalescing at attach, restored by `detach`. Restart-only. ([#269](https://github.com/unredacted/packetframe/pull/269))
 - `local-prefix6`: the connected fast path for IPv6, with NDP kept off it. ([#72](https://github.com/unredacted/packetframe/pull/72))
-- `attach <iface> tc`: a tc-ingress datapath (custom-fib only). It measured about 70% more CPU per packet than generic XDP, so it is not recommended. ([#75](https://github.com/unredacted/packetframe/pull/75))
+- `attach <iface> tc`: a tc-ingress datapath (custom-fib only). It costs more CPU per packet than generic XDP, so it is not recommended. ([#75](https://github.com/unredacted/packetframe/pull/75))
 - New counters: the softnet `time_squeeze` export, and `err_parse_tc` split by bounds check. ([#184](https://github.com/unredacted/packetframe/pull/184), [#138](https://github.com/unredacted/packetframe/pull/138))
 
 **probe** (`packetframe feasibility`)
