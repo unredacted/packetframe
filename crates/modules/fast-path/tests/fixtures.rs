@@ -16,7 +16,10 @@
 
 mod common;
 
-use common::{insert_vlan_tag, xdp_action, Harness, Ipv4TcpBuilder, Ipv6TcpBuilder, StatIdx};
+use common::{
+    insert_vlan_tag, xdp_action, Harness, Ipv4TcpBuilder, Ipv6TcpBuilder, StatIdx, BUILDER_DST_MAC,
+    TEST_RUN_INGRESS_IFINDEX,
+};
 
 fn rx_total_delta(before: u64, h: &Harness) -> u64 {
     h.stat(StatIdx::RxTotal) - before
@@ -369,6 +372,8 @@ fn vlan_tagged_ipv4_src_match_dry_run_bumps_matched_v4() {
     }
     .build();
     let tagged = insert_vlan_tag(&base, 1337);
+    // Attach programs the router's MAC on each VLAN it routes.
+    h.add_rx_mac_on(TEST_RUN_INGRESS_IFINDEX, 1337, BUILDER_DST_MAC);
 
     let before_matched = h.stat(StatIdx::MatchedV4);
     let before_src = h.stat(StatIdx::MatchedSrcOnly);
@@ -396,6 +401,8 @@ fn vlan_tagged_ipv6_dst_match_dry_run_bumps_matched_v6() {
     }
     .build();
     let tagged = insert_vlan_tag(&base, 66);
+    // Attach programs the router's MAC on each VLAN it routes.
+    h.add_rx_mac_on(TEST_RUN_INGRESS_IFINDEX, 66, BUILDER_DST_MAC);
 
     let before_v6 = h.stat(StatIdx::MatchedV6);
     let before_dst = h.stat(StatIdx::MatchedDstOnly);

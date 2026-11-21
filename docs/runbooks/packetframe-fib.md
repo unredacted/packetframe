@@ -2421,7 +2421,8 @@ Check:
 ### Symptom: `pass_not_for_us` jumps and `fwd_ok` falls with it
 
 What it means: the XDP program routes a matched frame only when its
-destination MAC is in `RX_MACS` for the port it arrived on. Everything
+destination MAC is in `RX_MACS` for the port it arrived on and the VLAN
+it arrived on (untagged, or its 802.1Q VID). Everything
 else goes to the kernel untouched and counts `pass_not_for_us`. Without
 the check, a bridge member's hook routed frames between two hosts on
 one VLAN when either address was allowlisted: TTL decremented, source
@@ -2431,16 +2432,42 @@ and a `fallback-default` /0 sent them upstream.
 
 Per port, `RX_MACS` holds the MACs `packetframe_common::topology::
 receive_macs` derives, the same rule vpp-offload uses for its divert
-rules:
+rules, each keyed on the VLANs it is received on
+(`receive_vlan_macs`):
 
-- a bridge member: the bridge's MAC, plus the MAC of each L3 device (a
-  VLAN device or VLAN bridge that no bridge has enslaved) on a VLAN of
-  that bridge;
+- a bridge member: the bridge's MAC untagged; and on the VID of each L3
+  device (a VLAN device or VLAN bridge that no bridge has enslaved) on
+  a VLAN of that bridge, the bridge's MAC and that device's;
 - a plain port, including one enslaved to a master that is not a
-  bridge (a VRF): its own MAC. A VLAN sub-interface there with a MAC of
-  its own is left out, so frames addressed to it take the kernel path;
-- a bond: its MACs, keyed on the bond's ifindex and on each slave's
+  bridge (a VRF): its own MAC, untagged and on the VID of each L3
+  device on a VLAN of the port. A VLAN sub-interface there with a MAC
+  of its own is left out, so frames addressed to it take the kernel
+  path;
+- a member of a bridge with `vlan_filtering` on (UniFi's `switch0`):
+  the same MACs, keyed by the VID on the wire, for each frame the
+  bridge admits and passes up to its own stack, read from one AF_BRIDGE
+  dump per refresh (`bridge vlan show`). An untagged or priority-tagged
+  frame takes the port's PVID; a VLAN must be in the port's table and
+  be one of the bridge's own (`bridge vlan show dev switch0`). Passed up
+  untagged it reaches the bridge's MAC; passed up tagged, the MACs of
+  that VLAN's L3 device as above. So on a gateway where each port has
+  VLAN 1 as PVID and 3900 tagged, the port's keys are VIDs 0, 1 and
+  3900. A `bridge vlan` add or delete is followed like any link change;
+- a member of a bridge filtering in a way that rule does not model
+  (`vlan_protocol 802.1ad`, or a setting that cannot be read): nothing,
+  so every frame on that port takes the kernel path. Attach, and the
+  watcher when the setting changes, log `port's bridge filters by VLAN
+  in a way RX_MACS does not model` with the reason;
+- a bond: its entries, keyed on the bond's ifindex and on each slave's
   (native XDP on a bond reports the slave as the ingress interface).
+
+A frame tagged with a VID that has no L3 device on its port (or the
+port's bridge) is one the kernel drops, since no VLAN device takes it,
+so the fast path passes it too. An 802.1ad (S-tagged) frame always takes
+the kernel path: `/proc/net/vlan/config` does not say which TPID a VLAN
+device has, so the entries are 802.1Q's, as for `VLAN_RESOLVE`. A VLAN
+that leaves a port loses its entries at once, even when another entry
+of that refresh cannot be inserted.
 
 Attach fills the map before the first XDP attach. From then on the
 redirect-target watcher refreshes it on every `RTM_NEWLINK`, so a bridge
@@ -2458,11 +2485,15 @@ router MAC is missing from the map. Check:
 - `journalctl -u packetframe | grep -E 'RX_MACS|receive MACs'`: attach
   logs `RX_MACS populated`, the watcher logs `RX_MACS refreshed from
   link events`, and a port whose MACs could not be read logs `receive
-  MACs unreadable` by name.
+  MACs unreadable` by name (a failed `bridge VLAN dump` makes every
+  filtering bridge's member unreadable for that pass).
 - `bpftool map dump pinned /sys/fs/bpf/packetframe/fast-path/maps/RX_MACS`
-  against `ip -br link`. Each key is the port's ifindex (4 bytes,
-  little-endian), the MAC and 2 pad bytes. Every attached port should
-  have its own MAC (plain port) or its bridge's MAC (bridge member).
+  against `ip -br link`, `cat /proc/net/vlan/config` and, for a member
+  of a filtering bridge, `bridge vlan show`. Each key is the
+  port's ifindex (4 bytes, little-endian), the MAC, and the VID (2
+  bytes, little-endian; 0 for untagged). Every attached port should have
+  its own MAC (plain port) or its bridge's MAC (bridge member) untagged,
+  and an entry on each VID it routes.
 - The MAC your hosts actually send to: `ip neigh` on a host for the
   gateway address, or `tcpdump -e` on the port. A MAC that belongs to
   none of the devices above, such as a macvlan or VRRP virtual MAC, is
