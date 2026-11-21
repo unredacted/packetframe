@@ -30,12 +30,20 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 ## [0.6.5] - 2026-11-20
 
-A point release on 0.6.4 for VPP v26.10, and for VPPs other than the vpp-unifi builds. vpp-offload's VPP bindings are regenerated against v26.10 and come out identical, so 0.6.5 and 0.6.4 both attach to VPP 26.06 or 26.10. The packaged VPP sampler plugin is now built for v26.10. PacketFrame's VPP checks now also run against fd.io's own packages, and the sampler plugin builds for any VPP from 26.06 on. A 0.6.4 config and route ledger carry over unchanged.
+A point release on 0.6.4 with fixes from a security review, and support for VPP v26.10 and VPPs other than the vpp-unifi builds. The fixes tighten what may feed the route mirror and how much it may hold, keep the XDP fast path to the VLANs the kernel would route, and harden neigh-snoop's saved cache, install queue and conflict handling. vpp-offload's VPP bindings, regenerated against v26.10, come out identical, so 0.6.5 attaches to VPP 26.06 or 26.10. The packaged VPP sampler plugin is now built for v26.10, and it builds for any VPP from 26.06 on. A 0.6.4 config and route ledger carry over unchanged, except in the cases listed under Upgrading.
 
 ### Upgrading from 0.6.4
 
 1. Install the 0.6.5 package or tarball. The .deb runs no maintainer scripts, so the running daemon is unaffected.
 2. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with or without vpp-offload, as for 0.6.4.
+
+- **A route feed from this host** (bgpd, bird or a BMP emitter on the router itself) is admitted only from root or the account `peer-user` names; the default is `frr` and `bird`, where they exist. A feed run under any other account needs `peer-user <name|uid>`, or its connection is refused and logged with its uid. The start needs `CONFIG_INET_DIAG`, which UniFi gateways have. [#419](https://github.com/unredacted/packetframe/pull/419)
+
+- **neigh-snoop's `persist-dir`** must be owned by root, closed to group and others, and under root-owned directories that are closed or sticky. One under a world-writable directory, such as `/data` on UniFi, is never restored: each start logs why and the bridge learns from scratch. The default, `/var/lib/packetframe/state/neigh-cache`, passes. [#412](https://github.com/unredacted/packetframe/pull/412)
+
+- **BMP driving a `packetframe-fib` FIB** now always requires Loc-RIB: an emitter that sends pre- or post-policy frames has its session closed. Without `require-loc-rib` in the config, the route ledger's identity changes, so the first start after the upgrade is cold. BGP route sources are unaffected. [#411](https://github.com/unredacted/packetframe/pull/411)
+
+- **A port on a bridge with `vlan_filtering` on** is fast-pathed only on the VLANs the bridge's tables admit and pass up to the router (`bridge vlan show`); UniFi's `switch0` is such a bridge. A bridge filtering 802.1ad tags, or whose VLAN settings can't be read, leaves its ports off the fast path, with a warning saying why. [#418](https://github.com/unredacted/packetframe/pull/418)
 
 - **flow-export on a gateway already running VPP 26.10:** step 2 adopts the running VPP, and VPP reads its plugin directory only at start, so it keeps the plugin it loaded (0.6.4's, built for 26.06, which never sampled there). To load 0.6.5's, restart VPP too: `systemctl stop packetframe && packetframe detach --all && systemctl start packetframe`. While VPP restarts, steered traffic falls back to the kernel and XDP path. Then check `show pf-sampler` reads `active`.
 
@@ -45,6 +53,11 @@ A point release on 0.6.4 for VPP v26.10, and for VPPs other than the vpp-unifi b
 
 ### Highlights
 
+- **Security fixes.**
+  - Route feed: local connections only from root or the routing daemon [#419](https://github.com/unredacted/packetframe/pull/419), BMP only Loc-RIB when it drives forwarding [#411](https://github.com/unredacted/packetframe/pull/411), a route mirror bounded by the FIB's capacity [#417](https://github.com/unredacted/packetframe/pull/417), and no full-mirror Resync after a connection that sent nothing [#415](https://github.com/unredacted/packetframe/pull/415).
+  - XDP: routing only on the VLANs the kernel would route [#418](https://github.com/unredacted/packetframe/pull/418).
+  - neigh-snoop: a saved cache restored only if root wrote it, a bounded install queue, conflicting MACs refused before they are learned, and no overwriting a neighbour the kernel confirmed meanwhile ([#412](https://github.com/unredacted/packetframe/pull/412), [#413](https://github.com/unredacted/packetframe/pull/413), [#414](https://github.com/unredacted/packetframe/pull/414), [#416](https://github.com/unredacted/packetframe/pull/416)).
+- **Each fix ran on the lab gateway.** Main's build passed the full hardware suite there (35 test binaries, 1,085 tests). FIB verify matched 64 of 64 probes over 179,700 routes. On `switch0`'s ports the fast-path entries followed `bridge vlan` changes live.
 - **VPP v26.10.** On the lab gateway (trixie build of v26.10, 179,700 routes):
   - FIB verify matched 64 of 64 probes, and a keep-VPP restart kept VPP's pid.
   - The plugin loaded and ran (`show pf-sampler`: `active`). It sampled 194 of 20,000 packet-generator packets at 1:100 into an sFlow collector.
@@ -88,6 +101,8 @@ A point release on 0.6.4 for VPP v26.10, and for VPPs other than the vpp-unifi b
 ### Known limitations
 
 - No packet has crossed a NIC into VPP v26.10 yet. The lab's member ports have no carrier, so its test injected with VPP's packet generator and routed out through a tap. NIC receive, transmit and steering on 26.10 are unproven on hardware.
+- The VLAN check [#418](https://github.com/unredacted/packetframe/pull/418) was checked on the lab by its map entries, not by traffic. If a NIC strips VLAN tags before generic XDP sees the frame (`rx-vlan-offload`), the check cannot tell that port's tagged frames apart, which leaves it as permissive as 0.6.4.
+- neigh-snoop's rewritten install queue [#413](https://github.com/unredacted/packetframe/pull/413) has run on the lab gateway only, not yet on an IX-facing bridge.
 - Only the trixie (UniFi OS 6.x) build of v26.10 has run on a gateway; the bullseye build has passed CI only.
 - The limitations listed for 0.6.4 otherwise still apply.
 
