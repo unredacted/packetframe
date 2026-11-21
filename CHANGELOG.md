@@ -28,7 +28,29 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
-## [0.6.5] - UNRELEASED
+## [0.6.5] - 2026-11-20
+
+A point release on 0.6.4 for VPP v26.10, and for VPPs other than the vpp-unifi builds. vpp-offload's VPP bindings are regenerated against v26.10 and come out identical, so 0.6.5 and 0.6.4 both attach to VPP 26.06 or 26.10. The packaged VPP sampler plugin is now built for v26.10. PacketFrame's VPP checks now also run against fd.io's own packages, and the sampler plugin builds for any VPP from 26.06 on. A 0.6.4 config and route ledger carry over unchanged.
+
+### Upgrading from 0.6.4
+
+1. Install the 0.6.5 package or tarball. The .deb runs no maintainer scripts, so the running daemon is unaffected.
+2. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with or without vpp-offload, as for 0.6.4.
+
+- **flow-export on a gateway already running VPP 26.10:** step 2 adopts the running VPP, and VPP reads its plugin directory only at start, so it keeps the plugin it loaded (0.6.4's, built for 26.06, which never sampled there). To load 0.6.5's, restart VPP too: `systemctl stop packetframe && packetframe detach --all && systemctl start packetframe`. While VPP restarts, steered traffic falls back to the kernel and XDP path. Then check `show pf-sampler` reads `active`.
+
+- **flow-export on a gateway still running VPP 26.06:** the packaged plugin is built for VPP `26.10.0-16~gb4caea981-octeon9`, so VPP 26.06 refuses it or leaves it inert. Forwarding and vpp-offload are unaffected; VPP just stops sampling. `packetframe feasibility`'s `flow-export.vpp.plugin` row and vppctl's `show pf-sampler` say which applies. To sample through VPP, do one of these:
+  - Install VPP v26.10 first: unredacted/vpp-unifi `vpp-v26.10-b4caea981-octeon9-{bullseye,trixie}-arm64`, detach, install, attach. [Install and upgrade on the router](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/vpp-offload.md#install-and-upgrade-on-the-router)
+  - Build the plugin for the VPP you run. ["Another VPP"](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/flow-export.md#vpp)
+
+### Highlights
+
+- **VPP v26.10.** On the lab gateway (trixie build of v26.10, 179,700 routes):
+  - FIB verify matched 64 of 64 probes, and a keep-VPP restart kept VPP's pid.
+  - The plugin loaded and ran (`show pf-sampler`: `active`). It sampled 194 of 20,000 packet-generator packets at 1:100 into an sFlow collector.
+  - VPP routed them through the bridge and its BVI with TTL 64 → 63.
+- **Any VPP, not only vpp-unifi's.** CI now runs PacketFrame's VPP checks against fd.io's own 26.10 packages on Ubuntu noble, arm64 and amd64: the sampler plugin's live smoke test, the CLI parsers in a real VPP, and binary-API drift. The plugin now builds on x86_64 against VPP 26.06 and later. The flow-export runbook says how to build it for any installed VPP.
+- **vpp-unifi gates its releases on these checks,** so it publishes no VPP that PacketFrame's sampler plugin, bindings or CLI parsers fail against.
 
 ### Changes
 
@@ -45,6 +67,44 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 **neigh-snoop**
 
 - An install decided while the kernel held the address unresolved (INCOMPLETE, FAILED) is written without `NLM_F_REPLACE`, so it can no longer overwrite a MAC the kernel confirmed after the decision. Only a STALE entry with another MAC is replaced. [#416](https://github.com/unredacted/packetframe/pull/416)
+
+**vpp-offload**
+
+- The binary-API bindings are generated from VPP v26.10 (stable/2610 at b4caea981), and `generated.rs` is unchanged: no wire-format change, so the CRC handshake accepts 26.06 and 26.10 alike. ([#403](https://github.com/unredacted/packetframe/pull/403))
+
+**flow-export**
+
+- The packaged VPP sampler plugin is built for VPP v26.10, on a vpp-plugin fork that handles 26.10's buffer chain-length change and rebuilds when the VPP headers change. ([#403](https://github.com/unredacted/packetframe/pull/403))
+- The plugin builds on x86_64 against VPP 26.06 and later, whose x86 march variants changed. ([#409](https://github.com/unredacted/packetframe/pull/409))
+- The runbook's "Another VPP" covers building the plugin for any installed VPP, restarting VPP to load it, and checking `show pf-sampler` (`active`, or `INERT:` and why). `show plugins` listing it proves nothing. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/flow-export.md#vpp), [#407](https://github.com/unredacted/packetframe/pull/407))
+
+**Build and CI**
+
+- Checks vpp-unifi runs on each candidate VPP before publishing it: the sampler plugin's live smoke test on the candidate's packages, binary-API drift on its `.api.json` bundle, and vpp-offload's CLI parsers against it running. ([vpp-api README](https://github.com/unredacted/packetframe/blob/v0.6.5/crates/modules/vpp-offload/vpp-api/README.md#the-gate-no-vpp-is-published-that-packetframe-does-not-work-with), [#405](https://github.com/unredacted/packetframe/pull/405), [#406](https://github.com/unredacted/packetframe/pull/406))
+- The same checks run in CI against fd.io's own VPP packages on Ubuntu noble, arm64 and amd64. API drift against a different VPP release is reported, not failed. ([#408](https://github.com/unredacted/packetframe/pull/408), [#409](https://github.com/unredacted/packetframe/pull/409))
+- Rust 1.100 ([#402](https://github.com/unredacted/packetframe/pull/402)); loom 0.7.3 ([#401](https://github.com/unredacted/packetframe/pull/401)). The runbooks refer to the reference deployment generically ([#400](https://github.com/unredacted/packetframe/pull/400)).
+
+### Known limitations
+
+- No packet has crossed a NIC into VPP v26.10 yet. The lab's member ports have no carrier, so its test injected with VPP's packet generator and routed out through a tap. NIC receive, transmit and steering on 26.10 are unproven on hardware.
+- Only the trixie (UniFi OS 6.x) build of v26.10 has run on a gateway; the bullseye build has passed CI only.
+- The limitations listed for 0.6.4 otherwise still apply.
+
+### Install and verify
+
+When upgrading, follow steps 1 and 2 above.
+
+```sh
+ARCH=$(dpkg --print-architecture)   # amd64 or arm64
+curl -LO "https://github.com/unredacted/packetframe/releases/download/v0.6.5/packetframe_0.6.5_${ARCH}.deb"
+curl -LO https://github.com/unredacted/packetframe/releases/download/v0.6.5/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+dpkg -i "packetframe_0.6.5_${ARCH}.deb"
+```
+
+Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the `aarch64-unknown-linux-gnu` tarball and the arm64 .deb also carry the VPP sampler plugin.
+
+**Full changelog:** https://github.com/unredacted/packetframe/compare/v0.6.4...v0.6.5
 
 ## [0.6.4] - 2026-11-13
 
