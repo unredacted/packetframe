@@ -28,23 +28,99 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
-## [0.6.5] - UNRELEASED
+## [0.6.5] - 2026-11-21
+
+A point release on 0.6.4 with fixes from a security review, and support for VPP v26.10 and VPPs other than the vpp-unifi builds. The fixes tighten what may feed the route mirror and how much it may hold, keep the XDP fast path to the VLANs the kernel would route, and harden neigh-snoop's saved cache, install queue and conflict handling. vpp-offload's VPP bindings, regenerated against v26.10, come out identical, so 0.6.5 attaches to VPP 26.06 or 26.10. The packaged VPP sampler plugin is now built for v26.10, and it builds for any VPP from 26.06 on. A 0.6.4 config and route ledger carry over unchanged, except in the cases listed under Upgrading.
+
+### Upgrading from 0.6.4
+
+1. Install the 0.6.5 package or tarball. The .deb runs no maintainer scripts, so the running daemon is unaffected.
+2. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with or without vpp-offload, as for 0.6.4.
+
+- **A route feed from this host** (bgpd, bird or a BMP emitter on the router itself) is admitted only from root or the account `peer-user` names; the default is `frr` and `bird`, where they exist. A feed run under any other account needs `peer-user <name|uid>`, or its connection is refused and logged with its uid. The start needs `CONFIG_INET_DIAG`, which UniFi gateways have. [#419](https://github.com/unredacted/packetframe/pull/419)
+
+- **neigh-snoop's `persist-dir`** must be owned by root, closed to group and others, and under root-owned directories that are closed or sticky. One under a world-writable directory, such as `/data` on UniFi, is never restored: each start logs why and the bridge learns from scratch. The default, `/var/lib/packetframe/state/neigh-cache`, passes. [#412](https://github.com/unredacted/packetframe/pull/412)
+
+- **BMP driving a `packetframe-fib` FIB** now always requires Loc-RIB: an emitter that sends pre- or post-policy frames has its session closed. Without `require-loc-rib` in the config, the route ledger's identity changes, so the first start after the upgrade is cold. BGP route sources are unaffected. [#411](https://github.com/unredacted/packetframe/pull/411)
+
+- **A port on a bridge with `vlan_filtering` on** is fast-pathed only on the VLANs the bridge's tables admit and pass up to the router (`bridge vlan show`); UniFi's `switch0` is such a bridge. A bridge filtering 802.1ad tags, or whose VLAN settings can't be read, leaves its ports off the fast path, with a warning saying why. [#418](https://github.com/unredacted/packetframe/pull/418)
+
+- **flow-export on a gateway already running VPP 26.10:** step 2 adopts the running VPP, and VPP reads its plugin directory only at start, so it keeps the plugin it loaded (0.6.4's, built for 26.06, which never sampled there). To load 0.6.5's, restart VPP too: `systemctl stop packetframe && packetframe detach --all && systemctl start packetframe`. While VPP restarts, steered traffic falls back to the kernel and XDP path. Then check `show pf-sampler` reads `active`.
+
+- **flow-export on a gateway still running VPP 26.06:** the packaged plugin is built for VPP `26.10.0-16~gb4caea981-octeon9`, so VPP 26.06 refuses it or leaves it inert. Forwarding and vpp-offload are unaffected; VPP just stops sampling. `packetframe feasibility`'s `flow-export.vpp.plugin` row and vppctl's `show pf-sampler` say which applies. To sample through VPP, do one of these:
+  - Install VPP v26.10 first: unredacted/vpp-unifi `vpp-v26.10-b4caea981-octeon9-{bullseye,trixie}-arm64`, detach, install, attach. [Install and upgrade on the router](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/vpp-offload.md#install-and-upgrade-on-the-router)
+  - Build the plugin for the VPP you run. ["Another VPP"](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/flow-export.md#vpp)
+
+### Highlights
+
+- **Security fixes.**
+  - Route feed: local connections only from root or the routing daemon [#419](https://github.com/unredacted/packetframe/pull/419), BMP only Loc-RIB when it drives forwarding [#411](https://github.com/unredacted/packetframe/pull/411), a route mirror bounded by the FIB's capacity [#417](https://github.com/unredacted/packetframe/pull/417), and no full-mirror Resync after a connection that sent nothing [#415](https://github.com/unredacted/packetframe/pull/415).
+  - XDP: routing only on the VLANs the kernel would route [#418](https://github.com/unredacted/packetframe/pull/418).
+  - neigh-snoop: a saved cache restored only if root wrote it, a bounded install queue, conflicting MACs refused before they are learned, and no overwriting a neighbour the kernel confirmed meanwhile ([#412](https://github.com/unredacted/packetframe/pull/412), [#413](https://github.com/unredacted/packetframe/pull/413), [#414](https://github.com/unredacted/packetframe/pull/414), [#416](https://github.com/unredacted/packetframe/pull/416)).
+- **Each fix ran on the lab gateway.** Main's build passed the full hardware suite there (35 test binaries, 1,085 tests). FIB verify matched 64 of 64 probes over 179,700 routes. On `switch0`'s ports the fast-path entries followed `bridge vlan` changes live.
+- **VPP v26.10.** On the lab gateway (trixie build of v26.10, 179,700 routes):
+  - FIB verify matched 64 of 64 probes, and a keep-VPP restart kept VPP's pid.
+  - The plugin loaded and ran (`show pf-sampler`: `active`). It sampled 194 of 20,000 packet-generator packets at 1:100 into an sFlow collector.
+  - VPP routed them through the bridge and its BVI with TTL 64 → 63.
+- **Any VPP, not only vpp-unifi's.** CI now runs PacketFrame's VPP checks against fd.io's own 26.10 packages on Ubuntu noble, arm64 and amd64: the sampler plugin's live smoke test, the CLI parsers in a real VPP, and binary-API drift. The plugin now builds on x86_64 against VPP 26.06 and later. The flow-export runbook says how to build it for any installed VPP.
+- **vpp-unifi gates its releases on these checks,** so it publishes no VPP that PacketFrame's sampler plugin, bindings or CLI parsers fail against.
 
 ### Changes
 
 **fast-path**
 
+- With BMP feeding a `packetframe-fib` FIB, only Loc-RIB frames are accepted whether or not `require-loc-rib` is set: a pre- or post-policy frame ends the session instead of installing a route the emitter's own routing daemon rejected. `compare` mode keeps the flag opt-in. A BMP config without the flag gets a new route-ledger identity, so its first start after the upgrade is cold. [#411](https://github.com/unredacted/packetframe/pull/411)
 - A route-feed connection that dispatched no route since the last `Resync` (a failed handshake, a session that sent nothing) no longer queues another walk over the whole mirror ahead of the next session's table. BGP and BMP alike. [#415](https://github.com/unredacted/packetframe/pull/415)
-
 - The route mirror is bounded by the FIB map's capacity: per family, a new prefix is refused once every slot is held, and advertisements are bounded per prefix and in aggregate. At the limit, installed routes keep forwarding and refreshes and withdrawals still apply; readiness is withheld and a full feed replay is requested after 60 s. A withdrawal whose map delete failed keeps its slot and fails every GC until a retried delete lands, where a retry used to report it done while the route stayed installed. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/packetframe-fib.md#route-capacity), [#417](https://github.com/unredacted/packetframe/pull/417))
-
 - The XDP program routes a frame only on a VLAN the router has an L3 device for on its ingress port, as the kernel would; on a bridge with `vlan_filtering` on, only on what the bridge's VLAN tables admit and pass up. [#418](https://github.com/unredacted/packetframe/pull/418)
-
 - A route-source listener admits a connection from this host only if root owns it, or the account `peer-user <name|uid>` names (by default `frr` and `bird`, where they exist), so no other local process can feed the route mirror. Existing configs keep working; the start needs the kernel's TCP socket diagnostics (`CONFIG_INET_DIAG`), which UniFi gateways have. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/packetframe-fib.md#who-may-connect-to-the-route-source-listener), [#419](https://github.com/unredacted/packetframe/pull/419))
 
 **neigh-snoop**
 
+- A saved neighbour cache is restored only if root could have written it, by the route ledger's rule: the file and its directory owned by the daemon's user and closed to group and others, every ancestor root-owned and closed or sticky, no symlinks, at most 256 MiB. A rejected cache is logged and the bridge learns from scratch. A `persist-dir` under a world-writable directory, such as `/data` on UniFi, is rejected at every start; the default `/var/lib/packetframe/state/neigh-cache` passes. [#412](https://github.com/unredacted/packetframe/pull/412)
+- The paced installer's queue is bounded by the learned table's cap, one slot per destination. Overflow and cancelled work count as `queue_dropped`, and a job re-reads its evidence when it is handed to the kernel, so an evicted entry's old MAC is never installed. [#413](https://github.com/unredacted/packetframe/pull/413)
+- An observation whose MAC conflicts with a confirmed kernel neighbour is refused before it is learned, so it can no longer re-point a declared router's other addresses or ride into the next saved cache. A cache saved by an earlier release keeps an entry only where the kernel confirms its MAC. [#414](https://github.com/unredacted/packetframe/pull/414)
 - An install decided while the kernel held the address unresolved (INCOMPLETE, FAILED) is written without `NLM_F_REPLACE`, so it can no longer overwrite a MAC the kernel confirmed after the decision. Only a STALE entry with another MAC is replaced. [#416](https://github.com/unredacted/packetframe/pull/416)
+
+**vpp-offload**
+
+- The binary-API bindings are generated from VPP v26.10 (stable/2610 at b4caea981), and `generated.rs` is unchanged: no wire-format change, so the CRC handshake accepts 26.06 and 26.10 alike. ([#403](https://github.com/unredacted/packetframe/pull/403))
+
+**flow-export**
+
+- The packaged VPP sampler plugin is built for VPP v26.10, on a vpp-plugin fork that handles 26.10's buffer chain-length change and rebuilds when the VPP headers change. ([#403](https://github.com/unredacted/packetframe/pull/403))
+- The plugin builds on x86_64 against VPP 26.06 and later, whose x86 march variants changed. ([#409](https://github.com/unredacted/packetframe/pull/409))
+- The runbook's "Another VPP" covers building the plugin for any installed VPP, restarting VPP to load it, and checking `show pf-sampler` (`active`, or `INERT:` and why). `show plugins` listing it proves nothing. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/flow-export.md#vpp), [#407](https://github.com/unredacted/packetframe/pull/407))
+
+**Build and CI**
+
+- Checks vpp-unifi runs on each candidate VPP before publishing it: the sampler plugin's live smoke test on the candidate's packages, binary-API drift on its `.api.json` bundle, and vpp-offload's CLI parsers against it running. ([vpp-api README](https://github.com/unredacted/packetframe/blob/v0.6.5/crates/modules/vpp-offload/vpp-api/README.md#the-gate-no-vpp-is-published-that-packetframe-does-not-work-with), [#405](https://github.com/unredacted/packetframe/pull/405), [#406](https://github.com/unredacted/packetframe/pull/406))
+- The same checks run in CI against fd.io's own VPP packages on Ubuntu noble, arm64 and amd64. API drift against a different VPP release is reported, not failed. ([#408](https://github.com/unredacted/packetframe/pull/408), [#409](https://github.com/unredacted/packetframe/pull/409))
+- Rust 1.100 ([#402](https://github.com/unredacted/packetframe/pull/402)); loom 0.7.3 ([#401](https://github.com/unredacted/packetframe/pull/401)). The runbooks refer to the reference deployment generically ([#400](https://github.com/unredacted/packetframe/pull/400)).
+
+### Known limitations
+
+- No packet has crossed a NIC into VPP v26.10 yet. The lab's member ports have no carrier, so its test injected with VPP's packet generator and routed out through a tap. NIC receive, transmit and steering on 26.10 are unproven on hardware.
+- The VLAN check [#418](https://github.com/unredacted/packetframe/pull/418) was checked on the lab by its map entries, not by traffic. If a NIC strips VLAN tags before generic XDP sees the frame (`rx-vlan-offload`), the check cannot tell that port's tagged frames apart, which leaves it as permissive as 0.6.4.
+- neigh-snoop's rewritten install queue [#413](https://github.com/unredacted/packetframe/pull/413) has run on the lab gateway only, not yet on an IX-facing bridge.
+- Only the trixie (UniFi OS 6.x) build of v26.10 has run on a gateway; the bullseye build has passed CI only.
+- The limitations listed for 0.6.4 otherwise still apply.
+
+### Install and verify
+
+When upgrading, follow steps 1 and 2 above.
+
+```sh
+ARCH=$(dpkg --print-architecture)   # amd64 or arm64
+curl -LO "https://github.com/unredacted/packetframe/releases/download/v0.6.5/packetframe_0.6.5_${ARCH}.deb"
+curl -LO https://github.com/unredacted/packetframe/releases/download/v0.6.5/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+dpkg -i "packetframe_0.6.5_${ARCH}.deb"
+```
+
+Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the `aarch64-unknown-linux-gnu` tarball and the arm64 .deb also carry the VPP sampler plugin.
+
+**Full changelog:** https://github.com/unredacted/packetframe/compare/v0.6.4...v0.6.5
 
 ## [0.6.4] - 2026-11-13
 
