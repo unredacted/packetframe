@@ -23,7 +23,7 @@ highlights, the changes grouped by module at one line each with their
 PR links, known limitations, and install steps. During a cycle a PR
 adds only its line, under its module in the `UNRELEASED` section, and
 leaves mechanism, measurements and incident history to the runbooks
-and the PR description; the release PR writes the rest. Lines inside a
+and the PR description; the release PR writes the rest. A section never mentions a test rig, a deployment or its incidents (where a change was tested, route counts, port names, dated events): it says what changed and what an operator must know. Lines inside a
 section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
@@ -57,11 +57,7 @@ A point release on 0.6.4 with fixes from a security review, and support for VPP 
   - Route feed: local connections only from root or the routing daemon [#419](https://github.com/unredacted/packetframe/pull/419), BMP only Loc-RIB when it drives forwarding [#411](https://github.com/unredacted/packetframe/pull/411), a route mirror bounded by the FIB's capacity [#417](https://github.com/unredacted/packetframe/pull/417), and no full-mirror Resync after a connection that sent nothing [#415](https://github.com/unredacted/packetframe/pull/415).
   - XDP: routing only on the VLANs the kernel would route [#418](https://github.com/unredacted/packetframe/pull/418).
   - neigh-snoop: a saved cache restored only if root wrote it, a bounded install queue, conflicting MACs refused before they are learned, and no overwriting a neighbour the kernel confirmed meanwhile ([#412](https://github.com/unredacted/packetframe/pull/412), [#413](https://github.com/unredacted/packetframe/pull/413), [#414](https://github.com/unredacted/packetframe/pull/414), [#416](https://github.com/unredacted/packetframe/pull/416)).
-- **Each fix ran on the lab gateway.** Main's build passed the full hardware suite there (35 test binaries, 1,085 tests). FIB verify matched 64 of 64 probes over 179,700 routes. On `switch0`'s ports the fast-path entries followed `bridge vlan` changes live.
-- **VPP v26.10.** On the lab gateway (trixie build of v26.10, 179,700 routes):
-  - FIB verify matched 64 of 64 probes, and a keep-VPP restart kept VPP's pid.
-  - The plugin loaded and ran (`show pf-sampler`: `active`). It sampled 194 of 20,000 packet-generator packets at 1:100 into an sFlow collector.
-  - VPP routed them through the bridge and its BVI with TTL 64 → 63.
+- **VPP v26.10.** The bindings come out identical against v26.10, so 0.6.5 attaches to VPP 26.06 or 26.10, and the packaged sampler plugin is built for 26.10.
 - **Any VPP, not only vpp-unifi's.** CI now runs PacketFrame's VPP checks against fd.io's own 26.10 packages on Ubuntu noble, arm64 and amd64: the sampler plugin's live smoke test, the CLI parsers in a real VPP, and binary-API drift. The plugin now builds on x86_64 against VPP 26.06 and later. The flow-export runbook says how to build it for any installed VPP.
 - **vpp-unifi gates its releases on these checks,** so it publishes no VPP that PacketFrame's sampler plugin, bindings or CLI parsers fail against.
 
@@ -96,14 +92,14 @@ A point release on 0.6.4 with fixes from a security review, and support for VPP 
 
 - Checks vpp-unifi runs on each candidate VPP before publishing it: the sampler plugin's live smoke test on the candidate's packages, binary-API drift on its `.api.json` bundle, and vpp-offload's CLI parsers against it running. ([vpp-api README](https://github.com/unredacted/packetframe/blob/v0.6.5/crates/modules/vpp-offload/vpp-api/README.md#the-gate-no-vpp-is-published-that-packetframe-does-not-work-with), [#405](https://github.com/unredacted/packetframe/pull/405), [#406](https://github.com/unredacted/packetframe/pull/406))
 - The same checks run in CI against fd.io's own VPP packages on Ubuntu noble, arm64 and amd64. API drift against a different VPP release is reported, not failed. ([#408](https://github.com/unredacted/packetframe/pull/408), [#409](https://github.com/unredacted/packetframe/pull/409))
-- Rust 1.100 ([#402](https://github.com/unredacted/packetframe/pull/402)); loom 0.7.3 ([#401](https://github.com/unredacted/packetframe/pull/401)). The runbooks refer to the reference deployment generically ([#400](https://github.com/unredacted/packetframe/pull/400)).
+- Rust 1.100 ([#402](https://github.com/unredacted/packetframe/pull/402)); loom 0.7.3 ([#401](https://github.com/unredacted/packetframe/pull/401)). The runbooks no longer name specific deployments ([#400](https://github.com/unredacted/packetframe/pull/400)).
 
 ### Known limitations
 
-- No packet has crossed a NIC into VPP v26.10 yet. The lab's member ports have no carrier, so its test injected with VPP's packet generator and routed out through a tap. NIC receive, transmit and steering on 26.10 are unproven on hardware.
-- The VLAN check [#418](https://github.com/unredacted/packetframe/pull/418) was checked on the lab by its map entries, not by traffic. If a NIC strips VLAN tags before generic XDP sees the frame (`rx-vlan-offload`), the check cannot tell that port's tagged frames apart, which leaves it as permissive as 0.6.4.
-- neigh-snoop's rewritten install queue [#413](https://github.com/unredacted/packetframe/pull/413) has run on the lab gateway only, not yet on an IX-facing bridge.
-- Only the trixie (UniFi OS 6.x) build of v26.10 has run on a gateway; the bullseye build has passed CI only.
+- Traffic through a NIC into VPP v26.10 is not yet verified: NIC receive, transmit and steering on 26.10 are unproven.
+- The VLAN check [#418](https://github.com/unredacted/packetframe/pull/418) is not yet verified with traffic. It cannot see a VLAN tag a NIC strips before generic XDP sees the frame (`rx-vlan-offload`): on such a port it cannot tell tagged frames apart, which leaves it as permissive as 0.6.4.
+- neigh-snoop's rewritten install queue [#413](https://github.com/unredacted/packetframe/pull/413) is not yet verified on an IX-facing bridge.
+- The Debian 11 (bullseye) build of VPP v26.10 has passed CI only; it is not yet verified on a gateway.
 - The limitations listed for 0.6.4 otherwise still apply.
 
 ### Install and verify
@@ -124,7 +120,7 @@ Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the
 
 ## [0.6.4] - 2026-11-13
 
-A point release on 0.6.3 for the minutes between a gateway's start and the fast path forwarding on a whole table, then VPP steering. After the 6.0.17 upgrade of the reference deployment (2026-11-12), the operator switched `dry-run` off by hand once the seed had applied (1:43 under load) and moved the steering lever once VPP was ready (22 s). The daemon can now do both itself. A route-ledger seed goes into the live FIB longest prefix first, the neighbour resolver keeps serving while the seed applies, and the daemon runs at bgpd's priority. A 0.6.3 config and route ledger carry over unchanged. Both new behaviours are opt-in.
+A point release on 0.6.3 for the minutes between a gateway's start and the fast path forwarding on a whole table, then VPP steering. Switching `dry-run` off once the seed has applied, and steering once VPP is ready, no longer need an operator: the daemon can now do both itself. A route-ledger seed goes into the live FIB longest prefix first, the neighbour resolver keeps serving while the seed applies, and the daemon runs at bgpd's priority. A 0.6.3 config and route ledger carry over unchanged. Both new behaviours are opt-in.
 
 ### Upgrading from 0.6.3
 
@@ -141,10 +137,10 @@ The start seeds from the ledger 0.6.3 wrote at the stop. Neither ledger format c
 
 ### Highlights
 
-- **The fast path lets go of `dry-run` by itself.** `dry-run until-seeded` releases when a whole, attested route-ledger seed has applied (`seed-whole`), or else when the completeness authority attests the mirror (`authority-attested`). The route source's End-of-RIB is not enough. On the lab, a cold start's first End-of-RIB came with the mirror 17% short of FRR, because FRR was still loading its upstream. It does not release while a failed route install is unrepaired. On the lab it released 3.8 s into a seeded start and 18 s into a cold one.
+- **The fast path lets go of `dry-run` by itself.** `dry-run until-seeded` releases when a whole, attested route-ledger seed has applied (`seed-whole`), or else when the completeness authority attests the mirror (`authority-attested`). The route source's End-of-RIB is not enough. A cold start's first End-of-RIB can come before FRR has loaded its upstreams, with the mirror short of FRR's table. It does not release while a failed route install is unrepaired.
 - **A seed is correct by longest match while it applies.** The ledger is applied longest prefix first, so a covering route never carries traffic meant for a more-specific route not yet in.
 - **The steer needs no operator at start.** `steer-at-start on` steers at the first convergence whose gates pass, from a fresh or an adopted VPP. A dark member in use still refuses it, and the row says so (Degraded) rather than waiting.
-- **The resolver serves through a seed.** The routes the resolver makes itself (`local-prefix` hosts, the `fallback-default`, a link's PeerDown) queue for the programmer in order, instead of holding the resolver behind the seed. On the reference deployment the transit next hop behind 1.1M routes went unserved for the seed's 73 s. On the lab, 0.6.3's resolver waited out the whole 1.6 s seed; 0.6.4's finished at once.
+- **The resolver serves through a seed.** The routes the resolver makes itself (`local-prefix` hosts, the `fallback-default`, a link's PeerDown) queue for the programmer in order, instead of holding the resolver behind the seed. Until now a transit next hop could go unserved for the whole seed.
 - **The daemon runs at bgpd's priority,** `Nice=-15`, and VPP inherits it. On a gateway booting into full traffic, nice 0 left the seed, the FRR feed and VPP's loader at a fraction of their idle rate.
 - **IRQs stay off VPP's cores.** A port re-opened by a speed change or a udapi reconfig gets its queue IRQs back on VPP's cores. They are now moved off again within 2 s, every time, not only at attach.
 
@@ -154,7 +150,7 @@ The start seeds from the ledger 0.6.3 wrote at the stop. Neither ledger format c
 
 - A route-ledger seed goes into the live FIB longest prefix first (IPv4, then IPv6), whatever order the record holds, so a partial seed is correct by longest match at every instant: a covering route never forwards traffic meant for a more-specific route not yet in. The record format is unchanged. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/packetframe-fib.md#what-the-next-start-does-with-it), [#396](https://github.com/unredacted/packetframe/pull/396))
 - `dry-run until-seeded` holds like `dry-run on` until the route mirror is whole (a whole, attested route-ledger seed applied; otherwise the completeness authority attesting the mirror, or with no authority the route source's first End-of-RIB), then forwards like `off` by itself and records `dry_run_released`. A reload never holds again; `on`/`off` win as before. The `dry-run` row says whether it holds, and for what, or when it let go. It holds while a failed route install is unrepaired. Needs `forwarding-mode packetframe-fib` and a `route-source`, and with BMP a completeness authority. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.4/docs/runbooks/packetframe-fib.md#dry-run-until-seeded), [#398](https://github.com/unredacted/packetframe/pull/398))
-- The neighbour resolver keeps serving while a route-ledger seed applies. The routes it makes itself (`local-prefix` host routes, the `fallback-default`, a link's PeerDown) wait for the programmer in an applier of their own, in order, instead of holding the resolver behind the whole seed: on the reference deployment after an upgrade, the transit next hop behind 1.1M routes went unserved for the seed's 73 s. Queued neighbour events are also applied between seed chunks, not one per chunk. ([#393](https://github.com/unredacted/packetframe/pull/393))
+- The neighbour resolver keeps serving while a route-ledger seed applies. The routes it makes itself (`local-prefix` host routes, the `fallback-default`, a link's PeerDown) wait for the programmer in an applier of their own, in order, instead of holding the resolver behind the whole seed, which could leave a transit next hop unserved for the whole seed. Queued neighbour events are also applied between seed chunks, not one per chunk. ([#393](https://github.com/unredacted/packetframe/pull/393))
 
 **vpp-offload**
 
@@ -170,8 +166,7 @@ The start seeds from the ledger 0.6.3 wrote at the stop. Neither ledger format c
 
 - `dry-run until-seeded` holds for as long as the completeness authority does not attest. An authority that never publishes (FRR unreachable, `vtysh` failing) keeps it holding: safe, because the kernel forwards, but nothing moves to the fast path. The `fib-integrity` row says why. `dry-run off` and a reload end the hold.
 - With BMP and no completeness authority there is no `until-seeded`: BMP has no End-of-RIB, and the quiet period that stands in for one can fall mid-dump.
-- `steer-at-start` has not steered on the lab: its members are dark, so it reached only the refusal. The supervisor's tests cover the steer.
-- The lab could not reproduce the resolver's 73 s stall on the reference deployment: its only next hop is always in the neighbour cache, and its seed takes 1.6 s. It showed that the resolver no longer waits for the seed.
+- `steer-at-start` is not yet verified steering a gateway with live members; the supervisor's tests cover the steer.
 - The control-plane thread placement is still computed at attach only. A udapi re-spread while VPP runs can move IRQs onto those CPUs.
 - The limitations listed for 0.6.3 otherwise still apply.
 
@@ -193,7 +188,7 @@ Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the
 
 ## [0.6.3] - 2026-11-12
 
-A point release on 0.6.2 for the first load of a fresh VPP: the step between a gateway's start and VPP steering. On a gateway that boots into full traffic, that load took 3.5 min on 2026-11-05, against about 35 s idle, and VPP died during it on both post-upgrade boots. VPP now has its cores to itself while it loads, stops its workers less often, and every load's length is recorded. A 0.6.2 config and route ledger carry over unchanged.
+A point release on 0.6.2 for the first load of a fresh VPP: the step between a gateway's start and VPP steering. On a gateway that boots into full traffic, that load can take minutes rather than the seconds it takes idle, and VPP could die during it. VPP now has its cores to itself while it loads, stops its workers less often, and every load's length is recorded. A 0.6.2 config and route ledger carry over unchanged.
 
 ### Upgrading from 0.6.2
 
@@ -210,8 +205,8 @@ The start seeds from the ledger 0.6.2 wrote at the stop. Neither ledger format c
 
 ### Highlights
 
-- **VPP has its cores to itself while it loads.** A fresh VPP's load runs on its main thread at 100%, and slows in step with the main core it loses; UniFi's daemons run on any core, `ubios-udapi-server` at VPP's own priority. From VPP's spawn until it leaves Syncing, every other top-level cgroup is kept off VPP's main and worker cores, and threads that pinned themselves get their affinity back afterwards. On a lab EFG, six nice -20 busy loops on VPP's main core stretched a 170,291-route load from 5.5 s to 22 s; fenced, it took 5.5 s. [The core fence](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#the-core-fence-during-a-fresh-load)
-- **Fewer worker barriers during a load.** VPP aborts when a worker misses a barrier for 1 s (`worker thread deadlock`), and the lab reproduced that abort mid-load from `load_balance_create` with a 3 s stall on a worker core. Preallocated pools take away the barriers pool growth caused, and the largest holds: from 196 to 167 per million routes, longest 16.7 ms to 6.9 ms. Moving every NIC's interrupts off VPP's cores takes away a source of such stalls: on the lab, `eth0`'s queue IRQs were on VPP's main core and both workers. [IRQ affinity before attach](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#irq-affinity-before-attach)
+- **VPP has its cores to itself while it loads.** A fresh VPP's load runs on its main thread at 100%, and slows in step with the main core it loses; UniFi's daemons run on any core, `ubios-udapi-server` at VPP's own priority. From VPP's spawn until it leaves Syncing, every other top-level cgroup is kept off VPP's main and worker cores, and threads that pinned themselves get their affinity back afterwards. [The core fence](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#the-core-fence-during-a-fresh-load)
+- **Fewer worker barriers during a load.** VPP aborts when a worker misses a barrier for 1 s (`worker thread deadlock`), which a stall on a worker core can cause mid-load. Preallocated pools take away the barriers pool growth caused and shorten the longest holds, and moving every NIC's interrupts off VPP's cores takes away a source of such stalls. [IRQ affinity before attach](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#irq-affinity-before-attach)
 - **Every fresh load is timed.** `fresh_hold_released` carries `load_ms`, and the hwtest bundle carries `vpp_bulk_load_bench`, which times a bulk load into a scratch VPP and counts its barriers by caller.
 
 ### Changes
@@ -220,15 +215,15 @@ The start seeds from the ledger 0.6.2 wrote at the stop. Neither ledger format c
 
 - A fresh VPP stops its workers less often while it loads: `startup.conf` preallocates the FIB's load-balance and fib-entry pools for the routes `expected-routes` budgets (`l3fib`), and attach moves every NIC's queue IRQs off VPP's cores, not only the member ports'. A worker that misses VPP's barrier for 1 s aborts it, which is how a fresh load died after a reboot. ([#387](https://github.com/unredacted/packetframe/pull/387))
 - `fresh_hold_released` carries `load_ms`, how long a fresh VPP took to take the whole table. The hwtest bundle carries `vpp_bulk_load_bench`, which times a bulk load into a scratch VPP and counts its barriers by caller. ([#388](https://github.com/unredacted/packetframe/pull/388))
-- While a fresh VPP loads its table, every top-level cgroup except the daemon's own (`system.slice` under the packaged unit) is kept off VPP's main and worker cores, and self-pinned threads get their affinity back afterwards (`cores_fenced` / `cores_released`). On the lab, six nice -20 hogs on VPP's main core slowed a 170k-route load from 5.5 s to 22 s; fenced, it took 5.5 s. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#the-core-fence-during-a-fresh-load), [#390](https://github.com/unredacted/packetframe/pull/390))
+- While a fresh VPP loads its table, every top-level cgroup except the daemon's own (`system.slice` under the packaged unit) is kept off VPP's main and worker cores, and self-pinned threads get their affinity back afterwards (`cores_fenced` / `cores_released`). ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.3/docs/runbooks/vpp-offload.md#the-core-fence-during-a-fresh-load), [#390](https://github.com/unredacted/packetframe/pull/390))
 
 ### Known limitations
 
 - Barriers remain during a load: about 146 per million routes come from VPP growing its per-route counters, which no startup option presizes. A worker stalled for 1 s across one of them still aborts VPP. A `worker thread deadlock` in `<state-dir>/vpp-diag/` says it happened.
 - The fence leaves the daemon's own top-level cgroup alone (`system.slice` under the packaged unit): fencing inside it would unpin VPP's threads on kernel 5.15. On a UniFi gateway it holds only small services.
 - A thread that pins itself while the fence is held keeps the full CPU set afterwards; only pins taken before the fence are restored.
-- VPP's octeon driver can fail a start under load: a port-creation SIGSEGV and a `device init failed [rv -35]` were each seen on the lab, in about 1 of 40 and 1 of 60 starts. The supervisor restarts VPP within seconds.
-- A first load still runs at the main thread's pace, about 33,000 routes a second on the lab's cores: about 35 s for a full table once nothing else takes its core.
+- VPP's octeon driver can fail a start under load: a port-creation SIGSEGV and a `device init failed [rv -35]` occur occasionally. The supervisor restarts VPP within seconds.
+- A first load still runs at the main thread's pace, tens of seconds for a full table once nothing else takes its core.
 - The limitations listed for 0.6.2 otherwise still apply.
 
 ### Install and verify
@@ -249,7 +244,7 @@ Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the
 
 ## [0.6.2] - 2026-11-12
 
-A point release on 0.6.1. After a reboot, a next hop that resolves late no longer leaves its routes out of VPP until the route source happens to re-send each one: on 2026-11-05 that held the reference gateway's first steer for over twenty minutes, with 486,318 routes through one transit judged unresolvable. A VPP that dies now leaves its output, the signal and a core behind, and a next hop slow to resolve is recorded in the event log with the likeliest cause. A 0.6.1 config and route ledger carry over unchanged.
+A point release on 0.6.1. After a reboot, a next hop that resolves late no longer leaves its routes out of VPP until the route source happens to re-send each one, which could hold a gateway's first steer for many minutes. A VPP that dies now leaves its output, the signal and a core behind, and a next hop slow to resolve is recorded in the event log with the likeliest cause. A 0.6.1 config and route ledger carry over unchanged.
 
 ### Upgrading from 0.6.1
 
@@ -261,12 +256,12 @@ The start seeds from the ledger 0.6.1 wrote at the stop. Neither ledger format c
 
 - **VPP's diagnostics directory.** A VPP the daemon starts writes its stdout and stderr to `<state-dir>/vpp-diag/` and runs there, with `runtime-dir` and `coredump-size unlimited` added to its `unix` stanza. This happens only if every directory from `/` down is root's and closed to others; otherwise a journal warning says why and VPP starts as before. Either way the stanza no longer sets `full-coredump`. Its stats socket moves there too. A VPP kept by `--keep-vpp` gets this at its next start; then `/proc/$(pidof vpp)/coredump_filter` reads `00000013`, and `/proc/sys/kernel/core_pattern` says where a core goes. [VPP died of a signal](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core)
 - **New events:** `vpp_killed` (vpp-offload), and `nexthop_resolve_slow` and `nexthop_resolved_late` (fast-path). [The event log](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/event-log.md)
-- **Debian 13 gateways.** EFG firmware 6.0.17 moves the gateway to Debian 13, where the Debian 11 VPP build cannot install. vpp-unifi's `vpp-v26.06-octeon9-trixie-arm64` is the same VPP commit PacketFrame binds to (`c3200b88`), with identical API CRCs, and a lab EFG on 6.0.17 ran this release's code with vpp-offload on it: ready, verified, nothing unresolvable. Install that build there instead.
+- **Debian 13 gateways.** EFG firmware 6.0.17 moves the gateway to Debian 13, where the Debian 11 VPP build cannot install. vpp-unifi's `vpp-v26.06-octeon9-trixie-arm64` is the same VPP commit PacketFrame binds to (`c3200b88`), with identical API CRCs. Install that build there instead.
 
 ### Highlights
 
 - **A late neighbour no longer holds the steer.** When a neighbour resolves after the drain has judged its routes unresolvable, those routes are queued for VPP again at once, on a plain port as on a bridge. Until now only a bridge neighbour did that; on a plain port, such as a transit's, the routes waited for the route source to change each one. A route VPP already holds through the same paths is not re-sent. [Unresolvable routes](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/vpp-offload.md#packetframe_vpp_routesstateunresolvable--0)
-- **A VPP crash leaves evidence.** A fresh VPP died of SIGABRT under boot load on 2026-10-30 and again on 2026-11-05, and nothing said why: its output went to `/dev/null`, its backtrace to a RAM journal, and no core could be written. Now its output and backtrace are kept, a core can be written without the hugepage heap, and `vpp_killed` names the fault VPP's own handler caught. [VPP died of a signal](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core)
+- **A VPP crash leaves evidence.** When a fresh VPP died under boot load, nothing said why: its output went to `/dev/null`, its backtrace to a RAM journal, and no core could be written. Now its output and backtrace are kept, a core can be written without the hugepage heap, and `vpp_killed` names the fault VPP's own handler caught. [VPP died of a signal](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/vpp-offload.md#vpp-died-of-a-signal-its-output-and-its-core)
 - **Slow next hops explained.** A next hop still unresolved 30 s after it was registered or lost is recorded, with what each resolve request did, what the kernel answered, the egress link's state and carrier changes, and a `reading` naming the likeliest cause, such as `unanswered`, `probes-skipped` or `link-flapped`. It is recorded again when it resolves. [Slow next hops](https://github.com/unredacted/packetframe/blob/v0.6.2/docs/runbooks/packetframe-fib.md#slow-next-hops-in-the-event-log)
 
 ### Changes
@@ -291,7 +286,7 @@ The start seeds from the ledger 0.6.1 wrote at the stop. Neither ledger format c
 - A neighbour that resolves late still costs a pass over every route through it: each is sent to VPP again, one at a time, so a late transit delays the first steer by however long a table's worth of updates takes under the load at the time.
 - After VPP's package is removed or reinstalled (a firmware upgrade does this), its removal script hands the port's VF back to the kernel, and adopting the running VPP is refused ("recorded port does not match reality") until `packetframe detach --all`, which costs the route ledger.
 - `detach --keep-vpp` refuses when the config newly adds vpp-offload; use `detach --all` for that change, and the next start loads cold.
-- After days of uptime the kernel can fail to grant VPP's hugepages: a lab gateway granted none of 4 × 512 MiB after 8 days. Dropping the page cache and compacting memory (`sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory`) before the start let all four be granted.
+- After days of uptime the kernel can fail to grant any of VPP's hugepages. Dropping the page cache and compacting memory (`sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory`) before the start may let them be granted; check the allocation before starting VPP.
 - A gateway firmware upgrade can still remove hand-installed packages: reinstall packetframe, and VPP, after one.
 - The limitations listed for 0.6.1 otherwise still apply.
 
@@ -330,7 +325,7 @@ The start seeds from the ledger 0.6.0 wrote at the stop, so the upgrade does not
 ### Highlights
 
 - **A table that survives FRR relearning it.** After a reboot or a bgpd restart (every UniFi BGP configuration upload is one), FRR can send End-of-RIB while its transits are still loading: at `select-defer-time` in restart mode, within a second of the session in helper mode. Its GC used to remove most of a mirror that was right, from VPP too. With the FRR authority it now waits for the transits, then removes only what FRR no longer has. [The held GC](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/packetframe-fib.md#the-gc-over-earlier-routes-waits-for-frrs-upstreams)
-- **A fresh VPP steers on a whole seed.** After the 2026-10-30 reboot of the reference deployment, VPP's first steer came 32.5 minutes after the reboot, waiting for both transits' End-of-RIB with the whole table already in the mirror. Over a whole, attested route-ledger seed it now verifies and steers while the authority's only objection is upstreams still loading. [A fresh VPP and a seeded mirror](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/vpp-offload.md#a-fresh-vpp-and-a-seeded-mirror)
+- **A fresh VPP steers on a whole seed.** After a reboot, VPP's first steer waited for every transit's End-of-RIB even with the whole table already in the mirror. Over a whole, attested route-ledger seed it now verifies and steers while the authority's only objection is upstreams still loading. [A fresh VPP and a seeded mirror](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/vpp-offload.md#a-fresh-vpp-and-a-seeded-mirror)
 - **Seeded restarts without VPP.** The routine restart keeps the route ledger and the wan-egress rules on a `packetframe-fib` box without vpp-offload, which until now loaded its table cold after every restart. [Restarts and detach](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/packetframe-fib.md#turning-it-off-and-detach)
 
 ### Changes
@@ -349,7 +344,7 @@ The start seeds from the ledger 0.6.0 wrote at the stop, so the upgrade does not
 **CLI and operations**
 
 - `packetframe detach --keep-vpp` works without vpp-offload when no VPP is on record, so a restart on such a box keeps the route ledger and the wan-egress rules instead of loading cold. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.1/docs/runbooks/packetframe-fib.md#turning-it-off-and-detach), [#378](https://github.com/unredacted/packetframe/pull/378))
-- Development only: three tests in the hardware test bundle no longer misbehave on a router. One ran the live detach path against a real `eth5`, one leaked pinned FIB maps on every run, and one miscounted polls under load. ([#377](https://github.com/unredacted/packetframe/pull/377))
+- Development only: three tests in the hardware test bundle no longer misbehave on a router. One ran the live detach path against a real interface, one leaked pinned FIB maps on every run, and one miscounted polls under load. ([#377](https://github.com/unredacted/packetframe/pull/377))
 - Built with Rust 1.99.1. ([#372](https://github.com/unredacted/packetframe/pull/372))
 
 ### Known limitations
@@ -377,7 +372,7 @@ Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the
 
 ## [0.6.0] - 2026-10-13
 
-The first release since 0.5.0 (2026-09-28). It adds the flow-export module (experimental) and fast-path's `wan-egress`, brings a restart on a full table down from minutes to seconds, and hardens vpp-offload, neigh-snoop and the BGP feed against the failures found in production on 2026-10-07 and 2026-10-12. A 0.5.0 config parses unchanged, but read **Upgrading from 0.5.0** first: a mode and three counters were renamed, an `attach` of keepalived's dedicated VRRP link is refused, and the state files' ownership rules are stricter.
+The first release since 0.5.0 (2026-09-28). It adds the flow-export module (experimental) and fast-path's `wan-egress`, brings a restart on a full table down from minutes to seconds, and hardens vpp-offload, neigh-snoop and the BGP feed against failures seen under production load. A 0.5.0 config parses unchanged, but read **Upgrading from 0.5.0** first: a mode and three counters were renamed, an `attach` of keepalived's dedicated VRRP link is refused, and the state files' ownership rules are stricter.
 
 ### Upgrading from 0.5.0
 
@@ -385,7 +380,7 @@ The first release since 0.5.0 (2026-09-28). It adds the flow-export module (expe
 2. `systemctl daemon-reload`
 3. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with **0.6.0**'s `detach` (plain `packetframe detach` without vpp-offload). It removes fast-path's pins, whose maps changed, so no `detach --all` is needed, and VPP stays up and steered throughout.
 
-The first start after 0.5.0 loads the route mirror from the route source, because 0.5.0 writes no route ledger: about 2.5 minutes for 1.35M routes on the reference deployment, with steering up throughout. Every later restart seeds the mirror from the ledger.
+The first start after 0.5.0 loads the route mirror from the route source, because 0.5.0 writes no route ledger: a few minutes on a full table, with steering up throughout. Every later restart seeds the mirror from the ledger.
 
 - **Renamed mode and counters.** `forwarding-mode custom-fib` is now `packetframe-fib`; the old name still parses, with a deprecation warning. `custom_fib_hit`, `custom_fib_miss` and `custom_fib_no_neigh` are now `fib_hit`, `fib_miss` and `fib_no_neigh` (`packetframe_fib_hit_total` and so on), and the mode label reads `mode="packetframe-fib"`. Counter indices are unchanged; update any alert or dashboard that matches the old names.
 - **Stricter state files.** vpp-offload's state file and preserved route ledger, and fast-path's and guard's tc filter records, are refused unless they and `state-dir` are root-owned, closed to group and others, and reached through no symlink. The packaged default passes, and so does any `state-dir` where `packetframe reconfigure` works today. [The check and the fix](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/vpp-offload.md#attach-or-detach-refuses-refusing-vpp-offloadjson-)
@@ -396,10 +391,10 @@ The first start after 0.5.0 loads the route mirror from the route source, becaus
 ### Highlights
 
 - **Flow export (experimental).** The new `flow-export` module sends sampled packets as sFlow v5, or flow records as IPFIX with privacy profiles and origin AS numbers, to collectors such as Akvorado and FastNetMon. Samples come from the XDP and tc programs, from VPP's sampler plugin on steered ports, and from a kernel tc sampler on interfaces neither sees. Off until configured. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/flow-export.md)
-- **Restarts in seconds.** A clean stop saves the route mirror and the next start seeds it before the route source connects; an adopted VPP then diffs against it once the completeness authority attests it, rather than after the BGP replay. Measured on the reference deployment (1.35M routes, four steered ports): 50 s from start to VPP verified and steering re-asserted, with no BGP session reset. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/vpp-offload.md#the-steered-diff-and-a-seeded-mirror)
-- **Exempt traffic spread over RSS.** vpp-offload's keep rules sent every exempt frame to queue 0, and on 2026-10-07 that held one core at 99% softirq while the others idled. Keeps are now RSS rules, with a `kernel-path` status row per steered port. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/vpp-offload.md#rss-keeps-and-the-queue-0-fallback)
+- **Restarts in seconds.** A clean stop saves the route mirror and the next start seeds it before the route source connects; an adopted VPP then diffs against it once the completeness authority attests it, rather than after the BGP replay. FRR's upstream BGP sessions are not reset. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/vpp-offload.md#the-steered-diff-and-a-seeded-mirror)
+- **Exempt traffic spread over RSS.** vpp-offload's keep rules sent every exempt frame to queue 0, which could hold one core at full softirq while the others idled. Keeps are now RSS rules, with a `kernel-path` status row per steered port. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/vpp-offload.md#rss-keeps-and-the-queue-0-fallback)
 - **`wan-egress`** sends private sources past a full-table `main` to the platform's own WAN policy and NAT. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/packetframe-fib.md#wan-egress)
-- **A route feed that rides out an FRR reload.** On 2026-10-12 a BGP config upload restarted FRR on a saturated gateway and the feed failed three ways. The listener now keeps the session alive from a thread of its own, ends it at the peer's close, and sweeps stale routes at End-of-RIB rather than after a pause. The longest control-plane hold after a 1M-route sweep fell from 1.06 s to 68 ms on the reference gateway. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/packetframe-fib.md#symptom-the-feed-session-drops-during-a-full-table-load)
+- **A route feed that rides out an FRR reload.** A BGP config upload that restarts FRR on a saturated gateway could break the feed three ways. The listener now keeps the session alive from a thread of its own, ends it at the peer's close, and sweeps stale routes at End-of-RIB rather than after a pause. A sweep of a full table no longer holds the control plane for a second. [Runbook](https://github.com/unredacted/packetframe/blob/v0.6.0/docs/runbooks/packetframe-fib.md#symptom-the-feed-session-drops-during-a-full-table-load)
 - **Recovering in place.** Lost netlink notifications are re-read instead of missed, the neighbour resolver is supervised and restarted, and vpp-offload follows the router's own addresses while it runs.
 
 ### Changes
@@ -444,7 +439,7 @@ The first start after 0.5.0 loads the route mirror from the route source, becaus
 
 **CLI and operations**
 
-- `packetframe sampler status|watch|configure|clear`: lab tooling for the VPP sampler plugin. ([#312](https://github.com/unredacted/packetframe/pull/312))
+- `packetframe sampler status|watch|configure|clear`: development tooling for the VPP sampler plugin. ([#312](https://github.com/unredacted/packetframe/pull/312))
 - `Module::breaker_tripping()`, an additive trait method with a no-op default, called before a circuit-breaker `detach`. ([#306](https://github.com/unredacted/packetframe/pull/306))
 - Development only, off in release builds: the `packetframe-flow-encode` crate and `packetframe flow-synth` behind the `dev-tools` feature. ([#308](https://github.com/unredacted/packetframe/pull/308))
 - Built with Rust 1.99.0. ([#314](https://github.com/unredacted/packetframe/pull/314))
@@ -502,9 +497,9 @@ The first release since 0.2.7 (2026-05-20). It adds three modules (vpp-offload, 
 
 ### Highlights
 
-- **VPP offload, in production.** vpp-offload steers IPv4 and IPv6, in both directions, into a VPP instance on NIC virtual functions, with the eBPF fast-path as the failover tier. On the reference deployment (four steered ports, full IPv4 and IPv6 tables), softirq is about 74% of CPU with no bypass and 31–62% with the eBPF fast-path alone. Steering IPv4 into VPP took it to 11–19%, and moving IPv6 in alongside it took it to about 1%. Every figure from the fast-path-only one on is an off-peak reading. [Runbook](https://github.com/unredacted/packetframe/blob/v0.5.0/docs/runbooks/vpp-offload.md) · [Measurements](https://github.com/unredacted/packetframe/blob/main/docs/runbooks/vpp-offload.md#numbers-measured-vs-published-on-faith)
-- **Restarts that stay steered.** `packetframe detach --keep-vpp` leaves VPP forwarding, and the next daemon adopts it from the route ledger the clean stop preserved. Measured on the reference deployment: no unsteered window, and VPP is never restarted. [Runbook](https://github.com/unredacted/packetframe/blob/v0.5.0/docs/runbooks/vpp-offload.md#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)
-- **neigh-snoop** learns neighbours on IX-facing bridges passively and feeds FRR's next-hop gate. In production on the reference deployment. [Runbook](https://github.com/unredacted/packetframe/blob/v0.5.0/docs/runbooks/neigh-snoop.md)
+- **VPP offload.** vpp-offload steers IPv4 and IPv6, in both directions, into a VPP instance on NIC virtual functions, with the eBPF fast-path as the failover tier, and takes the forwarding softirq load off the kernel. [Runbook](https://github.com/unredacted/packetframe/blob/v0.5.0/docs/runbooks/vpp-offload.md) · [Measurements](https://github.com/unredacted/packetframe/blob/main/docs/runbooks/vpp-offload.md#numbers-measured-vs-published-on-faith)
+- **Restarts that stay steered.** `packetframe detach --keep-vpp` leaves VPP forwarding, and the next daemon adopts it from the route ledger the clean stop preserved. There is no unsteered window, and VPP is never restarted. [Runbook](https://github.com/unredacted/packetframe/blob/v0.5.0/docs/runbooks/vpp-offload.md#what-a-keep-vpp-restart-costs-now-the-preserved-route-ledger)
+- **neigh-snoop** learns neighbours on IX-facing bridges passively and feeds FRR's next-hop gate. [Runbook](https://github.com/unredacted/packetframe/blob/v0.5.0/docs/runbooks/neigh-snoop.md)
 - **Event log.** `packetframe events` shows steering, verify, restarts and health transitions from a persistent log, with or without the daemon running. [Runbook](https://github.com/unredacted/packetframe/blob/v0.5.0/docs/runbooks/event-log.md)
 
 ### Changes
@@ -519,7 +514,7 @@ The first release since 0.2.7 (2026-05-20). It adds three modules (vpp-offload, 
 - IPv6: `v6 on` loads the IPv6 table into VPP. `v6-divert <vlans>|untagged` on a `port` line diverts TCP and UDP over IPv6 addressed to the router's MAC. `steer-keep6` keeps services that accept new sessions on the kernel path; DNS (destination port 53) and BGP (TCP 179, both directions) are built-in keeps. ([#278](https://github.com/unredacted/packetframe/pull/278), [#279](https://github.com/unredacted/packetframe/pull/279), [#280](https://github.com/unredacted/packetframe/pull/280))
 - Router-owned IPv6 that `v6-divert` sends to VPP returns to the kernel over a hand-back veth, guarded by a stateless ACL in VPP that admits only replies. ([#283](https://github.com/unredacted/packetframe/pull/283))
 - `loopback-address6` gives VPP a global source for its ICMPv6 errors; `drift-accept6` acknowledges an IPv6 drift finding. ([#285](https://github.com/unredacted/packetframe/pull/285), [#288](https://github.com/unredacted/packetframe/pull/288))
-- `packetframe detach --keep-vpp` restarts the daemon while VPP forwards. Without a usable route ledger the next start reads VPP's FIB instead, on the eBPF tier meanwhile (about 3 minutes at 1.1M routes); the `adoption_path` event says which path ran. ([#253](https://github.com/unredacted/packetframe/pull/253), [#277](https://github.com/unredacted/packetframe/pull/277))
+- `packetframe detach --keep-vpp` restarts the daemon while VPP forwards. Without a usable route ledger the next start reads VPP's FIB instead, on the eBPF tier meanwhile (a few minutes on a full table); the `adoption_path` event says which path ran. ([#253](https://github.com/unredacted/packetframe/pull/253), [#277](https://github.com/unredacted/packetframe/pull/277))
 - Per-port health rows in `packetframe status`, gauges in the metrics textfile, and remedies that name commands the module accepts. ([#114](https://github.com/unredacted/packetframe/pull/114), [#129](https://github.com/unredacted/packetframe/pull/129))
 
 **neigh-snoop** (new)
@@ -542,7 +537,7 @@ The first release since 0.2.7 (2026-05-20). It adds three modules (vpp-offload, 
 - `fib-cache on`: a destination cache in front of custom-FIB lookups. Default off. ([#79](https://github.com/unredacted/packetframe/pull/79))
 - `coalesce …`: NIC interrupt coalescing at attach, restored by `detach`. Restart-only. ([#269](https://github.com/unredacted/packetframe/pull/269))
 - `local-prefix6`: the connected fast path for IPv6, with NDP kept off it. ([#72](https://github.com/unredacted/packetframe/pull/72))
-- `attach <iface> tc`: a tc-ingress datapath (custom-fib only). It measured about 70% more CPU per packet than generic XDP on the reference hardware, so it is not recommended. ([#75](https://github.com/unredacted/packetframe/pull/75))
+- `attach <iface> tc`: a tc-ingress datapath (custom-fib only). It costs more CPU per packet than generic XDP, so it is not recommended. ([#75](https://github.com/unredacted/packetframe/pull/75))
 - New counters: the softnet `time_squeeze` export, and `err_parse_tc` split by bounds check. ([#184](https://github.com/unredacted/packetframe/pull/184), [#138](https://github.com/unredacted/packetframe/pull/138))
 
 **probe** (`packetframe feasibility`)
@@ -569,12 +564,12 @@ The first release since 0.2.7 (2026-05-20). It adds three modules (vpp-offload, 
 
 ### Known limitations
 
-- A fast-path restart still bounces the link on drivers where XDP attach and detach reset the port (a few lost pings over about two minutes on the reference hardware), because fast-path does not adopt pins across a restart.
+- A fast-path restart still bounces the link on drivers where XDP attach and detach reset the port (a few lost pings), because fast-path does not adopt pins across a restart.
 - IPv6 is steered by frame, not address: only TCP/UDP arriving on a VLAN listed in `v6-divert` is offloaded, so list every upstream VLAN. The allowlist does not scope what is diverted, and diverted IPv6 bypasses the kernel's forward-path netfilter. ([runbook](https://github.com/unredacted/packetframe/blob/v0.5.0/docs/runbooks/vpp-offload.md#v6-divert-steering))
 - VPP's own glean output (the ARP requests and neighbour solicitations it sends) bypasses guard, which polices kernel tc egress.
 - Native XDP is refused on rvu-nicpf interfaces on kernels without upstream commit 04f647c8e456 (Linux 6.8), including the reference vendor kernel, where native attach panics. Use `generic` or `auto`.
 - The .deb runs no maintainer scripts: run `systemctl daemon-reload` after every install.
-- MCAM steering rules survived one vendor provisioning push on a lab box on one firmware release. Survival across firmware releases is untested. Nothing re-asserts stripped rules automatically; the 30 s readback reports them as `steering DEGRADED`.
+- MCAM steering rules have survived one vendor provisioning push on one firmware release. Survival across firmware releases is untested. Nothing re-asserts stripped rules automatically; the 30 s readback reports them as `steering DEGRADED`.
 
 ### Install and verify
 
