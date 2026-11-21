@@ -56,16 +56,17 @@ A point release on 0.6.4 for VPP v26.10, and for VPPs other than the vpp-unifi b
 
 **fast-path**
 
+- With BMP feeding a `packetframe-fib` FIB, only Loc-RIB frames are accepted whether or not `require-loc-rib` is set: a pre- or post-policy frame ends the session instead of installing a route the emitter's own routing daemon rejected. `compare` mode keeps the flag opt-in. A BMP config without the flag gets a new route-ledger identity, so its first start after the upgrade is cold. [#411](https://github.com/unredacted/packetframe/pull/411)
 - A route-feed connection that dispatched no route since the last `Resync` (a failed handshake, a session that sent nothing) no longer queues another walk over the whole mirror ahead of the next session's table. BGP and BMP alike. [#415](https://github.com/unredacted/packetframe/pull/415)
-
 - The route mirror is bounded by the FIB map's capacity: per family, a new prefix is refused once every slot is held, and advertisements are bounded per prefix and in aggregate. At the limit, installed routes keep forwarding and refreshes and withdrawals still apply; readiness is withheld and a full feed replay is requested after 60 s. A withdrawal whose map delete failed keeps its slot and fails every GC until a retried delete lands, where a retry used to report it done while the route stayed installed. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/packetframe-fib.md#route-capacity), [#417](https://github.com/unredacted/packetframe/pull/417))
-
 - The XDP program routes a frame only on a VLAN the router has an L3 device for on its ingress port, as the kernel would; on a bridge with `vlan_filtering` on, only on what the bridge's VLAN tables admit and pass up. [#418](https://github.com/unredacted/packetframe/pull/418)
-
 - A route-source listener admits a connection from this host only if root owns it, or the account `peer-user <name|uid>` names (by default `frr` and `bird`, where they exist), so no other local process can feed the route mirror. Existing configs keep working; the start needs the kernel's TCP socket diagnostics (`CONFIG_INET_DIAG`), which UniFi gateways have. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/packetframe-fib.md#who-may-connect-to-the-route-source-listener), [#419](https://github.com/unredacted/packetframe/pull/419))
 
 **neigh-snoop**
 
+- A saved neighbour cache is restored only if root could have written it, by the route ledger's rule: the file and its directory owned by the daemon's user and closed to group and others, every ancestor root-owned and closed or sticky, no symlinks, at most 256 MiB. A rejected cache is logged and the bridge learns from scratch. A `persist-dir` under a world-writable directory, such as `/data` on UniFi, is rejected at every start; the default `/var/lib/packetframe/state/neigh-cache` passes. [#412](https://github.com/unredacted/packetframe/pull/412)
+- The paced installer's queue is bounded by the learned table's cap, one slot per destination. Overflow and cancelled work count as `queue_dropped`, and a job re-reads its evidence when it is handed to the kernel, so an evicted entry's old MAC is never installed. [#413](https://github.com/unredacted/packetframe/pull/413)
+- An observation whose MAC conflicts with a confirmed kernel neighbour is refused before it is learned, so it can no longer re-point a declared router's other addresses or ride into the next saved cache. A cache saved by an earlier release keeps an entry only where the kernel confirms its MAC. [#414](https://github.com/unredacted/packetframe/pull/414)
 - An install decided while the kernel held the address unresolved (INCOMPLETE, FAILED) is written without `NLM_F_REPLACE`, so it can no longer overwrite a MAC the kernel confirmed after the decision. Only a STALE entry with another MAC is replaced. [#416](https://github.com/unredacted/packetframe/pull/416)
 
 **vpp-offload**
