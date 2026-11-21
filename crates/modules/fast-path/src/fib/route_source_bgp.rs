@@ -84,7 +84,7 @@
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -104,6 +104,7 @@ use tracing::{debug, info, warn};
 
 use packetframe_common::fib::{IpPrefix, PeerId, RouteEvent, RouteSourceError};
 
+use crate::fib::local_peer::{LocalPeers, Peer};
 use crate::fib::programmer::FibProgrammerHandle;
 use crate::fib::route_source_bmp::SharedIntegritySnapshot;
 
@@ -247,6 +248,11 @@ pub struct BgpListenerConfig {
     /// checks are the only identity binding available in the
     /// absence of TCP-MD5 / TCP-AO.
     pub expected_peer_ip: Option<IpAddr>,
+    /// The accounts whose sockets on this host may connect, checked
+    /// after the source-IP gates. A loopback or AnyIP listen is
+    /// reachable by every local process, and the address checks cannot
+    /// tell them apart. See [`crate::fib::local_peer`].
+    pub local_peers: LocalPeers,
     /// Session-liveness handle, reported to the second tier. See
     /// [`packetframe_common::fib::FeedSession`] for why this travels
     /// out-of-band of the route events.
@@ -263,6 +269,7 @@ impl BgpListenerConfig {
             hold_time: DEFAULT_HOLD_TIME,
             peer_acl: Vec::new(),
             expected_peer_ip: None,
+            local_peers: LocalPeers::root_only(),
             session: None,
         }
     }
@@ -306,6 +313,9 @@ pub struct BgpListener {
     read_hold: ReadHold,
     /// The constants outside tests; see [`QuietWindows`].
     quiet: QuietWindows,
+    /// A route event has been dispatched since the last `Resync` was
+    /// queued, so the next one would change something; see `serve`.
+    resync_owed: AtomicBool,
 }
 
 /// What lets the listener hold the GC at End-of-RIB until FRR has
@@ -686,6 +696,7 @@ impl BgpListener {
             gc_hold: None,
             read_hold: ReadHold::default(),
             quiet: QuietWindows::default(),
+            resync_owed: AtomicBool::new(false),
         }
     }
 
@@ -737,14 +748,16 @@ impl BgpListener {
             peer_as = self.cfg.peer_as,
             peer_acl_entries = self.cfg.peer_acl.len(),
             peer_ip_pin = ?self.cfg.expected_peer_ip,
+            local_peer_uids = ?self.cfg.local_peers.uids(),
             auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
             "BGP listener started"
         );
         self.serve(listener).await
     }
 
-    /// Accept loop. One session at a time; on disconnect emit `Resync`
-    /// and re-accept.
+    /// Accept loop. One session at a time; on disconnect emit `Resync`,
+    /// if any route event was dispatched since the last one, and
+    /// re-accept.
     ///
     /// While a session runs, the peer's later connections wait in the
     /// kernel's accept queue, handshaken and with the peer's OPEN in
@@ -797,14 +810,30 @@ impl BgpListener {
             if let Some(hold) = &self.gc_hold {
                 hold.session_ended(crate::fib::route_ledger::now_unix());
             }
+            // Only when a route event has been dispatched since the last
+            // one. A Resync marks the route source's advertisements unseen,
+            // and only a route event (an UPDATE's Add or Del, End-of-RIB's
+            // GC) changes what is marked. After a failed handshake or a
+            // session that sent nothing, another would re-mark what is
+            // already marked, at the cost of a walk over the whole mirror
+            // that everything queued behind it waits out, the next
+            // session's table included: any local process able to reach
+            // the port could keep queueing them while no session was up
+            // (Codex Security finding occ_3b034ce6). A mirror seeded from
+            // the route ledger starts unseen, so nothing is owed before the
+            // first session.
+            //
             // Queued, not awaited. The programmer applies commands in
             // order, so the Resync lands ahead of everything the next
             // session sends whenever it is applied; waiting for it would
             // only hold the next handshake behind whatever the programmer
             // is still working through, such as a GC of a million routes,
             // while the peer's new connection waits unanswered.
-            if let Err(e) = self.prog_handle.queue_route_event(RouteEvent::Resync).await {
-                warn!(error = %e, "Resync dispatch failed");
+            if self.resync_owed.swap(false, Ordering::AcqRel) {
+                if let Err(e) = self.prog_handle.queue_route_event(RouteEvent::Resync).await {
+                    warn!(error = %e, "Resync dispatch failed");
+                    self.resync_owed.store(true, Ordering::Release);
+                }
             }
         }
     }
@@ -878,7 +907,8 @@ impl BgpListener {
         }
     }
 
-    /// The connection, if its source may speak BGP to us.
+    /// The connection, if its source may speak BGP to us: its address,
+    /// and, when it comes from this host, the account that owns it.
     fn admit(&self, (stream, addr): (TcpStream, SocketAddr)) -> Option<(TcpStream, SocketAddr)> {
         // Source-IP gating runs before any byte is read: an unauthorized
         // peer must not reach BGP framing because that's the surface the
@@ -898,6 +928,28 @@ impl BgpListener {
                     %addr,
                     %expected,
                     "BGP accept rejected: source IP does not match peer-ip pin"
+                );
+                return None;
+            }
+        }
+        // Then who owns the other end, when it is on this host: an
+        // address any local process may connect from says nothing about
+        // which one did (Codex Security occ_d9beffd5).
+        let local = match stream.local_addr() {
+            Ok(local) => local,
+            Err(e) => {
+                warn!(%addr, error = %e, "BGP accept rejected: no local address to judge it by");
+                return None;
+            }
+        };
+        match self.cfg.local_peers.check(local, addr) {
+            Ok(Peer::Local { uid }) => debug!(%addr, uid, "BGP connection from a local peer"),
+            Ok(Peer::Remote) => {}
+            Err(refusal) => {
+                warn!(
+                    %addr,
+                    allowed_uids = ?self.cfg.local_peers.uids(),
+                    "BGP accept rejected: {refusal}"
                 );
                 return None;
             }
@@ -1080,15 +1132,36 @@ impl BgpListener {
             }};
         }
         loop {
-            let frame = match or_end!(next_frame(
-                &mut frame_rx,
-                held.as_ref().map(|h| h.next_look)
-            )) {
+            // A local withdrawal can make room while the peer is idle. Poll
+            // only while incomplete so a newly armed deadline is observed.
+            let retry = self.prog_handle.replay_deadline().or_else(|| {
+                self.prog_handle
+                    .admission_incomplete()
+                    .then(|| tokio::time::Instant::now() + Duration::from_secs(60))
+            });
+            if self.prog_handle.take_replay_if_due() {
+                return Err(RouteSourceError::recoverable(
+                    "route admission needs a full replay",
+                ));
+            }
+            let wake = held
+                .as_ref()
+                .map(|h| h.next_look)
+                .into_iter()
+                .chain(retry)
+                .min();
+            let frame = match or_end!(next_frame(&mut frame_rx, wake)) {
                 Next::Frame(frame) => frame,
                 Next::HoldPoll => {
                     let Some(since) = held.as_ref().map(|h| h.since) else {
                         continue;
                     };
+                    if held
+                        .as_ref()
+                        .is_some_and(|h| h.next_look > tokio::time::Instant::now())
+                    {
+                        continue;
+                    }
                     match self.gc_hold_verdict(session_started, since).await {
                         GcHold::Hold { why, earlier } => {
                             if let Some(h) = held.as_mut() {
@@ -1255,6 +1328,10 @@ impl BgpListener {
             .field("held_secs", held_secs)
             .emit();
         }
+        // Owed before the dispatch: one that fails partway can have
+        // removed routes all the same.
+        self.resync_owed.store(true, Ordering::Release);
+        let recovering = self.prog_handle.admission_incomplete();
         let dispatched = self
             .prog_handle
             .apply_route_event(RouteEvent::InitiationComplete)
@@ -1266,6 +1343,11 @@ impl BgpListener {
             hold.gc_ran();
         }
         if let Err(e) = dispatched {
+            if matches!(e, super::programmer::ProgrammerError::ReplayRequired(_)) {
+                // The sweep completed. Keep accepting withdrawals while the
+                // feed is held; repeating this sweep cannot restore omitted keys.
+                return true;
+            }
             warn!(error = %e, "InitiationComplete dispatch failed");
             return false;
         }
@@ -1299,6 +1381,9 @@ impl BgpListener {
         // and `set_up` clears it a moment later (review finding, on the
         // BMP path). Do not move this above the raise.
         if let Some(sess) = &self.cfg.session {
+            if recovering {
+                sess.set_up(true);
+            }
             sess.mark_reconciled();
         }
         true
@@ -1363,7 +1448,37 @@ impl BgpListener {
                 .as_secs() as i64,
             Ordering::Relaxed,
         );
-        if *updates_seen == 1 {
+        if let Some(sess) = &self.cfg.session {
+            // Stream activity in ROUTE-ELEMENT units, changed
+            // or not: a reconnect reannounces an unchanged
+            // table, the mirror never moves, and the gate
+            // compares activity against route-scaled quiet
+            // rates — counting frames instead of the elements
+            // they fan out to let a batched million-route dump
+            // read as quiet (review finding). Floored at one
+            // unit so an empty UPDATE (End-of-RIB shape) still
+            // counts as stream evidence — one unit against
+            // route-scaled rates is noise.
+            sess.pulse_n((elems.len() as u64).max(1));
+        }
+        let mut carried = Families::default();
+        for elem in elems {
+            carried.insert(match elem.prefix.prefix {
+                ipnet::IpNet::V4(_) => Family::V4,
+                ipnet::IpNet::V6(_) => Family::V6,
+            });
+            let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
+                Some(e) => e,
+                None => continue,
+            };
+            self.resync_owed.store(true, Ordering::Release);
+            if let Err(e) = self.prog_handle.apply_route_event(event).await {
+                if !matches!(e, super::programmer::ProgrammerError::Admission(_)) {
+                    warn!(error = %e, "route event dispatch failed");
+                }
+            }
+        }
+        if *updates_seen == 1 && !self.prog_handle.admission_incomplete() {
             // The stream has started; see the handshake note
             // for why this — and not post-stream silence — is
             // where the session becomes live.
@@ -1397,33 +1512,6 @@ impl BgpListener {
             // releasing it on stale credit.
             if let Some(sess) = &self.cfg.session {
                 sess.set_up(true);
-            }
-        }
-        if let Some(sess) = &self.cfg.session {
-            // Stream activity in ROUTE-ELEMENT units, changed
-            // or not: a reconnect reannounces an unchanged
-            // table, the mirror never moves, and the gate
-            // compares activity against route-scaled quiet
-            // rates — counting frames instead of the elements
-            // they fan out to let a batched million-route dump
-            // read as quiet (review finding). Floored at one
-            // unit so an empty UPDATE (End-of-RIB shape) still
-            // counts as stream evidence — one unit against
-            // route-scaled rates is noise.
-            sess.pulse_n((elems.len() as u64).max(1));
-        }
-        let mut carried = Families::default();
-        for elem in elems {
-            carried.insert(match elem.prefix.prefix {
-                ipnet::IpNet::V4(_) => Family::V4,
-                ipnet::IpNet::V6(_) => Family::V6,
-            });
-            let event = match elem_to_route_event(&elem, peer_id, fallback_nh) {
-                Some(e) => e,
-                None => continue,
-            };
-            if let Err(e) = self.prog_handle.apply_route_event(event).await {
-                warn!(error = %e, "route event dispatch failed");
             }
         }
         Ok(carried)
@@ -3254,6 +3342,8 @@ mod tests {
         let addr = lst.local_addr().expect("local addr");
         let mut cfg = BgpListenerConfig::new(addr, TEST_AS, TEST_AS, Ipv4Addr::new(192, 0, 2, 1));
         cfg.hold_time = TEST_HOLD.as_secs() as u16;
+        // The tests are the peer, from this process's own sockets.
+        cfg.local_peers = LocalPeers::root_only().and_uid(unsafe { libc::geteuid() });
         let mut listener = BgpListener::new(cfg, prog, CancellationToken::new());
         listener.quiet = TEST_QUIET;
         (lst, listener, addr)
@@ -4237,6 +4327,47 @@ mod tests {
         serving.await.expect("join").expect("serve");
     }
 
+    /// A local process of an account that may not feed routes is
+    /// refused at admission, before it hears our OPEN, while the allowed
+    /// peer's connection is admitted (Codex Security occ_d9beffd5). Being
+    /// refused at admission is also what keeps it from displacing the
+    /// peer in [`BgpListener::newest_live`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_refuses_a_local_connection_from_another_account() {
+        let me = unsafe { libc::geteuid() };
+        if me == 0 {
+            // Root is always admitted, so a root test process has no
+            // other account to be.
+            return;
+        }
+        let (prog, log) = recording_handle();
+        let (lst, mut listener, addr) = unserved(prog).await;
+        let peer = TcpStream::connect(addr).await.expect("connect");
+        let mut intruder = TcpStream::connect(addr).await.expect("connect");
+        intruder.write_all(&peer_open(GR_PEER)).await.expect("OPEN");
+        // Both connections are this process's, so judge each as it is
+        // accepted: the peer's as an allowed account, the newer one as
+        // one that is not.
+        let peer_port = peer.local_addr().expect("peer addr").port();
+        let (stream, from) = lst.accept().await.expect("accept");
+        assert_eq!(from.port(), peer_port);
+        assert!(
+            listener.admit((stream, from)).is_some(),
+            "the allowed peer is admitted"
+        );
+        listener.cfg.local_peers = LocalPeers::root_only();
+        let (stream, from) = lst.accept().await.expect("accept");
+        assert!(
+            listener.admit((stream, from)).is_none(),
+            "a local socket of an account outside the allowed set must be refused"
+        );
+        assert!(
+            ends_unanswered(&mut intruder).await,
+            "the refused connection must be closed without our OPEN"
+        );
+        assert!(log.is_empty(), "{:?}", log.events());
+    }
+
     /// Nor to a newer one its own client has already closed, as a port
     /// probe does: after #360 the probe won the queue, the peer's live
     /// connection was closed in its favour, and then the probe was found
@@ -4260,6 +4391,89 @@ mod tests {
             .expect("the peer's connection was closed, not served");
         assert_eq!(first, MSG_TYPE_OPEN);
         assert!(log.is_empty(), "{:?}", log.events());
+        shutdown.cancel();
+        serving.await.expect("join").expect("serve");
+    }
+
+    /// The peer's half of the OPEN exchange on a connection `serve`
+    /// took.
+    async fn handshake(peer: &mut TcpStream, caps: PeerCaps) {
+        assert_eq!(read_type(peer).await.expect("OPEN"), MSG_TYPE_OPEN);
+        peer.write_all(&peer_open(caps)).await.expect("send OPEN");
+        assert_eq!(
+            read_type(peer).await.expect("KEEPALIVE"),
+            MSG_TYPE_KEEPALIVE
+        );
+        for family in caps.end_of_rib_we_send().iter() {
+            let msg = read_message(peer).await.expect("End-of-RIB");
+            assert_eq!(end_of_rib_in(&msg), Some(family));
+        }
+    }
+
+    /// A connection `serve` took that fails the OPEN exchange: our OPEN,
+    /// then a header with no marker in place of the peer's, then whatever
+    /// we answer until we close. Returns once we have closed, which is
+    /// after the session's end was handled up to the next accept.
+    async fn fail_open_exchange(addr: SocketAddr) {
+        let mut conn = TcpStream::connect(addr).await.expect("connect");
+        assert_eq!(read_type(&mut conn).await.expect("OPEN"), MSG_TYPE_OPEN);
+        conn.write_all(&[0u8; BGP_HEADER_LEN])
+            .await
+            .expect("send a broken header");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while read_message(&mut conn).await.is_ok() {}
+        })
+        .await
+        .expect("a broken OPEN exchange is closed");
+    }
+
+    /// A Resync only after a session that dispatched a route event. One
+    /// after connections that never got past the OPEN exchange, or after a
+    /// session that came up and sent nothing, would re-mark a mirror
+    /// already marked, with a walk over all of it (Codex Security finding
+    /// occ_3b034ce6). A session that sends an UPDATE owes exactly one,
+    /// and failed attempts after it owe none more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_session_that_dispatched_a_route_event_queues_a_resync() {
+        let (prog, log) = recording_handle();
+        let (lst, listener, addr) = unserved(prog.clone()).await;
+        let shutdown = listener.shutdown.clone();
+        let serving = tokio::spawn(listener.serve(lst));
+
+        fail_open_exchange(addr).await;
+        fail_open_exchange(addr).await;
+        let mut quiet = TcpStream::connect(addr).await.expect("connect");
+        handshake(&mut quiet, PLAIN_PEER).await;
+        drop(quiet);
+        // Served only once the quiet session's end has been handled.
+        fail_open_exchange(addr).await;
+        // A round trip behind anything the listener queued.
+        prog.mirror_counts().await.expect("mirror counts");
+        assert!(
+            log.is_empty(),
+            "nothing was dispatched, so nothing is owed: {:?}",
+            log.events()
+        );
+
+        let mut live = TcpStream::connect(addr).await.expect("connect");
+        handshake(&mut live, PLAIN_PEER).await;
+        live.write_all(&test_update()).await.expect("UPDATE");
+        wait_until("the UPDATE is applied", Duration::from_secs(5), || {
+            !log.is_empty()
+        })
+        .await;
+        drop(live);
+        fail_open_exchange(addr).await;
+        fail_open_exchange(addr).await;
+        prog.mirror_counts().await.expect("mirror counts");
+        let events = log.events();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [RouteEvent::Add { .. }, RouteEvent::Resync]
+            ),
+            "one Resync, for the session that sent a route: {events:?}"
+        );
         shutdown.cancel();
         serving.await.expect("join").expect("serve");
     }
@@ -5020,21 +5234,6 @@ mod tests {
                 wr.write_all(&encode_end_of_rib(family))
                     .await
                     .expect("End-of-RIB");
-            }
-        }
-
-        /// The peer's half of the OPEN exchange on a connection `serve`
-        /// took.
-        async fn handshake(peer: &mut TcpStream, caps: PeerCaps) {
-            assert_eq!(read_type(peer).await.expect("OPEN"), MSG_TYPE_OPEN);
-            peer.write_all(&peer_open(caps)).await.expect("send OPEN");
-            assert_eq!(
-                read_type(peer).await.expect("KEEPALIVE"),
-                MSG_TYPE_KEEPALIVE
-            );
-            for family in caps.end_of_rib_we_send().iter() {
-                let msg = read_message(peer).await.expect("End-of-RIB");
-                assert_eq!(end_of_rib_in(&msg), Some(family));
             }
         }
 

@@ -698,6 +698,10 @@ pub(crate) struct RxMacSync {
     /// Ports whose state could not be read this pass; their entries were
     /// left alone. The watcher retries while any of them still exists.
     pub unknown: Vec<(String, u32)>,
+    /// `(port, bridge, why)` for each port refused because its bridge
+    /// filters by VLAN in a way `RX_MACS` does not model: it has no
+    /// entries, so every frame on it takes the kernel path.
+    pub refused: Vec<(String, String, String)>,
 }
 
 /// Bring `RX_MACS` to what each attached XDP port (`(iface, ifindex)`)
@@ -714,15 +718,40 @@ pub(crate) fn sync_rx_macs<T: std::borrow::BorrowMut<aya::maps::MapData>>(
     reported: &std::collections::HashSet<u32>,
 ) -> RxMacSync {
     let current: Vec<RxMacKey> = map.keys().filter_map(Result::ok).collect();
+    let mut tables = crate::rx_macs::BridgeTables::default();
     let desired: Vec<crate::rx_macs::PortMacs> = ports
         .iter()
         .map(|(iface, ifindex)| crate::rx_macs::PortMacs {
             iface: iface.clone(),
             ifindex: *ifindex,
-            rx: crate::rx_macs::kernel_port_rx(iface),
+            rx: crate::rx_macs::kernel_port_rx(iface, &mut tables),
         })
         .collect();
     let plan = crate::rx_macs::plan(&current, &desired);
+    // Reported here when a refusal removes entries, i.e. when the bridge
+    // changes how it filters under a running daemon; attach reports the
+    // ports it starts refused.
+    for port in &plan.ports {
+        if let (Some((bridge, why)), false) = (&port.refused, port.revoke.is_empty()) {
+            warn!(
+                iface = %port.iface,
+                %bridge,
+                reason = %why,
+                removed = port.revoke.len(),
+                "port's bridge filters by VLAN in a way RX_MACS does not model: its entries \
+                 are removed and every frame on it takes the kernel path, which applies the \
+                 bridge's filtering"
+            );
+        }
+    }
+    let refused: Vec<(String, String, String)> = plan
+        .ports
+        .iter()
+        .filter_map(|p| {
+            let (bridge, why) = p.refused.clone()?;
+            Some((p.iface.clone(), bridge, why))
+        })
+        .collect();
     for (iface, ifindex, why) in &plan.unknown {
         if reported.contains(ifindex) {
             continue;
@@ -771,6 +800,7 @@ pub(crate) fn sync_rx_macs<T: std::borrow::BorrowMut<aya::maps::MapData>>(
             .into_iter()
             .map(|(iface, ifindex, _)| (iface, ifindex))
             .collect(),
+        refused,
     }
 }
 
@@ -1248,6 +1278,39 @@ fn anyip_addr_from_cfg(cfg: &ModuleConfig<'_>) -> Option<std::net::Ipv4Addr> {
             ),
             _ => None,
         })
+}
+
+/// The accounts that may feed the `route-source` from this host, or
+/// `None` without one. Run in `attach`'s preflight, before anything
+/// attaches or pins: it asks the kernel once each question the listener
+/// asks at every `accept()`, and looks up `peer-user`, so a kernel with
+/// no socket diagnostics or an account this host lacks fails the start
+/// cleanly. From `RouteController::start` the same failure came after
+/// `pin_program_and_maps` and left orphaned pins (review finding,
+/// PR #419), the trap the anyip preflight was moved ahead of (#196).
+fn local_peers_preflight(
+    cfg: &ModuleConfig<'_>,
+) -> ModuleResult<Option<crate::fib::local_peer::LocalPeers>> {
+    let Some(spec) = cfg.section.directives.iter().find_map(|d| match d {
+        ModuleDirective::RouteSource(spec) => Some(spec),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let peer_user = match spec {
+        packetframe_common::config::RouteSourceSpec::Bgp { peer_user, .. }
+        | packetframe_common::config::RouteSourceSpec::Bmp { peer_user, .. } => peer_user,
+    };
+    let fail = |e: String| {
+        ModuleError::other(
+            MODULE_NAME,
+            format!("route-source local peer preflight: {e}"),
+        )
+    };
+    crate::fib::local_peer::self_test().map_err(|e| fail(e.to_string()))?;
+    crate::fib::local_peer::LocalPeers::resolve(peer_user.as_deref())
+        .map(Some)
+        .map_err(fail)
 }
 
 /// Advisory exclusive lock serializing the anyip preflight and the
@@ -1864,11 +1927,14 @@ pub fn attach(
     // removal happens while the lock is still held.
     let mut _anyip_lock: Option<std::fs::File> = None;
     let mut anyip_guard = AnyipUnwindGuard::new(None);
+    let mut local_peers: Option<crate::fib::local_peer::LocalPeers> = None;
     if matches!(
         forwarding_mode_from_cfg(cfg),
         packetframe_common::config::ForwardingMode::PacketframeFib
             | packetframe_common::config::ForwardingMode::Compare
     ) {
+        // Ahead of the anyip route too: a failure here installs nothing.
+        local_peers = local_peers_preflight(cfg)?;
         if let Some(addr) = anyip_addr_from_cfg(cfg) {
             // Serialize preflight→ownership across concurrent starts.
             // Created-vs-Adopted alone cannot transfer ownership
@@ -2018,6 +2084,15 @@ pub fn attach(
             .map_err(|e| ModuleError::other(MODULE_NAME, format!("RX_MACS try_from: {e}")))?;
         let sync = sync_rx_macs(&mut rx, &ports, &Default::default());
         info!(entries = sync.added, "RX_MACS populated");
+        for (iface, bridge, why) in &sync.refused {
+            warn!(
+                iface = %iface,
+                %bridge,
+                reason = %why,
+                "port's bridge filters by VLAN in a way RX_MACS does not model: no entries, so \
+                 every frame on it takes the kernel path, which applies the bridge's filtering"
+            );
+        }
     }
 
     let prog: &mut Xdp = state
@@ -2263,6 +2338,8 @@ pub fn attach(
                 // the `peer_from` ACL is either non-empty or the listen
                 // is loopback.
                 allow_remote: _,
+                // Resolved into `local_peers` by the preflight.
+                peer_user: _,
             }) => format!("{addr}:{port}")
                 .parse::<std::net::SocketAddr>()
                 .ok()
@@ -2270,6 +2347,9 @@ pub fn attach(
                     listen,
                     require_loc_rib: *require_loc_rib,
                     peer_acl: peer_from.clone(),
+                    local_peers: local_peers
+                        .clone()
+                        .expect("the preflight resolves local peers for every route-source"),
                 }),
             ModuleDirective::RouteSource(packetframe_common::config::RouteSourceSpec::Bgp {
                 addr,
@@ -2281,6 +2361,7 @@ pub fn attach(
                 peer_ip,
                 anyip,
                 allow_remote: _,
+                peer_user: _,
             }) => {
                 let listen: std::net::SocketAddr = format!("{addr}:{port}").parse().ok()?;
                 // Default router-id: lowest 32 bits of the listen
@@ -2299,6 +2380,9 @@ pub fn attach(
                     peer_acl: peer_from.clone(),
                     expected_peer_ip: *peer_ip,
                     anyip: *anyip,
+                    local_peers: local_peers
+                        .clone()
+                        .expect("the preflight resolves local peers for every route-source"),
                 })
             }
             _ => None,

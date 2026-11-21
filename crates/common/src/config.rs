@@ -1058,6 +1058,13 @@ impl FromStr for ForwardingMode {
 /// declare an `IpNet` ACL via one or more `peer-from <cidr>` sub-
 /// keywords. The BGP variant additionally accepts `peer-ip <ip>`
 /// to pin the configured `peer-as` to a specific source address.
+///
+/// A connection from this host is judged by who owns it as well: a
+/// loopback or AnyIP listen is reachable by every local process, so
+/// the listener admits a local socket only if root, or the account
+/// `peer-user <name|uid>` names, owns it (`frr` and `bird`, where they
+/// exist, when no `peer-user` is given). See fast-path's
+/// `fib::local_peer`.
 /// What the integrity checker treats as the authority for the mirror.
 ///
 /// The checker compares packetframe's FIB mirror against an authority
@@ -1303,12 +1310,8 @@ pub enum RouteSourceSpec {
     /// `require_loc_rib`: when true, only RouteMonitoring frames
     /// with peer_type = 3 (RFC 9069 Loc-RIB Instance Peer) are
     /// accepted; pre/post-policy frames cause the session to be
-    /// torn down with an error. **This is required for safe use
-    /// against pre/post-policy emitters** like bird 2.x, without
-    /// it, multiple peers' Adj-RIB-In streams would race-overwrite
-    /// per-prefix nexthops in the FIB and produce silent
-    /// wrong-forwarding. See module docs in
-    /// `route_source_bmp.rs`.
+    /// torn down with an error. The parser sets this for packetframe-fib
+    /// forwarding and for an explicit `require-loc-rib` in compare mode.
     Bmp {
         addr: String,
         port: u16,
@@ -1324,6 +1327,12 @@ pub enum RouteSourceSpec {
         /// is parse-rejected when `allow_remote` is true; ignored
         /// (must be empty) when `allow_remote` is false.
         peer_from: Vec<ipnet::IpNet>,
+        /// `peer-user <name|uid>`: the account, besides root, whose
+        /// sockets on this host may connect. `None` admits the `frr`
+        /// and `bird` accounts where they exist. Looked up when the
+        /// listener starts, not here: config is parsed on hosts that
+        /// are not the router too.
+        peer_user: Option<String>,
     },
     /// iBGP listener, packetframe accepts an iBGP session from
     /// bird and ingests UPDATEs as bird's selected best paths.
@@ -1365,6 +1374,8 @@ pub enum RouteSourceSpec {
         /// by definition not loopback) and is v4-only today, like
         /// the router-id defaulting it composes with.
         anyip: bool,
+        /// See [`RouteSourceSpec::Bmp::peer_user`].
+        peer_user: Option<String>,
     },
 }
 
@@ -1382,8 +1393,8 @@ impl RouteSourceSpec {
     /// under the same BGP peer id, so an ACL moved from one to the other
     /// across a restart must not accept the first router's ledger for the
     /// second. BMP has no pin, so its ACL is always identity. `router-id`,
-    /// `anyip` and `allow-remote` change how the session is announced or
-    /// bound, not whose routes arrive, so editing them keeps a ledger
+    /// `anyip`, `allow-remote` and `peer-user` change how the session is
+    /// announced, bound or admitted, not whose routes arrive, so editing them keeps a ledger
     /// usable; so does the ACL under a BGP peer pin, which already names
     /// the speaker. A loopback listen has no ACL and renders none.
     ///
@@ -4056,6 +4067,26 @@ fn parse(input: &str) -> Result<Config, ConfigError> {
         }
     }
 
+    // Resolve the policy once, after both directives are known. The listener,
+    // the restart-only reload guard, and the route ledger all use this spec.
+    // An unfiltered compare mirror or saved ledger cannot become a forwarding FIB.
+    if let Some(fp) = modules.iter_mut().find(|m| m.name == "fast-path") {
+        let mode = fp.directives.iter().find_map(|d| match d {
+            ModuleDirective::ForwardingMode(mode) => Some(*mode),
+            _ => None,
+        });
+        if mode == Some(ForwardingMode::PacketframeFib) {
+            for directive in &mut fp.directives {
+                if let ModuleDirective::RouteSource(RouteSourceSpec::Bmp {
+                    require_loc_rib, ..
+                }) = directive
+                {
+                    *require_loc_rib = true;
+                }
+            }
+        }
+    }
+
     Ok(Config {
         global: global.unwrap_or_default(),
         modules,
@@ -6234,10 +6265,54 @@ fn parse_integrity_authority_frr<'a>(
     })
 }
 
+/// `peer-user <name|uid>`: once per route source, and a value that can
+/// name an account (a uid, or a name of the characters account names
+/// use). Whether the account exists is the listener's question at
+/// start, on the router; config is parsed elsewhere too.
+fn parse_peer_user(
+    line: usize,
+    kind: &str,
+    value: &str,
+    slot: &mut Option<String>,
+) -> Result<(), ConfigError> {
+    if slot.is_some() {
+        return Err(ConfigError::parse(
+            line,
+            format!("route-source {kind}: duplicate `peer-user`"),
+        ));
+    }
+    // All digits is a uid, and must be one; anything else is a name,
+    // of the characters useradd(8) accepts, a trailing `$` included.
+    let valid = if value.bytes().all(|b| b.is_ascii_digit()) {
+        !value.is_empty() && value.parse::<u32>().is_ok()
+    } else {
+        let body = value.strip_suffix('$').unwrap_or(value);
+        value.len() <= 32
+            && body
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            && body
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    };
+    if !valid {
+        return Err(ConfigError::parse(
+            line,
+            format!(
+                "route-source {kind}: bad peer-user `{value}` (an account name or a numeric uid)"
+            ),
+        ));
+    }
+    *slot = Some(value.to_string());
+    Ok(())
+}
+
 /// Parse `route-source <kind> <args...>`. Two kinds supported:
-/// - `bmp <addr>:<port> [require-loc-rib] [allow-remote peer-from <cidr> ...]`
+/// - `bmp <addr>:<port> [require-loc-rib] [allow-remote peer-from <cidr> ...]
+///        [peer-user <name|uid>]`
 /// - `bgp <addr>:<port> local-as <asn> peer-as <asn> [router-id <ipv4>]
-///        [allow-remote peer-from <cidr> ... [peer-ip <ip>]]`
+///        [allow-remote peer-from <cidr> ... [peer-ip <ip>]] [peer-user <name|uid>]`
 ///
 /// Unknown kinds become parse errors with an explicit message.
 ///
@@ -6264,13 +6339,23 @@ fn parse_route_source<'a>(
             let mut require_loc_rib = false;
             let mut allow_remote = false;
             let mut peer_from: Vec<ipnet::IpNet> = Vec::new();
+            let mut peer_user: Option<String> = None;
             // Peek-driven loop: `require-loc-rib` / `allow-remote`
-            // are no-value flags; `peer-from` consumes one trailing
-            // CIDR argument.
+            // are no-value flags; `peer-from` and `peer-user` consume
+            // one trailing argument.
             while let Some(tok) = rest.next() {
                 match tok {
                     "require-loc-rib" => require_loc_rib = true,
                     "allow-remote" => allow_remote = true,
+                    "peer-user" => {
+                        let value = rest.next().ok_or_else(|| {
+                            ConfigError::parse(
+                                line,
+                                "route-source bmp: `peer-user` requires a <name|uid> argument",
+                            )
+                        })?;
+                        parse_peer_user(line, "bmp", value, &mut peer_user)?;
+                    }
                     "peer-from" => {
                         let cidr_str = rest.next().ok_or_else(|| {
                             ConfigError::parse(
@@ -6290,7 +6375,7 @@ fn parse_route_source<'a>(
                         return Err(ConfigError::parse(
                             line,
                             format!(
-                                "route-source bmp: unknown tail flag `{other}` (known: require-loc-rib, allow-remote, peer-from <cidr>)"
+                                "route-source bmp: unknown tail flag `{other}` (known: require-loc-rib, allow-remote, peer-from <cidr>, peer-user <name|uid>)"
                             ),
                         ));
                     }
@@ -6303,6 +6388,7 @@ fn parse_route_source<'a>(
                 require_loc_rib,
                 allow_remote,
                 peer_from,
+                peer_user,
             }))
         }
         "bgp" => {
@@ -6320,6 +6406,7 @@ fn parse_route_source<'a>(
             let mut peer_from: Vec<ipnet::IpNet> = Vec::new();
             let mut peer_ip: Option<std::net::IpAddr> = None;
             let mut anyip = false;
+            let mut peer_user: Option<String> = None;
             while let Some(key) = rest.next() {
                 // `allow-remote` is a no-value flag; everything
                 // else takes one argument.
@@ -6380,11 +6467,12 @@ fn parse_route_source<'a>(
                         })?;
                         peer_ip = Some(ip);
                     }
+                    "peer-user" => parse_peer_user(line, "bgp", value, &mut peer_user)?,
                     other => {
                         return Err(ConfigError::parse(
                             line,
                             format!(
-                                "route-source bgp: unknown key `{other}` (known: local-as, peer-as, router-id, allow-remote, peer-from, peer-ip, anyip)"
+                                "route-source bgp: unknown key `{other}` (known: local-as, peer-as, router-id, allow-remote, peer-from, peer-ip, anyip, peer-user)"
                             ),
                         ));
                     }
@@ -6459,6 +6547,7 @@ fn parse_route_source<'a>(
                 peer_from,
                 peer_ip,
                 anyip,
+                peer_user,
             }))
         }
         other => Err(ConfigError::parse(
@@ -9252,12 +9341,14 @@ module fast-path
                 require_loc_rib,
                 allow_remote,
                 peer_from,
+                peer_user,
             } => {
                 assert_eq!(addr, "127.0.0.1");
                 assert_eq!(port, 6543);
                 assert!(!require_loc_rib, "default should be off");
                 assert!(!allow_remote, "loopback default does not need opt-in");
                 assert!(peer_from.is_empty());
+                assert_eq!(peer_user, None, "no peer-user: the default accounts");
             }
             other => panic!("expected Bmp, got {other:?}"),
         }
@@ -9276,6 +9367,80 @@ module fast-path
     }
 
     #[test]
+    fn route_source_peer_user_parses_for_both_kinds() {
+        for (line, want) in [
+            (
+                "  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551 peer-user frr\n",
+                "frr",
+            ),
+            (
+                "  route-source bgp 127.0.0.1:1179 peer-user 124 local-as 65551 peer-as 65551\n",
+                "124",
+            ),
+            (
+                "  route-source bmp 127.0.0.1:6543 peer-user bird require-loc-rib\n",
+                "bird",
+            ),
+            (
+                "  route-source bmp 127.0.0.1:6543 require-loc-rib peer-user _bgp-d.1$\n",
+                "_bgp-d.1$",
+            ),
+        ] {
+            let got = match extract_route_source(line) {
+                RouteSourceSpec::Bgp { peer_user, .. } | RouteSourceSpec::Bmp { peer_user, .. } => {
+                    peer_user
+                }
+            };
+            assert_eq!(got.as_deref(), Some(want), "{line}");
+        }
+    }
+
+    #[test]
+    fn route_source_peer_user_rejects_what_names_no_account() {
+        for (tail, needle) in [
+            ("peer-user", "requires"),
+            ("peer-user frr peer-user bird", "duplicate"),
+            ("peer-user 4294967296", "bad peer-user"),
+            ("peer-user -frr", "bad peer-user"),
+            ("peer-user fr/r", "bad peer-user"),
+            (
+                "peer-user aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bad peer-user",
+            ),
+        ] {
+            for kind in [
+                "bgp 127.0.0.1:1179 local-as 65551 peer-as 65551",
+                "bmp 127.0.0.1:6543",
+            ] {
+                let body = format!("  route-source {kind} {tail}\n");
+                match parse_module_body(&body).unwrap_err() {
+                    ConfigError::Parse { message, .. } => {
+                        assert!(message.contains(needle), "{body}: {message}")
+                    }
+                    other => panic!("{body}: expected a parse error, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Who may connect is not whose routes arrive: a ledger written under
+    /// one `peer-user` seeds a start under another.
+    #[test]
+    fn route_source_peer_user_is_not_ledger_identity() {
+        let identity = |line: &str| extract_route_source(line).ledger_identity();
+        assert_eq!(
+            identity("  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551\n"),
+            identity(
+                "  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551 peer-user frr\n"
+            ),
+        );
+        assert_eq!(
+            identity("  route-source bmp 127.0.0.1:6543\n"),
+            identity("  route-source bmp 127.0.0.1:6543 peer-user 0\n"),
+        );
+    }
+
+    #[test]
     fn route_source_bmp_require_loc_rib_flag() {
         match extract_route_source("  route-source bmp 127.0.0.1:6543 require-loc-rib\n") {
             RouteSourceSpec::Bmp {
@@ -9283,6 +9448,29 @@ module fast-path
             } => assert!(require_loc_rib),
             other => panic!("expected Bmp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bmp_forwarding_requires_loc_rib_even_when_the_flag_is_omitted() {
+        let bmp = "route-source bmp 127.0.0.1:6543";
+        let strict = extract_route_source(&format!("{bmp} require-loc-rib"));
+        let observational = extract_route_source(&format!("forwarding-mode compare\n{bmp}"));
+        assert_ne!(observational.ledger_identity(), strict.ledger_identity());
+
+        for mode in ["packetframe-fib", "custom-fib"] {
+            for body in [
+                format!("{bmp}\nforwarding-mode {mode}"),
+                format!("forwarding-mode {mode}\n{bmp}"),
+            ] {
+                let source = extract_route_source(&body);
+                assert_eq!(source, strict, "{body}");
+                assert_eq!(source.ledger_identity(), strict.ledger_identity());
+            }
+        }
+        assert_eq!(
+            extract_route_source(&format!("forwarding-mode compare\n{bmp} require-loc-rib")),
+            strict
+        );
     }
 
     #[test]
@@ -9331,7 +9519,9 @@ module fast-path
                 peer_from,
                 peer_ip,
                 anyip,
+                peer_user,
             } => {
+                assert_eq!(peer_user, None, "no peer-user: the default accounts");
                 assert_eq!(addr, "127.0.0.1");
                 assert_eq!(port, 1179);
                 assert_eq!(local_as, 65551);

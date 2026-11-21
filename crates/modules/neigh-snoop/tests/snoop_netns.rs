@@ -674,7 +674,9 @@ fn never_downgrades_or_overrides_confirmed_entries() {
 /// its confirmed MAC. It must still fill an unresolved entry the mirror
 /// never heard of (an entry created FAILED or INCOMPLETE emits no
 /// notification), as `NLM_F_EXCL` would not, and create an absent one.
-/// An install over a row the mirror does hold replaces it, as before.
+/// The same write serves a row the mirror holds unresolved, which can
+/// resolve before the write lands. An install over a STALE row the
+/// mirror holds replaces it, as before.
 #[test]
 #[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
 fn an_install_on_a_missing_row_never_overrides_a_kernel_mac() {
@@ -730,6 +732,18 @@ fn an_install_on_a_missing_row_never_overrides_a_kernel_mac() {
         assert!(
             line.contains("STALE") && line.contains(&mac_str(MAC_Y)),
             "an absent entry is created: {line}"
+        );
+
+        // Decided while the row was FAILED; confirmed with another MAC
+        // before the write lands (Codex Security finding occ_4bacbca3).
+        use packetframe_neigh_snoop::table::InstallReason;
+        set("198.51.100.93", None, "failed");
+        set("198.51.100.93", Some(MAC_X), "reachable");
+        assert_eq!(install(93, InstallReason::Unusable.mode()).await, Ok(()));
+        let line = neigh("198.51.100.93");
+        assert!(
+            line.contains("REACHABLE") && line.contains(&mac_str(MAC_X)),
+            "a row confirmed after an unresolved decision must keep its MAC: {line}"
         );
 
         assert_eq!(install(90, InstallMode::Replace).await, Ok(()));

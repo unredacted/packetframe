@@ -33,7 +33,9 @@ BGP upload. **It never transmits.**
   (`mac_conflict`) and ignored: a second router leaking on that
   participant's port is more likely than a real move, and NUD will
   fail the entry if the held MAC stops answering — FAILED *is*
-  repaired.
+  repaired. PacketFrame checks all addresses asserted by a frame before
+  learning a MAC. It checks a declared router’s protected bindings before
+  deriving a MAC for another address.
 - **Participants that never resolve anyone.** Passive learning makes
   an unresolved next-hop rare, not impossible. The FRR next-hop gate
   (below) makes it harmless.
@@ -160,15 +162,17 @@ Attribution notes:
   table dirty; the persist debounce (3 s) coalesces it.
 - `mac_conflict` climbing on one address is a participant with two
   routers on its port, or spoofing. Nothing is installed; look at who.
-- An install for an address the kernel mirror holds no row for is
-  written without `NLM_F_REPLACE`: the kernel creates the entry, or
-  fills one it holds unresolved (INCOMPLETE, FAILED), but keeps a valid
-  MAC it holds, a confirmed one included. The mirror can miss a live
-  entry (a neighbour dump taken during churn can skip one, and the
-  kernel does not flag it), and this is what keeps such a miss from
-  overwriting it. Such a write changes nothing and so counts
+- An install for an address the kernel mirror holds no row for, or holds
+  unresolved (INCOMPLETE, FAILED), is written without `NLM_F_REPLACE`:
+  the kernel creates the entry, or fills one it holds unresolved, but
+  keeps a valid MAC it holds, a confirmed one included. The mirror can
+  miss a live entry (a neighbour dump taken during churn can skip one,
+  and the kernel does not flag it), or the entry can resolve between
+  the decision and the write, and this is what keeps either from being
+  overwritten. Such a write changes nothing and so counts
   `unconfirmed`; the next sighting decides again on the row the
-  kernel's next notification or re-read brings.
+  kernel's next notification or re-read brings. Only a STALE row with
+  another MAC is replaced.
 - `frames_outgoing_dropped_total` should be zero. Non-zero means the
   socket filter is not attached.
 - `recreated` link events during a provision or BGP upload are normal;
@@ -350,8 +354,18 @@ purpose:
   forget a bridge's table; a wrong MAC in it costs one failed unicast
   probe and is corrected on the next sighting).
 
+When upgrading to version 2 neighbor snapshots, PacketFrame imports a version 1
+entry only if the kernel independently holds its MAC in a REACHABLE, PERMANENT,
+or NOARP binding for that address. Other legacy entries must be learned again.
+Later starts use the version 2 snapshot for normal warm seeding.
+
 `packetframe status` prints each bridge's persisted table size and
-age without a daemon.
+age without a daemon. Startup and status accept a regular snapshot up to
+256 MiB. The file and its directory must belong to the reader's effective
+user (normally root) and allow writes only by their owner. Ancestors must
+belong to root or the reader and may allow group or other writes only if
+the sticky bit is set. Symlinks are refused throughout the path. Startup
+logs a rejected snapshot and learns the bridge's neighbours from scratch.
 
 ## Customer VLANs behind a vpp-offload `local-route6`
 

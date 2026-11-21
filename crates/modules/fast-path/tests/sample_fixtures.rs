@@ -401,6 +401,7 @@ fn vlan_frames_are_sampled_once_as_received() {
             // the tag inline, as it arrived (TEST_RUN never lifts a tag
             // into skb metadata; the veth test covers that).
             let mut h = forwarding(fib, egress);
+            h.add_rx_mac_on(TEST_RUN_INGRESS_IFINDEX, 100, ROUTER_MAC);
             let mut tap = every_packet(&mut h, hook, 1);
             let tagged = insert_vlan_tag(&routed(0), 100);
             run(&h, hook, &tagged);

@@ -32,6 +32,7 @@ use crate::fib::integrity::{
     shared_snapshot, IntegrityChecker, IntegrityConfig, IntegrityPosture, SharedSnapshot,
     DEFAULT_INTERVAL,
 };
+use crate::fib::local_peer::LocalPeers;
 use crate::fib::neigh_supervision::{ResolverStatus, SharedResolverStatus};
 use crate::fib::netlink_neigh::{
     FallbackDefaultSpec, LocalPrefixSpec, NeighborResolveHandle, NetlinkNeighborResolver,
@@ -164,6 +165,10 @@ pub enum RouteSourceConfig {
         /// parser only permits empty when the listen address is
         /// itself loopback).
         peer_acl: Vec<ipnet::IpNet>,
+        /// The accounts whose sockets on this host may connect, resolved
+        /// by the caller before anything is attached, since the
+        /// resolution can fail. See [`crate::fib::local_peer`].
+        local_peers: LocalPeers,
     },
     Bgp {
         listen: SocketAddr,
@@ -176,6 +181,8 @@ pub enum RouteSourceConfig {
         /// accepted connection whose source IP differs is closed
         /// before the BGP OPEN exchange.
         expected_peer_ip: Option<IpAddr>,
+        /// Same as the BMP variant's.
+        local_peers: LocalPeers,
         /// Install a `local <listen>/32 dev lo` kernel route (AnyIP)
         /// before binding, remove it on shutdown. See the `anyip`
         /// module docs for the FRR pairing this exists for.
@@ -538,6 +545,7 @@ impl RouteController {
                 listen,
                 require_loc_rib,
                 peer_acl,
+                local_peers,
             }) => {
                 let snapshot = shared_snapshot();
                 // Spawn the checker only when a LOCAL authority is named.
@@ -577,13 +585,15 @@ impl RouteController {
                 let shut = shutdown_token.clone();
                 let stall = snapshot.clone();
                 let peer_acl_for_spawn = peer_acl.clone();
+                let local_peer_uids = local_peers.uids().to_vec();
                 tasks.push(runtime.spawn(async move {
                     let mut backoff = LISTENER_BACKOFF_INITIAL;
                     loop {
                         let mut station = BmpStation::new(listen, prog.clone(), shut.clone())
                             .with_feed_session(feed_session.clone())
                             .with_stall_gate(stall.clone())
-                            .with_peer_acl(peer_acl_for_spawn.clone());
+                            .with_peer_acl(peer_acl_for_spawn.clone())
+                            .with_local_peers(local_peers.clone());
                         if require_loc_rib {
                             station = station.with_require_loc_rib();
                         }
@@ -612,6 +622,7 @@ impl RouteController {
                     bmp_addr = %listen,
                     require_loc_rib,
                     peer_acl_entries = peer_acl.len(),
+                    ?local_peer_uids,
                     auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
                     "RouteController started: NetlinkNeighborResolver + FibProgrammer + BmpStation + IntegrityChecker"
                 );
@@ -624,6 +635,7 @@ impl RouteController {
                 peer_acl,
                 expected_peer_ip,
                 anyip,
+                local_peers,
             }) => {
                 let snapshot = shared_snapshot();
                 // The GC hold's way of asking the FRR authority for a
@@ -686,6 +698,8 @@ impl RouteController {
                 cfg.session = feed_session.clone();
                 cfg.peer_acl = peer_acl;
                 cfg.expected_peer_ip = expected_peer_ip;
+                let local_peer_uids = local_peers.uids().to_vec();
+                cfg.local_peers = local_peers;
                 // Capture the auth-posture fields before the spawn
                 // moves `cfg` into the retry loop's coroutine, the
                 // post-spawn `info!` reads them and can't share with
@@ -782,6 +796,7 @@ impl RouteController {
                     peer_as,
                     peer_acl_entries,
                     peer_ip = ?peer_ip_log,
+                    ?local_peer_uids,
                     auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
                     "RouteController started: NetlinkNeighborResolver + FibProgrammer + BgpListener + IntegrityChecker"
                 );

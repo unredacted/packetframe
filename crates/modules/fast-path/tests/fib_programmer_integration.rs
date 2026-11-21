@@ -38,7 +38,7 @@ use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, R
 use packetframe_fast_path::aligned_bpf_copy;
 use packetframe_fast_path::fib::netlink_neigh::NeighborResolveHandle;
 use packetframe_fast_path::fib::programmer::{
-    FibProgrammer, ECMP_GROUPS_CAP, RECLAIM_TICK, REPROBE_TICK, WALK_CHUNK,
+    FibProgrammer, ProgrammerError, ECMP_GROUPS_CAP, RECLAIM_TICK, REPROBE_TICK, WALK_CHUNK,
 };
 use packetframe_fast_path::fib::resolve_watch::{Probe, ProbeLog};
 use packetframe_fast_path::fib::types::{
@@ -139,7 +139,21 @@ impl Drop for PinDirs {
 /// stay alive after `take_map` hands them to the programmer.
 fn load_and_pin(pins: &PinDirs) -> Ebpf {
     let bytes = aligned_bpf_copy();
-    let ebpf = Ebpf::load(&bytes).expect("Ebpf::load");
+    pin_fib_maps(pins, Ebpf::load(&bytes).expect("Ebpf::load"))
+}
+
+/// [`load_and_pin`] with FIB_V4 created at `entries` slots rather than
+/// the compiled maximum, so a test can reach its capacity.
+fn load_and_pin_fib_v4_sized(pins: &PinDirs, entries: u32) -> Ebpf {
+    let bytes = aligned_bpf_copy();
+    let ebpf = aya::EbpfLoader::new()
+        .set_max_entries("FIB_V4", entries)
+        .load(&bytes)
+        .expect("EbpfLoader::load");
+    pin_fib_maps(pins, ebpf)
+}
+
+fn pin_fib_maps(pins: &PinDirs, ebpf: Ebpf) -> Ebpf {
     for name in [
         "NEXTHOPS",
         "FIB_V4",
@@ -255,7 +269,22 @@ impl ProgrammerHarness {
     fn with_asn(asn: Option<Arc<packetframe_common::fib::asn::AsnTable>>) -> Self {
         let pins = PinDirs::setup();
         let ebpf = load_and_pin(&pins);
+        Self::over(pins, ebpf, asn)
+    }
 
+    /// `new()` over a FIB_V4 of `entries` slots: the programmer reads its
+    /// prefix budget from the map it is handed.
+    fn with_fib_v4_entries(entries: u32) -> Self {
+        let pins = PinDirs::setup();
+        let ebpf = load_and_pin_fib_v4_sized(&pins, entries);
+        Self::over(pins, ebpf, None)
+    }
+
+    fn over(
+        pins: PinDirs,
+        ebpf: Ebpf,
+        asn: Option<Arc<packetframe_common::fib::asn::AsnTable>>,
+    ) -> Self {
         // Programmer opens the maps via from_pin. `FibProgrammer::open_*`
         // hard-codes the production pin layout
         // (`<bpffs>/fast-path/maps/<NAME>`); we pin flat under
@@ -564,6 +593,33 @@ impl ProgrammerHarness {
         F: std::future::Future<Output = T>,
     {
         self.rt.block_on(f)
+    }
+
+    /// Run `f` on a thread whose FIB deletes fail in the kernel (see
+    /// [`fail_bpf_map_deletes_on_this_thread`]); `f` drives the programmer
+    /// through [`Self::run`] like any test body. Deletes driven from any
+    /// other thread, before and after, succeed.
+    fn with_deletes_failing<T: Send>(&self, f: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                fail_bpf_map_deletes_on_this_thread();
+                // Pin the premise: a delete from this thread fails in the
+                // kernel, and not as an absent key, which the programmer
+                // rightly treats as done.
+                let mut probe = open_lpm_v4(&self.pins.path("FIB_V4"));
+                let err = probe
+                    .remove(&LpmKey::new(32, [203, 0, 113, 255]))
+                    .expect_err("this thread's deletes must fail");
+                assert!(
+                    matches!(&err, aya::maps::MapError::SyscallError(e)
+                        if e.io_error.raw_os_error() == Some(libc::EPERM)),
+                    "the filter must fail deletes with EPERM, got {err:?}"
+                );
+                f()
+            })
+            .join()
+            .expect("the thread whose deletes fail")
+        })
     }
 
     /// Read FIB_V4 entry via a fresh parallel handle so we don't
@@ -3009,6 +3065,208 @@ fn a_failed_peer_down_recompute_is_owed_until_it_reconciles() {
     );
 }
 
+/// Make this thread's `bpf(BPF_MAP_DELETE_ELEM, …)` fail with EPERM, and
+/// leave every other syscall, and every other thread, alone.
+///
+/// A seccomp filter is per thread and cannot be removed, so a test runs
+/// the programmer's current-thread runtime from a thread that has one
+/// while deletes are meant to fail, and from its own thread once they
+/// are meant to succeed. Little-endian only: `args[0]`'s low word is at
+/// offset 16 of `seccomp_data`, which holds on both CI architectures.
+fn fail_bpf_map_deletes_on_this_thread() {
+    const BPF_MAP_DELETE_ELEM: u32 = 3;
+    const OFF_NR: u32 = 0;
+    const OFF_ARG0_LO: u32 = 16;
+    let stmt = |code: u32, k: u32| libc::sock_filter {
+        code: code as u16,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jeq = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt,
+        jf,
+        k,
+    };
+    let load = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
+    let mut filter = [
+        stmt(load, OFF_NR),
+        jeq(libc::SYS_bpf as u32, 0, 3),
+        stmt(load, OFF_ARG0_LO),
+        jeq(BPF_MAP_DELETE_ELEM, 0, 1),
+        stmt(
+            libc::BPF_RET | libc::BPF_K,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        ),
+        stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW),
+    ];
+    let prog = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    // SAFETY: plain prctls; `prog` and `filter` outlive the call, which
+    // copies them into the kernel.
+    unsafe {
+        assert_eq!(
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0),
+            0,
+            "PR_SET_NO_NEW_PRIVS: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &prog as *const libc::sock_fprog,
+                0,
+                0
+            ),
+            0,
+            "PR_SET_SECCOMP: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// A withdrawal whose kernel delete failed keeps everything that says the
+/// route is still installed, because it is: the entry, its debt, its
+/// prefix slot and a GC that reports failure, which is what withholds the
+/// route source's readiness. All of it lifts only when a retried delete
+/// really succeeds.
+///
+/// The record leaves the mirror before the delete, and the retry once
+/// found no record and answered `Ok` without touching the map: the debt
+/// cleared, the slot was freed and the feed reported ready while the
+/// kernel kept forwarding the withdrawn route (Codex Security finding
+/// occ_26038f66's verification; its own regression test handed the slot
+/// accounting a successful result directly, so it could not see this).
+/// Here the delete fails in the kernel, from a seccomp filter on the
+/// thread driving the programmer.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn a_failed_withdrawal_delete_keeps_its_slot_and_debt_until_it_lands() {
+    // Two slots: the withdrawn prefix and one survivor fill the family,
+    // so a held slot shows as a refused third prefix.
+    let h = ProgrammerHarness::with_fib_v4_entries(2);
+    let peer = PeerId(0x0c0f_fee0);
+    let withdrawn = IpPrefix::V4 {
+        addr: [192, 0, 2, 0],
+        prefix_len: 25,
+    };
+    let survivor = IpPrefix::V4 {
+        addr: [198, 51, 100, 0],
+        prefix_len: 24,
+    };
+    let newcomer = IpPrefix::V4 {
+        addr: [203, 0, 113, 0],
+        prefix_len: 24,
+    };
+    let nh = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 129));
+    let add = |prefix: IpPrefix| RouteEvent::Add {
+        peer_id: peer,
+        prefix,
+        nexthops: vec![nh],
+        path_id: None,
+        local_pref: None,
+        origin_asn: None,
+    };
+
+    h.run(async {
+        for prefix in [withdrawn, survivor] {
+            h.handle
+                .apply_route_event(add(prefix))
+                .await
+                .expect("install within capacity");
+        }
+        // A new session re-announces everything but `withdrawn`.
+        h.handle
+            .apply_route_event(RouteEvent::Resync)
+            .await
+            .expect("resync");
+        h.handle
+            .apply_route_event(add(survivor))
+            .await
+            .expect("re-announce the survivor");
+    });
+    assert!(h.read_fib_v4([192, 0, 2, 0], 25).is_some());
+
+    // Two GCs on a thread whose deletes fail: the sweep's own, then the
+    // retry of its debt. The second is the regression.
+    let (first, retry) = h.with_deletes_failing(|| {
+        h.run(async {
+            let first = h
+                .handle
+                .apply_route_event(RouteEvent::InitiationComplete)
+                .await;
+            let retry = h
+                .handle
+                .apply_route_event(RouteEvent::InitiationComplete)
+                .await;
+            (first, retry)
+        })
+    });
+    assert!(first.is_err(), "the GC's delete failed: {first:?}");
+    assert!(
+        matches!(&retry, Err(ProgrammerError::MapWrite(_))),
+        "a retried delete that fails again must fail the GC again, not \
+         report a reconciled mirror: {retry:?}"
+    );
+    assert!(
+        h.read_fib_v4([192, 0, 2, 0], 25).is_some(),
+        "the withdrawn route is still installed"
+    );
+    assert!(
+        h.run(async { h.handle.has_session_routes().await.expect("query") }),
+        "an installed withdrawal is session state until its delete lands"
+    );
+    let refused = h.run(async { h.handle.apply_route_event(add(newcomer)).await });
+    assert!(
+        matches!(&refused, Err(ProgrammerError::Admission(_))),
+        "the undeleted withdrawal still holds its slot: {refused:?}"
+    );
+    assert!(h.read_fib_v4([203, 0, 113, 0], 24).is_none());
+
+    // From this thread the delete succeeds. The GC reports only that the
+    // refusal above needs a replay, not a failed delete.
+    let landed = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(
+        matches!(&landed, Err(ProgrammerError::ReplayRequired(_))),
+        "the retried delete lands; only the refusal is outstanding: {landed:?}"
+    );
+    assert!(
+        h.read_fib_v4([192, 0, 2, 0], 25).is_none(),
+        "the retried delete removed the withdrawn route"
+    );
+
+    // The replay is admitted into the freed slot, and the GC is clean.
+    let replayed = h.run(async {
+        h.handle
+            .apply_route_event(RouteEvent::Resync)
+            .await
+            .expect("resync");
+        for prefix in [survivor, newcomer] {
+            h.handle
+                .apply_route_event(add(prefix))
+                .await
+                .expect("the freed slot admits the newcomer");
+        }
+        h.handle
+            .apply_route_event(RouteEvent::InitiationComplete)
+            .await
+    });
+    assert!(
+        replayed.is_ok(),
+        "a complete replay reconciles: {replayed:?}"
+    );
+    assert!(h.read_fib_v4([203, 0, 113, 0], 24).is_some());
+    assert!(h.read_fib_v4([198, 51, 100, 0], 24).is_some());
+}
+
 /// `has_session_routes` answers for route-source peers only.
 ///
 /// The mirror is shared with the neighbour resolver's `local-prefix`
@@ -4587,7 +4845,7 @@ fn neighbour_events_are_served_between_a_walks_chunks() {
 }
 
 /// An owed prefix the mirror no longer holds is visited by the next GC,
-/// and its debt clears.
+/// and its debt clears once the retried delete lands.
 ///
 /// A record leaves the mirror with its recompute still owed only through a
 /// tear-down whose map delete failed, because the record goes first
@@ -4598,19 +4856,20 @@ fn neighbour_events_are_served_between_a_walks_chunks() {
 /// mirror's. The mirror here is two chunks of local routes, so the owed
 /// prefix is reached only in the walk's third.
 ///
-/// The failure is a v4 /33. The kernel's LPM trie refuses a prefix longer
-/// than its key (EINVAL) on insert and delete alike, so the Add leaves its
-/// record in the mirror uninstalled, and the GC's tear-down of it fails
-/// after the record has gone.
+/// The delete fails in the kernel, on a thread whose deletes a seccomp
+/// filter refuses, and lands from the test's own thread. This test once
+/// injected the failure with a v4 /33, which the trie refuses on delete
+/// as on insert, and expected the retry to succeed: it did only because
+/// the retry never touched the map (Codex Security finding occ_26038f66).
 #[test]
 #[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
 fn an_owed_prefix_the_mirror_no_longer_holds_is_reconciled_by_the_next_gc() {
     let h = ProgrammerHarness::new();
     let session = PeerId(0x5350);
     let local = PeerId::local_arp(34);
-    let too_long = IpPrefix::V4 {
+    let withdrawn = IpPrefix::V4 {
         addr: [192, 0, 2, 0],
-        prefix_len: 33,
+        prefix_len: 24,
     };
     let add = |peer: PeerId, prefix: IpPrefix, nexthop: IpAddr| RouteEvent::Add {
         peer_id: peer,
@@ -4621,7 +4880,7 @@ fn an_owed_prefix_the_mirror_no_longer_holds_is_reconciled_by_the_next_gc() {
         origin_asn: None,
     };
     let local_routes = many_v6_64s(2 * WALK_CHUNK);
-    let refused = h.run(async {
+    h.run(async {
         for p in &local_routes {
             h.handle
                 .apply_route_event(add(local, *p, ledger::nh6()))
@@ -4629,34 +4888,29 @@ fn an_owed_prefix_the_mirror_no_longer_holds_is_reconciled_by_the_next_gc() {
                 .expect("a local route");
         }
         h.handle
-            .apply_route_event(add(session, too_long, ledger::nh_a()))
+            .apply_route_event(add(session, withdrawn, ledger::nh_a()))
             .await
+            .expect("the session's route");
     });
-    assert!(
-        refused.is_err(),
-        "the premise: the trie refuses a /33: {refused:?}"
-    );
     let counts = || h.run(async { h.handle.mirror_counts().await.expect("counts") });
     let session_state = || h.run(async { h.handle.has_session_routes().await.expect("query") });
-    assert_eq!(
-        counts(),
-        (1, local_routes.len()),
-        "the premise: the refused Add's record stays in the mirror"
-    );
+    assert!(h.read_fib_v4([192, 0, 2, 0], 24).is_some());
 
-    // The session goes, and its /33's tear-down fails at the map delete.
-    let failed = h.run(async {
-        h.handle
-            .apply_route_event(RouteEvent::Resync)
-            .await
-            .expect("Resync");
-        h.handle
-            .apply_route_event(RouteEvent::InitiationComplete)
-            .await
+    // The session goes, and its route's tear-down fails at the map delete.
+    let failed = h.with_deletes_failing(|| {
+        h.run(async {
+            h.handle
+                .apply_route_event(RouteEvent::Resync)
+                .await
+                .expect("Resync");
+            h.handle
+                .apply_route_event(RouteEvent::InitiationComplete)
+                .await
+        })
     });
     assert!(
         failed.is_err(),
-        "the premise: the GC's tear-down of the /33 fails: {failed:?}"
+        "the premise: the GC's tear-down fails: {failed:?}"
     );
     assert_eq!(
         counts(),
@@ -4667,6 +4921,10 @@ fn an_owed_prefix_the_mirror_no_longer_holds_is_reconciled_by_the_next_gc() {
         session_state(),
         "the premise: the owed prefix counts as session state"
     );
+    assert!(
+        h.read_fib_v4([192, 0, 2, 0], 24).is_some(),
+        "the premise: the withdrawn route is still installed"
+    );
 
     let retry = h.run(async {
         h.handle
@@ -4675,9 +4933,10 @@ fn an_owed_prefix_the_mirror_no_longer_holds_is_reconciled_by_the_next_gc() {
     });
     assert!(retry.is_ok(), "{retry:?}");
     assert!(
-        !session_state(),
-        "the next GC must visit the owed prefix the mirror no longer holds and clear its debt"
+        h.read_fib_v4([192, 0, 2, 0], 24).is_none(),
+        "the next GC must visit the owed prefix the mirror no longer holds and delete it"
     );
+    assert!(!session_state(), "and its debt clears");
     assert_eq!(counts(), (0, local_routes.len()), "local routes stay");
 }
 
@@ -5065,6 +5324,7 @@ fn a_preserving_stop_and_the_next_start_round_trip_the_mirror() {
                     peer_acl: Vec::new(),
                     expected_peer_ip: None,
                     anyip: false,
+                    local_peers: packetframe_fast_path::fib::local_peer::LocalPeers::root_only(),
                 },
             ),
             integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::None,
@@ -5204,6 +5464,7 @@ fn a_preserving_stop_finishes_a_gc_under_way() {
                     peer_acl: Vec::new(),
                     expected_peer_ip: None,
                     anyip: false,
+                    local_peers: packetframe_fast_path::fib::local_peer::LocalPeers::root_only(),
                 },
             ),
             integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::None,
@@ -5307,6 +5568,7 @@ fn a_preserving_stop_mid_gc_writes_the_mirror_the_gc_leaves() {
                     peer_acl: Vec::new(),
                     expected_peer_ip: None,
                     anyip: false,
+                    local_peers: packetframe_fast_path::fib::local_peer::LocalPeers::root_only(),
                 },
             ),
             integrity_authority: packetframe_common::config::IntegrityAuthoritySpec::None,

@@ -61,6 +61,36 @@ how to roll back to the kernel-FIB path if something goes wrong.
   `FP_CFG_FLAG_PACKETFRAME_FIB` bit in the CFG map; kernel-FIB mode bypasses
   all of the above and calls `bpf_fib_lookup()` as before.
 
+### Route capacity
+
+Per address family, the route mirror admits at most as many prefixes as
+the pinned FIB map has slots (never more than the compiled maximum). A
+prefix holds its slot while it is in the mirror, and also after a
+withdrawal whose map delete failed: the kernel entry is still there and
+still forwarding, so the slot, the repair debt and the IDs it points at
+stay until a retried delete lands. Each family also admits at most eight
+advertisements per prefix slot in aggregate, 256 peer/path
+advertisements for any one prefix, and eight distinct nexthops per
+advertisement. Refreshing an advertisement that already exists, or
+adding one to a prefix that already holds a slot, uses no new slot.
+
+At the limit, PacketFrame keeps forwarding what is installed and keeps
+applying refreshes and withdrawals. It refuses the new route, logs
+`route admission limit reached; awaiting a complete feed replay` once,
+withholds readiness, and after 60 seconds requests a full replay of the
+feed. If the replay also exceeds capacity, the session keeps applying
+updates, and a withdrawal, peer departure or sweep that frees a slot
+schedules another replay after the same delay. A clean replay restores
+readiness. A feed that stays too large needs fewer exported routes or
+paths. A refused local route (`local-prefix`, `fallback-default`) needs
+a daemon restart, which seeds them from the kernel again, before
+readiness returns.
+
+A failed withdrawal delete fails every GC that retries it, which is what
+keeps the route source from reporting the session reconciled; the
+`GC recompute failed; prefixes retained for the next GC` warning names
+it.
+
 ## Healthy operation
 
 Indicators that the PacketFrame FIB path is working:
@@ -148,6 +178,62 @@ If the session is missing:
 - bird's `protocol bgp packetframe { ... }` block is present and
   bird hasn't logged a session-establishment failure: `journalctl
   -u bird | tail -50`
+- packetframe has not refused the connection:
+  `journalctl -u packetframe | grep 'accept rejected'`. See
+  [who may connect to the route-source listener](#who-may-connect-to-the-route-source-listener).
+
+### Who may connect to the route-source listener
+
+BGP and BMP carry no authentication here, and a loopback or AnyIP
+listen address is reachable by every process on the router. So when a
+connection comes from this host, the listener asks the kernel who owns
+the other end (socket diagnostics, `inet_diag`) before it reads a byte,
+and admits it only if the owner is:
+
+- **root**, always. FRR's bgpd opens its outbound sessions as root (its
+  real uid stays 0), so on an FRR-fed gateway the socket bgpd connects
+  from is root's, not `frr`'s. Measured on the reference lab gateway,
+  2026-11-20.
+- the account `peer-user <name|uid>` names, if set:
+
+  ```
+  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551 peer-user bird
+  route-source bmp 127.0.0.1:6543 require-loc-rib peer-user frr
+  ```
+
+- with no `peer-user`, the `frr` and `bird` accounts, where they exist.
+  Existing configs need no change.
+
+A local connection is also refused if its owner has already closed or
+half-closed it, or if it comes from one of this host's addresses with no
+socket left behind it. A process could otherwise write a feed, close,
+and leave the data queued for us. On 5.15 a closed socket reports root
+as its owner.
+
+A remote peer has no socket on this host and is judged as before, by
+`peer-from` and `peer-ip`.
+
+The start logs the allowed uids (`local_peer_uids` on the `BGP listener
+started` / `BMP station listening` line). A refusal is a WARN naming the
+reason:
+
+```
+BGP accept rejected: the connecting socket is owned by uid 1000, which may not feed routes (root, the peer-user account, or by default frr/bird)
+```
+
+If the routing daemon itself is refused, find the account that owns its
+socket and name it with `peer-user`:
+
+```sh
+ss -Htnep state established "( dport = :1179 )"   # uid:N is shown when it is not 0
+```
+
+The start fails if the kernel has no TCP socket diagnostics
+(`CONFIG_INET_DIAG`, `CONFIG_INET_TCP_DIAG`; the `inet_diag` and
+`tcp_diag` modules elsewhere), or if `peer-user` names an account the
+host does not have. The UniFi gateways' 5.15 kernels build both options
+in. They have neither nftables nor iptables' owner match, which is why
+the check uses socket diagnostics rather than a packet filter.
 
 ### Feeding from FRR instead of bird (`anyip`)
 
@@ -1963,10 +2049,10 @@ will try again.
 The BMP route source is useful when:
 
 - Your routing daemon emits **RFC 9069 Loc-RIB BMP** (peer_type 3).
-  FRR has this today; bird does not. Set `require-loc-rib` on the
-  `route-source bmp` line; the BmpStation will refuse any
-  non-Loc-RIB frame and tear the session down with an error,
-  preventing silent wrong-forwarding from pre/post-policy streams:
+  In `packetframe-fib` mode, the BMP station closes the session on
+  any non-Loc-RIB RouteMonitoring frame. Set `require-loc-rib` in
+  `compare` mode as well to prepare for a live cutover. An unfiltered
+  compare feed needs a restart before it can drive forwarding.
 
   ```
   route-source bmp 127.0.0.1:6543 require-loc-rib
@@ -2391,7 +2477,8 @@ Check:
 ### Symptom: `pass_not_for_us` jumps and `fwd_ok` falls with it
 
 What it means: the XDP program routes a matched frame only when its
-destination MAC is in `RX_MACS` for the port it arrived on. Everything
+destination MAC is in `RX_MACS` for the port it arrived on and the VLAN
+it arrived on (untagged, or its 802.1Q VID). Everything
 else goes to the kernel untouched and counts `pass_not_for_us`. Without
 the check, a bridge member's hook routed frames between two hosts on
 one VLAN when either address was allowlisted: TTL decremented, source
@@ -2401,16 +2488,42 @@ and a `fallback-default` /0 sent them upstream.
 
 Per port, `RX_MACS` holds the MACs `packetframe_common::topology::
 receive_macs` derives, the same rule vpp-offload uses for its divert
-rules:
+rules, each keyed on the VLANs it is received on
+(`receive_vlan_macs`):
 
-- a bridge member: the bridge's MAC, plus the MAC of each L3 device (a
-  VLAN device or VLAN bridge that no bridge has enslaved) on a VLAN of
-  that bridge;
+- a bridge member: the bridge's MAC untagged; and on the VID of each L3
+  device (a VLAN device or VLAN bridge that no bridge has enslaved) on
+  a VLAN of that bridge, the bridge's MAC and that device's;
 - a plain port, including one enslaved to a master that is not a
-  bridge (a VRF): its own MAC. A VLAN sub-interface there with a MAC of
-  its own is left out, so frames addressed to it take the kernel path;
-- a bond: its MACs, keyed on the bond's ifindex and on each slave's
+  bridge (a VRF): its own MAC, untagged and on the VID of each L3
+  device on a VLAN of the port. A VLAN sub-interface there with a MAC
+  of its own is left out, so frames addressed to it take the kernel
+  path;
+- a member of a bridge with `vlan_filtering` on (UniFi's `switch0`):
+  the same MACs, keyed by the VID on the wire, for each frame the
+  bridge admits and passes up to its own stack, read from one AF_BRIDGE
+  dump per refresh (`bridge vlan show`). An untagged or priority-tagged
+  frame takes the port's PVID; a VLAN must be in the port's table and
+  be one of the bridge's own (`bridge vlan show dev switch0`). Passed up
+  untagged it reaches the bridge's MAC; passed up tagged, the MACs of
+  that VLAN's L3 device as above. So on a gateway where each port has
+  VLAN 1 as PVID and 3900 tagged, the port's keys are VIDs 0, 1 and
+  3900. A `bridge vlan` add or delete is followed like any link change;
+- a member of a bridge filtering in a way that rule does not model
+  (`vlan_protocol 802.1ad`, or a setting that cannot be read): nothing,
+  so every frame on that port takes the kernel path. Attach, and the
+  watcher when the setting changes, log `port's bridge filters by VLAN
+  in a way RX_MACS does not model` with the reason;
+- a bond: its entries, keyed on the bond's ifindex and on each slave's
   (native XDP on a bond reports the slave as the ingress interface).
+
+A frame tagged with a VID that has no L3 device on its port (or the
+port's bridge) is one the kernel drops, since no VLAN device takes it,
+so the fast path passes it too. An 802.1ad (S-tagged) frame always takes
+the kernel path: `/proc/net/vlan/config` does not say which TPID a VLAN
+device has, so the entries are 802.1Q's, as for `VLAN_RESOLVE`. A VLAN
+that leaves a port loses its entries at once, even when another entry
+of that refresh cannot be inserted.
 
 Attach fills the map before the first XDP attach. From then on the
 redirect-target watcher refreshes it on every `RTM_NEWLINK`, so a bridge
@@ -2428,11 +2541,15 @@ router MAC is missing from the map. Check:
 - `journalctl -u packetframe | grep -E 'RX_MACS|receive MACs'`: attach
   logs `RX_MACS populated`, the watcher logs `RX_MACS refreshed from
   link events`, and a port whose MACs could not be read logs `receive
-  MACs unreadable` by name.
+  MACs unreadable` by name (a failed `bridge VLAN dump` makes every
+  filtering bridge's member unreadable for that pass).
 - `bpftool map dump pinned /sys/fs/bpf/packetframe/fast-path/maps/RX_MACS`
-  against `ip -br link`. Each key is the port's ifindex (4 bytes,
-  little-endian), the MAC and 2 pad bytes. Every attached port should
-  have its own MAC (plain port) or its bridge's MAC (bridge member).
+  against `ip -br link`, `cat /proc/net/vlan/config` and, for a member
+  of a filtering bridge, `bridge vlan show`. Each key is the
+  port's ifindex (4 bytes, little-endian), the MAC, and the VID (2
+  bytes, little-endian; 0 for untagged). Every attached port should have
+  its own MAC (plain port) or its bridge's MAC (bridge member) untagged,
+  and an entry on each VID it routes.
 - The MAC your hosts actually send to: `ip neigh` on a host for the
   gateway address, or `tcpdump -e` on the port. A MAC that belongs to
   none of the devices above, such as a macvlan or VRRP virtual MAC, is

@@ -492,7 +492,7 @@ fn pass_path_preserves_packet_bytes_on_devmap_miss() {
         let map = bpf.map_mut("RX_MACS").expect("RX_MACS map");
         let mut rx: aya::maps::HashMap<_, common::RxMacKey, u8> =
             aya::maps::HashMap::try_from(map).expect("HashMap::try_from RX_MACS");
-        rx.insert(common::RxMacKey::new(ifindex_a, mac_a), 1u8, 0)
+        rx.insert(common::RxMacKey::new(ifindex_a, 0, mac_a), 1u8, 0)
             .expect("RX_MACS insert");
     }
 

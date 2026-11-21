@@ -54,6 +54,20 @@ A point release on 0.6.4 for VPP v26.10, and for VPPs other than the vpp-unifi b
 
 ### Changes
 
+**fast-path**
+
+- A route-feed connection that dispatched no route since the last `Resync` (a failed handshake, a session that sent nothing) no longer queues another walk over the whole mirror ahead of the next session's table. BGP and BMP alike. [#415](https://github.com/unredacted/packetframe/pull/415)
+
+- The route mirror is bounded by the FIB map's capacity: per family, a new prefix is refused once every slot is held, and advertisements are bounded per prefix and in aggregate. At the limit, installed routes keep forwarding and refreshes and withdrawals still apply; readiness is withheld and a full feed replay is requested after 60 s. A withdrawal whose map delete failed keeps its slot and fails every GC until a retried delete lands, where a retry used to report it done while the route stayed installed. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/packetframe-fib.md#route-capacity), [#417](https://github.com/unredacted/packetframe/pull/417))
+
+- The XDP program routes a frame only on a VLAN the router has an L3 device for on its ingress port, as the kernel would; on a bridge with `vlan_filtering` on, only on what the bridge's VLAN tables admit and pass up. [#418](https://github.com/unredacted/packetframe/pull/418)
+
+- A route-source listener admits a connection from this host only if root owns it, or the account `peer-user <name|uid>` names (by default `frr` and `bird`, where they exist), so no other local process can feed the route mirror. Existing configs keep working; the start needs the kernel's TCP socket diagnostics (`CONFIG_INET_DIAG`), which UniFi gateways have. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/packetframe-fib.md#who-may-connect-to-the-route-source-listener), [#419](https://github.com/unredacted/packetframe/pull/419))
+
+**neigh-snoop**
+
+- An install decided while the kernel held the address unresolved (INCOMPLETE, FAILED) is written without `NLM_F_REPLACE`, so it can no longer overwrite a MAC the kernel confirmed after the decision. Only a STALE entry with another MAC is replaced. [#416](https://github.com/unredacted/packetframe/pull/416)
+
 **vpp-offload**
 
 - The binary-API bindings are generated from VPP v26.10 (stable/2610 at b4caea981), and `generated.rs` is unchanged: no wire-format change, so the CRC handshake accepts 26.06 and 26.10 alike. ([#403](https://github.com/unredacted/packetframe/pull/403))
