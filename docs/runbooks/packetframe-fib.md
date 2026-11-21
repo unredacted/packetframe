@@ -1963,10 +1963,10 @@ will try again.
 The BMP route source is useful when:
 
 - Your routing daemon emits **RFC 9069 Loc-RIB BMP** (peer_type 3).
-  FRR has this today; bird does not. Set `require-loc-rib` on the
-  `route-source bmp` line; the BmpStation will refuse any
-  non-Loc-RIB frame and tear the session down with an error,
-  preventing silent wrong-forwarding from pre/post-policy streams:
+  In `packetframe-fib` mode, the BMP station closes the session on
+  any non-Loc-RIB RouteMonitoring frame. Set `require-loc-rib` in
+  `compare` mode as well to prepare for a live cutover. An unfiltered
+  compare feed needs a restart before it can drive forwarding.
 
   ```
   route-source bmp 127.0.0.1:6543 require-loc-rib
