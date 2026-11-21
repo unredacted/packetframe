@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.5] - UNRELEASED
+
+### Changes
+
+**fast-path**
+
+- A route-feed connection that dispatched no route since the last `Resync` (a failed handshake, a session that sent nothing) no longer queues another walk over the whole mirror ahead of the next session's table. BGP and BMP alike. [#415](https://github.com/unredacted/packetframe/pull/415)
+
 ## [0.6.4] - 2026-11-13
 
 A point release on 0.6.3 for the minutes between a gateway's start and the fast path forwarding on a whole table, then VPP steering. After the 6.0.17 upgrade of the reference deployment (2026-11-12), the operator switched `dry-run` off by hand once the seed had applied (1:43 under load) and moved the steering lever once VPP was ready (22 s). The daemon can now do both itself. A route-ledger seed goes into the live FIB longest prefix first, the neighbour resolver keeps serving while the seed applies, and the daemon runs at bgpd's priority. A 0.6.3 config and route ledger carry over unchanged. Both new behaviours are opt-in.
