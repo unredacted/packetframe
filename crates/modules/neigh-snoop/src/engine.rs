@@ -25,7 +25,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -179,7 +179,115 @@ impl Vtysh for FrrQueue {
 enum Origin {
     Learn,
     Seed,
-    Derived,
+    Derived(IpAddr),
+}
+
+/// An enqueued target can have both direct and sibling evidence. Preserve
+/// its original counter attribution and the most recently observed sibling.
+/// No age applies here: `seed-max-age` filters the persisted file at load,
+/// and a bridge back from an outage longer than that re-seeds its
+/// retained table.
+#[derive(Clone, Copy)]
+struct PendingInstall {
+    seed: bool,
+    sibling: Option<IpAddr>,
+}
+
+impl PendingInstall {
+    fn new(origin: Origin) -> Self {
+        Self {
+            seed: origin == Origin::Seed,
+            sibling: match origin {
+                Origin::Derived(ip) => Some(ip),
+                _ => None,
+            },
+        }
+    }
+
+    fn resolve(
+        self,
+        ip: IpAddr,
+        table: &LearnedTable,
+    ) -> Option<(Origin, &crate::table::LearnedEntry)> {
+        if let Some(entry) = table.get(&ip) {
+            return Some((
+                if self.seed {
+                    Origin::Seed
+                } else {
+                    Origin::Learn
+                },
+                entry,
+            ));
+        }
+        let source = self.sibling?;
+        Some((Origin::Derived(source), table.get(&source)?))
+    }
+}
+
+/// One FIFO slot per destination. The reverse index lets eviction cancel
+/// work without walking or leaving tombstones in a large bridge queue.
+#[derive(Default)]
+struct PendingInstalls {
+    order: BTreeMap<u64, (IpAddr, PendingInstall)>,
+    slots: HashMap<IpAddr, u64>,
+}
+
+impl PendingInstalls {
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn refresh(&mut self, ip: IpAddr, new: PendingInstall) -> Option<PendingInstall> {
+        let slot = self.slots.get(&ip)?;
+        let (_, existing) = self.order.get_mut(slot).expect("indexed pending install");
+        if new.sibling.is_some() {
+            existing.sibling = new.sibling;
+        }
+        Some(*existing)
+    }
+
+    fn enqueue(&mut self, ip: IpAddr, intent: PendingInstall, cap: usize) -> bool {
+        if self.len() >= cap {
+            return false;
+        }
+        let slot = self.order.last_key_value().map_or(0, |(last, _)| last + 1);
+        self.order.insert(slot, (ip, intent));
+        self.slots.insert(ip, slot);
+        true
+    }
+
+    fn remove(&mut self, ip: &IpAddr) {
+        if let Some(slot) = self.slots.remove(ip) {
+            self.order.remove(&slot);
+        }
+    }
+
+    fn remove_evidence(&mut self, target: IpAddr, lost: IpAddr, table: &LearnedTable) -> bool {
+        let Some(slot) = self.slots.get(&target) else {
+            return false;
+        };
+        let (_, intent) = self.order.get_mut(slot).expect("indexed pending install");
+        if intent.sibling == Some(lost) {
+            intent.sibling = None;
+        }
+        if table.get(&target).is_some() || intent.sibling.is_some_and(|ip| table.get(&ip).is_some())
+        {
+            return false;
+        }
+        self.remove(&target);
+        true
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(IpAddr, PendingInstall) -> bool) {
+        self.order.retain(|_, (ip, origin)| {
+            if keep(*ip, *origin) {
+                true
+            } else {
+                self.slots.remove(ip);
+                false
+            }
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -224,8 +332,7 @@ struct IfaceState {
     socket_error: Option<String>,
     promisc_confirmed: bool,
     heard_peers: HashSet<IpAddr>,
-    pending: VecDeque<InstallJob>,
-    queued: HashSet<IpAddr>,
+    pending: PendingInstalls,
     in_flight: HashMap<IpAddr, InFlight>,
     /// Holddown bookkeeping for addresses installed by derivation,
     /// which are not in the learned table.
@@ -254,8 +361,7 @@ impl IfaceState {
             socket_error: None,
             promisc_confirmed: false,
             heard_peers: HashSet::new(),
-            pending: VecDeque::new(),
-            queued: HashSet::new(),
+            pending: PendingInstalls::default(),
             in_flight: HashMap::new(),
             derived_last_install: HashMap::new(),
             dirty_since: None,
@@ -270,6 +376,121 @@ impl IfaceState {
         }
     }
 
+    fn observe(&mut self, learned: frame::Learned, wall: SystemTime, now: Instant) -> Observe {
+        let (outcome, evicted) =
+            self.table
+                .observe(learned.ip, learned.mac, learned.source, wall, now);
+        if let Some(ip) = evicted {
+            self.forget_evidence(ip);
+            self.counters.learn(LearnOutcome::Evicted);
+        }
+        outcome
+    }
+
+    fn forget_evidence(&mut self, ip: IpAddr) {
+        if self.pending.remove_evidence(ip, ip, &self.table) {
+            self.counters.install(InstallOutcome::QueueDropped);
+        }
+        if let Some(siblings) = self.cfg.siblings_of(&ip) {
+            for &target in siblings {
+                if self.pending.remove_evidence(target, ip, &self.table) {
+                    self.counters.install(InstallOutcome::QueueDropped);
+                }
+            }
+        }
+    }
+
+    fn prune_pending(&mut self) {
+        let before = self.pending.len();
+        self.pending
+            .retain(|ip, intent| intent.resolve(ip, &self.table).is_some());
+        while self.pending.len() > self.table.cap() {
+            let (_, &(ip, _)) = self.pending.order.last_key_value().unwrap();
+            self.pending.remove(&ip);
+        }
+        self.counters.installs[InstallOutcome::QueueDropped.index()] +=
+            (before - self.pending.len()) as u64;
+    }
+
+    /// Resolve the current MAC at both admission and handoff. A live row
+    /// for the destination takes precedence over a declared sibling.
+    fn install_job(
+        &mut self,
+        ip: IpAddr,
+        intent: PendingInstall,
+        mirror: &KernelMirror,
+        now: Instant,
+    ) -> Option<(Origin, u32, [u8; 6], InstallMode)> {
+        let ifindex = self.ifindex.filter(|_| self.up)?;
+        let Some((origin, evidence)) = intent.resolve(ip, &self.table) else {
+            self.counters.install(InstallOutcome::QueueDropped);
+            return None;
+        };
+        let last_install = match origin {
+            Origin::Derived(_) => self.derived_last_install.get(&ip).copied(),
+            _ => evidence.last_install,
+        };
+        match install_decision(
+            mirror.get(ifindex, &ip),
+            evidence.mac,
+            last_install,
+            now,
+            DEFAULT_HOLDDOWN,
+        ) {
+            Decision::Install(reason) => Some((origin, ifindex, evidence.mac, reason.mode())),
+            Decision::Skip(reason) => {
+                self.counters.install(InstallOutcome::Skipped(reason));
+                None
+            }
+        }
+    }
+
+    fn consider_install(
+        &mut self,
+        ip: IpAddr,
+        origin: Origin,
+        mirror: &KernelMirror,
+        now: Instant,
+    ) -> bool {
+        let intent = PendingInstall::new(origin);
+        if let Some(existing) = self.pending.refresh(ip, intent) {
+            // A duplicate keeps its turn. Mirror state and holddown can
+            // change again before the paced installer takes it.
+            return self.install_job(ip, existing, mirror, now).is_some();
+        }
+        if self.install_job(ip, intent, mirror, now).is_none() {
+            return false;
+        }
+        if self.pending.enqueue(ip, intent, self.table.cap()) {
+            true
+        } else {
+            self.counters.install(InstallOutcome::QueueDropped);
+            false
+        }
+    }
+
+    fn next_install(
+        &mut self,
+        bridge_idx: usize,
+        mirror: &KernelMirror,
+        now: Instant,
+    ) -> Option<InstallJob> {
+        while let Some((_, &(ip, intent))) = self.pending.order.first_key_value() {
+            if let Some((origin, ifindex, mac, mode)) = self.install_job(ip, intent, mirror, now) {
+                return Some(InstallJob {
+                    bridge_idx,
+                    ifindex,
+                    ip,
+                    mac,
+                    origin,
+                    mode,
+                });
+            }
+            self.pending.remove(&ip);
+        }
+        None
+    }
+
     fn mark_dirty(&mut self, now: Instant) {
         if self.dirty_since.is_none() {
             self.dirty_since = Some(now);
@@ -281,7 +502,7 @@ impl IfaceState {
     fn confirmed(&mut self, origin: Origin) {
         match origin {
             Origin::Seed => self.counters.seed(SeedOutcome::Confirmed),
-            Origin::Learn | Origin::Derived => self.counters.install(InstallOutcome::Confirmed),
+            Origin::Learn | Origin::Derived(_) => self.counters.install(InstallOutcome::Confirmed),
         }
     }
 }
@@ -1024,8 +1245,7 @@ impl Engine {
                 b.in_flight.clear();
                 // Rate-limited jobs still queued target the dead ifindex
                 // and would also block the re-seed's enqueue by dedup.
-                b.pending.clear();
-                b.queued.clear();
+                b.pending = PendingInstalls::default();
                 b.ifindex = Some(info.ifindex);
                 b.own_mac = info.mac;
                 b.promisc_confirmed = info.promisc;
@@ -1078,8 +1298,7 @@ impl Engine {
         b.up_since = None;
         b.own_addrs.clear();
         b.in_flight.clear();
-        b.pending.clear();
-        b.queued.clear();
+        b.pending = PendingInstalls::default();
         b.counters.link_event(LinkEvent::Down);
         self.publish_coverage_params();
     }
@@ -1153,13 +1372,10 @@ impl Engine {
 
     fn seed(&mut self, bi: usize, now: Instant) {
         self.purge_inadmissible(bi, now);
-        let entries: Vec<(IpAddr, [u8; 6])> = self.bridges[bi]
-            .table
-            .iter()
-            .map(|(ip, e)| (*ip, e.mac))
-            .collect();
-        for (ip, mac) in entries {
-            self.consider_install(bi, ip, mac, Origin::Seed, now);
+        let b = &mut self.bridges[bi];
+        let entries: Vec<_> = b.table.iter().map(|(ip, _)| *ip).collect();
+        for ip in entries {
+            b.consider_install(ip, Origin::Seed, &self.mirror, now);
         }
     }
 
@@ -1190,6 +1406,7 @@ impl Engine {
         }
         for (ip, why) in &rejected {
             b.table.remove(ip);
+            b.forget_evidence(*ip);
             b.counters.filter_reject(*why);
         }
         b.mark_dirty(now);
@@ -1468,10 +1685,7 @@ impl Engine {
                 b.counters.filter_reject(why);
                 continue;
             }
-            let (outcome, evicted) = b.table.observe(l.ip, l.mac, l.source, wall, now);
-            if evicted.is_some() {
-                b.counters.learn(LearnOutcome::Evicted);
-            }
+            let outcome = b.observe(l, wall, now);
             // Any admitted observation counts as hearing a peer: a peer
             // restored from disk refreshes rather than appears, and a
             // peer added by hot reload may already be in the table.
@@ -1499,61 +1713,18 @@ impl Engine {
                     );
                 }
             }
-            self.consider_install(bi, l.ip, l.mac, Origin::Learn, now);
+            b.consider_install(l.ip, Origin::Learn, &self.mirror, now);
             // One MAC per member port: a MAC learned for one address of
             // a declared router applies to its other addresses too.
-            let siblings: Vec<IpAddr> = self.bridges[bi]
+            let siblings: Vec<IpAddr> = b
                 .cfg
                 .siblings_of(&l.ip)
                 .map(|s| s.iter().copied().filter(|s| *s != l.ip).collect())
                 .unwrap_or_default();
             for s in siblings {
-                if self.consider_install(bi, s, l.mac, Origin::Derived, now) {
-                    self.bridges[bi].counters.learn(LearnOutcome::Derived);
+                if b.consider_install(s, Origin::Derived(l.ip), &self.mirror, now) {
+                    b.counters.learn(LearnOutcome::Derived);
                 }
-            }
-        }
-    }
-
-    /// Run the install decision and queue the job if it says install.
-    /// Returns whether a job was queued.
-    fn consider_install(
-        &mut self,
-        bi: usize,
-        ip: IpAddr,
-        mac: [u8; 6],
-        origin: Origin,
-        now: Instant,
-    ) -> bool {
-        let b = &mut self.bridges[bi];
-        let Some(ifindex) = b.ifindex else {
-            return false;
-        };
-        if !b.up {
-            return false;
-        }
-        let last_install = match origin {
-            Origin::Derived => b.derived_last_install.get(&ip).copied(),
-            _ => b.table.get(&ip).and_then(|e| e.last_install),
-        };
-        let kernel = self.mirror.get(ifindex, &ip);
-        match install_decision(kernel, mac, last_install, now, DEFAULT_HOLDDOWN) {
-            Decision::Install(reason) => {
-                if b.queued.insert(ip) {
-                    b.pending.push_back(InstallJob {
-                        bridge_idx: bi,
-                        ifindex,
-                        ip,
-                        mac,
-                        origin,
-                        mode: reason.mode(),
-                    });
-                }
-                true
-            }
-            Decision::Skip(reason) => {
-                b.counters.install(InstallOutcome::Skipped(reason));
-                false
             }
         }
     }
@@ -1576,33 +1747,7 @@ impl Engine {
         let now = Instant::now();
         for k in 0..n {
             let bi = (self.rr + k) % n;
-            let job = loop {
-                let Some(mut job) = self.bridges[bi].pending.pop_front() else {
-                    break None;
-                };
-                let b = &mut self.bridges[bi];
-                b.queued.remove(&job.ip);
-                if !b.up || b.ifindex != Some(job.ifindex) {
-                    continue; // enqueued for a device that is gone
-                }
-                if let Some(e) = b.table.get(&job.ip) {
-                    job.mac = e.mac;
-                }
-                let last_install = match job.origin {
-                    Origin::Derived => b.derived_last_install.get(&job.ip).copied(),
-                    _ => b.table.get(&job.ip).and_then(|e| e.last_install),
-                };
-                let kernel = self.mirror.get(job.ifindex, &job.ip);
-                match install_decision(kernel, job.mac, last_install, now, DEFAULT_HOLDDOWN) {
-                    Decision::Install(reason) => {
-                        job.mode = reason.mode();
-                        break Some(job);
-                    }
-                    Decision::Skip(reason) => {
-                        b.counters.install(InstallOutcome::Skipped(reason));
-                    }
-                }
-            };
+            let job = self.bridges[bi].next_install(bi, &self.mirror, now);
             let Some(job) = job else {
                 continue;
             };
@@ -1610,6 +1755,7 @@ impl Engine {
             match self.install_tx.try_send(job.clone()) {
                 Ok(()) => {
                     let b = &mut self.bridges[bi];
+                    b.pending.remove(&job.ip);
                     b.in_flight.insert(
                         job.ip,
                         InFlight {
@@ -1620,12 +1766,12 @@ impl Engine {
                     );
                     match job.origin {
                         Origin::Seed => b.counters.seed(SeedOutcome::Requested),
-                        Origin::Learn | Origin::Derived => {
+                        Origin::Learn | Origin::Derived(_) => {
                             b.counters.install(InstallOutcome::Requested)
                         }
                     }
                     match job.origin {
-                        Origin::Derived => {
+                        Origin::Derived(_) => {
                             b.derived_last_install.insert(job.ip, now);
                         }
                         _ => {
@@ -1635,13 +1781,11 @@ impl Engine {
                         }
                     }
                 }
-                Err(mpsc::error::TrySendError::Full(job)) => {
-                    // Hand-off buffer full: keep the job at the head.
-                    let b = &mut self.bridges[bi];
-                    b.queued.insert(job.ip);
-                    b.pending.push_front(job);
+                // A full handoff keeps the same FIFO slot for the next tick.
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.bridges[bi].pending.remove(&job.ip);
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {}
             }
             return;
         }
@@ -1677,6 +1821,7 @@ impl Engine {
         self.ticks += 1;
         for bi in 0..self.bridges.len() {
             let b = &mut self.bridges[bi];
+            b.prune_pending();
             let expired: Vec<IpAddr> = b
                 .in_flight
                 .iter()
@@ -1687,7 +1832,7 @@ impl Engine {
                 if let Some(p) = b.in_flight.remove(&ip) {
                     match p.origin {
                         Origin::Seed => b.counters.seed(SeedOutcome::Unconfirmed),
-                        Origin::Learn | Origin::Derived => {
+                        Origin::Learn | Origin::Derived(_) => {
                             b.counters.install(InstallOutcome::Unconfirmed)
                         }
                     }
@@ -1775,6 +1920,18 @@ impl Engine {
         self.deny_macs = new.deny_macs.clone();
         for bi in 0..self.bridges.len() {
             self.purge_inadmissible(bi, now);
+            let b = &mut self.bridges[bi];
+            // A regrouped peer no longer vouches for a former sibling.
+            // Keep any independent evidence for the target itself.
+            for (target, intent) in b.pending.order.values_mut() {
+                if intent.sibling.is_some_and(|source| {
+                    !b.cfg
+                        .siblings_of(&source)
+                        .is_some_and(|group| group.contains(target))
+                }) {
+                    intent.sibling = None;
+                }
+            }
         }
         if new.hot.table_max != self.hot.table_max {
             for b in &mut self.bridges {
@@ -1786,6 +1943,9 @@ impl Engine {
                     b.mark_dirty(now);
                 }
             }
+        }
+        for b in &mut self.bridges {
+            b.prune_pending();
         }
         self.hot = new.hot.clone();
         // Presence and list names are restart-only (refused upstream);
@@ -2133,5 +2293,184 @@ async fn rs_task(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+    use crate::cfg::PeerCfg;
+    use crate::frame::{Learned, Source};
+    use std::net::Ipv4Addr;
+
+    const MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
+    const NEW_MAC: [u8; 6] = [2, 0, 0, 0, 0, 2];
+
+    fn ip(n: u8) -> IpAddr {
+        Ipv4Addr::new(192, 0, 2, n).into()
+    }
+
+    fn bridge(cap: usize, peers: &[u8]) -> IfaceState {
+        let cfg = BridgeCfg {
+            name: "br0".into(),
+            ix_mode: false,
+            prefixes: vec!["192.0.2.0/24".parse().unwrap()],
+            peers: vec![PeerCfg {
+                addrs: peers.iter().copied().map(ip).collect(),
+                route_server: false,
+            }],
+        };
+        let mut b = IfaceState::new(cfg, cap);
+        b.ifindex = Some(1);
+        b.up = true;
+        b
+    }
+
+    fn observe(b: &mut IfaceState, n: u8, mac: [u8; 6], now: Instant) {
+        b.observe(
+            Learned {
+                ip: ip(n),
+                mac,
+                source: Source::ArpReply,
+            },
+            SystemTime::now(),
+            now,
+        );
+    }
+
+    #[test]
+    fn table_evictions_bound_the_fifo_and_index_and_keep_current_work() {
+        let mut b = bridge(3, &[]);
+        let mirror = KernelMirror::default();
+        let start = Instant::now();
+        for n in 1..=9 {
+            let now = start + Duration::from_millis(n.into());
+            observe(&mut b, n, MAC, now);
+            assert!(b.consider_install(ip(n), Origin::Learn, &mirror, now));
+            assert!(b.consider_install(ip(n), Origin::Learn, &mirror, now));
+            assert_eq!(b.pending.len(), b.table.len());
+            assert_eq!(b.pending.slots.len(), b.pending.len());
+            assert!(b.pending.slots.keys().all(|ip| b.table.get(ip).is_some()));
+        }
+        assert_eq!(b.counters.installs[InstallOutcome::QueueDropped.index()], 6);
+        let now = start + Duration::from_secs(1);
+        observe(&mut b, 7, NEW_MAC, now);
+        for n in 7..=9 {
+            let job = b.next_install(0, &mirror, now).unwrap();
+            assert_eq!(job.ip, ip(n));
+            assert_eq!(job.mac, if n == 7 { NEW_MAC } else { MAC });
+            // Until the installer accepts the handoff the head stays queued.
+            assert_eq!(b.next_install(0, &mirror, now).unwrap().ip, job.ip);
+            b.pending.remove(&job.ip);
+        }
+        assert!(b.next_install(0, &mirror, now).is_none());
+    }
+
+    #[test]
+    fn derived_work_tracks_its_source_and_shares_the_cap_with_seeds() {
+        let mut b = bridge(3, &[1, 2, 3]);
+        let mirror = KernelMirror::default();
+        let start = Instant::now();
+        observe(&mut b, 1, MAC, start);
+        assert!(b.consider_install(ip(1), Origin::Seed, &mirror, start));
+        for n in [2, 3] {
+            assert!(b.consider_install(ip(n), Origin::Derived(ip(1)), &mirror, start));
+        }
+        let now = start + Duration::from_secs(1);
+        observe(&mut b, 4, MAC, now);
+        assert!(!b.consider_install(ip(4), Origin::Learn, &mirror, now));
+        assert_eq!(b.pending.len(), 3);
+        observe(&mut b, 2, NEW_MAC, now);
+        assert!(b.consider_install(ip(2), Origin::Learn, &mirror, now));
+        assert!(b.consider_install(ip(3), Origin::Derived(ip(2)), &mirror, now));
+        observe(&mut b, 5, MAC, now);
+        assert!(b.table.get(&ip(1)).is_none());
+        let first = b.next_install(0, &mirror, now).unwrap();
+        assert_eq!(
+            (first.ip, first.mac, first.origin),
+            (ip(2), NEW_MAC, Origin::Learn)
+        );
+        b.pending.remove(&first.ip);
+        let sibling = b.next_install(0, &mirror, now).unwrap();
+        assert_eq!(
+            (sibling.ip, sibling.mac, sibling.origin),
+            (ip(3), NEW_MAC, Origin::Derived(ip(2)))
+        );
+        assert!(b.consider_install(ip(4), Origin::Learn, &mirror, now));
+        b.table.set_cap(1);
+        b.prune_pending();
+        assert!(b.pending.len() <= 1);
+        assert_eq!(b.pending.len(), b.pending.slots.len());
+        assert!(b
+            .pending
+            .order
+            .values()
+            .all(|&(ip, intent)| intent.resolve(ip, &b.table).is_some()));
+    }
+
+    /// `seed-max-age` filters the persisted file at load and nothing else:
+    /// a bridge back from an outage longer than that re-seeds the table it
+    /// kept, so its queued seed work never expires with age.
+    #[test]
+    fn queued_seeds_do_not_expire_with_seed_max_age() {
+        let mut b = bridge(2, &[]);
+        let mirror = KernelMirror::default();
+        let start = Instant::now();
+        observe(&mut b, 1, MAC, start);
+        let later = start + Duration::from_secs(30 * 86_400);
+        assert!(b.consider_install(ip(1), Origin::Seed, &mirror, later));
+        b.prune_pending();
+        let job = b.next_install(0, &mirror, later).unwrap();
+        assert_eq!((job.ip, job.mac, job.origin), (ip(1), MAC, Origin::Seed));
+        assert_eq!(b.counters.installs[InstallOutcome::QueueDropped.index()], 0);
+    }
+
+    #[test]
+    fn live_refresh_keeps_a_seeds_turn_through_a_transient_skip() {
+        let mut b = bridge(2, &[]);
+        let mut mirror = KernelMirror::default();
+        let start = Instant::now();
+        observe(&mut b, 1, MAC, start);
+        assert!(b.consider_install(ip(1), Origin::Seed, &mirror, start));
+        mirror.upsert(
+            1,
+            ip(1),
+            MirrorEntry {
+                state: crate::table::NudState::Reachable,
+                mac: Some(MAC),
+            },
+        );
+        let refreshed = start + Duration::from_secs(1);
+        observe(&mut b, 1, MAC, refreshed);
+        assert!(!b.consider_install(ip(1), Origin::Learn, &mirror, refreshed));
+        assert_eq!(b.pending.len(), 1);
+        mirror.remove(1, &ip(1));
+        let later = refreshed + Duration::from_secs(61);
+        b.prune_pending();
+        let job = b.next_install(0, &mirror, later).unwrap();
+        assert_eq!((job.ip, job.mac, job.origin), (ip(1), MAC, Origin::Seed));
+    }
+
+    #[test]
+    fn queued_target_keeps_its_independent_sibling_observation() {
+        let mut b = bridge(2, &[1, 2]);
+        let mirror = KernelMirror::default();
+        let first = Instant::now();
+        let later = first + Duration::from_secs(1);
+        observe(&mut b, 1, MAC, first);
+        assert!(b.consider_install(ip(1), Origin::Learn, &mirror, first));
+        observe(&mut b, 2, NEW_MAC, later);
+        assert!(b.consider_install(ip(1), Origin::Derived(ip(2)), &mirror, later));
+        let direct = b.next_install(0, &mirror, later).unwrap();
+        assert_eq!((direct.mac, direct.origin), (MAC, Origin::Learn));
+        observe(&mut b, 3, MAC, later + Duration::from_secs(1));
+        let sibling = b.next_install(0, &mirror, later).unwrap();
+        assert_eq!(
+            (sibling.ip, sibling.mac, sibling.origin),
+            (ip(1), NEW_MAC, Origin::Derived(ip(2)))
+        );
+        observe(&mut b, 4, MAC, later + Duration::from_secs(2));
+        assert!(b.pending.slots.is_empty());
+        assert!(b.next_install(0, &mirror, later).is_none());
     }
 }
