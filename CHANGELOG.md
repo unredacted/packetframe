@@ -40,6 +40,8 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 - The XDP program routes a frame only on a VLAN the router has an L3 device for on its ingress port, as the kernel would; on a bridge with `vlan_filtering` on, only on what the bridge's VLAN tables admit and pass up. [#418](https://github.com/unredacted/packetframe/pull/418)
 
+- A route-source listener admits a connection from this host only if root owns it, or the account `peer-user <name|uid>` names (by default `frr` and `bird`, where they exist), so no other local process can feed the route mirror. Existing configs keep working; the start needs the kernel's TCP socket diagnostics (`CONFIG_INET_DIAG`), which UniFi gateways have. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/packetframe-fib.md#who-may-connect-to-the-route-source-listener), [#419](https://github.com/unredacted/packetframe/pull/419))
+
 **neigh-snoop**
 
 - An install decided while the kernel held the address unresolved (INCOMPLETE, FAILED) is written without `NLM_F_REPLACE`, so it can no longer overwrite a MAC the kernel confirmed after the decision. Only a STALE entry with another MAC is replaced. [#416](https://github.com/unredacted/packetframe/pull/416)

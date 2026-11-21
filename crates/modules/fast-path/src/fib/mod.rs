@@ -46,6 +46,12 @@ pub mod neigh_supervision;
 /// loop. The resolver and the programmer that feed it are Linux-gated.
 pub mod resolve_watch;
 
+/// Which local accounts may feed the route mirror, judged at a route
+/// source's `accept()`. The rules are pure and tested everywhere; the
+/// socket-diagnostics lookups behind them are Linux's, with `ENOSYS`
+/// stubs elsewhere.
+pub mod local_peer;
+
 #[cfg(target_os = "linux")]
 pub mod anyip;
 #[cfg(target_os = "linux")]
