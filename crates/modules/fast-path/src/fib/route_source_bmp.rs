@@ -1180,7 +1180,10 @@ mod tests {
             .and_then(|l| l.local_addr())
             .expect("free port");
         let shutdown = CancellationToken::new();
-        let station = BmpStation::new(addr, prog.clone(), shutdown.clone());
+        // This process's own account is admitted, so the connections
+        // reach the session path rather than the local-peer refusal.
+        let station = BmpStation::new(addr, prog.clone(), shutdown.clone())
+            .with_local_peers(LocalPeers::root_only().and_uid(unsafe { libc::geteuid() }));
         let serving = tokio::spawn(station.run());
         for _ in 0..3 {
             let mut conn = loop {
