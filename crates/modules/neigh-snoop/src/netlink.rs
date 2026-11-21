@@ -36,6 +36,23 @@ pub struct LinkInfo {
     pub ifindex: u32,
     pub name: Option<String>,
     pub mac: Option<[u8; 6]>,
+    /// Administratively up *and* with carrier (`IFF_UP` and
+    /// `IFF_LOWER_UP`): the state in which the kernel keeps what is
+    /// installed. When a device that is up loses carrier, the kernel
+    /// flushes its non-permanent neighbours (`neigh_carrier_down`, under
+    /// the default `arp_evict_nocarrier`/`ndisc_evict_nocarrier`). That
+    /// happens when a port under the bridge goes down, and also when a
+    /// device created without carrier comes up before its link does,
+    /// once the kernel gets to the carrier-off event from the creation.
+    /// Linkwatch can hold that event for up to a second, so a seed
+    /// written in between is lost. The flush comes from the same
+    /// `NETDEV_CHANGE` that sends the RTM_NEWLINK reporting no carrier,
+    /// and the notifiers run before the message is sent. So a flush is
+    /// followed by a message that reads not up, and the message that
+    /// brings carrier back re-seeds. The one exception is carrier that
+    /// is back before the message is built, since the flags are read
+    /// then. A driver can do that outside RTNL, but only in the time the
+    /// notifiers take, which is far shorter than a port renegotiating.
     pub up: bool,
     pub promisc: bool,
 }
@@ -64,7 +81,10 @@ pub fn link_info(msg: &LinkMessage) -> LinkInfo {
         ifindex: msg.header.index,
         name,
         mac,
-        up: msg.header.flags.contains(LinkFlags::Up),
+        up: msg
+            .header
+            .flags
+            .contains(LinkFlags::Up | LinkFlags::LowerUp),
         promisc: promiscuity > 0 || msg.header.flags.contains(LinkFlags::Promisc),
     }
 }
@@ -445,7 +465,7 @@ mod tests {
     fn link_info_reads_name_mac_and_flags() {
         let mut m = LinkMessage::default();
         m.header.index = 9;
-        m.header.flags = LinkFlags::Up | LinkFlags::Promisc;
+        m.header.flags = LinkFlags::Up | LinkFlags::LowerUp | LinkFlags::Promisc;
         m.attributes = vec![
             LinkAttribute::IfName("br0".into()),
             LinkAttribute::Address(vec![2, 0, 0, 0, 0, 9]),
@@ -455,6 +475,12 @@ mod tests {
         assert_eq!(l.name.as_deref(), Some("br0"));
         assert_eq!(l.mac, Some([2, 0, 0, 0, 0, 9]));
         assert!(l.up && l.promisc);
+        // Up without carrier is not up: the kernel flushes what is
+        // installed there once it processes the carrier loss.
+        m.header.flags = LinkFlags::Up | LinkFlags::Promisc;
+        assert!(!link_info(&m).up);
+        m.header.flags = LinkFlags::LowerUp;
+        assert!(!link_info(&m).up);
         // Socket-membership promiscuity: refcount attribute, no flag.
         m.header.flags = LinkFlags::Up;
         m.attributes.push(LinkAttribute::Promiscuity(1));

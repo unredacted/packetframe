@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.6] - UNRELEASED
+
+### Changes
+
+**neigh-snoop**
+
+- A bridge counts as up only when it also has carrier. When it loses carrier, the kernel flushes its neighbours. The learned table is now re-seeded when carrier comes back, not only after an admin bring-up, and a bridge that comes up before its link is no longer seeded into a flush. [#423](https://github.com/unredacted/packetframe/pull/423)
+
 ## [0.6.5] - 2026-11-21
 
 A point release on 0.6.4 with fixes from a security review, and support for VPP v26.10 and VPPs other than the vpp-unifi builds. The fixes tighten what may feed the route mirror and how much it may hold, keep the XDP fast path to the VLANs the kernel would route, and harden neigh-snoop's saved cache, install queue and conflict handling. vpp-offload's VPP bindings, regenerated against v26.10, come out identical, so 0.6.5 attaches to VPP 26.06 or 26.10. The packaged VPP sampler plugin is now built for v26.10, and it builds for any VPP from 26.06 on. A 0.6.4 config and route ledger carry over unchanged, except in the cases listed under Upgrading.

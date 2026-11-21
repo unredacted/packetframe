@@ -1431,7 +1431,9 @@ impl Engine {
                     self.bring_up(bi, now).await;
                     self.publish_coverage_params();
                 } else if b.up && !info.up {
-                    info!(bridge = %name, "bridge down");
+                    // Down or without carrier (see `LinkInfo::up`); a
+                    // carrier loss has flushed its neighbours already.
+                    info!(bridge = %name, "bridge down or without carrier");
                     b.up = false;
                     b.up_since = None;
                     b.counters.link_event(LinkEvent::Down);

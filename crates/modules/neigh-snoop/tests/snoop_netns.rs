@@ -1498,6 +1498,41 @@ fn survives_device_recreation_by_name() {
     rig.stop();
 }
 
+/// (f) The bridge loses carrier and gets it back while staying
+/// administratively up, as when its only port flaps. The kernel flushes
+/// every non-permanent neighbour on a device whose carrier goes down
+/// (`arp_evict_nocarrier`, `ndisc_evict_nocarrier`), so the learned table
+/// must be re-seeded when carrier returns, as after a bring-up.
+#[test]
+#[ignore = "needs CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_ADMIN; run via sudo -E cargo test -p packetframe-neigh-snoop --tests -- --ignored"]
+fn re_seeds_when_carrier_returns() {
+    let rig = Rig::start();
+    rig.inject(&arp_request(MAC_X, MAC_X, v4(77), v4(200)));
+    rig.wait_neigh("198.51.100.77", |l| l.contains("STALE"));
+    let (netns, b) = (rig.names.netns.clone(), rig.names.veth_b.clone());
+
+    // Downing the peer takes the carrier off veth A, which stays up.
+    ns_run(&netns, &["ip", "link", "set", &b, "down"]);
+    wait_for(Duration::from_secs(5), "the carrier-loss flush", || {
+        rig.neigh("198.51.100.77")
+            .is_none()
+            .then(|| "flushed".to_string())
+    });
+    rig.wait_counter("carrier loss seen as down", |s| {
+        s.bridges[0].link == packetframe_neigh_snoop::snapshot::LinkState::Down
+    });
+
+    // No frame is injected from here on: only a re-seed can put it back.
+    ns_run(&netns, &["ip", "link", "set", &b, "up"]);
+    let line = rig.wait_neigh("198.51.100.77", |l| l.contains("STALE"));
+    assert!(line.contains(&mac_str(MAC_X)), "{line}");
+    rig.wait_counter("re-seed confirmed", |s| {
+        s.bridges[0].link == packetframe_neigh_snoop::snapshot::LinkState::Up
+            && s.bridges[0].counters.seeds[SeedOutcome::Confirmed.index()] >= 1
+    });
+    rig.stop();
+}
+
 /// (j) Coverage reads kernel nexthop objects: routes installed with
 /// `nhid` (FRR's shape) carry no gateway attribute, so the sampler
 /// must expand the objects — including a group — and skip the
