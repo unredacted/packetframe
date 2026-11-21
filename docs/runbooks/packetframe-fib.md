@@ -178,6 +178,62 @@ If the session is missing:
 - bird's `protocol bgp packetframe { ... }` block is present and
   bird hasn't logged a session-establishment failure: `journalctl
   -u bird | tail -50`
+- packetframe has not refused the connection:
+  `journalctl -u packetframe | grep 'accept rejected'`. See
+  [who may connect to the route-source listener](#who-may-connect-to-the-route-source-listener).
+
+### Who may connect to the route-source listener
+
+BGP and BMP carry no authentication here, and a loopback or AnyIP
+listen address is reachable by every process on the router. So when a
+connection comes from this host, the listener asks the kernel who owns
+the other end (socket diagnostics, `inet_diag`) before it reads a byte,
+and admits it only if the owner is:
+
+- **root**, always. FRR's bgpd opens its outbound sessions as root (its
+  real uid stays 0), so on an FRR-fed gateway the socket bgpd connects
+  from is root's, not `frr`'s. Measured on the reference lab gateway,
+  2026-11-20.
+- the account `peer-user <name|uid>` names, if set:
+
+  ```
+  route-source bgp 127.0.0.1:1179 local-as 65551 peer-as 65551 peer-user bird
+  route-source bmp 127.0.0.1:6543 require-loc-rib peer-user frr
+  ```
+
+- with no `peer-user`, the `frr` and `bird` accounts, where they exist.
+  Existing configs need no change.
+
+A local connection is also refused if its owner has already closed or
+half-closed it, or if it comes from one of this host's addresses with no
+socket left behind it. A process could otherwise write a feed, close,
+and leave the data queued for us. On 5.15 a closed socket reports root
+as its owner.
+
+A remote peer has no socket on this host and is judged as before, by
+`peer-from` and `peer-ip`.
+
+The start logs the allowed uids (`local_peer_uids` on the `BGP listener
+started` / `BMP station listening` line). A refusal is a WARN naming the
+reason:
+
+```
+BGP accept rejected: the connecting socket is owned by uid 1000, which may not feed routes (root, the peer-user account, or by default frr/bird)
+```
+
+If the routing daemon itself is refused, find the account that owns its
+socket and name it with `peer-user`:
+
+```sh
+ss -Htnep state established "( dport = :1179 )"   # uid:N is shown when it is not 0
+```
+
+The start fails if the kernel has no TCP socket diagnostics
+(`CONFIG_INET_DIAG`, `CONFIG_INET_TCP_DIAG`; the `inet_diag` and
+`tcp_diag` modules elsewhere), or if `peer-user` names an account the
+host does not have. The UniFi gateways' 5.15 kernels build both options
+in. They have neither nftables nor iptables' owner match, which is why
+the check uses socket diagnostics rather than a packet filter.
 
 ### Feeding from FRR instead of bird (`anyip`)
 

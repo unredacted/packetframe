@@ -61,6 +61,7 @@ use tracing::{debug, info, warn};
 
 use packetframe_common::fib::{IpPrefix, PeerId, RouteEvent, RouteSourceError};
 
+use crate::fib::local_peer::{LocalPeers, Peer};
 use crate::fib::programmer::{FibProgrammerHandle, ProgrammerError};
 
 /// Cap on a single BMP message size. Per RFC 7854 §4.1 the
@@ -123,6 +124,9 @@ pub struct BmpStation {
     /// source IP must fall within at least one entry or the
     /// connection is dropped before the BMP framing starts.
     peer_acl: Vec<ipnet::IpNet>,
+    /// The accounts whose sockets on this host may connect. See
+    /// [`crate::fib::local_peer`].
+    local_peers: LocalPeers,
     /// Session-liveness handle, reported to the second tier. See
     /// [`packetframe_common::fib::FeedSession`].
     session: Option<std::sync::Arc<packetframe_common::fib::FeedSession>>,
@@ -202,6 +206,7 @@ impl BmpStation {
             stall_gate: None,
             require_loc_rib: false,
             peer_acl: Vec::new(),
+            local_peers: LocalPeers::root_only(),
             session: None,
             up_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             saw_peer_up: std::sync::atomic::AtomicBool::new(false),
@@ -318,6 +323,13 @@ impl BmpStation {
         self
     }
 
+    /// Set the accounts whose sockets on this host may connect. Root
+    /// alone by default.
+    pub fn with_local_peers(mut self, local_peers: LocalPeers) -> Self {
+        self.local_peers = local_peers;
+        self
+    }
+
     /// Main loop: bind, accept, handle one connection at a time.
     /// On disconnect (clean or error), emit Resync so the programmer
     /// marks all mirrored routes unseen, the next `RouteEvent::Add`
@@ -331,6 +343,7 @@ impl BmpStation {
         info!(
             addr = %self.listen_addr,
             peer_acl_entries = self.peer_acl.len(),
+            local_peer_uids = ?self.local_peers.uids(),
             auth_posture = if loopback_only { "loopback-only" } else { "allow-remote (no TCP-MD5)" },
             "BMP station listening"
         );
@@ -392,6 +405,21 @@ impl BmpStation {
                                 drop(stream);
                                 continue;
                             }
+                            // And the owner of the other end, when it
+                            // is on this host (Codex Security
+                            // occ_d9beffd5): any local process could
+                            // otherwise feed the station, and as BMP
+                            // never writes, even one that wrote its
+                            // stream and closed would be read in full.
+                            if let Err(refusal) = self.admit_local(&stream, addr) {
+                                warn!(
+                                    %addr,
+                                    allowed_uids = ?self.local_peers.uids(),
+                                    "BMP accept rejected: {refusal}"
+                                );
+                                drop(stream);
+                                continue;
+                            }
                             info!(%addr, "BMP client connected");
                             if let Err(e) = self.handle_connection(stream).await {
                                 warn!(error = %e, "BMP connection handler exited with error");
@@ -446,6 +474,23 @@ impl BmpStation {
                 }
             }
         }
+    }
+
+    /// Whether the account owning `stream`'s other end, when it is on
+    /// this host, may feed routes.
+    fn admit_local(
+        &self,
+        stream: &TcpStream,
+        addr: SocketAddr,
+    ) -> Result<(), crate::fib::local_peer::Refusal> {
+        let local = stream
+            .local_addr()
+            .map_err(crate::fib::local_peer::Refusal::Lookup)?;
+        match self.local_peers.check(local, addr)? {
+            Peer::Local { uid } => debug!(%addr, uid, "BMP connection from a local peer"),
+            Peer::Remote => {}
+        }
+        Ok(())
     }
 
     /// Handle one BMP connection. Spawns a reader task that pushes
@@ -1122,7 +1167,7 @@ fn bind_with_reuseaddr(addr: SocketAddr) -> std::io::Result<TcpListener> {
 mod tests {
     use super::*;
     use crate::fib::programmer::recording_handle;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Connections that end without a frame dispatch no route event, so
     /// they owe no Resync: before, each queued a walk over the whole
@@ -1157,5 +1202,45 @@ mod tests {
         assert!(log.is_empty(), "{:?}", log.events());
         shutdown.cancel();
         serving.await.expect("join").expect("run");
+    }
+
+    /// BMP never writes to its peer, so a refused connection shows only
+    /// as the station closing it, where an admitted one would be held
+    /// open waiting for frames (Codex Security occ_d9beffd5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_connection_from_another_account_is_closed_unread() {
+        if unsafe { libc::geteuid() } == 0 {
+            // Root is always admitted, so a root test process has no
+            // other account to be.
+            return;
+        }
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port")
+            .port();
+        let listen = SocketAddr::from(([127, 0, 0, 1], port));
+        let (prog, log) = recording_handle();
+        let shutdown = CancellationToken::new();
+        // Root alone: this process's own uid is not admitted.
+        let station = BmpStation::new(listen, prog, shutdown.clone());
+        let running = tokio::spawn(station.run());
+        let mut conn = loop {
+            match TcpStream::connect(listen).await {
+                Ok(conn) => break conn,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut byte))
+            .await
+            .expect("a refused connection is closed, not held open");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        assert!(
+            log.is_empty(),
+            "nothing reached the programmer: {:?}",
+            log.events()
+        );
+        shutdown.cancel();
+        running.await.expect("join").expect("station");
     }
 }
