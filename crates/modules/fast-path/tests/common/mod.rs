@@ -311,10 +311,16 @@ impl Harness {
     }
 
     /// Program `mac` as a destination MAC the router receives on at
-    /// `ifindex` (`RX_MACS`).
+    /// `ifindex`, untagged (`RX_MACS`).
     pub fn add_rx_mac(&mut self, ifindex: u32, mac: [u8; 6]) {
+        self.add_rx_mac_on(ifindex, 0, mac);
+    }
+
+    /// [`Self::add_rx_mac`] on VLAN `vid`: what attach programs for a
+    /// port with an L3 device on that VLAN.
+    pub fn add_rx_mac_on(&mut self, ifindex: u32, vid: u16, mac: [u8; 6]) {
         self.rx_macs()
-            .insert(RxMacKey::new(ifindex, mac), 1u8, 0)
+            .insert(RxMacKey::new(ifindex, vid, mac), 1u8, 0)
             .expect("RX_MACS insert");
     }
 
