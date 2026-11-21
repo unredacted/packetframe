@@ -641,12 +641,14 @@ impl FibProgrammerHandle {
 }
 
 /// Shared log of every [`RouteEvent`] a [`recording_handle`] observed,
-/// in dispatch order, and how many re-probe nudges it was sent.
+/// in dispatch order, how many re-probe nudges it was sent, and how many
+/// times it was asked whether the mirror holds session routes.
 #[doc(hidden)]
 #[derive(Clone, Default)]
 pub struct RouteEventLog {
     events: std::sync::Arc<std::sync::Mutex<Vec<RouteEvent>>>,
     reprobe_nudges: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    session_route_queries: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[doc(hidden)]
@@ -667,6 +669,13 @@ impl RouteEventLog {
     /// [`FibProgrammerHandle::reprobe_unresolved_now`] calls received.
     pub fn reprobe_nudges(&self) -> u64 {
         self.reprobe_nudges
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// [`FibProgrammerHandle::has_session_routes`] calls received: the BMP
+    /// station makes one at the end of every connection it admitted.
+    pub fn session_route_queries(&self) -> u64 {
+        self.session_route_queries
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -816,6 +825,8 @@ fn spawn_recorder(
                     let _ = reply.send(counts);
                 }
                 Command::HasSessionRoutes { reply } => {
+                    sink.session_route_queries
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let _ = reply.send(false);
                 }
                 Command::SessionFamilies { reply } => {

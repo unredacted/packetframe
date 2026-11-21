@@ -1180,15 +1180,27 @@ mod tests {
             .and_then(|l| l.local_addr())
             .expect("free port");
         let shutdown = CancellationToken::new();
-        let station = BmpStation::new(addr, prog.clone(), shutdown.clone());
+        // This process's own account is admitted, so the connections
+        // reach the session path rather than the local-peer refusal.
+        let station = BmpStation::new(addr, prog.clone(), shutdown.clone())
+            .with_local_peers(LocalPeers::root_only().and_uid(unsafe { libc::geteuid() }));
         let serving = tokio::spawn(station.run());
-        for _ in 0..3 {
+        // Three connections the station admitted. One closed before the
+        // station checks its owner is refused as already closed, before
+        // the path under test, and leaves no trace but the close; so each
+        // is held open a moment first, and one refused anyway is retried.
+        let mut attempts = 0;
+        while log.session_route_queries() < 3 {
+            attempts += 1;
+            assert!(attempts <= 20, "the station admitted too few connections");
+            let handled = log.session_route_queries();
             let mut conn = loop {
                 match TcpStream::connect(addr).await {
                     Ok(c) => break c,
                     Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
                 }
             };
+            tokio::time::sleep(Duration::from_millis(50)).await;
             conn.shutdown().await.expect("close");
             // Our end closes once the station has handled the connection.
             let mut byte = [0u8; 1];
@@ -1196,6 +1208,12 @@ mod tests {
                 .await
                 .expect("the station closes its end")
                 .ok();
+            // An admitted connection ends with the station asking the
+            // mirror whether it holds routes; a refused one never does.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            while log.session_route_queries() == handled && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
         // A round trip behind anything the station dispatched.
         prog.mirror_counts().await.expect("mirror counts");
