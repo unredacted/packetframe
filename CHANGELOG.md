@@ -36,6 +36,8 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 - A route-feed connection that dispatched no route since the last `Resync` (a failed handshake, a session that sent nothing) no longer queues another walk over the whole mirror ahead of the next session's table. BGP and BMP alike. [#415](https://github.com/unredacted/packetframe/pull/415)
 
+- The route mirror is bounded by the FIB map's capacity: per family, a new prefix is refused once every slot is held, and advertisements are bounded per prefix and in aggregate. At the limit, installed routes keep forwarding and refreshes and withdrawals still apply; readiness is withheld and a full feed replay is requested after 60 s. A withdrawal whose map delete failed keeps its slot and fails every GC until a retried delete lands, where a retry used to report it done while the route stayed installed. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.5/docs/runbooks/packetframe-fib.md#route-capacity), [#417](https://github.com/unredacted/packetframe/pull/417))
+
 **neigh-snoop**
 
 - An install decided while the kernel held the address unresolved (INCOMPLETE, FAILED) is written without `NLM_F_REPLACE`, so it can no longer overwrite a MAC the kernel confirmed after the decision. Only a STALE entry with another MAC is replaced. [#416](https://github.com/unredacted/packetframe/pull/416)
