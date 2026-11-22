@@ -1038,7 +1038,8 @@ fn neigh_stale_in_one_request(ifindex: u32, entries: &[(Ipv4Addr, [u8; 6])]) {
 /// row for any of them), then one request puts them all back STALE with
 /// another MAC. Most of those notifications are lost to the shrunk
 /// buffer, so the re-read is the first the mirror hears of them: rows
-/// that *appeared*, none dropped or changed. They are repaired only if
+/// that *appeared*, none dropped or changed (a burst the engine hears in
+/// full is deleted and sent again). They are repaired only if
 /// the re-read re-seeds on that; no frame arrives to repair them
 /// otherwise. A STALE entry holding another MAC is replaced only outside
 /// the 30 s holddown since our last install of it, so the test waits it
@@ -1077,82 +1078,111 @@ fn rows_that_appear_unheard_are_repaired() {
             .count()
     };
 
-    // Delete them all, one request per address, paced, so that each
-    // RTM_DELNEIGH is heard and the mirror holds no row for any of them.
-    // The premise can still fail on the shrunk buffer: a lost delete is an
-    // overrun, and its re-read re-seeds every address. So a round counts
-    // only if it ends with no overrun, nothing owed and nothing held;
-    // otherwise wait for the re-seed and delete again.
-    let mut clean = false;
-    for _ in 0..3 {
-        let round = rig.snapshot().netlink.overruns;
-        for i in 0..N {
-            ns_run(
-                &rig.names.netns,
-                &[
-                    "ip",
-                    "neigh",
-                    "del",
-                    &addr(i).to_string(),
-                    "dev",
-                    &rig.names.veth_a,
-                ],
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // Long enough for an overrun to be reported and published.
-        std::thread::sleep(Duration::from_secs(2));
-        let s = rig.snapshot();
-        if s.netlink.overruns == round
-            && !s.netlink.resync_pending
-            && s.bridges[0].participant_coverage.resolved == 0
-            && held() == 0
-        {
-            clean = true;
-            break;
-        }
-        wait_for(
-            Duration::from_secs(20),
-            "the re-seed after a lost delete",
-            || {
-                let s = rig.snapshot();
-                (all_resolved(&s) && !s.netlink.resync_pending && held() == usize::from(N))
-                    .then(|| format!("{s:?}"))
-            },
-        );
-    }
-    assert!(clean, "premise: a round of deletes was heard in full");
-
-    // Out of the holddown (`DEFAULT_HOLDDOWN`, 30 s from each install's
-    // dispatch): from the moment the install counters stop moving, which
-    // covers the learn's installs and any re-seed's.
+    // Install dispatches so far: the learn's installs and any re-seed's.
     let dispatched = |s: &Snapshot| {
         let c = &s.bridges[0].counters;
         c.installs[InstallOutcome::Requested.index()] + c.seeds[SeedOutcome::Requested.index()]
     };
-    let mut last = dispatched(&rig.snapshot());
-    let mut still_since = Instant::now();
-    while still_since.elapsed() < Duration::from_secs(3) {
-        std::thread::sleep(Duration::from_millis(500));
-        let now = dispatched(&rig.snapshot());
-        if now != last {
-            last = now;
-            still_since = Instant::now();
+    // Waits until the install counters have not moved for 3 s; returns
+    // their value.
+    let settled = || {
+        let mut last = dispatched(&rig.snapshot());
+        let mut still_since = Instant::now();
+        while still_since.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(500));
+            let now = dispatched(&rig.snapshot());
+            if now != last {
+                last = now;
+                still_since = Instant::now();
+            }
         }
-    }
-    std::thread::sleep(Duration::from_secs(31));
-    let before = rig.snapshot();
-    assert!(!before.netlink.resync_pending, "{:?}", before.netlink);
-    assert_eq!(dispatched(&before), last, "no install since the wait began");
-
+        last
+    };
     let a_ifindex = if_nametoindex(&rig.names.veth_a);
     let entries: Vec<(Ipv4Addr, [u8; 6])> = (0..N).map(|i| (addr(i), other(i))).collect();
-    neigh_stale_in_one_request(a_ifindex, &entries);
-    // The premise: the burst overflowed the buffer, so some of the rows
-    // reach the mirror only through the re-read.
-    rig.wait_counter("an overrun reported for the burst", |s| {
-        s.netlink.overruns > before.netlink.overruns
-    });
+
+    // The burst below must overflow the buffer, and on a many-core host
+    // the engine sometimes drains it fast enough that nothing is lost.
+    // A burst heard in full proves nothing here, so delete and burst again.
+    let mut overflowed = false;
+    for attempt in 1..=3 {
+        // Delete them all, one request per address, paced, so that each
+        // RTM_DELNEIGH is heard and the mirror holds no row for any of them.
+        // The premise can still fail on the shrunk buffer: a lost delete is an
+        // overrun, and its re-read re-seeds every address. So a round counts
+        // only if it ends with no overrun, nothing owed and nothing held;
+        // otherwise wait for the re-seed and delete again.
+        let mut clean = false;
+        for _ in 0..3 {
+            let round = rig.snapshot().netlink.overruns;
+            for i in 0..N {
+                ns_run(
+                    &rig.names.netns,
+                    &[
+                        "ip",
+                        "neigh",
+                        "del",
+                        &addr(i).to_string(),
+                        "dev",
+                        &rig.names.veth_a,
+                    ],
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // Long enough for an overrun to be reported and published.
+            std::thread::sleep(Duration::from_secs(2));
+            let s = rig.snapshot();
+            if s.netlink.overruns == round
+                && !s.netlink.resync_pending
+                && s.bridges[0].participant_coverage.resolved == 0
+                && held() == 0
+            {
+                clean = true;
+                break;
+            }
+            wait_for(
+                Duration::from_secs(20),
+                "the re-seed after a lost delete",
+                || {
+                    let s = rig.snapshot();
+                    (all_resolved(&s) && !s.netlink.resync_pending && held() == usize::from(N))
+                        .then(|| format!("{s:?}"))
+                },
+            );
+        }
+        assert!(clean, "premise: a round of deletes was heard in full");
+
+        // Out of the holddown (`DEFAULT_HOLDDOWN`, 30 s from each install's
+        // dispatch), counted from the moment the install counters stop moving.
+        let last = settled();
+        std::thread::sleep(Duration::from_secs(31));
+        let before = rig.snapshot();
+        assert!(!before.netlink.resync_pending, "{:?}", before.netlink);
+        assert_eq!(dispatched(&before), last, "no install since the wait began");
+
+        neigh_stale_in_one_request(a_ifindex, &entries);
+        // The premise: the burst overflowed the buffer, so some of the rows
+        // reach the mirror only through the re-read.
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            if rig.snapshot().netlink.overruns > before.netlink.overruns {
+                overflowed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if overflowed {
+            break;
+        }
+        // Heard in full: let whatever the engine does with those rows land
+        // before the next round deletes them.
+        eprintln!("attempt {attempt}: the burst was heard in full; deleting and bursting again");
+        settled();
+    }
+    assert!(
+        overflowed,
+        "premise: one of three bursts overflowed the buffer"
+    );
     wait_for(
         Duration::from_secs(15),
         "every learned address re-seeded STALE with its learned MAC",
