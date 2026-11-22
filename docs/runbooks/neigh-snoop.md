@@ -217,6 +217,15 @@ PF owns the dynamic half when `frr-gate` is configured:
   holds it, since bgpd's route-maps are what consult it.
 - One batched `vtysh` invocation per changed tick; a readback that
   matches the desired set is what counts as `changed`.
+- Every gate call, read or write, is `vtysh -d bgpd …`: bgpd alone,
+  because bgpd's route-maps are the only consumer. Without `-d`, vtysh
+  fans `ip prefix-list` out to every daemon that implements it. On FRR
+  10 with mgmtd running, zebra's copy goes through mgmtd as an implicit
+  commit, which needs the candidate datastore lock. vtysh tries mgmtd
+  first and stops when that fails, so a held lock or a commit stuck on
+  an unresponsive backend blocks the write to bgpd too. With `-d bgpd`,
+  zebra's copy of the lists is no longer updated. Nothing in the gate
+  reads it.
 - A reload (the lists fell back to placeholders only) triggers an
   immediate refill.
 - Route-server coverage: each `route-server` peer's received routes
@@ -318,6 +327,26 @@ session has never been up from their side).
   bgpd, not a coverage problem. `FRR says: Inbound soft reconfiguration
   not enabled` means the IX session lacks `soft-reconfiguration
   inbound`.
+- **`frr-gate` Unhealthy "vtysh exited …: % command failed, could not
+  lock candidate DS"**: a gate write went through mgmtd and mgmtd's
+  candidate datastore was locked. Releases before the gate talked to
+  bgpd alone hit this on FRR 10 with mgmtd running, and reported it as
+  `vtysh exited exit status: 1:` with nothing after the colon, because
+  vtysh prints command errors on stdout and only stderr was kept. Two
+  read-only checks show the cause. First, `vtysh -c "show mgmt
+  frontend-adapter all detail"`: the session listing `candidate` under
+  `DS-Locks` holds the lock. Second, `vtysh -c "show mgmt
+  backend-adapter all"`: a backend whose `Msg-Recvd` stays at 1 while
+  `Msg-Sent` climbs is connected but never answers, so every commit
+  waits out mgmtd's 600 s backend timeout. mgmtd logs `Backend timeout
+  … aborting commit` when that happens. Upgrade PacketFrame. The gate
+  then stops sending commits through mgmtd, so once a stuck commit
+  times out, nothing from the gate takes the lock again. Hand edits to
+  bgpd-only policy hit the same lock; `vtysh -d bgpd -c "configure
+  terminal" -c …` avoids it.
+- **`frr-gate` Unhealthy, any other error**: the text after `vtysh
+  exited …:` is vtysh's stderr followed by the last lines of its stdout.
+  The last of these is the command that stopped it.
 - **`netlink` row Degraded "netlink notifications lost (N overruns)"**:
   the kernel dropped link/neighbour/address notifications on the
   engine's subscription — a port bounce flushing a peering LAN's
