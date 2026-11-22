@@ -332,14 +332,21 @@ session has never been up from their side).
   candidate datastore was locked. Releases before the gate talked to
   bgpd alone hit this on FRR 10 with mgmtd running, and reported it as
   `vtysh exited exit status: 1:` with nothing after the colon, because
-  vtysh prints command errors on stdout and only stderr was kept. Two
+  vtysh prints command errors on stdout and only stderr was kept. Three
   read-only checks show the cause. First, `vtysh -c "show mgmt
-  frontend-adapter all detail"`: the session listing `candidate` under
-  `DS-Locks` holds the lock. Second, `vtysh -c "show mgmt
-  backend-adapter all"`: a backend whose `Msg-Recvd` stays at 1 while
-  `Msg-Sent` climbs is connected but never answers, so every commit
-  waits out mgmtd's 600 s backend timeout. mgmtd logs `Backend timeout
-  … aborting commit` when that happens. Upgrade PacketFrame. The gate
+  frontend-adapter all detail"`: the session listing `candidate` or
+  `running` under `DS-Locks` holds the lock. Second, `vtysh -c "show
+  mgmt transaction all"`: a `CONFIG` transaction can hold the lock
+  after its session is gone, shown with `Session-Id: 0`. Third, `vtysh
+  -c "show mgmt backend-adapter all"`: a backend whose `Msg-Recvd`
+  stays at 1 while `Msg-Sent` climbs is connected but never answers,
+  so every commit waits out mgmtd's 600 s backend timeout. mgmtd logs
+  `Backend timeout … aborting commit` when that happens. A backend can
+  also reject a commit and drop its connection: zebra logs a libyang
+  error (for example a UTF-8 error on a prefix-list `ipv4-prefix`) and
+  mgmtd logs `Backend daemon disconnected while processing commit!`.
+  The gate's commands are plain ASCII, so an error like that comes from
+  inside FRR, not from the gate. Upgrade PacketFrame. The gate
   then stops sending commits through mgmtd, so once a stuck commit
   times out, nothing from the gate takes the lock again. Hand edits to
   bgpd-only policy hit the same lock; `vtysh -d bgpd -c "configure
