@@ -35,6 +35,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 **neigh-snoop**
 
 - A bridge counts as up only when it also has carrier. When it loses carrier, the kernel flushes its neighbours. The learned table is now re-seeded when carrier comes back, not only after an admin bring-up, and a bridge that comes up before its link is no longer seeded into a flush. [#423](https://github.com/unredacted/packetframe/pull/423)
+- The FRR next-hop gate talks to bgpd alone (`vtysh -d bgpd`). On FRR 10 with mgmtd running, a fanned-out prefix-list write went through mgmtd first and failed whenever mgmtd's candidate datastore was locked, so the gate lists stopped refilling. A failed vtysh call's error now includes what vtysh printed on stdout, where FRR reports command errors. [#424](https://github.com/unredacted/packetframe/pull/424)
 
 ## [0.6.5] - 2026-11-21
 
