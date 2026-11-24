@@ -55,6 +55,9 @@ use packetframe_vpp_offload::vpp_api::generated::{
     SwInterfaceIp6EnableDisable, SwInterfaceIp6EnableDisableReply, SwInterfaceIp6ndRaConfig,
     SwInterfaceIp6ndRaConfigReply, SwInterfaceSetUnnumbered,
 };
+use packetframe_vpp_offload::vpp_api::generated::{
+    MssClampDetails, MssClampEnableDisable, MssClampEnableDisableReply, MssClampGetReply,
+};
 
 /// The index the fake's `dev_create_port_if` hands out. Routes must
 /// install onto *this*, learned from VPP, never onto a guess.
@@ -96,6 +99,12 @@ pub struct AclState {
 
 /// Shared [`AclState`].
 pub type Acls = std::sync::Arc<std::sync::Mutex<AclState>>;
+
+/// The `mss_clamp` plugin's state: `sw_if_index` → `(dir4, mss4, dir6,
+/// mss6)`, as VPP holds it (an unset family's value is `0xffff`). VPP
+/// state, so it outlives a connection.
+pub type MssClampTable =
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<u32, (u8, u16, u8, u16)>>>;
 
 /// One v6 neighbour: `(ip, sw_if_index, mac, flags)`.
 pub type Neighbour6 = ([u8; 16], u32, [u8; 6], u8);
@@ -202,6 +211,9 @@ pub struct Fake {
     /// outlives a connection. See the `sw_interface_add_del_address`
     /// handler for what is and is not modelled.
     pub addresses6: std::sync::Arc<std::sync::Mutex<Addresses6>>,
+    /// The `mss_clamp` plugin's table — shared so a test can play another
+    /// client changing it.
+    pub mss_clamps: MssClampTable,
     _dir: tempdir::TempDir,
     events: Receiver<Event>,
 }
@@ -363,6 +375,13 @@ pub struct Behaviour {
     /// While set, the first member port reports admin-up but LINK-DOWN —
     /// a cable pulled mid-run, toggled by the test between scans.
     pub first_port_dark: Option<&'static std::sync::atomic::AtomicBool>,
+    /// Leave the `mss_clamp` plugin's messages out of the handshake — a
+    /// VPP built without it.
+    pub no_mss_clamp_plugin: bool,
+    /// Refuse every `mss_clamp_enable_disable` with a non-zero retval.
+    pub reject_mss_clamp: bool,
+    /// Refuse only the `mss_clamp_enable_disable` that clears a clamp.
+    pub reject_mss_clamp_clear: bool,
 }
 
 /// The fake's IPv6 interface-address table: `sw_if_index` → `(octets,
@@ -473,6 +492,8 @@ impl Fake {
                 .insert(LOOPBACK_INDEX, held.to_vec());
         }
         let addrs6 = addresses6.clone();
+        let mss_clamps: MssClampTable = Default::default();
+        let clamps = mss_clamps.clone();
         thread::spawn(move || {
             let mut b = behaviour;
             // VPP's neighbour table, OUTSIDE the accept loop, because it
@@ -514,6 +535,7 @@ impl Fake {
                     &afp,
                     &acl_state,
                     &addrs6,
+                    &clamps,
                     &mut stall,
                 );
                 // One-shot hangup: the point of that test is that a fresh
@@ -532,6 +554,7 @@ impl Fake {
             neighbours6,
             acls,
             addresses6,
+            mss_clamps,
             _dir: dir,
             events: rx,
         }
@@ -559,6 +582,7 @@ fn serve(
     af_packets: &AfPackets,
     acls: &Acls,
     addresses6: &std::sync::Mutex<Addresses6>,
+    mss_clamps: &MssClampTable,
     stall: &mut Option<(&'static str, usize)>,
 ) -> Option<()> {
     // What `sw_interface_set_mac_address` last set, per interface. The
@@ -574,6 +598,10 @@ fn serve(
         message_table: Vec::new(),
     };
     for (i, m) in MESSAGE_META.iter().enumerate() {
+        if behaviour.no_mss_clamp_plugin && m.name.starts_with("mss_clamp") {
+            reply.count -= 1;
+            continue;
+        }
         let crc = if behaviour.garbage_crcs {
             "deadbeef".to_string()
         } else {
@@ -1350,6 +1378,76 @@ fn serve(
                     write_frame(sock, &d);
                 }
                 continue;
+            }
+            "mss_clamp_enable_disable" => {
+                let mut d = Decoder::new(&req);
+                let r = MssClampEnableDisable::decode(&mut d).expect("decodes as an mss_clamp set");
+                let clears = r.ipv4_direction == 0 && r.ipv6_direction == 0;
+                let retval =
+                    if behaviour.reject_mss_clamp || (behaviour.reject_mss_clamp_clear && clears) {
+                        -1
+                    } else {
+                        // VPP's `mssc_enable_disable`: a family with no
+                        // direction holds the unset value.
+                        let mss4 = if r.ipv4_direction == 0 {
+                            0xffff
+                        } else {
+                            r.ipv4_mss
+                        };
+                        let mss6 = if r.ipv6_direction == 0 {
+                            0xffff
+                        } else {
+                            r.ipv6_mss
+                        };
+                        let mut t = mss_clamps.lock().unwrap();
+                        if r.ipv4_direction == 0 && r.ipv6_direction == 0 {
+                            t.remove(&r.sw_if_index);
+                        } else {
+                            t.insert(
+                                r.sw_if_index,
+                                (r.ipv4_direction, mss4, r.ipv6_direction, mss6),
+                            );
+                        }
+                        0
+                    };
+                let _ = tx.send(Event::Msg(format!(
+                    "mss_clamp if={} dir4={} mss4={} dir6={} mss6={}",
+                    r.sw_if_index, r.ipv4_direction, r.ipv4_mss, r.ipv6_direction, r.ipv6_mss
+                )));
+                out = reply_head("mss_clamp_enable_disable_reply");
+                MssClampEnableDisableReply {
+                    context: ctx,
+                    retval,
+                }
+                .encode(&mut out);
+            }
+            "mss_clamp_get" => {
+                let snapshot: Vec<(u32, (u8, u16, u8, u16))> = mss_clamps
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(i, v)| (*i, *v))
+                    .collect();
+                for (sw_if_index, (dir4, mss4, dir6, mss6)) in snapshot {
+                    let mut d = reply_head("mss_clamp_details");
+                    MssClampDetails {
+                        context: ctx,
+                        sw_if_index,
+                        ipv4_mss: mss4,
+                        ipv6_mss: mss6,
+                        ipv4_direction: dir4,
+                        ipv6_direction: dir6,
+                    }
+                    .encode(&mut d);
+                    write_frame(sock, &d);
+                }
+                out = reply_head("mss_clamp_get_reply");
+                MssClampGetReply {
+                    context: ctx,
+                    retval: 0,
+                    cursor: u32::MAX,
+                }
+                .encode(&mut out);
             }
             "af_packet_create_v3" => {
                 let mut d = Decoder::new(&req);

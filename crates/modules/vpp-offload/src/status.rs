@@ -85,6 +85,9 @@ pub const SUBSYS_ICMP6_SOURCE: &str = "icmp6-source";
 /// ([`crate::kernel_path`]): present while any port has rules in the
 /// ledger, Degraded when it drops.
 pub const SUBSYS_KERNEL_PATH: &str = "kernel-path";
+/// VPP's TCP MSS clamp ([`crate::mss_clamp`]), present only while some
+/// `mss-clamp vlan` line is configured.
+pub const SUBSYS_MSS_CLAMP: &str = "mss-clamp";
 
 /// Liveness of the binary API, as observed from ping/pong timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,6 +387,9 @@ pub struct StatusSnapshot {
     /// [`crate::runtime::RuntimeStatus::icmp6_source`] and
     /// [`Self::v6_errors_unsourced`].
     pub icmp6_source: Option<std::net::Ipv6Addr>,
+    /// The `mss-clamp vlan` lines and which are not in place. See
+    /// [`Self::mss_clamp_health`].
+    pub mss_clamp: crate::mss_clamp::ClampStatus,
     pub undead: bool,
     pub failures: u32,
     pub counts: SinkCounts,
@@ -613,6 +619,9 @@ pub struct SteerAudit {
     /// because it only matters for the diverted IPv6 above — the
     /// `icmp6-source` row judges the two together.
     pub icmp6_source: Option<std::net::Ipv6Addr>,
+    /// See [`crate::runtime::RuntimeStatus::mss_clamp`]. Carried here
+    /// because a missing clamp holds the first steer.
+    pub mss_clamp: crate::mss_clamp::ClampStatus,
 }
 
 impl StatusSnapshot {
@@ -721,6 +730,7 @@ impl StatusSnapshot {
             steer_v6_only: audit.v6_only,
             handback: audit.handback,
             icmp6_source: audit.icmp6_source,
+            mss_clamp: audit.mss_clamp,
             undead: sup.is_undead(),
             failures: sup.failures(),
             counts,
@@ -802,6 +812,7 @@ impl StatusSnapshot {
                 v6_only: rs.steer_v6_only,
                 handback: rs.handback,
                 icmp6_source: rs.icmp6_source,
+                mss_clamp: rs.mss_clamp,
             },
             rs.shadowed_routes,
             rs.kernel_delivered_routes,
@@ -1025,6 +1036,7 @@ impl StatusSnapshot {
         }
         subsystems.extend(self.drift_v6_health());
         subsystems.extend(self.icmp6_source_health());
+        subsystems.extend(self.mss_clamp_health());
         if !self.neighbours_unplaced.is_empty() || self.fdb_unreadable.is_some() {
             let mut parts = Vec::new();
             if !self.neighbours_unplaced.is_empty() {
@@ -1192,6 +1204,9 @@ impl StatusSnapshot {
             // MTU shrinks at VPP, and a `*` hop in every traceroute. The
             // `icmp6-source` row says so, from the same predicate.
             && !self.v6_errors_unsourced()
+            // A configured MSS clamp VPP does not apply: steered SYNs to
+            // or from that VLAN leave unclamped (the `mss-clamp` row).
+            && self.mss_clamp.healthy()
             // A v6 diversion held back for the hand-back path is traffic
             // the operator asked to divert and the module is not — the
             // `v6-handback` row says Degraded, and overall must not
@@ -1472,6 +1487,66 @@ impl StatusSnapshot {
                 self.steer_v6_divert.join(", ")
             )),
             last_success_age_seconds: None,
+        })
+    }
+
+    /// The `mss-clamp` row: present only while some `mss-clamp vlan` line
+    /// is configured. Healthy when every one is in place in VPP, Degraded
+    /// while any is not, which also holds the first steer
+    /// ([`SinkCounts::mss_clamps_missing`]).
+    fn mss_clamp_health(&self) -> Option<SubsystemHealth> {
+        if self.mss_clamp.configured.is_empty() && self.mss_clamp.not_cleared.is_empty() {
+            return None;
+        }
+        let vlans = |v: &[u16]| {
+            v.iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Some(if self.mss_clamp.healthy() {
+            SubsystemHealth {
+                name: SUBSYS_MSS_CLAMP.into(),
+                state: HealthState::Healthy,
+                message: Some(format!(
+                    "TCP MSS clamped in VPP on vlan {}",
+                    vlans(&self.mss_clamp.configured)
+                )),
+                last_success_age_seconds: None,
+            }
+        } else if !self.mss_clamp.in_place() {
+            SubsystemHealth {
+                name: SUBSYS_MSS_CLAMP.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "not in place: {}. A steered SYN to or from such a VLAN would leave \
+                     unclamped, so a first steer is held until it is — \
+                     docs/runbooks/mss-clamp.md, With vpp-offload",
+                    self.mss_clamp
+                        .missing
+                        .iter()
+                        .map(|(v, why)| format!("vlan {v}: {why}"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )),
+                last_success_age_seconds: None,
+            }
+        } else {
+            SubsystemHealth {
+                name: SUBSYS_MSS_CLAMP.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "a removed clamp is still set: {}. Retried every VLAN refresh; it \
+                     only over-clamps, so steering is unaffected",
+                    self.mss_clamp
+                        .not_cleared
+                        .iter()
+                        .map(|(_, why)| why.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )),
+                last_success_age_seconds: None,
+            }
         })
     }
 
@@ -5170,6 +5245,68 @@ mod tests {
         assert!(msg.contains("IPv6 on eth4 vlan 100,200"), "{msg}");
         assert!(!msg.contains("allowlisted IPv4"), "{msg}");
         assert!(msg.contains("no IPv4 is diverted"), "{msg}");
+    }
+
+    /// The `mss-clamp` row: absent with nothing configured, Healthy with
+    /// every clamp in place, Degraded (overall too) naming the VLAN and
+    /// why while one is not.
+    #[test]
+    fn an_mss_clamp_not_in_place_is_degraded_and_named() {
+        let led = ledger_with(10, 0, 0);
+        let sup = ready_supervisor();
+        let mut snap = StatusSnapshot::observe(
+            &sup,
+            led.counts(),
+            &PendingMap::new(),
+            ApiHealth::Answering {
+                silent_for: Duration::ZERO,
+            },
+            verified(1),
+            ports_up(),
+            true,
+        );
+        let row = |s: &StatusSnapshot| {
+            s.report()
+                .subsystems
+                .into_iter()
+                .find(|x| x.name == SUBSYS_MSS_CLAMP)
+        };
+        assert_eq!(
+            snap.report().overall,
+            HealthState::Healthy,
+            "fixture must be nominal"
+        );
+        assert!(row(&snap).is_none(), "nothing configured, no row");
+
+        snap.mss_clamp = crate::mss_clamp::ClampStatus {
+            configured: vec![1337],
+            ..Default::default()
+        };
+        let r = row(&snap).unwrap();
+        assert_eq!(r.state, HealthState::Healthy);
+        assert!(r.message.unwrap().contains("vlan 1337"));
+        assert_eq!(snap.report().overall, HealthState::Healthy);
+
+        snap.mss_clamp.missing = vec![(1337, "VPP cannot clamp: no plugin".into())];
+        let r = row(&snap).unwrap();
+        assert_eq!(r.state, HealthState::Degraded);
+        let msg = r.message.unwrap();
+        assert!(msg.contains("vlan 1337: VPP cannot clamp"), "{msg}");
+        assert_eq!(snap.report().overall, HealthState::Degraded);
+
+        // A removed clamp VPP would not clear: the row stays, Degraded,
+        // with nothing configured.
+        snap.mss_clamp = crate::mss_clamp::ClampStatus {
+            not_cleared: vec![(
+                7,
+                "VPP refused to clear a removed clamp on interface 7".into(),
+            )],
+            ..Default::default()
+        };
+        let r = row(&snap).unwrap();
+        assert_eq!(r.state, HealthState::Degraded);
+        assert!(r.message.unwrap().contains("interface 7"));
+        assert_eq!(snap.report().overall, HealthState::Degraded);
     }
 
     /// Diverted IPv6 with no `loopback-address6` behind it gets an

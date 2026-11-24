@@ -32,10 +32,15 @@ route is programmed. Two consequences that are easy to miss:
 
 - **The whitelist is the contract, not the VPP release.** A new VPP
   can change a hundred messages this module never speaks and remain
-  fully compatible; compatibility is defined over the ~82 messages the
+  fully compatible; compatibility is defined over the ~89 messages the
   module actually uses. This is why the vendored bundle stays a small
   whitelist rather than the whole API surface — every vendored file
   widens what counts as a breaking change.
+- **A few messages are optional** (`OPTIONAL_MESSAGES` in
+  `src/vpp_api/transport.rs`): the `mss_clamp` plugin's, which only a
+  configured `mss-clamp vlan` uses. A VPP without them, or with them in
+  another shape, still attaches; the difference is reported by name only
+  when a clamp is configured.
 - **Incompatibility is loud and early, never adaptive.** One build of
   packetframe speaks exactly one wire format. There is no version
   negotiation and no "close enough": a mismatched CRC is refused by

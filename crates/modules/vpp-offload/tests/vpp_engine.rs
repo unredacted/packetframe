@@ -5590,3 +5590,283 @@ fn a_connect_to_a_vpp_that_never_accepts_is_bounded_and_charged_as_its_wait() {
     #[cfg(not(target_os = "linux"))]
     let _ = error;
 }
+
+// ---- `mss-clamp vlan`: VPP's TCP MSS clamp on a VLAN's L3 interfaces.
+
+fn clamps(ip4: Option<u16>) -> std::sync::Arc<packetframe_vpp_offload::mss_clamp::MssClamps> {
+    std::sync::Arc::new(packetframe_vpp_offload::mss_clamp::MssClamps::new(vec![
+        packetframe_vpp_offload::mss_clamp::VlanClamp {
+            vlan: 1337,
+            ip4,
+            ip6: None,
+        },
+    ]))
+}
+
+/// At attach the clamp lands both ways on the VLAN's BVI and on the
+/// trunk's subif; a reload's new value and a removed line follow at the
+/// next refresh, and a clamp on an interface the module does not own is
+/// never touched.
+#[test]
+fn an_mss_clamp_follows_its_vlan_line() {
+    let fake = Fake::start("mss-clamp");
+    let handle = clamps(Some(1360));
+    let mut e = engine_with_local_route(&fake).with_mss_clamps(handle.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let held = |f: &Fake| f.mss_clamps.lock().unwrap().clone();
+    let both_ways = (0x3u8, 1360u16, 0u8, 0xffffu16);
+    assert_eq!(
+        held(&fake),
+        [(SUBIF_BASE, both_ways), (BVI_BASE, both_ways)].into(),
+        "the BVI routes the VLAN, and the subif is listed too"
+    );
+    assert_eq!(e.counts().mss_clamps_missing, 0);
+    assert_eq!(e.mss_clamp_status().configured, vec![1337]);
+
+    // Another client's clamp on an interface we do not own.
+    fake.mss_clamps.lock().unwrap().insert(77, both_ways);
+    fake.drain_events();
+    let none = Mirror { routes: vec![] };
+    // Nothing changed: nothing sent.
+    e.refresh_placement(&none).expect("refresh");
+    let sent = msgs_of(&fake.drain_events());
+    assert!(
+        !sent.iter().any(|m| m.starts_with("mss_clamp if=")),
+        "an unchanged clamp is read back, not re-sent: {sent:?}"
+    );
+
+    // A reload lowers it.
+    handle.publish(clamps(Some(1300)).get());
+    e.refresh_placement(&none).expect("refresh");
+    let lower = (0x3u8, 1300u16, 0u8, 0xffffu16);
+    assert_eq!(
+        held(&fake),
+        [(SUBIF_BASE, lower), (BVI_BASE, lower), (77, both_ways)].into()
+    );
+
+    // A reload removes the line: ours come off, the stranger's stays.
+    handle.publish(Vec::new());
+    e.refresh_placement(&none).expect("refresh");
+    assert_eq!(held(&fake), [(77, both_ways)].into());
+    assert!(e.mss_clamp_status().configured.is_empty());
+    // And with nothing configured or held, the plugin is left alone.
+    fake.drain_events();
+    e.refresh_placement(&none).expect("refresh");
+    assert!(!msgs_of(&fake.drain_events())
+        .iter()
+        .any(|m| m.starts_with("mss_clamp")));
+}
+
+/// A VPP without the plugin attaches as before; a configured clamp is
+/// reported missing, which holds the first steer, rather than failing
+/// the attach.
+#[test]
+fn a_vpp_without_the_mss_clamp_plugin_holds_the_first_steer() {
+    let fake = Fake::start_behaving(
+        "mss-noplugin",
+        Behaviour {
+            no_mss_clamp_plugin: true,
+            ..Default::default()
+        },
+    );
+    // Unconfigured: nothing to say.
+    let mut e = engine_with_local_route(&fake).with_mss_clamps(std::sync::Arc::default());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh)
+        .expect("attach without the plugin");
+    assert_eq!(e.counts().mss_clamps_missing, 0);
+
+    let fake = Fake::start_behaving(
+        "mss-noplugin2",
+        Behaviour {
+            no_mss_clamp_plugin: true,
+            ..Default::default()
+        },
+    );
+    let mut e = engine_with_local_route(&fake).with_mss_clamps(clamps(Some(1360)));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh)
+        .expect("attach still succeeds");
+    let c = e.counts();
+    assert_eq!(c.mss_clamps_missing, 1);
+    assert!(
+        c.blocks_first_steer(),
+        "a missing clamp holds the first steer"
+    );
+    let why = &e.mss_clamp_status().missing[0];
+    assert_eq!(why.0, 1337);
+    assert!(why.1.contains("plugin"), "{why:?}");
+}
+
+/// A line a reload publishes is not in place until a pass has set it, so
+/// a first steer asked for in the same reload is held until then.
+#[test]
+fn a_reloaded_mss_clamp_holds_the_first_steer_until_set() {
+    let fake = Fake::start("mss-pending");
+    let handle: std::sync::Arc<packetframe_vpp_offload::mss_clamp::MssClamps> =
+        std::sync::Arc::default();
+    let mut e = engine_with_local_route(&fake).with_mss_clamps(handle.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    assert_eq!(e.counts().mss_clamps_missing, 0);
+
+    handle.publish(clamps(Some(1360)).get());
+    let c = e.counts();
+    assert_eq!(c.mss_clamps_missing, 1, "published, not yet set");
+    assert!(c.blocks_first_steer());
+    assert!(e.mss_clamp_status().missing[0].1.contains("reload"));
+
+    e.refresh_placement(&Mirror { routes: vec![] })
+        .expect("refresh");
+    assert_eq!(e.counts().mss_clamps_missing, 0);
+    assert_eq!(fake.mss_clamps.lock().unwrap().len(), 2);
+}
+
+/// An adopted VPP may hold a clamp a previous process set under a config
+/// that has since dropped it: the first pass reads VPP even with nothing
+/// configured, and takes ours off.
+#[test]
+fn a_stale_mss_clamp_is_cleared_with_nothing_configured() {
+    let fake = Fake::start("mss-stale");
+    let left = (0x3u8, 1360u16, 0u8, 0xffffu16);
+    fake.mss_clamps.lock().unwrap().insert(SUBIF_BASE, left);
+    fake.mss_clamps.lock().unwrap().insert(77, left);
+    let mut e = engine_with_local_route(&fake).with_mss_clamps(std::sync::Arc::default());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    assert_eq!(
+        *fake.mss_clamps.lock().unwrap(),
+        [(77, left)].into(),
+        "ours cleared, the stranger's kept"
+    );
+    // Swept once: later passes leave the plugin alone.
+    fake.drain_events();
+    e.refresh_placement(&Mirror { routes: vec![] })
+        .expect("refresh");
+    assert!(!msgs_of(&fake.drain_events())
+        .iter()
+        .any(|m| m.starts_with("mss_clamp")));
+}
+
+/// A removed clamp VPP will not clear is reported, and retried, even
+/// with nothing configured any more.
+#[test]
+fn a_refused_mss_clamp_removal_is_reported_and_retried() {
+    let fake = Fake::start_behaving(
+        "mss-noclear",
+        Behaviour {
+            reject_mss_clamp_clear: true,
+            ..Default::default()
+        },
+    );
+    let handle = clamps(Some(1360));
+    let mut e = engine_with_local_route(&fake).with_mss_clamps(handle.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    assert!(e.mss_clamp_status().healthy());
+
+    handle.publish(Vec::new());
+    let none = Mirror { routes: vec![] };
+    e.refresh_placement(&none).expect("refresh");
+    let s = e.mss_clamp_status();
+    assert!(s.in_place(), "nothing configured is missing");
+    assert_eq!(s.not_cleared.len(), 2, "{s:?}");
+    assert!(!s.healthy());
+    assert_eq!(
+        e.counts().mss_clamps_missing,
+        0,
+        "over-clamping holds no steer"
+    );
+
+    fake.drain_events();
+    e.refresh_placement(&none).expect("refresh");
+    assert!(
+        msgs_of(&fake.drain_events())
+            .iter()
+            .any(|m| m.starts_with("mss_clamp if=")),
+        "retried"
+    );
+    assert_eq!(e.mss_clamp_status().not_cleared.len(), 2);
+}
+
+/// [`Kernel`] whose bridge VLAN table can be made unreadable.
+struct VlansFail {
+    kernel: Kernel,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Topology for VlansFail {
+    fn classify(&self, dev: &str) -> Result<Option<DevKind>, String> {
+        self.kernel.classify(dev)
+    }
+    fn fdb(&self) -> Result<FdbSnapshot, String> {
+        self.kernel.fdb()
+    }
+    fn port_vlans(&self) -> Result<PortVlans, String> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            Err("bridge vlan table unreadable".into())
+        } else {
+            self.kernel.port_vlans()
+        }
+    }
+    fn master_of(&self, port: &str) -> Option<String> {
+        self.kernel.master_of(port)
+    }
+    fn bridge_l3(&self, bridge: &str, vid: u16) -> Option<BridgeL3> {
+        self.kernel.bridge_l3(bridge, vid)
+    }
+}
+
+/// An unreadable bridge VLAN table stops the topology work, not a
+/// reload's clamp change.
+#[test]
+fn an_mss_clamp_reload_applies_while_the_vlan_table_is_unreadable() {
+    let fake = Fake::start("mss-novlans");
+    let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = clamps(Some(1360));
+    let mut e = engine_with_local_route(&fake)
+        .with_topology(Box::new(VlansFail {
+            kernel: Kernel {
+                kinds: vec![("br1337", bridge_vlan(1337))],
+                fdb: std::sync::Arc::new(std::sync::Mutex::new(Ok(fdb_with(&[(
+                    1337, MAC, "eth4",
+                )])))),
+                vlans: Default::default(),
+                masters: vec![("eth4", "switch0")],
+                l3: vec![("switch0", 1337, BRIDGE_MAC)],
+            },
+            fail: fail.clone(),
+        }))
+        .with_mss_clamps(handle.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    handle.publish(clamps(Some(1300)).get());
+    let _ = e.refresh_placement(&Mirror { routes: vec![] });
+    let lower = (0x3u8, 1300u16, 0u8, 0xffffu16);
+    assert_eq!(
+        *fake.mss_clamps.lock().unwrap(),
+        [(SUBIF_BASE, lower), (BVI_BASE, lower)].into()
+    );
+    assert_eq!(e.counts().mss_clamps_missing, 0);
+}
+
+/// A clamp VPP refuses is missing too, and is retried at the next pass.
+#[test]
+fn a_refused_mss_clamp_is_reported_missing() {
+    let fake = Fake::start_behaving(
+        "mss-refused",
+        Behaviour {
+            reject_mss_clamp: true,
+            ..Default::default()
+        },
+    );
+    let mut e = engine_with_local_route(&fake).with_mss_clamps(clamps(Some(1360)));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    assert_eq!(e.counts().mss_clamps_missing, 1);
+    assert!(e.mss_clamp_status().missing[0].1.contains("refused"));
+    assert!(fake.mss_clamps.lock().unwrap().is_empty());
+}

@@ -1391,6 +1391,19 @@ fn apply_steering(
                         crate::driver::STEER_RETRY_EVERY.as_secs()
                     ));
                 }
+                if counts.mss_clamps_missing > 0 {
+                    return Err(format!(
+                        "refusing the first steer: {} `mss-clamp vlan` line(s) not in place \
+                         in VPP: {}. A steered SYN to or from that VLAN would leave \
+                         unclamped, because the fast path's clamp never sees a frame steered \
+                         to VPP. `packetframe status` shows the mss-clamp row. The request is \
+                         remembered: the module steers on its own once they are in place, at \
+                         most {}s later",
+                        counts.mss_clamps_missing,
+                        runtime.mss_clamps_missing().join("; "),
+                        crate::driver::STEER_RETRY_EVERY.as_secs()
+                    ));
+                }
                 let named = runtime.unresolvable_named();
                 return Err(format!(
                     "refusing the first steer: the FIB is incomplete ({} unresolvable{}, {} \

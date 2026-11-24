@@ -86,6 +86,12 @@ pub enum TransportError {
     #[error("this VPP does not implement `{0}` — is the plugin loaded?")]
     MessageUnknown(&'static str),
 
+    /// An [`OPTIONAL_MESSAGES`] message this VPP cannot be spoken to in:
+    /// absent, or present with another CRC. Raised only when something
+    /// tries to use it; the handshake let the connection through.
+    #[error("this VPP cannot be sent `{name}`: {why}")]
+    OptionalUnavailable { name: &'static str, why: String },
+
     /// A reply arrived whose id is not in the table. Distinct from a
     /// CRC mismatch: the stream is intact, we simply cannot interpret
     /// this message, which usually means an async event we did not
@@ -102,6 +108,24 @@ pub enum TransportError {
     #[error("expected context {expected}, got {got} — stream desynchronised")]
     ContextMismatch { expected: u32, got: u32 },
 }
+
+/// Messages a VPP may lack, or carry in another shape, without failing
+/// the handshake: a plugin's API that only some configurations use.
+///
+/// Every other message is checked eagerly at connect, because a skew
+/// found halfway through a FIB load is a half-populated FIB. These
+/// cannot be: refusing every VPP without the `mss_clamp` plugin would
+/// refuse attaching to VPPs that were never asked to clamp. So an
+/// absent or mismatched one is recorded instead, its id forgotten
+/// (nothing unchecked can be sent or decoded), and the reason returned
+/// by [`Transport::unavailable`] and by any attempt to use it.
+pub const OPTIONAL_MESSAGES: &[&str] = &[
+    "mss_clamp_enable_disable",
+    "mss_clamp_enable_disable_reply",
+    "mss_clamp_get",
+    "mss_clamp_get_reply",
+    "mss_clamp_details",
+];
 
 /// A connected, handshaken VPP API client.
 pub struct Transport {
@@ -130,6 +154,8 @@ pub struct Transport {
     connect_deadline: Option<Instant>,
     /// Frames VPP has sent us since the handshake. See [`Self::answers`].
     answers: u64,
+    /// [`OPTIONAL_MESSAGES`] this VPP cannot be spoken to in, and why.
+    unavailable: HashMap<&'static str, String>,
 }
 
 impl Transport {
@@ -198,6 +224,7 @@ impl Transport {
             timeout,
             waited: Duration::ZERO,
             connect_deadline: Some(deadline),
+            unavailable: HashMap::new(),
             answers: 0,
         };
         t.handshake(only)?;
@@ -267,10 +294,13 @@ impl Transport {
                 self.ids.insert(name.to_string(), entry.index);
             }
         }
-        self.verify_against(&reply, only)?;
+        self.unavailable = self.verify_against(&reply, only)?;
         if let Some(only) = only {
             self.ids.retain(|name, _| only.contains(&name.as_str()));
         }
+        let unavailable = &self.unavailable;
+        self.ids
+            .retain(|name, _| !unavailable.contains_key(name.as_str()));
 
         // Now that ids are known, index the per-message context offsets.
         for meta in MESSAGE_META {
@@ -283,7 +313,8 @@ impl Transport {
 
     /// Every message we speak must exist with our CRC: the whole
     /// whitelist, or only `only`'s names of it (see
-    /// [`Transport::connect_speaking`]).
+    /// [`Transport::connect_speaking`]). An [`OPTIONAL_MESSAGES`] one
+    /// that does not is returned, with why, instead of refused.
     ///
     /// Checked eagerly at connect rather than lazily at first use: a
     /// version skew discovered halfway through installing a million
@@ -293,7 +324,8 @@ impl Transport {
         &self,
         reply: &SockclntCreateReply,
         only: Option<&[&str]>,
-    ) -> Result<(), TransportError> {
+    ) -> Result<HashMap<&'static str, String>, TransportError> {
+        let mut unavailable = HashMap::new();
         let mut theirs: HashMap<&str, &str> = HashMap::new();
         for entry in &reply.message_table {
             if let Some((name, crc)) = entry.name.rsplit_once('_') {
@@ -304,12 +336,30 @@ impl Transport {
             .iter()
             .filter(|m| only.is_none_or(|only| only.contains(&m.name)))
         {
+            let optional = OPTIONAL_MESSAGES.contains(&meta.name);
             let Some(their_crc) = theirs.get(meta.name) else {
+                if optional {
+                    unavailable.insert(
+                        meta.name,
+                        "this VPP does not implement it — is the plugin loaded?".to_string(),
+                    );
+                    continue;
+                }
                 return Err(TransportError::MessageUnknown(meta.name));
             };
             // Ours is `0xdeadbeef`; theirs is the bare hex suffix.
             let ours = meta.crc.trim_start_matches("0x");
             if !their_crc.eq_ignore_ascii_case(ours) {
+                if optional {
+                    unavailable.insert(
+                        meta.name,
+                        format!(
+                            "API mismatch: our definitions say {}, this VPP says {their_crc}",
+                            meta.crc
+                        ),
+                    );
+                    continue;
+                }
                 return Err(TransportError::CrcMismatch {
                     name: meta.name,
                     ours: meta.crc,
@@ -317,7 +367,18 @@ impl Transport {
                 });
             }
         }
-        Ok(())
+        Ok(unavailable)
+    }
+
+    /// Why this VPP cannot be spoken to in the first of `names` it
+    /// cannot, or `None` when it can in all of them
+    /// ([`OPTIONAL_MESSAGES`]).
+    pub fn unavailable(&self, names: &[&str]) -> Option<String> {
+        names.iter().find_map(|n| {
+            self.unavailable
+                .get_key_value(n)
+                .map(|(name, why)| format!("`{name}`: {why}"))
+        })
     }
 
     fn take_context(&mut self) -> u32 {
@@ -328,6 +389,12 @@ impl Transport {
 
     /// Message id for a name, or a typed error naming what is missing.
     fn id_of<M: Message>(&self) -> Result<u16, TransportError> {
+        if let Some(why) = self.unavailable.get(M::NAME) {
+            return Err(TransportError::OptionalUnavailable {
+                name: M::NAME,
+                why: why.clone(),
+            });
+        }
         self.ids
             .get(M::NAME)
             .copied()
@@ -436,6 +503,38 @@ impl Transport {
                 return Err(TransportError::UnknownReplyId(id));
             }
             let mut d = Decoder::new(&payload);
+            out.push(Item::decode(&mut d)?);
+        }
+    }
+
+    /// Run one call of a cursor-paged `_get` service and collect it:
+    /// `req` is answered by any number of `Item`s, then by one `End`
+    /// (the `_get_reply`, carrying the retval and the cursor to resume
+    /// from). Unlike a dump, the reply IS the end-of-stream marker, so
+    /// no `control_ping` trails it.
+    ///
+    /// A message that is neither is a desynchronised stream, as in
+    /// [`Self::dump`].
+    pub fn get_page<Req, Item, End>(&mut self, req: Req) -> Result<(Vec<Item>, End), TransportError>
+    where
+        Req: Message,
+        Item: Message + Decode,
+        End: Message + Decode,
+    {
+        let item_id = self.id_of::<Item>()?;
+        let end_id = self.id_of::<End>()?;
+        self.send(req)?;
+        let mut out = Vec::new();
+        loop {
+            let payload = self.read_frame()?;
+            let id = peek_msg_id(&payload)?;
+            let mut d = Decoder::new(&payload);
+            if id == end_id {
+                return Ok((out, End::decode(&mut d)?));
+            }
+            if id != item_id {
+                return Err(TransportError::UnknownReplyId(id));
+            }
             out.push(Item::decode(&mut d)?);
         }
     }
@@ -686,7 +785,10 @@ mod tests {
             .collect()
     }
 
-    fn verify(entries: &[(String, String, u16)], response: i32) -> Result<(), TransportError> {
+    fn verify(
+        entries: &[(String, String, u16)],
+        response: i32,
+    ) -> Result<HashMap<&'static str, String>, TransportError> {
         verify_only(entries, response, None)
     }
 
@@ -694,7 +796,7 @@ mod tests {
         entries: &[(String, String, u16)],
         response: i32,
         only: Option<&[&str]>,
-    ) -> Result<(), TransportError> {
+    ) -> Result<HashMap<&'static str, String>, TransportError> {
         let owned: Vec<(&str, &str, u16)> = entries
             .iter()
             .map(|(n, c, i)| (n.as_str(), c.as_str(), *i))
@@ -720,13 +822,31 @@ mod tests {
             waited: Duration::ZERO,
             connect_deadline: None,
             answers: 0,
+            unavailable: HashMap::new(),
         };
         t.verify_against(&reply, only)
     }
 
     #[test]
     fn a_matching_table_verifies() {
-        assert!(verify(&all_ours(None), 0).is_ok());
+        assert!(verify(&all_ours(None), 0).unwrap().is_empty());
+    }
+
+    /// A VPP without an optional plugin, or with its API in another
+    /// shape, still connects: each such message is reported, not
+    /// refused, and only its use fails.
+    #[test]
+    fn an_optional_message_absent_or_drifted_is_reported_not_refused() {
+        let mut entries = all_ours(Some(("mss_clamp_get", "deadbeef")));
+        entries.retain(|(n, _, _)| n != "mss_clamp_enable_disable");
+        let unavailable = verify(&entries, 0).expect("connects");
+        assert!(unavailable["mss_clamp_enable_disable"].contains("plugin"));
+        assert!(unavailable["mss_clamp_get"].contains("deadbeef"));
+        assert_eq!(unavailable.len(), 2, "{unavailable:?}");
+        // Every optional message really is in the whitelist.
+        for name in OPTIONAL_MESSAGES {
+            assert!(MESSAGE_META.iter().any(|m| m.name == *name), "{name}");
+        }
     }
 
     #[test]
@@ -813,6 +933,7 @@ mod tests {
             waited: Duration::ZERO,
             connect_deadline: None,
             answers: 0,
+            unavailable: HashMap::new(),
         };
         t.set_timeout(deadline).unwrap();
 

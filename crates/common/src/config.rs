@@ -330,6 +330,24 @@ pub enum ModuleDirective {
     /// Broadcast and multicast exemptions are built in and need no
     /// directive.
     VppSteerExempt(Ipv4Prefix),
+    /// `mss-clamp vlan <vid> [ip4 <mss>] [ip6 <mss>]` — clamp the TCP MSS
+    /// of SYNs VPP routes to or from that VLAN, with VPP's `mss_clamp`
+    /// plugin on the VLAN's L3 interface (its BVI when bridged, otherwise
+    /// each member's subinterface), both directions.
+    ///
+    /// The fast path's `mss-clamp` runs in XDP, which a frame steered to
+    /// VPP never reaches. This is the VPP side of it, per VLAN because
+    /// the plugin's scope is an interface: every host on the VLAN is
+    /// clamped, not only one prefix. A fast-path `mss-clamp <cidr>`
+    /// whose prefix lies inside a `local-route` on this VLAN, at a value
+    /// no lower than this one, counts as covered, and the steer that
+    /// would otherwise bypass it is allowed. Hot-reloadable.
+    VppMssClamp {
+        vlan: u16,
+        ip4: Option<u16>,
+        ip6: Option<u16>,
+        line: usize,
+    },
     /// `drift-accept6 <ipv6-prefix>` — an `exempt-drift-v6` finding the
     /// operator has examined and accepted. A v6 finding whose destination
     /// is this prefix or inside it stops degrading health and is counted
@@ -2717,6 +2735,23 @@ impl Config {
     /// - `unresolvable-accept6` ([`Self::validate_vpp_unresolvable_accepts6`]);
     /// - `local-route6` ([`Self::validate_vpp_local_routes6`]).
     pub fn validate_vpp_offload(&self) -> Result<(), ConfigError> {
+        // `mss-clamp vlan` parses in any section (directive parsing is
+        // shared), but only vpp-offload reads it. Anywhere else it would
+        // be a clamp silently not installed.
+        for m in self.modules.iter().filter(|m| m.name != "vpp-offload") {
+            for d in &m.directives {
+                if let ModuleDirective::VppMssClamp { vlan, line, .. } = d {
+                    return Err(ConfigError::parse(
+                        *line,
+                        format!(
+                            "`mss-clamp vlan {vlan}` belongs in module vpp-offload, not module \
+                             {}: only VPP clamps per VLAN",
+                            m.name
+                        ),
+                    ));
+                }
+            }
+        }
         let Some(vpp) = self.modules.iter().find(|m| m.name == "vpp-offload") else {
             return Ok(());
         };
@@ -2829,6 +2864,7 @@ impl Config {
             }
         }
 
+        Self::validate_vpp_mss_clamp_lines(vpp)?;
         self.validate_vpp_v6_steering(vpp)?;
         Self::validate_vpp_drift_accepts6(vpp)?;
         Self::validate_vpp_unresolvable_accepts6(vpp)?;
@@ -3088,6 +3124,91 @@ impl Config {
         Self::validate_vpp_mss_clamps(vpp, fp, global_dir)
     }
 
+    /// `mss-clamp vlan` lines on their own: one per VLAN, on a VLAN some
+    /// port carries, IPv6 only under `v6 on`, and one IPv4 value across
+    /// them all.
+    ///
+    /// **One IPv4 value**, because of VPP 26.10's plugin: its IPv4 node
+    /// handles packets in pairs and clamps the second of each pair to the
+    /// FIRST one's interface value (`mss_clamp_node.c`, fixed upstream on
+    /// 2026-11-18 by `d3f8893947`, after 26.10). With one value that
+    /// cannot matter; with two, a SYN on one VLAN can take the other's.
+    /// To be lifted once the VPP builds PacketFrame attests carry the fix.
+    fn validate_vpp_mss_clamp_lines(vpp: &ModuleSection) -> Result<(), ConfigError> {
+        // Last one wins, as `VppOffloadConfig::from_directives` reads it.
+        let v6_on = vpp
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::VppV6(v) => Some(*v),
+                _ => None,
+            })
+            .next_back()
+            .unwrap_or(false);
+        let mut seen: Vec<u16> = Vec::new();
+        let mut first_ip4: Option<(u16, u16)> = None;
+        for d in &vpp.directives {
+            let ModuleDirective::VppMssClamp {
+                vlan,
+                ip4,
+                ip6,
+                line,
+            } = d
+            else {
+                continue;
+            };
+            if seen.contains(vlan) {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!("duplicate `mss-clamp vlan {vlan}` in module vpp-offload"),
+                ));
+            }
+            seen.push(*vlan);
+            let carried = vpp.directives.iter().any(|p| {
+                matches!(p, ModuleDirective::VppPort { vlans, vlans_all, .. }
+                    if *vlans_all || vlans.contains(vlan))
+            });
+            if !carried {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!(
+                        "mss-clamp vlan {vlan}: no `port` line carries vlan {vlan} (in its \
+                         `vlans` list, or `vlans all`), so VPP has no interface on it to \
+                         clamp"
+                    ),
+                ));
+            }
+            if ip6.is_some() && !v6_on {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!(
+                        "mss-clamp vlan {vlan}: an `ip6` clamp needs `v6 on`; without it VPP \
+                         carries no IPv6"
+                    ),
+                ));
+            }
+            if let Some(mss) = ip4 {
+                match first_ip4 {
+                    Some((other_vlan, other)) if other != *mss => {
+                        return Err(ConfigError::parse(
+                            *line,
+                            format!(
+                                "mss-clamp vlan {vlan}: ip4 {mss} differs from vlan \
+                                 {other_vlan}'s ip4 {other}. VPP 26.10's clamp applies one \
+                                 packet's interface value to the next packet in its pair, so \
+                                 VLANs with different IPv4 values would clamp each other's \
+                                 SYNs; use one IPv4 value for every VLAN"
+                            ),
+                        ));
+                    }
+                    None => first_ip4 = Some((*vlan, *mss)),
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Refuse a steer that would carry traffic a fast-path `mss-clamp`
     /// covers through VPP, which does not apply it.
     ///
@@ -3254,6 +3375,33 @@ impl Config {
             member || delivered4 || delivered6
         };
 
+        let vlan_clamp = |vid: u16| {
+            vpp.directives.iter().find_map(|d| match d {
+                ModuleDirective::VppMssClamp { vlan, ip4, ip6, .. } if *vlan == vid => {
+                    Some((*ip4, *ip6))
+                }
+                _ => None,
+            })
+        };
+        let vpp_clamped =
+            |p: &MssClampPrefix, mss: u16| {
+                vpp.directives.iter().any(|d| match (d, p) {
+                    (
+                        ModuleDirective::VppLocalRoute { prefix, vlan, .. },
+                        MssClampPrefix::V4(p),
+                    ) if prefix.contains_prefix(p) => vlan_clamp(*vlan)
+                        .and_then(|(ip4, _)| ip4)
+                        .is_some_and(|m| m <= mss),
+                    (
+                        ModuleDirective::VppLocalRoute6 { prefix, vlan, .. },
+                        MssClampPrefix::V6(p),
+                    ) if prefix.contains_prefix(p) => vlan_clamp(*vlan)
+                        .and_then(|(_, ip6)| ip6)
+                        .is_some_and(|m| m <= mss),
+                    _ => false,
+                })
+            };
+
         for d in &fp.directives {
             let ModuleDirective::MssClamp {
                 prefix,
@@ -3265,6 +3413,12 @@ impl Config {
                 continue;
             };
             if iface.as_deref().is_some_and(|dev| !vpp_egress(dev)) {
+                continue;
+            }
+            // Clamped in VPP too: the prefix's hosts live on a VLAN VPP
+            // clamps both ways, at or below this value, so everything to
+            // or from them crosses that VLAN's L3 interface in VPP.
+            if prefix.is_some_and(|p| vpp_clamped(&p, *mss)) {
                 continue;
             }
             let shown = match (prefix, iface) {
@@ -3371,10 +3525,12 @@ impl Config {
                     format!(
                         "`{shown}` would not apply to traffic `port {port}` steers to VPP: \
                          {why}. The clamp runs in the eBPF tier, which a frame diverted to \
-                         VPP never reaches, so it would leave unclamped. Keep that traffic \
-                         on the kernel path (a `steer-exempt` for traffic TO a prefix, or \
-                         `steer off` / another `direction` on the port), or drop the clamp \
-                         if it is no longer needed"
+                         VPP never reaches, so it would leave unclamped. Clamp it in VPP \
+                         too (`mss-clamp vlan <vid> ip4|ip6 <mss>` in module vpp-offload, \
+                         for a prefix inside a `local-route` on that VLAN), keep that \
+                         traffic on the kernel path (a `steer-exempt` for traffic TO a \
+                         prefix, or `steer off` / another `direction` on the port), or \
+                         drop the clamp if it is no longer needed"
                     ),
                 ));
             }
@@ -4695,6 +4851,78 @@ fn parse_wan_egress<'a>(
     })
 }
 
+/// `mss-clamp vlan <vid> [ip4 <mss>] [ip6 <mss>]`, the tokens after
+/// `vlan` ([`ModuleDirective::VppMssClamp`]).
+fn parse_vpp_mss_clamp<'a>(
+    line: usize,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> Result<ModuleDirective, ConfigError> {
+    const FORM: &str = "form: `mss-clamp vlan <vid> [ip4 <mss>] [ip6 <mss>]`, at least one family";
+    let vid_tok = rest.next().ok_or_else(|| {
+        ConfigError::parse(line, format!("mss-clamp vlan: expected a VLAN id ({FORM})"))
+    })?;
+    let vlan: u16 = vid_tok
+        .parse()
+        .ok()
+        .filter(|v| (1..=4094).contains(v))
+        .ok_or_else(|| {
+            ConfigError::parse(
+                line,
+                format!("mss-clamp vlan: `{vid_tok}` is not a VLAN id (1-4094)"),
+            )
+        })?;
+    let (mut ip4, mut ip6) = (None, None);
+    while let Some(fam) = rest.next() {
+        let slot = match fam {
+            "ip4" => &mut ip4,
+            "ip6" => &mut ip6,
+            other => {
+                return Err(ConfigError::parse(
+                    line,
+                    format!(
+                        "mss-clamp vlan {vlan}: expected `ip4` or `ip6`, got `{other}` ({FORM})"
+                    ),
+                ))
+            }
+        };
+        if slot.is_some() {
+            return Err(ConfigError::parse(
+                line,
+                format!("mss-clamp vlan {vlan}: `{fam}` given twice"),
+            ));
+        }
+        let mss_tok = rest.next().ok_or_else(|| {
+            ConfigError::parse(
+                line,
+                format!("mss-clamp vlan {vlan}: `{fam}` needs an MSS value"),
+            )
+        })?;
+        let mss: u16 = mss_tok
+            .parse()
+            .ok()
+            .filter(|m| (88..=65495).contains(m))
+            .ok_or_else(|| {
+                ConfigError::parse(
+                    line,
+                    format!("mss-clamp vlan {vlan}: MSS `{mss_tok}` is not in [88, 65495]"),
+                )
+            })?;
+        *slot = Some(mss);
+    }
+    if ip4.is_none() && ip6.is_none() {
+        return Err(ConfigError::parse(
+            line,
+            format!("mss-clamp vlan {vlan}: no MSS given ({FORM})"),
+        ));
+    }
+    Ok(ModuleDirective::VppMssClamp {
+        vlan,
+        ip4,
+        ip6,
+        line,
+    })
+}
+
 fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, ConfigError> {
     let head = first_token(s);
     let mut rest = rest_tokens(s);
@@ -4959,6 +5187,10 @@ fn parse_module_directive(line: usize, s: &str) -> Result<ModuleDirective, Confi
                      (form: `mss-clamp [<cidr>] [via <iface>] <mtu>`)",
                 )
             })?;
+            // vpp-offload's form: `mss-clamp vlan <vid> [ip4 <mss>] [ip6 <mss>]`.
+            if tok1 == "vlan" {
+                return parse_vpp_mss_clamp(line, rest);
+            }
             let mut prefix: Option<MssClampPrefix> = None;
             let mut iface: Option<String> = None;
             let mss_tok: &str;
@@ -9006,6 +9238,137 @@ module vpp-offload
             exempt,
         )
         .unwrap_err();
+    }
+
+    /// `mss-clamp vlan`: the grammar, its own rules, and the cover it
+    /// gives a fast-path clamp the guard would otherwise refuse.
+    #[test]
+    fn a_vpp_mss_clamp_covers_a_local_prefix_on_its_vlan() {
+        let parse = |l: &str| parse_module_directive(7, l).map_err(|e| format!("{e}"));
+        assert_eq!(
+            parse("mss-clamp vlan 1337 ip4 1360").unwrap(),
+            ModuleDirective::VppMssClamp {
+                vlan: 1337,
+                ip4: Some(1360),
+                ip6: None,
+                line: 7
+            }
+        );
+        assert_eq!(
+            parse("mss-clamp vlan 10 ip6 1340 ip4 1360").unwrap(),
+            ModuleDirective::VppMssClamp {
+                vlan: 10,
+                ip4: Some(1360),
+                ip6: Some(1340),
+                line: 7
+            }
+        );
+        for (bad, why) in [
+            ("mss-clamp vlan", "VLAN id"),
+            ("mss-clamp vlan 0 ip4 1360", "1-4094"),
+            ("mss-clamp vlan 4095 ip4 1360", "1-4094"),
+            ("mss-clamp vlan 10", "no MSS"),
+            ("mss-clamp vlan 10 1360", "`ip4` or `ip6`"),
+            ("mss-clamp vlan 10 ip4", "needs an MSS"),
+            ("mss-clamp vlan 10 ip4 87", "[88, 65495]"),
+            ("mss-clamp vlan 10 ip4 1360 ip4 1300", "twice"),
+        ] {
+            let e = parse(bad).unwrap_err();
+            assert!(e.contains(why), "`{bad}`: {e}");
+        }
+        // The fast path's forms are untouched.
+        assert!(matches!(
+            parse("mss-clamp 192.0.2.0/24 1360").unwrap(),
+            ModuleDirective::MssClamp { .. }
+        ));
+
+        let check = |clamp: &str, ports: &str, vpp_extra: &str| {
+            let cfg = format!(
+                "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth2 generic\n  \
+                 attach eth4 generic\n  allow-prefix 192.0.2.0/24\n  \
+                 allow-prefix 203.0.113.0/24\n  local-prefix 192.0.2.0/24 via br1337\n  \
+                 {clamp}\n\n\
+                 module vpp-offload\n  loopback-address 198.51.100.254/32\n  {ports}\n  \
+                 local-route 192.0.2.0/24 port eth4 vlan 1337\n  steer-exempt 192.0.2.0/24\n\
+                 {vpp_extra}"
+            );
+            Config::parse(&cfg)
+                .unwrap()
+                .validate_vpp_offload()
+                .map_err(|e| format!("{e}"))
+        };
+        let trunk_both = "port eth2 cores 1 steer on direction dst\n  \
+                          port eth4 cores 1 steer on vlans 1337 direction both";
+        let clamp = "mss-clamp 192.0.2.0/24 1360";
+
+        // The trunk steering both ways is refused without VPP's clamp...
+        check(clamp, trunk_both, "").unwrap_err();
+        // ...and allowed with it, at the same value or lower.
+        check(clamp, trunk_both, "  mss-clamp vlan 1337 ip4 1360\n").unwrap();
+        check(clamp, trunk_both, "  mss-clamp vlan 1337 ip4 1300\n").unwrap();
+        // A higher value does not cover it, nor does another VLAN's clamp,
+        // nor an IPv6-only one.
+        let e = check(clamp, trunk_both, "  mss-clamp vlan 1337 ip4 1400\n").unwrap_err();
+        assert!(
+            e.contains("mss-clamp vlan <vid>"),
+            "the remedy is named: {e}"
+        );
+        let other_vlan = "port eth2 cores 1 steer on direction dst\n  \
+                          port eth4 cores 1 steer on vlans 1337,88 direction both";
+        check(clamp, other_vlan, "  mss-clamp vlan 88 ip4 1360\n").unwrap_err();
+        check(
+            clamp,
+            trunk_both,
+            "  v6 on\n  mss-clamp vlan 1337 ip6 1340\n",
+        )
+        .unwrap_err();
+        // A prefix outside the local-route is not covered by its VLAN.
+        check(
+            "mss-clamp 198.18.0.0/15 1360",
+            trunk_both,
+            "  mss-clamp vlan 1337 ip4 1360\n",
+        )
+        .unwrap_err();
+
+        // The lines' own rules.
+        let e = check(
+            clamp,
+            trunk_both,
+            "  mss-clamp vlan 1337 ip4 1360\n  mss-clamp vlan 1337 ip4 1360\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("duplicate"), "{e}");
+        let e = check(clamp, trunk_both, "  mss-clamp vlan 42 ip4 1360\n").unwrap_err();
+        assert!(e.contains("no `port` line carries vlan 42"), "{e}");
+        let e = check(clamp, trunk_both, "  mss-clamp vlan 1337 ip6 1340\n").unwrap_err();
+        assert!(e.contains("`v6 on`"), "{e}");
+        let e = check(
+            clamp,
+            other_vlan,
+            "  mss-clamp vlan 1337 ip4 1360\n  mss-clamp vlan 88 ip4 1300\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("one IPv4 value"), "{e}");
+        // `vlans all` carries every VLAN.
+        let all = "port eth2 cores 1 steer on direction dst\n  \
+                   port eth4 cores 1 steer on vlans all direction both";
+        check(clamp, all, "  mss-clamp vlan 1337 ip4 1360\n").unwrap();
+        // The last `v6` line wins, as the module reads it.
+        let e = check(
+            clamp,
+            trunk_both,
+            "  v6 on\n  v6 off\n  mss-clamp vlan 1337 ip4 1360 ip6 1340\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("`v6 on`"), "{e}");
+        // Only vpp-offload reads the VLAN form.
+        let e = check(
+            "mss-clamp vlan 1337 ip4 1360",
+            trunk_both,
+            "  mss-clamp vlan 1337 ip4 1360\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("belongs in module vpp-offload"), "{e}");
     }
 
     /// dst steering into VPP without local delivery for a steerable

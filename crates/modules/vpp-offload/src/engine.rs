@@ -1083,6 +1083,17 @@ pub struct ConvergenceEngine {
     /// rather than the handle, so every count and name one status read
     /// takes is judged against the same set.
     unresolvable_accepts6: Vec<packetframe_common::config::Ipv6Prefix>,
+    /// The `mss-clamp vlan` set, read afresh on each pass
+    /// ([`Self::ensure_mss_clamps`]). `None` until a builder sets it,
+    /// which reads as no clamp configured.
+    mss_clamps: Option<std::sync::Arc<crate::mss_clamp::MssClamps>>,
+    /// Whether the configured clamps are in place, from the last pass
+    /// ([`Self::mss_clamp_status`]).
+    mss_clamp_status: crate::mss_clamp::ClampStatus,
+    /// Whether this VPP connection has had its clamps read once. Until
+    /// then a pass reads them even with nothing configured, so a clamp a
+    /// previous process left on an adopted VPP is cleared.
+    mss_clamps_swept: bool,
     /// Kernel FIB lookups the current walk may still make
     /// ([`Self::kernel_owns`]). Reset to [`FIB_MATCH_BUDGET_RESYNC`] by
     /// each resync and to [`FIB_MATCH_BUDGET_DELTA`] by each delta
@@ -1353,6 +1364,9 @@ impl ConvergenceEngine {
             link_local_refused: HashSet::new(),
             steer_exempts: Vec::new(),
             unresolvable_accepts6: Vec::new(),
+            mss_clamps: None,
+            mss_clamp_status: Default::default(),
+            mss_clamps_swept: false,
             loopback,
             loop_index: None,
             loopback6: None,
@@ -1506,6 +1520,176 @@ impl ConvergenceEngine {
         self
     }
 
+    /// Declare the `mss-clamp vlan` set's handle, which `reconfigure`
+    /// publishes into ([`crate::mss_clamp::MssClamps`]).
+    pub fn with_mss_clamps(mut self, clamps: std::sync::Arc<crate::mss_clamp::MssClamps>) -> Self {
+        self.mss_clamps = Some(clamps);
+        self
+    }
+
+    /// Whether the configured `mss-clamp vlan` lines are in place in VPP:
+    /// the last pass's answer, with any line published since counted as
+    /// not yet in place ([`crate::mss_clamp::ClampStatus::with_pending`]).
+    pub fn mss_clamp_status(&self) -> crate::mss_clamp::ClampStatus {
+        match &self.mss_clamps {
+            Some(h) => self.mss_clamp_status.clone().with_pending(&h.get()),
+            None => self.mss_clamp_status.clone(),
+        }
+    }
+
+    /// Put the configured `mss-clamp vlan` lines in place on each VLAN's
+    /// L3 interfaces, and take a removed line's clamp off ours
+    /// ([`crate::mss_clamp`]). Run at attach and on every VLAN refresh, so
+    /// an adopted VPP, a BVI built later, a trunk's new subif and a
+    /// reload all converge on the next pass. Reads VPP's clamps back each
+    /// time rather than trusting a record: another client can change
+    /// them, and a fresh VPP holds none.
+    ///
+    /// Never fails the pass for a clamp VPP will not take, or a VPP
+    /// without the plugin: those are recorded as missing, which holds the
+    /// first steer and shows on the status row. Only a broken connection
+    /// is an error, as everywhere else.
+    fn ensure_mss_clamps(&mut self) -> Result<(), EngineError> {
+        use crate::mss_clamp::{self, ClampStatus};
+        let configured = self
+            .mss_clamps
+            .as_ref()
+            .map(|h| h.get())
+            .unwrap_or_default();
+        let owned = self.port_index.indices();
+        let Some(t) = self.transport.as_mut() else {
+            return Ok(());
+        };
+        let mut status = ClampStatus {
+            configured: configured.iter().map(|c| c.vlan).collect(),
+            applied: configured.clone(),
+            ..Default::default()
+        };
+        // Nothing configured, nothing of ours to clear, and this VPP
+        // already read once: never touch the plugin, so a VPP without it
+        // is no different from before. The first pass on a connection
+        // reads regardless — an adopted VPP may hold a clamp a previous
+        // process set under a config that has since dropped it.
+        if configured.is_empty() && !self.mss_clamp_status.had_any() && self.mss_clamps_swept {
+            self.mss_clamp_status = status;
+            return Ok(());
+        }
+        if let Some(why) = t.unavailable(mss_clamp::MESSAGES) {
+            status.missing = configured
+                .iter()
+                .map(|c| (c.vlan, format!("VPP cannot clamp: {why}")))
+                .collect();
+            self.mss_clamp_status = status;
+            self.mss_clamps_swept = true;
+            return Ok(());
+        }
+        let targets: mss_clamp::Targets = configured
+            .iter()
+            .map(|c| (*c, self.vlan_l3_interfaces(c.vlan)))
+            .collect();
+        for (c, ifs) in &targets {
+            if ifs.is_empty() {
+                status.missing.push((
+                    c.vlan,
+                    "VPP has no interface on this VLAN yet (no subinterface or BVI)".into(),
+                ));
+            }
+        }
+        let want = mss_clamp::desired(&targets);
+        let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+        let held = match mss_clamp::read(t) {
+            Ok(h) => h,
+            Err(e) => {
+                self.disconnect();
+                return Err(e.into());
+            }
+        };
+        for (sw_if_index, clamp) in mss_clamp::plan(&want, &held, &owned) {
+            let t = self.transport.as_mut().ok_or(EngineError::NotConnected)?;
+            match mss_clamp::set(t, sw_if_index, clamp) {
+                Ok(Ok(())) => tracing::info!(
+                    sw_if_index,
+                    ipv4_mss = clamp.mss4,
+                    ipv6_mss = clamp.mss6,
+                    on = clamp != mss_clamp::Clamp::OFF,
+                    "vpp-offload: TCP MSS clamp set on a VLAN interface"
+                ),
+                Ok(Err(retval)) if !want.contains_key(&sw_if_index) => {
+                    status.not_cleared.push((
+                        sw_if_index,
+                        format!(
+                            "VPP refused to clear a removed clamp on interface {sw_if_index} \
+                             (retval {retval})"
+                        ),
+                    ));
+                }
+                Ok(Err(retval)) => {
+                    for (c, ifs) in &targets {
+                        if ifs.contains(&sw_if_index) {
+                            status.missing.push((
+                                c.vlan,
+                                format!(
+                                    "VPP refused the clamp on interface {sw_if_index} \
+                                     (retval {retval})"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.disconnect();
+                    return Err(e.into());
+                }
+            }
+        }
+        status.missing.sort();
+        status.missing.dedup_by_key(|(v, _)| *v);
+        if status.missing != self.mss_clamp_status.missing {
+            for (vlan, why) in &status.missing {
+                tracing::warn!(vlan, reason = %why, "vpp-offload: TCP MSS clamp not in place");
+            }
+        }
+        if status.not_cleared != self.mss_clamp_status.not_cleared {
+            for (sw_if_index, why) in &status.not_cleared {
+                tracing::warn!(sw_if_index, reason = %why, "vpp-offload: removed TCP MSS clamp still set");
+            }
+        }
+        self.mss_clamp_status = status;
+        self.mss_clamps_swept = true;
+        Ok(())
+    }
+
+    /// The VPP interfaces a VLAN is routed through: its BVI when bridged,
+    /// every member's subinterface on it, and the VF of a port that sends
+    /// it untagged. A subinterface that is only an L2 member of the
+    /// bridge sees no routed traffic, so clamping it too is harmless, and
+    /// listing it keeps the answer right whichever way the VLAN is wired.
+    fn vlan_l3_interfaces(&self, vlan: u16) -> Vec<u32> {
+        use crate::sink::NexthopTarget;
+        let mut out = Vec::new();
+        if let Some(i) = self.port_index.get(&NexthopTarget::Bvi { vlan }) {
+            out.push(i);
+        }
+        for p in &self.ports {
+            if let Some(i) = self.port_index.get(&NexthopTarget::Subif {
+                port: p.port.clone(),
+                vlan,
+            }) {
+                out.push(i);
+            }
+            if self.nexthops.is_untagged(&p.port, vlan) {
+                if let Some(i) = self.port_index.get(&NexthopTarget::Vf {
+                    port: p.port.clone(),
+                }) {
+                    out.push(i);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Declare the `vlans all` ports ([`crate::VppOffloadConfig::trunk_ports`]).
     pub fn with_trunk_ports(mut self, ports: Vec<String>) -> Self {
         self.trunk_ports = ports;
@@ -1527,11 +1711,14 @@ impl ConvergenceEngine {
     /// the next restart, which costs nothing — nothing can be placed on a
     /// VLAN the FDB no longer has.
     fn reconcile_vlans(&mut self) -> Result<(), EngineError> {
+        // An unreadable bridge or no loopback yet stops the topology work,
+        // not the clamps: a reload's clamp change is applied against the
+        // interfaces already known.
         let Some(pv) = self.refresh_untagged() else {
-            return Ok(());
+            return self.ensure_mss_clamps();
         };
         let Some(loop_idx) = self.loop_index else {
-            return Ok(());
+            return self.ensure_mss_clamps();
         };
         for port in self.trunk_ports.clone() {
             let missing: Vec<u16> = pv
@@ -1588,7 +1775,10 @@ impl ConvergenceEngine {
         // A BVI built just now, or a VLAN that turned untagged or tagged,
         // changes where a local route's attached route belongs. After
         // ip6, which a v6 attached route's new interface needs first.
-        self.rehome_attached_routes()
+        self.rehome_attached_routes()?;
+        // And the same new interfaces get their VLAN's MSS clamp, as does
+        // a clamp a reload added or removed.
+        self.ensure_mss_clamps()
     }
 
     /// Take the members' untagged VLANs from the kernel bridge, and hand
@@ -3025,6 +3215,7 @@ impl ConvergenceEngine {
     pub fn counts(&self) -> SinkCounts {
         let mut c = self.ledger.counts();
         c.unexempted_local = self.unexempted_local().len() as u64;
+        c.mss_clamps_missing = self.mss_clamp_status().missing.len() as u64;
         if self.drainer.families().carries_v6() {
             let mut v6 = self.ledger.v6_counts();
             v6.unresolvable_accepted = self.accepted_unresolvable().len() as u64;
@@ -3469,6 +3660,11 @@ impl ConvergenceEngine {
         // interface without ip6 has nothing to leave by.
         self.ensure_ip6()?;
         self.install_attached_routes()?;
+        // Before any steer can happen: a VLAN whose clamp is not in place
+        // holds the first one ([`SinkCounts::mss_clamps_missing`]). A new
+        // connection reads VPP's clamps at least once, configured or not.
+        self.mss_clamps_swept = false;
+        self.ensure_mss_clamps()?;
         // The hand-back interface, created or adopted with every device
         // attach — a new VPP needs a new one — but its /128s are left for
         // the next tick: an adopted FIB must reach the preserved ledger's
