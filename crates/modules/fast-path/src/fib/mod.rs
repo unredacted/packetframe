@@ -46,6 +46,11 @@ pub mod neigh_supervision;
 /// loop. The resolver and the programmer that feed it are Linux-gated.
 pub mod resolve_watch;
 
+/// Ungated for the same reason: which connected routes make a one-way
+/// fast path is pure, and so is its status row. Only the programmer that
+/// observes the mirror, and the address read it uses, are Linux's.
+pub mod one_way;
+
 /// Which local accounts may feed the route mirror, judged at a route
 /// source's `accept()`. The rules are pure and tested everywhere; the
 /// socket-diagnostics lookups behind them are Linux's, with `ENOSYS`

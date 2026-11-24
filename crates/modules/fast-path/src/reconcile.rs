@@ -222,6 +222,15 @@ pub fn reconcile(state: &mut ActiveState, cfg: &ModuleConfig<'_>) -> ModuleResul
     if let Some(w) = &state.redirect_watch {
         w.set_directives(cfg.section.directives.to_vec());
     }
+    // The one-way check is armed by an allowlisted `local-prefix`, and the
+    // allowlist is hot: re-judge the last observed routes against it
+    // (`local-prefix` itself is read at start, and the watch keeps those).
+    for w in state
+        .one_way
+        .set_directives(cfg.section.directives.to_vec())
+    {
+        warn!("{w}");
+    }
     // Last: the one step here that writes kernel policy rather than
     // maps, so a failure in it cannot keep the map updates above (or
     // the watcher's hand-over) from landing.

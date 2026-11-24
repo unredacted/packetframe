@@ -339,6 +339,10 @@ pub struct ResolverPolicy {
     /// Interface names (not ifindexes; the platform recreates bridges)
     /// on which the resolver must never issue its `NUD_NONE` kick.
     pub ix_interfaces: Vec<String>,
+    /// Where the programmer reports the connected routes it hands to the
+    /// kernel, to be judged for a one-way fast path
+    /// ([`crate::fib::one_way`]).
+    pub one_way: Option<crate::fib::one_way::SharedOneWay>,
 }
 
 /// The handles a second forwarding tier registers before attach — how
@@ -386,6 +390,7 @@ impl RouteController {
             local_prefixes,
             fallback_default,
             ix_interfaces,
+            one_way,
         } = policy;
         let SecondTierSignals {
             completeness,
@@ -444,6 +449,9 @@ impl RouteController {
         if let Some(table) = asn_table {
             programmer.set_asn_table(table);
             info!("origin-AS table registered with the FibProgrammer (flow export)");
+        }
+        if let Some(watch) = one_way {
+            programmer.set_one_way_watch(watch);
         }
         // The seed, likewise before the programmer runs: it is applied
         // ahead of every route event, so the route source spawned below

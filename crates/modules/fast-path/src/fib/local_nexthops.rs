@@ -208,6 +208,17 @@ pub fn kernel_local_addrs() -> HashSet<IpAddr> {
 /// `getifaddrs`, both families. Empty on a failed read.
 #[cfg(target_os = "linux")]
 pub fn kernel_addrs_by_iface() -> Vec<(String, IpAddr)> {
+    kernel_ifaddrs()
+        .into_iter()
+        .map(|(name, addr, _)| (name, addr))
+        .collect()
+}
+
+/// [`kernel_addrs_by_iface`] with each address's prefix length, from
+/// its netmask (`None` when the kernel gave none). Empty on a failed
+/// read.
+#[cfg(target_os = "linux")]
+pub fn kernel_ifaddrs() -> Vec<(String, IpAddr, Option<u8>)> {
     let mut out = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates the list; freed below on every path
@@ -246,7 +257,7 @@ pub fn kernel_addrs_by_iface() -> Vec<(String, IpAddr)> {
                 let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
                     .to_string_lossy()
                     .into_owned();
-                out.push((name, addr));
+                out.push((name, addr, netmask_len(ifa.ifa_netmask, family)));
             }
         }
         cur = ifa.ifa_next;
@@ -254,6 +265,30 @@ pub fn kernel_addrs_by_iface() -> Vec<(String, IpAddr)> {
     // SAFETY: the list came from a successful getifaddrs.
     unsafe { libc::freeifaddrs(ifap) };
     out
+}
+
+/// The prefix length a `getifaddrs` netmask encodes: its one bits.
+/// `None` for no netmask, or one of another family.
+#[cfg(target_os = "linux")]
+fn netmask_len(mask: *const libc::sockaddr, family: i32) -> Option<u8> {
+    if mask.is_null() {
+        return None;
+    }
+    // SAFETY: non-null; getifaddrs gives the netmask the address's family.
+    if i32::from(unsafe { (*mask).sa_family }) != family {
+        return None;
+    }
+    if family == libc::AF_INET {
+        // SAFETY: AF_INET guarantees sockaddr_in layout.
+        let raw = unsafe { (*(mask as *const libc::sockaddr_in)).sin_addr.s_addr };
+        u8::try_from(raw.count_ones()).ok()
+    } else if family == libc::AF_INET6 {
+        // SAFETY: AF_INET6 guarantees sockaddr_in6 layout.
+        let raw = unsafe { (*(mask as *const libc::sockaddr_in6)).sin6_addr.s6_addr };
+        u8::try_from(raw.iter().map(|b| b.count_ones()).sum::<u32>()).ok()
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

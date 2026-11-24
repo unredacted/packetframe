@@ -3817,15 +3817,21 @@ pub fn parse_mac_literal(tok: &str) -> Result<[u8; 6], String> {
 /// One warning per `local-prefix` / `local-prefix6` directive that no
 /// same-family `allow-prefix` / `allow-prefix6` even overlaps.
 ///
-/// The allowlist is consulted *before* the FIB lookup, so a synthesized
-/// host route does nothing when inbound traffic to it never matches the
-/// allowlist — the feature silently no-ops. The runbook names this the
-/// top operator footgun, and `local-prefix6` doubles the exposure
-/// because the v4 and v6 allowlists are declared separately.
+/// The allowlist is consulted *before* the FIB lookup and matches a
+/// packet's source OR its destination. A local-prefix with no
+/// overlapping allow entry therefore still carries traffic: the replies
+/// of flows whose other end is allowlisted, which is exactly what a
+/// reply-only `local-prefix` is declared for (see
+/// [`one_way_fast_path_routes`]). What it does not carry is traffic to
+/// its hosts from senders outside the allowlist. Forgetting the allow
+/// entry for a customer prefix is still the runbook's top operator
+/// footgun, and `local-prefix6` doubles the exposure because the v4 and
+/// v6 allowlists are declared separately, so the line says what the
+/// prefix does and does not get, and leaves the choice to the operator.
 ///
 /// Advisory only, never fatal: the check looks for *any overlap* rather
-/// than full coverage, so it fires only on the forgot-it-entirely case
-/// and cannot false-positive on a prefix jointly covered by several
+/// than full coverage, so it fires only on the no-allow-entry-at-all
+/// case and cannot false-positive on a prefix jointly covered by several
 /// narrower allow entries. Callers log each returned string at WARN.
 pub fn uncovered_local_prefix_warnings(directives: &[ModuleDirective]) -> Vec<String> {
     let mut allow_v4: Vec<Ipv4Prefix> = Vec::new();
@@ -3856,17 +3862,23 @@ pub fn uncovered_local_prefix_warnings(directives: &[ModuleDirective]) -> Vec<St
             } if !overlaps_v4(cidr) => {
                 out.push(format!(
                     "local-prefix {}/{} via {iface} (line {line}) has no overlapping \
-                     allow-prefix; the allowlist is checked before the FIB lookup, so its \
-                     synthesized /32s will never be used. Add a covering `allow-prefix`",
+                     allow-prefix, so its /32s serve only flows whose other end is \
+                     allowlisted (the allowlist, checked before the FIB lookup, matches \
+                     source or destination). That is right for a reply-only local-prefix, \
+                     which keeps those flows symmetric; leave it. To fast-path traffic to \
+                     these hosts from anywhere else, add a covering `allow-prefix`",
                     cidr.addr, cidr.prefix_len
                 ));
             }
             ModuleDirective::LocalPrefix6 { cidr, iface, line } if !overlaps_v6(cidr) => {
                 out.push(format!(
                     "local-prefix6 {}/{} via {iface} (line {line}) has no overlapping \
-                     allow-prefix6; the allowlist is checked before the FIB lookup, so its \
-                     synthesized /128s will never be used. Add a covering `allow-prefix6` \
-                     (the v4 allowlist does not cover v6)",
+                     allow-prefix6, so its /128s serve only flows whose other end is \
+                     allowlisted (the allowlist, checked before the FIB lookup, matches \
+                     source or destination). That is right for a reply-only local-prefix6, \
+                     which keeps those flows symmetric; leave it. To fast-path traffic to \
+                     these hosts from anywhere else, add a covering `allow-prefix6` (the v4 \
+                     allowlist does not cover v6)",
                     cidr.addr, cidr.prefix_len
                 ));
             }
@@ -3874,6 +3886,84 @@ pub fn uncovered_local_prefix_warnings(directives: &[ModuleDirective]) -> Vec<St
         }
     }
     out
+}
+
+/// The routes a one-way fast path would come from: kernel-delivered
+/// connected routes that no `local-prefix` covers, in a family where at
+/// least one allowlisted `local-prefix` exists.
+///
+/// `kernel_routes` are the connected prefixes the route mirror holds
+/// with a next hop the fast path can never resolve: unspecified
+/// (`0.0.0.0` / `::`, as FRR's `redistribute connected` over iBGP sends
+/// them) or the router's own address. XDP passes traffic *to* their
+/// hosts to the kernel. Traffic *from* their hosts to a host in an
+/// allowlisted `local-prefix` matches the allowlist on its destination
+/// and takes the host route, so it never reaches the kernel either. The
+/// kernel then sees one direction of each such flow: conntrack marks the
+/// replies INVALID, a stateful firewall drops them, and the connection
+/// times out. Under `kernel-fib` the same flows were whole, because
+/// `bpf_fib_lookup` resolved the kernel's own connected neighbour.
+///
+/// The fix is a `local-prefix` for the connected prefix, allowlisted or
+/// not: its host routes give the other direction the fast path too. So a
+/// route a `local-prefix` wholly contains is not reported, and one only
+/// partly covered (a narrower `local-prefix` inside it) is, because the
+/// rest of it is still one-way.
+///
+/// "Allowlisted" is the overlap test [`uncovered_local_prefix_warnings`]
+/// uses. Without such a `local-prefix` in the family, no host route
+/// exists for the other direction to take, so the family's routes are
+/// not reported: both directions go through the kernel.
+///
+/// Order is preserved and duplicates are kept, as given.
+pub fn one_way_fast_path_routes(
+    directives: &[ModuleDirective],
+    kernel_routes: &[crate::fib::IpPrefix],
+) -> Vec<crate::fib::IpPrefix> {
+    use crate::fib::IpPrefix;
+    let mut allow_v4: Vec<Ipv4Prefix> = Vec::new();
+    let mut allow_v6: Vec<Ipv6Prefix> = Vec::new();
+    let mut local_v4: Vec<Ipv4Prefix> = Vec::new();
+    let mut local_v6: Vec<Ipv6Prefix> = Vec::new();
+    for d in directives {
+        match d {
+            ModuleDirective::AllowPrefix4(p) => allow_v4.push(*p),
+            ModuleDirective::AllowPrefix6(p) => allow_v6.push(*p),
+            ModuleDirective::LocalPrefix { cidr, .. } => local_v4.push(*cidr),
+            ModuleDirective::LocalPrefix6 { cidr, .. } => local_v6.push(*cidr),
+            _ => {}
+        }
+    }
+    let armed_v4 = local_v4.iter().any(|l| {
+        allow_v4
+            .iter()
+            .any(|a| a.contains_prefix(l) || l.contains_prefix(a))
+    });
+    let armed_v6 = local_v6.iter().any(|l| {
+        allow_v6
+            .iter()
+            .any(|a| a.contains_prefix(l) || l.contains_prefix(a))
+    });
+    kernel_routes
+        .iter()
+        .filter(|r| match **r {
+            IpPrefix::V4 { addr, prefix_len } => {
+                let p = Ipv4Prefix {
+                    addr: Ipv4Addr::from(addr),
+                    prefix_len,
+                };
+                armed_v4 && !local_v4.iter().any(|l| l.contains_prefix(&p))
+            }
+            IpPrefix::V6 { addr, prefix_len } => {
+                let p = Ipv6Prefix {
+                    addr: Ipv6Addr::from(addr),
+                    prefix_len,
+                };
+                armed_v6 && !local_v6.iter().any(|l| l.contains_prefix(&p))
+            }
+        })
+        .copied()
+        .collect()
 }
 
 /// One warning per `wan-egress from` prefix that overlaps an
@@ -10541,6 +10631,158 @@ module fast-path
              local-prefix 192.0.2.0/24 via br1337\n",
         );
         assert!(w.is_empty(), "narrower allow overlaps, no warn: {w:?}");
+    }
+
+    /// The reworded line must not tell the operator the prefix is unused
+    /// or push them to allowlist it: a reply-only local-prefix is a
+    /// deliberate configuration (the one-way fast-path fix).
+    #[test]
+    fn uncovered_local_prefix_warning_describes_the_reply_leg() {
+        let w = warnings_for(
+            "  allow-prefix 198.51.100.0/24\n\
+             allow-prefix6 2001:db8:1::/48\n\
+             local-prefix 198.51.100.0/24 via br1337\n\
+             local-prefix 192.0.2.0/24 via br20\n\
+             local-prefix6 2001:db8:2::/64 via br20\n",
+        );
+        assert_eq!(w.len(), 2, "got: {w:?}");
+        for line in &w {
+            assert!(!line.contains("never be used"), "got: {line}");
+            assert!(line.contains("other end is allowlisted"), "got: {line}");
+            assert!(line.contains("source or destination"), "got: {line}");
+            assert!(line.contains("reply-only"), "got: {line}");
+        }
+        assert!(
+            w[0].starts_with("local-prefix 192.0.2.0/24 via br20"),
+            "got: {}",
+            w[0]
+        );
+        assert!(w[0].contains("/32s"), "got: {}", w[0]);
+        assert!(
+            w[1].starts_with("local-prefix6 2001:db8:2::/64 via br20"),
+            "got: {}",
+            w[1]
+        );
+        assert!(w[1].contains("/128s"), "got: {}", w[1]);
+        assert!(w[1].contains("does not cover v6"), "got: {}", w[1]);
+    }
+
+    // --- one_way_fast_path_routes -----------------------------------------
+
+    fn kv4(s: &str) -> crate::fib::IpPrefix {
+        let (a, l) = s.split_once('/').unwrap();
+        crate::fib::IpPrefix::V4 {
+            addr: a.parse::<Ipv4Addr>().unwrap().octets(),
+            prefix_len: l.parse().unwrap(),
+        }
+    }
+
+    fn kv6(s: &str) -> crate::fib::IpPrefix {
+        let (a, l) = s.split_once('/').unwrap();
+        crate::fib::IpPrefix::V6 {
+            addr: a.parse::<Ipv6Addr>().unwrap().octets(),
+            prefix_len: l.parse().unwrap(),
+        }
+    }
+
+    fn one_way_for(body: &str, kernel: &[crate::fib::IpPrefix]) -> Vec<crate::fib::IpPrefix> {
+        let m = parse_module_body(body).expect("parse");
+        one_way_fast_path_routes(&m.directives, kernel)
+    }
+
+    /// The reference deployment's case: an allowlisted customer
+    /// local-prefix, and an internal VLAN the feed delivers as a
+    /// connected route with an unresolvable next hop and no local-prefix.
+    #[test]
+    fn one_way_names_the_uncovered_connected_route() {
+        let kernel = [kv4("198.51.100.0/24"), kv4("192.0.2.0/24")];
+        let got = one_way_for(
+            "  allow-prefix 198.51.100.0/24\n\
+             local-prefix 198.51.100.0/24 via br1337\n",
+            &kernel,
+        );
+        assert_eq!(got, vec![kv4("192.0.2.0/24")]);
+    }
+
+    /// The operator fix: a local-prefix for the internal VLAN, with no
+    /// allow-prefix of its own, clears it.
+    #[test]
+    fn one_way_cleared_by_a_reply_only_local_prefix() {
+        let kernel = [kv4("198.51.100.0/24"), kv4("192.0.2.0/24")];
+        let got = one_way_for(
+            "  allow-prefix 198.51.100.0/24\n\
+             local-prefix 198.51.100.0/24 via br1337\n\
+             local-prefix 192.0.2.0/24 via br20\n",
+            &kernel,
+        );
+        assert!(got.is_empty(), "got: {got:?}");
+    }
+
+    /// No allowlisted local-prefix: nothing takes the other direction's
+    /// host route, so both go through the kernel and nothing is one-way.
+    #[test]
+    fn one_way_silent_without_an_allowlisted_local_prefix() {
+        let kernel = [kv4("192.0.2.0/24")];
+        // A local-prefix that is not allowlisted does not arm it.
+        assert!(one_way_for("  local-prefix 198.51.100.0/24 via br1337\n", &kernel).is_empty());
+        // Nor does an allow-prefix with no local-prefix.
+        assert!(one_way_for("  allow-prefix 198.51.100.0/24\n", &kernel).is_empty());
+        // Nor anything at all.
+        assert!(one_way_for("  forwarding-mode packetframe-fib\n", &kernel).is_empty());
+    }
+
+    /// Each family is armed by its own allowlisted local-prefix: the v4
+    /// host routes give no v6 flow a fast direction, and vice versa.
+    #[test]
+    fn one_way_is_per_family() {
+        let kernel = [kv4("192.0.2.0/24"), kv6("2001:db8:20::/64")];
+        let v4_only = one_way_for(
+            "  allow-prefix 198.51.100.0/24\n\
+             local-prefix 198.51.100.0/24 via br1337\n",
+            &kernel,
+        );
+        assert_eq!(v4_only, vec![kv4("192.0.2.0/24")]);
+        let v6_only = one_way_for(
+            "  allow-prefix6 2001:db8:1::/48\n\
+             local-prefix6 2001:db8:1:1337::/64 via br1337\n",
+            &kernel,
+        );
+        assert_eq!(v6_only, vec![kv6("2001:db8:20::/64")]);
+        let both = one_way_for(
+            "  allow-prefix 198.51.100.0/24\n\
+             allow-prefix6 2001:db8:1::/48\n\
+             local-prefix 198.51.100.0/24 via br1337\n\
+             local-prefix6 2001:db8:1:1337::/64 via br1337\n\
+             local-prefix6 2001:db8:20::/64 via br20\n",
+            &kernel,
+        );
+        assert_eq!(both, vec![kv4("192.0.2.0/24")]);
+    }
+
+    /// A narrower local-prefix inside the connected route leaves the
+    /// rest of it one-way; a wider one covers it.
+    #[test]
+    fn one_way_needs_whole_coverage() {
+        let kernel = [kv4("192.0.2.0/24")];
+        let base = "  allow-prefix 198.51.100.0/24\n\
+                    local-prefix 198.51.100.0/24 via br1337\n";
+        let narrower = format!("{base}  local-prefix 192.0.2.0/25 via br20\n");
+        assert_eq!(one_way_for(&narrower, &kernel), vec![kv4("192.0.2.0/24")]);
+        let wider = format!("{base}  local-prefix 192.0.2.0/23 via br20\n");
+        assert!(one_way_for(&wider, &kernel).is_empty());
+    }
+
+    /// The allowlisted local-prefix's own connected route is covered by
+    /// itself and is never reported.
+    #[test]
+    fn one_way_skips_the_allowlisted_prefix_itself() {
+        let kernel = [kv4("198.51.100.0/24")];
+        assert!(one_way_for(
+            "  allow-prefix 198.51.100.0/24\n\
+             local-prefix 198.51.100.0/24 via br1337\n",
+            &kernel,
+        )
+        .is_empty());
     }
 
     // --- wan-egress ---
