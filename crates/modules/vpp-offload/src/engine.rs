@@ -1090,6 +1090,10 @@ pub struct ConvergenceEngine {
     /// Whether the configured clamps are in place, from the last pass
     /// ([`Self::mss_clamp_status`]).
     mss_clamp_status: crate::mss_clamp::ClampStatus,
+    /// Whether this VPP connection has had its clamps read once. Until
+    /// then a pass reads them even with nothing configured, so a clamp a
+    /// previous process left on an adopted VPP is cleared.
+    mss_clamps_swept: bool,
     /// Kernel FIB lookups the current walk may still make
     /// ([`Self::kernel_owns`]). Reset to [`FIB_MATCH_BUDGET_RESYNC`] by
     /// each resync and to [`FIB_MATCH_BUDGET_DELTA`] by each delta
@@ -1362,6 +1366,7 @@ impl ConvergenceEngine {
             unresolvable_accepts6: Vec::new(),
             mss_clamps: None,
             mss_clamp_status: Default::default(),
+            mss_clamps_swept: false,
             loopback,
             loop_index: None,
             loopback6: None,
@@ -1522,10 +1527,14 @@ impl ConvergenceEngine {
         self
     }
 
-    /// Whether the configured `mss-clamp vlan` lines are in place in VPP,
-    /// as of the last pass.
-    pub fn mss_clamp_status(&self) -> &crate::mss_clamp::ClampStatus {
-        &self.mss_clamp_status
+    /// Whether the configured `mss-clamp vlan` lines are in place in VPP:
+    /// the last pass's answer, with any line published since counted as
+    /// not yet in place ([`crate::mss_clamp::ClampStatus::with_pending`]).
+    pub fn mss_clamp_status(&self) -> crate::mss_clamp::ClampStatus {
+        match &self.mss_clamps {
+            Some(h) => self.mss_clamp_status.clone().with_pending(&h.get()),
+            None => self.mss_clamp_status.clone(),
+        }
     }
 
     /// Put the configured `mss-clamp vlan` lines in place on each VLAN's
@@ -1553,11 +1562,15 @@ impl ConvergenceEngine {
         };
         let mut status = ClampStatus {
             configured: configured.iter().map(|c| c.vlan).collect(),
-            missing: Vec::new(),
+            applied: configured.clone(),
+            ..Default::default()
         };
-        // Nothing configured, and nothing of ours to clear: never touch
-        // the plugin, so a VPP without it is no different from before.
-        if configured.is_empty() && !self.mss_clamp_status.had_any() {
+        // Nothing configured, nothing of ours to clear, and this VPP
+        // already read once: never touch the plugin, so a VPP without it
+        // is no different from before. The first pass on a connection
+        // reads regardless — an adopted VPP may hold a clamp a previous
+        // process set under a config that has since dropped it.
+        if configured.is_empty() && !self.mss_clamp_status.had_any() && self.mss_clamps_swept {
             self.mss_clamp_status = status;
             return Ok(());
         }
@@ -1567,6 +1580,7 @@ impl ConvergenceEngine {
                 .map(|c| (c.vlan, format!("VPP cannot clamp: {why}")))
                 .collect();
             self.mss_clamp_status = status;
+            self.mss_clamps_swept = true;
             return Ok(());
         }
         let targets: mss_clamp::Targets = configured
@@ -1600,6 +1614,15 @@ impl ConvergenceEngine {
                     on = clamp != mss_clamp::Clamp::OFF,
                     "vpp-offload: TCP MSS clamp set on a VLAN interface"
                 ),
+                Ok(Err(retval)) if !want.contains_key(&sw_if_index) => {
+                    status.not_cleared.push((
+                        sw_if_index,
+                        format!(
+                            "VPP refused to clear a removed clamp on interface {sw_if_index} \
+                             (retval {retval})"
+                        ),
+                    ));
+                }
                 Ok(Err(retval)) => {
                     for (c, ifs) in &targets {
                         if ifs.contains(&sw_if_index) {
@@ -1626,7 +1649,13 @@ impl ConvergenceEngine {
                 tracing::warn!(vlan, reason = %why, "vpp-offload: TCP MSS clamp not in place");
             }
         }
+        if status.not_cleared != self.mss_clamp_status.not_cleared {
+            for (sw_if_index, why) in &status.not_cleared {
+                tracing::warn!(sw_if_index, reason = %why, "vpp-offload: removed TCP MSS clamp still set");
+            }
+        }
         self.mss_clamp_status = status;
+        self.mss_clamps_swept = true;
         Ok(())
     }
 
@@ -1682,11 +1711,14 @@ impl ConvergenceEngine {
     /// the next restart, which costs nothing — nothing can be placed on a
     /// VLAN the FDB no longer has.
     fn reconcile_vlans(&mut self) -> Result<(), EngineError> {
+        // An unreadable bridge or no loopback yet stops the topology work,
+        // not the clamps: a reload's clamp change is applied against the
+        // interfaces already known.
         let Some(pv) = self.refresh_untagged() else {
-            return Ok(());
+            return self.ensure_mss_clamps();
         };
         let Some(loop_idx) = self.loop_index else {
-            return Ok(());
+            return self.ensure_mss_clamps();
         };
         for port in self.trunk_ports.clone() {
             let missing: Vec<u16> = pv
@@ -3183,7 +3215,7 @@ impl ConvergenceEngine {
     pub fn counts(&self) -> SinkCounts {
         let mut c = self.ledger.counts();
         c.unexempted_local = self.unexempted_local().len() as u64;
-        c.mss_clamps_missing = self.mss_clamp_status.missing.len() as u64;
+        c.mss_clamps_missing = self.mss_clamp_status().missing.len() as u64;
         if self.drainer.families().carries_v6() {
             let mut v6 = self.ledger.v6_counts();
             v6.unresolvable_accepted = self.accepted_unresolvable().len() as u64;
@@ -3629,7 +3661,9 @@ impl ConvergenceEngine {
         self.ensure_ip6()?;
         self.install_attached_routes()?;
         // Before any steer can happen: a VLAN whose clamp is not in place
-        // holds the first one ([`SinkCounts::mss_clamps_missing`]).
+        // holds the first one ([`SinkCounts::mss_clamps_missing`]). A new
+        // connection reads VPP's clamps at least once, configured or not.
+        self.mss_clamps_swept = false;
         self.ensure_mss_clamps()?;
         // The hand-back interface, created or adopted with every device
         // attach — a new VPP needs a new one — but its /128s are left for

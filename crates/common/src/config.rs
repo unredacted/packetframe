@@ -2735,6 +2735,23 @@ impl Config {
     /// - `unresolvable-accept6` ([`Self::validate_vpp_unresolvable_accepts6`]);
     /// - `local-route6` ([`Self::validate_vpp_local_routes6`]).
     pub fn validate_vpp_offload(&self) -> Result<(), ConfigError> {
+        // `mss-clamp vlan` parses in any section (directive parsing is
+        // shared), but only vpp-offload reads it. Anywhere else it would
+        // be a clamp silently not installed.
+        for m in self.modules.iter().filter(|m| m.name != "vpp-offload") {
+            for d in &m.directives {
+                if let ModuleDirective::VppMssClamp { vlan, line, .. } = d {
+                    return Err(ConfigError::parse(
+                        *line,
+                        format!(
+                            "`mss-clamp vlan {vlan}` belongs in module vpp-offload, not module \
+                             {}: only VPP clamps per VLAN",
+                            m.name
+                        ),
+                    ));
+                }
+            }
+        }
         let Some(vpp) = self.modules.iter().find(|m| m.name == "vpp-offload") else {
             return Ok(());
         };
@@ -3118,10 +3135,16 @@ impl Config {
     /// cannot matter; with two, a SYN on one VLAN can take the other's.
     /// To be lifted once the VPP builds PacketFrame attests carry the fix.
     fn validate_vpp_mss_clamp_lines(vpp: &ModuleSection) -> Result<(), ConfigError> {
+        // Last one wins, as `VppOffloadConfig::from_directives` reads it.
         let v6_on = vpp
             .directives
             .iter()
-            .any(|d| matches!(d, ModuleDirective::VppV6(true)));
+            .filter_map(|d| match d {
+                ModuleDirective::VppV6(v) => Some(*v),
+                _ => None,
+            })
+            .next_back()
+            .unwrap_or(false);
         let mut seen: Vec<u16> = Vec::new();
         let mut first_ip4: Option<(u16, u16)> = None;
         for d in &vpp.directives {
@@ -4815,17 +4838,18 @@ fn parse_vpp_mss_clamp<'a>(
         })?;
     let (mut ip4, mut ip6) = (None, None);
     while let Some(fam) = rest.next() {
-        let slot =
-            match fam {
-                "ip4" => &mut ip4,
-                "ip6" => &mut ip6,
-                other => return Err(ConfigError::parse(
+        let slot = match fam {
+            "ip4" => &mut ip4,
+            "ip6" => &mut ip6,
+            other => {
+                return Err(ConfigError::parse(
                     line,
                     format!(
                         "mss-clamp vlan {vlan}: expected `ip4` or `ip6`, got `{other}` ({FORM})"
                     ),
-                )),
-            };
+                ))
+            }
+        };
         if slot.is_some() {
             return Err(ConfigError::parse(
                 line,
@@ -9272,6 +9296,22 @@ module vpp-offload
         let all = "port eth2 cores 1 steer on direction dst\n  \
                    port eth4 cores 1 steer on vlans all direction both";
         check(clamp, all, "  mss-clamp vlan 1337 ip4 1360\n").unwrap();
+        // The last `v6` line wins, as the module reads it.
+        let e = check(
+            clamp,
+            trunk_both,
+            "  v6 on\n  v6 off\n  mss-clamp vlan 1337 ip4 1360 ip6 1340\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("`v6 on`"), "{e}");
+        // Only vpp-offload reads the VLAN form.
+        let e = check(
+            "mss-clamp vlan 1337 ip4 1360",
+            trunk_both,
+            "  mss-clamp vlan 1337 ip4 1360\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("belongs in module vpp-offload"), "{e}");
     }
 
     /// dst steering into VPP without local delivery for a steerable

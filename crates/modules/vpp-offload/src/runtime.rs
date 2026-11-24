@@ -2714,7 +2714,7 @@ impl Runtime {
     /// The configured `mss-clamp vlan` set and what is not in place, for
     /// the status row.
     pub fn mss_clamp_status(&self) -> crate::mss_clamp::ClampStatus {
-        self.core.borrow().engine.mss_clamp_status().clone()
+        self.core.borrow().engine.mss_clamp_status()
     }
 
     /// The IPv4 unresolvable routes by name, for the refusal that names
@@ -3052,7 +3052,7 @@ impl Runtime {
             },
             handback: c.engine.handback_status(),
             icmp6_source: c.engine.icmp6_source(),
-            mss_clamp: c.engine.mss_clamp_status().clone(),
+            mss_clamp: c.engine.mss_clamp_status(),
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),

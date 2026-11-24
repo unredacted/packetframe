@@ -380,6 +380,8 @@ pub struct Behaviour {
     pub no_mss_clamp_plugin: bool,
     /// Refuse every `mss_clamp_enable_disable` with a non-zero retval.
     pub reject_mss_clamp: bool,
+    /// Refuse only the `mss_clamp_enable_disable` that clears a clamp.
+    pub reject_mss_clamp_clear: bool,
 }
 
 /// The fake's IPv6 interface-address table: `sw_if_index` → `(octets,
@@ -1380,32 +1382,34 @@ fn serve(
             "mss_clamp_enable_disable" => {
                 let mut d = Decoder::new(&req);
                 let r = MssClampEnableDisable::decode(&mut d).expect("decodes as an mss_clamp set");
-                let retval = if behaviour.reject_mss_clamp {
-                    -1
-                } else {
-                    // VPP's `mssc_enable_disable`: a family with no
-                    // direction holds the unset value.
-                    let mss4 = if r.ipv4_direction == 0 {
-                        0xffff
+                let clears = r.ipv4_direction == 0 && r.ipv6_direction == 0;
+                let retval =
+                    if behaviour.reject_mss_clamp || (behaviour.reject_mss_clamp_clear && clears) {
+                        -1
                     } else {
-                        r.ipv4_mss
+                        // VPP's `mssc_enable_disable`: a family with no
+                        // direction holds the unset value.
+                        let mss4 = if r.ipv4_direction == 0 {
+                            0xffff
+                        } else {
+                            r.ipv4_mss
+                        };
+                        let mss6 = if r.ipv6_direction == 0 {
+                            0xffff
+                        } else {
+                            r.ipv6_mss
+                        };
+                        let mut t = mss_clamps.lock().unwrap();
+                        if r.ipv4_direction == 0 && r.ipv6_direction == 0 {
+                            t.remove(&r.sw_if_index);
+                        } else {
+                            t.insert(
+                                r.sw_if_index,
+                                (r.ipv4_direction, mss4, r.ipv6_direction, mss6),
+                            );
+                        }
+                        0
                     };
-                    let mss6 = if r.ipv6_direction == 0 {
-                        0xffff
-                    } else {
-                        r.ipv6_mss
-                    };
-                    let mut t = mss_clamps.lock().unwrap();
-                    if r.ipv4_direction == 0 && r.ipv6_direction == 0 {
-                        t.remove(&r.sw_if_index);
-                    } else {
-                        t.insert(
-                            r.sw_if_index,
-                            (r.ipv4_direction, mss4, r.ipv6_direction, mss6),
-                        );
-                    }
-                    0
-                };
                 let _ = tx.send(Event::Msg(format!(
                     "mss_clamp if={} dir4={} mss4={} dir6={} mss6={}",
                     r.sw_if_index, r.ipv4_direction, r.ipv4_mss, r.ipv6_direction, r.ipv6_mss

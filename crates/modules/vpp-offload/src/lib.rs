@@ -1752,10 +1752,20 @@ impl Module for VppOffloadModule {
         attached
             .unresolvable_accepts6
             .publish(new.unresolvable_accepts6.clone());
-        // `mss-clamp vlan` too: the engine reads it at its next VLAN
-        // refresh, and a clamp not yet in place holds a first steer there
-        // rather than here.
-        attached.mss_clamps.publish(new.mss_clamps.clone());
+        // `mss-clamp vlan` is hot too, in two steps. Before any steering
+        // change: the superset of both sets at the lower value
+        // ([`mss_clamp::during_reload`]). A clamp this reload adds then
+        // reads as not in place until the engine has set it, which holds
+        // a first steer the same reload asks for; and a clamp it removes
+        // stays on until the steering change that goes with it has
+        // landed. The exact set is published only once the reload is
+        // accepted (every `Ok` below). A failed reload keeps the
+        // superset: going back to the old set could take off a clamp a
+        // remembered first steer is waiting on.
+        attached.mss_clamps.publish(mss_clamp::during_reload(
+            &self.cfg.mss_clamps,
+            &new.mss_clamps,
+        ));
 
         let allowlist = self.allowlist.get();
         let target = (self.plan_reload)(&new, &allowlist, &self.state_dir)
@@ -1847,6 +1857,7 @@ impl Module for VppOffloadModule {
                     "vpp-offload: reload changes none of this module's steering inputs; \
                      applied unchanged without waiting on the supervision loop"
                 );
+                attached.mss_clamps.publish(new.mss_clamps.clone());
                 self.cfg = new;
                 return Ok(());
             }
@@ -1867,6 +1878,7 @@ impl Module for VppOffloadModule {
         // the apply would make the NEXT reconfigure diff against a target
         // that was never installed, so a failed canary step would look
         // like a no-op change and never be retried.
+        attached.mss_clamps.publish(new.mss_clamps.clone());
         self.cfg = new;
         Ok(())
     }

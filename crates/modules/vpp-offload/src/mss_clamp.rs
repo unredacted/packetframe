@@ -69,6 +69,34 @@ impl MssClamps {
     }
 }
 
+/// What the engine is given while a reload is in flight: every VLAN
+/// either set clamps, at the lowest IPv4 value of both (one value, as
+/// validation requires of each set) and the lower IPv6 value per VLAN.
+/// Published before the reload's steering change and kept if it fails;
+/// only an accepted reload publishes its exact set. So a reload never
+/// takes a clamp off steered traffic until its unsteer has landed, and a
+/// clamp it adds is in place before a first steer it asks for.
+pub fn during_reload(old: &[VlanClamp], new: &[VlanClamp]) -> Vec<VlanClamp> {
+    let ip4 = old.iter().chain(new).filter_map(|c| c.ip4).min();
+    let mut out: Vec<VlanClamp> = Vec::new();
+    for c in new.iter().chain(old) {
+        if let Some(have) = out.iter_mut().find(|o| o.vlan == c.vlan) {
+            have.ip6 = match (have.ip6, c.ip6) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            have.ip4 = have.ip4.or(c.ip4.and(ip4));
+        } else {
+            out.push(VlanClamp {
+                vlan: c.vlan,
+                ip4: c.ip4.and(ip4),
+                ip6: c.ip6,
+            });
+        }
+    }
+    out
+}
+
 /// What one interface holds, or should: per family, the directions and
 /// the value. A family with no direction holds no value; VPP reports an
 /// unset one as `0xffff`, so it is normalised to 0 here.
@@ -233,17 +261,54 @@ pub struct ClampStatus {
     pub configured: Vec<u16>,
     /// Configured VLANs not (yet) clamped, each with why.
     pub missing: Vec<(u16, String)>,
+    /// The lines the last pass worked to, so a line a reload published
+    /// since reads as not yet in place ([`Self::with_pending`]).
+    pub applied: Vec<VlanClamp>,
+    /// Interfaces still holding a clamp a reload removed, because VPP
+    /// refused to clear it, each with why. Retried every pass. It does
+    /// not hold a steer (a stale clamp only over-clamps), but the row
+    /// says so.
+    pub not_cleared: Vec<(u32, String)>,
 }
 
 impl ClampStatus {
+    /// Every configured clamp is in place: what a first steer needs.
     pub fn in_place(&self) -> bool {
         self.missing.is_empty()
     }
 
-    /// Whether the last pass had any clamp configured, so a reload that
-    /// removed every line still clears what the previous one set.
+    /// In place, and nothing removed is left behind.
+    pub fn healthy(&self) -> bool {
+        self.in_place() && self.not_cleared.is_empty()
+    }
+
+    /// Whether the last pass had any clamp configured or left one it
+    /// could not clear, so a reload that removed every line still clears
+    /// what the previous one set, and keeps retrying a refused clear.
     pub fn had_any(&self) -> bool {
-        !self.configured.is_empty()
+        !self.configured.is_empty() || !self.not_cleared.is_empty()
+    }
+
+    /// This status against the set published now: a line the last pass
+    /// did not work to (a reload since) is not in place yet. The engine
+    /// runs between steering requests, so without this a reload that adds
+    /// a clamp and flips a port to `steer on` in one go would find the
+    /// first-steer gate still reading the old set.
+    pub fn with_pending(mut self, current: &[VlanClamp]) -> Self {
+        self.configured = current.iter().map(|c| c.vlan).collect();
+        self.missing
+            .retain(|(v, _)| current.iter().any(|c| c.vlan == *v));
+        for c in current {
+            if !self.applied.contains(c) && !self.missing.iter().any(|(v, _)| *v == c.vlan) {
+                self.missing.push((
+                    c.vlan,
+                    "set by a reload; VPP is given it at the next VLAN refresh, within seconds"
+                        .into(),
+                ));
+            }
+        }
+        self.missing.sort();
+        self
     }
 }
 
@@ -296,6 +361,55 @@ mod tests {
         // RX only is not what was asked for.
         held.insert(200, Clamp { dir4: 1, ..c1360 });
         assert_eq!(plan(&want, &held, &owned)[0], (200, c1360));
+    }
+
+    #[test]
+    fn a_reload_in_flight_clamps_the_superset_at_the_lower_value() {
+        let v = |vlan, ip4, ip6| VlanClamp { vlan, ip4, ip6 };
+        let old = [v(10, Some(1400), None), v(20, Some(1400), Some(1300))];
+        let new = [v(20, Some(1360), Some(1340)), v(30, None, Some(1320))];
+        assert_eq!(
+            during_reload(&old, &new),
+            vec![
+                v(20, Some(1360), Some(1300)),
+                v(30, None, Some(1320)),
+                // Dropped by the reload, kept until it is accepted, at
+                // the one IPv4 value.
+                v(10, Some(1360), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_published_since_the_last_pass_is_not_in_place() {
+        let line = VlanClamp {
+            vlan: 1337,
+            ip4: Some(1360),
+            ip6: None,
+        };
+        let worked = ClampStatus {
+            configured: vec![1337],
+            applied: vec![line],
+            ..Default::default()
+        };
+        assert!(worked.clone().with_pending(&[line]).in_place());
+        // A changed value, and a new VLAN, are pending.
+        let raised = VlanClamp {
+            ip4: Some(1300),
+            ..line
+        };
+        let s = worked.clone().with_pending(&[raised]);
+        assert_eq!(s.missing.len(), 1, "{s:?}");
+        let other = VlanClamp { vlan: 88, ..line };
+        let s = worked.clone().with_pending(&[line, other]);
+        assert_eq!(s.missing[0].0, 88);
+        assert_eq!(s.configured, vec![1337, 88]);
+        // A removed line holds nothing, even one that was missing.
+        let missing = ClampStatus {
+            missing: vec![(1337, "no interface".into())],
+            ..worked
+        };
+        assert!(missing.with_pending(&[]).in_place());
     }
 
     #[test]

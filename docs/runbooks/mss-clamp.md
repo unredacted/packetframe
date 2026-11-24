@@ -105,9 +105,14 @@ fast path, on SYN and SYN-ACK only.
   the eBPF tier when steering is off or VPP is gone.
 - **Hot-reloadable.** `packetframe reconfigure` applies a new, changed
   or removed line at the next VLAN refresh, within seconds, with no
-  restart and no change to steering. VPP holds the clamp itself, so it
-  survives a `--keep-vpp` restart, and adoption reads it back and puts
-  it right.
+  restart and no change to steering. While the reload is in flight VPP
+  is given every VLAN either config clamps, at the lower value, so a
+  removed clamp stays on until the reload's steering change has landed
+  and an added one holds a first steer the same reload asks for until
+  it is set. A reload that fails keeps that superset. VPP holds the
+  clamp itself, so it survives a `--keep-vpp` restart, and adoption
+  reads it back and puts it right, clearing a clamp on our interfaces
+  that the config no longer has.
 - **One IPv4 value across all lines**, for now. VPP 26.10's plugin
   clamps the second packet of each pair it handles at the first one's
   interface value (fixed upstream after 26.10). With one value that

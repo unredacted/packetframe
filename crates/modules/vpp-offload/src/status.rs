@@ -1206,7 +1206,7 @@ impl StatusSnapshot {
             && !self.v6_errors_unsourced()
             // A configured MSS clamp VPP does not apply: steered SYNs to
             // or from that VLAN leave unclamped (the `mss-clamp` row).
-            && self.mss_clamp.in_place()
+            && self.mss_clamp.healthy()
             // A v6 diversion held back for the hand-back path is traffic
             // the operator asked to divert and the module is not — the
             // `v6-handback` row says Degraded, and overall must not
@@ -1495,7 +1495,7 @@ impl StatusSnapshot {
     /// while any is not, which also holds the first steer
     /// ([`SinkCounts::mss_clamps_missing`]).
     fn mss_clamp_health(&self) -> Option<SubsystemHealth> {
-        if self.mss_clamp.configured.is_empty() {
+        if self.mss_clamp.configured.is_empty() && self.mss_clamp.not_cleared.is_empty() {
             return None;
         }
         let vlans = |v: &[u16]| {
@@ -1504,7 +1504,7 @@ impl StatusSnapshot {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        Some(if self.mss_clamp.in_place() {
+        Some(if self.mss_clamp.healthy() {
             SubsystemHealth {
                 name: SUBSYS_MSS_CLAMP.into(),
                 state: HealthState::Healthy,
@@ -1514,7 +1514,7 @@ impl StatusSnapshot {
                 )),
                 last_success_age_seconds: None,
             }
-        } else {
+        } else if !self.mss_clamp.in_place() {
             SubsystemHealth {
                 name: SUBSYS_MSS_CLAMP.into(),
                 state: HealthState::Degraded,
@@ -1526,6 +1526,22 @@ impl StatusSnapshot {
                         .missing
                         .iter()
                         .map(|(v, why)| format!("vlan {v}: {why}"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )),
+                last_success_age_seconds: None,
+            }
+        } else {
+            SubsystemHealth {
+                name: SUBSYS_MSS_CLAMP.into(),
+                state: HealthState::Degraded,
+                message: Some(format!(
+                    "a removed clamp is still set: {}. Retried every VLAN refresh; it \
+                     only over-clamps, so steering is unaffected",
+                    self.mss_clamp
+                        .not_cleared
+                        .iter()
+                        .map(|(_, why)| why.as_str())
                         .collect::<Vec<_>>()
                         .join("; ")
                 )),
@@ -5264,7 +5280,7 @@ mod tests {
 
         snap.mss_clamp = crate::mss_clamp::ClampStatus {
             configured: vec![1337],
-            missing: vec![],
+            ..Default::default()
         };
         let r = row(&snap).unwrap();
         assert_eq!(r.state, HealthState::Healthy);
@@ -5276,6 +5292,20 @@ mod tests {
         assert_eq!(r.state, HealthState::Degraded);
         let msg = r.message.unwrap();
         assert!(msg.contains("vlan 1337: VPP cannot clamp"), "{msg}");
+        assert_eq!(snap.report().overall, HealthState::Degraded);
+
+        // A removed clamp VPP would not clear: the row stays, Degraded,
+        // with nothing configured.
+        snap.mss_clamp = crate::mss_clamp::ClampStatus {
+            not_cleared: vec![(
+                7,
+                "VPP refused to clear a removed clamp on interface 7".into(),
+            )],
+            ..Default::default()
+        };
+        let r = row(&snap).unwrap();
+        assert_eq!(r.state, HealthState::Degraded);
+        assert!(r.message.unwrap().contains("interface 7"));
         assert_eq!(snap.report().overall, HealthState::Degraded);
     }
 
