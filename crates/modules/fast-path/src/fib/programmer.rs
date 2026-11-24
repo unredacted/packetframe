@@ -557,8 +557,9 @@ impl FibProgrammerHandle {
             .map_err(|_| ProgrammerError::Shutdown)
     }
 
-    /// Return the current `(v4, v6)` route mirror counts. Used by the
-    /// integrity checker to diff against bird's `show route count`.
+    /// Return the current `(v4, v6)` route mirror counts: every record,
+    /// the resolver's `local-prefix` host routes included. A completeness
+    /// authority compares against [`Self::session_route_counts`] instead.
     /// Reads the programmer's in-memory mirror, not the BPF maps
     /// the mirror is the authoritative record of what the programmer
     /// believes it has written.
@@ -566,6 +567,28 @@ impl FibProgrammerHandle {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Command::MirrorCounts { reply: tx })
+            .await
+            .map_err(|_| ProgrammerError::Shutdown)?;
+        rx.await.map_err(|_| ProgrammerError::Shutdown)
+    }
+
+    /// How many prefixes ROUTE-SOURCE peers have in the mirror, per
+    /// family, and how many routes the second tier is fed that no route
+    /// source delivered. What a completeness authority's count is
+    /// compared against.
+    ///
+    /// Narrower than [`Self::mirror_counts`] for the reason
+    /// [`Self::session_families`] is: the mirror also holds the
+    /// neighbour resolver's synthetic `local-prefix` /32s and /128s
+    /// (and any `fallback-default`) under [`PeerId::local_arp`], and no
+    /// authority counts those. On a full table they are noise; on a box
+    /// whose feed carries 22 prefixes, 50 of them read the mirror as
+    /// 70 — "far more than the authority reports" — and the steering
+    /// gate refused for good.
+    pub async fn session_route_counts(&self) -> Result<SessionRouteCounts, ProgrammerError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::SessionRouteCounts { reply: tx })
             .await
             .map_err(|_| ProgrammerError::Shutdown)?;
         rx.await.map_err(|_| ProgrammerError::Shutdown)
@@ -677,6 +700,28 @@ impl RouteEventLog {
     pub fn session_route_queries(&self) -> u64 {
         self.session_route_queries
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The mirror as a completeness authority sees it
+/// ([`FibProgrammerHandle::session_route_counts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionRouteCounts {
+    /// v4 prefixes with at least one route-source advertisement.
+    pub v4: usize,
+    /// v6 prefixes with at least one route-source advertisement.
+    pub v6: usize,
+    /// Prefixes the second tier is fed that no route source delivered:
+    /// a `fallback-default` with no session default under it. Not in
+    /// `v4`/`v6`, because no authority counts them, but a consumer that
+    /// counts what it was fed holds them.
+    pub unsourced: usize,
+}
+
+impl SessionRouteCounts {
+    /// Both families' route-source prefixes.
+    pub fn total(&self) -> usize {
+        self.v4 + self.v6
     }
 }
 
@@ -824,6 +869,13 @@ fn spawn_recorder(
                 Command::MirrorCounts { reply } => {
                     let _ = reply.send(counts);
                 }
+                Command::SessionRouteCounts { reply } => {
+                    let _ = reply.send(SessionRouteCounts {
+                        v4: counts.0,
+                        v6: counts.1,
+                        unsourced: 0,
+                    });
+                }
                 Command::HasSessionRoutes { reply } => {
                     sink.session_route_queries
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -863,6 +915,10 @@ enum Command {
     /// programmer's mirror state. Used by the integrity checker.
     MirrorCounts {
         reply: oneshot::Sender<(usize, usize)>,
+    },
+    /// See [`FibProgrammerHandle::session_route_counts`].
+    SessionRouteCounts {
+        reply: oneshot::Sender<SessionRouteCounts>,
     },
     /// Report whether any route-source peer still holds an
     /// advertisement. See [`FibProgrammerHandle::has_session_routes`].
@@ -1647,7 +1703,8 @@ impl FibProgrammer {
         if !self.dry_run_authority {
             return;
         }
-        let mirror = (self.routes_v4.len() + self.routes_v6.len()) as u64;
+        // Route-source prefixes: what the authority's report compared.
+        let mirror = self.session_route_counts().total() as u64;
         if self
             .completeness
             .as_ref()
@@ -1910,6 +1967,9 @@ impl FibProgrammer {
             Command::ApplyRouteEvent { event, reply } => self.on_route_event(event, reply),
             Command::MirrorCounts { reply } => {
                 let _ = reply.send((self.routes_v4.len(), self.routes_v6.len()));
+            }
+            Command::SessionRouteCounts { reply } => {
+                let _ = reply.send(self.session_route_counts());
             }
             Command::HasSessionRoutes { reply } => {
                 // `routes_by_peer` drops a peer's entry when its last
@@ -2262,6 +2322,51 @@ impl FibProgrammer {
         }
     }
 
+    /// [`FibProgrammerHandle::session_route_counts`].
+    ///
+    /// The whole mirror less the prefixes only local-ARP peers hold, so
+    /// it costs O(local routes), not O(mirror): a full table is a
+    /// million records, the local ones a few dozen. A prefix with a
+    /// session advertisement beside a local one is a session route.
+    fn session_route_counts(&self) -> SessionRouteCounts {
+        let mut local_only: HashSet<(bool, [u8; 16], u8)> = HashSet::new();
+        for (peer, keys) in &self.routes_by_peer {
+            if is_session_peer(*peer) {
+                continue;
+            }
+            local_only.extend(keys.iter().copied());
+        }
+        let (mut local_v4, mut local_v6, mut unsourced) = (0usize, 0usize, 0usize);
+        for key in local_only {
+            let prefix = peer_key_prefix(key);
+            let Some(rec) = self.lookup_mirror(&prefix) else {
+                continue;
+            };
+            if rec.advertisements.keys().any(|(p, _)| is_session_peer(*p)) {
+                continue;
+            }
+            if key.0 {
+                local_v4 += 1;
+            } else {
+                local_v6 += 1;
+            }
+            // Fed to the second tier all the same: the announce site
+            // withholds only local delivery.
+            if !is_local_delivery(
+                &prefix,
+                rec.advertisements.keys().map(|(p, _)| *p),
+                &rec.nexthop_ips,
+            ) {
+                unsourced += 1;
+            }
+        }
+        SessionRouteCounts {
+            v4: self.routes_v4.len().saturating_sub(local_v4),
+            v6: self.routes_v6.len().saturating_sub(local_v6),
+            unsourced,
+        }
+    }
+
     /// The mirror's route-source advertisements as a ledger record.
     ///
     /// Two passes over the mirror: the first interns peers and nexthops
@@ -2326,8 +2431,8 @@ impl FibProgrammer {
         } else {
             written_at_unix
         };
-        // Against the whole mirror, which is what the authority's report
-        // compared: its `mirror_routes` is `MirrorCounts`. A report
+        // Against the route-source prefixes, which is what the authority's
+        // report compared: its `mirror_routes` is `SessionRouteCounts`. A report
         // retained across the stop's own session loss still counts (the
         // mirror keeps every route a `Resync` marks); one that no longer
         // describes the mirror's size — a GC since removed much of it —
@@ -2336,9 +2441,7 @@ impl FibProgrammer {
         // must share for it to count; with no scope there is nothing it
         // could be honoured under, so nothing is recorded.
         let attested_for = match (&self.completeness, &self.attestation_scope) {
-            (Some(h), Some(scope))
-                if h.attests((self.routes_v4.len() + self.routes_v6.len()) as u64) =>
-            {
+            (Some(h), Some(scope)) if h.attests(self.session_route_counts().total() as u64) => {
                 scope.clone()
             }
             _ => String::new(),

@@ -32,6 +32,10 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 ### Changes
 
+**fast-path**
+
+- The completeness authority (`birdc` or `frr`) compares its count against the prefixes a route source delivered, not the whole mirror. The `local-prefix` host routes and the `fallback-default` no longer count, so a small table no longer reads as `AuthorityMismatch`. vpp-offload's gate takes the fallback default off its own count too. [#PR](https://github.com/unredacted/packetframe/pull/PR)
+
 **neigh-snoop**
 
 - A bridge counts as up only when it also has carrier. When it loses carrier, the kernel flushes its neighbours. The learned table is now re-seeded when carrier comes back, not only after an admin bring-up, and a bridge that comes up before its link is no longer seeded into a flush. [#423](https://github.com/unredacted/packetframe/pull/423)
