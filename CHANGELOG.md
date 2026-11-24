@@ -36,6 +36,10 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 - The completeness authority (`birdc` or `frr`) compares its count against the prefixes a route source delivered, not the whole mirror. The `local-prefix` host routes and the `fallback-default` no longer count, so a small table no longer reads as `AuthorityMismatch`. vpp-offload's gate takes the fallback default off its own count too. [#427](https://github.com/unredacted/packetframe/pull/427)
 
+**vpp-offload**
+
+- A steer that would carry traffic a fast-path `mss-clamp` covers through VPP, which does not apply it, is refused at start and at reload, naming the clamp and the port. Before, the clamp silently stopped applying to steered traffic. [#430](https://github.com/unredacted/packetframe/pull/430)
+
 **CLI and operations**
 
 - `packetframe detach --all` with no `--config` reads the default config when there is one, so it finds VPP's state file in the configured `state-dir`. It used the built-in default directory and, on a box with another `state-dir`, left VPP running. It now also logs the state directory it read. [#428](https://github.com/unredacted/packetframe/pull/428)

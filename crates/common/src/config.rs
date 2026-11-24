@@ -3085,6 +3085,300 @@ impl Config {
                 }
             }
         }
+        Self::validate_vpp_mss_clamps(vpp, fp, global_dir)
+    }
+
+    /// Refuse a steer that would carry traffic a fast-path `mss-clamp`
+    /// covers through VPP, which does not apply it.
+    ///
+    /// The clamp runs in XDP, and a frame the NIC diverts to VPP never
+    /// reaches XDP, so it leaves unclamped. Nothing else says so: the
+    /// steer installs, every health row is green, and the clamp has
+    /// quietly stopped applying to the steered traffic. Same rule as
+    /// `direction dst` coverage above: a silent loss of policy is
+    /// refused at load (and at reload, which re-validates), not found
+    /// later. Design: `docs/runbooks/vpp-mss-clamp-design.md`.
+    ///
+    /// What counts as diverted, per clamp (only steered ports count):
+    ///
+    /// - No prefix (`mss-clamp <mss>`, `mss-clamp via <if> <mss>`):
+    ///   any IPv4 steer, or any `v6-divert`.
+    /// - An IPv4 prefix P. On a `src` side: P overlaps the allowlist
+    ///   (P's hosts send through VPP), or P is not wholly `steer-exempt`
+    ///   (other steered sources reach P through VPP). On a `dst` side:
+    ///   the allowlisted part of P is not wholly `steer-exempt`
+    ///   (inbound to P), or P is remote (in no `local-prefix`) and some
+    ///   allowlisted destination is not exempt (P's hosts reach it
+    ///   through VPP).
+    /// - An IPv6 prefix: any `v6-divert`, which diverts by frame and
+    ///   cannot be scoped by address.
+    ///
+    /// A family with no allowlist diverts nothing the fast path would
+    /// clamp, nor does IPv4 when the exemptions cover every address;
+    /// "local" is coverage by the `local-prefix` lines together; and
+    /// `dry-run on` applies no clamp, so the check is skipped.
+    ///
+    /// A `via <if>` clamp is judged only when VPP can send out of `<if>`:
+    /// a member port, or the device of a `local-prefix` VPP delivers to
+    /// through a `local-route`. Any other device (a tunnel, say) is not
+    /// one VPP egresses, so the clamp cannot be lost to it.
+    fn validate_vpp_mss_clamps(
+        vpp: &ModuleSection,
+        fp: &ModuleSection,
+        global_dir: VppSteerDirection,
+    ) -> Result<(), ConfigError> {
+        // `dry-run on` (the first `dry-run` line, as the fast path reads
+        // it) passes matched packets before the clamp, so there is no
+        // clamp to lose. `until-seeded` releases on its own and is
+        // checked; turning `dry-run off` is a reload, which re-validates.
+        let dry_run_on = fp.directives.iter().find_map(|d| match d {
+            ModuleDirective::DryRun(on) => Some(*on),
+            ModuleDirective::DryRunUntilSeeded => Some(false),
+            _ => None,
+        }) == Some(true);
+        if dry_run_on {
+            return Ok(());
+        }
+        struct Steered<'a> {
+            iface: &'a str,
+            src: bool,
+            dst: bool,
+            v6: bool,
+        }
+        let steered: Vec<Steered> = vpp
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::VppPort {
+                    iface,
+                    steer: true,
+                    direction,
+                    v6_divert,
+                    ..
+                } => {
+                    let dir = direction.unwrap_or(global_dir);
+                    Some(Steered {
+                        iface,
+                        src: matches!(dir, VppSteerDirection::Src | VppSteerDirection::Both),
+                        dst: matches!(dir, VppSteerDirection::Dst | VppSteerDirection::Both),
+                        v6: match v6_divert {
+                            Some(VppV6Divert::Untagged) => true,
+                            Some(VppV6Divert::Vlans(v)) => !v.is_empty(),
+                            None => false,
+                        },
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let allow4: Vec<&Ipv4Prefix> = fp
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::AllowPrefix4(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        let exempts: Vec<&Ipv4Prefix> = vpp
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::VppSteerExempt(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        // Nothing v4 is diverted without an allowlist (the plan installs
+        // no rule at all), so the sides only count with one. Nor when the
+        // exemptions cover every destination: a `steer-exempt` keep rule
+        // outranks every divert rule, src or dst.
+        let everything = Ipv4Prefix {
+            addr: std::net::Ipv4Addr::UNSPECIFIED,
+            prefix_len: 0,
+        };
+        let v4 = !allow4.is_empty() && !v4_tiled(&everything, &exempts);
+        let src_port = steered.iter().find(|p| v4 && p.src).map(|p| p.iface);
+        let dst_port = steered.iter().find(|p| v4 && p.dst).map(|p| p.iface);
+        // Likewise IPv6: the fast path clamps only what an
+        // `allow-prefix6` matched, so with none there is no v6 clamp to
+        // lose to `v6-divert`.
+        let v6 = fp
+            .directives
+            .iter()
+            .any(|d| matches!(d, ModuleDirective::AllowPrefix6(_)));
+        let v6_port = steered.iter().find(|p| v6 && p.v6).map(|p| p.iface);
+        let any_v4_port = src_port.or(dst_port);
+
+        let exempted = |p: &Ipv4Prefix| v4_tiled(p, &exempts);
+        let overlap = |a: &Ipv4Prefix, b: &Ipv4Prefix| -> Option<Ipv4Prefix> {
+            if a.contains_prefix(b) {
+                Some(*b)
+            } else if b.contains_prefix(a) {
+                Some(*a)
+            } else {
+                None
+            }
+        };
+        // Tiled, not contained: a clamped /23 can be two local /24s.
+        let locals4: Vec<&Ipv4Prefix> = fp
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::LocalPrefix { cidr, .. } => Some(cidr),
+                _ => None,
+            })
+            .collect();
+        let local_v4 = |p: &Ipv4Prefix| v4_tiled(p, &locals4);
+        let vpp_egress = |dev: &str| {
+            let member = vpp
+                .directives
+                .iter()
+                .any(|d| matches!(d, ModuleDirective::VppPort { iface, .. } if iface == dev));
+            let delivered4 = fp.directives.iter().any(|d| match d {
+                ModuleDirective::LocalPrefix { cidr, iface, .. } if iface == dev => {
+                    vpp.directives.iter().any(|r| {
+                        matches!(r, ModuleDirective::VppLocalRoute { prefix, .. }
+                            if cidr.contains_prefix(prefix) || prefix.contains_prefix(cidr))
+                    })
+                }
+                _ => false,
+            });
+            let delivered6 = fp.directives.iter().any(|d| match d {
+                ModuleDirective::LocalPrefix6 { cidr, iface, .. } if iface == dev => {
+                    vpp.directives.iter().any(|r| {
+                        matches!(r, ModuleDirective::VppLocalRoute6 { prefix, .. }
+                            if cidr.contains_prefix(prefix) || prefix.contains_prefix(cidr))
+                    })
+                }
+                _ => false,
+            });
+            member || delivered4 || delivered6
+        };
+
+        for d in &fp.directives {
+            let ModuleDirective::MssClamp {
+                prefix,
+                iface,
+                mss,
+                line,
+            } = d
+            else {
+                continue;
+            };
+            if iface.as_deref().is_some_and(|dev| !vpp_egress(dev)) {
+                continue;
+            }
+            let shown = match (prefix, iface) {
+                (Some(MssClampPrefix::V4(p)), Some(i)) => {
+                    format!("mss-clamp {}/{} via {i} {mss}", p.addr, p.prefix_len)
+                }
+                (Some(MssClampPrefix::V4(p)), None) => {
+                    format!("mss-clamp {}/{} {mss}", p.addr, p.prefix_len)
+                }
+                (Some(MssClampPrefix::V6(p)), Some(i)) => {
+                    format!("mss-clamp {}/{} via {i} {mss}", p.addr, p.prefix_len)
+                }
+                (Some(MssClampPrefix::V6(p)), None) => {
+                    format!("mss-clamp {}/{} {mss}", p.addr, p.prefix_len)
+                }
+                (None, Some(i)) => format!("mss-clamp via {i} {mss}"),
+                (None, None) => format!("mss-clamp {mss}"),
+            };
+            let lost: Option<(&str, String)> = match prefix {
+                None => any_v4_port
+                    .map(|port| {
+                        (
+                            port,
+                            "it steers IPv4, and the clamp applies to all of it".into(),
+                        )
+                    })
+                    .or_else(|| {
+                        v6_port.map(|port| {
+                            (
+                                port,
+                                "it diverts IPv6, and the clamp applies to all of it".into(),
+                            )
+                        })
+                    }),
+                Some(MssClampPrefix::V6(_)) => v6_port.map(|port| {
+                    (
+                        port,
+                        "it diverts IPv6 by frame, which no address can scope, so traffic to \
+                         and from the prefix can reach VPP"
+                            .into(),
+                    )
+                }),
+                Some(MssClampPrefix::V4(p)) => {
+                    let src_hosts = src_port.and_then(|port| {
+                        allow4.iter().find(|a| overlap(a, p).is_some()).map(|a| {
+                            (
+                                port,
+                                format!(
+                                    "it steers `direction src` and the allowlisted {}/{} \
+                                     overlaps the prefix, so its hosts' traffic goes through VPP",
+                                    a.addr, a.prefix_len
+                                ),
+                            )
+                        })
+                    });
+                    let src_to = || {
+                        src_port.filter(|_| !exempted(p)).map(|port| {
+                            (
+                                port,
+                                "it steers `direction src`, so traffic from the allowlist to \
+                                 the prefix goes through VPP, and no `steer-exempt` covers \
+                                 the prefix"
+                                    .into(),
+                            )
+                        })
+                    };
+                    let dst_to = || {
+                        dst_port.and_then(|port| {
+                            allow4
+                                .iter()
+                                .filter_map(|a| overlap(a, p))
+                                .find(|o| !exempted(o))
+                                .map(|o| {
+                                    (
+                                        port,
+                                        format!(
+                                            "it steers `direction dst`, and inbound to {}/{} \
+                                             goes through VPP: no `steer-exempt` covers it",
+                                            o.addr, o.prefix_len
+                                        ),
+                                    )
+                                })
+                        })
+                    };
+                    let dst_from = || {
+                        dst_port
+                            .filter(|_| !local_v4(p) && allow4.iter().any(|a| !exempted(a)))
+                            .map(|port| {
+                                (
+                                    port,
+                                    "it steers `direction dst`, and the prefix is remote (in no \
+                                     `local-prefix`), so its hosts' traffic to the allowlist \
+                                     goes through VPP"
+                                        .into(),
+                                )
+                            })
+                    };
+                    src_hosts.or_else(src_to).or_else(dst_to).or_else(dst_from)
+                }
+            };
+            if let Some((port, why)) = lost {
+                return Err(ConfigError::parse(
+                    *line,
+                    format!(
+                        "`{shown}` would not apply to traffic `port {port}` steers to VPP: \
+                         {why}. The clamp runs in the eBPF tier, which a frame diverted to \
+                         VPP never reaches, so it would leave unclamped. Keep that traffic \
+                         on the kernel path (a `steer-exempt` for traffic TO a prefix, or \
+                         `steer off` / another `direction` on the port), or drop the clamp \
+                         if it is no longer needed"
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -3812,6 +4106,30 @@ pub fn parse_mac_literal(tok: &str) -> Result<[u8; 6], String> {
             u8::from_str_radix(p, 16).map_err(|_| format!("`{tok}`: octet `{p}` is not hex"))?;
     }
     Ok(mac)
+}
+
+/// Whether `pieces` together cover every address in `target`. Half-open
+/// `u64` ranges, so /0 and the last address do not wrap.
+fn v4_tiled(target: &Ipv4Prefix, pieces: &[&Ipv4Prefix]) -> bool {
+    let range = |p: &Ipv4Prefix| -> (u64, u64) {
+        let start = u64::from(u32::from(p.network()));
+        (start, start + (1u64 << (32 - p.prefix_len)))
+    };
+    let (start, end) = range(target);
+    let mut spans: Vec<(u64, u64)> = pieces
+        .iter()
+        .map(|p| range(p))
+        .filter(|&(s, e)| s < end && e > start)
+        .collect();
+    spans.sort_unstable();
+    let mut cursor = start;
+    for (s, e) in spans {
+        if s > cursor {
+            break;
+        }
+        cursor = cursor.max(e);
+    }
+    cursor >= end
 }
 
 /// One warning per `local-prefix` / `local-prefix6` directive that no
@@ -8573,6 +8891,121 @@ module vpp-offload
                     local-route 192.0.2.0/24 port eth4 vlan 1337\n  \
                     local-route6 2001:db8:1::/64 port eth4 vlan 1337\n";
         Config::parse(dual).unwrap().validate_vpp_offload().unwrap();
+    }
+
+    /// A steer that would carry clamped traffic through VPP, which does
+    /// not apply the fast path's `mss-clamp`, is refused at load.
+    #[test]
+    fn a_steer_that_would_bypass_an_mss_clamp_is_refused() {
+        // A customer /24 behind a trunk, clamped; a transit port steering
+        // inbound. 203.0.113.0/24 is another allowlisted (transit) prefix.
+        let check = |clamp: &str, ports: &str, extra: &str| {
+            let cfg = format!(
+                "module fast-path\n  forwarding-mode packetframe-fib\n  attach eth2 generic\n  \
+                 attach eth4 generic\n  allow-prefix 192.0.2.0/24\n  \
+                 allow-prefix 203.0.113.0/24\n  local-prefix 192.0.2.0/24 via br1337\n  \
+                 {clamp}\n\n\
+                 module vpp-offload\n  loopback-address 198.51.100.254/32\n  {ports}\n  \
+                 local-route 192.0.2.0/24 port eth4 vlan 1337\n{extra}"
+            );
+            Config::parse(&cfg)
+                .unwrap()
+                .validate_vpp_offload()
+                .map_err(|e| format!("{e}"))
+        };
+        let transit_dst = "port eth2 cores 1 steer on direction dst\n  \
+                           port eth4 cores 1 steer off vlans 1337";
+        let exempt = "  steer-exempt 192.0.2.0/24\n";
+
+        // Inbound to the clamped prefix stays on the kernel path: valid.
+        check("mss-clamp 192.0.2.0/24 1360", transit_dst, exempt).unwrap();
+        // Nothing steered: valid, whatever the clamp.
+        let off = "port eth2 cores 1 steer off\n  port eth4 cores 1 steer off vlans 1337";
+        check("mss-clamp 1360", off, "").unwrap();
+
+        // Without the exemption, inbound to it reaches VPP.
+        let e = check("mss-clamp 192.0.2.0/24 1360", transit_dst, "").unwrap_err();
+        assert!(e.contains("inbound to 192.0.2.0/24"), "{e}");
+        assert!(e.contains("port eth2"), "{e}");
+        // Exempting only part of it is not enough.
+        let e = check(
+            "mss-clamp 192.0.2.0/24 1360",
+            transit_dst,
+            "  steer-exempt 192.0.2.0/25\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("inbound to 192.0.2.0/24"), "{e}");
+        // Two halves are.
+        check(
+            "mss-clamp 192.0.2.0/24 1360",
+            transit_dst,
+            "  steer-exempt 192.0.2.0/25\n  steer-exempt 192.0.2.128/25\n",
+        )
+        .unwrap();
+
+        // Steering the trunk's sources: the customer's own SYNs go to VPP,
+        // and no destination exemption can keep them.
+        let trunk_both = "port eth2 cores 1 steer on direction dst\n  \
+                          port eth4 cores 1 steer on vlans 1337 direction both";
+        let e = check("mss-clamp 192.0.2.0/24 1360", trunk_both, exempt).unwrap_err();
+        assert!(e.contains("`direction src`"), "{e}");
+        assert!(e.contains("port eth4"), "{e}");
+        assert!(
+            e.contains("line"),
+            "the refusal names the clamp's line: {e}"
+        );
+
+        // A remote prefix: its hosts' traffic to a steered destination
+        // arrives on the transit port and goes to VPP.
+        let e = check("mss-clamp 198.18.0.0/15 1360", transit_dst, exempt).unwrap_err();
+        assert!(e.contains("remote"), "{e}");
+        // ...unless nothing allowlisted is left to divert to.
+        check(
+            "mss-clamp 198.18.0.0/15 1360",
+            transit_dst,
+            "  steer-exempt 192.0.2.0/24\n  steer-exempt 203.0.113.0/24\n",
+        )
+        .unwrap();
+
+        // An unscoped clamp covers everything steered.
+        let e = check("mss-clamp 1360", transit_dst, exempt).unwrap_err();
+        assert!(e.contains("`mss-clamp 1360`"), "{e}");
+        // An egress clamp counts only where VPP can send.
+        let e = check("mss-clamp via eth2 1360", transit_dst, exempt).unwrap_err();
+        assert!(e.contains("`mss-clamp via eth2 1360`"), "{e}");
+        let e = check("mss-clamp via br1337 1360", transit_dst, exempt).unwrap_err();
+        assert!(e.contains("via br1337"), "a device VPP delivers to: {e}");
+        check("mss-clamp via wg0 1360", transit_dst, exempt).unwrap();
+        check("mss-clamp 198.18.0.0/15 via wg0 1360", transit_dst, exempt).unwrap();
+
+        // IPv6 is diverted by frame: any v6 clamp is lost to `v6-divert`.
+        let v6_ports = "v6 on\n  port eth2 cores 1 steer on direction dst v6-divert untagged\n  \
+                        port eth4 cores 1 steer off vlans 1337";
+        let v6_clamp = "allow-prefix6 2001:db8::/32\n  mss-clamp 2001:db8::/48 1340";
+        let e = check(v6_clamp, v6_ports, exempt).unwrap_err();
+        assert!(e.contains("IPv6"), "{e}");
+        check(v6_clamp, transit_dst, exempt).unwrap();
+        // ...but only with a v6 allowlist: without one the fast path
+        // clamps no IPv6, so there is nothing to lose.
+        check("mss-clamp 2001:db8::/48 1340", v6_ports, exempt).unwrap();
+
+        // A prefix tiled by local subnets is local, not remote.
+        check(
+            "local-prefix 192.0.3.0/24 via br1338\n  mss-clamp 192.0.2.0/23 1360",
+            transit_dst,
+            exempt,
+        )
+        .unwrap();
+        // Exemptions covering every destination divert nothing.
+        check("mss-clamp 1360", trunk_both, "  steer-exempt 0.0.0.0/0\n").unwrap();
+        // `dry-run on` applies no clamp; `until-seeded` releases by itself.
+        check("dry-run on\n  mss-clamp 1360", transit_dst, exempt).unwrap();
+        check(
+            "dry-run until-seeded\n  mss-clamp 1360",
+            transit_dst,
+            exempt,
+        )
+        .unwrap_err();
     }
 
     /// dst steering into VPP without local delivery for a steerable
