@@ -35,6 +35,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 **fast-path**
 
 - The completeness authority (`birdc` or `frr`) compares its count against the prefixes a route source delivered, not the whole mirror. The `local-prefix` host routes and the `fallback-default` no longer count, so a small table no longer reads as `AuthorityMismatch`. vpp-offload's gate takes the fallback default off its own count too. [#427](https://github.com/unredacted/packetframe/pull/427)
+- Under `packetframe-fib`, a connected prefix the feed delivers with next hop `0.0.0.0` or the router's own address, with no `local-prefix`, makes its flows to an allowlisted `local-prefix` one-way: the replies reach the kernel alone and conntrack drops them as INVALID. Such prefixes are now named in a `one-way-fast-path` status row, a WARN and `packetframe_fib_one_way_routes`, with the `local-prefix ... via <iface>` line that fixes each. The warning for a `local-prefix` with no allow entry no longer says its host routes are never used: they serve flows whose other end is allowlisted, which a reply-only `local-prefix` is for. [#432](https://github.com/unredacted/packetframe/pull/432)
 
 **vpp-offload**
 

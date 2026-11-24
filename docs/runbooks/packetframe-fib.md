@@ -717,6 +717,11 @@ Alongside the existing counter family, the textfile exporter emits:
   the programmer (gauges). See the triage entry
   [nexthops stuck `incomplete` while the kernel neighbour is
   REACHABLE](#symptom-nexthops-stuck-incomplete-while-the-kernel-neighbour-is-reachable).
+- `packetframe_fib_one_way_routes`: connected routes the fast path hands
+  to the kernel while their hosts' traffic to an allowlisted
+  `local-prefix` bypasses it (gauge; absent until the programmer's first
+  check, about a minute after start). Anything above 0 is a
+  [one-way fast path](#reply-only-local-prefix-the-one-way-fast-path).
 
 Example alerts:
 
@@ -737,6 +742,10 @@ sum(packetframe_nexthops{state=~"incomplete|failed"}) > 0
 
 # The daemon had to restart its neighbour resolver.
 increase(packetframe_fib_neigh_resolver_restarts_total[1h]) > 0
+
+# A connected prefix needs a local-prefix, or its flows to allowlisted
+# local-prefix hosts are one-way and time out.
+packetframe_fib_one_way_routes > 0
 
 # Unexpected forwarding-mode transition.
 changes(packetframe_fib_forwarding_mode{mode="packetframe-fib"}[5m]) > 0
@@ -969,14 +978,18 @@ connected /128.
   needed. The directive is a no-op in this mode (parsed and
   validated, but the resolver only emits events when both
   packetframe-fib AND a route-source are configured).
-- **Operator hasn't declared the customer prefix in `allow-prefix`.**
-  XDP filters on allowlist BEFORE the FIB lookup, so a /32 in the
-  FIB does nothing if the parent prefix isn't matched. Add the
-  customer /24 to `allow-prefix` first. Same for `local-prefix6`:
-  it needs a covering `allow-prefix6`, and that is a separate
-  directive — declaring only the v4 pair is the common slip.
-  packetframe logs a startup WARN for any local-prefix directive
-  with no overlapping same-family allow entry.
+- **Operator hasn't declared the customer prefix in `allow-prefix`
+  (and meant to).** XDP filters on the allowlist BEFORE the FIB
+  lookup, matching source or destination. A /32 under a prefix with no
+  allow entry carries only flows whose other end is allowlisted, never
+  traffic to its hosts from anywhere else. For a customer prefix that
+  is a slip: add the customer /24 to `allow-prefix` first. Same for
+  `local-prefix6`: it needs a covering `allow-prefix6`, and that is a
+  separate directive — declaring only the v4 pair is the common slip.
+  packetframe logs a startup WARN for any local-prefix directive with
+  no overlapping same-family allow entry, saying what the prefix does
+  and does not get. A **reply-only** `local-prefix` (below) draws the
+  same WARN by design; leave it as it is.
 - **The prefix isn't actually connected.** Declare what is configured
   on the interface (`ip -6 addr show dev <iface>`), not the aggregate
   you announce to the world. The announced aggregate is a null-routed
@@ -994,6 +1007,73 @@ connected /128.
   iface (WireGuard, GRE, IPSec). The BPF program can't redirect
   to non-XDP-capable interfaces, so the /32 just sits unused.
   Stick to physical and bridge interfaces.
+
+### Reply-only `local-prefix`: the one-way fast path
+
+Once one allowlisted `local-prefix` exists, every *other* connected
+prefix on the box needs a `local-prefix` too, allowlisted or not. A
+prefix without one can break its flows to the allowlisted hosts.
+
+How it breaks. The feed can deliver a connected prefix with a next hop
+the fast path never resolves: `0.0.0.0` / `::` (FRR's
+`redistribute connected` over iBGP) or the router's own address. The
+FIB holds it `incomplete`. Take an internal VLAN, `192.0.2.0/24` on
+`br20`, neither allowlisted nor declared, and a customer LAN,
+`198.51.100.0/24` on `br1337`, allowlisted with a `local-prefix`. A
+flow between `192.0.2.10` and `198.51.100.20` is split:
+
+- `192.0.2.10 → 198.51.100.20` matches the allowlist on its
+  destination, takes the customer host's /32 and is redirected by XDP.
+  The kernel never sees it.
+- `198.51.100.20 → 192.0.2.10` hits the `incomplete` /24 and is passed
+  to the kernel (`fib_no_neigh`).
+
+The kernel sees one direction only. For a connection the internal host
+opens, conntrack never saw the SYN, so it marks the SYN-ACK INVALID. A
+stateful firewall drops it and the connection times out. Under
+`kernel-fib` the same flows worked, because `bpf_fib_lookup` resolved
+the kernel's own connected neighbour for the reply. So this shows up at
+the move to `packetframe-fib`, on prefixes nobody thought to declare.
+
+The fix is a `local-prefix` for each such connected prefix, with no
+allow entry:
+
+```
+  allow-prefix 198.51.100.0/24
+  local-prefix 198.51.100.0/24 via br1337    # customer LAN, allowlisted
+  local-prefix 192.0.2.0/24    via br20      # internal VLAN, reply-only
+```
+
+Its host routes give the reply the fast path too, so both directions
+bypass the kernel. It does not fast-path traffic to `192.0.2.0/24` from
+anywhere else: that needs the allowlist, and nothing here asks for it.
+At startup it draws the "no overlapping allow-prefix" WARN, which says
+exactly this. That is expected; do not remove the line or allowlist the
+prefix to silence it. The reference deployment runs its internal VLANs
+this way.
+
+packetframe catches the hazard itself. About a minute after start, and
+every minute after, the FIB programmer looks up each of the kernel's
+connected prefixes in its mirror. It skips a prefix whose interface
+does not sit on an `attach` interface (directly, or through VLAN,
+bridge or bond devices): hosts on a management NIC the fast path never
+sees enter the kernel both ways. Where the mirror holds the prefix
+over unresolvable or own-address next hops, no `local-prefix` wholly
+covers it, and the same family has an allowlisted `local-prefix`, it:
+
+- logs a WARN once per prefix, naming the `local-prefix ... via <iface>`
+  line to add;
+- shows a `one-way-fast-path` row in `packetframe status`, Degraded,
+  listing every such prefix. The row is absent when there are none;
+- sets `packetframe_fib_one_way_routes` to the count.
+
+A reload re-judges the last findings against the new allowlist. A new
+`local-prefix` takes a restart, like every `local-prefix` edit (see
+Disabling below). A `local-prefix` narrower than the connected prefix
+leaves the rest of it one-way, so the prefix stays listed. Only
+`packetframe-fib` and `compare` run the check; `kernel-fib` has no
+mirror and no hazard. When the last such subnet's address goes away,
+the next check clears the findings.
 
 ### Disabling
 
@@ -1763,6 +1843,14 @@ restart that seeds.
    routes flow to the kernel FIB. Customer /32s, connected, static
    default still flow via non-BGP mechanisms; udapi parses those
    fine.
+5. If the config has any allowlisted `local-prefix`, give every other
+   connected prefix (internal VLANs, management, storage) a
+   `local-prefix ... via <iface>` too, with no allow entry. Under
+   `kernel-fib` their flows to the allowlisted hosts worked; under
+   `packetframe-fib` they are one-way and time out without it. See
+   [Reply-only `local-prefix`](#reply-only-local-prefix-the-one-way-fast-path).
+   `ip -br addr` lists the connected prefixes. After the cutover the
+   `one-way-fast-path` status row, if present, lists any you missed.
 
 **Cutover sequence:**
 
@@ -2107,6 +2195,24 @@ you can deploy a build that has it.
 Note that other ICMPv6 (echo, errors) is deliberately *not* gated: the
 guard keys on message type, not on hop limit, so ordinary ICMPv6 still
 fast-paths.
+
+### Symptom: connections between an internal VLAN and customer hosts time out after the move to packetframe-fib
+
+What it means: a one-way fast path. The internal VLAN's connected route
+has no `local-prefix`, so traffic to its hosts goes to the kernel, while
+their traffic to an allowlisted `local-prefix` is fast-pathed. The
+kernel's conntrack sees half of each flow and marks the rest INVALID.
+
+```sh
+sudo packetframe status | grep -A2 one-way-fast-path
+# Kernel side: INVALID drops on the replies.
+sudo conntrack -S | grep -o 'invalid=[0-9]*'
+```
+
+The row names each prefix and the `local-prefix ... via <iface>` line
+that fixes it. Add the lines (no allow entry) and restart. The mechanism
+and why `kernel-fib` never showed it are in
+[Reply-only `local-prefix`](#reply-only-local-prefix-the-one-way-fast-path).
 
 ### Symptom: `fib_miss` climbs without `fib_hit` keeping pace
 

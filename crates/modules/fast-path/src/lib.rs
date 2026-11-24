@@ -334,9 +334,10 @@ impl Module for FastPathModule {
 
     /// Only the gauges that live in the daemon's memory rather than in a
     /// pinned map come through here: `wan-egress`, the route ledger, the
-    /// neighbour resolver and the redirect-target watcher. Everything else
-    /// the cli's MetricsExporter (`crates/cli/src/metrics.rs`) reads from
-    /// the pins directly on its 15 s cadence.
+    /// neighbour resolver, the redirect-target watcher and the one-way
+    /// fast-path watch. Everything else the cli's MetricsExporter
+    /// (`crates/cli/src/metrics.rs`) reads from the pins directly on its
+    /// 15 s cadence.
     #[cfg(target_os = "linux")]
     fn sample_metrics(&self, out: &mut MetricsWriter<'_>) -> ModuleResult<()> {
         if let Some(w) = self.state.as_ref().and_then(|s| s.wan_egress.as_ref()) {
@@ -358,6 +359,9 @@ impl Module for FastPathModule {
             .and_then(linux_impl::neigh_resolver_status)
         {
             n.render_metrics(std::time::Instant::now(), out.out);
+        }
+        if let Some(w) = self.state.as_ref().and_then(linux_impl::one_way_watch) {
+            w.render_metrics(out.out);
         }
         Ok(())
     }
@@ -403,6 +407,11 @@ impl Module for FastPathModule {
     /// A fifth, `redirect-watch`, whenever attached (in any forwarding
     /// mode): whether the redirect maps still follow the link table, or
     /// why not.
+    ///
+    /// A sixth, `one-way-fast-path`, only while it has findings: connected
+    /// routes with no `local-prefix` that the fast path hands to the
+    /// kernel while their hosts' traffic to an allowlisted `local-prefix`
+    /// bypasses it (`fib::one_way`).
     #[cfg(target_os = "linux")]
     fn health_check(&self, _ctx: &HealthCtx) -> ModuleResult<HealthReport> {
         let mut subsystems: Vec<_> = self
@@ -440,6 +449,17 @@ impl Module for FastPathModule {
         }
         if let Some(w) = self.state.as_ref().and_then(|s| s.redirect_watch.as_ref()) {
             subsystems.push(w.status().subsystem_health());
+        }
+        // `one-way-fast-path`, only with findings: connected routes the
+        // fast path hands to the kernel while their hosts' traffic to an
+        // allowlisted local-prefix bypasses it.
+        if let Some(h) = self
+            .state
+            .as_ref()
+            .and_then(linux_impl::one_way_watch)
+            .and_then(|w| w.subsystem_health())
+        {
+            subsystems.push(h);
         }
         // `worse_of` rather than a hand-rolled escalation: a module that
         // reports Healthy over a Degraded subsystem disagrees with its

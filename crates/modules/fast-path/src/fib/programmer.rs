@@ -1319,6 +1319,11 @@ pub struct FibProgrammer {
     /// the kernel never resolves and nothing re-probes
     /// ([`super::local_nexthops`]). Re-read with every re-probe summary.
     local: LocalNexthops,
+    /// Where the connected routes the fast path hands to the kernel are
+    /// reported, to be judged for a one-way fast path
+    /// ([`crate::fib::one_way`]). Read with every re-probe summary. `None`
+    /// in harnesses.
+    one_way: Option<crate::fib::one_way::SharedOneWay>,
 
     // --- Route ledger ---
     /// A ledger to seed the mirror from, handed over before `run` (see
@@ -1614,6 +1619,7 @@ impl FibProgrammer {
                 slow_budget: Budget::default(),
                 slow_after: resolve_watch::SLOW_AFTER,
                 local: LocalNexthops::new(kernel_local_addrs()),
+                one_way: None,
                 seed: None,
                 seeding: false,
                 unseen_session: 0,
@@ -1801,6 +1807,12 @@ impl FibProgrammer {
     /// every origin programmed before it.
     pub fn set_asn_table(&mut self, table: Arc<packetframe_common::fib::asn::AsnTable>) {
         self.asn_table = Some(table);
+    }
+
+    /// Report the mirror's kernel-only connected routes to `watch` once a
+    /// minute ([`Self::check_one_way`]).
+    pub fn set_one_way_watch(&mut self, watch: crate::fib::one_way::SharedOneWay) {
+        self.one_way = Some(watch);
     }
 
     /// How long a nexthop may stay unresolved before it is reported as
@@ -2899,6 +2911,7 @@ impl FibProgrammer {
         if now.duration_since(self.reprobe_last_stats) >= REPROBE_STATS_INTERVAL {
             self.reprobe_last_stats = now;
             self.refresh_local();
+            self.check_one_way();
             // A request the resolver served after the nexthop resolved or
             // went leaves a tally nothing will take. Only unresolved
             // nexthops need one.
@@ -3073,6 +3086,43 @@ impl FibProgrammer {
             "nexthops that are the router's own addresses changed; local ones are delivered \
              by the kernel and are not awaiting resolution"
         );
+    }
+
+    /// Tell the one-way watch which of the kernel's connected prefixes
+    /// the mirror holds over next hops the fast path never resolves
+    /// (unspecified, or the router's own): XDP passes traffic to them to
+    /// the kernel. One lookup per connected prefix, never a walk of the
+    /// mirror. Right after [`Self::refresh_local`], so `local` is current.
+    fn check_one_way(&self) {
+        let Some(watch) = &self.one_way else {
+            return;
+        };
+        // A failed read keeps the last findings; an empty one (no subnet
+        // left on the box) clears them.
+        let Some(connected) = crate::fib::one_way::kernel_connected_routes() else {
+            return;
+        };
+        // Only subnets whose hosts reach the router through an attached
+        // interface: the others' traffic enters the kernel both ways.
+        let attached = watch.attached();
+        let routes = connected
+            .into_iter()
+            .filter(|r| {
+                crate::fib::one_way::on_datapath(
+                    &r.iface,
+                    &attached,
+                    crate::fib::one_way::sysfs_lowers,
+                )
+            })
+            .filter(|r| {
+                self.lookup_mirror(&r.prefix).is_some_and(|rec| {
+                    crate::fib::one_way::kernel_only(&rec.nexthop_ips, |ip| self.local.is_local(ip))
+                })
+            })
+            .collect();
+        for w in watch.observe(routes) {
+            warn!("{w}");
+        }
     }
 
     /// Put a nexthop that just became the router's own back on the kernel

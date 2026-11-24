@@ -889,6 +889,11 @@ pub struct ActiveState {
     /// What this start did with the route ledger, and the seed's
     /// progress since — shared with the control plane that applies it.
     pub ledger_status: crate::fib::route_ledger::SharedLedgerStatus,
+    /// The connected routes that make a one-way fast path, as the
+    /// programmer last found them against the config in force (refreshed
+    /// by every SIGHUP reconcile). Reported only while the control plane
+    /// runs.
+    pub one_way: crate::fib::one_way::SharedOneWay,
     /// `dry-run`'s mode and, for `until-seeded`, whether the mirror has
     /// been whole yet ([`crate::dry_run_gate`]). Shared with the
     /// programmer, which lets the hold go, and the reload.
@@ -1020,6 +1025,9 @@ pub fn load(cfg: &ModuleConfig<'_>, ctx: &LoaderCtx<'_>) -> ModuleResult<ActiveS
         wan_egress: None,
         route_ledger: route_ledger_spec_from_cfg(cfg),
         ledger_status: crate::fib::route_ledger::shared_status(),
+        one_way: std::sync::Arc::new(crate::fib::one_way::OneWayWatch::new(
+            cfg.section.directives.to_vec(),
+        )),
         dry_run_gate: crate::dry_run_gate::DryRunGate::new(crate::dry_run_gate::DryRunMode::of(
             &cfg.section.directives,
         )),
@@ -2505,6 +2513,7 @@ pub fn attach(
                 local_prefixes,
                 fallback_default,
                 ix_interfaces: ix_mode_ifaces,
+                one_way: Some(state.one_way.clone()),
             },
             fdb_pin_chains,
             route_sink,
@@ -3997,6 +4006,13 @@ pub fn route_ledger_status(state: &ActiveState) -> Option<crate::fib::route_ledg
     )
 }
 
+/// The one-way fast-path watch, for the health and metrics surfaces.
+/// `None` in kernel-fib mode: no mirror, so nothing is one-way.
+pub fn one_way_watch(state: &ActiveState) -> Option<&crate::fib::one_way::OneWayWatch> {
+    state.route_controller.as_ref()?;
+    Some(&state.one_way)
+}
+
 /// The neighbour resolver's status, for the health and metrics surfaces.
 /// `None` in kernel-fib mode, where no resolver runs.
 pub fn neigh_resolver_status(
@@ -4604,6 +4620,7 @@ mod tests {
             wan_egress: None,
             route_ledger: packetframe_common::config::RouteLedgerSpec::default(),
             ledger_status: crate::fib::route_ledger::shared_status(),
+            one_way: Default::default(),
             dry_run_gate: crate::dry_run_gate::DryRunGate::new(
                 crate::dry_run_gate::DryRunMode::Off,
             ),
