@@ -32,6 +32,10 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 ### Changes
 
+**vpp-offload**
+
+- A steer that would carry traffic a fast-path `mss-clamp` covers through VPP, which does not apply it, is refused at start and at reload, naming the clamp and the port. Before, the clamp silently stopped applying to steered traffic. [#PR](https://github.com/unredacted/packetframe/pull/PR)
+
 **neigh-snoop**
 
 - A bridge counts as up only when it also has carrier. When it loses carrier, the kernel flushes its neighbours. The learned table is now re-seeded when carrier comes back, not only after an admin bring-up, and a bridge that comes up before its link is no longer seeded into a flush. [#423](https://github.com/unredacted/packetframe/pull/423)

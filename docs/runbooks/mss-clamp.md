@@ -7,6 +7,7 @@ Operator guide for `mss-clamp` directives in `module fast-path`. Closes the [SPE
 - [When to use it](#when-to-use-it)
 - [Grammar + lookup precedence](#grammar--lookup-precedence)
 - [What gets clamped](#what-gets-clamped)
+- [With vpp-offload](#with-vpp-offload)
 - [Troubleshooting](#troubleshooting)
 - [Why no `from <iface>` (ingress) form?](#why-no-from-iface-ingress-form)
 - [Hot-reload semantics](#hot-reload-semantics)
@@ -54,6 +55,31 @@ CIDR ranges work for both IPv4 and IPv6; the parser dispatches on the address fa
 - Only when a clamp value > 0 applies. A packet whose lookup returns no policy is forwarded with no counter activity.
 
 What is **not** touched: the original packet's TCP timestamp, SACK, window-scale, or any other option. Only the MSS option's 2 bytes change. Checksum is recomputed via RFC 1624 incremental update, with no full TCP-segment re-fold.
+
+## With vpp-offload
+
+The clamp runs in XDP. A frame the NIC steers to VPP never reaches XDP,
+so VPP forwards it unclamped. vpp-offload therefore refuses, at start and
+at reload, a steer that would carry clamped traffic through VPP, and
+names the `mss-clamp` line and the port. What counts:
+
+- `mss-clamp <mss>`: anything steered. `mss-clamp via <iface> <mss>`:
+  the same, when VPP can send out of `<iface>` (a member port, or the
+  device of a `local-prefix` a `local-route` delivers to). A clamp via a
+  device VPP never egresses, such as a tunnel, is not judged.
+- An IPv4 prefix, on a `direction src` side: the prefix overlaps the
+  allowlist, or it is not wholly `steer-exempt`. On a `direction dst`
+  side: the allowlisted part of it is not wholly `steer-exempt`, or it
+  is remote (in no `local-prefix`) and something allowlisted is not
+  exempt.
+- An IPv6 prefix: any `v6-divert`, which diverts by frame and cannot be
+  scoped by address.
+
+To keep a clamped prefix on the kernel path, `steer-exempt` it (that
+keeps traffic TO it) and leave its hosts' trunk unsteered or
+`direction dst`, or take it off the allowlist. The design notes for
+clamping in VPP itself are in
+[vpp-mss-clamp-design.md](vpp-mss-clamp-design.md).
 
 ## Troubleshooting
 
