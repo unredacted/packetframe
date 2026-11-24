@@ -2032,6 +2032,18 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
         }
     }
 
+    // Where this detach looks, and why: every record it acts on (VPP's
+    // state file, the pin registry, the route ledger) is found there.
+    tracing::info!(
+        state_dir = %state_dir.display(),
+        bpffs_root = %bpffs_root.display(),
+        config = %config.map_or_else(
+            || "none (built-in defaults)".to_string(),
+            |p| p.display().to_string()
+        ),
+        "detach: reading state from"
+    );
+
     // Only now, with no daemon to share the file with: a teardown is one
     // of the transitions the event log exists to keep.
     let log_global = parsed.as_ref().map_or_else(
@@ -2845,6 +2857,14 @@ fn detach_vpp_offload_with(
     use packetframe_vpp_offload::runtime::{Steering as _, TERM_GRACE};
 
     let Some(state) = ResourceState::load(state_dir).map_err(|e| format!("vpp state: {e}"))? else {
+        // Said, with the directory, because the directory is the thing
+        // that can be wrong: a detach reading another `state-dir` than
+        // the daemon wrote finds nothing here and would otherwise say
+        // nothing at all about the VPP it left running.
+        tracing::info!(
+            state_dir = %state_dir.display(),
+            "vpp-offload: no VPP on record in this state directory; nothing to terminate"
+        );
         // Nothing acquired — but the IPv6 hand-back path can outlive the
         // record (a teardown that released the VFs and could not remove
         // the veth), and this command is the remedy the daemon names for
