@@ -209,22 +209,23 @@ pub fn kernel_local_addrs() -> HashSet<IpAddr> {
 #[cfg(target_os = "linux")]
 pub fn kernel_addrs_by_iface() -> Vec<(String, IpAddr)> {
     kernel_ifaddrs()
+        .unwrap_or_default()
         .into_iter()
         .map(|(name, addr, _)| (name, addr))
         .collect()
 }
 
 /// [`kernel_addrs_by_iface`] with each address's prefix length, from
-/// its netmask (`None` when the kernel gave none). Empty on a failed
-/// read.
+/// its netmask (`None` when the kernel gave none). `None` on a failed
+/// read, which a caller that acts on an empty result must tell apart.
 #[cfg(target_os = "linux")]
-pub fn kernel_ifaddrs() -> Vec<(String, IpAddr, Option<u8>)> {
+pub fn kernel_ifaddrs() -> Option<Vec<(String, IpAddr, Option<u8>)>> {
     let mut out = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates the list; freed below on every path
     // that saw a zero return.
     if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
-        return out;
+        return None;
     }
     let mut cur = ifap;
     while !cur.is_null() {
@@ -264,7 +265,7 @@ pub fn kernel_ifaddrs() -> Vec<(String, IpAddr, Option<u8>)> {
     }
     // SAFETY: the list came from a successful getifaddrs.
     unsafe { libc::freeifaddrs(ifap) };
-    out
+    Some(out)
 }
 
 /// The prefix length a `getifaddrs` netmask encodes: its one bits.

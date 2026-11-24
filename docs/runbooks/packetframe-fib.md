@@ -1045,7 +1045,10 @@ this way.
 
 packetframe catches the hazard itself. About a minute after start, and
 every minute after, the FIB programmer looks up each of the kernel's
-connected prefixes in its mirror. Where the mirror holds the prefix
+connected prefixes in its mirror. It skips a prefix whose interface
+does not sit on an `attach` interface (directly, or through VLAN,
+bridge or bond devices): hosts on a management NIC the fast path never
+sees enter the kernel both ways. Where the mirror holds the prefix
 over unresolvable or own-address next hops, no `local-prefix` wholly
 covers it, and the same family has an allowlisted `local-prefix`, it:
 
@@ -1060,7 +1063,8 @@ A reload re-judges the last findings against the new allowlist. A new
 Disabling below). A `local-prefix` narrower than the connected prefix
 leaves the rest of it one-way, so the prefix stays listed. Only
 `packetframe-fib` and `compare` run the check; `kernel-fib` has no
-mirror and no hazard.
+mirror and no hazard. When the last such subnet's address goes away,
+the next check clears the findings.
 
 ### Disabling
 

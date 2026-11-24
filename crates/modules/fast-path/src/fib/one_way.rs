@@ -17,7 +17,11 @@
 //! `packetframe-fib`, on prefixes nobody thought to declare.
 //!
 //! The fix is a `local-prefix <cidr> via <iface>` for each such prefix,
-//! allowlisted or not. This module names the prefixes that need one: a
+//! allowlisted or not. Only a prefix whose hosts reach the router
+//! through an `attach` interface can be split: on any other interface (a
+//! management NIC) their traffic enters the kernel both ways.
+//!
+//! This module names the prefixes that need one: a
 //! `one-way-fast-path` status row (present only with findings, like
 //! vpp-offload's drift rows), a gauge, and a WARN when one appears.
 //!
@@ -28,6 +32,7 @@
 //! module holds both, ungated, so the row is tested on every host. The
 //! connected-prefix read under it is Linux's.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -119,11 +124,50 @@ pub fn connected_routes(
     out
 }
 
-/// [`connected_routes`] from the kernel's interface addresses. Empty on a
-/// failed read.
+/// [`connected_routes`] from the kernel's interface addresses. `None` on
+/// a failed read; an empty list is a read that found no subnet (the last
+/// one's address went away), which clears the findings.
 #[cfg(target_os = "linux")]
-pub fn kernel_connected_routes() -> Vec<KernelRoute> {
-    connected_routes(crate::fib::local_nexthops::kernel_ifaddrs())
+pub fn kernel_connected_routes() -> Option<Vec<KernelRoute>> {
+    crate::fib::local_nexthops::kernel_ifaddrs().map(connected_routes)
+}
+
+/// Whether hosts on `dev` reach the router through the fast path: `dev`
+/// or a device under it (`lowers`: a VLAN's parent, a bridge's or bond's
+/// ports, and theirs) is one of the `attached` interfaces. Hosts on any
+/// other interface (a management NIC, say) enter the kernel in both
+/// directions, so none of their flows is one-way, whatever the mirror
+/// holds for their subnet.
+pub fn on_datapath(dev: &str, attached: &[String], lowers: impl Fn(&str) -> Vec<String>) -> bool {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut todo = vec![dev.to_string()];
+    while let Some(d) = todo.pop() {
+        if attached.contains(&d) {
+            return true;
+        }
+        if seen.insert(d.clone()) {
+            todo.extend(lowers(&d));
+        }
+    }
+    false
+}
+
+/// The devices directly under `dev`, from its `lower_*` links in sysfs.
+/// Empty for a device that is gone or has none.
+#[cfg(target_os = "linux")]
+pub fn sysfs_lowers(dev: &str) -> Vec<String> {
+    if dev.is_empty() || dev.contains('/') || dev == "." || dev == ".." {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(std::path::Path::new("/sys/class/net").join(dev)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| {
+            let name = e.ok()?.file_name();
+            name.to_str()?.strip_prefix("lower_").map(str::to_string)
+        })
+        .collect()
 }
 
 /// Whether a route installed over `nexthops` is one the fast path hands
@@ -241,6 +285,19 @@ impl OneWayWatch {
 
     pub fn findings(&self) -> Vec<KernelRoute> {
         self.lock().findings.clone()
+    }
+
+    /// The `attach` interfaces, read at start like the programs they
+    /// load: where the fast path sees traffic.
+    pub fn attached(&self) -> Vec<String> {
+        self.lock()
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::Attach { iface, .. } => Some(iface.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The `one-way-fast-path` row: Degraded while any finding stands,
@@ -383,6 +440,59 @@ mod tests {
             ),
         ]);
         assert_eq!(got, vec![route([192, 0, 2, 0], 24, "br20")]);
+    }
+
+    /// The reference shape: an L3 bridge per VLAN over a VLAN device on
+    /// the switch bridge, whose ports include the attached NIC.
+    fn lowers_of(dev: &str) -> Vec<String> {
+        let l: &[&str] = match dev {
+            "br100" => &["switch0.100"],
+            "switch0.100" => &["switch0"],
+            "switch0" => &["eth1", "eth2"],
+            "eth0.5" => &["eth0"],
+            // A loop the walk must not spin on.
+            "loopy" => &["loopy2"],
+            "loopy2" => &["loopy"],
+            _ => &[],
+        };
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn on_datapath_walks_down_to_an_attached_port() {
+        let attached = vec!["eth2".to_string()];
+        assert!(on_datapath("br100", &attached, lowers_of));
+        assert!(on_datapath("eth2", &attached, lowers_of));
+        // A management NIC (and a VLAN on it) the fast path never sees.
+        assert!(!on_datapath("eth0", &attached, lowers_of));
+        assert!(!on_datapath("eth0.5", &attached, lowers_of));
+        assert!(!on_datapath("loopy", &attached, lowers_of));
+        // A program on the bridge itself sees its hosts' traffic too.
+        assert!(on_datapath("br100", &["br100".to_string()], lowers_of));
+    }
+
+    #[test]
+    fn attached_lists_the_attach_lines() {
+        let w = OneWayWatch::new(directives(&format!(
+            "  attach eth2 native\n  attach eth3 generic\n{ARMED}"
+        )));
+        assert_eq!(w.attached(), vec!["eth2".to_string(), "eth3".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_observation_clears_the_findings() {
+        let w = OneWayWatch::new(directives(ARMED));
+        assert_eq!(
+            w.observe(vec![route([203, 0, 113, 0], 24, "br200")]).len(),
+            1
+        );
+        assert!(w.subsystem_health().is_some());
+        assert!(w.observe(Vec::new()).is_empty());
+        assert!(w.findings().is_empty());
+        assert!(w.subsystem_health().is_none());
+        let mut m = String::new();
+        w.render_metrics(&mut m);
+        assert!(m.contains("packetframe_fib_one_way_routes{module=\"fast-path\"} 0"));
     }
 
     #[test]

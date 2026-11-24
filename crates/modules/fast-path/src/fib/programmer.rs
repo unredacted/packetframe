@@ -2994,14 +2994,23 @@ impl FibProgrammer {
         let Some(watch) = &self.one_way else {
             return;
         };
-        // A box always holds an address on some subnet it routes for, so
-        // an empty read is a failed one: keep the last findings.
-        let connected = crate::fib::one_way::kernel_connected_routes();
-        if connected.is_empty() {
+        // A failed read keeps the last findings; an empty one (no subnet
+        // left on the box) clears them.
+        let Some(connected) = crate::fib::one_way::kernel_connected_routes() else {
             return;
-        }
+        };
+        // Only subnets whose hosts reach the router through an attached
+        // interface: the others' traffic enters the kernel both ways.
+        let attached = watch.attached();
         let routes = connected
             .into_iter()
+            .filter(|r| {
+                crate::fib::one_way::on_datapath(
+                    &r.iface,
+                    &attached,
+                    crate::fib::one_way::sysfs_lowers,
+                )
+            })
             .filter(|r| {
                 self.lookup_mirror(&r.prefix).is_some_and(|rec| {
                     crate::fib::one_way::kernel_only(&rec.nexthop_ips, |ip| self.local.is_local(ip))
