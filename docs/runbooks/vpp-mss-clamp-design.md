@@ -1,8 +1,8 @@
 # Design: MSS clamping for steered traffic
 
-Status: **proposal, not built.** The operator chooses between the options
-below. This page sets out what each would change, what it would cost, and
-where it stops working.
+Status: **decided, being built** (option 0, then option A; see
+[Decision](#decision)). This page sets out what each option would change,
+what it would cost, and where it stops working.
 
 ## The problem
 
@@ -207,26 +207,28 @@ and performance testing, in a plugin whose job today is sampling. It is
 also redundant with A wherever a prefix maps to a VLAN, which is the case
 that comes up. It is listed so the choice is explicit.
 
-## Recommendation
+## Decision
 
-1. **Option 0 now.** Silent loss of a configured clamp is the actual
-   defect, whichever remedy follows.
-2. **Then B.** It unblocks steering the trunks with the least code and no
-   new VPP dependency. The clamped prefix stays on the kernel path, which
-   is where it is today.
-3. **A when that prefix's traffic is worth offloading.** Do it after the
-   VPP build carries the upstream fix (or with the one-value restriction),
-   and after confirming the plugin ships in the build in use.
+The operator chose **option 0, then option A**. B stays on this page as
+the stopgap it would have been.
+
+Why A over B for the reference deployment:
+
+- The clamped prefix is bound to one VLAN by a `local-route`, so a clamp
+  on that VLAN's L3 interface covers exactly it.
+- It uses one MSS value, so the 26.10 dual-loop bug does not bite. The
+  one-value restriction stays until the VPP build carries the fix.
+- The VPP build in use ships `vpp-plugin-core`, `mss_clamp` included.
+- B would leave that prefix, most of what its trunk carries, on the
+  kernel path.
 
 ## Open questions
 
-- **Does the VPP build in use ship `mss_clamp_plugin.so`?** fd.io's
-  packages do (`vpp-plugin-core`). Check a custom build's package list.
-  CI's fd.io job could assert the plugin loads.
+- **Does every VPP build ship `mss_clamp_plugin.so`?** fd.io's packages
+  do (`vpp-plugin-core`), and so does the reference deployment's build.
+  A build without it is refused at attach only when a clamp is
+  configured.
 - **Is RX on a BVI the right hook for every bridged layout?** It is by
   VPP's arc layout (routed input on the BVI enters `ip4-unicast` there).
   Before building A, confirm it with a packet trace (`trace add`, a SYN
   from a host on the VLAN) on the reference deployment.
-- **A or B for the reference deployment's trunks?** That depends on how
-  much of the trunks' traffic the clamped prefix carries. It is the
-  operator's call.
