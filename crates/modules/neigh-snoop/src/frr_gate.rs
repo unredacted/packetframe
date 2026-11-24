@@ -381,6 +381,21 @@ pub use linux::{gate_task, GateInput};
 /// `snoop_netns`'s fake gets in front of both.
 pub use packetframe_common::frr::{RealVtysh, Vtysh};
 
+/// The one daemon the gate talks to. The lists exist for bgpd's
+/// route-maps, so bgpd's copy is the only one that gates anything, and
+/// the parser already reads bgpd's section. Asking vtysh for bgpd alone
+/// keeps mgmtd out of the path: on FRR 10 with mgmtd running, a
+/// fanned-out `ip prefix-list` goes to mgmtd first, as the transport for
+/// zebra's copy, and mgmtd turns it into an implicit commit that needs
+/// the candidate datastore lock. A commit stuck on an unresponsive
+/// backend holds that lock until mgmtd's 600 s backend timeout. The
+/// next commit takes it again, and every write in between fails with
+/// `% command failed, could not lock candidate DS`. vtysh tries mgmtd
+/// first and stops at the failure, so bgpd never got the entry either.
+/// Reads go the same way, so a reconcile never depends on another
+/// daemon's answer.
+pub const GATE_DAEMON: &str = "bgpd";
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
