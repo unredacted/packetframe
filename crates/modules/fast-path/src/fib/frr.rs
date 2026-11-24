@@ -1006,6 +1006,7 @@ pub fn observation(
     eligibility: &Eligibility,
     authority: Option<usize>,
     mirror: Option<usize>,
+    unsourced: usize,
     at: std::time::Instant,
 ) -> AuthorityObservation {
     match (eligibility, authority, mirror) {
@@ -1014,6 +1015,7 @@ pub fn observation(
             AuthorityObservation::Clean(CompletenessReport {
                 authority_routes: auth as u64,
                 mirror_routes: pf as u64,
+                unsourced_routes: unsourced as u64,
                 at,
             })
         }
@@ -2027,7 +2029,7 @@ exit
             for counts in [(Some(10), Some(10)), (None, None), (Some(10), None)] {
                 assert!(
                     matches!(
-                        observation(&revoked(), counts.0, counts.1, Instant::now()),
+                        observation(&revoked(), counts.0, counts.1, 0, Instant::now()),
                         AuthorityObservation::Disqualified(_)
                     ),
                     "the counts cannot argue with a fact about the deployment"
@@ -2039,12 +2041,12 @@ exit
         fn clean_needs_eligibility_and_both_counts() {
             let at = Instant::now();
             assert!(matches!(
-                observation(&Eligibility::Ok, Some(100), Some(99), at),
+                observation(&Eligibility::Ok, Some(100), Some(99), 0, at),
                 AuthorityObservation::Clean(_)
             ));
             for counts in [(None, Some(99)), (Some(100), None), (None, None)] {
                 assert_eq!(
-                    observation(&Eligibility::Ok, counts.0, counts.1, at),
+                    observation(&Eligibility::Ok, counts.0, counts.1, 0, at),
                     AuthorityObservation::Unreadable,
                     "a tick that lost a count has established nothing new"
                 );
@@ -2060,6 +2062,7 @@ exit
                     &Eligibility::Unknown("vtysh timed out".into()),
                     Some(1_000_000),
                     Some(1_000_000),
+                    0,
                     Instant::now()
                 ),
                 AuthorityObservation::Unreadable

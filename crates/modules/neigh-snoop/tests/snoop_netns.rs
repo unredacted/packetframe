@@ -1209,7 +1209,11 @@ fn rows_that_appear_unheard_are_repaired() {
 /// the scratch directory; the engine finds it via `PACKETFRAME_VTYSH`.
 /// A `frr10` file in the state directory switches `show … prefix-list`
 /// to FRR 10's per-daemon shape (a zebra `%` reply, then a `BGP:`
-/// section), which the first gate parser read as "absent".
+/// section), which the first gate parser read as "absent". A
+/// `mgmtd-locked` file makes every config command fail the way FRR 10
+/// with mgmtd does while another commit holds the candidate datastore
+/// (error on stdout, exit 1), unless the invocation names bgpd alone
+/// with `-d bgpd`, which never reaches mgmtd.
 fn write_fake_vtysh(state: &std::path::Path) -> PathBuf {
     let script = format!(
         r#"#!/bin/sh
@@ -1234,9 +1238,20 @@ del_line() {{
   grep -v -x -F -- "$line" "$f" > "$f.tmp" || true
   mv "$f.tmp" "$f"
 }}
+only=""
 while [ $# -gt 0 ]; do
-  if [ "$1" = "-c" ]; then
+  if [ "$1" = "-d" ]; then
+    shift; only="$1"
+  elif [ "$1" = "-c" ]; then
     shift; cmd="$1"
+    case "$cmd" in
+      "show "*|"configure terminal") ;;
+      *)
+        if [ -f "$STATE/mgmtd-locked" ] && [ "$only" != "bgpd" ]; then
+          echo "% command failed, could not lock candidate DS"
+          exit 1
+        fi;;
+    esac
     case "$cmd" in
       "show version") echo "FRRouting 10.1.2 (fake)";;
       "show ip prefix-list "*) show_list ip "${{cmd##* }}" v4;;
@@ -1286,6 +1301,10 @@ fn gate_reconciles_lists_and_measures_route_server_coverage() {
     std::fs::write(names.persist.join("v6"), "seq 5 deny ::/128\n").unwrap();
     std::fs::write(names.persist.join("rs4.json"), RS_JSON).unwrap();
     let fake = write_fake_vtysh(&names.persist);
+    // mgmtd's candidate datastore is locked for the whole test, as it was
+    // on the reference deployment after its FRR started running mgmtd:
+    // only a bgpd-only invocation can write.
+    std::fs::write(names.persist.join("mgmtd-locked"), "").unwrap();
     // Read once, at engine start; the gate tests are serialized through
     // this env var by being one test.
     std::env::set_var("PACKETFRAME_VTYSH", &fake);
@@ -1330,6 +1349,11 @@ fn gate_reconciles_lists_and_measures_route_server_coverage() {
     assert!(
         batch.contains(entry),
         "the add rides in the configure batch: {batch}"
+    );
+    assert!(
+        log.lines()
+            .all(|l| l.starts_with("-d bgpd ") || !l.contains("prefix-list")),
+        "every gate invocation names bgpd alone: {log}"
     );
     assert!(
         !std::fs::read_to_string(&v4_file)

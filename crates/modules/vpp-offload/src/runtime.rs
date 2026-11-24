@@ -2064,7 +2064,9 @@ fn authority_current(
     // The rule itself lives on the handle, where the fast-path's
     // preserving stop applies it too: a ledger is attested on exactly the
     // word this release would act on.
-    completeness.as_ref().map(|h| h.attests(mirror_now))
+    // `attests_fed`: `mirror_now` is the route source's count, which holds
+    // the fast path's `fallback-default` too, and the report does not.
+    completeness.as_ref().map(|h| h.attests_fed(mirror_now))
 }
 
 /// Whether a FRESH VPP's verify, and its first steer, may go ahead over a
@@ -6763,6 +6765,25 @@ mod tests {
     /// sample and is classified then, within one interval; one created
     /// by the clock does not. The gate still blocks meanwhile — that is
     /// `authority_current`'s job and is unchanged — and the
+    /// The route source counts the fast path's `fallback-default`; the
+    /// report's mirror count does not, and says how many it left out. On
+    /// a small table that one route is past the drift bound unless the
+    /// gate takes it off.
+    #[test]
+    fn the_fallback_default_does_not_read_as_drift() {
+        use packetframe_common::fib::{CompletenessReport, TableCompleteness};
+        let handle = std::sync::Arc::new(TableCompleteness::new());
+        handle.publish(CompletenessReport {
+            authority_routes: 14,
+            mirror_routes: 14,
+            unsourced_routes: 1,
+            at: std::time::Instant::now(),
+        });
+        let completeness = Some(handle);
+        assert_eq!(authority_current(&completeness, 15), Some(true));
+        assert_eq!(authority_current(&completeness, 14), Some(false));
+    }
+
     /// blocked-but-clearing message is what says so.
     #[test]
     fn a_mirror_that_outgrew_its_sample_is_not_a_faulty_authority() {
@@ -6771,6 +6792,7 @@ mod tests {
         handle.publish(CompletenessReport {
             authority_routes: 1_000_000,
             mirror_routes: 1_000_000,
+            unsourced_routes: 0,
             at: std::time::Instant::now(),
         });
         let completeness = Some(handle);
@@ -6815,6 +6837,7 @@ mod tests {
         real.publish(CompletenessReport {
             authority_routes: 13,
             mirror_routes: 1_303_920,
+            unsourced_routes: 0,
             at: std::time::Instant::now(),
         });
         let real = Some(real);
@@ -6861,6 +6884,7 @@ mod tests {
         let mismatch = |at| CompletenessReport {
             authority_routes: 13,
             mirror_routes: 1_303_920,
+            unsourced_routes: 0,
             at,
         };
         // The posture as the deferral would report it, given the run
@@ -6931,6 +6955,7 @@ mod tests {
         handle.publish(CompletenessReport {
             authority_routes: 1_303_920,
             mirror_routes: 1_303_920,
+            unsourced_routes: 0,
             at: t0 + Duration::from_secs(600),
         });
         run = track_authority_fault(run, authority_reading(&completeness).as_ref());
@@ -6984,6 +7009,7 @@ mod tests {
         let mismatch = |at| CompletenessReport {
             authority_routes: 13,
             mirror_routes: 1_303_920,
+            unsourced_routes: 0,
             at,
         };
 
@@ -7978,6 +8004,7 @@ mod tests {
         handle.publish(CompletenessReport {
             authority_routes: 1_000_000,
             mirror_routes: 300_000,
+            unsourced_routes: 0,
             at: std::time::Instant::now(),
         });
         let e = fx.steer().expect_err("must refuse a partial mirror");
@@ -7994,6 +8021,7 @@ mod tests {
         handle.publish(CompletenessReport {
             authority_routes: 1_000_000,
             mirror_routes: 999_000,
+            unsourced_routes: 0,
             at: std::time::Instant::now(),
         });
         admitted(fx.steer(), "a converged mirror permits steering");
@@ -8034,6 +8062,7 @@ mod tests {
         handle.publish(CompletenessReport {
             authority_routes: 1_000_000,
             mirror_routes: 1,
+            unsourced_routes: 0,
             at: std::time::Instant::now(),
         });
 

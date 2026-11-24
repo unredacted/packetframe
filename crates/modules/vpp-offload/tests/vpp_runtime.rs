@@ -2394,6 +2394,7 @@ fn an_incomplete_verdict_vetoes_every_proxy_release() {
     handle.publish(CompletenessReport {
         authority_routes: 1000,
         mirror_routes: 12,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     let mut d = Driver::new();
@@ -2408,6 +2409,7 @@ fn an_incomplete_verdict_vetoes_every_proxy_release() {
     handle.publish(CompletenessReport {
         authority_routes: 12,
         mirror_routes: 12,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     let (_, events) = steered::run_paced(&mut d, &rt, now, 512, |d| d.state() == State::Steered);
@@ -2435,6 +2437,7 @@ fn a_condemning_verdict_cannot_block_its_own_revocations_restore() {
     handle.publish(CompletenessReport {
         authority_routes: 12,
         mirror_routes: 12,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     let mut d = Driver::new();
@@ -2478,6 +2481,7 @@ fn a_condemning_verdict_cannot_block_its_own_revocations_restore() {
     handle.publish(CompletenessReport {
         authority_routes: 1000,
         mirror_routes: 12,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
 
@@ -2548,6 +2552,7 @@ fn a_stale_convergence_cannot_carry_a_shrunken_mirror() {
     handle.publish(CompletenessReport {
         authority_routes: 12,
         mirror_routes: 12,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     shared.lock().unwrap().pop();
@@ -2763,6 +2768,7 @@ fn completeness_releases_a_below_floor_table_promptly() {
     handle.publish(CompletenessReport {
         authority_routes: 4,
         mirror_routes: 4,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
 
@@ -2844,6 +2850,7 @@ fn a_flap_demotes_attestation_only_until_a_newer_report_arrives() {
     handle.publish(CompletenessReport {
         authority_routes: 4,
         mirror_routes: 4,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     session.set_up(false);
@@ -2879,6 +2886,7 @@ fn a_flap_demotes_attestation_only_until_a_newer_report_arrives() {
     handle.publish(CompletenessReport {
         authority_routes: 4,
         mirror_routes: 4,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     {
@@ -3028,6 +3036,7 @@ fn a_flapped_deferral_above_the_floor_waits_for_the_new_sessions_gc() {
     handle.publish(CompletenessReport {
         authority_routes: 12,
         mirror_routes: 12,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     let held_from = now;
@@ -3213,6 +3222,7 @@ fn a_steer_refused_by_completeness_retries_when_the_mirror_catches_up() {
     handle.publish(CompletenessReport {
         authority_routes: 5,
         mirror_routes: 5,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
 
@@ -3234,6 +3244,7 @@ fn a_steer_refused_by_completeness_retries_when_the_mirror_catches_up() {
     handle.publish(CompletenessReport {
         authority_routes: 1_000,
         mirror_routes: 5,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
 
@@ -3288,6 +3299,7 @@ fn a_steer_refused_by_completeness_retries_when_the_mirror_catches_up() {
     handle.publish(CompletenessReport {
         authority_routes: 5,
         mirror_routes: 5,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     // Bounded ticking rather than `run_until`, so a regression reads as
@@ -3542,6 +3554,7 @@ fn an_empty_target_is_permitted_over_a_table_with_known_holes() {
     handle.publish(packetframe_common::fib::CompletenessReport {
         authority_routes: 5,
         mirror_routes: 5,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
 
@@ -3569,6 +3582,7 @@ fn an_empty_target_is_permitted_over_a_table_with_known_holes() {
     handle.publish(packetframe_common::fib::CompletenessReport {
         authority_routes: 1_000,
         mirror_routes: 5,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
 
@@ -3710,6 +3724,7 @@ fn a_fresh_convergence_holds_verify_until_the_authority_confirms_the_table() {
     handle.publish(CompletenessReport {
         authority_routes: 5,
         mirror_routes: 5,
+        unsourced_routes: 0,
         at: Instant::now(),
     });
 
@@ -3779,6 +3794,7 @@ fn a_backlog_blocks_the_release_and_an_empty_sample_never_tears_down() {
     handle.publish(CompletenessReport {
         authority_routes: 5,
         mirror_routes: 5,
+        unsourced_routes: 0,
         at: Instant::now(),
     });
 
@@ -4727,6 +4743,7 @@ mod seeded_mirror {
         authority.record(AuthorityObservation::Clean(CompletenessReport {
             authority_routes: 6,
             mirror_routes: 6,
+            unsourced_routes: 0,
             at: std::time::Instant::now(),
         }));
         (
@@ -4955,6 +4972,7 @@ fn a_seed_the_authority_disputes_waits_for_the_replay() {
         .record(AuthorityObservation::Clean(CompletenessReport {
             authority_routes: 12,
             mirror_routes: 6,
+            unsourced_routes: 0,
             at: std::time::Instant::now(),
         }));
     let (_, seen) = seeded_mirror::replay(&mut d, &f, t0, 200, |_| false);
@@ -4985,6 +5003,7 @@ fn a_reconnect_shuts_the_seeded_door_until_the_replay_goes_quiet() {
         .record(AuthorityObservation::Clean(CompletenessReport {
             authority_routes: 6,
             mirror_routes: 6,
+            unsourced_routes: 0,
             at: std::time::Instant::now(),
         }));
     let (now, seen) = seeded_mirror::replay(&mut d, &f, t0, 200, |_| false);
@@ -5072,6 +5091,7 @@ fn a_seeded_release_sends_vpp_only_what_changed() {
     authority.record(AuthorityObservation::Clean(CompletenessReport {
         authority_routes: 6,
         mirror_routes: 6,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     }));
 
@@ -5460,6 +5480,7 @@ fn a_lever_moved_on_a_one_probe_verdict_waits_for_vpp_and_a_verify_of_the_table(
     authority.publish(CompletenessReport {
         authority_routes: TABLE as u64,
         mirror_routes: 1,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
 
@@ -5501,6 +5522,7 @@ fn a_lever_moved_on_a_one_probe_verdict_waits_for_vpp_and_a_verify_of_the_table(
     authority.publish(CompletenessReport {
         authority_routes: TABLE as u64,
         mirror_routes: TABLE as u64,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     let (now, _, reruns) = run_for(&mut d, &rt, now, Duration::from_secs(30));
@@ -5699,6 +5721,7 @@ fn ordinary_churn_neither_holds_the_lever_nor_buys_a_re_verify() {
     authority.publish(CompletenessReport {
         authority_routes: TABLE as u64,
         mirror_routes: TABLE as u64,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     let mut d = Driver::new();
@@ -5817,6 +5840,7 @@ fn the_next_canary_port_waits_for_a_reload_the_first_was_steered_before() {
     authority.publish(CompletenessReport {
         authority_routes: TABLE as u64,
         mirror_routes: TABLE as u64,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     let mut d = Driver::new();
@@ -5843,6 +5867,7 @@ fn the_next_canary_port_waits_for_a_reload_the_first_was_steered_before() {
     authority.publish(CompletenessReport {
         authority_routes: (TABLE * 3 / 2) as u64,
         mirror_routes: (TABLE * 3 / 2) as u64,
+        unsourced_routes: 0,
         at: std::time::Instant::now(),
     });
     let (now, _, _) = run_for(&mut d, &rt, now, Duration::from_secs(5));
@@ -6701,6 +6726,7 @@ mod steered_seeded {
                 .record(AuthorityObservation::Clean(CompletenessReport {
                     authority_routes: n,
                     mirror_routes: n,
+                    unsourced_routes: 0,
                     at: Instant::now(),
                 }));
         }
@@ -6945,6 +6971,7 @@ fn a_steered_seeded_release_lets_changes_reach_vpp_during_the_replay() {
     authority.record(AuthorityObservation::Clean(CompletenessReport {
         authority_routes: 6,
         mirror_routes: 6,
+        unsourced_routes: 0,
         at: Instant::now(),
     }));
 
@@ -7049,6 +7076,7 @@ fn a_steered_seeded_diff_without_every_leg_waits_for_the_replay_to_go_quiet() {
                 .record(AuthorityObservation::Clean(CompletenessReport {
                     authority_routes: 12,
                     mirror_routes: 6,
+                    unsourced_routes: 0,
                     at: Instant::now(),
                 }));
         }),
@@ -7382,6 +7410,7 @@ fn the_inherited_door_never_diffs_onto_traffic() {
                     a.record(AuthorityObservation::Clean(CompletenessReport {
                         authority_routes: n * 2,
                         mirror_routes: n,
+                        unsourced_routes: 0,
                         at: Instant::now(),
                     }));
                 }
@@ -7603,6 +7632,7 @@ fn a_release_after_a_dump_records_the_mirror_the_walk_read() {
                     authority.record(AuthorityObservation::Clean(CompletenessReport {
                         authority_routes: n,
                         mirror_routes: n,
+                        unsourced_routes: 0,
                         at: Instant::now(),
                     }));
                 }
@@ -8204,6 +8234,7 @@ mod seeded_at_scale {
         authority.record(AuthorityObservation::Clean(CompletenessReport {
             authority_routes: n,
             mirror_routes: n,
+            unsourced_routes: 0,
             at: Instant::now(),
         }));
         Fixture {
@@ -8833,6 +8864,7 @@ fn a_fresh_vpp_over_a_seed_that_is_not_whole_waits_for_the_authority() {
         .record(AuthorityObservation::Clean(CompletenessReport {
             authority_routes: 6,
             mirror_routes: 6,
+            unsourced_routes: 0,
             at: std::time::Instant::now(),
         }));
     let (_, seen) = run_until(&mut d, &f.rt, now, |d| d.state() == State::Ready);
@@ -8856,6 +8888,7 @@ fn a_count_mismatch_after_the_upstreams_load_shuts_the_door_on_the_steer() {
         .record(AuthorityObservation::Clean(CompletenessReport {
             authority_routes: 1_000,
             mirror_routes: 6,
+            unsourced_routes: 0,
             at: std::time::Instant::now(),
         }));
     let (_, seen) = seeded_fresh::steer(&mut d, &f, now, 64);

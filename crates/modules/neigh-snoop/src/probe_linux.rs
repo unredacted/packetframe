@@ -187,12 +187,15 @@ fn run(
     caps
 }
 
-/// Synchronous bounded `vtysh -c …` for the probe (feasibility is
+/// Synchronous bounded `vtysh -d bgpd -c …` for the probe (feasibility is
 /// synchronous). Kills the child if it outlives the budget.
 #[cfg(target_os = "linux")]
 fn vtysh_sync(path: &Path, commands: &[&str]) -> Result<String, String> {
     use std::io::Read as _;
+    // The same daemon the gate's runner talks to, so feasibility checks
+    // the lists the gate will read, through the same path.
     let mut cmd = std::process::Command::new(path);
+    cmd.arg("-d").arg(crate::frr_gate::GATE_DAEMON);
     for c in commands {
         cmd.arg("-c").arg(c);
     }
@@ -217,7 +220,10 @@ fn vtysh_sync(path: &Path, commands: &[&str]) -> Result<String, String> {
             Ok(Some(status)) => {
                 let out = reader.join().unwrap_or_default();
                 if !status.success() {
-                    return Err(format!("exited {status}"));
+                    return Err(format!(
+                        "exited {status}: {}",
+                        packetframe_common::frr::failure_detail(&out, "")
+                    ));
                 }
                 return Ok(out);
             }
