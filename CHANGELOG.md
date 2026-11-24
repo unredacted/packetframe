@@ -34,7 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **fast-path**
 
-- The completeness authority (`birdc` or `frr`) compares its count against the prefixes a route source delivered, not the whole mirror. The `local-prefix` host routes and the `fallback-default` no longer count, so a small table no longer reads as `AuthorityMismatch`. vpp-offload's gate takes the fallback default off its own count too. [#PR](https://github.com/unredacted/packetframe/pull/PR)
+- The completeness authority (`birdc` or `frr`) compares its count against the prefixes a route source delivered, not the whole mirror. The `local-prefix` host routes and the `fallback-default` no longer count, so a small table no longer reads as `AuthorityMismatch`. vpp-offload's gate takes the fallback default off its own count too. [#427](https://github.com/unredacted/packetframe/pull/427)
 
 **neigh-snoop**
 
