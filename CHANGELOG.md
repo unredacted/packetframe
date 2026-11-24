@@ -32,6 +32,10 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 ### Changes
 
+**vpp-offload**
+
+- `packetframe detach --all` with no `--config` reads the default config when there is one, so it finds VPP's state file in the configured `state-dir`. It used the built-in default directory and, on a box with another `state-dir`, left VPP running. It now also logs the state directory it read. [#PR](https://github.com/unredacted/packetframe/pull/PR)
+
 **neigh-snoop**
 
 - A bridge counts as up only when it also has carrier. When it loses carrier, the kernel flushes its neighbours. The learned table is now re-seeded when carrier comes back, not only after an admin bring-up, and a bridge that comes up before its link is no longer seeded into a flush. [#423](https://github.com/unredacted/packetframe/pull/423)
