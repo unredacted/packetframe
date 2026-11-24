@@ -75,10 +75,59 @@ names the `mss-clamp` line and the port. What counts:
 - An IPv6 prefix: any `v6-divert`, which diverts by frame and cannot be
   scoped by address.
 
-To keep a clamped prefix on the kernel path, `steer-exempt` it (that
-keeps traffic TO it) and leave its hosts' trunk unsteered or
-`direction dst`, or take it off the allowlist. The design notes for
-clamping in VPP itself are in
+There are two remedies. Clamp in VPP too (below), or keep the prefix on
+the kernel path: `steer-exempt` it (that keeps traffic TO it) and leave
+its hosts' trunk unsteered or `direction dst`, or take it off the
+allowlist.
+
+### Clamping in VPP: `mss-clamp vlan`
+
+```
+module vpp-offload
+  ...
+  port eth4 cores 1 steer on vlans all direction both
+  local-route 203.0.113.0/24 port eth4 vlan 1337
+  mss-clamp vlan 1337 ip4 1360            # and/or: ip6 <mss> (needs `v6 on`)
+```
+
+VPP's `mss_clamp` plugin clamps, both directions, on the VLAN's L3
+interface: its BVI when bridged, each member's subinterface on the
+VLAN, and the VF of a port that sends it untagged. A customer's SYN
+enters VPP there and the SYN-ACK back to it leaves there, so every flow
+to or from the VLAN's hosts is clamped. Same lower-if-higher rule as the
+fast path, on SYN and SYN-ACK only.
+
+- **Scope is the VLAN, not a prefix.** Every host on it is clamped. A
+  fast-path `mss-clamp <cidr> <mss>` counts as covered, and the guard
+  above lets the steer through, when `<cidr>` lies inside a
+  `local-route` on that VLAN and the VLAN's value is no higher than
+  `<mss>`. Keep the fast-path line: it still clamps the same traffic on
+  the eBPF tier when steering is off or VPP is gone.
+- **Hot-reloadable.** `packetframe reconfigure` applies a new, changed
+  or removed line at the next VLAN refresh, within seconds, with no
+  restart and no change to steering. VPP holds the clamp itself, so it
+  survives a `--keep-vpp` restart, and adoption reads it back and puts
+  it right.
+- **One IPv4 value across all lines**, for now. VPP 26.10's plugin
+  clamps the second packet of each pair it handles at the first one's
+  interface value (fixed upstream after 26.10). With one value that
+  cannot matter, so validation refuses two.
+- **The plugin must be loaded.** It ships in fd.io's `vpp-plugin-core`.
+  A VPP without it still attaches; a configured clamp is then reported
+  as not in place.
+- **Not in place holds the first steer.** A clamp VPP cannot apply (no
+  plugin, a VLAN with no interface yet, a refusal) shows on the
+  `mss-clamp` row of `packetframe status` as Degraded, naming the VLAN
+  and why, and a first steer is refused until it is in place. A port
+  already steering keeps steering; the row says what is missing.
+
+```sh
+sudo packetframe status | grep mss-clamp
+sudo vppctl show interface tcp-mss-clamp     # what VPP holds, per interface
+```
+
+To check it on the wire, capture a SYN-ACK leaving toward a host on the
+VLAN and look for `mss 1360` in its options. Design notes:
 [vpp-mss-clamp-design.md](vpp-mss-clamp-design.md).
 
 ## Troubleshooting

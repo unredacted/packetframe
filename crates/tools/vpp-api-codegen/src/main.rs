@@ -7,7 +7,7 @@
 //! re-runs this to diff, so a pin bump that changes the wire format
 //! fails the build instead of corrupting a FIB.
 //!
-//! Scope is a WHITELIST, not the whole API. Ten `.api.json` files
+//! Scope is a WHITELIST, not the whole API. The vendored `.api.json` files
 //! reach ~900 messages; the sink needs eleven. Generating everything
 //! would bury a real CRC change in noise, so [`MESSAGES`] names what
 //! we encode and the type graph is closed transitively from there.
@@ -247,6 +247,17 @@ const MESSAGES: &[&str] = &[
     "acl_interface_set_acl_list_reply",
     "acl_interface_list_dump",
     "acl_interface_list_details",
+    //   VPP's TCP MSS clamp (`mss_clamp.api.json`, a plugin): the
+    //   fast path's `mss-clamp` never sees a frame steered to VPP, so a
+    //   VLAN whose hosts need one is clamped in VPP, on that VLAN's L3
+    //   interface (`crate::mss_clamp`). OPTIONAL at the handshake
+    //   (`transport::OPTIONAL_MESSAGES`): a VPP without the plugin
+    //   attaches, and only a configured clamp is refused on it.
+    "mss_clamp_enable_disable",
+    "mss_clamp_enable_disable_reply",
+    "mss_clamp_get",
+    "mss_clamp_get_reply",
+    "mss_clamp_details",
 ];
 
 const FILES: &[&str] = &[
@@ -266,6 +277,7 @@ const FILES: &[&str] = &[
     "af_packet",
     "acl_types",
     "acl",
+    "mss_clamp",
 ];
 
 /// One field of a message or composite type.

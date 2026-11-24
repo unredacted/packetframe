@@ -5590,3 +5590,129 @@ fn a_connect_to_a_vpp_that_never_accepts_is_bounded_and_charged_as_its_wait() {
     #[cfg(not(target_os = "linux"))]
     let _ = error;
 }
+
+// ---- `mss-clamp vlan`: VPP's TCP MSS clamp on a VLAN's L3 interfaces.
+
+fn clamps(ip4: Option<u16>) -> std::sync::Arc<packetframe_vpp_offload::mss_clamp::MssClamps> {
+    std::sync::Arc::new(packetframe_vpp_offload::mss_clamp::MssClamps::new(vec![
+        packetframe_vpp_offload::mss_clamp::VlanClamp {
+            vlan: 1337,
+            ip4,
+            ip6: None,
+        },
+    ]))
+}
+
+/// At attach the clamp lands both ways on the VLAN's BVI and on the
+/// trunk's subif; a reload's new value and a removed line follow at the
+/// next refresh, and a clamp on an interface the module does not own is
+/// never touched.
+#[test]
+fn an_mss_clamp_follows_its_vlan_line() {
+    let fake = Fake::start("mss-clamp");
+    let handle = clamps(Some(1360));
+    let mut e = engine_with_local_route(&fake).with_mss_clamps(handle.clone());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    let held = |f: &Fake| f.mss_clamps.lock().unwrap().clone();
+    let both_ways = (0x3u8, 1360u16, 0u8, 0xffffu16);
+    assert_eq!(
+        held(&fake),
+        [(SUBIF_BASE, both_ways), (BVI_BASE, both_ways)].into(),
+        "the BVI routes the VLAN, and the subif is listed too"
+    );
+    assert_eq!(e.counts().mss_clamps_missing, 0);
+    assert_eq!(e.mss_clamp_status().configured, vec![1337]);
+
+    // Another client's clamp on an interface we do not own.
+    fake.mss_clamps.lock().unwrap().insert(77, both_ways);
+    fake.drain_events();
+    let none = Mirror { routes: vec![] };
+    // Nothing changed: nothing sent.
+    e.refresh_placement(&none).expect("refresh");
+    let sent = msgs_of(&fake.drain_events());
+    assert!(
+        !sent.iter().any(|m| m.starts_with("mss_clamp if=")),
+        "an unchanged clamp is read back, not re-sent: {sent:?}"
+    );
+
+    // A reload lowers it.
+    handle.publish(clamps(Some(1300)).get());
+    e.refresh_placement(&none).expect("refresh");
+    let lower = (0x3u8, 1300u16, 0u8, 0xffffu16);
+    assert_eq!(
+        held(&fake),
+        [(SUBIF_BASE, lower), (BVI_BASE, lower), (77, both_ways)].into()
+    );
+
+    // A reload removes the line: ours come off, the stranger's stays.
+    handle.publish(Vec::new());
+    e.refresh_placement(&none).expect("refresh");
+    assert_eq!(held(&fake), [(77, both_ways)].into());
+    assert!(e.mss_clamp_status().configured.is_empty());
+    // And with nothing configured or held, the plugin is left alone.
+    fake.drain_events();
+    e.refresh_placement(&none).expect("refresh");
+    assert!(!msgs_of(&fake.drain_events())
+        .iter()
+        .any(|m| m.starts_with("mss_clamp")));
+}
+
+/// A VPP without the plugin attaches as before; a configured clamp is
+/// reported missing, which holds the first steer, rather than failing
+/// the attach.
+#[test]
+fn a_vpp_without_the_mss_clamp_plugin_holds_the_first_steer() {
+    let fake = Fake::start_behaving(
+        "mss-noplugin",
+        Behaviour {
+            no_mss_clamp_plugin: true,
+            ..Default::default()
+        },
+    );
+    // Unconfigured: nothing to say.
+    let mut e = engine_with_local_route(&fake).with_mss_clamps(std::sync::Arc::default());
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh)
+        .expect("attach without the plugin");
+    assert_eq!(e.counts().mss_clamps_missing, 0);
+
+    let fake = Fake::start_behaving(
+        "mss-noplugin2",
+        Behaviour {
+            no_mss_clamp_plugin: true,
+            ..Default::default()
+        },
+    );
+    let mut e = engine_with_local_route(&fake).with_mss_clamps(clamps(Some(1360)));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh)
+        .expect("attach still succeeds");
+    let c = e.counts();
+    assert_eq!(c.mss_clamps_missing, 1);
+    assert!(
+        c.blocks_first_steer(),
+        "a missing clamp holds the first steer"
+    );
+    let why = &e.mss_clamp_status().missing[0];
+    assert_eq!(why.0, 1337);
+    assert!(why.1.contains("plugin"), "{why:?}");
+}
+
+/// A clamp VPP refuses is missing too, and is retried at the next pass.
+#[test]
+fn a_refused_mss_clamp_is_reported_missing() {
+    let fake = Fake::start_behaving(
+        "mss-refused",
+        Behaviour {
+            reject_mss_clamp: true,
+            ..Default::default()
+        },
+    );
+    let mut e = engine_with_local_route(&fake).with_mss_clamps(clamps(Some(1360)));
+    assert!(e.api_ready());
+    e.attach_devices(AttachMode::Fresh).expect("attach");
+    assert_eq!(e.counts().mss_clamps_missing, 1);
+    assert!(e.mss_clamp_status().missing[0].1.contains("refused"));
+    assert!(fake.mss_clamps.lock().unwrap().is_empty());
+}

@@ -70,6 +70,7 @@ pub mod kernel_path;
 pub mod ledger_record;
 pub mod liveness;
 pub mod load_clock;
+pub mod mss_clamp;
 pub mod nic;
 pub mod ntuple;
 pub mod process;
@@ -188,6 +189,10 @@ pub struct VppOffloadConfig {
     /// loop, like `drift_accepts6` and for the same reason: it changes
     /// what `fib-v6` reports, never what VPP or the NIC holds.
     pub unresolvable_accepts6: Vec<packetframe_common::config::Ipv6Prefix>,
+    /// `mss-clamp vlan` lines ([`mss_clamp::MssClamps`]). Hot: published
+    /// into the engine's handle on reload and applied at its next VLAN
+    /// refresh, without the supervision loop's steering path.
+    pub mss_clamps: Vec<mss_clamp::VlanClamp>,
     /// `v6 on`: VPP carries IPv6 routes and neighbours
     /// ([`fib_sync::FamilyPolicy::Both`]). Default off. Restart-only —
     /// it sizes the segments VPP fixes at start, and decides what the
@@ -314,6 +319,13 @@ impl VppOffloadConfig {
                 ModuleDirective::VppDriftAccept6 { prefix, .. } => out.drift_accepts6.push(*prefix),
                 ModuleDirective::VppUnresolvableAccept6 { prefix, .. } => {
                     out.unresolvable_accepts6.push(*prefix)
+                }
+                ModuleDirective::VppMssClamp { vlan, ip4, ip6, .. } => {
+                    out.mss_clamps.push(mss_clamp::VlanClamp {
+                        vlan: *vlan,
+                        ip4: *ip4,
+                        ip6: *ip6,
+                    })
                 }
                 ModuleDirective::VppBinary(p) => out.vpp_binary = Some(p.clone()),
                 ModuleDirective::ExpectedRoutes(n) => out.expected_routes = *n,
@@ -1740,6 +1752,10 @@ impl Module for VppOffloadModule {
         attached
             .unresolvable_accepts6
             .publish(new.unresolvable_accepts6.clone());
+        // `mss-clamp vlan` too: the engine reads it at its next VLAN
+        // refresh, and a clamp not yet in place holds a first steer there
+        // rather than here.
+        attached.mss_clamps.publish(new.mss_clamps.clone());
 
         let allowlist = self.allowlist.get();
         let target = (self.plan_reload)(&new, &allowlist, &self.state_dir)
@@ -2750,6 +2766,7 @@ mod tests {
             steer_keeps6: vec![],
             drift_accepts6: vec![],
             unresolvable_accepts6: vec![],
+            mss_clamps: vec![],
             v6: false,
             steer_direction: Default::default(),
             loopback_address6: None,
@@ -3015,6 +3032,7 @@ mod tests {
             unresolvable_accepts6: std::sync::Arc::new(engine::UnresolvableAccepts6::new(
                 m.cfg.unresolvable_accepts6.clone(),
             )),
+            mss_clamps: std::sync::Arc::new(mss_clamp::MssClamps::new(m.cfg.mss_clamps.clone())),
             sampler_dir: sampler::SamplerDir::Unavailable("not prepared in this test".into()),
         });
         m

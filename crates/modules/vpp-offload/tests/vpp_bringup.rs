@@ -182,6 +182,7 @@ impl Host {
             steer_keeps6: vec![],
             drift_accepts6: vec![],
             unresolvable_accepts6: vec![],
+            mss_clamps: vec![],
             v6: false,
             // These fixtures have no route authority to compare
             // against, and none of them steers; the gate is exercised

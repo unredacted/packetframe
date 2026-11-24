@@ -2698,6 +2698,25 @@ impl Runtime {
         self.core.borrow_mut().engine.set_steer_exempts(exempts);
     }
 
+    /// The configured `mss-clamp vlan` lines not in place, each with
+    /// why, for the refusal that names them.
+    pub fn mss_clamps_missing(&self) -> Vec<String> {
+        self.core
+            .borrow()
+            .engine
+            .mss_clamp_status()
+            .missing
+            .iter()
+            .map(|(vlan, why)| format!("vlan {vlan}: {why}"))
+            .collect()
+    }
+
+    /// The configured `mss-clamp vlan` set and what is not in place, for
+    /// the status row.
+    pub fn mss_clamp_status(&self) -> crate::mss_clamp::ClampStatus {
+        self.core.borrow().engine.mss_clamp_status().clone()
+    }
+
     /// The IPv4 unresolvable routes by name, for the refusal that names
     /// them ([`crate::engine::ConvergenceEngine::unresolvable_named`]).
     pub fn unresolvable_named(&self) -> Vec<String> {
@@ -3033,6 +3052,7 @@ impl Runtime {
             },
             handback: c.engine.handback_status(),
             icmp6_source: c.engine.icmp6_source(),
+            mss_clamp: c.engine.mss_clamp_status().clone(),
             resync_deferred: c
                 .deferred_resync
                 .map(|d| (c.source.route_count(), d.floor())),
@@ -3311,6 +3331,9 @@ pub struct RuntimeStatus {
     /// while `steer_v6_divert` is non-empty means diverted IPv6 gets no
     /// Time Exceeded or Packet Too Big from VPP at all.
     pub icmp6_source: Option<std::net::Ipv6Addr>,
+    /// The `mss-clamp vlan` lines and which are not in place
+    /// ([`crate::mss_clamp`]).
+    pub mss_clamp: crate::mss_clamp::ClampStatus,
     /// Changes the source is holding that the engine has not pulled yet.
     ///
     /// Distinct from `pending_ops`, which is what the engine has pulled

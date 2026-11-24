@@ -173,6 +173,11 @@ pub struct SinkCounts {
     /// never enter it — the engine fills it in
     /// ([`crate::engine::ConvergenceEngine::unexempted_local`]).
     pub unexempted_local: u64,
+    /// Configured `mss-clamp vlan` lines not in place in VPP
+    /// ([`crate::mss_clamp`]): a steered SYN to or from that VLAN would
+    /// leave unclamped, the fast path's clamp being out of its reach. The
+    /// engine fills it in.
+    pub mss_clamps_missing: u64,
     /// IPv6's counts, when VPP carries the family (`v6 on`); `None`
     /// under [`crate::fib_sync::FamilyPolicy::V4Only`], which is how
     /// every surface tells "v6 is not loaded" from "v6 is loaded and
@@ -273,6 +278,10 @@ impl SinkCounts {
     /// (`unexempted_local`): absent from VPP by design, so a steered
     /// packet for it would follow a less-specific route out of the box.
     ///
+    /// And a configured `mss-clamp vlan` not in place
+    /// (`mss_clamps_missing`): config validation let the steer through
+    /// because VPP was to clamp that VLAN.
+    ///
     /// This deliberately governs only **first-attach**. Once traffic is
     /// steered, a single later withheld route must not tear steering
     /// down — unsteering a mostly-correct VPP is worse than the gap. An
@@ -281,6 +290,7 @@ impl SinkCounts {
         self.unresolvable > 0
             || self.withheld > 0
             || self.unexempted_local > 0
+            || self.mss_clamps_missing > 0
             || self.installing > 0
             || self.installed == 0
     }

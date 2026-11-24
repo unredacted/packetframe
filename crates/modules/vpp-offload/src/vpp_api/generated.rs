@@ -103,6 +103,11 @@ pub const MESSAGE_META: &[MessageMeta] = &[
     MessageMeta { name: "acl_interface_set_acl_list_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
     MessageMeta { name: "acl_interface_list_dump", crc: "0xf9e6675e", context_offset: 6, client_index_prefix: true },
     MessageMeta { name: "acl_interface_list_details", crc: "0xe695d256", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "mss_clamp_enable_disable", crc: "0xd31b44e3", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "mss_clamp_enable_disable_reply", crc: "0xe8d4e804", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "mss_clamp_get", crc: "0x47250981", context_offset: 6, client_index_prefix: true },
+    MessageMeta { name: "mss_clamp_get_reply", crc: "0x53b48f5d", context_offset: 2, client_index_prefix: false },
+    MessageMeta { name: "mss_clamp_details", crc: "0xd3a4de61", context_offset: 2, client_index_prefix: false },
 ];
 
 // enum acl_action : u8
@@ -195,6 +200,11 @@ pub const L2_API_PORT_TYPE_UU_FWD: u32 = 2;
 pub const LINK_DUPLEX_API_UNKNOWN: u32 = 0;
 pub const LINK_DUPLEX_API_HALF: u32 = 1;
 pub const LINK_DUPLEX_API_FULL: u32 = 2;
+
+// enum mss_clamp_dir : u8
+pub const MSS_CLAMP_DIR_NONE: u8 = 0;
+pub const MSS_CLAMP_DIR_RX: u8 = 1;
+pub const MSS_CLAMP_DIR_TX: u8 = 2;
 
 // enum sub_if_flags : u32
 pub const SUB_IF_API_FLAG_NO_TAGS: u32 = 1;
@@ -4339,6 +4349,218 @@ impl Decode for AclInterfaceListDetails {
 impl Message for AclInterfaceListDetails {
     const NAME: &'static str = "acl_interface_list_details";
     const CRC: &'static str = "0xe695d256";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `mss_clamp_enable_disable` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MssClampEnableDisable {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub ipv4_mss: u16,
+    pub ipv6_mss: u16,
+    pub ipv4_direction: u8,
+    pub ipv6_direction: u8,
+}
+
+impl Encode for MssClampEnableDisable {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.ipv4_mss).to_be_bytes());
+        buf.extend_from_slice(&(self.ipv6_mss).to_be_bytes());
+        buf.extend_from_slice(&(self.ipv4_direction as u8).to_be_bytes());
+        buf.extend_from_slice(&(self.ipv6_direction as u8).to_be_bytes());
+    }
+}
+
+impl Decode for MssClampEnableDisable {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let ipv4_mss = d.u16()?;
+        let ipv6_mss = d.u16()?;
+        let ipv4_direction = d.u8()?;
+        let ipv6_direction = d.u8()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            ipv4_mss,
+            ipv6_mss,
+            ipv4_direction,
+            ipv6_direction,
+        })
+    }
+}
+
+impl Message for MssClampEnableDisable {
+    const NAME: &'static str = "mss_clamp_enable_disable";
+    const CRC: &'static str = "0xd31b44e3";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `mss_clamp_enable_disable_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MssClampEnableDisableReply {
+    pub context: u32,
+    pub retval: i32,
+}
+
+impl Encode for MssClampEnableDisableReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+    }
+}
+
+impl Decode for MssClampEnableDisableReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        Ok(Self {
+            context,
+            retval,
+        })
+    }
+}
+
+impl Message for MssClampEnableDisableReply {
+    const NAME: &'static str = "mss_clamp_enable_disable_reply";
+    const CRC: &'static str = "0xe8d4e804";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `mss_clamp_get` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MssClampGet {
+    pub context: u32,
+    pub cursor: u32,
+    pub sw_if_index: u32,
+}
+
+impl Encode for MssClampGet {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.cursor).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+    }
+}
+
+impl Decode for MssClampGet {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let _ = d.u32()?;
+        let context = d.u32()?;
+        let cursor = d.u32()?;
+        let sw_if_index = d.u32()?;
+        Ok(Self {
+            context,
+            cursor,
+            sw_if_index,
+        })
+    }
+}
+
+impl Message for MssClampGet {
+    const NAME: &'static str = "mss_clamp_get";
+    const CRC: &'static str = "0x47250981";
+    const CONTEXT_OFFSET: usize = 6;
+    const CLIENT_INDEX_PREFIX: bool = true;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `mss_clamp_get_reply` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MssClampGetReply {
+    pub context: u32,
+    pub retval: i32,
+    pub cursor: u32,
+}
+
+impl Encode for MssClampGetReply {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.retval).to_be_bytes());
+        buf.extend_from_slice(&(self.cursor).to_be_bytes());
+    }
+}
+
+impl Decode for MssClampGetReply {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let retval = d.i32()?;
+        let cursor = d.u32()?;
+        Ok(Self {
+            context,
+            retval,
+            cursor,
+        })
+    }
+}
+
+impl Message for MssClampGetReply {
+    const NAME: &'static str = "mss_clamp_get_reply";
+    const CRC: &'static str = "0x53b48f5d";
+    const CONTEXT_OFFSET: usize = 2;
+    const CLIENT_INDEX_PREFIX: bool = false;
+    fn set_context(&mut self, context: u32) { self.context = context; }
+}
+
+/// `mss_clamp_details` — generated from the pinned .api.json.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MssClampDetails {
+    pub context: u32,
+    pub sw_if_index: u32,
+    pub ipv4_mss: u16,
+    pub ipv6_mss: u16,
+    pub ipv4_direction: u8,
+    pub ipv6_direction: u8,
+}
+
+impl Encode for MssClampDetails {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.context).to_be_bytes());
+        buf.extend_from_slice(&(self.sw_if_index).to_be_bytes());
+        buf.extend_from_slice(&(self.ipv4_mss).to_be_bytes());
+        buf.extend_from_slice(&(self.ipv6_mss).to_be_bytes());
+        buf.extend_from_slice(&(self.ipv4_direction as u8).to_be_bytes());
+        buf.extend_from_slice(&(self.ipv6_direction as u8).to_be_bytes());
+    }
+}
+
+impl Decode for MssClampDetails {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let _ = d.u16()?;
+        let context = d.u32()?;
+        let sw_if_index = d.u32()?;
+        let ipv4_mss = d.u16()?;
+        let ipv6_mss = d.u16()?;
+        let ipv4_direction = d.u8()?;
+        let ipv6_direction = d.u8()?;
+        Ok(Self {
+            context,
+            sw_if_index,
+            ipv4_mss,
+            ipv6_mss,
+            ipv4_direction,
+            ipv6_direction,
+        })
+    }
+}
+
+impl Message for MssClampDetails {
+    const NAME: &'static str = "mss_clamp_details";
+    const CRC: &'static str = "0xd3a4de61";
     const CONTEXT_OFFSET: usize = 2;
     const CLIENT_INDEX_PREFIX: bool = false;
     fn set_context(&mut self, context: u32) { self.context = context; }

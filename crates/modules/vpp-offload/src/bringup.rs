@@ -123,6 +123,8 @@ pub struct Attached {
     /// The `unresolvable-accept6` set, likewise
     /// ([`crate::engine::UnresolvableAccepts6`]).
     pub unresolvable_accepts6: Arc<crate::engine::UnresolvableAccepts6>,
+    /// The `mss-clamp vlan` set, likewise ([`crate::mss_clamp::MssClamps`]).
+    pub mss_clamps: Arc<crate::mss_clamp::MssClamps>,
     /// The VPP sampler's directory as attach left it: the `sampler-dir`
     /// row.
     pub sampler_dir: crate::sampler::SamplerDir,
@@ -1000,6 +1002,7 @@ pub fn bring_up(
         Arc::new(crate::engine::UnresolvableAccepts6::new(
             cfg.unresolvable_accepts6.clone(),
         )),
+        Arc::new(crate::mss_clamp::MssClamps::new(cfg.mss_clamps.clone())),
         sampler_dir,
         cfg.steer_at_start,
     ) {
@@ -1083,6 +1086,7 @@ fn finish(
     families: FamilyPolicy,
     drift_accepts6: Arc<crate::drift::DriftAccepts6>,
     unresolvable_accepts6: Arc<crate::engine::UnresolvableAccepts6>,
+    mss_clamps: Arc<crate::mss_clamp::MssClamps>,
     sampler_dir: crate::sampler::SamplerDir,
     steer_at_start: bool,
 ) -> Result<Attached, String> {
@@ -1508,6 +1512,7 @@ fn finish(
     let handback_wanted = crate::handback::plans_divert_v6(&held_steering.targets);
     let loop_accepts6 = drift_accepts6.clone();
     let loop_unresolvable_accepts6 = unresolvable_accepts6.clone();
+    let loop_mss_clamps = mss_clamps.clone();
     // The kernel path's host side ([`crate::kernel_path::LiveKernelPath`]),
     // built on the loop thread from these: where the IRQs and counters
     // live, every CPU VPP is on (derived AND observed — the same set the
@@ -1597,7 +1602,8 @@ fn finish(
         .with_trunk_ports(trunk_ports)
         .with_loopback6(loopback6)
         .with_self_networks(self_nets.clone())
-        .with_self_networks_v6(self_nets6.clone());
+        .with_self_networks_v6(self_nets6.clone())
+        .with_mss_clamps(loop_mss_clamps);
         engine.set_steer_exempts(engine_exempts.clone());
         // Per-neighbour placement reads the live kernel on Linux; the
         // default elsewhere treats every device as plain.
@@ -1887,6 +1893,7 @@ fn finish(
         control_plane,
         drift_accepts6,
         unresolvable_accepts6,
+        mss_clamps,
         sampler_dir,
     })
 }
@@ -2066,6 +2073,7 @@ mod completeness_gate_tests {
             steer_keeps6: vec![],
             drift_accepts6: vec![],
             unresolvable_accepts6: vec![],
+            mss_clamps: vec![],
             v6: false,
             steer_direction: Default::default(),
             loopback_address6: None,
