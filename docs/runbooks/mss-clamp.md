@@ -75,6 +75,13 @@ names the `mss-clamp` line and the port. What counts:
 - An IPv6 prefix: any `v6-divert`, which diverts by frame and cannot be
   scoped by address.
 
+Nothing counts as diverted for a family with no allowlist
+(`allow-prefix` / `allow-prefix6`), since the fast path clamps only
+matched traffic, nor for IPv4 when `steer-exempt` lines cover every
+address. "Local" means covered by `local-prefix` lines, together.
+Under `dry-run on` the fast path applies no clamp, so the check is
+skipped; it runs again on the reload that turns dry-run off.
+
 There are two remedies. Clamp in VPP too (below), or keep the prefix on
 the kernel path: `steer-exempt` it (that keeps traffic TO it) and leave
 its hosts' trunk unsteered or `direction dst`, or take it off the

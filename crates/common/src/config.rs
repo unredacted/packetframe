@@ -3234,6 +3234,11 @@ impl Config {
     /// - An IPv6 prefix: any `v6-divert`, which diverts by frame and
     ///   cannot be scoped by address.
     ///
+    /// A family with no allowlist diverts nothing the fast path would
+    /// clamp, nor does IPv4 when the exemptions cover every address;
+    /// "local" is coverage by the `local-prefix` lines together; and
+    /// `dry-run on` applies no clamp, so the check is skipped.
+    ///
     /// A `via <if>` clamp is judged only when VPP can send out of `<if>`:
     /// a member port, or the device of a `local-prefix` VPP delivers to
     /// through a `local-route`. Any other device (a tunnel, say) is not
@@ -3243,6 +3248,18 @@ impl Config {
         fp: &ModuleSection,
         global_dir: VppSteerDirection,
     ) -> Result<(), ConfigError> {
+        // `dry-run on` (the first `dry-run` line, as the fast path reads
+        // it) passes matched packets before the clamp, so there is no
+        // clamp to lose. `until-seeded` releases on its own and is
+        // checked; turning `dry-run off` is a reload, which re-validates.
+        let dry_run_on = fp.directives.iter().find_map(|d| match d {
+            ModuleDirective::DryRun(on) => Some(*on),
+            ModuleDirective::DryRunUntilSeeded => Some(false),
+            _ => None,
+        }) == Some(true);
+        if dry_run_on {
+            return Ok(());
+        }
         struct Steered<'a> {
             iface: &'a str,
             src: bool,
@@ -3292,11 +3309,24 @@ impl Config {
             })
             .collect();
         // Nothing v4 is diverted without an allowlist (the plan installs
-        // no rule at all), so the sides only count with one.
-        let v4 = !allow4.is_empty();
+        // no rule at all), so the sides only count with one. Nor when the
+        // exemptions cover every destination: a `steer-exempt` keep rule
+        // outranks every divert rule, src or dst.
+        let everything = Ipv4Prefix {
+            addr: std::net::Ipv4Addr::UNSPECIFIED,
+            prefix_len: 0,
+        };
+        let v4 = !allow4.is_empty() && !v4_tiled(&everything, &exempts);
         let src_port = steered.iter().find(|p| v4 && p.src).map(|p| p.iface);
         let dst_port = steered.iter().find(|p| v4 && p.dst).map(|p| p.iface);
-        let v6_port = steered.iter().find(|p| p.v6).map(|p| p.iface);
+        // Likewise IPv6: the fast path clamps only what an
+        // `allow-prefix6` matched, so with none there is no v6 clamp to
+        // lose to `v6-divert`.
+        let v6 = fp
+            .directives
+            .iter()
+            .any(|d| matches!(d, ModuleDirective::AllowPrefix6(_)));
+        let v6_port = steered.iter().find(|p| v6 && p.v6).map(|p| p.iface);
         let any_v4_port = src_port.or(dst_port);
 
         let exempted = |p: &Ipv4Prefix| v4_tiled(p, &exempts);
@@ -3309,11 +3339,16 @@ impl Config {
                 None
             }
         };
-        let local_v4 = |p: &Ipv4Prefix| {
-            fp.directives.iter().any(|d| {
-                matches!(d, ModuleDirective::LocalPrefix { cidr, .. } if cidr.contains_prefix(p))
+        // Tiled, not contained: a clamped /23 can be two local /24s.
+        let locals4: Vec<&Ipv4Prefix> = fp
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                ModuleDirective::LocalPrefix { cidr, .. } => Some(cidr),
+                _ => None,
             })
-        };
+            .collect();
+        let local_v4 = |p: &Ipv4Prefix| v4_tiled(p, &locals4);
         let vpp_egress = |dev: &str| {
             let member = vpp
                 .directives
@@ -9178,9 +9213,31 @@ module vpp-offload
         // IPv6 is diverted by frame: any v6 clamp is lost to `v6-divert`.
         let v6_ports = "v6 on\n  port eth2 cores 1 steer on direction dst v6-divert untagged\n  \
                         port eth4 cores 1 steer off vlans 1337";
-        let e = check("mss-clamp 2001:db8::/48 1340", v6_ports, exempt).unwrap_err();
+        let v6_clamp = "allow-prefix6 2001:db8::/32\n  mss-clamp 2001:db8::/48 1340";
+        let e = check(v6_clamp, v6_ports, exempt).unwrap_err();
         assert!(e.contains("IPv6"), "{e}");
-        check("mss-clamp 2001:db8::/48 1340", transit_dst, exempt).unwrap();
+        check(v6_clamp, transit_dst, exempt).unwrap();
+        // ...but only with a v6 allowlist: without one the fast path
+        // clamps no IPv6, so there is nothing to lose.
+        check("mss-clamp 2001:db8::/48 1340", v6_ports, exempt).unwrap();
+
+        // A prefix tiled by local subnets is local, not remote.
+        check(
+            "local-prefix 192.0.3.0/24 via br1338\n  mss-clamp 192.0.2.0/23 1360",
+            transit_dst,
+            exempt,
+        )
+        .unwrap();
+        // Exemptions covering every destination divert nothing.
+        check("mss-clamp 1360", trunk_both, "  steer-exempt 0.0.0.0/0\n").unwrap();
+        // `dry-run on` applies no clamp; `until-seeded` releases by itself.
+        check("dry-run on\n  mss-clamp 1360", transit_dst, exempt).unwrap();
+        check(
+            "dry-run until-seeded\n  mss-clamp 1360",
+            transit_dst,
+            exempt,
+        )
+        .unwrap_err();
     }
 
     /// `mss-clamp vlan`: the grammar, its own rules, and the cover it
