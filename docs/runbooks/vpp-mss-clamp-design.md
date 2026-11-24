@@ -79,9 +79,11 @@ crosses. For a VLAN carrying the clamped prefix's hosts:
 
 So RX + TX on the VLAN's L3 interface covers both directions of every
 flow to or from hosts on that VLAN, whichever port it entered through.
-That holds only while the prefix is bound to a VLAN. For a clamp scoped to
-an egress port (`mss-clamp via <iface>`), TX on that port's VPP
-interface is the equivalent.
+That holds only while the prefix is bound to a VLAN. A clamp scoped to an
+egress port (`mss-clamp via <iface>`) has no single equivalent: a tagged
+route leaves through the VLAN's subinterface or BVI, each its own
+`sw_if_index`, and a feature on the parent port does not carry over to
+them.
 
 ## The options
 
@@ -92,13 +94,20 @@ covers, naming the directive and the remedies. This is the same rule
 `direction dst` already follows for uncovered local prefixes: a silent
 loss of policy is a load-time refusal, not a canary discovery.
 
-Coverage, per steered port and direction:
+Coverage, per steered port and direction. A prefix clamp matches source
+OR destination, so each side is judged for both endpoints:
 
 | `mss-clamp` form | Diverted, so refused, when |
 |---|---|
-| `<cidr> <mss>` / `<cidr> via <if> <mss>` | a `src` side diverts an allowlisted prefix overlapping `<cidr>` and no source opt-out covers the overlap; or a `dst` side does and no `steer-exempt` covers it |
-| `via <if> <mss>` | `<if>` is a member port (VPP may route out of it), and anything is steered |
+| `<cidr> <mss>` / `<cidr> via <if> <mss>`, on a `src` side | `<cidr>` overlaps the allowlist (its hosts are diverted as sources), or `<cidr>` is not wholly `steer-exempt` (an allowlisted source sending TO it is diverted) |
+| the same, on a `dst` side | the allowlisted part of `<cidr>` is not wholly `steer-exempt` (inbound to it), or `<cidr>` is remote and some allowlisted destination is not exempt (its hosts sending to that destination are diverted) |
+| `via <if> <mss>` | `<if>` is one VPP can send out of (a member port, or a device a `local-route` delivers to), and anything is steered |
 | `<mss>` (global) | anything is steered |
+
+For example, with `allow-prefix 10.0.0.0/24`, `mss-clamp 203.0.113.0/24
+1360` and `direction src`, a SYN from 10.0.0.1 to 203.0.113.1 is diverted
+by its source while the clamp matches its destination. The second test on
+the `src` row refuses it unless 203.0.113.0/24 is exempt.
 
 IPv6 is judged by `v6-divert`: a v6 clamp prefix on a box that diverts
 IPv6 by frame on any VLAN cannot be shown not to cross VPP, so it counts
@@ -117,21 +126,23 @@ path's prefixes, because VPP's scope (an interface) is wider than the
 fast path's (a prefix):
 
 ```
-mss-clamp vlan <vid> <mss> [ip6 <mss>]      # RX + TX on that VLAN's L3 interface
-mss-clamp port <port> <mss> [ip6 <mss>]     # TX on a port's VPP interface (`via` forms)
+mss-clamp vlan <vid> [ip4 <mss>] [ip6 <mss>]   # RX + TX on that VLAN's L3 interfaces
 ```
 
 The guard (option 0) accepts a fast-path `mss-clamp <cidr>` as covered
 when a `local-route` binds `<cidr>` to a VLAN that carries a VPP clamp at
-or below the fast path's value. It accepts `via <if>` when a `port` clamp
-is configured on `<if>`.
+or below the fast path's value. There is no `port` form: a tagged route
+leaves through a subinterface or BVI, not the parent port, so a clamp on
+the port would miss it. `via <if>` clamps stay refused when steered.
 
 What it takes:
 
-- Vendor `mss_clamp.api.json`. It is a plugin API, so its messages must
-  be **optional** in the CRC handshake: looked up only when a clamp is
-  configured, and refused by name at attach ("this VPP has no mss_clamp
-  plugin") when one is configured and the plugin is missing.
+- Vendor `mss_clamp.api.json`. It is a plugin API, so its messages are
+  **optional** in the CRC handshake: verified at every connect whenever
+  VPP offers them, configured or not, and recorded as unavailable (by
+  name and why) when absent or drifted, rather than refusing the attach.
+  A clamp added later by a reload then uses messages the handshake has
+  already checked, or is reported as not in place.
 - Attach and adoption: enable the clamp after the subinterface or BVI
   exists. On an adopted VPP, read it back with `mss_clamp_get` and
   re-assert it, as attach already does for up/unnumbered. `vlans all`
@@ -191,8 +202,9 @@ What it does not do:
   its price.
 - **IPv6.** The NIC cannot match a v6 address (`steer.rs`, "IPv6: by
   frame"), so there is no v6 source opt-out. For a v6 clamp, the remedy
-  is leaving that VLAN out of `v6-divert`, which is already per VLAN and
-  does not blackhole.
+  is leaving out of `v6-divert` every VLAN that can carry either half of
+  an affected flow (the clamped VLAN and the upstream or transit VLANs
+  its return traffic arrives on), or clamping in VPP (option A's `ip6`).
 
 Cost: small. It is the existing exemption machinery with one more side.
 
@@ -226,8 +238,8 @@ Why A over B for the reference deployment:
 
 - **Does every VPP build ship `mss_clamp_plugin.so`?** fd.io's packages
   do (`vpp-plugin-core`), and so does the reference deployment's build.
-  A build without it is refused at attach only when a clamp is
-  configured.
+  A build without it still attaches; a configured clamp is reported as
+  not in place and holds the first steer.
 - **Is RX on a BVI the right hook for every bridged layout?** It is by
   VPP's arc layout (routed input on the BVI enters `ip4-unicast` there).
   Before building A, confirm it with a packet trace (`trace add`, a SYN
