@@ -242,8 +242,18 @@ pub struct CompletenessReport {
     /// What the authority says it has — whichever daemon
     /// `integrity-authority` names.
     pub authority_routes: u64,
-    /// What our mirror holds.
+    /// What our mirror holds that a route source delivered: the
+    /// prefixes the authority could have counted. Not the whole mirror,
+    /// which also holds the neighbour resolver's `local-prefix` host
+    /// routes and any `fallback-default` — no authority counts those,
+    /// and on a small table they outnumber it.
     pub mirror_routes: u64,
+    /// Routes the second tier is fed that no route source delivered: a
+    /// `fallback-default` with no session default under it. Outside
+    /// `mirror_routes` for the reason above, and reported because a
+    /// consumer that counts what it was fed holds them too
+    /// ([`TableCompleteness::attests_fed`]).
+    pub unsourced_routes: u64,
     /// When the comparison was made.
     pub at: std::time::Instant,
 }
@@ -625,11 +635,24 @@ impl TableCompleteness {
     /// separate reads recomputes one report's drift against another
     /// report's verdict.
     pub fn attests(&self, mirror_now: u64) -> bool {
+        self.attests_with(|_| mirror_now)
+    }
+
+    /// [`Self::attests`] for a consumer counting what the fast path FED
+    /// it, which includes the report's `unsourced_routes` (a
+    /// `fallback-default`): those come off `fed_now` before the
+    /// comparison, so one fallback route on a 14-route table is not 7%
+    /// drift.
+    pub fn attests_fed(&self, fed_now: u64) -> bool {
+        self.attests_with(|r| fed_now.saturating_sub(r.unsourced_routes))
+    }
+
+    fn attests_with(&self, mirror_now: impl FnOnce(&CompletenessReport) -> u64) -> bool {
         let (report, verdict) = self.latest_verdict();
         verdict.permits_steering()
             && report.is_some_and(|r| {
                 CompletenessReport {
-                    mirror_routes: mirror_now,
+                    mirror_routes: mirror_now(&r),
                     ..r
                 }
                 .drift()
@@ -1385,6 +1408,7 @@ mod tests {
             Some(CompletenessReport {
                 authority_routes: 0,
                 mirror_routes: 1_000_000,
+                unsourced_routes: 0,
                 at: std::time::Instant::now(),
             }),
             std::time::Instant::now(),
@@ -1631,6 +1655,7 @@ mod tests {
             CompletenessReport {
                 authority_routes: authority,
                 mirror_routes: mirror,
+                unsourced_routes: 0,
                 at: Instant::now() - age,
             }
         }
@@ -1783,6 +1808,7 @@ mod tests {
             CompletenessReport {
                 authority_routes: 1_000_000,
                 mirror_routes: 1_000_000,
+                unsourced_routes: 0,
                 at: Instant::now(),
             }
         }
@@ -1853,6 +1879,7 @@ mod tests {
             h.record(AuthorityObservation::Clean(CompletenessReport {
                 authority_routes: 1_000_000,
                 mirror_routes: 400_000,
+                unsourced_routes: 0,
                 at: Instant::now(),
             }));
 
@@ -1898,6 +1925,7 @@ mod tests {
             h.record(AuthorityObservation::Clean(CompletenessReport {
                 authority_routes: 1_000_000,
                 mirror_routes: 1_000_000,
+                unsourced_routes: 0,
                 at: Instant::now() - (STEER_MAX_REPORT_AGE + Duration::from_secs(60)),
             }));
             assert!(matches!(h.verdict(), Completeness::Ineligible(_)));
@@ -1967,6 +1995,7 @@ mod tests {
             h.record(AuthorityObservation::Clean(CompletenessReport {
                 authority_routes: 1_000_000,
                 mirror_routes: 400_000,
+                unsourced_routes: 0,
                 at: Instant::now(),
             }));
             assert!(matches!(h.verdict(), Completeness::Ineligible(_)));
@@ -2000,6 +2029,25 @@ mod tests {
             );
             h.record(AuthorityObservation::Disqualified(not_ready()));
             assert!(!h.attests(1_000_000), "a revocation outranks the counts");
+        }
+
+        /// A consumer counting what it was fed holds the fallback default
+        /// the authority never counts; on a small table that one route
+        /// alone is past the drift bound unless it comes off.
+        #[test]
+        fn attests_fed_discounts_the_unsourced_routes() {
+            let h = TableCompleteness::new();
+            h.record(AuthorityObservation::Clean(CompletenessReport {
+                authority_routes: 14,
+                mirror_routes: 14,
+                unsourced_routes: 1,
+                at: Instant::now(),
+            }));
+            assert!(h.attests(14));
+            assert!(!h.attests(15), "one extra route on 14 is 7%");
+            assert!(h.attests_fed(15), "14 sourced + the fallback default");
+            assert!(!h.attests_fed(14), "the feed lost a route");
+            assert!(!h.attests_fed(16));
         }
     }
 }

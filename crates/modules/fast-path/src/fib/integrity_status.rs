@@ -192,6 +192,7 @@ impl Sample {
         packetframe_common::fib::CompletenessReport {
             authority_routes: self.authority_prefixes as u64,
             mirror_routes: self.packetframe_prefixes as u64,
+            unsourced_routes: 0,
             at: self.at,
         }
     }
@@ -841,6 +842,7 @@ mod tests {
         let report = CompletenessReport {
             authority_routes: 1_000_000,
             mirror_routes: 1_000_000,
+            unsourced_routes: 0,
             at,
         };
         for offset in [
@@ -1125,6 +1127,7 @@ mod tests {
         h.record(AuthorityObservation::Clean(CompletenessReport {
             authority_routes: 69_155,
             mirror_routes: 69_155,
+            unsourced_routes: 0,
             at: Instant::now(),
         }));
         assert!(

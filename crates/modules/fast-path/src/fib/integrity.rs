@@ -191,9 +191,13 @@ impl IntegrityChecker {
         // This NARROWS the window to the difference between two
         // concurrent completions — it does not close it, so consumers
         // that escalate on a mismatch still need more than one sample.
+        //
+        // Route-source prefixes only, not the whole mirror: the
+        // neighbour resolver's `local-prefix` host routes live there too
+        // and bird's tables do not hold them (`session_route_counts`).
         let (bird_route, pf_route) = tokio::join!(
             run_birdc_count(&self.config.birdc_path),
-            self.prog.mirror_counts()
+            self.prog.session_route_counts()
         );
         // ONE `Instant` for the whole run, stamped the moment the pair
         // completes — `last_run`, the comparison and the published
@@ -228,7 +232,8 @@ impl IntegrityChecker {
         // its error and leaves the previous COMPARISON standing whole,
         // aged, and labelled as history.
         let fresh_bird = bird_route.as_ref().ok().copied();
-        let fresh_mirror = pf_route.as_ref().ok().map(|(v4, v6)| v4 + v6);
+        let fresh_mirror = pf_route.as_ref().ok().map(|c| c.total());
+        let unsourced = pf_route.as_ref().map_or(0, |c| c.unsourced) as u64;
 
         let mut snap = self.snapshot.write().await;
         snap.last_run = Some(at);
@@ -255,8 +260,8 @@ impl IntegrityChecker {
             }
         }
         if let Err(e) = &pf_route {
-            snap.last_error = Some(format!("programmer mirror_counts: {e}"));
-            warn!(error = %e, "integrity check: mirror_counts failed");
+            snap.last_error = Some(format!("programmer session_route_counts: {e}"));
+            warn!(error = %e, "integrity check: session_route_counts failed");
         }
 
         // Recorded, and republished to the steering gate, only when BOTH
@@ -332,6 +337,7 @@ impl IntegrityChecker {
                 handle.publish(packetframe_common::fib::CompletenessReport {
                     authority_routes: bird as u64,
                     mirror_routes: pf as u64,
+                    unsourced_routes: unsourced,
                     at,
                 });
             }
