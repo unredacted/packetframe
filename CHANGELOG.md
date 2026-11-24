@@ -32,9 +32,9 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 ### Changes
 
-**vpp-offload**
+**CLI and operations**
 
-- `packetframe detach --all` with no `--config` reads the default config when there is one, so it finds VPP's state file in the configured `state-dir`. It used the built-in default directory and, on a box with another `state-dir`, left VPP running. It now also logs the state directory it read. [#PR](https://github.com/unredacted/packetframe/pull/PR)
+- `packetframe detach --all` with no `--config` reads the default config when there is one, so it finds VPP's state file in the configured `state-dir`. It used the built-in default directory and, on a box with another `state-dir`, left VPP running. It now also logs the state directory it read. [#428](https://github.com/unredacted/packetframe/pull/428)
 
 **neigh-snoop**
 
