@@ -32,6 +32,10 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 ### Changes
 
+**fast-path**
+
+- Under `packetframe-fib`, a connected prefix the feed delivers with next hop `0.0.0.0` or the router's own address, with no `local-prefix`, makes its flows to an allowlisted `local-prefix` one-way: the replies reach the kernel alone and conntrack drops them as INVALID. Such prefixes are now named in a `one-way-fast-path` status row, a WARN and `packetframe_fib_one_way_routes`, with the `local-prefix ... via <iface>` line that fixes each. The warning for a `local-prefix` with no allow entry no longer says its host routes are never used: they serve flows whose other end is allowlisted, which a reply-only `local-prefix` is for. [#432](https://github.com/unredacted/packetframe/pull/432)
+
 **neigh-snoop**
 
 - A bridge counts as up only when it also has carrier. When it loses carrier, the kernel flushes its neighbours. The learned table is now re-seeded when carrier comes back, not only after an admin bring-up, and a bridge that comes up before its link is no longer seeded into a flush. [#423](https://github.com/unredacted/packetframe/pull/423)
