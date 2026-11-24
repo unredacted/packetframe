@@ -746,8 +746,10 @@ impl EngineHandle {
         ))?;
         let turn = Arc::new(tokio::sync::Mutex::new(()));
         // The gate takes its turn per reconcile, not per call (see
-        // `gate_task`), so its runner is the bare one.
-        let gate_vtysh: Arc<dyn Vtysh> = Arc::new(RealVtysh::from_env(GATE_VTYSH_TIMEOUT));
+        // `gate_task`), so its runner is the bare one. It talks to bgpd
+        // only (see `frr_gate::GATE_DAEMON`).
+        let gate_vtysh: Arc<dyn Vtysh> =
+            Arc::new(RealVtysh::from_env(GATE_VTYSH_TIMEOUT).only(frr_gate::GATE_DAEMON));
         let rs_vtysh: Arc<dyn Vtysh> = Arc::new(FrrQueue {
             inner: RealVtysh::from_env(RS_DUMP_TIMEOUT),
             turn: turn.clone(),
