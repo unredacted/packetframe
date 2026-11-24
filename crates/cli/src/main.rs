@@ -65,6 +65,30 @@ pub(crate) fn config_path_or_default(caller: Option<PathBuf>) -> PathBuf {
     caller.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
 }
 
+/// The config `detach` reads, given `--config`, `--all`, `--keep-vpp`
+/// and whether the default config file exists.
+///
+/// A scoped detach (and `--keep-vpp`, which checks the running VPP
+/// against the config the next start reads) always has one. `--all`
+/// needs no config to know WHAT to tear down, but it still needs one to
+/// know WHERE: `state-dir` and `bpffs-root` come from it. It used to
+/// read none, so on a box whose config sets `state-dir`, `detach --all`
+/// looked for VPP's state file in the default directory, found nothing,
+/// and left VPP running; the next start found the recorded VPP and
+/// terminated it itself. So `--all` reads the default config when there
+/// is one, and falls back to the built-in defaults only when there is
+/// not (a box being cleaned up after its config was removed).
+fn detach_config_path(
+    config: Option<PathBuf>,
+    all: bool,
+    keep_vpp: bool,
+    default_exists: bool,
+) -> Option<PathBuf> {
+    config.or_else(|| {
+        (!all || keep_vpp || default_exists).then(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+    })
+}
+
 #[derive(Parser)]
 #[command(
     name = "packetframe",
@@ -346,19 +370,12 @@ fn main() -> ExitCode {
             all,
             keep_vpp,
         } => {
-            // `detach --all` with no config is still meaningful (rip
-            // every pin we can find). Only default the path for the
-            // scoped case where `config` is expected to name the
-            // module whose pins to tear down.
-            let path = config.or_else(|| {
-                // `--keep-vpp` checks the running VPP against the config
-                // the next start reads, so it always has one.
-                if all && !keep_vpp {
-                    None
-                } else {
-                    Some(PathBuf::from(DEFAULT_CONFIG_PATH))
-                }
-            });
+            let path = detach_config_path(
+                config,
+                all,
+                keep_vpp,
+                std::path::Path::new(DEFAULT_CONFIG_PATH).exists(),
+            );
             match loader::detach(path.as_deref(), all, keep_vpp) {
                 Ok(()) => ExitCode::from(EXIT_OK),
                 Err(e) => {
@@ -487,4 +504,24 @@ fn not_implemented(name: &str) -> ExitCode {
         "not implemented in this release, tracked in the v0.1 plan"
     );
     ExitCode::from(EXIT_RUNTIME_ERROR)
+}
+
+#[cfg(test)]
+mod detach_config_tests {
+    use super::*;
+
+    #[test]
+    fn detach_all_reads_the_default_config_when_there_is_one() {
+        let default = Some(PathBuf::from(DEFAULT_CONFIG_PATH));
+        // `--all` still needs the config's `state-dir` to find VPP.
+        assert_eq!(detach_config_path(None, true, false, true), default);
+        // With no config on the box, the built-in defaults.
+        assert_eq!(detach_config_path(None, true, false, false), None);
+        // Scoped and `--keep-vpp` always read one.
+        assert_eq!(detach_config_path(None, false, false, false), default);
+        assert_eq!(detach_config_path(None, true, true, false), default);
+        // `--config` wins.
+        let given = Some(PathBuf::from("/tmp/other.conf"));
+        assert_eq!(detach_config_path(given.clone(), true, false, true), given);
+    }
 }

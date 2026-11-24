@@ -41,6 +41,10 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 - A steer that would carry traffic a fast-path `mss-clamp` covers through VPP, which does not apply it, is refused at start and at reload, naming the clamp and the port. Before, the clamp silently stopped applying to steered traffic. [#430](https://github.com/unredacted/packetframe/pull/430)
 - `mss-clamp vlan <vid> [ip4 <mss>] [ip6 <mss>]` clamps TCP MSS in VPP, both directions on that VLAN's L3 interface, with VPP's `mss_clamp` plugin. A fast-path `mss-clamp` on a prefix inside a `local-route` on that VLAN then counts as covered, so its trunk can steer. Hot-reloadable. Needs the plugin loaded (fd.io's `vpp-plugin-core`); while a clamp is not in place, `packetframe status` shows it and a first steer is held. One IPv4 value across all lines, because of a VPP 26.10 plugin bug. [#431](https://github.com/unredacted/packetframe/pull/431)
 
+**CLI and operations**
+
+- `packetframe detach --all` with no `--config` reads the default config when there is one, so it finds VPP's state file in the configured `state-dir`. It used the built-in default directory and, on a box with another `state-dir`, left VPP running. It now also logs the state directory it read. [#428](https://github.com/unredacted/packetframe/pull/428)
+
 **neigh-snoop**
 
 - A bridge counts as up only when it also has carrier. When it loses carrier, the kernel flushes its neighbours. The learned table is now re-seeded when carrier comes back, not only after an admin bring-up, and a bridge that comes up before its link is no longer seeded into a flush. [#423](https://github.com/unredacted/packetframe/pull/423)
