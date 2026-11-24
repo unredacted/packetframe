@@ -35,7 +35,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 **vpp-offload**
 
 - A steer that would carry traffic a fast-path `mss-clamp` covers through VPP, which does not apply it, is refused at start and at reload, naming the clamp and the port. Before, the clamp silently stopped applying to steered traffic. [#430](https://github.com/unredacted/packetframe/pull/430)
-- `mss-clamp vlan <vid> [ip4 <mss>] [ip6 <mss>]` clamps TCP MSS in VPP, both directions on that VLAN's L3 interface, with VPP's `mss_clamp` plugin. A fast-path `mss-clamp` on a prefix inside a `local-route` on that VLAN then counts as covered, so its trunk can steer. Hot-reloadable. Needs the plugin loaded (fd.io's `vpp-plugin-core`); while a clamp is not in place, `packetframe status` shows it and a first steer is held. One IPv4 value across all lines, because of a VPP 26.10 plugin bug. [#PR](https://github.com/unredacted/packetframe/pull/PR)
+- `mss-clamp vlan <vid> [ip4 <mss>] [ip6 <mss>]` clamps TCP MSS in VPP, both directions on that VLAN's L3 interface, with VPP's `mss_clamp` plugin. A fast-path `mss-clamp` on a prefix inside a `local-route` on that VLAN then counts as covered, so its trunk can steer. Hot-reloadable. Needs the plugin loaded (fd.io's `vpp-plugin-core`); while a clamp is not in place, `packetframe status` shows it and a first steer is held. One IPv4 value across all lines, because of a VPP 26.10 plugin bug. [#431](https://github.com/unredacted/packetframe/pull/431)
 
 **neigh-snoop**
 
