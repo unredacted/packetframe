@@ -374,7 +374,12 @@ impl FrrAuthorityChecker {
         // being fetched shows up as drift that never existed. Every
         // per-family `vtysh` call and the mirror read overlap on this
         // task.
-        let (authority, mirror) = tokio::join!(self.authority_count(), self.prog.mirror_counts());
+        //
+        // Route-source prefixes only, not the whole mirror: the
+        // neighbour resolver's `local-prefix` host routes live there too
+        // and FRR counts none of them (`session_route_counts`).
+        let (authority, mirror) =
+            tokio::join!(self.authority_count(), self.prog.session_route_counts());
         // ONE `Instant`, stamped the moment the pair completes — the
         // comparison, `last_run` and the published report all carry it,
         // and `IntegrityPosture` tells a current comparison from a
@@ -433,7 +438,8 @@ impl FrrAuthorityChecker {
         }
 
         let fresh_authority = authority.as_ref().ok().copied();
-        let fresh_mirror = mirror.as_ref().ok().map(|(v4, v6)| v4 + v6);
+        let fresh_mirror = mirror.as_ref().ok().map(|c| c.total());
+        let unsourced = mirror.as_ref().map_or(0, |c| c.unsourced);
 
         // Exactly one observation per tick, and the precedence is the
         // point of the ordering.
@@ -453,7 +459,7 @@ impl FrrAuthorityChecker {
         // `Disqualified`, so it never replaces a `Clean` or an
         // `Unreadable`; `loading_only` implies a not-ready upstream, which
         // `classify_bracketed` always reports as a revocation.
-        let obs = match observation(&eligibility, fresh_authority, fresh_mirror, at) {
+        let obs = match observation(&eligibility, fresh_authority, fresh_mirror, unsourced, at) {
             AuthorityObservation::Disqualified(r) if loading_only => {
                 AuthorityObservation::Loading(r)
             }
@@ -549,8 +555,8 @@ impl FrrAuthorityChecker {
             warn!(error = %e, "FRR authority: prefix count failed");
         }
         if let Err(e) = &mirror {
-            snap.last_error = Some(format!("programmer mirror_counts: {e}"));
-            warn!(error = %e, "FRR authority: mirror_counts failed");
+            snap.last_error = Some(format!("programmer session_route_counts: {e}"));
+            warn!(error = %e, "FRR authority: session_route_counts failed");
         }
         if let Eligibility::Unknown(why) = &eligibility {
             if snap.last_error.is_none() {

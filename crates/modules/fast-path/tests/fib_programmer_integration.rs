@@ -38,7 +38,8 @@ use packetframe_common::fib::{IpPrefix, NeighEvent, PeerId, ResolvedRouteSink, R
 use packetframe_fast_path::aligned_bpf_copy;
 use packetframe_fast_path::fib::netlink_neigh::NeighborResolveHandle;
 use packetframe_fast_path::fib::programmer::{
-    FibProgrammer, ProgrammerError, ECMP_GROUPS_CAP, RECLAIM_TICK, REPROBE_TICK, WALK_CHUNK,
+    FibProgrammer, ProgrammerError, SessionRouteCounts, ECMP_GROUPS_CAP, RECLAIM_TICK,
+    REPROBE_TICK, WALK_CHUNK,
 };
 use packetframe_fast_path::fib::resolve_watch::{Probe, ProbeLog};
 use packetframe_fast_path::fib::types::{
@@ -3426,6 +3427,99 @@ fn session_families_ignore_local_prefix_routes() {
     });
 }
 
+/// `session_route_counts` counts what the authority can count: the
+/// prefixes a route source delivered.
+///
+/// A completeness authority compares its prefix count against this. It
+/// used `mirror_counts()`, which includes the resolver's `local-prefix`
+/// host routes, and on a box whose feed carried 22 prefixes about 50 of
+/// them made the mirror read 70: `AuthorityMismatch`, and a steering
+/// gate that refused for good. The `fallback-default` is not counted
+/// either (no authority holds it), but it is reported as unsourced,
+/// because the second tier is fed it.
+#[test]
+#[ignore = "needs CAP_BPF + bpffs; run via sudo -E cargo test -- --ignored"]
+fn session_route_counts_leave_out_local_routes() {
+    let h = ProgrammerHarness::new();
+    let bgp = PeerId(0x7070);
+    let default = IpPrefix::V4 {
+        addr: [0, 0, 0, 0],
+        prefix_len: 0,
+    };
+    let host = IpPrefix::V4 {
+        addr: [192, 0, 2, 50],
+        prefix_len: 32,
+    };
+    let host_nh = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50));
+    let host6 = IpPrefix::V6 {
+        addr: v6("2001:db8::50"),
+        prefix_len: 128,
+    };
+    let host6_nh = IpAddr::V6("2001:db8::50".parse().unwrap());
+    let fallback_nh = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+    let bgp_nh = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+    let routed = IpPrefix::V4 {
+        addr: [198, 51, 100, 0],
+        prefix_len: 24,
+    };
+    let add = |peer_id: PeerId, prefix: IpPrefix, nh: IpAddr| RouteEvent::Add {
+        peer_id,
+        prefix,
+        nexthops: vec![nh],
+        path_id: None,
+        local_pref: None,
+        origin_asn: None,
+    };
+    let counts = |v4, v6, unsourced| SessionRouteCounts { v4, v6, unsourced };
+
+    h.run(async {
+        for event in [
+            add(PeerId::local_arp(34), host, host_nh),
+            add(PeerId::local_arp(34), host6, host6_nh),
+        ] {
+            h.handle.apply_route_event(event).await.expect("local Add");
+        }
+        assert_eq!(h.handle.mirror_counts().await.expect("counts"), (1, 1));
+        assert_eq!(
+            h.handle.session_route_counts().await.expect("counts"),
+            counts(0, 0, 0),
+            "local-prefix host routes belong to no session, and the second tier is not fed them"
+        );
+
+        h.handle
+            .apply_route_event(add(PeerId::local_arp(33), default, fallback_nh))
+            .await
+            .expect("fallback-default Add");
+        h.handle
+            .apply_route_event(add(bgp, routed, bgp_nh))
+            .await
+            .expect("session Add");
+        assert_eq!(
+            h.handle.session_route_counts().await.expect("counts"),
+            counts(1, 0, 1),
+            "the session's route counts; the fallback default is fed but no source's"
+        );
+
+        // A session default lands on the fallback's record: now a session
+        // route like any other.
+        h.handle
+            .apply_route_event(add(bgp, default, bgp_nh))
+            .await
+            .expect("session default Add");
+        // And a session advertising a host a local-prefix also covers.
+        h.handle
+            .apply_route_event(add(bgp, host, bgp_nh))
+            .await
+            .expect("session host Add");
+        assert_eq!(h.handle.mirror_counts().await.expect("counts"), (3, 1));
+        assert_eq!(
+            h.handle.session_route_counts().await.expect("counts"),
+            counts(3, 0, 0),
+            "a prefix a session advertises counts, whatever else holds it"
+        );
+    });
+}
+
 /// Re-advertising an identical nexthop set announces nothing.
 ///
 /// Not an optimisation: under a peering flap the same prefix is
@@ -5100,6 +5194,7 @@ fn a_stop_records_whether_the_authority_vouched_for_the_mirror() {
         AuthorityObservation::Clean(CompletenessReport {
             authority_routes: authority,
             mirror_routes: mirror,
+            unsourced_routes: 0,
             at: std::time::Instant::now(),
         })
     };

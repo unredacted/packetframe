@@ -393,6 +393,15 @@ binds to the `upstream` it follows:
 integrity-authority frr upstream 192.0.2.1 families v4 upstream 2001:db8::1 families v6
 ```
 
+The mirror side of the comparison is the prefixes a route source
+delivered. The `local-prefix` host routes and the `fallback-default`
+live in the mirror too, but neither FRR nor bird counts them, so they
+are left out (`birdc` and `frr` alike). Counting them was harmless on a
+full table and fatal on a small one: about 50 host routes beside a
+22-prefix feed read as `AuthorityMismatch`, and the steering gate
+refused for good. vpp-offload, which counts the routes it was fed,
+takes the fallback default off its own count the same way.
+
 `none` was the only honest answer before this variant existed — a
 `birdc` that is not installed fails blind every 300 s. The reference
 router now runs `integrity-authority frr`; a config still saying `none`
