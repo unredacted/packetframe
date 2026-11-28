@@ -34,7 +34,7 @@ A point release on 0.6.5. VPP can now clamp TCP MSS itself, per VLAN, so a trunk
 
 ### Upgrading from 0.6.5
 
-1. Install the 0.6.6 package or tarball. The .deb runs no maintainer scripts, so the running daemon is unaffected.
+1. Install the 0.6.6 package or tarball, then `systemctl daemon-reload`. The .deb runs no maintainer scripts, so the running daemon is unaffected.
 2. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with or without vpp-offload, as for 0.6.5.
 
 - **A fast-path `mss-clamp` on traffic a port steers into VPP** is now refused at start and at reload, naming the clamp and the port. Before 0.6.6 the clamp silently stopped applying to that traffic. Before upgrading, check that each clamp's traffic stays on the kernel path (a `steer-exempt` for traffic to the prefix, `steer off` or another `direction`), or add `mss-clamp vlan <vid> ip4 <mss>` for its VLAN. The check is skipped while `dry-run on`. [#430](https://github.com/unredacted/packetframe/pull/430)
@@ -96,6 +96,7 @@ curl -LO "https://github.com/unredacted/packetframe/releases/download/v0.6.6/pac
 curl -LO https://github.com/unredacted/packetframe/releases/download/v0.6.6/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 dpkg -i "packetframe_0.6.6_${ARCH}.deb"
+systemctl daemon-reload
 ```
 
 Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the `aarch64-unknown-linux-gnu` tarball and the arm64 .deb also carry the VPP sampler plugin.
