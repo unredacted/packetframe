@@ -22,6 +22,7 @@ pub mod breaker;
 pub mod coalesce;
 pub mod dry_run_gate;
 pub mod fib;
+pub mod health_text;
 pub mod metrics;
 pub mod pin;
 pub mod redirect_watch_status;

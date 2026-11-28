@@ -378,6 +378,28 @@ pub enum PlanError {
     SecondMain { first: u32, second: u32 },
 }
 
+impl PlanError {
+    /// The refusal as the `wan-egress` row states it; [`fmt::Display`]
+    /// is the journal's longer form.
+    pub fn brief(&self) -> String {
+        match self {
+            Self::MainNotFound => "no unconditional `lookup main` rule; nothing installed".into(),
+            Self::BandExhausted { main, low } => format!(
+                "priorities {low}..{} below main ({main}) all taken; need two free, nothing \
+                 installed",
+                main - 1
+            ),
+            Self::NoRoomAfterMain { main } => {
+                format!("main at {main}, the highest priority; nothing installed")
+            }
+            Self::SecondMain { first, second } => format!(
+                "second `lookup main` at {second} after {first}; nothing installed until one \
+                 goes"
+            ),
+        }
+    }
+}
+
 impl fmt::Display for PlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -599,51 +621,41 @@ impl Default for Status {
 impl Status {
     fn present_text(&self) -> String {
         self.present
-            .map_or_else(|| "an unknown number".to_string(), |n| n.to_string())
+            .map_or_else(|| "?".to_string(), |n| n.to_string())
     }
 
     pub fn subsystem_health(&self, now: Instant) -> SubsystemHealth {
         let (state, message) = match &self.condition {
             Condition::Converged => {
                 let placement = match &self.layout {
-                    Some(l) => format!(
-                        "; keep at {}, goto {} -> {} past main at {}{}",
-                        l.keep,
-                        l.goto,
-                        l.target,
-                        l.main,
-                        if l.anchor { " (anchor)" } else { "" }
-                    ),
+                    Some(l) => format!(" past main at {}", l.main),
                     None => String::new(),
                 };
                 (
                     HealthState::Healthy,
-                    format!("{} rules in place{placement}", self.present_text()),
+                    format!("{} rules{placement}", self.present_text()),
                 )
             }
             Condition::Pending => (
                 HealthState::Degraded,
-                "no reconcile has completed yet".to_string(),
+                "no pass has finished yet".to_string(),
             ),
-            Condition::Refused(why) => (HealthState::Degraded, why.to_string()),
+            Condition::Refused(why) => (HealthState::Degraded, why.brief()),
             Condition::Failing(error) => (
                 HealthState::Degraded,
                 format!(
-                    "repair failing: {} of {} rules in place; {error}",
+                    "repair failing, {}/{} rules in place: {error}",
                     self.present_text(),
                     self.desired
                 ),
             ),
             Condition::Retired => (
                 HealthState::Healthy,
-                "removed from the config; no rules remain".to_string(),
+                "removed from the config; no rules left".to_string(),
             ),
             Condition::Removing(error) => (
                 HealthState::Degraded,
-                format!(
-                    "removed from the config, but its rules could not all be removed \
-                     (retrying): {error}"
-                ),
+                format!("removed from the config; rule removal failing, retrying: {error}"),
             ),
         };
         SubsystemHealth {
@@ -1208,11 +1220,7 @@ mod tests {
         assert_eq!(h.name, "wan-egress");
         assert_eq!(h.state, HealthState::Healthy);
         let msg = h.message.unwrap();
-        assert!(msg.starts_with("3 rules in place"), "{msg}");
-        assert!(
-            msg.contains("past main at 32000") && msg.contains("(anchor)"),
-            "{msg}"
-        );
+        assert_eq!(msg, "3 rules past main at 32000");
 
         let refused = Status {
             condition: Condition::Refused(PlanError::MainNotFound),
@@ -1230,7 +1238,10 @@ mod tests {
         };
         let h = failing.subsystem_health(now);
         assert_eq!(h.state, HealthState::Degraded);
-        assert!(h.message.unwrap().contains("repair failing: 1 of 3"));
+        assert_eq!(
+            h.message.unwrap(),
+            "repair failing, 1/3 rules in place: EPERM"
+        );
 
         // A pass that never saw the rules says so rather than "0 of 3".
         let unseen = Status {
@@ -1239,7 +1250,7 @@ mod tests {
         };
         let msg = unseen.subsystem_health(now).message.unwrap();
         assert!(
-            msg.contains("repair failing: an unknown number of 3"),
+            msg.starts_with("repair failing, ?/3 rules in place"),
             "{msg}"
         );
         let mut out = String::new();
@@ -1258,7 +1269,10 @@ mod tests {
         };
         let h = removing.subsystem_health(now);
         assert_eq!(h.state, HealthState::Degraded);
-        assert!(h.message.unwrap().contains("could not all be removed"));
+        assert!(h
+            .message
+            .unwrap()
+            .contains("rule removal failing, retrying: EBUSY"));
     }
 
     #[test]

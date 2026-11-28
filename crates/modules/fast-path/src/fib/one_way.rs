@@ -313,24 +313,25 @@ impl OneWayWatch {
             .iter()
             .map(|r| format!("{} on {}", show(&r.prefix), r.iface))
             .collect();
-        let mut fixes = String::new();
-        for r in &findings {
-            let d = match r.prefix {
-                IpPrefix::V4 { .. } => "local-prefix",
-                IpPrefix::V6 { .. } => "local-prefix6",
-            };
-            let _ = write!(fixes, "; `{d} {} via {}`", show(&r.prefix), r.iface);
-        }
+        let fixes: Vec<String> = findings
+            .iter()
+            .map(|r| {
+                let d = match r.prefix {
+                    IpPrefix::V4 { .. } => "local-prefix",
+                    IpPrefix::V6 { .. } => "local-prefix6",
+                };
+                format!("`{d} {} via {}`", show(&r.prefix), r.iface)
+            })
+            .collect();
         Some(SubsystemHealth {
             name: SUBSYS_ONE_WAY.to_string(),
             state: HealthState::Degraded,
             message: Some(format!(
-                "{} connected route(s) with no local-prefix go to the kernel while their \
-                 hosts' traffic to an allowlisted local-prefix is fast-pathed: {}. The kernel \
-                 sees one direction of those flows, so conntrack marks the replies INVALID and \
-                 a stateful firewall drops them. Add, then restart{fixes}",
-                findings.len(),
-                named.join(", ")
+                "{} {} no local-prefix; replies to fast-pathed traffic are dropped as INVALID; \
+                 add {}, then restart",
+                crate::health_text::list(&named),
+                if findings.len() == 1 { "has" } else { "have" },
+                crate::health_text::list(&fixes)
             )),
             last_success_age_seconds: None,
         })

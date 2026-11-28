@@ -935,6 +935,51 @@ impl Refusal {
         )
     }
 
+    /// The `route-ledger` row's reason: [`Self::describe`] without the
+    /// explanation, which the event log and the runbook carry.
+    pub fn brief(&self) -> String {
+        use crate::health_text::age;
+        match self {
+            Refusal::Missing => "no ledger in state-dir".into(),
+            Refusal::Disabled => "route-ledger off; an earlier ledger was removed".into(),
+            Refusal::ForwardingMode(m) => format!("forwarding-mode is {}", mode_name(*m)),
+            Refusal::NoRouteSource => "no route-source configured".into(),
+            Refusal::Unreadable(e) => format!("unreadable ({e}); removed"),
+            Refusal::Unremovable(e) => format!(
+                "could not be removed after reading ({e}); remove {LEDGER_FILE_NAME} from \
+                 state-dir by hand"
+            ),
+            Refusal::Corrupt(e) => format!("corrupt: {e}"),
+            Refusal::FormatVersion { found } => format!(
+                "format version {found}; this binary reads {LEDGER_FORMAT_V1} and \
+                 {LEDGER_FORMAT_VERSION}"
+            ),
+            Refusal::Identity {
+                recorded,
+                configured,
+            } => format!("written for route source `{recorded}`, config has `{configured}`"),
+            Refusal::TooOld {
+                age_secs,
+                max_age_secs,
+            } => format!(
+                "routes last confirmed {} ago, past max-age {}",
+                age(*age_secs),
+                age(*max_age_secs)
+            ),
+            Refusal::Clock { ahead_secs } => format!(
+                "confirmed {} in the future; the clock moved",
+                age(*ahead_secs)
+            ),
+            Refusal::PeerId { recorded, expected } => {
+                format!("peer id {recorded:#x}, this build's listener uses {expected:#x}")
+            }
+            Refusal::Untrusted(why) => format!("untrusted ({why}); removed unread"),
+            Refusal::TooLarge { len, max } => {
+                format!("too large ({len} bytes, max {max}); removed unread")
+            }
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             Refusal::Missing => "no route ledger in state-dir (the previous stop was not a clean \
@@ -1457,7 +1502,8 @@ pub enum StartReport {
     NotChecked,
     /// `route-ledger off`.
     Off,
-    /// Not used; `code` and `detail` as in the event log.
+    /// Not used; `code` as in the event log, `detail` the row's short
+    /// reason ([`Refusal::brief`]).
     Refused { code: &'static str, detail: String },
     /// Accepted; see [`LedgerStatus::seed`].
     Seeded,
@@ -1606,13 +1652,19 @@ impl LedgerStatus {
     /// start used to be, not a fault — with two exceptions: a file that
     /// could not be consumed (it could seed a later start after this one
     /// moved on), and a seed whose installs failed.
+    ///
+    /// External automation reads this message: a seeded start begins
+    /// `seeded <N> IPv4 + <M> IPv6`, an unapplied seed carries `; applying`,
+    /// a reconciled one `GC removed <N>`, and a start with no seed begins
+    /// `not used at this start`. Keep those forms.
     pub fn subsystem_health(&self, now_unix: u64, now: Instant) -> SubsystemHealth {
+        use crate::health_text::{age, brief};
+        let since = |t: Instant| age(now.saturating_duration_since(t).as_secs());
         let (state, message) = match (&self.start, &self.seed) {
             (StartReport::NotChecked, _) => (HealthState::Healthy, "not checked yet".to_string()),
             (StartReport::Off, _) => (
                 HealthState::Healthy,
-                "off (`route-ledger off`): every start loads the mirror from the route source"
-                    .to_string(),
+                "not used at this start (route-ledger off)".to_string(),
             ),
             (StartReport::Refused { code, detail }, _) => (
                 if *code == "unremovable" {
@@ -1620,55 +1672,44 @@ impl LedgerStatus {
                 } else {
                     HealthState::Healthy
                 },
-                format!("not used at this start ({code}): {detail}; the mirror loaded cold"),
+                format!("not used at this start: {detail}"),
             ),
             (StartReport::Seeded, None) => (HealthState::Healthy, "seeded".to_string()),
             (StartReport::Seeded, Some(s)) => {
-                let written = human_secs(now_unix.saturating_sub(s.written_at_unix));
                 let mut m = format!(
-                    "seeded {} IPv4 + {} IPv6 routes from a ledger written {written} ago",
-                    s.counts.v4.prefixes, s.counts.v6.prefixes
+                    "seeded {} IPv4 + {} IPv6 (ledger {} old",
+                    s.counts.v4.prefixes,
+                    s.counts.v6.prefixes,
+                    age(now_unix.saturating_sub(s.written_at_unix))
                 );
                 if s.confirmed_at_unix < s.written_at_unix {
                     m.push_str(&format!(
-                        " (oldest routes last confirmed {} ago)",
-                        human_secs(now_unix.saturating_sub(s.confirmed_at_unix))
+                        ", oldest routes {}",
+                        age(now_unix.saturating_sub(s.confirmed_at_unix))
                     ));
                 }
+                m.push(')');
                 match (s.applied_at, s.stream_started_at, s.reconciled) {
                     (None, _, _) => m.push_str("; applying"),
-                    (Some(_), _, Some((at, removed))) => m.push_str(&format!(
-                        "; reconciled {} ago — the route source's dump re-advertised the rest \
-                         and the GC removed {removed} it no longer has",
-                        human_secs(now.saturating_duration_since(at).as_secs())
-                    )),
-                    (Some(_), None, None) => m.push_str(
-                        "; waiting for the route source's first route — forwarding on the seed, \
-                         not attested to a second tier until then",
-                    ),
+                    (Some(_), _, Some((_, removed))) => {
+                        m.push_str(&format!("; GC removed {removed}"))
+                    }
+                    (Some(_), None, None) => {
+                        m.push_str("; waiting for the route source's first route")
+                    }
                     (Some(_), Some(_), None) => match self.gc_held_over(HeldOver::Seed) {
-                        None => m.push_str(&format!(
-                            "; the route source is replaying: {} seeded advertisements not yet \
-                             re-advertised (removed at its InitiationComplete if never)",
-                            s.unconfirmed
-                        )),
+                        None => m.push_str(&format!("; {} not re-advertised yet", s.unconfirmed)),
                         Some(h) => m.push_str(&format!(
-                            "; the route source sent End-of-RIB {} ago with {} seeded \
-                             advertisements not re-advertised, and the GC that would remove them \
-                             is held: {}. It runs once the authority reads every upstream \
-                             loaded, or in {} at most (max-age)",
-                            human_secs(now.saturating_duration_since(h.since).as_secs()),
+                            "; GC of {} unconfirmed held {} ({}), runs in {} at most",
                             s.unconfirmed,
-                            h.why,
-                            human_secs(h.expires_at_unix.saturating_sub(now_unix)),
+                            since(h.since),
+                            brief(&h.why),
+                            age(h.expires_at_unix.saturating_sub(now_unix)),
                         )),
                     },
                 }
                 if s.failed > 0 {
-                    m.push_str(&format!(
-                        "; {} seeded prefixes could not be installed",
-                        s.failed
-                    ));
+                    m.push_str(&format!("; {} failed to install", s.failed));
                 }
                 (
                     if s.failed > 0 {
@@ -1683,12 +1724,10 @@ impl LedgerStatus {
         let mut message = message;
         if let Some(h) = self.gc_held_over(HeldOver::EarlierSession) {
             message.push_str(&format!(
-                "; the route source reconnected and sent End-of-RIB {} ago, and the GC that \
-                 would remove what the earlier session sent and this one has not is held: {}. It \
-                 runs once the authority reads every upstream loaded, or in {} at most (max-age)",
-                human_secs(now.saturating_duration_since(h.since).as_secs()),
-                h.why,
-                human_secs(h.expires_at_unix.saturating_sub(now_unix)),
+                "; GC of the earlier session's routes held {} ({}), runs in {} at most",
+                since(h.since),
+                brief(&h.why),
+                age(h.expires_at_unix.saturating_sub(now_unix)),
             ));
         }
         SubsystemHealth {
@@ -2837,7 +2876,8 @@ mod tests {
         let r = row(&st);
         assert_eq!(r.name, SUBSYS_ROUTE_LEDGER);
         assert_eq!(r.state, HealthState::Healthy);
-        assert!(r.message.unwrap().contains("too-old"));
+        let m = r.message.unwrap();
+        assert!(m.starts_with("not used at this start: old"), "{m}");
         st.start = StartReport::Refused {
             code: "unremovable",
             detail: "EPERM".into(),
@@ -2869,14 +2909,32 @@ mod tests {
             reconciled: None,
         });
         let m = row(&st).message.unwrap();
-        assert!(
-            m.contains("seeded 1100000 IPv4 + 250000 IPv6 routes from a ledger written 4m00s ago"),
+        assert_eq!(
+            m, "seeded 1100000 IPv4 + 250000 IPv6 (ledger 4m old); 900000 not re-advertised yet",
             "{m}"
         );
-        assert!(m.contains("900000 seeded advertisements not yet"), "{m}");
         st.seed.as_mut().unwrap().reconciled = Some((now, 12));
         let m = row(&st).message.unwrap();
-        assert!(m.contains("GC removed 12"), "{m}");
+        assert_eq!(
+            m,
+            "seeded 1100000 IPv4 + 250000 IPv6 (ledger 4m old); GC removed 12"
+        );
+
+        // The forms external automation keys on.
+        let seed = st.seed.as_mut().unwrap();
+        seed.reconciled = None;
+        seed.applied_at = None;
+        let m = row(&st).message.unwrap();
+        assert!(m.starts_with("seeded 1100000 IPv4 + 250000 IPv6"), "{m}");
+        assert!(m.contains("; applying"), "{m}");
+        st.seed.as_mut().unwrap().applied_at = Some(now);
+        st.seed.as_mut().unwrap().reconciled = Some((now, 12));
+        st.start = StartReport::Off;
+        assert!(row(&st)
+            .message
+            .unwrap()
+            .starts_with("not used at this start"));
+        st.start = StartReport::Seeded;
 
         let mut out = String::new();
         st.render_metrics(&mut out);
@@ -2910,12 +2968,11 @@ mod tests {
         let r = st.subsystem_health(NOW, now);
         assert_eq!(r.state, HealthState::Healthy);
         let m = r.message.unwrap();
-        assert!(m.starts_with("off (`route-ledger off`)"), "{m}");
-        assert!(
-            m.contains("reconnected and sent End-of-RIB 1m30s ago")
-                && m.contains("End-of-RIB for ipv4")
-                && m.contains("in 10m00s at most (max-age)"),
-            "{m}"
+        assert_eq!(
+            m,
+            "not used at this start (route-ledger off); GC of the earlier session's routes \
+             held 1m (upstream 192.0.2.1 is Established but has not sent End-of-RIB for ipv4), \
+             runs in 10m at most"
         );
 
         st.start = StartReport::Seeded;
@@ -2936,9 +2993,9 @@ mod tests {
         st.gc_held = Some(held(HeldOver::Seed));
         let m = st.subsystem_health(NOW, now).message.unwrap();
         assert!(
-            m.contains("sent End-of-RIB 1m30s ago with 7 seeded advertisements")
-                && m.contains("in 10m00s at most (max-age)")
-                && !m.contains("reconnected"),
+            m.contains("; GC of 7 unconfirmed held 1m (upstream 192.0.2.1")
+                && m.contains("runs in 10m at most")
+                && !m.contains("earlier session"),
             "{m}"
         );
     }

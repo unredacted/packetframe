@@ -455,6 +455,20 @@ impl ExitCause {
     }
 }
 
+impl ExitCause {
+    /// The cause as the `neigh-resolver` row states it.
+    pub fn brief(&self) -> String {
+        match self {
+            Self::Failed(e) => format!("error: {e}"),
+            Self::Stalled { silent } => format!(
+                "made no progress for {}",
+                crate::health_text::age(silent.as_secs())
+            ),
+            Self::Returned => "returned unasked".into(),
+        }
+    }
+}
+
 impl std::fmt::Display for ExitCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -595,27 +609,27 @@ impl ResolverStatus {
     /// is absent — a whitelist, so a state nobody anticipated reads
     /// Degraded rather than fine.
     pub fn subsystem_health(&self, now: Instant) -> SubsystemHealth {
+        use crate::health_text::age;
         let mut problems: Vec<(HealthState, String)> = Vec::new();
-        let ago = |t: Instant| human_secs(now.saturating_duration_since(t).as_secs());
+        let ago = |t: Instant| age(now.saturating_duration_since(t).as_secs());
         match &self.phase {
             Phase::Running => {}
             Phase::Starting => problems.push((
                 HealthState::Degraded,
-                "starting: subscribing and reading the kernel's links and neighbours".into(),
+                "starting: reading the kernel's links and neighbours".into(),
             )),
             Phase::Restarting { until } => {
                 let cause = self
                     .last_restart
                     .as_ref()
-                    .map_or_else(|| "ended".to_string(), |r| r.cause.to_string());
+                    .map_or_else(|| "ended".to_string(), |r| r.cause.brief());
                 problems.push((
                     HealthState::Unhealthy,
                     format!(
-                        "NOT RUNNING: the resolver {cause}; restart #{} in {} — until then no \
-                         nexthop is resolved or re-resolved and their traffic takes the kernel \
-                         path",
+                        "NOT RUNNING ({cause}); restart #{} in {}; nexthops do not resolve \
+                         until then",
                         self.counters.restarts,
-                        human_secs(until.saturating_duration_since(now).as_secs())
+                        age(until.saturating_duration_since(now).as_secs())
                     ),
                 ));
             }
@@ -626,11 +640,8 @@ impl ResolverStatus {
                 problems.push((
                     HealthState::Unhealthy,
                     format!(
-                        "no progress for {} — neighbour events and resolve requests are not \
-                         being served, so nexthops cannot resolve; the supervisor restarts a \
-                         loop stuck for {}",
-                        human_secs(silent.as_secs()),
-                        human_secs(self.stall_after.as_secs())
+                        "no progress for {}; nexthops cannot resolve",
+                        age(silent.as_secs())
                     ),
                 ));
             }
@@ -640,9 +651,7 @@ impl ResolverStatus {
                 problems.push((
                     HealthState::Degraded,
                     format!(
-                        "waiting {} for the FibProgrammer to accept its events — neighbour \
-                         changes are queued behind it; this is the programmer's backlog, and \
-                         restarting the resolver cannot clear it",
+                        "waiting {} on the FibProgrammer; neighbour changes queued behind it",
                         ago(since)
                     ),
                 ));
@@ -655,11 +664,10 @@ impl ResolverStatus {
                 problems.push((
                     HealthState::Degraded,
                     format!(
-                        "restarted {} ago (restart #{}): the previous loop {} after running {}",
+                        "restarted {} ago (restart #{}): {}",
                         ago(r.at),
                         self.counters.restarts,
-                        r.cause,
-                        human_secs(r.ran_for.as_secs())
+                        r.cause.brief()
                     ),
                 ));
             }
@@ -667,25 +675,18 @@ impl ResolverStatus {
         if let Some(owed) = self.resync_owed {
             let lost = match owed.cause {
                 OwedCause::Overrun => format!(
-                    "neighbour/link notifications were lost {} ago (socket overrun)",
+                    "notifications lost to a socket overrun {} ago",
                     ago(owed.since)
                 ),
-                OwedCause::ReadIncomplete => format!(
-                    "a read of the kernel's links and neighbours did not complete {} ago",
-                    ago(owed.since)
-                ),
+                OwedCause::ReadIncomplete => {
+                    format!("kernel read did not complete {} ago", ago(owed.since))
+                }
             };
             let state = match &self.last_resync_error {
-                Some(e) => format!("the resync failed ({e}) and is retried"),
-                None => "a resync is pending".into(),
+                Some(e) => format!("resync failing, retrying: {e}"),
+                None => "resync pending".into(),
             };
-            problems.push((
-                HealthState::Degraded,
-                format!(
-                    "{lost}; {state} — until it completes, a neighbour that changed meanwhile \
-                     is unknown here"
-                ),
-            ));
+            problems.push((HealthState::Degraded, format!("{lost}; {state}")));
         }
         // A retired socket normally exits at once (its task is idle in a
         // read); one still there after a request's bound is blocked in
@@ -697,41 +698,34 @@ impl ResolverStatus {
             problems.push((
                 HealthState::Degraded,
                 format!(
-                    "the request socket was retired {} ago and the kernel still holds it \
-                     (typically `rtnl_lock`); proactive probes are skipped until it lets go",
+                    "request socket stuck in the kernel for {} (rtnl_lock?); probes skipped",
                     ago(since)
                 ),
             ));
         }
 
-        let c = &self.counters;
-        let last_resync = self
-            .last_resync
-            .map(|t| format!(", last {} ago", ago(t)))
-            .unwrap_or_default();
-        let counters = format!(
-            "overruns {} (resyncs {}{last_resync}, failed {}), request timeouts {}, probes \
-             skipped {}, restarts {}",
-            c.overruns,
-            c.resyncs,
-            c.resync_failures,
-            c.request_timeouts,
-            c.probes_skipped,
-            c.restarts
-        );
         let state = problems
             .iter()
             .fold(HealthState::Healthy, |acc, (s, _)| acc.worse_of(*s));
         let message = if problems.is_empty() {
-            format!(
-                "running (incarnation {}); last progress {} ago; {counters}",
-                self.incarnation,
-                ago(self.last_progress)
-            )
+            let c = &self.counters;
+            let mut m = format!(
+                "{} overruns, {} timeouts, {} restarts",
+                c.overruns, c.request_timeouts, c.restarts
+            );
+            if c.resync_failures > 0 {
+                m.push_str(&format!(", {} failed resyncs", c.resync_failures));
+            }
+            if c.probes_skipped > 0 {
+                m.push_str(&format!(", {} probes skipped", c.probes_skipped));
+            }
+            m
         } else {
-            let mut m: Vec<String> = problems.into_iter().map(|(_, m)| m).collect();
-            m.push(counters);
-            m.join("; ")
+            problems
+                .into_iter()
+                .map(|(_, m)| m)
+                .collect::<Vec<_>>()
+                .join("; ")
         };
         SubsystemHealth {
             name: SUBSYS_NEIGH_RESOLVER.to_string(),
@@ -1194,6 +1188,10 @@ mod tests {
         let h = s.subsystem_health(now + Duration::from_secs(9));
         assert_eq!(h.state, HealthState::Healthy, "{:?}", h.message);
         assert_eq!(h.name, SUBSYS_NEIGH_RESOLVER);
+        assert_eq!(
+            h.message.as_deref(),
+            Some("0 overruns, 0 timeouts, 0 restarts")
+        );
         assert_eq!(h.last_success_age_seconds, Some(9));
     }
 
@@ -1263,9 +1261,11 @@ mod tests {
         let h = s.subsystem_health(now);
         assert_eq!(h.state, HealthState::Unhealthy);
         let m = h.message.unwrap();
-        assert!(m.contains("NOT RUNNING"), "{m}");
-        assert!(m.contains("netlink multicast stream closed"), "{m}");
-        assert!(m.contains("restart #3 in 4s"), "{m}");
+        assert_eq!(
+            m,
+            "NOT RUNNING (error: netlink multicast stream closed); restart #3 in 4s; nexthops \
+             do not resolve until then"
+        );
     }
 
     #[test]
@@ -1280,9 +1280,10 @@ mod tests {
         let h = s.subsystem_health(now + Duration::from_secs(2));
         assert_eq!(h.state, HealthState::Degraded);
         let m = h.message.unwrap();
-        assert!(m.contains("socket overrun"), "{m}");
-        assert!(m.contains("resync is pending"), "{m}");
-        assert!(m.contains("overruns 4"), "{m}");
+        assert_eq!(
+            m,
+            "notifications lost to a socket overrun 2s ago; resync pending"
+        );
 
         s.resync_owed = None;
         s.counters.resyncs = 1;
@@ -1293,7 +1294,7 @@ mod tests {
             "a resynced overrun is history, still in the counters: {:?}",
             h.message
         );
-        assert!(h.message.unwrap().contains("overruns 4 (resyncs 1"));
+        assert_eq!(h.message.unwrap(), "4 overruns, 0 timeouts, 0 restarts");
     }
 
     /// A debt names its own cause. An overrun answered days ago must not

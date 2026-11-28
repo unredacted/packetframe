@@ -776,9 +776,7 @@ applied, the sample's age, and any error:
 
 ```
   fast-path: healthy
-    fib-integrity  healthy — bird 1272306 prefixes, mirror 1272281 — drift 0.002%,
-                   within the 1.000% warn threshold. A steering gate reads this same
-                   comparison and would permit a steer ... (last ok 41s ago)
+    fib-integrity  healthy — bird 1272306, mirror 1272281, drift 0.002% (3m ago)
 ```
 
 Two facts, and they are not interchangeable. The drift against the
@@ -791,8 +789,8 @@ legitimately differ. For a rollout, the second one is the one that
 matters.
 
 The row is present whenever a checker is running, **including before
-its first comparison completes** — "no comparison has completed yet"
-and "compared, and they agree" are deliberately different lines,
+its first comparison completes** — "no comparison yet" and
+"compared, and they agree" are deliberately different lines,
 because a rollout is gated on the difference (see
 `docs/runbooks/vpp-offload.md`). No row at all means no checker: either
 `kernel-fib` mode or a control plane with no `route-source`.
@@ -1335,14 +1333,14 @@ in force:
 
 | Row | Meaning | What to do |
 |---|---|---|
-| healthy, `N rules in place; keep at K, goto G -> T past main at M` | Every rule is in place | Nothing |
-| degraded, `no unconditional lookup main rule found` | Nothing to skip past; nothing was written, existing rules left as they were | `ip rule show`; the platform may be mid-provisioning. It retries every pass |
-| degraded, `priorities ... below main are taken` | Fewer than two free priorities within 100 of `main`; nothing written or changed | `ip rule show` to see what fills the band |
-| degraded, `a second unconditional lookup main at S follows the one at F` | Skipping the first `main` would only reach the second; nothing written or changed | Usually a provisioning pass caught half-way; if it persists, find which one the platform meant to keep |
-| degraded, `repair failing: X of Y rules in place; ...` | A dump or write failed. Writes stop at the first failed stage (anchor, then keep, then goto), and nothing old is removed until every new rule is in, so a partial pass never leaves a goto without its keep rules | The error names the rule and the netlink error; it retries every pass |
-| degraded, `repair failing: ...; no netlink reply within 30s; abandoned where it stood` | The kernel never answered a request in the pass (a reply it could not allocate is never sent). Without the bound the pass would wait forever, stopping every later pass and every reload's. Writes go out in stage order, so a pass cut short leaves a safe prefix of them | It retries every pass; a run of these means the box is starved of memory or RTNL |
-| degraded, `repair failing: an unknown number of Y rules in place; ...` | The pass never saw the rules (the dump failed or went unanswered), so how many are in place is not known; the `present` gauge is absent until a pass sees them | As above |
-| degraded, `removed from the config, but its rules could not all be removed` | A reload dropped the directive and the removal did not finish | It retries every pass and on the next reload; `packetframe detach` also removes them |
+| healthy, `N rules past main at M` | Every rule is in place | Nothing |
+| degraded, `no unconditional lookup main rule; nothing installed` | Nothing to skip past; nothing was written, existing rules left as they were | `ip rule show`; the platform may be mid-provisioning. It retries every pass |
+| degraded, `priorities ... below main (M) all taken` | Fewer than two free priorities within 100 of `main`; nothing written or changed | `ip rule show` to see what fills the band |
+| degraded, `second lookup main at S after F` | Skipping the first `main` would only reach the second; nothing written or changed | Usually a provisioning pass caught half-way; if it persists, find which one the platform meant to keep |
+| degraded, `repair failing, X/Y rules in place: ...` | A dump or write failed. Writes stop at the first failed stage (anchor, then keep, then goto), and nothing old is removed until every new rule is in, so a partial pass never leaves a goto without its keep rules | The error names the rule and the netlink error; it retries every pass |
+| degraded, `repair failing, ...: ...; no netlink reply within 30s; abandoned where it stood` | The kernel never answered a request in the pass (a reply it could not allocate is never sent). Without the bound the pass would wait forever, stopping every later pass and every reload's. Writes go out in stage order, so a pass cut short leaves a safe prefix of them | It retries every pass; a run of these means the box is starved of memory or RTNL |
+| degraded, `repair failing, ?/Y rules in place: ...` | The pass never saw the rules (the dump failed or went unanswered), so how many are in place is not known; the `present` gauge is absent until a pass sees them | As above |
+| degraded, `removed from the config; rule removal failing, retrying: ...` | A reload dropped the directive and the removal did not finish | It retries every pass and on the next reload; `packetframe detach` also removes them |
 
 **udapi-server will not start and logs `neither table nor goto is
 defined for routing rule`.** List the rules it objects to with
@@ -1527,11 +1525,11 @@ forwards at once.
 
 **What status shows.** The `dry-run` row, present for `on` and
 `until-seeded`:
-- `until-seeded: holding for Ns, every packet passes to the kernel;
-  waiting for …`, naming the seed still applying, routes owed a repair,
-  the completeness authority's attestation, or (with no authority) the
-  route source's first End-of-RIB;
-- `until-seeded: released at <UTC> (<trigger>) after Ns; forwarding`.
+- `until-seeded: holding <age>, waiting for …`, naming the seed still
+  applying, routes owed a repair, the completeness authority's
+  attestation, or (with no authority) the route source's first
+  End-of-RIB;
+- `until-seeded: released <UTC> by <trigger> after <age>`.
 
 Both are Healthy: a hold is designed. A hold that outlives the route
 source's load is the route source's problem, and the `route-ledger` and
@@ -1675,12 +1673,10 @@ InitiationComplete fired   trigger="end-of-rib" gc_hold="upstreams-loaded"
 Events `feed_gc_held` (`over`: `seed` or `earlier-session`;
 `unconfirmed` for a seed; `detail`: why) and `feed_gc_released` (`over`,
 `trigger`, `held_secs`). The `route-ledger` status row says so: over a
-seed, `the route source sent End-of-RIB … ago with N seeded
-advertisements not re-advertised, and the GC that would remove them is
-held: <why>`; after a reconnect, `the route source reconnected and sent
-End-of-RIB … ago, and the GC that would remove what the earlier session
-sent and this one has not is held: <why>`. Both end `It runs once the
-authority reads every upstream loaded, or in … at most (max-age)`.
+seed, `GC of N unconfirmed held <age> (<why>), runs in <age> at most`;
+after a reconnect, `GC of the earlier session's routes held <age>
+(<why>), runs in <age> at most`. The GC runs once the authority reads
+every upstream loaded, or at `max-age`, whichever is first.
 
 **What it costs.** For as long as the GC waits, an earlier route FRR no
 longer has goes on forwarding where it did: in the eBPF tier and in a
@@ -1764,11 +1760,11 @@ GC](#the-gc-over-earlier-routes-waits-for-frrs-upstreams) between the last
 two when FRR's End-of-RIB came early).
 
 `packetframe status` carries a `route-ledger` row whenever the
-PacketFrame FIB control plane runs: `seeded … from a ledger written … ago`
-and then `waiting for the route source's first route`, `the route
-source is replaying: N seeded advertisements not yet re-advertised` (or
-`the route source sent End-of-RIB … and the GC … is held`), and
-`reconciled … ago`; or `not used at this start (<reason>)`; or `off`.
+PacketFrame FIB control plane runs: `seeded N IPv4 + M IPv6 (ledger …
+old)` followed by `; applying`, then `; waiting for the route source's
+first route`, `; N not re-advertised yet` (or `; GC of N unconfirmed
+held …`), and `; GC removed N`; or `not used at this start: <reason>`
+(`not used at this start (route-ledger off)` with `route-ledger off`).
 Textfile gauges:
 
 ```
@@ -2352,7 +2348,7 @@ used only when every probe had that outcome:
 | `pending` | Kicked, but the kernel reported neither an answer nor a failure | Notifications lost: the resolver's `overruns` and resyncs |
 | `ix-mode` | Every probe found the egress `ix-mode`, so it is not solicited; the snooper seeds it | The snooper (neigh-snoop runbook) and the peer's traffic on the fabric |
 | `no-route` | Every probe found no route to it | `ip route get <nexthop>`: the connected route goes with its interface |
-| `probes-skipped` | No request socket: one was stuck on `rtnl_lock` and retired | The `neigh-resolver` row in `packetframe status` ("the request socket was retired … ago"); `request_timeouts` and `probes_skipped` in the resolver's stats line |
+| `probes-skipped` | No request socket: one was stuck on `rtnl_lock` and retired | The `neigh-resolver` row in `packetframe status` ("request socket stuck in the kernel for …"); `request_timeouts` and `probes_skipped` in the resolver's stats line |
 | `probes-timed-out` | Every request hit its timeout | Same: `rtnl_lock` held, or replies dropped |
 | `requests-failed` | The kernel refused every kick | The journal at debug for the error |
 | `not-solicited` | No probe solicited it, for more than one of the reasons above; `detail` lists them (`3 skipped, 1 timed out`) | Each one listed |
@@ -2454,19 +2450,20 @@ loop waited for it forever, and nothing noticed. The daemon now:
   storm.
 
 **Read the `neigh-resolver` row in `packetframe status`.** It is present
-whenever the PacketFrame FIB control plane runs, and its `last ok` age is
-the loop's progress age; an idle loop still makes progress every second.
+whenever the PacketFrame FIB control plane runs, and its age (shown
+once it passes a minute) is the loop's progress age; an idle loop still
+makes progress every second.
 
 | Row reads | Meaning |
 |---|---|
-| healthy, `running (incarnation N); last progress Ns ago; overruns …` | Working. Non-zero overruns with an equal number of resyncs are history. |
+| healthy, `N overruns, N timeouts, N restarts` | Working. Overruns on a healthy row have all been answered by a resync; they are history. |
 | **unhealthy**, `no progress for …` | The loop is stuck right now. The supervisor restarts it after 30 s. During a long kernel `rtnl_lock` hold the whole control-plane runtime can stall, and this reads unhealthy until the lock is released, without a restart. |
-| **unhealthy**, `NOT RUNNING: the resolver <cause>; restart #N in …` | Between a failure and its restart. The cause names the error or the stall. |
-| degraded, `restarted … ago (restart #N): the previous loop …` | Recovered by a restart in the last 10 minutes. The text says why the old loop was replaced. |
-| degraded, `… notifications were lost … ago (socket overrun); a resync is pending` (or `the resync failed (…) and is retried`) | An overrun is not yet answered. A failed resync is retried every 5 s. |
-| degraded, `a read of the kernel's links and neighbours did not complete … ago; the resync failed (…)` | A read failed, for example a dump timed out or an entry missing from a dump could not be confirmed gone. It is retried every 5 s, and the error says what failed. |
-| degraded, `waiting … for the FibProgrammer to accept its events` | The **programmer** is not draining, for example during a route-ledger seed or a full-table load. Restarting the resolver cannot help, so it is not restarted. If this lasts, the programmer is the problem. |
-| degraded, `the request socket was retired … ago and the kernel still holds it` | A request timed out and its socket is blocked in the kernel, typically on `rtnl_lock`. Proactive probes are skipped until it is released, and the programmer re-probes later. |
+| **unhealthy**, `NOT RUNNING (<cause>); restart #N in …` | Between a failure and its restart. The cause names the error or the stall. |
+| degraded, `restarted … ago (restart #N): <cause>` | Recovered by a restart in the last 10 minutes. The text says why the old loop was replaced. |
+| degraded, `notifications lost to a socket overrun … ago; resync pending` (or `resync failing, retrying: …`) | An overrun is not yet answered. A failed resync is retried every 5 s. |
+| degraded, `kernel read did not complete … ago; resync failing, retrying: …` | A read failed, for example a dump timed out or an entry missing from a dump could not be confirmed gone. It is retried every 5 s, and the error says what failed. |
+| degraded, `waiting … on the FibProgrammer; neighbour changes queued behind it` | The **programmer** is not draining, for example during a route-ledger seed or a full-table load. Restarting the resolver cannot help, so it is not restarted. If this lasts, the programmer is the problem. |
+| degraded, `request socket stuck in the kernel for … (rtnl_lock?); probes skipped` | A request timed out and its socket is blocked in the kernel, typically on `rtnl_lock`. Proactive probes are skipped until it is released, and the programmer re-probes later. |
 
 The same numbers, as textfile metrics:
 
@@ -2549,24 +2546,23 @@ a reused ifindex).
 
 Check:
 
-- `packetframe status`, the fast-path `redirect-watch` row: healthy
-  `following the link table` is the normal state (with a count of
-  overruns, if any, each made good by a re-read). Degraded `link
+- `packetframe status`, the fast-path `redirect-watch` row: a bare
+  `healthy` is the normal state (`N overruns, all re-read` if
+  notifications were ever lost). Degraded `link
   notifications lost (N overruns)` means the maps are not known to be
   current yet: the re-read runs a quarter second after the burst of link
   events settles, and the recovery is done once its links have been read
-  and offered to the maps. Until then `not recovered yet (retrying)` says
+  and offered to the maps. Until then `re-read failing, retrying: …` says
   why (the dump failed, or the link topology could not be read to apply
   it); a failed dump is retried every 5 s. Links that qualify but are not
   in the maps are a separate fact, shown whatever the overrun history,
   in two forms:
-  - Degraded `N qualifying links are not in the redirect maps: the maps
-    are full`: an insert was refused with `E2BIG`. The maps hold 64 links
+  - Degraded `N links not in the redirect maps (maps full, 64 each)`: an insert was refused with `E2BIG`. The maps hold 64 links
     each. Each such link is warned about once (`redirect target refused:
     the maps are full`) and offered again as soon as an eviction makes
     room — a link deleted, or a reload — not on a timer.
-  - Degraded `N qualifying links could not be inserted into the redirect
-    maps (<error>)`: any other failure, such as a transient `ENOMEM`
+  - Degraded `N links could not be inserted into the redirect maps
+    (<error>); retrying`: any other failure, such as a transient `ENOMEM`
     from the devmap's atomic allocation. It is retried every 5 s and
     warned when first seen or when its errno changes
     (`redirect target insert failed`).

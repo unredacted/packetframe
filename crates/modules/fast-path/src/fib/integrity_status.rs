@@ -320,42 +320,27 @@ impl IntegrityPosture {
     /// The row `packetframe status` prints.
     pub fn subsystem_health(&self) -> SubsystemHealth {
         let (state, message) = match self {
+            // Healthy: a stated deployment fact, not a fault. The box's
+            // routes come from a source elsewhere, so nothing local can
+            // attest the mirror; the runbook says what that means for a
+            // second tier.
             Self::NoAuthority => (
-                // Healthy: this is a stated deployment fact, not a
-                // fault. The box's routes come from a source elsewhere,
-                // so nothing local can attest the mirror — and the
-                // checker correctly does not compare against a RIB that
-                // is not the feed.
                 HealthState::Healthy,
-                "no integrity authority on this box (`integrity-authority none`): its routes \
-                 are fed from a source elsewhere, so a local authority would compare the \
-                 mirror against the wrong RIB. No comparison is run and completeness is not \
-                 attested here — a second-tier steering gate treats the mirror as \
-                 unattested, which is why `require-table-complete on` is refused with this \
-                 setting"
-                    .to_string(),
+                "no authority configured; completeness not checked".to_string(),
             ),
+            // Healthy: forwarding does not depend on this, and a box that
+            // has not reached its first interval is not impaired. It must
+            // still never read like agreement.
             Self::AwaitingFirstCheck => (
-                // Healthy: forwarding does not depend on this. The
-                // checker is a diagnostic safety net, and a box that has
-                // simply not reached its first interval is not impaired.
-                // The message carries the whole content of this state.
                 HealthState::Healthy,
                 format!(
-                    "no comparison has completed yet — the first lands one interval ({}s by \
-                     default) after the control plane starts. This is NOT agreement: nothing \
-                     has yet compared the authority's RIB against the mirror, and a \
-                     second-tier \
-                     steering gate that consults it holds until something does",
+                    "no comparison yet; the first is due within {}s",
                     DEFAULT_INTERVAL.as_secs()
                 ),
             ),
             Self::Unread => (
                 HealthState::Degraded,
-                "the integrity snapshot was being written at the moment this was sampled, so \
-                 the last comparison could not be read. Self-clearing: the next health poll \
-                 (5 s) carries it. Nothing about the comparison itself is implied either way"
-                    .to_string(),
+                "snapshot busy while sampled; clears at the next poll".to_string(),
             ),
             Self::Checked {
                 run_age,
@@ -400,88 +385,58 @@ impl IntegrityPosture {
         authority: Option<&'static str>,
         revoked: Option<&packetframe_common::fib::Revocation>,
     ) -> (HealthState, String) {
+        use crate::health_text::{age, brief};
         let mut state = HealthState::Healthy;
         let mut clauses: Vec<String> = Vec::new();
 
-        // FIRST, and its own clause, because it overrides the verdict
-        // below rather than qualifying it: the counts can agree
-        // perfectly while the mirror is ineligible, and a row that led
-        // with "converged" would describe an authority that is refusing
-        // every steer. Degraded rather than Healthy for the same reason.
+        // FIRST, because it overrides the verdict below rather than
+        // qualifying it: the counts can agree perfectly while the mirror
+        // is ineligible, and a row that led with them would describe an
+        // authority that is refusing every steer.
         if let Some(r) = revoked {
             state = state.worse_of(HealthState::Degraded);
             clauses.push(format!(
-                "the authority has DISQUALIFIED this mirror regardless of the counts: {}. \
-                 A steering gate that consults this authority would refuse while this holds, \
-                 and it clears only on a check that comes back clean AND whose counts agree \
-                 — waiting alone will not do it",
-                r.describe()
+                "DISQUALIFIED: {}; a steer would be refused until a clean check agrees",
+                brief(r.describe())
             ));
         }
 
         match sample {
             Some(s) => {
+                // A retained comparison is history: said before the
+                // numbers, so they are never read as current.
                 let (verdict_state, verdict) = Self::verdict(s, authority, revoked);
                 state = state.worse_of(verdict_state);
-                clauses.push(verdict);
+                clauses.push(if s.current {
+                    verdict
+                } else {
+                    format!("previous comparison: {verdict}")
+                });
             }
             None => {
-                // A run finished and produced nothing to compare. With an
-                // error alongside it this is the ordinary "birdc is
-                // unreachable" case; the clause below says what that
-                // costs rather than restating the error.
                 state = state.worse_of(HealthState::Degraded);
-                clauses.push(format!(
-                    "no comparison has ever completed ({:.0}s since the last attempt), so \
-                     there is no verdict to read — this is NOT agreement",
-                    run_age.as_secs_f64()
-                ));
+                clauses.push("no comparison has completed".to_string());
             }
         }
 
         if let Some(e) = error {
             state = state.worse_of(HealthState::Degraded);
-            // Whether the numbers above survive this is the whole
-            // question, and the answer is not the same in the two cases:
-            // a run that failed outright left the previous comparison
-            // standing as history, while a run that compared fine and
-            // then failed on `birdc show protocols` leaves the comparison
-            // current. Presenting a retained sample as though the check
-            // had just confirmed it is the failure this surface exists to
-            // avoid.
+            // Whether the numbers above are current is the question: a
+            // run that compared fine and then failed leaves them current;
+            // a run that failed outright leaves the previous ones.
             clauses.push(match sample {
-                Some(s) if s.current => format!(
-                    "the same run reported an error: {e} — the comparison above is from this \
-                     run and stands"
-                ),
-                Some(_) => format!(
-                    "the most recent check ({:.0}s ago) could not complete: {e} — so the \
-                     comparison above is HISTORY, not the current state, and it ages until a \
-                     check succeeds. Forwarding is unaffected; what is degraded is the \
-                     ability to attest completeness at all, which a second-tier steering gate \
-                     will refuse on",
-                    run_age.as_secs_f64()
-                ),
-                None => format!(
-                    "the most recent check ({:.0}s ago) could not complete: {e}. Forwarding is \
-                     unaffected; what is degraded is the ability to attest completeness at \
-                     all, which a second-tier steering gate will refuse on",
-                    run_age.as_secs_f64()
-                ),
+                Some(s) if s.current => format!("same run also failed: {e}"),
+                _ => format!("last check ({} ago) failed: {e}", age(run_age.as_secs())),
             });
         } else if sample.is_none() {
             // Unreachable from the checker, which records an error on
             // every path that produces no comparison. Stated rather than
             // asserted: a surface that panics is worse than one that says
             // it does not understand what it read.
-            clauses.push(
-                "the run recorded neither a comparison nor a reason, which the checker has no \
-                 path to produce — read this as a malformed snapshot rather than as a verdict"
-                    .to_string(),
-            );
+            clauses.push("and no error recorded (malformed snapshot)".to_string());
         }
 
-        (state, clauses.join(". "))
+        (state, clauses.join("; "))
     }
 
     /// The comparison itself, without regard to what else the run did.
@@ -506,74 +461,61 @@ impl IntegrityPosture {
         authority: Option<&'static str>,
         revoked: Option<&packetframe_common::fib::Revocation>,
     ) -> (HealthState, String) {
+        use packetframe_common::fib::Completeness;
         let mut state = HealthState::Healthy;
-        let counts = format!(
-            "{} {} prefixes, mirror {}",
-            authority.unwrap_or("the authority"),
+        let mut m = format!(
+            "{} {}, mirror {}",
+            authority.unwrap_or("authority"),
             s.authority_prefixes,
             s.packetframe_prefixes
         );
 
         let gate = s.gate_verdict(revoked);
 
-        // The drift PERCENTAGE is only worth printing when it is a
-        // drift. When the authority is at fault — the mirror holds far
-        // more than the authority claims, or the authority claims zero —
-        // `|bird - mirror| / bird` is the 6.8-million-percent figure the
-        // domain code explicitly decided not to print (see
-        // `Completeness::AuthorityMismatch`), and leading with it buries
-        // the real explanation under noise. In that case the diagnostic
-        // states the mismatch and leaves the number to the gate verdict.
-        let diagnostic = if gate.authority_is_at_fault() {
+        // The drift percentage only when it is a drift. When the
+        // authority is at fault (it holds far fewer than the mirror, or
+        // none) `|bird - mirror| / bird` is the 6.8-million-percent
+        // figure the domain code decided not to print; the refusal below
+        // names the mismatch instead.
+        if gate.authority_is_at_fault() {
             state = state.worse_of(HealthState::Degraded);
-            "the mirror holds far more than the authority reports (or the authority reports \
-             none) — this is a mismatch, not a drift, so no percentage is meaningful"
-                .to_string()
-        } else {
-            match s.drift {
-                Some(d) => {
-                    if d.above {
-                        state = state.worse_of(HealthState::Degraded);
-                    }
-                    format!(
-                        "drift {:.3}%, {} the {:.3}% warn threshold",
-                        d.fraction * 100.0,
-                        if d.above { "at or above" } else { "within" },
-                        d.threshold * 100.0
-                    )
-                }
-                None => "no drift fraction is defined: the authority reports NO prefixes \
-                         in the families it was asked about, and a fraction of zero says \
-                         nothing"
-                    .to_string(),
+        } else if let Some(d) = s.drift {
+            m.push_str(&format!(", drift {:.3}%", d.fraction * 100.0));
+            if d.above {
+                state = state.worse_of(HealthState::Degraded);
+                m.push_str(&format!(" (warn at {:.3}%)", d.threshold * 100.0));
             }
-        };
+        }
 
-        // SUBJUNCTIVE, deliberately. This row predicts what a steer
-        // WOULD do from this comparison; it is not a refusal that has
-        // happened. "would permit" / "would refuse" is accurate whether
-        // or not a gate is even consulting the comparison on this box —
-        // and on a `require-table-complete off` box none is — where
-        // "REFUSES" reads as an action that never occurred. Same
-        // discipline that separated "the record is stale" from "the
-        // daemon is gone".
-        let rollout = if gate.permits_steering() {
-            "a second-tier steering gate reads this same comparison and would permit a steer \
-             — this is the positive evidence a rollout needs, and the counts behind it are \
-             the authority's own table against the route mirror"
-                .to_string()
+        // SUBJUNCTIVE: this predicts what a steer WOULD do from this
+        // comparison, whether or not a gate consults it on this box. A
+        // revocation already said so above.
+        if gate.permits_steering() {
+            if state != HealthState::Healthy {
+                m.push_str("; a steer would still be permitted");
+            }
         } else {
             state = state.worse_of(HealthState::Degraded);
-            // `describe()` is the refusal an operator would see from the
-            // steer itself, verbatim — including the staleness case,
-            // which `assess` checks before it will look at drift at all.
-            format!(
-                "a second-tier steering gate reads this same comparison and would refuse: {}",
-                gate.describe()
-            )
-        };
-
-        (state, format!("{counts} — {diagnostic}. {rollout}"))
+            let why = match &gate {
+                Completeness::Ineligible(_) => None,
+                Completeness::Incomplete { drift, .. } => Some(format!(
+                    "mirror {:.2}% short, probably still loading",
+                    drift * 100.0
+                )),
+                Completeness::AuthorityMismatch { .. } => Some(
+                    "the authority is not this mirror's feed; check `integrity-authority`, or \
+                     set `require-table-complete off` and restart"
+                        .to_string(),
+                ),
+                Completeness::Stale { .. } => Some("the comparison is too old".to_string()),
+                Completeness::Unknown { why } => Some((*why).to_string()),
+                Completeness::Converged { .. } => None,
+            };
+            if let Some(why) = why {
+                m.push_str(&format!("; a steer would be refused: {why}"));
+            }
+        }
+        (state, m)
     }
 }
 
@@ -641,15 +583,14 @@ mod tests {
         assert_ne!(waiting.message, agreeing.message);
 
         let waiting_msg = waiting.message.unwrap();
-        assert!(waiting_msg.contains("NOT agreement"), "{waiting_msg}");
+        assert!(waiting_msg.contains("no comparison yet"), "{waiting_msg}");
         assert!(waiting_msg.contains("300s"), "{waiting_msg}");
         // The freshness field is the other half of the distinction.
         assert_eq!(waiting.last_success_age_seconds, None);
         assert_eq!(agreeing.last_success_age_seconds, Some(30));
 
         let agreeing_msg = agreeing.message.unwrap();
-        assert!(agreeing_msg.contains("bird 1272306 prefixes, mirror 1272281"));
-        assert!(agreeing_msg.contains("within the 1.000% warn threshold"));
+        assert_eq!(agreeing_msg, "bird 1272306, mirror 1272281, drift 0.002%");
     }
 
     #[test]
@@ -662,8 +603,7 @@ mod tests {
         .subsystem_health();
         assert_eq!(h.state, HealthState::Degraded);
         let m = h.message.unwrap();
-        assert!(m.contains("drift 13.540%"), "{m}");
-        assert!(m.contains("1.000% warn threshold"), "{m}");
+        assert!(m.contains("drift 13.540% (warn at 1.000%)"), "{m}");
         // Still a completed comparison, so it still has an age.
         assert_eq!(h.last_success_age_seconds, Some(12));
     }
@@ -692,13 +632,12 @@ mod tests {
             .subsystem_health()
             .message
             .unwrap();
-        assert!(m.contains("at or above the 1.000% warn threshold"), "{m}");
+        assert!(m.contains("(warn at 1.000%)"), "{m}");
         assert!(
-            m.contains("would permit a steer"),
+            m.contains("a steer would still be permitted"),
             "claimed a refusal the gate will not make: {m}"
         );
-        assert!(!m.contains("would refuse"), "{m}");
-        assert!(m.contains("would permit a steer"), "{m}");
+        assert!(!m.contains("would be refused"), "{m}");
     }
 
     /// A tuned `drift-warn-fraction` is the range version of the same
@@ -712,8 +651,8 @@ mod tests {
         let snap = clean_run(at, 1_000_000, 970_000, drift(0.03, 0.05));
         let h = IntegrityPosture::observe(&snap, at).subsystem_health();
         let m = h.message.clone().unwrap();
-        assert!(m.contains("within the 5.000% warn threshold"), "{m}");
-        assert!(m.contains("would refuse"), "{m}");
+        assert!(m.contains("drift 3.000%") && !m.contains("warn at"), "{m}");
+        assert!(m.contains("would be refused: mirror 3.00% short"), "{m}");
         assert_eq!(
             h.state,
             HealthState::Degraded,
@@ -730,10 +669,10 @@ mod tests {
         let h = IntegrityPosture::observe(&clean_run(at, 1000, 995, drift(0.005, 0.05)), at)
             .subsystem_health();
         assert_eq!(h.state, HealthState::Healthy);
-        assert!(h
-            .message
-            .unwrap()
-            .contains("within the 5.000% warn threshold"));
+        assert!(!h.message.unwrap().contains("warn at"));
+        let h = IntegrityPosture::observe(&clean_run(at, 1000, 940, drift(0.06, 0.05)), at)
+            .subsystem_health();
+        assert!(h.message.unwrap().contains("(warn at 5.000%)"));
     }
 
     /// `integrity-authority none` is informational, not an alarm, and
@@ -747,8 +686,7 @@ mod tests {
             "declaring no authority is a config fact, not a fault"
         );
         let m = h.message.unwrap();
-        assert!(m.contains("integrity-authority none"), "{m}");
-        assert!(m.contains("unattested"), "{m}");
+        assert_eq!(m, "no authority configured; completeness not checked");
         // It must NOT print a comparison or a would-refuse verdict:
         // there is nothing to compare.
         assert!(!m.contains("would refuse"), "{m}");
@@ -769,14 +707,14 @@ mod tests {
         assert_eq!(h.state, HealthState::Degraded);
         let m = h.message.unwrap();
         assert!(
-            m.contains("mismatch, not a drift"),
+            m.contains("not this mirror's feed"),
             "a gross mismatch states itself: {m}"
         );
         assert!(
             !m.contains("6859") && !m.contains("685916"),
             "the 6.8-million-percent figure must not appear: {m}"
         );
-        assert!(m.contains("would refuse"), "{m}");
+        assert!(m.contains("would be refused"), "{m}");
     }
 
     /// The runbook's measured case: bird up, carrying 13 routes against
@@ -789,7 +727,7 @@ mod tests {
         assert_eq!(h.state, HealthState::Degraded);
         let m = h.message.unwrap();
         assert!(
-            m.contains("mismatch, not a drift"),
+            m.contains("the authority reports zero routes"),
             "a zero authority is a mismatch, not a drift figure: {m}"
         );
         assert!(
@@ -814,10 +752,10 @@ mod tests {
         .subsystem_health();
         assert_eq!(stale.state, HealthState::Degraded);
         let m = stale.message.unwrap();
-        assert!(m.contains("would refuse"), "{m}");
-        // Verbatim from `Completeness::describe()`, so the row prints
-        // the refusal the steer itself would print.
-        assert!(m.contains("too old to act on"), "{m}");
+        assert!(
+            m.contains("would be refused: the comparison is too old"),
+            "{m}"
+        );
         // Still a real completed comparison, so its age is still
         // reported — that number is the whole diagnosis here.
         assert_eq!(
@@ -885,7 +823,7 @@ mod tests {
         assert_eq!(h.state, HealthState::Degraded);
         assert_eq!(h.last_success_age_seconds, None);
         let m = h.message.unwrap();
-        assert!(m.contains("no comparison has ever completed"), "{m}");
+        assert!(m.contains("no comparison has completed"), "{m}");
         assert!(m.contains("No such file"), "{m}");
     }
 
@@ -921,7 +859,7 @@ mod tests {
         // The age is the comparison's own, not the failed run's.
         assert_eq!(h.last_success_age_seconds, Some(305));
         let m = h.message.unwrap();
-        assert!(m.contains("HISTORY"), "{m}");
+        assert!(m.starts_with("previous comparison: bird 1272306"), "{m}");
         assert!(m.contains("channel closed"), "{m}");
     }
 
@@ -945,8 +883,8 @@ mod tests {
         // An error is an error, even beside a good comparison.
         assert_eq!(h.state, HealthState::Degraded);
         let m = h.message.unwrap();
-        assert!(m.contains("is from this run and stands"), "{m}");
-        assert!(!m.contains("HISTORY"), "{m}");
+        assert!(m.contains("same run also failed"), "{m}");
+        assert!(!m.contains("previous comparison"), "{m}");
         assert!(m.contains("exit 1"), "{m}");
     }
 
@@ -956,7 +894,7 @@ mod tests {
         assert_eq!(h.state, HealthState::Degraded);
         assert_eq!(h.last_success_age_seconds, None);
         let m = h.message.unwrap();
-        assert!(m.contains("Self-clearing"), "{m}");
+        assert!(m.contains("clears at the next poll"), "{m}");
         assert_ne!(
             Some(m),
             IntegrityPosture::AwaitingFirstCheck
@@ -1023,7 +961,7 @@ mod tests {
             "the reason is still reported: {msg}"
         );
         assert!(
-            !msg.contains("would permit a steer"),
+            !msg.contains("would still be permitted"),
             "and must NOT predict a steer the gate refuses: {msg}"
         );
         assert!(
@@ -1031,7 +969,7 @@ mod tests {
             "nor invite one: {msg}"
         );
         assert!(
-            msg.contains("would refuse") || msg.contains("disqualifies"),
+            msg.contains("would be refused"),
             "the prediction has to say what the gate would actually do: {msg}"
         );
         // The counts are still shown — an operator watching the mirror
@@ -1105,7 +1043,7 @@ mod tests {
             .expect("a message");
         assert!(msg.contains("DISQUALIFIED"), "{msg}");
         assert!(
-            !msg.contains("would permit a steer"),
+            !msg.contains("would still be permitted"),
             "the row must not advertise a steer the gate refuses, whichever door it \
              arrives through: {msg}"
         );
