@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.7] - UNRELEASED
+
+### Changes
+
+**vpp-offload**
+
+- A fresh VPP's route load no longer stalls when every core outside VPP's is busy. While the core fence holds, the daemon's thread that sends VPP its routes moves onto VPP's main core once it waits longer for a CPU than VPP's main thread runs, and gets its own CPUs back when the fence is released; a `CPUAffinity=` without that core keeps it where it is. `fresh_hold_released` says whether and when it moved (`sender_core`, `sender_moved_ms`) and how much of `load_ms` waited on the route source rather than loading (`source_wait_ms`); `cores_released` adds `sender_restored`. [#PRNUM](https://github.com/unredacted/packetframe/pull/PRNUM)
+
 ## [0.6.6] - 2026-11-28
 
 A point release on 0.6.5. VPP can now clamp TCP MSS itself, per VLAN, so a trunk whose hosts need a clamp can be steered; a steer that would bypass a fast-path clamp is refused instead of silently dropping it. `packetframe status` names the connected prefixes that make flows one-way under `packetframe-fib`, and every module health row is one short line. The completeness authority works on small tables, `detach --all` finds VPP under a non-default `state-dir`, and neigh-snoop's FRR gate keeps working while mgmtd's datastore is locked. A 0.6.5 config and route ledger carry over unchanged, except in the cases listed under Upgrading.

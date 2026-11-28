@@ -5546,6 +5546,50 @@ affinity back at release if the same thread (same id and start time) is
 still running. A thread that pins itself during the load is left with the
 full set.
 
+**A starved sender moves onto VPP's main core.** The load has a second
+end: the daemon's supervision thread, which sends VPP the routes and
+reads its replies. It runs on the cores the fence leaves to the rest of
+the box, and after an upgrade those carry the eBPF tier's softirq, which
+no nice level preempts. On the reference deployment (2026-11-28) VPP's
+main thread ran 84 s of a 454 s load while the sender waited 132 s for a
+CPU. While the fence is held and VPP is `Syncing`, the daemon compares
+every 2 s the sender's wait for a CPU with VPP's main thread's CPU time.
+Once the wait is the larger (and at least 200 ms), it moves the sender
+onto VPP's main core until the fence is released, and the release gives
+it its own CPUs back (`sender_restored` on `cores_released`). Not from the
+start: on one core the two threads take turns, so a load costs the sum of
+their CPU time instead of the larger of the two, which is slower on an
+idle box. Only where the daemon's own affinity allowed the main core
+before attach took VPP's cores away; a `CPUAffinity=` without it keeps
+the sender where it is. `fresh_hold_released` says whether and when it
+moved (`sender_core`, `sender_moved_ms`), and the journal says
+`the fresh load's sender waited longer for a CPU than VPP's main thread
+ran; moved it onto VPP's main core`.
+
+Measured on the lab, a fresh VPP respawned over a full mirror:
+
+| Load on the cores outside VPP's | Before | After | Sender moved |
+|---|---|---|---|
+| none | 6.6 s | 7.1 s | no |
+| 15 busy loops at nice -15 and 15 at nice 0, fenced | 8.4 s | 8.4 s | no |
+| softirq on every one (pktgen into a veth) | 46.2 s, the sender waiting 41.0 s | 14.1 s | after 2.0 s |
+| both | 43.6 s | 14.6 s | after 2.6 s |
+
+199,235 routes; VPP's main thread ran 5.8 to 7.2 s in each. `nice -20` on
+the sender changed nothing under softirq (35.4 s against 37.1 s), and
+moving it from the start made an idle load 12.9 s. Under softirq the load
+now takes about the two threads' CPU time added together, about twice
+VPP's alone: the sender's own CPU (about 25 µs a route) is what is left
+to win.
+
+**Reading `fresh_hold_released`.** `load_ms` runs from the fresh resync's
+start to the hold's release. `source_wait_ms` is the part of it during
+which VPP already held everything the mirror did and the hold waited on
+the route source or its authority: a cold start's dump, or a seed's
+replay until the authority vouches for the mirror. The rest is the load
+itself, and there `vpp_main_cpu_ms` near it means VPP's main thread was
+the limit, and a large `sender_wait_ms` a starved sender.
+
 **Release** (`cores_released`), with `reason`:
 - `loaded`: VPP left `Syncing` with its table;
 - `vpp-down`: it went to Backoff or Stopped instead;
