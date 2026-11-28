@@ -34,7 +34,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **vpp-offload**
 
-- A fresh VPP's route load no longer stalls when every core outside VPP's is busy. While the core fence holds, the daemon's thread that sends VPP its routes moves onto VPP's main core once it waits longer for a CPU than VPP's main thread runs, and gets its own CPUs back when the fence is released; a `CPUAffinity=` without that core keeps it where it is. `fresh_hold_released` says whether and when it moved (`sender_core`, `sender_moved_ms`) and how much of `load_ms` waited on the route source rather than loading (`source_wait_ms`); `cores_released` adds `sender_restored`. [#PRNUM](https://github.com/unredacted/packetframe/pull/PRNUM)
+- A fresh VPP's route load no longer stalls when every core outside VPP's is busy. While the core fence holds, the daemon's thread that sends VPP its routes moves onto VPP's main core once it waits longer for a CPU than VPP's main thread runs, and gets its own CPUs back when the fence is released; a `CPUAffinity=` without that core keeps it where it is. `fresh_hold_released` says whether and when it moved (`sender_core`, `sender_moved_ms`) and how much of `load_ms` waited on the route source rather than loading (`source_wait_ms`); `cores_released` adds `sender_restored`. [#436](https://github.com/unredacted/packetframe/pull/436)
 
 ## [0.6.6] - 2026-11-28
 
