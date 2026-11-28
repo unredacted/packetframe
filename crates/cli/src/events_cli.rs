@@ -223,12 +223,14 @@ pub fn status_lines(
     let describe = |path: &Path, max: u64| {
         let rotated = events::rotated_path(path);
         format!(
-            "event log: {} ({} of {} per file{}); `packetframe events` reads it",
+            "event log: {} ({}{}); read with `packetframe events`",
             path.display(),
-            size(path).map_or_else(|| "not yet written".to_string(), human_bytes),
-            human_bytes(max),
+            size(path).map_or_else(
+                || format!("not written yet, max {}", human_bytes(max)),
+                |n| format!("{} of {}", human_bytes(n), human_bytes(max))
+            ),
             if size(&rotated).is_some() {
-                ", plus the rotated .1"
+                ", plus .1"
             } else {
                 ""
             }
@@ -240,17 +242,17 @@ pub fn status_lines(
             None => "event log: off (`event-log off`)".to_string(),
         }];
     };
-    let mut lines = vec![
-        describe(&st.path, st.max_bytes),
-        format!(
-            "  daemon writer: {} written, {} dropped (queue full), {} lost (write failed)",
-            st.written, st.dropped, st.lost
-        ),
-    ];
+    let mut lines = vec![describe(&st.path, st.max_bytes)];
+    // Only a loss is worth a line.
+    if st.dropped > 0 || st.lost > 0 {
+        lines.push(format!(
+            "  daemon writer: {} dropped (queue full), {} lost (write failed)",
+            st.dropped, st.lost
+        ));
+    }
     if configured.as_ref() != Some(&(st.path.clone(), st.max_bytes)) {
         lines.push(format!(
-            "  after restart: {} (the config changed; event-log is restart-only, and \
-             `packetframe events` reads the configured file — `--file {}` reads this one)",
+            "  after restart: {} (event-log is restart-only; `--file {}` reads the current one)",
             match &configured {
                 Some((p, m)) => format!("{} at {} per file", p.display(), human_bytes(*m)),
                 None => "off".to_string(),
@@ -260,7 +262,7 @@ pub fn status_lines(
     }
     if let Some(e) = &st.last_error {
         lines.push(format!(
-            "  WARNING: the daemon cannot write the event log: {}",
+            "  WARNING: can't write the event log: {}",
             scrub_for_terminal(e)
         ));
     }
@@ -554,7 +556,7 @@ mod tests {
         );
         assert_eq!(
             idle,
-            ["event log: /persist/pf/events.log (not yet written of 1.0 MiB per file); `packetframe events` reads it"]
+            ["event log: /persist/pf/events.log (not written yet, max 1.0 MiB); read with `packetframe events`"]
         );
         assert_eq!(
             status_lines(None, None, size),

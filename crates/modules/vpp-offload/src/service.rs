@@ -1170,7 +1170,7 @@ fn expire_verdict(
             // Through `remember_failures` like every other writer. This
             // one used to append directly while the tick paths assigned,
             // so whether the verify reason survived depended on ordering.
-            remember_failures(last_failures, vec![format!("Verify: {}", v.summary())]);
+            remember_failures(last_failures, vec![format!("Verify: {}", v.brief())]);
         }
     }
     *last_verify_at = None;
@@ -1548,9 +1548,7 @@ fn run_loop(
         let now = Instant::now();
         let rs = runtime.status();
         let fib = match (last_verify, last_verify_at) {
-            (Some(outcome), Some(at)) => {
-                FibSync::from_outcome(outcome, now - *at, rs.v6_ledger().as_ref())
-            }
+            (Some(outcome), Some(at)) => FibSync::from_outcome(outcome, now - *at),
             _ => FibSync::NeverVerified,
         };
         // The store failure goes INTO the snapshot, not onto the report

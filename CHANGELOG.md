@@ -44,6 +44,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 **CLI and operations**
 
+- `packetframe status` prints each module health row as one short line: the facts, and for a row that is not healthy, what is wrong and the fix. Row names and states are unchanged. A row's age is shown only when it is a minute old or more, as `45s`, `12m`, `37h` or `4d`. The `route-ledger` row keeps the wording automation reads (`seeded <N> IPv4 + <M> IPv6`, `; applying`, `GC removed <N>`, `not used at this start`); with the ledger off it now reads `not used at this start (route-ledger off)`. [#433](https://github.com/unredacted/packetframe/pull/433)
 - `packetframe detach --all` with no `--config` reads the default config when there is one, so it finds VPP's state file in the configured `state-dir`. It used the built-in default directory and, on a box with another `state-dir`, left VPP running. It now also logs the state directory it read. [#428](https://github.com/unredacted/packetframe/pull/428)
 
 **neigh-snoop**

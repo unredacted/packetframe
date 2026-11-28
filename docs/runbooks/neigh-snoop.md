@@ -354,7 +354,7 @@ session has never been up from their side).
 - **`frr-gate` Unhealthy, any other error**: the text after `vtysh
   exited …:` is vtysh's stderr followed by the last lines of its stdout.
   The last of these is the command that stopped it.
-- **`netlink` row Degraded "netlink notifications lost (N overruns)"**:
+- **`netlink` row Degraded "N netlink overruns"**:
   the kernel dropped link/neighbour/address notifications on the
   engine's subscription — a port bounce flushing a peering LAN's
   neighbours in one burst does it. Until the re-read that follows

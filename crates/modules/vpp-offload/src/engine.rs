@@ -1589,10 +1589,9 @@ impl ConvergenceEngine {
             .collect();
         for (c, ifs) in &targets {
             if ifs.is_empty() {
-                status.missing.push((
-                    c.vlan,
-                    "VPP has no interface on this VLAN yet (no subinterface or BVI)".into(),
-                ));
+                status
+                    .missing
+                    .push((c.vlan, "no VPP interface on this VLAN yet".into()));
             }
         }
         let want = mss_clamp::desired(&targets);
@@ -1617,10 +1616,7 @@ impl ConvergenceEngine {
                 Ok(Err(retval)) if !want.contains_key(&sw_if_index) => {
                     status.not_cleared.push((
                         sw_if_index,
-                        format!(
-                            "VPP refused to clear a removed clamp on interface {sw_if_index} \
-                             (retval {retval})"
-                        ),
+                        format!("interface {sw_if_index} refused the clear (retval {retval})"),
                     ));
                 }
                 Ok(Err(retval)) => {
@@ -1628,10 +1624,7 @@ impl ConvergenceEngine {
                         if ifs.contains(&sw_if_index) {
                             status.missing.push((
                                 c.vlan,
-                                format!(
-                                    "VPP refused the clamp on interface {sw_if_index} \
-                                     (retval {retval})"
-                                ),
+                                format!("interface {sw_if_index} refused it (retval {retval})"),
                             ));
                         }
                     }
@@ -2132,9 +2125,7 @@ impl ConvergenceEngine {
         let refused: String = if let Some(why) = &self.fib_match_halted {
             why.clone()
         } else if self.fib_match_budget == 0 {
-            "the kernel was not asked about this prefix (this walk's lookup budget was spent, \
-             as on a feed whose every route names the router)"
-                .into()
+            "kernel was not asked (this walk's lookup budget was spent)".into()
         } else {
             self.fib_match_budget -= 1;
             let asked = std::time::Instant::now();
@@ -2142,8 +2133,7 @@ impl ConvergenceEngine {
             self.fib_match_spent += asked.elapsed();
             if self.fib_match_spent >= FIB_MATCH_WALL_BUDGET && self.fib_match_halted.is_none() {
                 self.fib_match_halted = Some(format!(
-                    "the kernel was not asked about this prefix (this walk's {} ms for kernel \
-                     lookups was spent)",
+                    "kernel was not asked (this walk's {} ms for kernel lookups was spent)",
                     FIB_MATCH_WALL_BUDGET.as_millis()
                 ));
             }
@@ -2153,7 +2143,7 @@ impl ConvergenceEngine {
                     return true;
                 }
                 Ok(FibMatch::Unicast { oifs }) if oifs.is_empty() => {
-                    "the kernel's route for exactly this prefix names no device".into()
+                    "kernel route names no device".into()
                 }
                 Ok(FibMatch::Unicast { oifs }) => {
                     match oifs.iter().find(|d| !self.vpp_cannot_reach(d)) {
@@ -2162,17 +2152,13 @@ impl ConvergenceEngine {
                             return true;
                         }
                         Some(dev) => format!(
-                        "the kernel sends this prefix out {dev}, which VPP can reach (a transit \
-                         route under `next-hop-self`?)"
-                    ),
+                            "kernel sends it out {dev}, which VPP can reach (transit route under \
+                         next-hop-self?)"
+                        ),
                     }
                 }
-                Ok(FibMatch::Other) => "the kernel's route for exactly this prefix drops it \
-                                        (blackhole, unreachable or prohibit)"
-                    .into(),
-                Ok(FibMatch::NotExact) => {
-                    "the kernel has no route of its own for exactly this prefix".into()
-                }
+                Ok(FibMatch::Other) => "kernel route drops it".into(),
+                Ok(FibMatch::NotExact) => "no exact kernel route".into(),
                 // The first failure ends the walk's lookups: a facility
                 // that did not answer once is not asked again for every
                 // remaining candidate.
@@ -2184,10 +2170,9 @@ impl ConvergenceEngine {
                          the rest of this walk"
                     );
                     self.fib_match_halted = Some(format!(
-                        "the kernel's FIB could not be read ({e}), so it was not asked again \
-                         this walk"
+                        "kernel FIB unreadable ({e}); not asked again this walk"
                     ));
-                    format!("the kernel's route for this prefix could not be read ({e})")
+                    format!("kernel route unreadable ({e})")
                 }
             }
         };
@@ -2384,16 +2369,12 @@ impl ConvergenceEngine {
         // the router reads unresolvable exactly when a subnet it sits in
         // is unknown.
         let stale = self.self_nets_error.as_ref().map_or(String::new(), |e| {
-            format!(
-                "; the router's addresses could not be re-read ({e}), so a subnet addressed \
-                 since the last good read is not known"
-            )
+            format!("; router addresses unreadable ({e})")
         });
         if self.self_addrs.contains(nh) && matches!(prefix, IpPrefix::V6 { .. }) {
             return format!(
-                "the router's own address, which VPP has no adjacency for; the prefix is in no \
-                 subnet or address of the router, and IPv6 has no steer-exempt, so diverted \
-                 traffic for it would be dropped in VPP rather than left to the kernel{stale}"
+                "router's own address, no VPP adjacency; in no router subnet, and IPv6 has no \
+                 steer-exempt{stale}"
             );
         }
         if self.self_addrs.contains(nh) {
@@ -2402,18 +2383,17 @@ impl ConvergenceEngine {
             // ([`Self::kernel_delivered_route`]), so its absence is the
             // reason.
             return format!(
-                "the router's own address, which VPP has no adjacency for; {}{stale}",
-                self.kernel_refused.get(prefix).map_or(
-                    "the prefix is in no subnet or address of the router",
-                    String::as_str
-                )
+                "router's own address, no VPP adjacency; {}{stale}",
+                self.kernel_refused
+                    .get(prefix)
+                    .map_or("in no router subnet", String::as_str)
             );
         }
         if is_link_local(nh) {
-            return "link-local, whose interface the route feed does not carry".into();
+            return "link-local; the feed carries no interface".into();
         }
         if !self.drainer.families().carries_address(*nh) {
-            return "an IPv6 next hop, and VPP carries no IPv6 (`v6 off`)".into();
+            return "IPv6 next hop under v6 off".into();
         }
         self.nexthops.why_unresolved(nh)
     }
@@ -6899,7 +6879,7 @@ mod tests {
         assert_eq!((plan.upserts, plan.kernel_delivered), (2, 0), "{plan:?}");
         assert!(
             e.why_unresolved(&lan, &own)
-                .contains("sends this prefix out eth4, which VPP can reach"),
+                .contains("sends it out eth4, which VPP can reach"),
             "{}",
             e.why_unresolved(&lan, &own)
         );
@@ -6984,7 +6964,7 @@ mod tests {
         );
         assert!(
             e.why_unresolved(&lan, &own)
-                .contains("sends this prefix out eth4, which VPP can reach"),
+                .contains("sends it out eth4, which VPP can reach"),
             "{}",
             e.why_unresolved(&lan, &own)
         );
@@ -7014,7 +6994,7 @@ mod tests {
         assert_eq!((plan.upserts, plan.kernel_delivered), (1, 1), "{plan:?}");
         assert!(
             e.why_unresolved(&elsewhere, &own)
-                .contains("could not be re-read (getifaddrs: Cannot allocate memory)"),
+                .contains("router addresses unreadable (getifaddrs: Cannot allocate memory)"),
             "{}",
             e.why_unresolved(&elsewhere, &own)
         );

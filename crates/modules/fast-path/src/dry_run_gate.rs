@@ -248,17 +248,18 @@ impl DryRunGate {
         let s = self.lock();
         let message = match (s.mode, s.released) {
             (DryRunMode::Off, _) => return None,
-            (DryRunMode::On, _) => "on: every packet passes to the kernel".to_string(),
+            (DryRunMode::On, _) => "on: every packet goes to the kernel".to_string(),
             (DryRunMode::UntilSeeded, Some((trigger, at, held))) => format!(
-                "until-seeded: released at {} ({}) after {}s; forwarding",
+                "until-seeded: released {} by {} after {}",
                 humantime_utc(at),
                 trigger.as_str(),
-                held.as_secs()
+                crate::health_text::age(held.as_secs())
             ),
             (DryRunMode::UntilSeeded, None) => format!(
-                "until-seeded: holding for {}s, every packet passes to the kernel; waiting for \
-                 {waiting_on}",
-                Instant::now().saturating_duration_since(s.since).as_secs()
+                "until-seeded: holding {}, waiting for {waiting_on}",
+                crate::health_text::age(
+                    Instant::now().saturating_duration_since(s.since).as_secs()
+                )
             ),
         };
         Some(SubsystemHealth {
@@ -346,7 +347,7 @@ mod tests {
         );
         let msg = g.health("x").unwrap().message.unwrap();
         assert!(
-            msg.starts_with("until-seeded: released at") && msg.contains("seed-whole"),
+            msg.starts_with("until-seeded: released 20") && msg.contains("by seed-whole"),
             "{msg}"
         );
 

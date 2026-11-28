@@ -892,7 +892,7 @@ fn a_subnet_addressed_while_running_clears_the_parked_verdict() {
     assert_eq!((s.counts.installed, s.counts.unresolvable), (1, 1));
     assert!(
         s.unresolvable_named.len() == 1
-            && s.unresolvable_named[0].contains("sends this prefix out br-ix, which VPP can reach"),
+            && s.unresolvable_named[0].contains("sends it out br-ix, which VPP can reach"),
         "{:?}",
         s.unresolvable_named
     );
@@ -2970,13 +2970,13 @@ fn an_unattested_release_waits_for_the_route_sources_initiation_complete() {
     let (state, msg) = row(&report(&d, &rt, now), SUBSYS_FIB);
     assert_eq!(state, HealthState::Degraded, "{msg}");
     assert!(
-        msg.contains("release floor 10 met")
-            && msg.contains("with no completeness authority")
-            && msg.contains("InitiationComplete fired"),
+        msg.contains("(floor 10 met)")
+            && msg.contains("no authority")
+            && msg.contains("waits for InitiationComplete"),
         "the row names the wait and the journal line that ends it: {msg}"
     );
     assert!(
-        msg.contains("the adopted FIB keeps forwarding untouched"),
+        msg.contains("adopted FIB forwarding"),
         "still steered, so the adopted FIB carries the traffic: {msg}"
     );
 
@@ -3072,7 +3072,7 @@ fn a_flapped_deferral_above_the_floor_waits_for_the_new_sessions_gc() {
         packetframe_vpp_offload::status::SUBSYS_FIB,
     );
     assert!(
-        msg.contains("reconnected under this deferral") && msg.contains("InitiationComplete fired"),
+        msg.contains("feed reconnected") && msg.contains("waits for InitiationComplete"),
         "{msg}"
     );
 
@@ -3171,9 +3171,9 @@ fn a_reconnect_during_the_dump_spoils_the_release_until_it_reconciles() {
         packetframe_vpp_offload::status::SUBSYS_FIB,
     );
     assert!(
-        msg.contains("InitiationComplete fired")
-            && msg.contains("VPP is unsteered, so the traffic is on the eBPF tier")
-            && !msg.contains("keeps forwarding"),
+        msg.contains("waits for InitiationComplete")
+            && msg.contains("traffic on eBPF")
+            && !msg.contains("FIB forwarding"),
         "{msg}"
     );
 
@@ -5280,7 +5280,7 @@ mod first_steer_hold {
     pub fn report(d: &Driver, rt: &Runtime, now: Instant) -> HealthReport {
         let rs = rt.status();
         let fib = rs.last_verify.as_ref().map_or(FibSync::NeverVerified, |v| {
-            FibSync::from_outcome(v, Duration::ZERO, rs.v6_ledger().as_ref())
+            FibSync::from_outcome(v, Duration::ZERO)
         });
         StatusSnapshot::from_runtime(d.supervisor(), rs, d.api_health(now), fib).report()
     }
@@ -5289,7 +5289,7 @@ mod first_steer_hold {
     pub fn metrics(d: &Driver, rt: &Runtime, now: Instant) -> String {
         let rs = rt.status();
         let fib = rs.last_verify.as_ref().map_or(FibSync::NeverVerified, |v| {
-            FibSync::from_outcome(v, Duration::ZERO, rs.v6_ledger().as_ref())
+            FibSync::from_outcome(v, Duration::ZERO)
         });
         let snap = StatusSnapshot::from_runtime(d.supervisor(), rs, d.api_health(now), fib);
         packetframe_vpp_offload::status::render_metrics(&snap, "vpp-offload")
@@ -5509,7 +5509,7 @@ fn a_lever_moved_on_a_one_probe_verdict_waits_for_vpp_and_a_verify_of_the_table(
         row(&r, "fib-synced"),
         (
             HealthState::Healthy,
-            "1 routes installed; last verified on 1 probes against 1 routes".to_string()
+            "1 routes, 1/1 probes matched".to_string()
         )
     );
     assert_eq!(r.overall, HealthState::Healthy, "the baseline: {r:?}");
@@ -5542,13 +5542,10 @@ fn a_lever_moved_on_a_one_probe_verdict_waits_for_vpp_and_a_verify_of_the_table(
     assert_eq!(state, HealthState::Degraded, "{fib}");
     assert_eq!(r.overall, HealthState::Degraded, "{r:?}");
     assert!(
-        fib.contains("151 routes installed, but the last verify ran on 1 probes against 1 routes"),
+        fib.contains("151 routes; last verify covered 1 probes on 1 routes"),
         "{fib}"
     );
-    assert!(
-        fib.contains(&format!("{behind} change(s) still at the route source")),
-        "{fib}"
-    );
+    assert!(fib.contains(&format!("({behind} at source")), "{fib}");
     let (state, steering) = row(&r, "steering");
     assert_eq!(
         state,
@@ -5556,12 +5553,10 @@ fn a_lever_moved_on_a_one_probe_verdict_waits_for_vpp_and_a_verify_of_the_table(
         "waiting for a lever: {steering}"
     );
     assert!(
-        steering.contains("awaiting an operator lever move")
-            && steering.contains("A lever move now would be held")
-            && steering.contains(&format!(
-                "VPP has not caught up with the route mirror: {behind} change(s)"
-            ))
-            && steering.contains("1 probe(s) against 1 routes and 151 are installed now"),
+        steering.contains("needs a lever move")
+            && steering.contains("a lever move now is held")
+            && steering.contains(&format!("VPP behind the route mirror ({behind} at source"))
+            && steering.contains("last verify covered 1 probe(s) on 1 routes, 151 now"),
         "{steering}"
     );
 
@@ -5584,7 +5579,7 @@ fn a_lever_moved_on_a_one_probe_verdict_waits_for_vpp_and_a_verify_of_the_table(
     assert_eq!(state, HealthState::Degraded, "{steering}");
     assert!(
         steering.contains("intended but not in place")
-            && steering.contains("Held now because VPP has not caught up"),
+            && steering.contains("held: VPP behind the route mirror"),
         "{steering}"
     );
 
@@ -5660,7 +5655,7 @@ fn a_lever_moved_on_a_one_probe_verdict_waits_for_vpp_and_a_verify_of_the_table(
         row(&report(&d, &rt, now), "fib-synced"),
         (
             HealthState::Healthy,
-            format!("{TABLE} routes installed; last verified on 64 probes against {TABLE} routes")
+            format!("{TABLE} routes, 64/64 probes matched")
         )
     );
 
@@ -5906,10 +5901,8 @@ fn the_next_canary_port_waits_for_a_reload_the_first_was_steered_before() {
     let (state, steering) = row(&r, "steering");
     assert_eq!(state, HealthState::Degraded, "{steering}");
     assert!(
-        steering.contains(
-            "a steering change that diverts more traffic onto VPP is held because VPP has \
-             not caught up"
-        ) && steering.contains("The rules already installed stay as they are"),
+        steering.contains("addition held: VPP behind the route mirror")
+            && steering.contains("installed rules keep forwarding"),
         "{steering}"
     );
     assert_eq!(r.overall, HealthState::Degraded, "{r:?}");
@@ -5985,16 +5978,15 @@ fn a_mismatch_a_re_run_found_holds_the_steer_and_is_never_re_run_away() {
     let (state, fib) = row(&r, "fib-synced");
     assert_eq!(state, HealthState::Unhealthy, "{fib}");
     assert!(
-        fib.contains(
-            "No steer that diverts more traffic onto VPP is admitted on it, and it is not re-run"
-        ) && fib.contains("`systemctl restart packetframe`")
-            && fib.contains("will not preserve a route ledger a verify has disproved"),
+        fib.contains("verify FAILED")
+            && fib.contains("steers adding traffic refused")
+            && fib.contains("run: `systemctl restart packetframe`"),
         "{fib}"
     );
     let (_, steering) = row(&r, "steering");
     assert!(
-        steering.contains("A lever move now would be held")
-            && steering.contains("disagreeing with the route ledger"),
+        steering.contains("a lever move now is held")
+            && steering.contains("last verify found a mismatch"),
         "{steering}"
     );
     let refusal = lever(&mut d, &rt, now);
@@ -6236,7 +6228,7 @@ fn a_convergence_re_steer_waits_for_vpp_to_catch_up() {
     assert!(d.supervisor().steer_retry_pending(), "the want survives");
     let (_, steering) = row(&first_steer_hold::report(&d, &rt, now), "steering");
     assert!(
-        steering.contains("Held now because VPP has not caught up with the route mirror"),
+        steering.contains("held: VPP behind the route mirror"),
         "{steering}"
     );
 
@@ -7229,9 +7221,7 @@ fn a_steered_seeded_diff_beyond_the_allowance_waits_for_the_replay_to_go_quiet()
         );
         let row = fib_row(&d, &f, now);
         assert!(
-            row.starts_with("resync deferred")
-                && row.contains("early door")
-                && row.contains("shut"),
+            row.starts_with("resync deferred") && row.contains("seeded early diff refused"),
             "{name}: {row}"
         );
 

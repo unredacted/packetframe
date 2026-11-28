@@ -50,8 +50,8 @@ impl WatchStatus {
         let mut parts = Vec::new();
         if self.map_full > 0 {
             parts.push(format!(
-                "{} qualifying links are not in the redirect maps: the maps are full (64 links \
-                 each), and their traffic takes the kernel path until an eviction makes room",
+                "{} links not in the redirect maps (maps full, 64 each); their traffic takes \
+                 the kernel path",
                 self.map_full
             ));
         }
@@ -61,8 +61,7 @@ impl WatchStatus {
                 _ => "no errno".to_string(),
             };
             parts.push(format!(
-                "{} qualifying links could not be inserted into the redirect maps ({why}); \
-                 retrying, their traffic on the kernel path meanwhile",
+                "{} links could not be inserted into the redirect maps ({why}); retrying",
                 self.insert_failing
             ));
         }
@@ -73,43 +72,39 @@ impl WatchStatus {
         let (state, message) = if let Some(why) = &self.stopped {
             (
                 HealthState::Degraded,
-                format!(
-                    "stopped ({why}); the redirect maps follow the link table only on SIGHUP, \
-                     so a link created or re-created since stays on the kernel path \
-                     (pass_not_in_devmap)"
-                ),
+                Some(format!(
+                    "stopped ({why}); new links stay on the kernel path; run: systemctl \
+                     reload packetframe (SIGHUP) to re-read them"
+                )),
             )
         } else if self.resync_pending {
             let mut m = format!(
-                "link notifications lost ({} overruns); a link created or deleted meanwhile is \
-                 missing from the redirect maps until the link table is re-read",
+                "link notifications lost ({} overruns); new links may be missing from the \
+                 redirect maps until a re-read",
                 self.overruns
             );
             if let Some(e) = &self.last_resync_error {
-                let _ = write!(m, "; not recovered yet (retrying): {e}");
+                let _ = write!(m, "; re-read failing, retrying: {e}");
             }
             let unadmitted = self.unadmitted_text();
             if !unadmitted.is_empty() {
                 let _ = write!(m, "; {unadmitted}");
             }
-            (HealthState::Degraded, m)
+            (HealthState::Degraded, Some(m))
         } else if self.map_full > 0 || self.insert_failing > 0 {
-            (HealthState::Degraded, self.unadmitted_text())
+            (HealthState::Degraded, Some(self.unadmitted_text()))
+        } else if self.overruns > 0 {
+            (
+                HealthState::Healthy,
+                Some(format!("{} overruns, all re-read", self.overruns)),
+            )
         } else {
-            let mut m = "following the link table".to_string();
-            if self.overruns > 0 {
-                let _ = write!(
-                    m,
-                    "; {} notification overruns, each made good by a re-read",
-                    self.overruns
-                );
-            }
-            (HealthState::Healthy, m)
+            (HealthState::Healthy, None)
         };
         SubsystemHealth {
             name: SUBSYSTEM_NAME.to_string(),
             state,
-            message: Some(message),
+            message,
             last_success_age_seconds: None,
         }
     }
@@ -183,6 +178,7 @@ mod tests {
         let h = WatchStatus::default().subsystem_health();
         assert_eq!(h.name, "redirect-watch");
         assert_eq!(h.state, HealthState::Healthy);
+        assert_eq!(h.message, None, "nothing to say");
         let h = WatchStatus {
             overruns: 2,
             resyncs_ok: 1,
@@ -190,7 +186,7 @@ mod tests {
         }
         .subsystem_health();
         assert_eq!(h.state, HealthState::Healthy);
-        assert!(h.message.unwrap().contains("2 notification overruns"));
+        assert_eq!(h.message.unwrap(), "2 overruns, all re-read");
     }
 
     /// Lost notifications nobody has re-read yet are not "current": a
@@ -205,7 +201,7 @@ mod tests {
         assert_eq!(s.subsystem_health().state, HealthState::Degraded);
         s.last_resync_error = Some("link dump: no reply within 30s".into());
         let m = s.subsystem_health().message.unwrap();
-        assert!(m.contains("not recovered yet"), "{m}");
+        assert!(m.contains("re-read failing"), "{m}");
         assert!(m.contains("no reply within 30s"), "{m}");
     }
 
@@ -244,7 +240,7 @@ mod tests {
         assert_eq!(h.state, HealthState::Degraded);
         let m = h.message.unwrap();
         assert!(
-            m.starts_with("8 qualifying links are not in the redirect maps: the maps are full"),
+            m.starts_with("8 links not in the redirect maps (maps full"),
             "{m}"
         );
         assert!(
@@ -262,7 +258,7 @@ mod tests {
         let m = h.message.unwrap();
         let enomem = std::io::Error::from_raw_os_error(12).to_string();
         assert!(
-            m.starts_with("2 qualifying links could not be inserted") && m.contains(&enomem),
+            m.starts_with("2 links could not be inserted") && m.contains(&enomem),
             "{m}"
         );
         assert!(
@@ -278,7 +274,7 @@ mod tests {
         };
         let m = s.subsystem_health().message.unwrap();
         assert!(
-            m.contains("notifications lost") && m.contains("8 qualifying links"),
+            m.contains("notifications lost") && m.contains("8 links not in the redirect maps"),
             "{m}"
         );
     }

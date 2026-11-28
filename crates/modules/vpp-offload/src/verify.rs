@@ -130,6 +130,10 @@ pub const MISMATCH_REMEDY: &str = "restart the daemon (`systemctl restart packet
      full table — and steers again, so pick the window. Replacing VPP also clears it: stop the \
      daemon, run `packetframe detach --all`, start it";
 
+/// [`MISMATCH_REMEDY`] as a status row names it: the command alone. The
+/// runbook and the long form carry the read-back window it costs.
+pub const MISMATCH_FIX: &str = "run: `systemctl restart packetframe`";
+
 /// Why the last verify does not vouch for the IPv4 table installed now,
 /// as a first steer needs it to — [`unvouched`] decides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +158,26 @@ pub enum Unvouched {
         table: u64,
         installed: u64,
     },
+}
+
+impl Unvouched {
+    /// The short form a status row carries; [`std::fmt::Display`] is the
+    /// refusal's.
+    pub fn brief(&self) -> String {
+        match self {
+            Unvouched::NoVerdict => "no verify yet".to_string(),
+            Unvouched::Mismatch => format!("last verify found a mismatch; {MISMATCH_FIX}"),
+            Unvouched::Outgrown {
+                sampled,
+                table,
+                installed,
+            } => format!(
+                "last verify covered {sampled} probe(s) on {table} routes, {installed} now; \
+                 re-runs {}s after VPP catches up",
+                REVERIFY_DEBOUNCE.as_secs()
+            ),
+        }
+    }
 }
 
 impl std::fmt::Display for Unvouched {
@@ -316,9 +340,10 @@ pub struct FamilyVerify {
 /// Why the summary does not keep its own copy: which unresolvable routes
 /// an `unresolvable-accept6` names is decided against the accept set in
 /// force, which a reload changes without a verify. A verdict that is
-/// rendered long after it was taken (an incomplete one that never
-/// re-runs, on the `fib-synced` row) would otherwise go on classifying a
-/// route under the old set while `fib-v6` used the new one. None of this
+/// logged long after it was taken (an incomplete one that never re-runs)
+/// would otherwise go on classifying a route under the old set while
+/// `fib-v6` used the new one. (The `fib-synced` row carries
+/// [`VerifyOutcome::brief`], which names no IPv6 route.) None of this
 /// can fail the pass, so the verdict loses nothing by not holding it;
 /// IPv4's names stay the verdict's own, because they are what it failed
 /// on. Built by [`crate::engine::ConvergenceEngine::v6_ledger`] and,
@@ -470,6 +495,57 @@ impl VerifyOutcome {
     /// that has the live ledger renders [`Self::summary_with`].
     pub fn summary(&self) -> String {
         self.summary_with(None)
+    }
+
+    /// The verdict as a status row carries it: the outcome, the probes,
+    /// and only the counts that made it fail. [`Self::summary_with`] is
+    /// the long form the log line keeps.
+    pub fn brief(&self) -> String {
+        let verdict = if self.passed() {
+            "passed"
+        } else if !self.mismatches.is_empty() {
+            "FAILED"
+        } else {
+            "incomplete"
+        };
+        let mut s = format!(
+            "verify {verdict}: {}/{} probes matched on {} routes",
+            self.sampled.saturating_sub(self.mismatches.len()),
+            self.sampled,
+            self.table,
+        );
+        if self.sampled == 0 {
+            s.push_str(" (nothing to probe)");
+        }
+        if self.unresolvable > 0 {
+            s.push_str(&format!(", {} unresolvable", self.unresolvable));
+        }
+        if self.withheld > 0 {
+            s.push_str(&format!(", {} withheld", self.withheld));
+        }
+        if self.unexempted_local > 0 {
+            s.push_str(&format!(
+                ", {} kernel-delivered without steer-exempt",
+                self.unexempted_local
+            ));
+        }
+        if let Some(v6) = self.v6.as_ref().filter(|v| !v.mismatches.is_empty()) {
+            s.push_str(&format!(
+                "; IPv6 {}/{} matched",
+                v6.sampled.saturating_sub(v6.mismatches.len()),
+                v6.sampled
+            ));
+        }
+        let dark: Vec<&str> = self
+            .dead_interfaces
+            .iter()
+            .filter(|d| d.in_use)
+            .map(|d| d.name.as_str())
+            .collect();
+        if !dark.is_empty() {
+            s.push_str(&format!("; down with routes: {}", dark.join(", ")));
+        }
+        s
     }
 
     /// [`Self::summary`], with the IPv6 half's ledger counts and named

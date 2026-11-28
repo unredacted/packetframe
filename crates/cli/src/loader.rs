@@ -3279,7 +3279,7 @@ fn print_module_health(state_dir: &Path) {
     };
 
     let age = match crate::health::age_seconds(&snapshot) {
-        Some(a) => format!("{a}s old"),
+        Some(a) => format!("{} old", compact_age(a)),
         // The clock moved backwards since the write; saying so beats
         // printing a flattering number derived from it.
         None => "written in the future (clock skew)".to_string(),
@@ -3308,9 +3308,8 @@ fn print_module_health(state_dir: &Path) {
                 && (snapshot.start_ticks.is_none() || snapshot.boot_id.is_none()) =>
         {
             println!(
-                "module health (pid {pid}, {age}) — CANNOT CONFIRM this is the report of \
-                 the daemon running now: it recorded no identity, which an older build \
-                 does not. Restarting on this build makes it checkable."
+                "module health (pid {pid}, {age}) — CANNOT CONFIRM it is the running \
+                 daemon's: an older build records no identity; restart on this build"
             )
         }
         // Same pid is not the same process. A replacement handed the
@@ -3320,9 +3319,8 @@ fn print_module_health(state_dir: &Path) {
         // the snapshot predates identity recording it says so rather
         // than guessing either way.
         crate::daemon_presence::DaemonPresence::Running { pid } => println!(
-            "module health: STALE — this report was written by pid {}, and the daemon \
-             running now is pid {pid} (a different process, by its recorded identity). \
-             The report below is history, {age}.",
+            "module health: STALE — written by pid {}, but pid {pid} is a different \
+             process; history, {age}",
             snapshot.pid
         ),
         // The record could not answer — or answered WRONG — but the
@@ -3350,11 +3348,8 @@ fn print_module_health(state_dir: &Path) {
         // reassure.
         crate::daemon_presence::DaemonPresence::Gone { .. } if snapshot_matches_live(&snapshot) => {
             println!(
-                "module health (pid {}, {age}) — confirmed by the report's own recorded \
-                 identity. WARNING: every record-based check reads this daemon as absent \
-                 (no pid file, no identity sidecar, and the process-table scan cannot see \
-                 it), so `packetframe detach` would proceed under it. Stop the daemon \
-                 before detaching.",
+                "module health (pid {}, {age}) — WARNING: no pid file or identity record, \
+                 so `packetframe detach` would run under this daemon; stop it first",
                 snapshot.pid
             )
         }
@@ -3362,21 +3357,18 @@ fn print_module_health(state_dir: &Path) {
             if snapshot_matches_live(&snapshot) =>
         {
             println!(
-                "module health (pid {}, {age}) — confirmed by the report's own recorded \
-                 identity; the pid record is missing or stale, which `packetframe detach` \
-                 will refuse on until it is resolved.",
+                "module health (pid {}, {age}) — pid record missing or stale; \
+                 `packetframe detach` refuses until it is fixed",
                 snapshot.pid
             )
         }
         crate::daemon_presence::DaemonPresence::Gone { why } => println!(
-            "module health: STALE — the daemon that wrote this (pid {}) is gone ({why}). The \
-             report below is history, {age}; the dataplane may still be forwarding via its \
-             pins (§8.5).",
+            "module health: STALE — pid {} is gone ({why}); history, {age}. Its pins may \
+             still forward",
             snapshot.pid
         ),
         crate::daemon_presence::DaemonPresence::Unknown { why } => println!(
-            "module health (pid {}, {age}) — CANNOT CONFIRM the daemon is still running \
-             ({why}). Read the report as possibly historical until it can be checked.",
+            "module health (pid {}, {age}) — CANNOT CONFIRM the daemon is running ({why})",
             snapshot.pid
         ),
     }
@@ -3396,10 +3388,24 @@ fn print_module_health(state_dir: &Path) {
                     scrub_for_terminal(&m.module),
                     health_word(r.overall)
                 );
+                // Names line up within a module, however long the
+                // longest is.
+                let width = r
+                    .subsystems
+                    .iter()
+                    .map(|s| s.name.chars().count())
+                    .max()
+                    .unwrap_or(0)
+                    .max(14);
                 for sub in &r.subsystems {
+                    // A current row says nothing about its age; an old
+                    // one is worth a glance.
                     let age = match sub.last_success_age_seconds {
-                        Some(a) => format!(" (last ok {a}s ago)"),
-                        None => String::new(),
+                        Some(a) if a >= 60 && sub.state == HealthState::Healthy => {
+                            format!(" ({} ago)", compact_age(a))
+                        }
+                        Some(a) if a >= 60 => format!(" (last ok {} ago)", compact_age(a)),
+                        _ => String::new(),
                     };
                     let msg = sub
                         .message
@@ -3408,7 +3414,7 @@ fn print_module_health(state_dir: &Path) {
                         .unwrap_or_default();
                     let sep = if msg.is_empty() { "" } else { " — " };
                     println!(
-                        "    {:<14} {}{sep}{msg}{age}",
+                        "    {:<width$} {}{sep}{msg}{age}",
                         scrub_for_terminal(&sub.name),
                         health_word(sub.state)
                     );
@@ -3421,6 +3427,16 @@ fn print_module_health(state_dir: &Path) {
                 "  {}: no report and no error recorded (malformed snapshot)",
                 scrub_for_terminal(&m.module)
             ),
+        }
+    }
+
+    /// One unit, rounded down: `45s`, `12m`, `37h`, `4d`.
+    fn compact_age(secs: u64) -> String {
+        match secs {
+            s if s < 60 => format!("{s}s"),
+            s if s < 3600 => format!("{}m", s / 60),
+            s if s < 48 * 3600 => format!("{}h", s / 3600),
+            s => format!("{}d", s / 86_400),
         }
     }
 
