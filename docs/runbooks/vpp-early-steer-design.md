@@ -175,7 +175,40 @@ figure, about 35 s for its table, with none of the hazards above.
 Early steering could save at most a part of that, at the price of (1),
 (3) and (4).
 
-If the core isolation lands and the load is still long, the next step is
+**The core fence landed ([#390](https://github.com/unredacted/packetframe/pull/390)), and the load was still long.**
+On the reference deployment (2026-11-28, 0.6.6, 1,366,119 routes) the
+fresh load took 454 s. VPP's main thread was on CPU for 84 s and waited
+13 s for one: the fence worked, and the main thread sat idle most of the
+load. The sending thread ran 77 s and waited 132 s for a CPU. It runs on
+the cores the fence leaves to the rest of the box, and every one of them
+was saturated with the eBPF tier's softirq. So the earlier finding that
+sending faster bought nothing under contention held for contention on
+VPP's main core, and does not apply here: now the sender is the one
+starved.
+
+The lab reproduces it. With pktgen softirq on every core outside VPP's, a
+fresh load of 199,235 routes took 46 s against 6.6 s idle, with the
+sender waiting 41 s; `nice -20` on the sender changed nothing. From
+0.6.7 a starved sender moves onto VPP's main core while the fence holds
+([the core fence](vpp-offload.md#the-core-fence-during-a-fresh-load)):
+the same load takes 14 s, and an idle one is unchanged. That is the two
+threads' CPU time added together, since they take turns on one core:
+about twice VPP's alone. Batching the requests (one write per window
+instead of one per route) took about 10% off that and is not shipped.
+What is left is the sender's own CPU, about 25 µs a route on the lab and
+57 µs on the reference deployment. At the reference deployment's figures
+the load should come to about 2.7 min, not the 1 to 1.5 min of VPP's CPU
+time alone.
+
+Not all of the 454 s is accounted for by either thread. The sender was
+neither running nor waiting for 245 s, and VPP's main thread for 357 s. A
+fresh hold over a route-ledger seed also waits for the route source's
+replay and the authority's word after VPP has every route, so part of
+that may be the hold waiting on FRR, not the load. `fresh_hold_released`
+now says so (`source_wait_ms`), and the next fresh load on the reference
+deployment will show how the time splits.
+
+If the load is still long after this, the next step is
 evidence, not code. Take the reference deployment's traffic split by destination prefix
 length from the flow sampler, and measure the hand-back path's packets
 per second on the lab. Together they say whether a coverage gate would

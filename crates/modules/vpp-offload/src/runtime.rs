@@ -689,6 +689,11 @@ struct Core {
     /// ([`crate::fence`]). `None` off Linux, in tests, and where attach
     /// did not install one.
     core_fence: Option<crate::fence::CoreFence>,
+    /// While the fence is held over a loading VPP: whether the sending
+    /// thread is starved enough to move onto VPP's main core
+    /// ([`crate::load_clock::SenderWatch`]). Started on the first pass in
+    /// `Syncing`, dropped with the fence and at each spawn.
+    sender_watch: Option<crate::load_clock::SenderWatch>,
     /// NIC queue IRQs kept off VPP's cores after attach ([`crate::irq_guard`]).
     irq_guard: Option<crate::irq_guard::IrqGuard>,
     /// What the kernel path has been observed doing, per steered port.
@@ -1130,6 +1135,18 @@ struct FreshHold {
     /// one, from the same start: the release event says which side the
     /// load's time went to ([`crate::load_clock`]).
     clock: crate::load_clock::LoadClock,
+    /// How long VPP has held everything the mirror did while the hold
+    /// waited on the route source or its authority (a seed's replay, a
+    /// feed still dumping): from each idle drain to the next drain that
+    /// had routes to send. The release event's `source_wait_ms`; the rest
+    /// of `load_ms` is VPP's load itself.
+    source_wait: std::time::Duration,
+    /// Since when the drain has been idle, while it is.
+    idle_since: Option<std::time::Instant>,
+    /// The core the starved sender was moved onto and when
+    /// ([`crate::fence`]), for the release event's `sender_core` and
+    /// `sender_moved_ms`.
+    sender_moved: Option<(u16, std::time::Instant)>,
 }
 
 /// The loaded-and-quiet release of a STEERED adopted stage, with the feed
@@ -2431,6 +2448,7 @@ impl Runtime {
                 rx_kick: Box::new(NoKick),
                 kernel_path: Box::new(crate::kernel_path::NoKernelPath),
                 core_fence: None,
+                sender_watch: None,
                 irq_guard: None,
                 kernel_watch: KernelWatch::default(),
                 last_steer_audit: None,
@@ -2682,7 +2700,14 @@ impl Runtime {
     pub fn fence_tick(&self, state: crate::supervisor::State, now: std::time::Instant) {
         use crate::supervisor::State;
         let mut c = self.core.borrow_mut();
-        let Some(f) = c.core_fence.as_mut() else {
+        let Core {
+            core_fence,
+            sender_watch,
+            process,
+            fresh_hold,
+            ..
+        } = &mut *c;
+        let Some(f) = core_fence.as_mut() else {
             return;
         };
         let Some(held) = f.held_for(now) else {
@@ -2692,11 +2717,33 @@ impl Runtime {
             State::Starting | State::Syncing if held >= crate::fence::FENCE_MAX => "deadline",
             State::Starting | State::Syncing => {
                 f.refresh(now, false);
+                // A sender starved on the cores the fence leaves the rest
+                // of the box goes onto VPP's main core (`crate::fence`). This
+                // runs on the supervision thread, which is the sender.
+                if state == State::Syncing && f.sender_movable() {
+                    let vpp_pid = process.as_ref().map(|p| p.pid());
+                    let watch = sender_watch
+                        .get_or_insert_with(|| crate::load_clock::SenderWatch::start(vpp_pid));
+                    if watch.starved(now) {
+                        if let Some(core) = f.move_sender() {
+                            tracing::info!(
+                                core,
+                                "the fresh load's sender waited longer for a CPU than VPP's \
+                                 main thread ran; moved it onto VPP's main core until the \
+                                 load is done"
+                            );
+                            if let Some(h) = fresh_hold.as_mut() {
+                                h.sender_moved = Some((core, now));
+                            }
+                        }
+                    }
+                }
                 return;
             }
             State::Verifying | State::Ready | State::Steered => "loaded",
             _ => "vpp-down",
         };
+        *sender_watch = None;
         release_fence(f, reason, held);
     }
 
@@ -2717,6 +2764,7 @@ impl Runtime {
     pub fn release_core_fence(&self, reason: &str) {
         let now = std::time::Instant::now();
         let mut c = self.core.borrow_mut();
+        c.sender_watch = None;
         if let Some(f) = c.core_fence.as_mut() {
             if let Some(held) = f.held_for(now) {
                 release_fence(f, reason, held);
@@ -5574,7 +5622,13 @@ impl ObserveView {
         // drained backlog either way — what the door vouches for is the
         // mirror, and VPP has to hold all of it before verify samples it.
         let mut release_hold = false;
+        if let (Ok(crate::driver::Drain::More), Some(hold)) = (&r, fresh_hold.as_mut()) {
+            if let Some(t) = hold.idle_since.take() {
+                hold.source_wait += t.elapsed();
+            }
+        }
         if let (Ok(crate::driver::Drain::Idle), Some(hold)) = (&r, fresh_hold.as_mut()) {
+            let idle_since = *hold.idle_since.get_or_insert_with(std::time::Instant::now);
             let have = source.route_count();
             let attested = authority_current(completeness, have) == Some(true);
             let door = !attested
@@ -5619,9 +5673,11 @@ impl ObserveView {
                 );
             }
             let load_ms = hold.began.elapsed().as_millis() as u64;
+            let source_wait_ms = (hold.source_wait + idle_since.elapsed()).as_millis() as u64;
             let cpu = hold.clock.read();
             tracing::info!(
                 load_ms,
+                source_wait_ms,
                 vpp_main_cpu_ms = ?cpu.vpp_main_cpu_ms,
                 vpp_main_wait_ms = ?cpu.vpp_main_wait_ms,
                 sender_cpu_ms = ?cpu.sender_cpu_ms,
@@ -5632,7 +5688,14 @@ impl ObserveView {
                 event_log::Event::info(crate::MODULE_NAME, event_kind::FRESH_HOLD_RELEASED)
                     .field("door", if door { "seeded" } else { "authority" })
                     .field("routes", have)
-                    .field("load_ms", load_ms);
+                    .field("load_ms", load_ms)
+                    .field("source_wait_ms", source_wait_ms);
+            if let Some((core, at)) = hold.sender_moved {
+                ev = ev.field("sender_core", u64::from(core)).field(
+                    "sender_moved_ms",
+                    at.saturating_duration_since(hold.began).as_millis() as u64,
+                );
+            }
             for (k, v) in [
                 ("vpp_main_cpu_ms", cpu.vpp_main_cpu_ms),
                 ("vpp_main_wait_ms", cpu.vpp_main_wait_ms),
@@ -5668,6 +5731,8 @@ impl Effects for EffectsView {
         // Before VPP exists, so its first route already has its cores to
         // itself. A fence that cannot be set is logged and skipped: VPP
         // loads more slowly without it, not wrongly.
+        // A new VPP is another main thread to watch the sender against.
+        c.sender_watch = None;
         if let Some(f) = c.core_fence.as_mut() {
             let was_held = f.is_held();
             match f.engage(std::time::Instant::now()) {
@@ -6256,6 +6321,9 @@ impl Effects for EffectsView {
                 announced: false,
                 began: std::time::Instant::now(),
                 clock: crate::load_clock::LoadClock::start(vpp_pid),
+                source_wait: std::time::Duration::ZERO,
+                idle_since: None,
+                sender_moved: None,
             });
         }
         Ok(())
