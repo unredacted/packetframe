@@ -5439,7 +5439,7 @@ mod tests {
                 .subsystem_health(now_unix(), Instant::now());
             let message = row.message.unwrap();
             assert!(
-                message.contains("reconnected") && message.contains("is held"),
+                message.contains("earlier session's routes held"),
                 "{message}"
             );
             assert_eq!(

@@ -4863,9 +4863,12 @@ stop the daemon, then `packetframe detach --all`.
       fib-integrity  healthy — bird 1272306, mirror 1272281, drift 0.002% (3m ago)
   ```
 
-  **A healthy row is the pass, and it is the only one.** The row is
-  healthy only when a steering gate would permit a steer from this
-  comparison. It carries two separate facts and you want the second:
+  **The pass is a healthy row that shows both counts and a drift, and
+  only that.** `no authority configured` and `no comparison yet` are
+  healthy rows too, but nothing has been compared, so they attest
+  nothing (see the table below). A row with counts is healthy only when
+  a steering gate would permit a steer from that comparison. It carries
+  two separate facts and you want the second:
 
   - The **drift-catch diagnostic** — `drift N%`, with `(warn at M%)`
     when at or above the threshold — is fast-path's own alarm against the

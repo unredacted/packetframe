@@ -324,8 +324,9 @@ pub(crate) fn health(state: &ActiveState) -> HealthReport {
             Ok(current) if current != *ifindex => (
                 HealthState::Degraded,
                 Some(format!(
-                    "interface recreated (ifindex {ifindex} → {current}), filter lost; \
-                     restart to re-attach"
+                    "interface recreated (ifindex {ifindex} → {current}), filter lost; run: \
+                     {}",
+                    packetframe_common::module::RESTART_SEQUENCE
                 )),
             ),
             Ok(_) => (HealthState::Healthy, None),
