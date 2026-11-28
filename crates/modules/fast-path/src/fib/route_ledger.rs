@@ -64,8 +64,11 @@
 //!   whether or not it is used — a crash loop never re-seeds a stale one.
 //!   A file that cannot be removed is refused. A crash, a `kill -9` or a
 //!   breaker trip writes nothing, so a stale one is never what a start
-//!   finds; `packetframe detach` (a full one) removes it, `detach
-//!   --keep-vpp` (the routine restart) keeps it.
+//!   finds. `packetframe detach` keeps it, `--all` included: every leg
+//!   above is checked at the start whatever ran between, so a detach
+//!   adds nothing to them, and removing the file only cost the next
+//!   start a cold load. `detach --drop-ledger` removes it, for an
+//!   operator who wants that cold load.
 //!
 //! **How a seed is used.** Every seeded advertisement goes in marked
 //! `seen_this_session = false`, exactly as if a session had just been
@@ -856,8 +859,8 @@ fn read_route(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// No ledger in `state-dir`: the previous stop was not a clean
-    /// preserving exit, or wrote nothing, or was an older build, or a
-    /// full `packetframe detach` ran since.
+    /// preserving exit, or wrote nothing, or was an older build, or
+    /// `packetframe detach --drop-ledger` ran since.
     Missing,
     /// `route-ledger off`, and a ledger from an earlier run was there.
     Disabled,
@@ -983,8 +986,8 @@ impl Refusal {
     pub fn describe(&self) -> String {
         match self {
             Refusal::Missing => "no route ledger in state-dir (the previous stop was not a clean \
-                                 `systemctl stop`, preserved nothing, predates the ledger, or a \
-                                 full `packetframe detach` ran since)"
+                                 `systemctl stop`, preserved nothing, predates the ledger, or \
+                                 `packetframe detach --drop-ledger` ran since)"
                 .into(),
             Refusal::Disabled => {
                 "`route-ledger off`; a ledger an earlier run left was removed unused".into()
@@ -1323,7 +1326,7 @@ where
     }
 }
 
-/// Remove the record if there is one. `packetframe detach` (a full one)
+/// Remove the record if there is one. `packetframe detach --drop-ledger`
 /// calls this; so does every start, through [`consume`].
 pub fn remove(state_dir: &Path) -> Result<(), String> {
     let path = path_in(state_dir);

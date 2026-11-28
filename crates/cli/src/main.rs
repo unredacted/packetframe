@@ -143,9 +143,21 @@ enum Command {
         /// `packetframe run` adopts it and steered traffic keeps flowing
         /// across the restart: stop, `detach --keep-vpp`, start. Without
         /// vpp-offload (and no VPP on record) it is the same restart: it
-        /// keeps the fast-path's route ledger and wan-egress rules.
+        /// keeps the fast-path's wan-egress rules.
         #[arg(long)]
         keep_vpp: bool,
+        /// Also remove the fast-path route ledger the last clean stop
+        /// left in `state-dir`, so the next start loads its route table
+        /// cold from the route source (minutes on a full table) instead
+        /// of seeding it in seconds. Every detach keeps the ledger
+        /// without this, `--all` included: the next start refuses one
+        /// that is too old (`max-age`), from another route source or
+        /// forwarding mode, damaged, or not root's own. Use it only when
+        /// the routes in the ledger themselves are not wanted, even until
+        /// the route source's replay replaces them: say the route
+        /// source's own filters changed while PacketFrame was down.
+        #[arg(long)]
+        drop_ledger: bool,
     },
 
     /// Show attach state and live counter values.
@@ -369,6 +381,7 @@ fn main() -> ExitCode {
             config,
             all,
             keep_vpp,
+            drop_ledger,
         } => {
             let path = detach_config_path(
                 config,
@@ -376,7 +389,7 @@ fn main() -> ExitCode {
                 keep_vpp,
                 std::path::Path::new(DEFAULT_CONFIG_PATH).exists(),
             );
-            match loader::detach(path.as_deref(), all, keep_vpp) {
+            match loader::detach(path.as_deref(), all, keep_vpp, drop_ledger) {
                 Ok(()) => ExitCode::from(EXIT_OK),
                 Err(e) => {
                     tracing::error!(error = %e);
@@ -523,5 +536,23 @@ mod detach_config_tests {
         // `--config` wins.
         let given = Some(PathBuf::from("/tmp/other.conf"));
         assert_eq!(detach_config_path(given.clone(), true, false, true), given);
+    }
+
+    /// The route ledger stays unless `--drop-ledger` says otherwise.
+    #[test]
+    fn detach_keeps_the_route_ledger_unless_told_to_drop_it() {
+        let drop_ledger =
+            |args: &[&str]| match Cli::try_parse_from([&["packetframe", "detach"], args].concat())
+                .unwrap()
+                .command
+            {
+                Command::Detach { drop_ledger, .. } => drop_ledger,
+                _ => unreachable!("parsed as detach"),
+            };
+        assert!(!drop_ledger(&[]));
+        assert!(!drop_ledger(&["--all"]));
+        assert!(!drop_ledger(&["--keep-vpp"]));
+        assert!(drop_ledger(&["--all", "--drop-ledger"]));
+        assert!(drop_ledger(&["--drop-ledger"]));
     }
 }
