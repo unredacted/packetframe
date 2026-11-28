@@ -127,10 +127,8 @@ pub fn not_attached_entry(n: &NotAttached) -> ModuleEntry {
                 name: "startup".into(),
                 state: HealthState::Degraded,
                 message: Some(format!(
-                    "did not come up at startup: {}. The eBPF fast-path is forwarding on its \
-                     own and nothing is offloaded to this module. Fix the cause, then \
-                     `{RESTART_SEQUENCE}` — a reload cannot start a module that failed to \
-                     attach, and a bare restart leaves pins the next start refuses",
+                    "failed to start: {}; fast path forwarding alone. Fix it, then run: \
+                     {RESTART_SEQUENCE}",
                     n.reason
                 )),
                 last_success_age_seconds: None,
@@ -780,7 +778,7 @@ mod tests {
             "the reason is carried: {msg}"
         );
         assert!(
-            msg.contains("fast-path is forwarding"),
+            msg.contains("fast path forwarding alone"),
             "and what still works: {msg}"
         );
         assert!(

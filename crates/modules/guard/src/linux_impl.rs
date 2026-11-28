@@ -319,14 +319,13 @@ pub(crate) fn health(state: &ActiveState) -> HealthReport {
         let (hs, message) = match ifindex_of(iface) {
             Err(_) => (
                 HealthState::Degraded,
-                Some("interface vanished; its egress filter died with it".to_string()),
+                Some("interface gone; its filter went with it".to_string()),
             ),
             Ok(current) if current != *ifindex => (
                 HealthState::Degraded,
                 Some(format!(
-                    "interface recreated (ifindex {ifindex} → {current}); the egress \
-                     filter died with the old device — restart (stop, `packetframe \
-                     detach`, start) to re-attach"
+                    "interface recreated (ifindex {ifindex} → {current}), filter lost; \
+                     restart to re-attach"
                 )),
             ),
             Ok(_) => (HealthState::Healthy, None),
@@ -348,7 +347,7 @@ pub(crate) fn health(state: &ActiveState) -> HealthReport {
             name: "enforce".to_string(),
             state: HealthState::Healthy,
             message: Some(format!(
-                "dropped={dropped} monitored={monitored} (cumulative since attach)"
+                "{dropped} dropped, {monitored} monitored since attach"
             )),
             last_success_age_seconds: None,
         });

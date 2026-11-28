@@ -48,13 +48,13 @@ pub fn health(s: &Snapshot) -> HealthReport {
                 LinkState::Absent => row(
                     name,
                     HealthState::Degraded,
-                    "link absent; waiting for RTM_NEWLINK by name".into(),
+                    "bridge missing; waiting for it to appear".into(),
                     None,
                 ),
                 LinkState::Down => row(
                     name,
                     HealthState::Degraded,
-                    "link down or without carrier; will re-seed when it comes back".into(),
+                    "link down; re-seeds when it returns".into(),
                     None,
                 ),
                 LinkState::Up => match b.silent_secs {
@@ -62,7 +62,7 @@ pub fn health(s: &Snapshot) -> HealthReport {
                         name,
                         HealthState::Degraded,
                         format!(
-                            "link up but no learnable frame for {secs}s ({} entries held)",
+                            "no ARP/ND heard for {secs}s; {} entries held",
                             b.table_entries
                         ),
                         Some(secs),
@@ -75,7 +75,7 @@ pub fn health(s: &Snapshot) -> HealthReport {
                         name,
                         HealthState::Degraded,
                         format!(
-                            "capturing without confirmed promiscuous mode, {} entries; unicast ND/ARP replies may be missed",
+                            "promiscuous mode not confirmed; unicast ARP/ND replies may be missed ({} entries)",
                             b.table_entries
                         ),
                         secs,
@@ -83,7 +83,7 @@ pub fn health(s: &Snapshot) -> HealthReport {
                     secs => row(
                         name,
                         HealthState::Healthy,
-                        format!("capturing, {} entries", b.table_entries),
+                        format!("{} entries", b.table_entries),
                         secs,
                     ),
                 },
@@ -99,21 +99,21 @@ pub fn health(s: &Snapshot) -> HealthReport {
         let mut age = None;
         for b in s.bridges.iter().filter(|b| b.link == LinkState::Up) {
             let pc = b.participant_coverage;
-            let mut piece = format!("{} participants={}/{}", b.name, pc.resolved, pc.total);
+            let mut piece = format!("{}: participants {}/{}", b.name, pc.resolved, pc.total);
             if let Some(f) = pc.fraction() {
                 if f < PARTICIPANT_COVERAGE_HEALTHY_AT {
                     state = state.worse_of(HealthState::Degraded);
                 }
             }
             match &b.route_coverage {
-                CoverageState::Pending => piece.push_str(" routes=pending"),
+                CoverageState::Pending => piece.push_str(", routes pending"),
                 CoverageState::Unavailable(why) => {
                     state = state.worse_of(HealthState::Degraded);
-                    piece.push_str(&format!(" routes=unknown ({why})"));
+                    piece.push_str(&format!(", routes unknown ({why})"));
                 }
                 CoverageState::Measured(c) => {
                     piece.push_str(&format!(
-                        " routes={}/{}",
+                        ", routes {}/{}",
                         c.nexthops.resolved, c.nexthops.total
                     ));
                     if let Some(f) = c.nexthops.fraction() {
@@ -128,7 +128,7 @@ pub fn health(s: &Snapshot) -> HealthReport {
                             .take(NEVER_HEARD_LIST_MAX)
                             .map(|a| a.to_string())
                             .collect();
-                        piece.push_str(&format!(" unresolved=[{}]", shown.join(",")));
+                        piece.push_str(&format!(", unresolved {}", shown.join(" ")));
                     }
                     age = Some(age.map_or(c.age_secs, |a: u64| a.max(c.age_secs)));
                 }
@@ -155,7 +155,7 @@ pub fn health(s: &Snapshot) -> HealthReport {
             row(
                 "peers".into(),
                 HealthState::Healthy,
-                format!("{total} configured peer addresses, all heard"),
+                format!("all {total} peer addresses heard"),
                 None,
             )
         } else {
@@ -191,14 +191,14 @@ pub fn health(s: &Snapshot) -> HealthReport {
             row(
                 "frr-gate".into(),
                 state,
-                format!("{} consecutive failures: {e}", g.consecutive_failures),
+                format!("{} failures in a row: {e}", g.consecutive_failures),
                 g.last_change_age_secs,
             )
         } else if !g.lists_present {
             row(
                 "frr-gate".into(),
                 HealthState::Degraded,
-                "prefix-lists absent; waiting for the static FRR configuration".into(),
+                "prefix-lists missing; upload the static FRR config".into(),
                 None,
             )
         } else {
@@ -211,7 +211,7 @@ pub fn health(s: &Snapshot) -> HealthReport {
                 "frr-gate".into(),
                 HealthState::Healthy,
                 format!(
-                    "reconciled, {} v4 + {} v6 permitted{pending}",
+                    "{} v4 + {} v6 permitted{pending}",
                     g.permitted_v4, g.permitted_v6
                 ),
                 g.last_change_age_secs,
@@ -240,16 +240,16 @@ pub fn health(s: &Snapshot) -> HealthReport {
                         .map(|a| a.to_string())
                         .collect();
                     let unparsed = if r.unparsed_prefixes > 0 {
-                        format!(", {} without a parsable next-hop", r.unparsed_prefixes)
+                        format!(", {} unparsable", r.unparsed_prefixes)
                     } else {
                         String::new()
                     };
                     parts.push(format!(
-                        "{}: {} demoted of {} received{unparsed}, unresolved next-hops [{}]",
+                        "{}: {} of {} demoted{unparsed}; unresolved next hops {}",
                         r.rs,
                         r.demoted_prefixes,
                         r.received_prefixes,
-                        shown.join(",")
+                        shown.join(" ")
                     ));
                 }
             }
@@ -263,13 +263,12 @@ pub fn health(s: &Snapshot) -> HealthReport {
     // the metrics.
     if s.netlink.resync_pending {
         let mut message = format!(
-            "netlink notifications lost ({} overruns); the neighbour mirror may be stale until \
-             links, addresses and neighbours are re-read",
+            "{} netlink overruns; neighbour view may be stale until re-read",
             s.netlink.overruns
         );
         if let Some(e) = &s.netlink.last_error {
             message.push_str(&format!(
-                "; the last re-read failed (retrying every {}s): {e}",
+                "; re-read failed, retrying every {}s: {e}",
                 crate::resync::RESYNC_MIN_INTERVAL.as_secs()
             ));
         }
@@ -376,7 +375,7 @@ mod tests {
             .message
             .as_deref()
             .unwrap()
-            .contains("3 demoted of 50 received, unresolved next-hops [192.0.2.90]"));
+            .contains("3 of 50 demoted; unresolved next hops 192.0.2.90"));
         snap.rs[0].demoted_prefixes = 0;
         snap.rs[0].unresolved_nexthops.clear();
         let r = health(&snap);
@@ -402,7 +401,7 @@ mod tests {
             .message
             .as_deref()
             .unwrap()
-            .starts_with("capturing, 100"));
+            .starts_with("100 entries"));
     }
 
     #[test]
@@ -418,7 +417,7 @@ mod tests {
             .message
             .as_deref()
             .unwrap()
-            .contains("link absent"));
+            .contains("bridge missing"));
         assert_eq!(r.overall, HealthState::Degraded);
         // Coverage skips bridges that are not up.
         assert_eq!(
@@ -441,7 +440,7 @@ mod tests {
             .message
             .as_deref()
             .unwrap()
-            .contains("without confirmed promiscuous mode"));
+            .contains("promiscuous mode not confirmed"));
     }
 
     #[test]
@@ -495,7 +494,7 @@ mod tests {
             .message
             .as_deref()
             .unwrap()
-            .contains("routes=8/10 unresolved=[192.0.2.1,192.0.2.2]"));
+            .contains("routes 8/10, unresolved 192.0.2.1 192.0.2.2"));
 
         let mut b = up("br0");
         b.participant_coverage = Ratio {
@@ -519,7 +518,7 @@ mod tests {
             .message
             .as_deref()
             .unwrap()
-            .contains("routes=unknown"));
+            .contains("routes unknown"));
 
         let mut b = up("br0");
         b.route_coverage = CoverageState::Pending;
@@ -532,7 +531,7 @@ mod tests {
             .message
             .as_deref()
             .unwrap()
-            .contains("routes=pending"));
+            .contains("routes pending"));
     }
 
     #[test]
@@ -573,12 +572,12 @@ mod tests {
         assert_eq!(r.overall, HealthState::Degraded);
         let n = state_of(&r, "netlink");
         assert_eq!(n.state, HealthState::Degraded);
-        assert!(n.message.as_deref().unwrap().contains("3 overruns"));
+        assert!(n.message.as_deref().unwrap().contains("3 netlink overruns"));
 
         snap.netlink.last_error = Some("neighbour dump: no reply within 30s".into());
         let r = health(&snap);
         let m = state_of(&r, "netlink").message.clone().unwrap();
-        assert!(m.contains("the last re-read failed"), "{m}");
+        assert!(m.contains("re-read failed"), "{m}");
         assert!(m.contains("no reply within 30s"), "{m}");
 
         snap.netlink.resync_pending = false;

@@ -52,18 +52,14 @@ pub fn health(p: &Published, heartbeat_age: Duration, panicked: Option<&str>) ->
         rows.push(row(
             "worker",
             HealthState::Unhealthy,
-            format!(
-                "the export worker panicked ({why}): sampling is stopped and nothing is \
-                 exported; restart the daemon to resume"
-            ),
+            format!("worker panicked ({why}); nothing exported until a restart"),
         ));
     } else if stalled {
         rows.push(row(
             "worker",
             HealthState::Unhealthy,
             format!(
-                "the export worker has not run for {} ms: nothing is exported and every \
-                 port is uncovered",
+                "worker stalled for {} ms; nothing exported",
                 heartbeat_age.as_millis()
             ),
         ));
@@ -76,7 +72,7 @@ pub fn health(p: &Published, heartbeat_age: Duration, panicked: Option<&str>) ->
             "sampling",
             HealthState::Degraded,
             format!(
-                "{e}; 1:{}, {} header bytes, generation {} stays applied",
+                "{e}; still 1:{}, {} header bytes (generation {})",
                 p.rate, p.header_bytes, p.generation
             ),
         ),
@@ -84,8 +80,7 @@ pub fn health(p: &Published, heartbeat_age: Duration, panicked: Option<&str>) ->
             "sampling",
             HealthState::Degraded,
             format!(
-                "over budget: 1:{} is denser than the 1:{} the sampler's cost is \
-                 qualified at",
+                "over budget: 1:{} is denser than the qualified 1:{}",
                 p.rate,
                 packetframe_common::config::FLOW_BUDGET_RATE
             ),
@@ -106,16 +101,14 @@ pub fn health(p: &Published, heartbeat_age: Duration, panicked: Option<&str>) ->
         let mut parts = Vec::new();
         if path == Path::Vpp {
             let Some(v) = &p.vpp else { continue };
-            let epoch = v
-                .epoch
-                .map_or_else(String::new, |e| format!("; epoch {e:016x}"));
             let generations = match (v.applied, v.written) {
-                (Some(a), Some(w)) => format!(", generation {a} applied of {w} asked"),
-                (None, Some(w)) => format!(", generation {w} asked"),
+                (Some(a), Some(w)) if a == w => format!(" (generation {a})"),
+                (Some(a), Some(w)) => format!(" (generation {a} of {w})"),
+                (None, Some(w)) => format!(" (generation {w} pending)"),
                 _ => String::new(),
             };
             parts.push(format!(
-                "sampler {}: {}{epoch}{generations}",
+                "sampler {}: {}{generations}",
                 v.coverage.name(),
                 v.why
             ));
@@ -154,7 +147,7 @@ pub fn health(p: &Published, heartbeat_age: Duration, panicked: Option<&str>) ->
         rows.push(row(
             "ports",
             HealthState::Degraded,
-            format!("fast-path's port list could not be read (the last one stands): {e}"),
+            format!("can't read fast-path's port list, using the last one: {e}"),
         ));
     }
 
@@ -173,8 +166,7 @@ pub fn health(p: &Published, heartbeat_age: Duration, panicked: Option<&str>) ->
                 format!("collector {}", c.name),
                 HealthState::Healthy,
                 format!(
-                    "{} to {} ({kind}): {} datagrams submitted; receipt is the \
-                     collector's to confirm",
+                    "{} to {} ({kind}), {} datagrams sent",
                     c.format.name(),
                     c.addr,
                     c.datagrams
@@ -465,8 +457,7 @@ mod tests {
         assert_eq!(r.state, HealthState::Unhealthy);
         let m = r.message.unwrap();
         assert!(
-            m.contains("epoch 0000000000000007, generation 3 applied of 3 asked")
-                && m.contains("eth3 uncovered"),
+            m.contains("(generation 3)") && m.contains("eth3 uncovered"),
             "{m}"
         );
         let mut out = String::new();
@@ -502,11 +493,7 @@ mod tests {
             .iter()
             .find(|r| r.name == "collector fnm")
             .unwrap();
-        assert!(c
-            .message
-            .as_deref()
-            .unwrap()
-            .contains("receipt is the collector's to confirm"));
+        assert!(c.message.as_deref().unwrap().contains("datagrams sent"));
         assert_eq!(h.overall, HealthState::Degraded);
     }
 
@@ -550,7 +537,7 @@ mod tests {
             s.message
                 .as_deref()
                 .unwrap()
-                .contains("1:1000, 128 header bytes, generation 1 stays"),
+                .contains("still 1:1000, 128 header bytes (generation 1)"),
             "{:?}",
             s.message
         );
