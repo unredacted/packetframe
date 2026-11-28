@@ -1852,6 +1852,7 @@ impl StatusSnapshot {
                 summary,
                 age,
                 reruns,
+                table,
                 ..
             } => {
                 let c = self.counts;
@@ -1865,16 +1866,26 @@ impl StatusSnapshot {
                 } else {
                     "not re-run"
                 };
-                (
-                    HealthState::Degraded,
-                    Some(format!(
-                        "{summary} ({} ago); now {} installed, {} withheld, {} \
-                         unresolvable{}{}; {when}",
-                        ago(*age),
+                // The table's counts only when they add something: a route
+                // still withheld or unresolvable, or a table that changed
+                // since the verify (which may have resolved what it
+                // caught). The same all-clear table again is noise.
+                let now = if c.withheld > 0 || c.unresolvable > 0 || c.installed != *table {
+                    format!(
+                        "; now {} installed, {} withheld, {} unresolvable{}",
                         c.installed,
                         c.withheld,
                         c.unresolvable,
                         named(&self.unresolvable_named),
+                    )
+                } else {
+                    String::new()
+                };
+                (
+                    HealthState::Degraded,
+                    Some(format!(
+                        "{summary} ({} ago){now}{}; {when}",
+                        ago(*age),
                         self.kernel_delivered_note(),
                     )),
                 )
