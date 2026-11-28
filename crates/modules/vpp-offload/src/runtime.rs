@@ -5672,15 +5672,23 @@ impl Effects for EffectsView {
             let was_held = f.is_held();
             match f.engage(std::time::Instant::now()) {
                 Ok(()) if !was_held => {
+                    let sender_core = f.sender_core();
                     if let Some(r) = f.record() {
                         tracing::info!(
                             allowed = %r.allowed,
                             cgroups = r.cgroups.len(),
                             threads_pinned = r.threads.len(),
+                            sender_core = ?sender_core,
                             "fenced other userland off VPP's cores for the fresh load"
                         );
-                        event_log::Event::info(crate::MODULE_NAME, event_kind::CORES_FENCED)
-                            .field("allowed", r.allowed.clone())
+                        let mut ev =
+                            event_log::Event::info(crate::MODULE_NAME, event_kind::CORES_FENCED);
+                        // Where the sending thread runs for the load, when it
+                        // was moved onto VPP's main core.
+                        if let Some(core) = sender_core {
+                            ev = ev.field("sender_core", u64::from(core));
+                        }
+                        ev.field("allowed", r.allowed.clone())
                             .field("vpp_cores", crate::cores::format_cpu_list(&r.vpp_cores))
                             .field(
                                 "cgroups",

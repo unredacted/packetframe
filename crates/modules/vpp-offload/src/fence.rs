@@ -65,6 +65,26 @@
 //! While fenced, a top-level cgroup created after the fence began is
 //! fenced too, and one whose CPUs were changed back (systemd re-realising
 //! a slice) is fenced again ([`REFRESH_EVERY`]).
+//!
+//! ## The sender goes onto VPP's main core
+//!
+//! The load has two ends: VPP's main thread, and this daemon's thread that
+//! sends it the routes and reads the replies (the supervision thread). The
+//! fence clears VPP's cores, but the sender stays on the cores it leaves
+//! to everything else, and on a gateway that boots into full traffic
+//! those carry the eBPF tier's softirq, which no priority preempts. On the
+//! reference deployment (2026-11-28) VPP's main thread was on CPU for 84 s
+//! of a 454 s load while the sender spent 132 s runnable and not running;
+//! on the lab, with every other core saturated with softirq, a load that
+//! takes 7.5 s idle took 37 s, and `nice -20` on the sender changed
+//! nothing. So while the fence is held the sending thread is pinned to
+//! VPP's main core ([`CoreFence::with_sender_core`]), which the fence keeps
+//! clear of other userland and attach keeps clear of NIC interrupts. The
+//! main thread waits on the sender for most of a load anyway, so the two
+//! take turns on one core rather than competing with the box. A fresh VPP
+//! carries no traffic until the load is done, so its main core has nothing
+//! else to do. The release puts the thread's own CPUs back. Nothing is
+//! recorded for it: the thread is this daemon's, and dies with it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -175,6 +195,9 @@ pub struct Released {
     /// Recorded threads that had exited, or whose id now belongs to
     /// another thread.
     pub threads_gone: usize,
+    /// The sending thread was given its own CPUs back
+    /// ([`CoreFence::with_sender_core`]).
+    pub sender_restored: bool,
     /// What could not be put back, by cgroup or thread.
     pub failures: Vec<String>,
 }
@@ -188,6 +211,17 @@ pub trait FenceOps {
         std::fs::write(file, format!("{cpus}\n"))
     }
     fn set_affinity(&self, tid: i32, cpus: &[u16]) -> std::io::Result<()>;
+    /// The calling thread's id: the sender [`CoreFence::engage`] places.
+    fn current_tid(&self) -> Option<i32> {
+        #[cfg(target_os = "linux")]
+        {
+            Some(unsafe { libc::syscall(libc::SYS_gettid) } as i32)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
 }
 
 /// The live host: the cgroup files, and `sched_setaffinity(2)`.
@@ -250,6 +284,9 @@ pub struct CoreFence {
     vpp_cores: Vec<u16>,
     /// This daemon's own top-level cgroup, never fenced ([`own_top_level`]).
     own: Option<String>,
+    /// VPP's main core, where the sending thread runs while the fence is
+    /// held ([`Self::with_sender_core`]).
+    sender_core: Option<u16>,
     held: Option<Held>,
 }
 
@@ -259,6 +296,13 @@ struct Held {
     online: Vec<u16>,
     since: Instant,
     last_refresh: Instant,
+    sender: Option<SenderPin>,
+}
+
+/// The sending thread, moved onto VPP's main core, and its own CPUs.
+struct SenderPin {
+    tid: i32,
+    previous: Vec<u16>,
 }
 
 fn now_unix() -> u64 {
@@ -320,8 +364,27 @@ impl CoreFence {
             boot_id: boot_id.into(),
             vpp_cores,
             own,
+            sender_core: None,
             held: None,
         }
+    }
+
+    /// While held, run the thread that engaged the fence (the supervision
+    /// thread, which sends the load) on `core`, VPP's main core. See the
+    /// module docs. Only for a `core` the daemon was allowed before attach
+    /// kept it off VPP's cores: an operator's `CPUAffinity=` that left the
+    /// main core out stays in force.
+    pub fn with_sender_core(mut self, core: u16) -> Self {
+        self.sender_core = Some(core);
+        self
+    }
+
+    /// The core the sending thread is on while held, if it was moved.
+    pub fn sender_core(&self) -> Option<u16> {
+        self.held
+            .as_ref()
+            .and_then(|h| h.sender.as_ref())
+            .and(self.sender_core)
     }
 
     pub fn is_held(&self) -> bool {
@@ -391,6 +454,7 @@ impl CoreFence {
             online,
             since: now,
             last_refresh: now,
+            sender: None,
         };
         self.held = Some(held);
         // Nothing is fenced unless the record of it can be written first.
@@ -399,7 +463,43 @@ impl CoreFence {
             return Err(e);
         }
         self.refresh(now, true);
+        self.place_sender();
         Ok(())
+    }
+
+    /// Move the calling thread onto the sender core, remembering its CPUs.
+    /// A failure is a warning: the load is slower without it, not wrong.
+    fn place_sender(&mut self) {
+        let Some(core) = self.sender_core else {
+            return;
+        };
+        let Some(tid) = self.ops.current_tid() else {
+            return;
+        };
+        let Some(previous) = thread_cpus(&self.paths.proc_root, tid) else {
+            tracing::warn!(
+                tid,
+                "could not read the sending thread's CPUs; it stays where it is for the load"
+            );
+            return;
+        };
+        if previous == [core] {
+            return;
+        }
+        match self.ops.set_affinity(tid, &[core]) {
+            Ok(()) => {
+                if let Some(h) = self.held.as_mut() {
+                    h.sender = Some(SenderPin { tid, previous });
+                }
+            }
+            Err(e) => tracing::warn!(
+                tid,
+                core,
+                error = %e,
+                "could not move the sending thread onto VPP's main core; it stays where it \
+                 is for the load"
+            ),
+        }
     }
 
     /// While held: fence top-level cgroups that appeared since, and put
@@ -536,8 +636,16 @@ impl CoreFence {
     /// or `packetframe detach` to retry. A no-op when nothing is held.
     pub fn release(&mut self) -> Option<Released> {
         let h = self.held.take()?;
-        let (released, residual) = undo(&self.paths, self.ops.as_ref(), &h.record);
+        let (mut released, residual) = undo(&self.paths, self.ops.as_ref(), &h.record);
         settle_record(&self.paths.record(), residual);
+        if let Some(s) = h.sender {
+            match self.ops.set_affinity(s.tid, &s.previous) {
+                Ok(()) => released.sender_restored = true,
+                Err(e) => released
+                    .failures
+                    .push(format!("sending thread {}: {e}", s.tid)),
+            }
+        }
         Some(released)
     }
 }
@@ -690,6 +798,7 @@ pub fn report(reason: &str, held: Duration, r: &Released) {
             held_ms = held.as_millis() as u64,
             cgroups = r.cgroups.len(),
             threads_restored = r.threads_restored,
+            sender_restored = r.sender_restored,
             "let the core fence go"
         );
     } else {
@@ -705,6 +814,7 @@ pub fn report(reason: &str, held: Duration, r: &Released) {
         .field("cgroups", r.cgroups.join(","))
         .field("threads_restored", r.threads_restored as u64)
         .field("threads_gone", r.threads_gone as u64)
+        .field("sender_restored", r.sender_restored)
         .field("failures", r.failures.len() as u64)
         .field("failed", r.failures.join("; "))
         .emit();
@@ -777,8 +887,9 @@ mod tests {
     /// Each `set` call: the thread and the CPUs it was given.
     type Calls = Rc<RefCell<Vec<(i32, Vec<u16>)>>>;
 
+    /// The calls, and the thread id [`FenceOps::current_tid`] answers.
     #[derive(Clone, Default)]
-    struct FakeAffinity(Calls);
+    struct FakeAffinity(Calls, Option<i32>);
 
     impl FenceOps for FakeAffinity {
         /// As kernel 5.15 does: an empty list is refused for a cgroup
@@ -797,6 +908,10 @@ mod tests {
         fn set_affinity(&self, tid: i32, cpus: &[u16]) -> std::io::Result<()> {
             self.0.borrow_mut().push((tid, cpus.to_vec()));
             Ok(())
+        }
+
+        fn current_tid(&self) -> Option<i32> {
+            self.1
         }
     }
 
@@ -930,6 +1045,68 @@ mod tests {
         assert_eq!(r.cgroups.len(), 3);
         assert!(!fx.paths.state_dir.join(RECORD_FILE).exists());
         assert!(aff.0.borrow().is_empty(), "no thread was pinned");
+    }
+
+    #[test]
+    fn the_sender_runs_on_vpps_main_core_while_held_and_gets_its_cpus_back() {
+        let fx = Fixture::new("sender");
+        fx.cgroup("os.slice", "", &[], &[]);
+        fx.thread(4242, 1, "0-14");
+        let aff = FakeAffinity(Calls::default(), Some(4242));
+        let mut f = fence(&fx, &aff).with_sender_core(15);
+        assert_eq!(f.sender_core(), None, "nothing is moved before the fence");
+        let t0 = Instant::now();
+        f.engage(t0).unwrap();
+        assert_eq!(f.sender_core(), Some(15));
+        assert_eq!(*aff.0.borrow(), vec![(4242, vec![15])]);
+
+        // A respawn under a held fence is a refresh: the sender is not
+        // moved again, and its own CPUs are still the ones remembered.
+        fx.thread(4242, 1, "15");
+        f.engage(t0).unwrap();
+        assert_eq!(aff.0.borrow().len(), 1);
+
+        let r = f.release().unwrap();
+        assert!(r.sender_restored);
+        assert!(r.failures.is_empty(), "{:?}", r.failures);
+        assert_eq!(aff.0.borrow()[1], (4242, (0..=14).collect::<Vec<u16>>()));
+        assert_eq!(f.sender_core(), None);
+    }
+
+    #[test]
+    fn a_sender_that_cannot_be_moved_stays_put_and_the_fence_holds() {
+        struct NoMove(FakeAffinity);
+        impl FenceOps for NoMove {
+            fn write_cpuset(&self, file: &Path, cpus: &str) -> std::io::Result<()> {
+                self.0.write_cpuset(file, cpus)
+            }
+            fn set_affinity(&self, _tid: i32, _cpus: &[u16]) -> std::io::Result<()> {
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            }
+            fn current_tid(&self) -> Option<i32> {
+                Some(4242)
+            }
+        }
+        let fx = Fixture::new("nomove");
+        fx.cgroup("os.slice", "", &[], &[]);
+        fx.thread(4242, 1, "0-14");
+        let mut f = CoreFence::new(
+            fx.paths(),
+            Box::new(NoMove(FakeAffinity::default())),
+            "boot-a",
+            vec![17, 15, 16],
+        )
+        .with_sender_core(15);
+        f.engage(Instant::now()).unwrap();
+        assert!(f.is_held());
+        assert_eq!(fx.cpus("os.slice"), "0-14");
+        assert_eq!(f.sender_core(), None);
+        let r = f.release().unwrap();
+        assert!(
+            !r.sender_restored,
+            "nothing was moved, so nothing is put back"
+        );
+        assert!(r.failures.is_empty(), "{:?}", r.failures);
     }
 
     #[test]

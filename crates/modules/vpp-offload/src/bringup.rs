@@ -1378,6 +1378,10 @@ fn finish(
         }
     }
     vacate.sort_unstable();
+    // Asked before the restriction below takes VPP's cores away: the
+    // sending thread borrows VPP's main core for a fresh load only where
+    // the daemon's own policy allowed it (`fence::CoreFence::with_sender_core`).
+    let sender_may_use_main = cores::calling_thread_allows(core_map.main);
     match cores::restrict_daemon_from(&vacate) {
         // `0` is NOT success: no mask changed, so the daemon is still
         // free to run on VPP's cores. Logging it as a restriction would
@@ -1536,6 +1540,7 @@ fn finish(
         std::iter::once(core_map.main)
             .chain(core_map.workers.iter().copied())
             .collect::<Vec<u16>>(),
+        sender_may_use_main.then_some(core_map.main),
     );
     let kernel_path_inputs = (
         paths.sys.sysfs_net.clone(),
@@ -1693,12 +1698,21 @@ fn finish(
         ));
         #[cfg(target_os = "linux")]
         match crate::process::boot_id() {
-            Ok(boot) => runtime.core_fence(crate::fence::CoreFence::new(
-                crate::fence::FencePaths::live(fence_inputs.0.clone()),
-                Box::new(crate::fence::LiveOps),
-                boot,
-                fence_inputs.1.clone(),
-            )),
+            Ok(boot) => {
+                let fence = crate::fence::CoreFence::new(
+                    crate::fence::FencePaths::live(fence_inputs.0.clone()),
+                    Box::new(crate::fence::LiveOps),
+                    boot,
+                    fence_inputs.1.clone(),
+                );
+                // The fresh load's sender onto VPP's main core while the
+                // fence holds it clear (`crate::fence`, "The sender goes
+                // onto VPP's main core").
+                runtime.core_fence(match fence_inputs.2 {
+                    Some(main) => fence.with_sender_core(main),
+                    None => fence,
+                })
+            }
             Err(e) => tracing::warn!(
                 error = %e,
                 "no boot_id; a fresh VPP loads without the core fence"

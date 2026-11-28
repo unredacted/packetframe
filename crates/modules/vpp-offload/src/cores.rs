@@ -733,6 +733,25 @@ pub fn restrict_daemon_from(_vpp_cores: &[u16]) -> Result<usize, String> {
     // Non-Linux never attaches a VPP; there is nothing to protect.
     Ok(0)
 }
+
+/// Whether the calling thread may run on `cpu`. Asked before
+/// [`restrict_daemon_from`] takes VPP's cores away, so the answer is the
+/// daemon's own policy: `CPUAffinity=` or a taskset that left `cpu` out
+/// reads as `false`.
+#[cfg(target_os = "linux")]
+pub fn calling_thread_allows(cpu: u16) -> bool {
+    let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let rc =
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut mask) };
+    rc == 0
+        && (cpu as usize) < libc::CPU_SETSIZE as usize
+        && unsafe { libc::CPU_ISSET(cpu as usize, &mask) }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn calling_thread_allows(_cpu: u16) -> bool {
+    false
+}
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod affinity_tests {
     use super::*;
