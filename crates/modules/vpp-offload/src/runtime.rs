@@ -1130,6 +1130,14 @@ struct FreshHold {
     /// one, from the same start: the release event says which side the
     /// load's time went to ([`crate::load_clock`]).
     clock: crate::load_clock::LoadClock,
+    /// How long VPP has held everything the mirror did while the hold
+    /// waited on the route source or its authority (a seed's replay, a
+    /// feed still dumping): from each idle drain to the next drain that
+    /// had routes to send. The release event's `source_wait_ms`; the rest
+    /// of `load_ms` is VPP's load itself.
+    source_wait: std::time::Duration,
+    /// Since when the drain has been idle, while it is.
+    idle_since: Option<std::time::Instant>,
 }
 
 /// The loaded-and-quiet release of a STEERED adopted stage, with the feed
@@ -5574,7 +5582,13 @@ impl ObserveView {
         // drained backlog either way — what the door vouches for is the
         // mirror, and VPP has to hold all of it before verify samples it.
         let mut release_hold = false;
+        if let (Ok(crate::driver::Drain::More), Some(hold)) = (&r, fresh_hold.as_mut()) {
+            if let Some(t) = hold.idle_since.take() {
+                hold.source_wait += t.elapsed();
+            }
+        }
         if let (Ok(crate::driver::Drain::Idle), Some(hold)) = (&r, fresh_hold.as_mut()) {
+            let idle_since = *hold.idle_since.get_or_insert_with(std::time::Instant::now);
             let have = source.route_count();
             let attested = authority_current(completeness, have) == Some(true);
             let door = !attested
@@ -5619,9 +5633,11 @@ impl ObserveView {
                 );
             }
             let load_ms = hold.began.elapsed().as_millis() as u64;
+            let source_wait_ms = (hold.source_wait + idle_since.elapsed()).as_millis() as u64;
             let cpu = hold.clock.read();
             tracing::info!(
                 load_ms,
+                source_wait_ms,
                 vpp_main_cpu_ms = ?cpu.vpp_main_cpu_ms,
                 vpp_main_wait_ms = ?cpu.vpp_main_wait_ms,
                 sender_cpu_ms = ?cpu.sender_cpu_ms,
@@ -5632,7 +5648,8 @@ impl ObserveView {
                 event_log::Event::info(crate::MODULE_NAME, event_kind::FRESH_HOLD_RELEASED)
                     .field("door", if door { "seeded" } else { "authority" })
                     .field("routes", have)
-                    .field("load_ms", load_ms);
+                    .field("load_ms", load_ms)
+                    .field("source_wait_ms", source_wait_ms);
             for (k, v) in [
                 ("vpp_main_cpu_ms", cpu.vpp_main_cpu_ms),
                 ("vpp_main_wait_ms", cpu.vpp_main_wait_ms),
@@ -6264,6 +6281,8 @@ impl Effects for EffectsView {
                 announced: false,
                 began: std::time::Instant::now(),
                 clock: crate::load_clock::LoadClock::start(vpp_pid),
+                source_wait: std::time::Duration::ZERO,
+                idle_since: None,
             });
         }
         Ok(())
