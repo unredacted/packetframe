@@ -66,7 +66,7 @@
 //! fenced too, and one whose CPUs were changed back (systemd re-realising
 //! a slice) is fenced again ([`REFRESH_EVERY`]).
 //!
-//! ## The sender goes onto VPP's main core
+//! ## A starved sender goes onto VPP's main core
 //!
 //! The load has two ends: VPP's main thread, and this daemon's thread that
 //! sends it the routes and reads the replies (the supervision thread). The
@@ -77,14 +77,19 @@
 //! of a 454 s load while the sender spent 132 s runnable and not running;
 //! on the lab, with every other core saturated with softirq, a load that
 //! takes 7.5 s idle took 37 s, and `nice -20` on the sender changed
-//! nothing. So while the fence is held the sending thread is pinned to
-//! VPP's main core ([`CoreFence::with_sender_core`]), which the fence keeps
-//! clear of other userland and attach keeps clear of NIC interrupts. The
-//! main thread waits on the sender for most of a load anyway, so the two
-//! take turns on one core rather than competing with the box. A fresh VPP
-//! carries no traffic until the load is done, so its main core has nothing
-//! else to do. The release puts the thread's own CPUs back. Nothing is
-//! recorded for it: the thread is this daemon's, and dies with it.
+//! nothing.
+//!
+//! So while the fence is held, a sender that is starved is moved onto
+//! VPP's main core ([`CoreFence::move_sender`]), which the fence keeps
+//! clear of other userland and attach keeps clear of NIC interrupts. A
+//! fresh VPP carries no traffic until the load is done, so its main core
+//! has nothing else to do. Not from the start: sharing one core, the two
+//! threads take turns, and a load costs the sum of their CPU time rather
+//! than the larger of the two, which on an idle box is slower (on the lab,
+//! 12.9 s against 7.5 s). The caller decides when the sender's wait has
+//! come to cost more than that ([`crate::load_clock::SenderWatch`]). The
+//! release puts the thread's own CPUs back. Nothing is recorded for it:
+//! the thread is this daemon's, and dies with it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -369,14 +374,20 @@ impl CoreFence {
         }
     }
 
-    /// While held, run the thread that engaged the fence (the supervision
-    /// thread, which sends the load) on `core`, VPP's main core. See the
-    /// module docs. Only for a `core` the daemon was allowed before attach
-    /// kept it off VPP's cores: an operator's `CPUAffinity=` that left the
-    /// main core out stays in force.
+    /// Let [`Self::move_sender`] put the sending thread on `core`, VPP's
+    /// main core, while the fence is held. See the module docs. Only for a
+    /// `core` the daemon was allowed before attach kept it off VPP's
+    /// cores: an operator's `CPUAffinity=` that left the main core out
+    /// stays in force.
     pub fn with_sender_core(mut self, core: u16) -> Self {
         self.sender_core = Some(core);
         self
+    }
+
+    /// Whether [`Self::move_sender`] has something to do: a fence held,
+    /// a sender core, and the sender not moved yet.
+    pub fn sender_movable(&self) -> bool {
+        self.sender_core.is_some() && self.held.as_ref().is_some_and(|h| h.sender.is_none())
     }
 
     /// The core the sending thread is on while held, if it was moved.
@@ -463,42 +474,51 @@ impl CoreFence {
             return Err(e);
         }
         self.refresh(now, true);
-        self.place_sender();
         Ok(())
     }
 
-    /// Move the calling thread onto the sender core, remembering its CPUs.
-    /// A failure is a warning: the load is slower without it, not wrong.
-    fn place_sender(&mut self) {
-        let Some(core) = self.sender_core else {
-            return;
-        };
-        let Some(tid) = self.ops.current_tid() else {
-            return;
-        };
+    /// While held: move the calling thread, the sender, onto the sender
+    /// core for the rest of the fence, remembering its CPUs for the
+    /// release. The core when it moved; `None` when there is nothing to
+    /// move ([`Self::sender_movable`]) or the move failed, which is a
+    /// warning: the load is slower without it, not wrong.
+    pub fn move_sender(&mut self) -> Option<u16> {
+        if !self.sender_movable() {
+            return None;
+        }
+        let core = self.sender_core?;
+        let tid = self.ops.current_tid()?;
+        self.pin_sender(core, tid).then_some(core)
+    }
+
+    fn pin_sender(&mut self, core: u16, tid: i32) -> bool {
         let Some(previous) = thread_cpus(&self.paths.proc_root, tid) else {
             tracing::warn!(
                 tid,
                 "could not read the sending thread's CPUs; it stays where it is for the load"
             );
-            return;
+            return false;
         };
         if previous == [core] {
-            return;
+            return false;
         }
         match self.ops.set_affinity(tid, &[core]) {
             Ok(()) => {
                 if let Some(h) = self.held.as_mut() {
                     h.sender = Some(SenderPin { tid, previous });
                 }
+                true
             }
-            Err(e) => tracing::warn!(
+            Err(e) => {
+                tracing::warn!(
                 tid,
                 core,
                 error = %e,
-                "could not move the sending thread onto VPP's main core; it stays where it \
-                 is for the load"
-            ),
+                    "could not move the sending thread onto VPP's main core; it stays where \
+                     it is for the load"
+                );
+                false
+            }
         }
     }
 
@@ -1054,15 +1074,21 @@ mod tests {
         fx.thread(4242, 1, "0-14");
         let aff = FakeAffinity(Calls::default(), Some(4242));
         let mut f = fence(&fx, &aff).with_sender_core(15);
-        assert_eq!(f.sender_core(), None, "nothing is moved before the fence");
+        assert_eq!(f.move_sender(), None, "nothing is moved without a fence");
         let t0 = Instant::now();
         f.engage(t0).unwrap();
+        assert!(aff.0.borrow().is_empty(), "the fence alone moves no sender");
+        assert!(f.sender_movable());
+        assert_eq!(f.move_sender(), Some(15));
         assert_eq!(f.sender_core(), Some(15));
         assert_eq!(*aff.0.borrow(), vec![(4242, vec![15])]);
 
-        // A respawn under a held fence is a refresh: the sender is not
-        // moved again, and its own CPUs are still the ones remembered.
+        // Moved once per fence: neither a second ask nor a respawn under
+        // the held fence moves it again, and its own CPUs are still the
+        // ones remembered.
         fx.thread(4242, 1, "15");
+        assert!(!f.sender_movable());
+        assert_eq!(f.move_sender(), None);
         f.engage(t0).unwrap();
         assert_eq!(aff.0.borrow().len(), 1);
 
@@ -1100,6 +1126,7 @@ mod tests {
         f.engage(Instant::now()).unwrap();
         assert!(f.is_held());
         assert_eq!(fx.cpus("os.slice"), "0-14");
+        assert_eq!(f.move_sender(), None);
         assert_eq!(f.sender_core(), None);
         let r = f.release().unwrap();
         assert!(

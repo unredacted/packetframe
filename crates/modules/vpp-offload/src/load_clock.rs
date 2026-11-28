@@ -100,6 +100,69 @@ impl LoadClock {
     }
 }
 
+/// How long [`SenderWatch`] watches before it judges.
+pub const SENDER_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Waiting for a CPU below this in a window is not starvation, whatever
+/// VPP's main thread did.
+pub const SENDER_WAIT_FLOOR_MS: u64 = 200;
+
+/// Whether the sender would load faster on VPP's main core.
+///
+/// Sharing that core, the sender waits for VPP's main thread's turns, so
+/// the move costs it about the main thread's CPU time. It pays when the
+/// sender already waits longer than that for a CPU on its own cores: over
+/// a [`SENDER_WINDOW`], `sender_wait` above `vpp_main_cpu` (and above
+/// [`SENDER_WAIT_FLOOR_MS`]). On the lab, idle, the sender waited 16 ms in
+/// a 7.5 s load; with every other core in softirq it waited 32 s of 37 s
+/// while VPP's main thread ran 7 s, and moved, the load took 14 s; with
+/// CPU hogs at nice -15 it waited 4.1 s while VPP ran 5.8 s, and the load
+/// took 8.5 s where it would have taken 12 s moved.
+pub struct SenderWatch {
+    clock: LoadClock,
+    last: Option<(std::time::Instant, LoadCpu)>,
+}
+
+impl SenderWatch {
+    /// Watch VPP's main thread (`vpp_pid`) and the calling thread.
+    pub fn start(vpp_pid: Option<i32>) -> Self {
+        Self {
+            clock: LoadClock::start(vpp_pid),
+            last: None,
+        }
+    }
+
+    /// `true` when the window that ended at `now` shows the sender
+    /// starved. At most one judgement per window.
+    pub fn starved(&mut self, now: std::time::Instant) -> bool {
+        let cpu = self.clock.read();
+        judge(&mut self.last, now, cpu)
+    }
+}
+
+fn judge(
+    last: &mut Option<(std::time::Instant, LoadCpu)>,
+    now: std::time::Instant,
+    cpu: LoadCpu,
+) -> bool {
+    let Some((at, prev)) = *last else {
+        *last = Some((now, cpu));
+        return false;
+    };
+    if now.saturating_duration_since(at) < SENDER_WINDOW {
+        return false;
+    }
+    *last = Some((now, cpu));
+    let delta = |a: Option<u64>, b: Option<u64>| a.zip(b).map(|(a, b)| a.saturating_sub(b));
+    match (
+        delta(cpu.sender_wait_ms, prev.sender_wait_ms),
+        delta(cpu.vpp_main_cpu_ms, prev.vpp_main_cpu_ms),
+    ) {
+        (Some(wait), Some(vpp)) => wait >= SENDER_WAIT_FLOOR_MS && wait > vpp,
+        _ => false,
+    }
+}
+
 /// This process's pid and the calling thread's tid.
 #[cfg(target_os = "linux")]
 fn own_ids() -> Option<(i32, i32)> {
@@ -151,6 +214,57 @@ mod tests {
             }
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn reading(sender_wait: u64, vpp_cpu: u64) -> LoadCpu {
+        LoadCpu {
+            vpp_main_cpu_ms: Some(vpp_cpu),
+            vpp_main_wait_ms: Some(0),
+            sender_cpu_ms: Some(0),
+            sender_wait_ms: Some(sender_wait),
+        }
+    }
+
+    #[test]
+    fn a_sender_waiting_longer_than_vpp_runs_is_starved_once_a_window_shows_it() {
+        let t0 = std::time::Instant::now();
+        let mut last = None;
+        assert!(
+            !judge(&mut last, t0, reading(0, 0)),
+            "the first reading only starts the window"
+        );
+        let half = t0 + SENDER_WINDOW / 2;
+        assert!(
+            !judge(&mut last, half, reading(5_000, 100)),
+            "not before the window is up"
+        );
+        // Softirq on every other core: 1.7 s waiting, VPP 0.4 s on CPU.
+        assert!(judge(&mut last, t0 + SENDER_WINDOW, reading(1_700, 400)));
+        // CPU hogs at nice -15: 1 s waiting, VPP 1.4 s on CPU.
+        let t1 = t0 + SENDER_WINDOW * 2;
+        assert!(!judge(&mut last, t1, reading(2_700, 1_800)));
+        // Idle VPP and a sender that barely waits: under the floor.
+        let t2 = t0 + SENDER_WINDOW * 3;
+        assert!(!judge(&mut last, t2, reading(2_850, 1_800)));
+    }
+
+    #[test]
+    fn a_thread_that_cannot_be_read_is_never_judged_starved() {
+        let t0 = std::time::Instant::now();
+        let mut last = None;
+        let unknown = LoadCpu {
+            vpp_main_cpu_ms: None,
+            ..reading(0, 0)
+        };
+        judge(&mut last, t0, unknown);
+        assert!(!judge(
+            &mut last,
+            t0 + SENDER_WINDOW,
+            LoadCpu {
+                vpp_main_cpu_ms: None,
+                ..reading(9_000, 0)
+            }
+        ));
     }
 
     #[test]
