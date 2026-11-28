@@ -1932,7 +1932,12 @@ fn parse_reconfigure_marker(body: &str) -> Result<(), ReconfigureError> {
     }
 }
 
-pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), String> {
+pub fn detach(
+    config: Option<&Path>,
+    all: bool,
+    keep_vpp: bool,
+    drop_ledger: bool,
+) -> Result<(), String> {
     // Refuse to detach while a `packetframe run` daemon is live. The
     // daemon holds PinnedLink FDs in-process; unlinking the bpffs pin
     // paths alone doesn't drop the kernel-side bpf_link refcount, so
@@ -2136,6 +2141,24 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     #[cfg(not(feature = "fast-path"))]
     let _ = (config_has_fast_path, settle_time);
 
+    // The route ledger the last clean stop preserved stays, whatever the
+    // scope, unless the operator asked for a cold load. Outside the
+    // fast-path block on purpose: `--drop-ledger` names one file, and a
+    // detach scoped away from fast-path still means it.
+    #[cfg(feature = "fast-path")]
+    let route_ledger = match route_ledger_after_detach(&state_dir, drop_ledger) {
+        Ok(label) => label,
+        Err(e) => {
+            errors.push(e);
+            "remove-failed"
+        }
+    };
+    #[cfg(not(feature = "fast-path"))]
+    let route_ledger = {
+        let _ = drop_ledger;
+        "not-built"
+    };
+
     // `--keep-vpp` is the restart that keeps the offload: every other
     // module's pins must go (the next daemon refuses to start over
     // them), while VPP and its steering rules stay for that daemon to
@@ -2154,7 +2177,7 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
         VppDetach::Nothing => {
             tracing::info!(
                 "--keep-vpp with no vpp-offload configured and no VPP on record: nothing to \
-                 leave running; the route ledger and wan-egress rules stay for the next start"
+                 leave running; the wan-egress rules stay for the next start"
             );
             "none"
         }
@@ -2237,6 +2260,7 @@ pub fn detach(config: Option<&Path>, all: bool, keep_vpp: bool) -> Result<(), St
     ev.field("all", all)
         .field("keep_vpp", keep_vpp)
         .field("vpp", vpp_disposition)
+        .field("route_ledger", route_ledger)
         .emit();
     events::shutdown();
     result
@@ -2286,9 +2310,10 @@ fn keep_vpp_preflight(config: Option<&Config>, state_dir: &Path) -> Result<(), S
     let Some(section) = config.modules.iter().find(|m| m.name == "vpp-offload") else {
         // With no VPP on record there is nothing to strand, and this is
         // the routine restart of the modules there are: it keeps the
-        // fast-path's route ledger and wan-egress rules, which every other
-        // detach removes. Refusing here left a box without the offload no
-        // restart that seeds (found on the lab EFG, 2026-11-04).
+        // fast-path's wan-egress rules, which every other detach removes.
+        // Refusing here left a box without the offload no restart that
+        // seeds (found on the lab EFG, 2026-11-04), when every other
+        // detach also removed the route ledger.
         return match ResourceState::load(state_dir).map_err(|e| format!("vpp state: {e}"))? {
             None => Ok(()),
             Some(_) => Err(format!(
@@ -2596,26 +2621,44 @@ mod fast_path_teardown_tests {
         assert!(!super::fast_path_teardown(true).removes_wan_egress_rules());
     }
 
-    /// A full detach removes the route ledger; `--keep-vpp`, the routine
-    /// restart, keeps it for the start that follows.
-    #[test]
-    fn only_a_full_detach_removes_the_route_ledger() {
-        use packetframe_fast_path::fib::route_ledger;
-        assert!(super::fast_path_teardown(false).removes_route_ledger());
-        assert!(!super::fast_path_teardown(true).removes_route_ledger());
-
-        let dir = std::env::temp_dir().join(format!("pf-detach-ledger-{}", std::process::id()));
+    fn ledger_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pf-detach-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Every detach keeps the route ledger, `--all` and a bare `detach`
+    /// included: the start that reads it checks it whatever ran between.
+    #[test]
+    fn a_detach_keeps_the_route_ledger() {
+        use packetframe_fast_path::fib::route_ledger;
+        let dir = ledger_dir("ledger-kept");
+        assert_eq!(super::route_ledger_after_detach(&dir, false), Ok("absent"));
         route_ledger::write(&dir, b"a ledger").unwrap();
-        assert!(super::remove_route_ledger(&dir, Ok(())).is_ok());
-        assert!(!route_ledger::path_in(&dir).exists());
-        // Nothing there is not a failure, and an earlier failure survives.
-        assert!(super::remove_route_ledger(&dir, Ok(())).is_ok());
+        assert_eq!(super::route_ledger_after_detach(&dir, false), Ok("kept"));
         assert_eq!(
-            super::remove_route_ledger(&dir, Err("pins".into())),
-            Err("pins".into())
+            std::fs::read(route_ledger::path_in(&dir)).unwrap(),
+            b"a ledger"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--drop-ledger` removes it, so the next start loads cold; nothing
+    /// there is not a failure, and a removal that fails says so.
+    #[test]
+    fn drop_ledger_removes_the_route_ledger() {
+        use packetframe_fast_path::fib::route_ledger;
+        let dir = ledger_dir("ledger-dropped");
+        route_ledger::write(&dir, b"a ledger").unwrap();
+        assert_eq!(super::route_ledger_after_detach(&dir, true), Ok("removed"));
+        assert!(!route_ledger::path_in(&dir).exists());
+        assert_eq!(super::route_ledger_after_detach(&dir, true), Ok("absent"));
+
+        // A directory under the ledger's name cannot be unlinked.
+        std::fs::create_dir_all(route_ledger::path_in(&dir).join("x")).unwrap();
+        let e = super::route_ledger_after_detach(&dir, true).unwrap_err();
+        assert!(e.starts_with("route ledger removal: "), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -2651,14 +2694,6 @@ fn detach_fast_path(
             );
         }
     }
-    // The route ledger the last clean stop preserved: gone on a full
-    // detach, kept by `--keep-vpp` for the start that follows it. A
-    // failure joins the result like the others.
-    let result = if teardown.removes_route_ledger() {
-        remove_route_ledger(state_dir, result)
-    } else {
-        result
-    };
     // `wan-egress` policy rules, found by their protocol tag in a fresh
     // dump: no state file is needed, and nothing without the tag can be
     // touched. Whatever the pin teardown's outcome, like the coalescing
@@ -2694,29 +2729,42 @@ fn detach_fast_path(
     result
 }
 
-/// Remove the fast-path route ledger, folding a failure into `result`.
+/// What `detach` does with the fast-path route ledger the last clean
+/// stop preserved, as the `detach` event's `route_ledger` field:
+/// `absent`, `kept`, or with `drop` (`--drop-ledger`) `removed`.
+///
+/// Every detach keeps it. It used to go on every detach but
+/// `--keep-vpp`, on the view that the start after a recovery should
+/// trust nothing preserved; but that start checks the ledger leg by leg
+/// whatever ran between (route source identity, forwarding mode,
+/// `max-age` since its routes were last confirmed, owner and mode,
+/// size, format and checksum: `route_ledger`'s module docs), and a
+/// crash, a `kill -9` or a breaker trip never leaves one. Removing it
+/// guarded nothing those checks miss, and cost the next start a cold
+/// load of the whole table through the route source: minutes on a full
+/// table, against seconds for the seed. `--all` is also how VPP's
+/// version is changed, and a fresh VPP over a whole seed is what the
+/// seeded fresh door exists for.
 #[cfg(feature = "fast-path")]
-fn remove_route_ledger(state_dir: &Path, result: Result<(), String>) -> Result<(), String> {
+fn route_ledger_after_detach(state_dir: &Path, drop: bool) -> Result<&'static str, String> {
     use packetframe_fast_path::fib::route_ledger;
-    let existed = std::fs::symlink_metadata(route_ledger::path_in(state_dir)).is_ok();
-    match route_ledger::remove(state_dir) {
-        Ok(()) => {
-            if existed {
-                tracing::info!(
-                    "route ledger removed: the next start loads the route mirror cold from \
-                     the route source (`detach --keep-vpp` keeps it)"
-                );
-            }
-            result
-        }
-        Err(e) => {
-            let e = format!("route ledger removal: {e}");
-            Err(match result {
-                Ok(()) => e,
-                Err(prev) => format!("{prev}; AND {e}"),
-            })
-        }
+    if std::fs::symlink_metadata(route_ledger::path_in(state_dir)).is_err() {
+        return Ok("absent");
     }
+    if !drop {
+        tracing::info!(
+            "route ledger kept: the next start seeds the route mirror from it if it passes \
+             the start's checks (route source, forwarding mode, max-age, owner, integrity); \
+             `detach --drop-ledger` removes it for a cold load"
+        );
+        return Ok("kept");
+    }
+    route_ledger::remove(state_dir).map_err(|e| format!("route ledger removal: {e}"))?;
+    tracing::info!(
+        "route ledger removed (--drop-ledger): the next start loads the route mirror cold \
+         from the route source"
+    );
+    Ok("removed")
 }
 
 /// Pins, tc filters and the registry: everything `detach_fast_path`

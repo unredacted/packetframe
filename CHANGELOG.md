@@ -28,6 +28,14 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
+## [0.6.7] - UNRELEASED
+
+### Changes
+
+**CLI and operations**
+
+- `packetframe detach` keeps the fast-path route ledger, `--all` included, so the start after `detach --all` (changing VPP's version, a recovery) seeds its route table instead of loading it cold. That start still refuses a ledger that is past `max-age`, from another route source or forwarding mode, damaged, or not root's own. `detach --drop-ledger` removes it for a cold load, and the `detach` event's `route_ledger` field says what happened to it. VPP's route ledger is unchanged: `--all` still removes it. [#435](https://github.com/unredacted/packetframe/pull/435)
+
 ## [0.6.6] - 2026-11-28
 
 A point release on 0.6.5. VPP can now clamp TCP MSS itself, per VLAN, so a trunk whose hosts need a clamp can be steered; a steer that would bypass a fast-path clamp is refused instead of silently dropping it. `packetframe status` names the connected prefixes that make flows one-way under `packetframe-fib`, and every module health row is one short line. The completeness authority works on small tables, `detach --all` finds VPP under a non-default `state-dir`, and neigh-snoop's FRR gate keeps working while mgmtd's datastore is locked. A 0.6.5 config and route ledger carry over unchanged, except in the cases listed under Upgrading.

@@ -1549,7 +1549,7 @@ source's load is the route source's problem, and the `route-ledger` and
 
    | `reason` | When |
    |---|---|
-   | `missing` | No file: the previous stop was not clean, preserved nothing, predates the ledger, or a full `packetframe detach` ran since |
+   | `missing` | No file: the previous stop was not clean, preserved nothing, predates the ledger, or `packetframe detach --drop-ledger` ran since |
    | `disabled` | `route-ledger off`, and an earlier run had left one |
    | `forwarding-mode` | Not `packetframe-fib`. `compare` validates the PacketFrame FIB against the kernel's, and stale seeded routes would read as disagreements |
    | `no-route-source` | No `route-source`, so nothing could ever reconcile a seed |
@@ -1783,14 +1783,30 @@ Default `on`, `max-age 1800` (60..=86400 seconds). Reloadable: the stop
 writes according to the setting in force when it runs; the start reads
 the config it starts with.
 
-A full `packetframe detach` (and `detach --all`) removes the ledger:
-it is the recovery path, and the start after it should trust nothing a
-previous process preserved. `detach --keep-vpp` — the routine restart —
-keeps it, on a box without vpp-offload too: with no VPP on record there
-is nothing for it to keep running, and it refuses only when a VPP is on
-record that the config no longer declares. Before 0.6.1 it refused
-whenever the config had no vpp-offload section, so such a box had no
-restart that seeds.
+Every `packetframe detach` keeps the ledger, `--all` and a bare
+`detach` included, so stop → `detach --all` → start (changing VPP's
+version, a recovery) seeds like any restart. Before 0.6.7 every detach
+but `--keep-vpp` removed it, and the start after one loaded cold.
+Keeping it adds nothing the start does not already check, whatever ran
+in between: it refuses a ledger from another route source, under a
+forwarding mode other than `packetframe-fib`, older than `max-age`
+since its routes were last confirmed, not root's own, or damaged, and
+a crash, a `kill -9` or a breaker trip never leaves one. VPP's own
+ledger is another matter: it describes one VPP process, and `--all`
+still removes it with that VPP.
+
+`packetframe detach --drop-ledger` removes it, so the next start loads
+cold. Use it when the routes in it are not wanted even for the moments
+until the route source's replay and GC replace them: say the route
+source's export policy changed while PacketFrame was down. It combines
+with `--all`, `--keep-vpp` or a scoped detach. The `detach` event's
+`route_ledger` field says what happened to it.
+
+`detach --keep-vpp` — the routine restart — works on a box without
+vpp-offload too: with no VPP on record there is nothing for it to keep
+running, and it refuses only when a VPP is on record that the config
+no longer declares. Before 0.6.1 it refused whenever the config had no
+vpp-offload section, so such a box had no restart that seeds.
 
 ### Known limits
 
