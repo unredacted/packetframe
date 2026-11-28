@@ -152,11 +152,11 @@ impl ApiHealth {
 
     fn message(self) -> Option<String> {
         match self {
-            Self::NoProcess => Some("no process to ping".into()),
-            Self::Starting => Some("waiting for the API to open".into()),
+            Self::NoProcess => Some("no process".into()),
+            Self::Starting => Some("API not open yet".into()),
             Self::Answering { .. } => None,
             Self::Silent { silent_for, budget } => Some(format!(
-                "silent {:.1}s, past the {:.1}s budget — wedged",
+                "silent {:.1}s (budget {:.1}s); wedged",
                 silent_for.as_secs_f64(),
                 budget.as_secs_f64()
             )),
@@ -256,16 +256,9 @@ impl FibSync {
     /// re-derive the criteria, or the gate that governs steering and the
     /// gate that reports health could disagree.
     ///
-    /// `v6_ledger` is the live IPv6 ledger the `fib-v6` row reads
-    /// ([`crate::runtime::RuntimeStatus::v6_ledger`]); the summary's IPv6
-    /// half names its routes from it, so a reload of `unresolvable-accept6`
-    /// after the verify moves a route on both rows at once
-    /// ([`crate::verify::V6Ledger`]).
-    pub fn from_outcome(
-        outcome: &VerifyOutcome,
-        age: Duration,
-        v6_ledger: Option<&crate::verify::V6Ledger>,
-    ) -> Self {
+    /// The row carries the verdict's short form ([`VerifyOutcome::brief`]);
+    /// IPv6's routes are named by the `fib-v6` row from the live ledger.
+    pub fn from_outcome(outcome: &VerifyOutcome, age: Duration) -> Self {
         if outcome.passed() {
             Self::Verified {
                 age,
@@ -275,12 +268,12 @@ impl FibSync {
         } else if outcome.restart_worthy() {
             Self::Failed {
                 age,
-                summary: outcome.summary_with(v6_ledger),
+                summary: outcome.brief(),
             }
         } else {
             Self::Unfit {
                 age,
-                summary: outcome.summary_with(v6_ledger),
+                summary: outcome.brief(),
                 reruns: outcome.awaits_clean_table(),
                 sampled: outcome.sampled,
                 table: outcome.table,
@@ -961,9 +954,8 @@ impl StatusSnapshot {
                 name: SUBSYS_ROUTE_FEED.into(),
                 state: HealthState::Degraded,
                 message: Some(format!(
-                    "could not apply route updates to VPP ({e}); {} change(s) waiting at the \
-                     source and {} queued for VPP. Retried every tick — the offload is forwarding \
-                     a table that is behind bird, not a wrong one.",
+                    "route updates to VPP failing ({e}); {} at source, {} queued; retried \
+                     every tick",
                     self.source_backlog, self.pending_ops
                 )),
                 last_success_age_seconds: None,
@@ -974,10 +966,7 @@ impl StatusSnapshot {
                 name: SUBSYS_EXEMPT_DRIFT.into(),
                 state: HealthState::Degraded,
                 message: Some(format!(
-                    "{why}, so the exemption tripwire cannot judge them — a surviving \
-                     divert rule may be blackholing a prefix this config exempts. \
-                     `packetframe reconfigure` reconciles the NIC and settles it; \
-                     `ethtool -n <port>` shows what is actually installed"
+                    "{why}; exemptions cannot be judged; run: `packetframe reconfigure`"
                 )),
                 last_success_age_seconds: None,
             });
@@ -988,22 +977,21 @@ impl StatusSnapshot {
             // routes went away), and presenting them alone reads as
             // current — while a route added since could be invisible
             // and a named one already gone (review finding).
-            let stale = self.drift_unreadable.as_ref().map(|why| {
-                format!(
-                    ". NOTE: the latest scan could not read the kernel ({why}), so this list \
-                     is the last good one — newly added routes are invisible and a named one \
-                     may already be gone"
-                )
-            });
+            let stale = self
+                .drift_unreadable
+                .as_ref()
+                .map(|why| format!("; last scan failed ({why}), list may be stale"));
+            let (verb, them) = if self.drift_uncovered.len() == 1 {
+                ("has", "it")
+            } else {
+                ("have", "them")
+            };
             subsystems.push(SubsystemHealth {
                 name: SUBSYS_EXEMPT_DRIFT.into(),
                 state: HealthState::Degraded,
                 message: Some(format!(
-                    "kernel path(s) VPP cannot take, with no `steer-exempt` covering them: \
-                     {} — steered traffic for these dies at VPP's default route instead of \
-                     falling back to the kernel that would deliver it. Add a `steer-exempt` \
-                     per path (each costs one MCAM slot), or leave the port unsteered{}",
-                    self.drift_uncovered.join("; "),
+                    "{} {verb} no steer-exempt; steered traffic to {them} drops in VPP{}",
+                    capped(&self.drift_uncovered, "; "),
                     stale.unwrap_or_default()
                 )),
                 last_success_age_seconds: None,
@@ -1013,10 +1001,7 @@ impl StatusSnapshot {
                 name: SUBSYS_EXEMPT_DRIFT.into(),
                 state: HealthState::Degraded,
                 message: Some(format!(
-                    "the exemption tripwire could not read the kernel's routes ({why}), so \
-                     it is not watching for paths VPP cannot take — an uncovered one would \
-                     blackhole steered traffic unreported. The scan retries every minute; a \
-                     persistent failure needs looking at"
+                    "cannot read kernel routes ({why}); not watching; retried every minute"
                 )),
                 last_success_age_seconds: None,
             });
@@ -1025,11 +1010,7 @@ impl StatusSnapshot {
                 name: SUBSYS_EXEMPT_DRIFT.into(),
                 state: HealthState::Degraded,
                 message: Some(
-                    "the exemption tripwire has not finished a scan for this configuration \
-                     yet — on a full-table box the route dump takes seconds, and an empty \
-                     finding list before it lands is no verdict rather than a clean one. It \
-                     clears itself; a first steer is worth holding until it does"
-                        .into(),
+                    "first scan of this config not finished; hold a first steer until it is".into(),
                 ),
                 last_success_age_seconds: None,
             });
@@ -1041,24 +1022,20 @@ impl StatusSnapshot {
             let mut parts = Vec::new();
             if !self.neighbours_unplaced.is_empty() {
                 parts.push(format!(
-                    "bridge neighbour(s) VPP cannot reach: {} — routes through them are \
-                     unresolvable. Declare the VLAN on every member port its bridge spans \
-                     (`port … vlans`), or check the neighbour is live on the fabric \
-                     (`bridge fdb show`)",
-                    self.neighbours_unplaced.join("; ")
+                    "VPP cannot reach {}; routes via them unresolvable; declare the VLAN on \
+                     each member port the bridge spans (port … vlans)",
+                    capped(&self.neighbours_unplaced, "; ")
                 ));
             }
             if let Some(e) = &self.fdb_unreadable {
                 parts.push(format!(
-                    "the bridge tables cannot be read ({e}); placements and VLAN membership \
-                     hold at the last good read, and a spanning-tree move or VLAN change made \
-                     meanwhile is not being followed"
+                    "bridge tables unreadable ({e}); placements frozen at the last read"
                 ));
             }
             subsystems.push(SubsystemHealth {
                 name: SUBSYS_FDB.into(),
                 state: HealthState::Degraded,
-                message: Some(parts.join(". ")),
+                message: Some(parts.join("; ")),
                 last_success_age_seconds: None,
             });
         }
@@ -1067,8 +1044,7 @@ impl StatusSnapshot {
                 name: SUBSYS_STATE_FILE.into(),
                 state: HealthState::Degraded,
                 message: Some(format!(
-                    "could not persist observed state ({e}); a daemon restart will refuse \
-                     adoption and cycle VPP instead"
+                    "cannot persist state ({e}); a restart will cycle VPP, not adopt it"
                 )),
                 last_success_age_seconds: None,
             });
@@ -1218,18 +1194,14 @@ impl StatusSnapshot {
             && !self.kernel_path.iter().any(crate::kernel_path::PortReport::dropping)
     }
 
-    /// `"; N kernel-delivered (…)"` for the `fib-synced` row when any
+    /// `"; N kernel-delivered"` for the `fib-synced` row when any
     /// mirror prefix is left to the kernel, so a count that moved out of
     /// `unresolvable` is seen to have gone somewhere.
     fn kernel_delivered_note(&self) -> String {
         if self.kernel_delivered_routes == 0 {
             return String::new();
         }
-        format!(
-            "; {} kernel-delivered (the router's own subnets, addresses and routes out devices \
-             VPP cannot reach — by design, never unresolvable)",
-            self.kernel_delivered_routes
-        )
+        format!("; {} kernel-delivered", self.kernel_delivered_routes)
     }
 
     /// The `kernel-path` row: present while any port has rules in the
@@ -1251,75 +1223,78 @@ impl StatusSnapshot {
         let mut clauses = Vec::new();
         let mut dropping = Vec::new();
         for p in &self.kernel_path {
-            let keeps = match (&p.verdict, p.observed_rss, p.observed_queue0) {
+            // Facts only where they differ from the designed shape: RSS
+            // keeps with nothing pinned say nothing.
+            let mut notes: Vec<String> = Vec::new();
+            match (&p.verdict, p.observed_rss, p.observed_queue0) {
                 (Some(v), _, q0) if v.form == crate::ntuple::KeepForm::Rss => {
                     if q0 > 0 {
-                        format!(
-                            "keeps spread over RSS, but {q0} read back pinned to queue 0 — \
-                             left by an older daemon or changed out of band; `packetframe \
-                             reconfigure` rewrites them"
-                        )
-                    } else {
-                        "keeps spread over RSS".to_string()
+                        notes.push(format!(
+                            "{q0} keep(s) pinned to queue 0; run: `packetframe reconfigure`"
+                        ));
                     }
                 }
-                (Some(v), _, _) => format!(
-                    "keeps pinned to PF queue 0 (fallback: {})",
-                    v.why.as_deref().unwrap_or("the driver declined RSS")
-                ),
-                (None, 0, 0) => "no keep rules".to_string(),
-                (None, rss, q0) => format!(
-                    "keeps inherited from a previous daemon ({rss} on RSS, {q0} on queue 0); \
-                     the next steer rewrites them in the form the driver takes"
-                ),
-            };
-            let irq = match &p.irq {
-                Some(crate::kernel_path::Queue0Irq::Placed { irq, cpu, prior }) => format!(
-                    "; queue-0 IRQ {irq} placed on cpu {cpu} (was {prior}){}",
+                (Some(v), _, _) => notes.push(format!(
+                    "keeps on queue 0 ({})",
+                    v.why.as_deref().unwrap_or("driver declined RSS")
+                )),
+                (None, 0, 0) => notes.push("no keep rules".to_string()),
+                (None, rss, q0) => notes.push(format!(
+                    "keeps inherited ({rss} RSS, {q0} queue 0); next steer rewrites them"
+                )),
+            }
+            match &p.irq {
+                Some(crate::kernel_path::Queue0Irq::Placed { irq, cpu, .. }) => {
                     match &p.irq_delivered_on {
-                        Some(on) if *on != cpu.to_string() => format!(
-                            ", but it is delivered on {on} now — a port re-open resets it; \
-                             the next steer places it again"
-                        ),
-                        _ => String::new(),
+                        Some(on) if *on != cpu.to_string() => notes.push(format!(
+                            "queue-0 IRQ {irq} on cpu {on}, not {cpu}; next steer re-places it"
+                        )),
+                        _ => notes.push(format!("queue-0 IRQ {irq} on cpu {cpu}")),
                     }
-                ),
-                Some(crate::kernel_path::Queue0Irq::Unplaced { why }) => format!(
-                    "; queue-0 IRQ NOT moved ({why}){}",
+                }
+                Some(crate::kernel_path::Queue0Irq::Unplaced { why }) => notes.push(format!(
+                    "queue-0 IRQ not moved ({why}){}",
                     p.irq_delivered_on
                         .as_ref()
-                        .map(|on| format!(", delivered on cpu {on}"))
+                        .map(|on| format!(", on cpu {on}"))
                         .unwrap_or_default()
-                ),
-                None => String::new(),
-            };
+                )),
+                None => {}
+            }
             let traffic = match (&p.rates, &p.unreadable) {
                 (Some(r), _) => format!(
-                    "; receive {:.0} fps, queue 0 {:.0} fps{}, drops {:.0}/s",
-                    r.rx_fps,
-                    r.queue0_fps,
+                    "{} fps{}, {}",
+                    thousands(r.rx_fps.round() as u64),
                     r.queue0_share()
-                        .map(|s| format!(" ({:.0}%)", s * 100.0))
+                        .map(|s| format!(", queue 0 at {:.0}%", s * 100.0))
                         .unwrap_or_default(),
-                    r.drops_ps
+                    if r.drops_ps.round() == 0.0 {
+                        "no drops".to_string()
+                    } else {
+                        format!("{} drops/s", thousands(r.drops_ps.round() as u64))
+                    }
                 ),
-                (None, Some(e)) => format!("; counters unreadable ({e})"),
-                (None, None) => "; counters: first sample pending".to_string(),
+                (None, Some(e)) => format!("counters unreadable ({e})"),
+                (None, None) => "counters pending".to_string(),
             };
             if p.dropping() {
                 dropping.push(p);
             }
             // The one thing no readback can prove: that the driver
             // programs the RSS action it echoes back.
-            let suspect = if p.rss_suspect() {
-                " — queue 0 is taking most of the receive although the keeps read back as \
-                 RSS: one elephant flow can do that, but if it persists across many flows \
-                 the driver may not be honouring the RSS action (compare `rxq<N>: frames` \
-                 in `ethtool -S`)"
-            } else {
-                ""
-            };
-            clauses.push(format!("{}: {keeps}{irq}{traffic}{suspect}", p.iface));
+            if p.rss_suspect() {
+                notes.push(
+                    "queue 0 takes most receive despite RSS keeps; compare rxq frames in \
+                     ethtool -S"
+                        .to_string(),
+                );
+            }
+            let mut clause = format!("{} {traffic}", p.iface);
+            for n in notes {
+                clause.push_str("; ");
+                clause.push_str(&n);
+            }
+            clauses.push(clause);
         }
         if dropping.is_empty() {
             return Some(SubsystemHealth {
@@ -1333,28 +1308,23 @@ impl StatusSnapshot {
             .iter()
             .map(|p| {
                 let r = p.rates.expect("dropping() requires rates");
-                let remedy = if p.pins_queue0() {
+                let fix = if p.pins_queue0() {
                     format!(
-                        "its keeps pin to queue 0, so one CPU takes all of it: move that queue's \
-                         IRQ to an idle CPU outside VPP's cores (`grep '{0}-rxtx-0' \
-                         /proc/interrupts`, then `echo <cpu> > \
-                         /proc/irq/<irq>/smp_affinity_list`)",
+                        "fix: pin the {}-rxtx-0 IRQ to an idle CPU outside VPP's cores",
                         p.iface
                     )
                 } else {
                     format!(
-                        "its keeps spread over RSS, so the PF's queues together are outrun: \
-                         compare `ethtool -S {0} | grep 'rxq.*frames'` across queues (one hot \
-                         queue means the spread is not happening) and the per-CPU softirq load",
+                        "RSS queues outrun; check per-queue load with `ethtool -S {}`",
                         p.iface
                     )
                 };
                 format!(
-                    "{} is DROPPING {:.0} frames/s in the kernel's receive{} — {remedy}",
+                    "{} dropping {} frames/s in kernel receive{}; {fix}",
                     p.iface,
-                    r.drops_ps,
+                    thousands(r.drops_ps.round() as u64),
                     r.queue0_share()
-                        .map(|s| format!(" with queue 0 taking {:.0}% of it", s * 100.0))
+                        .map(|s| format!(" (queue 0 at {:.0}%)", s * 100.0))
                         .unwrap_or_default()
                 )
             })
@@ -1363,12 +1333,8 @@ impl StatusSnapshot {
             name: SUBSYS_KERNEL_PATH.into(),
             state: HealthState::Degraded,
             message: Some(format!(
-                "the kernel path for exempt traffic is dropping: {}. Exempt traffic is the \
-                 router's own, NAT return paths and every `steer-exempt` prefix; dropping it \
-                 starves BGP and pings first (docs/runbooks/vpp-offload.md, \"The kernel path \
-                 for exempt traffic\"). Per port: {}",
-                named.join("; "),
-                clauses.join(". ")
+                "{}; exempt traffic (BGP, NAT return, steer-exempt) is being lost",
+                named.join(". ")
             )),
             last_success_age_seconds: None,
         })
@@ -1383,36 +1349,35 @@ impl StatusSnapshot {
     /// The `v6-handback` row: absent unless the path is wanted or built.
     fn handback_health(&self) -> Option<SubsystemHealth> {
         let h = self.handback.as_ref()?;
-        let parts = format!(
-            "veth {} ({}), guard ACL {} (VPP ACL tag {}), VPP interface {}, {} router-owned \
-             /128(s) handed back{}",
-            if h.veth { "up" } else { "missing or down" },
-            crate::handback::KERNEL_IF,
-            if h.guard {
-                "in place"
-            } else {
-                "missing or drifted"
-            },
-            crate::handback::ACL_TAG,
-            match (&h.vpp_if, h.vpp_up) {
-                (Some(name), true) => format!("{name} up"),
-                (Some(name), false) => format!("{name} DOWN"),
-                (None, _) => "absent".to_string(),
-            },
-            h.routes,
-            match h.owned {
-                Some(n) if n != h.routes => format!(" of {n} the host holds"),
-                _ => String::new(),
-            },
-        );
+        let routes = match h.owned {
+            Some(n) if n != h.routes => format!("{} of {n} /128s handed back", h.routes),
+            _ => format!("{} /128s handed back", h.routes),
+        };
         let (state, message) = if h.wanted && !h.ready {
+            // Only the pieces that are wrong: those are what to look at.
+            let mut faults: Vec<String> = Vec::new();
+            if !h.veth {
+                faults.push(format!(
+                    "veth {} missing or down",
+                    crate::handback::KERNEL_IF
+                ));
+            }
+            if !h.guard {
+                faults.push("guard ACL missing or drifted".to_string());
+            }
+            match (&h.vpp_if, h.vpp_up) {
+                (Some(name), false) => faults.push(format!("VPP interface {name} down")),
+                (None, _) => faults.push("VPP interface absent".to_string()),
+                (Some(_), true) => {}
+            }
+            if faults.is_empty() {
+                faults.push(routes.clone());
+            }
             (
                 HealthState::Degraded,
                 format!(
-                    "IPv6 diversion held back: the hand-back path is not ready — {parts}{}. \
-                     Without it the router's own IPv6 arriving on a diverted port would be \
-                     dropped in VPP, so no `v6-divert` rule is installed; IPv4 steering is \
-                     unaffected. Retried every {}s",
+                    "IPv6 diversion held: {}{}; IPv4 unaffected; retried every {}s",
+                    faults.join(", "),
                     h.error
                         .as_ref()
                         .map(|e| format!("; last error: {e}"))
@@ -1424,16 +1389,16 @@ impl StatusSnapshot {
             (
                 HealthState::Healthy,
                 format!(
-                    "ready — {parts}{}",
+                    "{routes}{}",
                     h.tx_packets
-                        .map(|n| format!(", {n} packet(s) handed to the kernel"))
+                        .map(|n| format!(", {n} packets to the kernel"))
                         .unwrap_or_default()
                 ),
             )
         } else {
             (
                 HealthState::Healthy,
-                format!("built but not in use (no port diverts IPv6) — {parts}"),
+                format!("built, unused (no port has v6-divert); {routes}"),
             )
         };
         Some(SubsystemHealth {
@@ -1477,13 +1442,8 @@ impl StatusSnapshot {
             name: SUBSYS_ICMP6_SOURCE.into(),
             state: HealthState::Degraded,
             message: Some(format!(
-                "IPv6 is diverted into VPP on {} but VPP has no global IPv6 address to source \
-                 ICMPv6 errors from — its interfaces carry only link-locals, so it DROPS the \
-                 Time Exceeded, Packet Too Big and Destination Unreachable it would send for \
-                 that traffic: traceroutes through the router show `*` at its hop, and PMTUD \
-                 breaks for any flow whose path MTU shrinks there. Set `loopback-address6 \
-                 <address>` (a /128 from your own global space that no host interface holds; \
-                 restart-only) — docs/runbooks/vpp-offload.md, v6-divert steering",
+                "IPv6 diverted on {} but VPP has no global IPv6 to source ICMPv6 errors; \
+                 traceroute and PMTUD break; set: `loopback-address6 <address>` (restart)",
                 self.steer_v6_divert.join(", ")
             )),
             last_success_age_seconds: None,
@@ -1509,7 +1469,7 @@ impl StatusSnapshot {
                 name: SUBSYS_MSS_CLAMP.into(),
                 state: HealthState::Healthy,
                 message: Some(format!(
-                    "TCP MSS clamped in VPP on vlan {}",
+                    "vlan {} clamped",
                     vlans(&self.mss_clamp.configured)
                 )),
                 last_success_age_seconds: None,
@@ -1519,9 +1479,7 @@ impl StatusSnapshot {
                 name: SUBSYS_MSS_CLAMP.into(),
                 state: HealthState::Degraded,
                 message: Some(format!(
-                    "not in place: {}. A steered SYN to or from such a VLAN would leave \
-                     unclamped, so a first steer is held until it is — \
-                     docs/runbooks/mss-clamp.md, With vpp-offload",
+                    "not in place: {}; first steer held until it is",
                     self.mss_clamp
                         .missing
                         .iter()
@@ -1536,8 +1494,7 @@ impl StatusSnapshot {
                 name: SUBSYS_MSS_CLAMP.into(),
                 state: HealthState::Degraded,
                 message: Some(format!(
-                    "a removed clamp is still set: {}. Retried every VLAN refresh; it \
-                     only over-clamps, so steering is unaffected",
+                    "removed clamp still set: {}; retried each VLAN refresh",
                     self.mss_clamp
                         .not_cleared
                         .iter()
@@ -1571,38 +1528,25 @@ impl StatusSnapshot {
         let degraded = if !v6.lines.is_empty() {
             // Retained across a failed read, so the failure travels with
             // them — the same rule, and the same reason, as the v4 row.
-            let stale = v6.unreadable.as_ref().map(|why| {
-                format!(
-                    ". NOTE: the latest IPv6 scan could not read the kernel ({why}), so this \
-                     list is the last good one — newly added routes are invisible and a named \
-                     one may already be gone"
-                )
-            });
+            let stale = v6
+                .unreadable
+                .as_ref()
+                .map(|why| format!("; last scan failed ({why}), list may be stale"));
             Some(format!(
-                "IPv6 kernel path(s) VPP cannot take, while a port diverts IPv6 \
-                 (`v6-divert`): {} — diverted IPv6 for these dies in VPP, or leaves by a less \
-                 specific route VPP holds, instead of taking the kernel path. There is no \
-                 IPv6 `steer-exempt` (the NIC cannot match a v6 address). If VPP should carry \
-                 the route, fix the feed or the port's `vlans` so it can; if it is kernel-only, \
-                 keep its traffic on the kernel by port with `steer-keep6`, drop `v6-divert` \
-                 from the ports whose hosts reach it, or accept the risk knowingly with \
-                 `drift-accept6 <prefix>` (it stops degrading this row; the traffic still \
-                 dies){}",
-                v6.lines.join("; "),
+                "{}: VPP cannot take these; diverted IPv6 to them drops; fix: the feed or port \
+                 vlans, steer-keep6, drop v6-divert, or drift-accept6 <prefix>{}",
+                capped(&v6.lines, "; "),
                 stale.unwrap_or_default()
             ))
         } else {
             v6.unreadable.as_ref().map(|why| {
                 format!(
-                    "the exemption tripwire could not read the kernel's IPv6 routes ({why}), so \
-                     it is not watching for v6 paths VPP cannot take while a port diverts IPv6 \
-                     — an uncovered one would blackhole diverted traffic unreported. The scan \
-                     retries every minute; a persistent failure needs looking at"
+                    "cannot read kernel IPv6 routes ({why}); not watching; retried every minute"
                 )
             })
         };
         let (state, message) = match (degraded, drift_v6_acceptance_note(v6)) {
-            (Some(d), Some(note)) => (HealthState::Degraded, format!("{d}. {note}")),
+            (Some(d), Some(note)) => (HealthState::Degraded, format!("{d}; {note}")),
             (Some(d), None) => (HealthState::Degraded, d),
             (None, Some(note)) => (HealthState::Healthy, note),
             (None, None) => return None,
@@ -1673,10 +1617,7 @@ impl StatusSnapshot {
         let (state, message) = if self.undead {
             (
                 HealthState::Unhealthy,
-                Some(
-                    "survived SIGKILL — VFs and hugepages cannot be released, restart blocked"
-                        .into(),
-                ),
+                Some("survived SIGKILL; VFs and hugepages held, restart blocked".into()),
             )
         } else {
             match self.state {
@@ -1687,9 +1628,8 @@ impl StatusSnapshot {
                 ),
                 State::Starting => (HealthState::Degraded, Some("starting".into())),
                 s => {
-                    let msg = (self.failures > 0).then(|| {
-                        format!("running; {} failure(s) since last healthy", self.failures)
-                    });
+                    let msg = (self.failures > 0)
+                        .then(|| format!("{} failure(s) since last healthy", self.failures));
                     // A running process with a clean history is the only
                     // healthy case; everything else says why.
                     let st = if self.failures > 0 {
@@ -1760,9 +1700,9 @@ impl StatusSnapshot {
                 // it off too. Then the eBPF tier carries everything, and
                 // naming the adopted FIB sends an operator to the idle tier.
                 let forwarding = if self.steered {
-                    "the adopted FIB keeps forwarding untouched"
+                    "adopted FIB forwarding"
                 } else {
-                    "VPP is unsteered, so the traffic is on the eBPF tier"
+                    "traffic on eBPF"
                 };
                 let msg = if self.authority == AuthorityPosture::Vetoing {
                     // Persistent by construction, in BOTH senses now:
@@ -1774,23 +1714,10 @@ impl StatusSnapshot {
                     // produced the posture. See
                     // `authority_fault_confirmed`.
                     format!(
-                        "resync deferred: the route source holds {have} routes (release \
-                         floor {want}) and the floor is not what is holding this — the \
-                         completeness authority reports a route count that cannot describe \
-                         this mirror (far fewer than it holds, or none at all), so it is \
-                         not the authority feeding it, and that vetoes release at any \
-                         table size, so waiting for the source to go quiet will not clear \
-                         it — quiescence is never what releases a veto. TWO CONSECUTIVE \
-                         CHECKS reported it, so this is not one report catching a bulk \
-                         withdrawal mid-flight. Check that `integrity-authority` names \
-                         the daemon THIS box's routes actually come from; where they \
-                         legitimately come from elsewhere, \
-                         `require-table-complete off` is the right answer — but it is read \
-                         once at bring-up, so it needs a daemon RESTART. A reload is \
-                         refused by name and says so, so there is nothing to try first and \
-                         nothing that silently carries the old gate forward. Meanwhile \
-                         {forwarding}, and every steering change but `steer off` on every \
-                         port is refused while this holds"
+                        "resync deferred: authority vetoes release, its count cannot describe \
+                         the {have}-route mirror (2 checks); waiting won't clear it; check \
+                         integrity-authority, or set `require-table-complete off` and restart; \
+                         {forwarding}, only steer off accepted"
                     )
                 } else if self.authority == AuthorityPosture::AwaitingAuthority {
                     // Blocked, but self-clearing: no report yet, one that
@@ -1800,45 +1727,18 @@ impl StatusSnapshot {
                     // startup transient is how a healthy box gets
                     // "fixed" into a broken one.
                     format!(
-                        "resync deferred: the completeness authority has not attested yet \
-                         — no report has arrived, the last one aged out, the mirror is \
-                         still short of it, the mirror has grown past the count the last \
-                         sample took (the checker measures both once per `integrity-authority` \
-                         interval, and a loading table moves further than that in between), or ONE sample reported a \
-                         count that cannot describe this mirror and no second check has \
-                         confirmed it — so release is blocked for now. It releases itself \
-                         once a sample agrees; the source holds {have} routes against a \
-                         floor of {want}. If the authority really is at fault rather than \
-                         merely unasked or caught mid-withdrawal, the next sample says so \
-                         and this line changes to name it. Nothing is dropping: \
-                         {forwarding}"
+                        "resync deferred: authority has not attested yet ({have} routes, \
+                         floor {want}); releases itself; {forwarding}"
                     )
                 } else if have < want && self.authority == AuthorityPosture::Attesting {
                     format!(
-                        "resync deferred: the route source holds {have} routes, below the \
-                         release floor of {want}; {forwarding}. The completeness authority \
-                         can release this once its \
-                         report agrees with the mirror — expected within one \
-                         `integrity-authority` interval. If it persists well beyond that, \
-                         check the integrity checker and the route daemon rather than the \
-                         sizing"
+                        "resync deferred: {have} routes, below floor {want}; the authority \
+                         releases it within one interval; {forwarding}"
                     )
                 } else if have < want && self.authority == AuthorityPosture::DemotedByFlap {
                     format!(
-                        "resync deferred: the route source holds {have} routes, below the \
-                         release floor of {want}; {forwarding}. The feed session \
-                         reconnected under this deferral, so \
-                         the authority's report can no longer attest that the mirror is \
-                         THIS session's — a count can match while a reannouncement is \
-                         still mid-flight. Attestation returns when the route source \
-                         reports InitiationComplete for the new session (`InitiationComplete \
-                         fired` in the journal), whose GC removes what the previous session \
-                         left. What fires it depends on the route source, and the \
-                         packetframe-fib runbook names it; a feed that never gives it holds \
-                         this deferral indefinitely BY DESIGN. Nothing is dropping. To \
-                         resolve it, let the route \
-                         source finish its dump, or restart the daemon once the table is \
-                         loaded so the adoption starts unsteered"
+                        "resync deferred: {have} routes, below floor {want}; feed reconnected, \
+                         waits for InitiationComplete; {forwarding}"
                     )
                 } else if have < want {
                     // Reachable only with NO authority now: every other
@@ -1846,15 +1746,9 @@ impl StatusSnapshot {
                     // makes this text's "with no authority" accurate
                     // rather than an assumption.
                     format!(
-                        "resync deferred: the route source holds {have} routes, below the \
-                         release floor of {want}; {forwarding}. If the source is still \
-                         loading this clears itself — \
-                         but if {have} IS the whole table, the gate will never release: \
-                         with no authority it refuses to guess completeness below the \
-                         floor, by design. Size `expected-routes` within 16x of the real \
-                         table, or name a completeness authority \
-                         (`integrity-authority birdc|frr`) and enable \
-                         `require-table-complete`"
+                        "resync deferred: {have} routes, below floor {want}; if that is the \
+                         whole table, set expected-routes within 16x of it or configure \
+                         integrity-authority; {forwarding}"
                     )
                 } else if self.awaiting_reconciliation {
                     // The floor is met, and what is outstanding is the
@@ -1862,27 +1756,18 @@ impl StatusSnapshot {
                     // the unattested and demoted postures reach this: an
                     // attesting authority is that evidence.
                     let why = if self.authority == AuthorityPosture::DemotedByFlap {
-                        "the feed session reconnected under this deferral, so the \
-                         completeness authority's report can no longer attest that the \
-                         mirror is THIS session's"
+                        "feed reconnected"
                     } else {
-                        "with no completeness authority, only the route source itself can \
-                         say its dump is complete"
+                        "no authority"
                     };
                     format!(
-                        "resync deferred: the route source holds {have} routes (release \
-                         floor {want} met), and {why}: release waits for its \
-                         InitiationComplete for the current session (`InitiationComplete \
-                         fired` in the journal), so that a pause mid-dump is not taken for \
-                         the end of it. What fires it depends on the route source, and the \
-                         packetframe-fib runbook names it; a feed that never gives it holds \
-                         this indefinitely, by design. Nothing is dropping: {forwarding}"
+                        "resync deferred: {have} routes (floor {want} met); {why}, waits for \
+                         InitiationComplete; {forwarding}"
                     )
                 } else {
                     format!(
-                        "resync deferred: the route source holds {have} routes (release \
-                         floor {want} met); the diff runs once the source is live and has \
-                         gone quiet, and {forwarding} until then"
+                        "resync deferred: {have} routes (floor {want} met); diff runs once the \
+                         source goes quiet; {forwarding}"
                     )
                 };
                 // Whichever posture is reported: the refusal is a fact about
@@ -1890,7 +1775,7 @@ impl StatusSnapshot {
                 // it explains why a steered restart that would otherwise
                 // have verified within seconds is waiting out the replay.
                 let msg = match &self.seeded_door_refused {
-                    Some(refused) => format!("{msg}; {refused}"),
+                    Some(refused) => format!("{msg}; {}", refused.brief()),
                     None => msg,
                 };
                 (HealthState::Degraded, Some(msg))
@@ -1903,9 +1788,7 @@ impl StatusSnapshot {
             FibSync::NeverVerified if self.preserved_fib && self.counts.installed > 0 => (
                 HealthState::Degraded,
                 Some(format!(
-                    "resyncing the FIB the previous process verified and preserved ({} routes \
-                     installed): only the differences go to VPP, it keeps forwarding \
-                     meanwhile, and verify — paths included — judges it next",
+                    "resyncing the preserved FIB ({} routes); verify next",
                     self.counts.installed
                 )),
             ),
@@ -1927,18 +1810,13 @@ impl StatusSnapshot {
                 let (have, want) = self.fresh_hold.expect("checked above");
                 let msg = if want == 0 {
                     format!(
-                        "fresh convergence: routes install as the source loads (mirror \
-                         holds {have}); verify waits for the completeness authority's \
-                         first report (require-table-complete). On a full-table feed \
-                         this holds for the length of the route source's initial dump — minutes — by design"
+                        "fresh convergence: {have} routes; verify waits for the authority's \
+                         first report (require-table-complete)"
                     )
                 } else {
                     format!(
-                        "fresh convergence: routes install as the source loads (mirror \
-                         holds {have} of the authority's {want}); verify runs once over \
-                         the complete table when the authority confirms it \
-                         (require-table-complete). On a full-table feed this holds for \
-                         the length of the route source's initial dump — minutes — by design"
+                        "fresh convergence: {have} of {want} routes; verify waits for the \
+                         authority (require-table-complete)"
                     )
                 };
                 (HealthState::Degraded, Some(msg))
@@ -1965,9 +1843,8 @@ impl StatusSnapshot {
             FibSync::Unfit { .. } if self.counts.installed == 0 && self.steered => (
                 HealthState::Unhealthy,
                 Some(
-                    "0 routes installed while steered — every steered packet is dropped in \
-                     VPP. The module takes steering down on its own; if this persists the \
-                     unsteer was refused"
+                    "0 routes installed while steered; steered traffic drops in VPP until \
+                     steering comes down"
                         .into(),
                 ),
             ),
@@ -1982,20 +1859,18 @@ impl StatusSnapshot {
                 // them: one that failed only on what the table outgrows,
                 // and one the table has outgrown, whatever it failed on.
                 let when = if *reruns {
-                    "re-runs on its own once the table holds no unresolvable route and no \
-                     unexempted kernel-delivered prefix"
+                    "re-runs once no route is unresolvable"
                 } else if self.verify_outgrown().is_some() {
-                    "the table has outgrown it, so it re-runs on its own once VPP has caught \
-                     up with the route mirror and the table holds no unresolvable route"
+                    "table outgrew it; re-runs once VPP catches up"
                 } else {
-                    "does not re-run in steady state"
+                    "not re-run"
                 };
                 (
                     HealthState::Degraded,
                     Some(format!(
-                        "{summary} (verify ran {}s ago and {when}; the table now holds {} \
-                         installed, {} withheld, {} unresolvable{}{})",
-                        age.as_secs(),
+                        "{summary} ({} ago); now {} installed, {} withheld, {} \
+                         unresolvable{}{}; {when}",
+                        ago(*age),
                         c.installed,
                         c.withheld,
                         c.unresolvable,
@@ -2015,16 +1890,15 @@ impl StatusSnapshot {
                 (
                     HealthState::Unhealthy,
                     Some(format!(
-                        "{summary} (verify ran {}s ago). No steer that diverts more traffic \
-                         onto VPP is admitted on it, and it is not re-run; {}",
-                        age.as_secs(),
-                        crate::verify::MISMATCH_REMEDY
+                        "{summary} ({} ago); steers adding traffic refused; {}",
+                        ago(*age),
+                        crate::verify::MISMATCH_FIX
                     )),
                 )
             }
             FibSync::Failed { summary, age } => (
                 HealthState::Unhealthy,
-                Some(format!("{summary} (verify ran {}s ago)", age.as_secs())),
+                Some(format!("{summary} ({} ago)", ago(*age))),
             ),
             FibSync::Verified { sampled, table, .. } => {
                 let c = self.counts;
@@ -2034,12 +1908,11 @@ impl StatusSnapshot {
                     // a refused unsteer would leave exactly this.
                     (
                         HealthState::Unhealthy,
-                        Some(format!(
-                            "0 routes installed while steered — every steered packet is \
-                             dropped in VPP. The module takes steering down on its own; if \
-                             this persists the unsteer was refused (verified on {sampled} \
-                             probes earlier, and verify does not re-run in steady state)"
-                        )),
+                        Some(
+                            "0 routes installed while steered; steered traffic drops in VPP \
+                             until steering comes down"
+                                .to_string(),
+                        ),
                     )
                 } else if c.installed == 0 {
                     // The route source emptied (a feed session drop, a
@@ -2048,11 +1921,11 @@ impl StatusSnapshot {
                     // whether a steer is waiting to come back.
                     (
                         HealthState::Degraded,
-                        Some(format!(
-                            "0 routes installed — the route source is empty, so nothing is \
-                             offloaded and a steer is refused until it refills (verified on \
-                             {sampled} probes earlier)"
-                        )),
+                        Some(
+                            "0 routes installed; route source empty, steer refused until it \
+                             refills"
+                                .to_string(),
+                        ),
                     )
                 } else if c.degraded() {
                     // Both counts, always, and named: "table outgrew the
@@ -2062,8 +1935,9 @@ impl StatusSnapshot {
                     (
                         HealthState::Degraded,
                         Some(format!(
-                            "verified on {sampled} probes against {table} routes; {} withheld \
-                             (at capacity), {} unresolvable (mapping){}{}",
+                            "{} routes; {} withheld (at capacity), {} unresolvable \
+                             (mapping){}{}",
+                            c.installed,
                             c.withheld,
                             c.unresolvable,
                             named(&self.unresolvable_named),
@@ -2086,16 +1960,9 @@ impl StatusSnapshot {
                     (
                         HealthState::Degraded,
                         Some(format!(
-                            "{} routes installed, but the last verify ran on {sampled} probes \
-                             against {table} routes, so it vouches for less than {}% of this \
-                             table and a first steer waits for one that does. Verify re-runs \
-                             on its own once VPP has caught up with the route mirror ({} \
-                             change(s) still at the route source, {} queued for VPP) and the \
-                             table holds no unresolvable route",
-                            c.installed,
-                            crate::verify::VERIFY_COVERS_PERCENT,
-                            self.source_backlog,
-                            self.pending_ops,
+                            "{} routes; last verify covered {sampled} probes on {table} routes; \
+                             re-runs once VPP catches up ({} at source, {} queued)",
+                            c.installed, self.source_backlog, self.pending_ops,
                         )),
                     )
                 } else {
@@ -2107,9 +1974,13 @@ impl StatusSnapshot {
                     (
                         HealthState::Healthy,
                         Some(format!(
-                            "{} routes installed; last verified on {sampled} probes against \
-                             {table} routes",
-                            c.installed
+                            "{} routes, {sampled}/{sampled} probes matched{}",
+                            c.installed,
+                            if *table == c.installed {
+                                String::new()
+                            } else {
+                                format!(" on {table}")
+                            }
                         )),
                     )
                 }
@@ -2159,67 +2030,38 @@ impl StatusSnapshot {
                 named(&self.unresolvable_named_v6)
             );
             for (n, what) in [
-                (v6.withheld, "withheld (v6 pool at capacity)"),
+                (v6.withheld, "withheld (v6 pool full)"),
                 (v6.unresolvable_unaccepted(), v6_unresolvable.as_str()),
-                (
-                    v6.rejected,
-                    "refused by VPP (parked; retried when the route next changes or \
-                     at the next resync)",
-                ),
-                (
-                    v6.link_local_refused,
-                    "left out because every next hop is link-local, whose interface \
-                     the route feed does not carry",
-                ),
-                (
-                    v6.verify_mismatches,
-                    "probe(s) VPP disagreed on at the last verify (the table differs from \
-                     the ledger; verify does not re-run in steady state)",
-                ),
-                (
-                    v6.dark_egress,
-                    "member interface(s) carrying v6 adjacencies with no link",
-                ),
+                (v6.rejected, "refused by VPP (retried)"),
+                (v6.link_local_refused, "with only link-local next hops"),
+                (v6.verify_mismatches, "probe mismatch(es) at last verify"),
+                (v6.dark_egress, "dark member(s) with v6 adjacencies"),
             ] {
                 if n > 0 {
                     parts.push(format!("{n} {what}"));
                 }
             }
             let cost = match &diverted {
-                None => "No IPv6 is steered, so nothing is dropped".to_string(),
+                None => "not steered, nothing drops".to_string(),
                 Some(on) => format!(
-                    "IPv6 is diverted into VPP on {on}, so a diverted packet whose \
-                     prefix is withheld, unresolvable, refused or left out follows a less \
-                     specific VPP route or is dropped (`exempt-drift-v6` names the kernel \
-                     paths VPP cannot take)"
+                    "diverted on {on}, so their traffic drops or takes a less specific route"
                 ),
             };
             (
                 HealthState::Degraded,
-                format!(
-                    "IPv6 in VPP is impaired: {}. {cost}; the IPv4 table and its steering \
-                     are unaffected",
-                    parts.join(", ")
-                ),
+                format!("{}; {cost}", parts.join(", ")),
             )
         } else if v6.installed == 0 {
             match &diverted {
                 None => (
                     HealthState::Healthy,
-                    format!(
-                        "v6 on, no IPv6 routes in VPP yet ({} in flight); nothing IPv6 is \
-                         steered",
-                        v6.installing
-                    ),
+                    format!("no routes yet ({} in flight), not steered", v6.installing),
                 ),
                 Some(on) => (
                     HealthState::Degraded,
                     format!(
-                        "no IPv6 routes in VPP yet ({} in flight) while IPv6 is \
-                         diverted into VPP on {on}: every diverted IPv6 packet is dropped \
-                         until the table loads. Drop `v6-divert` (or set the port `steer \
-                         off`) and `packetframe reconfigure` to put it back on the eBPF \
-                         tier meanwhile",
+                        "no routes yet ({} in flight) while diverted on {on}; diverted IPv6 \
+                         drops; fix: drop v6-divert, run `packetframe reconfigure`",
                         v6.installing
                     ),
                 ),
@@ -2228,16 +2070,13 @@ impl StatusSnapshot {
             (
                 HealthState::Healthy,
                 match &diverted {
-                    None => format!("{} IPv6 routes loaded in VPP, not steered", v6.installed),
-                    Some(on) => format!(
-                        "{} IPv6 routes loaded in VPP; IPv6 is diverted into VPP on {on}",
-                        v6.installed
-                    ),
+                    None => format!("{} routes, not steered", v6.installed),
+                    Some(on) => format!("{} routes, diverted on {on}", v6.installed),
                 },
             )
         };
         let message = match self.unresolvable_v6_acceptance_note() {
-            Some(note) => format!("{message}. {note}"),
+            Some(note) => format!("{message}; {note}"),
             None => message,
         };
         Some(SubsystemHealth {
@@ -2263,21 +2102,16 @@ impl StatusSnapshot {
         let mut parts = Vec::new();
         if !self.unresolvable_accepted_v6.is_empty() {
             parts.push(format!(
-                "accepted: {} (`unresolvable-accept6` — acknowledged, not fixed: they stay \
-                 out of VPP, and diverted IPv6 for them still dies there)",
-                self.unresolvable_accepted_v6.join("; ")
+                "accepted: {} (unresolvable-accept6; still out of VPP)",
+                capped(&self.unresolvable_accepted_v6, "; ")
             ));
         }
         if matches!(self.state, State::Ready | State::Steered) {
             parts.extend(self.unresolvable_accepts_unmatched_v6.iter().map(|p| {
-                format!(
-                    "unresolvable-accept6 {p} matches no unresolvable route — the route resolved \
-                     or left the table; drop the line, or it will silently accept that prefix \
-                     the next time it goes unresolvable"
-                )
+                format!("unresolvable-accept6 {p} matches no unresolvable route; remove it")
             }));
         }
-        (!parts.is_empty()).then(|| parts.join(". "))
+        (!parts.is_empty()).then(|| parts.join("; "))
     }
 
     fn steering_health(&self) -> SubsystemHealth {
@@ -2340,9 +2174,7 @@ impl StatusSnapshot {
             // What is always true, and all an operator needs: this is
             // the command, and it reports its own reason when it
             // refuses (review finding).
-            "`packetframe reconfigure` re-applies steering, and reports its own reason if \
-             it refuses — a table too incomplete to steer into is the usual one"
-                .to_string()
+            "run: `packetframe reconfigure`".to_string()
         } else if matches!(self.state, State::Stopped) {
             // Nothing is running and nothing is trying to. Reachable and
             // nasty: `StopRequested` assigns `Stopped` before knowing
@@ -2351,9 +2183,8 @@ impl StatusSnapshot {
             // either way — so this is precisely the snapshot reporting
             // rules that still divert traffic into a VF whose VPP has
             // just been killed (review finding).
-            "supervision has stopped, so nothing will reconcile this on its own: with the \
-             daemon exited, `packetframe detach --all` retries the teardown, and `ethtool \
-             -N <iface> delete <loc>` removes a rule by hand"
+            "supervision stopped; once the daemon has exited, run `packetframe detach --all`, \
+             or remove by hand: `ethtool -N <iface> delete <loc>`"
                 .to_string()
         } else if !self.steer_configured {
             // A convergence CAN clear these now, and for a while none
@@ -2398,15 +2229,8 @@ impl StatusSnapshot {
             // wrong four times. Understating costs an operator one
             // unnecessary `reconfigure`; overstating costs them the
             // rules.
-            "no port is configured to steer, so a convergence that verifies without \
-             withheld or unresolvable routes reconciles the NIC to an empty target and \
-             removes these. One that ends incomplete parks in the staging state and \
-             emits no steer at all, so nothing reconciles and this line outlives the \
-             convergence — `packetframe reconfigure` is then the retry, and with no port \
-             asking to steer it removes the rules rather than reinstalling any. Do not \
-             wait for either if VPP is not forwarding: `ethtool -N <iface> delete <loc>` \
-             removes a rule now, and `packetframe detach --all` retries the whole \
-             teardown once this daemon has exited"
+            "no port steers, so a clean convergence removes them; now: `ethtool -N <iface> \
+             delete <loc>`, or `packetframe detach --all` once this daemon has exited"
                 .to_string()
         } else {
             // A convergence is in flight or is coming (`Backoff` has no
@@ -2436,11 +2260,7 @@ impl StatusSnapshot {
             // be wrong somewhere, and this line's history is entirely
             // about being wrong somewhere.
             let tail = if self.state.accepts_steering_removal() {
-                "Turning steering ON has to wait for that, and `packetframe reconfigure` \
-                 answers \"not converged\" if you ask for it here. Taking it OFF does \
-                 not: a reconfigure with every port `steer off` is admitted while \
-                 converging, precisely so a deferral cannot strand traffic on VPP with \
-                 no lever"
+                "until then only an all-ports steer off is accepted"
             } else {
                 // What it CHANGES is the promise; what it ANSWERS is not.
                 // A reload that edits no steering input is answered without
@@ -2449,19 +2269,9 @@ impl StatusSnapshot {
                 // refused like any other.
                 // Naming only the answer that does not vary keeps this line
                 // true of both (review finding).
-                "Until it converges there is nothing to ask: from here `packetframe \
-                 reconfigure` changes no steering, and a reload that edits steering answers \
-                 \"not converged\""
+                "nothing to run until it converges"
             };
-            format!(
-                "a convergence re-applies steering only if it verifies clean — one that \
-                 ends with routes withheld or unresolvable parks in the staging state and \
-                 emits no steer at all, and a steer that IS emitted can still be refused \
-                 by the completeness gate or held until VPP has caught up with the route \
-                 mirror. Each settles in the staging state with the want remembered, and \
-                 from there the module re-attempts the steer by itself once nothing \
-                 refuses it. {tail}"
-            )
+            format!("re-applied once a convergence verifies clean; {tail}")
         };
         // Stray rules do NOT share that remedy, and sharing it was a
         // P1. The two complaints differ in what waiting costs: a
@@ -2486,47 +2296,27 @@ impl StatusSnapshot {
             // ours would be the ownership guess this audit keeps
             // getting wrong. `ethtool -n` settles it either way.
             clauses.push(format!(
-                "{} location(s) the ledger names are still occupied by rules this config \
-                 does not ask for — a port it leaves unsteered, or prefixes dropped from \
-                 the allowlist — so traffic may still be diverted into VPP that should \
-                 not be. The rules outlived the request to remove them. `packetframe \
-                 reconfigure` removes exactly the locations the ledger names, so nothing \
-                 has to be identified by eye — but it deletes BY LOCATION, so it can no \
-                 more prove they still hold OUR rules than this audit can. Do not wait \
-                 for a convergence: while VPP is not forwarding, that traffic is going to \
-                 a VF nothing is servicing. Where reconfigure will not run, remove by \
-                 hand (`ethtool -n <iface>`, then `ethtool -N <iface> delete <loc>`); the \
-                 current allowlist is not the test, since the commonest stray is a prefix \
-                 just removed from it. The runbook has the field table",
+                "{} stray rule(s) may still divert traffic this config does not steer; \
+                 `packetframe reconfigure` removes them by ledger location; where it is \
+                 refused, remove by hand: `ethtool -n <iface>`, then `ethtool -N <iface> \
+                 delete <loc>`",
                 self.steer_stray
             ));
         }
         if self.steer_missing > 0 {
             clauses.push(format!(
-                "{} steering rule(s) this target asks for are missing from the NIC, no \
-                 longer match what was asked for, or were never installed — that traffic \
-                 is on the eBPF tier. Something changed them out of band (a UniFi \
-                 provisioning push can do this), or the allowlist grew while the inherited \
-                 rules stayed as they were; {remedy}",
+                "{} rule(s) missing from the NIC, that traffic is on eBPF; {remedy}",
                 self.steer_missing
             ));
         }
         if let Some(why) = &self.steer_audit_unreadable {
-            let unverifiable = format!(
-                "the NIC would not answer a rule readback ({why}), so rules may be \
-                 removed or altered without this being visible; `ethtool -n <iface>` is \
-                 the ground truth until it clears"
-            );
             clauses.push(if clauses.is_empty() {
-                format!("cannot verify steering: {unverifiable}")
+                format!("cannot verify steering: NIC readback failed ({why})")
             } else {
                 // The counts above are real but STALE, and saying so is
                 // the whole point — an operator reading a count as
                 // current will fix that many rules and stop looking.
-                format!(
-                    "and the count(s) above are the last answer the NIC gave, not current \
-                     ones: {unverifiable}"
-                )
+                format!("counts are stale: NIC readback failed ({why})")
             });
         }
         // Last, so the readback clause's "the count(s) above" still means
@@ -2536,16 +2326,16 @@ impl StatusSnapshot {
         // plain `steered`.
         if let Some(h) = self.held_addition() {
             clauses.push(format!(
-                "a steering change that diverts more traffic onto VPP is held because {h}. \
-                 The rules already installed stay as they are and keep forwarding; {}",
+                "addition held: {}; installed rules keep forwarding{}",
+                h.brief(),
                 if h.clears_itself() {
-                    "the change lands on its own once nothing holds it"
+                    ""
                 } else {
-                    "waiting does not clear this, so the change waits until it is cleared"
+                    "; waiting will not clear it"
                 }
             ));
         }
-        let message = (!clauses.is_empty()).then(|| clauses.join(". "));
+        let message = (!clauses.is_empty()).then(|| clauses.join("; "));
         if let Some(message) = message {
             return SubsystemHealth {
                 name: SUBSYS_STEERING.into(),
@@ -2572,34 +2362,17 @@ impl StatusSnapshot {
                 HealthState::Healthy,
                 Some(if self.steer_v6_divert.is_empty() {
                     if self.counts.v6.is_some() {
-                        "steered — MCAM rules are diverting allowlisted IPv4 traffic to VPP \
-                         (IPv6 routes are loaded in VPP by `v6 on`, but no IPv6 is steered: \
-                         no port has `v6-divert`, so it stays on the eBPF tier); \
-                         `ethtool -n <iface>` lists the rules"
-                            .into()
+                        "IPv4 steered; IPv6 not steered".to_string()
                     } else {
-                        "steered — MCAM rules are diverting allowlisted IPv4 traffic to VPP \
-                         (IPv6 stays on the eBPF tier: no port has `v6-divert`); \
-                         `ethtool -n <iface>` lists the rules"
-                            .into()
+                        "IPv4 steered".to_string()
                     }
                 } else if self.steer_v6_only {
                     format!(
-                        "steered — MCAM rules are diverting IPv6 on {} (every TCP and UDP \
-                         frame to the router there except DNS, BGP and `steer-keep6`) to \
-                         VPP; no IPv4 is diverted (nothing in the allowlist is steerable \
-                         IPv4), and other IPv6 stays on the eBPF tier. `ethtool -n <iface>` \
-                         lists the rules",
+                        "IPv6 steered on {}; no IPv4",
                         self.steer_v6_divert.join(", ")
                     )
                 } else {
-                    format!(
-                        "steered — MCAM rules are diverting allowlisted IPv4 traffic, and \
-                         IPv6 on {} (every TCP and UDP frame to the router there except \
-                         DNS, BGP and `steer-keep6`), to VPP; other IPv6 stays on the \
-                         eBPF tier. `ethtool -n <iface>` lists the rules",
-                        self.steer_v6_divert.join(", ")
-                    )
+                    format!("IPv4 steered; IPv6 on {}", self.steer_v6_divert.join(", "))
                 }),
             ),
             // Intended but absent: a failed steer, or steering torn down
@@ -2628,25 +2401,24 @@ impl StatusSnapshot {
                 HealthState::Degraded,
                 Some(if matches!(self.state, State::Ready) {
                     format!(
-                        "steering intended but not in place — traffic is on the eBPF tier. \
-                         The module re-attempts it on its own, at most every {}s, once \
-                         nothing is refusing it; `packetframe reconfigure` asks immediately \
-                         and reports the reason if it is refused again{}",
+                        "intended but not in place, traffic on eBPF; retried every {}s, or \
+                         run: `packetframe reconfigure`{}",
                         crate::driver::STEER_RETRY_EVERY.as_secs(),
                         self.steer_hold
                             .as_ref()
                             .map(|h| format!(
-                                ". Held now because {h}{}",
+                                "; held: {}{}",
+                                h.brief(),
                                 if h.clears_itself() {
                                     ""
                                 } else {
-                                    " — waiting does not clear this, so it will not steer by itself"
+                                    "; waiting will not clear it"
                                 }
                             ))
                             .unwrap_or_default()
                     )
                 } else {
-                    "steering intended but not in place — traffic is on the eBPF tier".to_string()
+                    "intended but not in place, traffic on eBPF".to_string()
                 }),
             ),
             // The deliberate staging state: all members up, FIB synced
@@ -2675,27 +2447,15 @@ impl StatusSnapshot {
                 // arms an already-steering port reaches; it covers
                 // these now.
                 Some(format!(
-                    "configured `steer on`, awaiting an operator lever move; traffic is on \
-                     the eBPF tier. A first attach never steers by itself — set the port \
-                     `steer off`, `packetframe reconfigure`, then back to `steer on` and \
-                     reconfigure again (canary ladder, docs/runbooks/vpp-offload.md){}",
+                    "`steer on` set, not yet steered; first steer needs a lever move: `steer \
+                     off`, reconfigure, `steer on`, reconfigure{}",
                     self.steer_hold
                         .as_ref()
-                        .map(|h| if h.clears_itself() {
-                            format!(
-                                ". A lever move now would be held, and steer on its own once \
-                                 nothing holds it, because {h}"
-                            )
-                        } else {
-                            format!(". A lever move now would be held, because {h}")
-                        })
+                        .map(|h| format!("; a lever move now is held: {}", h.brief()))
                         .unwrap_or_default()
                 )),
             ),
-            (false, false) => (
-                HealthState::Healthy,
-                Some("steer off (staging state); traffic is on the eBPF tier".into()),
-            ),
+            (false, false) => (HealthState::Healthy, Some("not steered (steer off)".into())),
         };
         SubsystemHealth {
             name: SUBSYS_STEERING.into(),
@@ -2709,30 +2469,24 @@ impl StatusSnapshot {
     /// place. Every message starts `steer-at-start: wanted` so a parser
     /// keys on it, then says what it is waiting for.
     fn steering_wanted_at_start(&self) -> (HealthState, Option<String>) {
-        const HEAD: &str = "steer-at-start: wanted from the start, not yet in place; traffic \
-                            is on the eBPF tier";
+        const HEAD: &str = "steer-at-start: wanted, not in place";
         let waiting = |what: String| {
             (
                 HealthState::Healthy,
-                Some(format!("{HEAD}. Waiting for {what}")),
+                Some(format!("{HEAD}; waiting for {what}")),
             )
         };
         match self.state {
             State::Stopped | State::Backoff => (
                 HealthState::Degraded,
                 Some(format!(
-                    "{HEAD}. VPP is not running; the want is kept and the steer follows the next \
-                     convergence that verifies"
+                    "{HEAD}; VPP not running, steers after the next clean convergence"
                 )),
             ),
-            State::Starting | State::Syncing | State::AdoptedResyncing => waiting(
-                "VPP's first convergence: the table to load, then verify, the completeness \
-                 gate and the first-steer hold"
-                    .into(),
-            ),
-            State::Verifying => {
-                waiting("verify, then the completeness gate and the first-steer hold".into())
+            State::Starting | State::Syncing | State::AdoptedResyncing => {
+                waiting("first convergence".into())
             }
+            State::Verifying => waiting("verify".into()),
             _ => {
                 let dead: Vec<&str> = self
                     .ports
@@ -2744,27 +2498,22 @@ impl StatusSnapshot {
                     return (
                         HealthState::Degraded,
                         Some(format!(
-                            "{HEAD}. Refused: member port(s) {} are dark and routes egress \
-                             them, so steering would blackhole that traffic; waiting does not \
-                             clear this, the link must come up",
+                            "{HEAD}; refused: {} down with routes; bring the link up",
                             dead.join(", ")
                         )),
                     );
                 }
                 match &self.steer_hold {
-                    Some(h) if h.clears_itself() => {
-                        waiting(format!("the first-steer hold to clear: {h}"))
-                    }
+                    Some(h) if h.clears_itself() => waiting(h.brief()),
                     Some(h) => (
                         HealthState::Degraded,
                         Some(format!(
-                            "{HEAD}. Held because {h} — waiting does not clear this, so it \
-                             will not steer by itself"
+                            "{HEAD}; held: {}; waiting will not clear it",
+                            h.brief()
                         )),
                     ),
                     None => waiting(format!(
-                        "the next retry, at most every {}s; a refusal names its gate in the \
-                         journal (`steer refused`)",
+                        "the next retry (every {}s)",
                         crate::driver::STEER_RETRY_EVERY.as_secs()
                     )),
                 }
@@ -2779,7 +2528,7 @@ impl StatusSnapshot {
         } else if dead.is_empty() {
             (
                 HealthState::Healthy,
-                Some(format!("{} member port(s) up", self.ports.len())),
+                Some(format!("{} up", self.ports.len())),
             )
         } else {
             // Severity consults BOTH facts about a dead member: whether
@@ -2795,43 +2544,44 @@ impl StatusSnapshot {
             // dark-idle members and read `ports UNHEALTHY` (2026-08-14)
             // — a page for a box forwarding everything correctly, which
             // is how alerts get muted.
-            let names = dead
-                .iter()
-                .map(|p| {
-                    format!(
-                        "{} (admin_up={} link_up={}{})",
-                        p.port,
-                        p.admin_up,
-                        p.link_up,
-                        if p.in_use {
-                            "; ROUTES EGRESS HERE"
-                        } else {
-                            "; idle"
-                        }
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let (st, tail) = match (dead.iter().any(|p| p.in_use), self.steered) {
-                (true, true) => (
+            let name = |p: &&PortLink| {
+                if p.admin_up {
+                    p.port.clone()
+                } else {
+                    format!("{} (admin down)", p.port)
+                }
+            };
+            let busy: Vec<String> = dead.iter().filter(|p| p.in_use).map(name).collect();
+            let idle: Vec<String> = dead.iter().filter(|p| !p.in_use).map(name).collect();
+            let idle_note = (!idle.is_empty()).then(|| format!("{} down, idle", idle.join(", ")));
+            let it = |n: &[String]| if n.len() == 1 { "it" } else { "them" };
+            let (st, msg) = match (busy.is_empty(), self.steered) {
+                (false, true) => (
                     HealthState::Unhealthy,
-                    "installed routes egress a member that cannot forward, and traffic is \
-                     steered — those paths are dropping",
+                    format!(
+                        "{} down, routes egress {it}; steered traffic via {it} drops",
+                        busy.join(", "),
+                        it = it(&busy)
+                    ),
                 ),
-                (true, false) => (
+                (false, false) => (
                     HealthState::Degraded,
-                    "installed routes egress a member that cannot forward; a steer into \
-                     this would blackhole those paths, and verify refuses it while this \
-                     holds",
+                    format!(
+                        "{} down, routes egress {}; steering refused until the link is up",
+                        busy.join(", "),
+                        it(&busy)
+                    ),
                 ),
-                (false, _) => (
+                (true, _) => (
                     HealthState::Degraded,
-                    "no installed route egresses them, so they deliberately carry nothing \
-                     and steering is unaffected; link-up plus a steering retry brings one \
-                     back into service",
+                    format!("{} down; no routes use {}", idle.join(", "), it(&idle)),
                 ),
             };
-            (st, Some(format!("down: {names} — {tail}")))
+            let msg = match (busy.is_empty(), idle_note) {
+                (false, Some(n)) => format!("{msg}; {n}"),
+                _ => msg,
+            };
+            (st, Some(msg))
         };
         SubsystemHealth {
             name: SUBSYS_PORTS.into(),
@@ -2939,18 +2689,16 @@ fn drift_v6_acceptance_note(v6: &crate::drift::V6DriftState) -> Option<String> {
     let mut parts = Vec::new();
     if !v6.accepted.is_empty() {
         parts.push(format!(
-            "accepted: {} (`drift-accept6` — acknowledged, not fixed: diverted IPv6 for these \
-             still dies in VPP)",
-            v6.accepted.join("; ")
+            "accepted: {} (drift-accept6; still drops in VPP)",
+            capped(&v6.accepted, "; ")
         ));
     }
-    parts.extend(v6.unmatched_accepts.iter().map(|p| {
-        format!(
-            "drift-accept6 {p} matches nothing — the finding it accepted is gone; drop the \
-             line, or it will silently accept whatever appears there next"
-        )
-    }));
-    (!parts.is_empty()).then(|| parts.join(". "))
+    parts.extend(
+        v6.unmatched_accepts
+            .iter()
+            .map(|p| format!("drift-accept6 {p} matches nothing; remove it")),
+    );
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// `": a; b; +K more"` for a non-empty list of named unresolvable
@@ -2961,6 +2709,47 @@ fn named(names: &[String]) -> String {
     } else {
         format!(": {}", names.join("; "))
     }
+}
+
+/// An age as the status renderer prints one: a single unit, rounded
+/// down — `45s` under a minute, `12m` under an hour, `37h` under two
+/// days, then `4d`.
+pub(crate) fn ago(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=172_799 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
+/// `41452` as `41,452`.
+pub(crate) fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// How many items a row lists before it summarises the rest.
+const LISTED: usize = 5;
+
+/// The first [`LISTED`] of `items` joined by `sep`, then `+N more`.
+fn capped(items: &[String], sep: &str) -> String {
+    if items.len() <= LISTED {
+        return items.join(sep);
+    }
+    format!(
+        "{}{sep}+{} more",
+        items[..LISTED].join(sep),
+        items.len() - LISTED
+    )
 }
 
 /// Render `packetframe_vpp_*` gauges for the Prometheus textfile
@@ -3940,19 +3729,19 @@ mod tests {
                 // classification rather than four independent
                 // contains() that could all drift true.
                 let expected = if state.accepts_steering_changes() {
-                    "`packetframe reconfigure` re-applies steering"
+                    "run: `packetframe reconfigure`"
                 } else if matches!(state, State::Stopped) {
-                    "supervision has stopped"
+                    "supervision stopped"
                 } else if !steer_configured {
-                    "no port is configured to steer"
+                    "no port steers"
                 } else {
-                    "only if it verifies clean"
+                    "verifies clean"
                 };
                 for marker in [
-                    "`packetframe reconfigure` re-applies steering",
-                    "supervision has stopped",
-                    "no port is configured to steer",
-                    "only if it verifies clean",
+                    "run: `packetframe reconfigure`",
+                    "supervision stopped",
+                    "no port steers",
+                    "verifies clean",
                 ] {
                     assert_eq!(
                         msg.contains(marker),
@@ -3972,7 +3761,7 @@ mod tests {
                 // forwarding meanwhile. So it must ALSO name a removal
                 // that works right now, and must not point at `detach`
                 // without saying that a live daemon refuses it.
-                if expected == "no port is configured to steer" {
+                if expected == "no port steers" {
                     assert!(
                         msg.contains("ethtool -N") && msg.contains("once this daemon has exited"),
                         "state {state:?}: waiting out a convergence is not always an \
@@ -4155,10 +3944,7 @@ mod tests {
                             // may still NAME reconfigure — the stray arm
                             // does, hedged with "where reconfigure will
                             // not run" — but it may not say it works now.
-                            for banned in [
-                                "asks immediately",
-                                "re-applies steering, and reports its own reason",
-                            ] {
+                            for banned in ["asks immediately", "run: `packetframe reconfigure`"] {
                                 assert!(
                                     !msg.contains(banned),
                                     "{} in {state:?} (steer_configured={steer_configured}, \
@@ -4299,14 +4085,13 @@ mod tests {
                      fallback wherever `reconfigure` cannot run: {msg}"
                 );
                 assert!(
-                    !msg.contains("only if it verifies clean"),
+                    !msg.contains("verifies clean"),
                     "state {state:?}: and must never defer to a convergence — with a \
                      refused unsteer the rules outlive the process, so waiting means \
                      dropping that prefix, not merely losing the offload: {msg}"
                 );
                 assert!(
-                    msg.contains("removes exactly the locations the ledger names")
-                        && msg.contains("current allowlist is not the test"),
+                    msg.contains("by ledger location") && msg.contains("ethtool -n <iface>"),
                     "state {state:?}: lead with the repair that needs no identification, \
                      and warn about the trap in the one that does — a rule for a prefix \
                      just removed from the allowlist cannot match the current config, \
@@ -4352,7 +4137,7 @@ mod tests {
         );
         let msg = steering.message.as_deref().unwrap_or_default();
         assert!(
-            msg.contains('2') && msg.contains("may still be diverted"),
+            msg.contains('2') && msg.contains("may still divert"),
             "and the line must say which way the problem points — these rules \
              need REMOVING, not reinstalling: {msg}"
         );
@@ -4400,11 +4185,11 @@ mod tests {
         assert_eq!(steering.state, HealthState::Degraded);
         let msg = steering.message.as_deref().unwrap_or_default();
         assert!(
-            msg.contains('1') && msg.contains("eBPF tier"),
+            msg.contains('1') && msg.contains("on eBPF"),
             "the proven drift must still be reported: {msg}"
         );
         assert!(
-            msg.contains("EIO") && msg.contains("not current ones"),
+            msg.contains("EIO") && msg.contains("counts are stale"),
             "and so must the fact that the count is stale and further drift is \
              invisible — reporting only the count sends an operator to fix that \
              many rules and stop looking: {msg}"
@@ -4499,10 +4284,7 @@ mod tests {
             let (state, msg) = fib_row(&s);
             assert_eq!(state, HealthState::Degraded, "{msg}");
             assert!(
-                msg.contains(
-                    "5000 routes installed, but the last verify ran on 64 probes against \
-                     1000 routes"
-                ),
+                msg.contains("5000 routes; last verify covered 64 probes on 1000 routes"),
                 "{msg}"
             );
             assert_eq!(s.report().overall, HealthState::Degraded, "{msg}");
@@ -4514,7 +4296,7 @@ mod tests {
             fib_row(&s),
             (
                 HealthState::Healthy,
-                "5000 routes installed; last verified on 64 probes against 4600 routes".into()
+                "5000 routes, 64/64 probes matched on 4600".into()
             )
         );
         assert_eq!(s.report().overall, HealthState::Healthy);
@@ -4535,10 +4317,10 @@ mod tests {
         );
         let (_, msg) = fib_row(&s);
         assert!(
-            msg.contains("the table has outgrown it, so it re-runs on its own"),
+            msg.contains("table outgrew it; re-runs once VPP catches up"),
             "{msg}"
         );
-        assert!(!msg.contains("does not re-run"), "{msg}");
+        assert!(!msg.contains("not re-run"), "{msg}");
     }
 
     /// A verify that passed does not make a later empty table healthy.
@@ -4590,7 +4372,7 @@ mod tests {
             fib.message
                 .as_deref()
                 .unwrap()
-                .contains("route source is empty"),
+                .contains("route source empty"),
             "{:?}",
             fib.message
         );
@@ -4651,7 +4433,7 @@ mod tests {
     fn a_stale_unfit_row_over_an_emptied_steered_table_is_unhealthy() {
         let stale = FibSync::Unfit {
             age: Duration::from_secs(1847),
-            summary: VerifyOutcome::default().summary(),
+            summary: VerifyOutcome::default().brief(),
             reruns: true,
             sampled: 0,
             table: 0,
@@ -4687,7 +4469,7 @@ mod tests {
     fn a_verify_that_its_own_recovery_outran_is_degraded_and_dated() {
         let stale = FibSync::Unfit {
             age: Duration::from_secs(1847),
-            summary: VerifyOutcome::default().summary(),
+            summary: VerifyOutcome::default().brief(),
             reruns: true,
             sampled: 0,
             table: 0,
@@ -4715,11 +4497,11 @@ mod tests {
         );
         let msg = fib.message.expect("a message");
         assert!(
-            msg.contains("INCOMPLETE"),
+            msg.contains("incomplete"),
             "the verdict is still reported, not hidden: {msg}"
         );
         assert!(
-            msg.contains("1847s ago"),
+            msg.contains("(30m ago)"),
             "with its age, because nothing re-verifies: {msg}"
         );
         assert!(
@@ -4757,7 +4539,7 @@ mod tests {
             .find(|x| x.name == SUBSYS_FIB)
             .expect("the fib row");
         assert_eq!(fib.state, HealthState::Unhealthy);
-        assert!(fib.message.expect("a message").contains("4s ago"));
+        assert!(fib.message.expect("a message").contains("(4s ago)"));
     }
 
     /// The row is not the alert. **`overall` must come down too.**
@@ -4774,7 +4556,7 @@ mod tests {
     fn a_recovered_unfit_verdict_does_not_page_at_the_top_level() {
         let stale = FibSync::Unfit {
             age: Duration::from_secs(1847),
-            summary: VerifyOutcome::default().summary(),
+            summary: VerifyOutcome::default().brief(),
             reruns: true,
             sampled: 0,
             table: 0,
@@ -4813,7 +4595,7 @@ mod tests {
                 },
                 FibSync::Unfit {
                     age: Duration::from_secs(30),
-                    summary: VerifyOutcome::default().summary(),
+                    summary: VerifyOutcome::default().brief(),
                     reruns: true,
                     sampled: 0,
                     table: 0,
@@ -4843,7 +4625,7 @@ mod tests {
             },
             FibSync::Unfit {
                 age: Duration::from_secs(30),
-                summary: VerifyOutcome::default().summary(),
+                summary: VerifyOutcome::default().brief(),
                 reruns: true,
                 sampled: 0,
                 table: 0,
@@ -5108,7 +4890,7 @@ mod tests {
         assert_eq!(ready.state, HealthState::Healthy, "{:?}", ready.message);
         let msg = ready.message.unwrap_or_default();
         assert!(
-            msg.starts_with("steer-at-start: wanted") && msg.contains("Waiting for"),
+            msg.starts_with("steer-at-start: wanted") && msg.contains("waiting for"),
             "{msg}"
         );
         assert!(!msg.contains("intended but not in place"), "{msg}");
@@ -5117,7 +4899,7 @@ mod tests {
         assert_eq!(dark.state, HealthState::Degraded, "{:?}", dark.message);
         let msg = dark.message.unwrap_or_default();
         assert!(
-            msg.contains("eth4") && msg.contains("waiting does not clear this"),
+            msg.contains("eth4") && msg.contains("bring the link up"),
             "{msg}"
         );
 
@@ -5163,7 +4945,7 @@ mod tests {
 
         let ready = line(State::Ready);
         assert!(
-            ready.contains("re-attempts it on its own"),
+            ready.contains("retried every"),
             "from Ready the module is already retrying, and the line must say so: {ready}"
         );
         assert!(
@@ -5177,7 +4959,7 @@ mod tests {
                 "{state:?}: still the same complaint: {msg}"
             );
             assert!(
-                !msg.contains("re-attempts it on its own"),
+                !msg.contains("retried every"),
                 "{state:?}: nothing is armed here — the repair is the convergence: {msg}"
             );
         }
@@ -5208,14 +4990,11 @@ mod tests {
             .unwrap();
         assert_eq!(row.state, HealthState::Healthy);
         let msg = row.message.expect("a message, not a bare healthy");
-        assert!(msg.starts_with("steered"), "{msg}");
         // Scoped to what steering covers: `RuleSet::plan` skips every v6
-        // prefix, so "allowlisted traffic" alone would overstate it.
-        assert!(msg.contains("IPv4"), "{msg}");
-        assert!(msg.contains("IPv6 stays on the eBPF tier"), "{msg}");
+        // prefix, so "steered" alone would overstate it.
+        assert_eq!(msg, "IPv4 steered");
 
-        // With v6 diverted, the row says where — port and VLANs — and
-        // stops claiming v6 stays put.
+        // With v6 diverted, the row says where — port and VLANs.
         snap.steer_v6_divert = vec!["eth4 vlan 100,200".into(), "eth5 untagged".into()];
         let msg = snap
             .report()
@@ -5229,8 +5008,7 @@ mod tests {
             msg.contains("IPv6 on eth4 vlan 100,200, eth5 untagged"),
             "{msg}"
         );
-        assert!(!msg.contains("no port has `v6-divert`"), "{msg}");
-        assert!(msg.contains("allowlisted IPv4"), "both families: {msg}");
+        assert!(msg.starts_with("IPv4 steered"), "both families: {msg}");
 
         // v6 only: the row stops claiming IPv4 is diverted.
         snap.steer_v6_only = true;
@@ -5242,9 +5020,9 @@ mod tests {
             .unwrap()
             .message
             .unwrap();
-        assert!(msg.contains("IPv6 on eth4 vlan 100,200"), "{msg}");
-        assert!(!msg.contains("allowlisted IPv4"), "{msg}");
-        assert!(msg.contains("no IPv4 is diverted"), "{msg}");
+        assert!(msg.contains("IPv6 steered on eth4 vlan 100,200"), "{msg}");
+        assert!(!msg.contains("IPv4 steered"), "{msg}");
+        assert!(msg.contains("no IPv4"), "{msg}");
     }
 
     /// The `mss-clamp` row: absent with nothing configured, Healthy with
@@ -5361,10 +5139,7 @@ mod tests {
         let msg = r.message.unwrap();
         assert!(msg.contains("eth4 vlan 100"), "{msg}");
         assert!(msg.contains("`loopback-address6"), "{msg}");
-        assert!(
-            msg.contains("Packet Too Big") && msg.contains("`*`"),
-            "{msg}"
-        );
+        assert!(msg.contains("PMTUD"), "{msg}");
         assert_eq!(snap.report().overall, HealthState::Degraded);
         assert!(gauge(&snap).ends_with(" 1"), "{}", gauge(&snap));
 
@@ -5573,7 +5348,7 @@ mod tests {
         assert_eq!(ports.state, HealthState::Degraded);
         let msg = ports.message.as_deref().unwrap_or_default();
         assert!(
-            msg.contains("idle") && msg.contains("steering is unaffected"),
+            msg == "eth4 down; no routes use it",
             "the row must say the dark member carries nothing: {msg}"
         );
 
@@ -5605,7 +5380,7 @@ mod tests {
             .expect("ports row");
         let msg = ports.message.as_deref().unwrap_or_default();
         assert!(
-            msg.contains("ROUTES EGRESS HERE"),
+            msg.contains("routes egress it"),
             "an in-use dark member must be distinguishable from an idle one: {msg}"
         );
     }
@@ -5754,7 +5529,7 @@ mod tests {
             "but a restart cannot make the source dump faster"
         );
         assert!(matches!(
-            FibSync::from_outcome(&empty, Duration::ZERO, None),
+            FibSync::from_outcome(&empty, Duration::ZERO),
             FibSync::Unfit { .. }
         ));
 
@@ -5766,7 +5541,7 @@ mod tests {
         };
         assert!(!holes.passed() && !holes.restart_worthy());
         assert!(matches!(
-            FibSync::from_outcome(&holes, Duration::ZERO, None),
+            FibSync::from_outcome(&holes, Duration::ZERO),
             FibSync::Unfit { .. }
         ));
 
@@ -5783,7 +5558,7 @@ mod tests {
         };
         assert!(wrong.restart_worthy());
         assert!(matches!(
-            FibSync::from_outcome(&wrong, Duration::ZERO, None),
+            FibSync::from_outcome(&wrong, Duration::ZERO),
             FibSync::Failed { .. }
         ));
 
@@ -5793,7 +5568,7 @@ mod tests {
         };
         assert!(good.passed());
         assert!(matches!(
-            FibSync::from_outcome(&good, Duration::ZERO, None),
+            FibSync::from_outcome(&good, Duration::ZERO),
             FibSync::Verified { sampled: 64, .. }
         ));
     }
@@ -5905,16 +5680,16 @@ mod tests {
 
         let vetoed = deferred(AuthorityPosture::Vetoing);
         assert!(
-            !vetoed.contains("gone quiet"),
+            !vetoed.contains("goes quiet"),
             "a vetoed deferral must not point at quiescence, which cannot release it: \
              {vetoed}"
         );
         assert!(
-            vetoed.contains("completeness authority") && vetoed.contains("vetoes"),
+            vetoed.contains("authority vetoes release"),
             "and it must name the authority as the blocker: {vetoed}"
         );
         assert!(
-            vetoed.contains("quiescence is never what releases a veto"),
+            vetoed.contains("waiting won't clear it"),
             "and say plainly that waiting for quiet is not the remedy: {vetoed}"
         );
         // One sample is still not proof of permanence — but that is now
@@ -5930,7 +5705,7 @@ mod tests {
              {vetoed}"
         );
         assert!(
-            vetoed.contains("TWO CONSECUTIVE CHECKS"),
+            vetoed.contains("2 checks"),
             "and the line must say what makes it trustworthy: {vetoed}"
         );
         // The opt-out it recommends is read once at bring-up, and
@@ -5943,21 +5718,16 @@ mod tests {
         // refusal is ever removed, this text becomes a lie and this
         // assertion is the tripwire.
         assert!(
-            vetoed.contains("RESTART"),
+            vetoed.contains("`require-table-complete off` and restart"),
             "recommending `require-table-complete off` without saying it needs a restart \
              is a remedy that silently does nothing: {vetoed}"
-        );
-        assert!(
-            vetoed.contains("reload is refused"),
-            "and it must say the reload refuses rather than leaving a plausible cheaper \
-             thing to try: {vetoed}"
         );
 
         // The permitting posture keeps the quiescence wording, so this
         // test cannot pass by making every deferral message identical.
         let attesting = deferred(AuthorityPosture::Attesting);
         assert!(
-            attesting.contains("gone quiet"),
+            attesting.contains("goes quiet"),
             "a non-vetoed deferral above the floor IS waiting for quiet: {attesting}"
         );
 
@@ -5967,7 +5737,7 @@ mod tests {
         // finding).
         let awaiting = deferred(AuthorityPosture::AwaitingAuthority);
         assert!(
-            !awaiting.contains("Waiting will not clear it"),
+            !awaiting.contains("won't clear"),
             "an authority that has merely not reported yet clears itself: {awaiting}"
         );
         assert!(
@@ -6020,7 +5790,7 @@ mod tests {
              nowhere: {msg}"
         );
         assert!(
-            msg.contains("not the authority feeding it"),
+            msg.contains("authority vetoes release"),
             "it must name the real blocker instead: {msg}"
         );
     }
@@ -6073,16 +5843,13 @@ mod tests {
                 let plain = row(authority, have, None);
                 let msg = row(authority, have, Some(refused));
                 assert!(
-                    !plain.contains("early door"),
+                    !plain.contains("early diff"),
                     "{authority:?} {have}: {plain}"
                 );
                 assert!(
                     msg.starts_with(&plain)
-                        && msg.contains(
-                            "its IPv6 diff would withdraw 3, replace 1 and add 2 routes \
-                             against the 200 IPv6 routes VPP is forwarding on, more than the 2"
-                        )
-                        && msg.contains("waits for the route source's replay to go quiet"),
+                        && msg.contains("IPv6 diff -3 ~1 +2 of 200 routes, over the 2 allowed")
+                        && msg.contains("waits for the replay to go quiet"),
                     "{authority:?} {have}: {msg}"
                 );
             }
@@ -6119,33 +5886,33 @@ mod tests {
                 .and_then(|s| s.message)
                 .expect("a deferral always explains itself")
         };
-        let waiting = "InitiationComplete for the current session";
+        let waiting = "waits for InitiationComplete";
 
         let absent = row(AuthorityPosture::Absent, 196, true);
         assert!(
-            absent.contains(waiting) && absent.contains("with no completeness authority"),
+            absent.contains(waiting) && absent.contains("no authority"),
             "{absent}"
         );
         let demoted = row(AuthorityPosture::DemotedByFlap, 196, true);
         assert!(
-            demoted.contains(waiting) && demoted.contains("reconnected under this deferral"),
+            demoted.contains(waiting) && demoted.contains("feed reconnected"),
             "{demoted}"
         );
         for authority in [AuthorityPosture::Absent, AuthorityPosture::DemotedByFlap] {
             let plain = row(authority, 196, false);
             assert!(
-                !plain.contains("InitiationComplete") && plain.contains("has gone quiet"),
+                !plain.contains("InitiationComplete") && plain.contains("goes quiet"),
                 "{authority:?}: {plain}"
             );
             let below = row(authority, 50, true);
             assert!(
-                below.contains("below the release floor of 100") && !below.contains(waiting),
+                below.contains("below floor 100") && !below.contains("(floor 100 met)"),
                 "{authority:?}: {below}"
             );
         }
         let vetoed = row(AuthorityPosture::Vetoing, 196, true);
         assert!(
-            vetoed.contains("not the authority feeding it") && !vetoed.contains(waiting),
+            vetoed.contains("authority vetoes release") && !vetoed.contains(waiting),
             "{vetoed}"
         );
     }
@@ -6164,8 +5931,8 @@ mod tests {
     fn every_deferral_line_names_the_tier_carrying_the_traffic() {
         use crate::runtime::AuthorityPosture;
         let led = ledger_with(10, 0, 0);
-        let on_vpp = "the adopted FIB keeps forwarding untouched";
-        let on_ebpf = "VPP is unsteered, so the traffic is on the eBPF tier";
+        let on_vpp = "adopted FIB forwarding";
+        let on_ebpf = "traffic on eBPF";
         for authority in [
             AuthorityPosture::Absent,
             AuthorityPosture::Attesting,
@@ -6199,14 +5966,12 @@ mod tests {
                         let case = format!("{authority:?} have={have} awaiting={awaiting}");
                         if steered {
                             assert!(
-                                msg.contains(on_vpp) && !msg.contains("eBPF tier"),
+                                msg.contains(on_vpp) && !msg.contains("eBPF"),
                                 "{case}, steered: {msg}"
                             );
                         } else {
                             assert!(
-                                msg.contains(on_ebpf)
-                                    && !msg.contains("keeps forwarding")
-                                    && !msg.contains("forwards the FIB"),
+                                msg.contains(on_ebpf) && !msg.contains("FIB forwarding"),
                                 "{case}, unsteered: {msg}"
                             );
                         }
@@ -6311,10 +6076,10 @@ mod tests {
         assert_eq!(r.state, HealthState::Degraded);
         let msg = r.message.unwrap();
         assert!(
-            msg.contains("IPv6 diversion held back")
+            msg.contains("IPv6 diversion held")
                 && msg.contains("guard ACL missing or drifted")
                 && msg.contains("acl_add_replace")
-                && msg.contains("IPv4 steering is unaffected"),
+                && msg.contains("IPv4 unaffected"),
             "{msg}"
         );
         assert_eq!(s.report().overall, HealthState::Degraded);
@@ -6345,7 +6110,7 @@ mod tests {
         assert_eq!(r.state, HealthState::Healthy);
         let msg = r.message.unwrap();
         assert!(
-            msg.contains("host-pfpunt0-vpp up") && msg.contains("4 router-owned /128(s)"),
+            msg == "4 /128s handed back, 1234 packets to the kernel",
             "{msg}"
         );
         assert_eq!(s.report().overall, HealthState::Healthy);
@@ -6395,7 +6160,7 @@ mod tests {
         assert_eq!(r.overall, HealthState::Healthy);
         let m = render_metrics(&off, "vpp-offload");
         assert!(!m.contains("packetframe_vpp_family_routes"), "{m}");
-        assert!(steering_line(&off).contains("no port has `v6-divert`"));
+        assert_eq!(steering_line(&off), "IPv4 steered");
 
         let mut on = v4;
         on.v6 = Some(crate::sink::FamilyCounts {
@@ -6411,14 +6176,10 @@ mod tests {
             .expect("row");
         assert_eq!(row.state, HealthState::Healthy);
         let msg = row.message.as_deref().unwrap_or("");
-        assert!(
-            msg.contains("250 IPv6 routes") && msg.contains("not steered"),
-            "{msg}"
-        );
+        assert!(msg == "250 routes, not steered", "{msg}");
         assert_eq!(r.overall, HealthState::Healthy);
         let line = steering_line(&s);
-        assert!(line.contains("no IPv6 is steered"), "{line}");
-        assert!(!line.contains("cannot steer"), "{line}");
+        assert_eq!(line, "IPv4 steered; IPv6 not steered");
         let m = render_metrics(&s, "vpp-offload");
         for want in [
             "packetframe_vpp_routes{module=\"vpp-offload\",state=\"installed\"} 5",
@@ -6479,9 +6240,9 @@ mod tests {
         let msg = row.message.as_deref().unwrap_or("");
         for want in [
             "1 refused by VPP",
-            "2 left out because every next hop is link-local",
-            "3 probe(s) VPP disagreed",
-            "1 member interface(s)",
+            "2 with only link-local next hops",
+            "3 probe mismatch(es)",
+            "1 dark member(s)",
         ] {
             assert!(msg.contains(want), "missing {want}: {msg}");
         }
@@ -6535,9 +6296,9 @@ mod tests {
         });
         let msg = holes.message.unwrap_or_default();
         assert_eq!(holes.state, HealthState::Degraded);
-        assert!(!msg.contains("No IPv6 is steered"), "{msg}");
+        assert!(!msg.contains("not steered"), "{msg}");
         assert!(
-            msg.contains("diverted into VPP on eth4 vlan 100") && msg.contains("dropped"),
+            msg.contains("diverted on eth4 vlan 100") && msg.contains("drops"),
             "{msg}"
         );
 
@@ -6547,11 +6308,8 @@ mod tests {
         });
         assert_eq!(empty.state, HealthState::Degraded, "{empty:?}");
         let msg = empty.message.unwrap_or_default();
-        assert!(!msg.contains("nothing IPv6 is steered"), "{msg}");
-        assert!(
-            msg.contains("every diverted IPv6 packet is dropped"),
-            "{msg}"
-        );
+        assert!(!msg.contains("not steered"), "{msg}");
+        assert!(msg.contains("diverted IPv6 drops"), "{msg}");
 
         let whole = row(crate::sink::FamilyCounts {
             installed: 250,
@@ -6560,7 +6318,7 @@ mod tests {
         assert_eq!(whole.state, HealthState::Healthy);
         let msg = whole.message.unwrap_or_default();
         assert!(!msg.contains("not steered"), "{msg}");
-        assert!(msg.contains("diverted into VPP on eth4 vlan 100"), "{msg}");
+        assert_eq!(msg, "250 routes, diverted on eth4 vlan 100");
     }
 
     /// `unresolvable-accept6` on the `fib-v6` row and its gauges. An
@@ -6574,10 +6332,10 @@ mod tests {
     #[test]
     fn an_accepted_unresolvable_v6_route_is_listed_and_degrades_nothing() {
         use crate::sink::FamilyCounts;
-        const AGGREGATE: &str = "2001:db8::/48 via 2001:db8::1 (the router's own address, \
-                                 which VPP has no adjacency for; …)";
-        const OTHER: &str = "2001:db8:0:5::/64 via 2001:db8::1 (the router's own address, \
-                             which VPP has no adjacency for; …)";
+        const AGGREGATE: &str = "2001:db8::/48 via 2001:db8::1 (router's own address, no VPP \
+                                 adjacency; …)";
+        const OTHER: &str = "2001:db8:0:5::/64 via 2001:db8::1 (router's own address, no VPP \
+                             adjacency; …)";
         let snap = |sup: &Supervisor,
                     v6: FamilyCounts,
                     open: &[&str],
@@ -6636,12 +6394,11 @@ mod tests {
         let r = row(&alone);
         let msg = r.message.unwrap_or_default();
         assert_eq!(r.state, HealthState::Healthy, "{msg}");
-        assert!(msg.starts_with("250 IPv6 routes loaded in VPP"), "{msg}");
-        assert!(!msg.contains("impaired"), "{msg}");
+        assert!(msg.starts_with("250 routes, "), "{msg}");
         assert!(
             msg.contains(
-                "accepted: 2001:db8::/48 via 2001:db8::1 (the router's own address, which VPP \
-                 has no adjacency for; …) (`unresolvable-accept6` — acknowledged, not fixed"
+                "accepted: 2001:db8::/48 via 2001:db8::1 (router's own address, no VPP \
+                 adjacency; …) (unresolvable-accept6; still out of VPP)"
             ),
             "{msg}"
         );
@@ -6665,7 +6422,7 @@ mod tests {
         let r = row(&both);
         let msg = r.message.unwrap_or_default();
         assert_eq!(r.state, HealthState::Degraded, "{msg}");
-        let (impaired, note) = msg.split_once(". accepted: ").expect("an accepted clause");
+        let (impaired, note) = msg.split_once("; accepted: ").expect("an accepted clause");
         assert!(
             impaired.contains("1 unresolvable (next hop not on a VPP port): 2001:db8:0:5::/64"),
             "{msg}"
@@ -6809,7 +6566,7 @@ mod tests {
             row.message
                 .as_deref()
                 .unwrap_or("")
-                .contains("has not finished a scan"),
+                .contains("first scan of this config not finished"),
             "{row:?}"
         );
         assert_ne!(report.overall, HealthState::Healthy);
@@ -6885,7 +6642,7 @@ mod tests {
             .and_then(|r| r.message.clone())
             .unwrap_or_default();
         assert!(msg.contains("vti64"), "the findings are still named: {msg}");
-        assert!(msg.contains("last good one"), "and marked stale: {msg}");
+        assert!(msg.contains("may be stale"), "and marked stale: {msg}");
 
         s.drift_unreadable = Some("netlink socket: permission denied".into());
         assert!(
@@ -6903,7 +6660,7 @@ mod tests {
             row.message
                 .as_deref()
                 .unwrap_or("")
-                .contains("could not read"),
+                .contains("cannot read kernel routes"),
             "{row:?}"
         );
         assert_ne!(report.overall, HealthState::Healthy);
@@ -6991,9 +6748,8 @@ mod tests {
         assert!(msg.contains("2001:db8:100::/48 via tun0"), "{msg}");
         assert!(
             msg.contains("steer-keep6") && msg.contains("v6-divert") && msg.contains("feed"),
-            "names the three remedies: {msg}"
+            "names the remedies: {msg}"
         );
-        assert!(msg.contains("no IPv6 `steer-exempt`"), "{msg}");
         assert_ne!(report.overall, HealthState::Healthy);
         let m = render_metrics(&s, "vpp-offload");
         assert!(m.contains("packetframe_vpp_exempt_drift_v6{module=\"vpp-offload\"} 1"));
@@ -7028,7 +6784,7 @@ mod tests {
             row.message
                 .as_deref()
                 .unwrap_or("")
-                .contains("could not read the kernel's IPv6 routes"),
+                .contains("cannot read kernel IPv6 routes"),
             "{row:?}"
         );
         assert_ne!(s.report().overall, HealthState::Healthy);
@@ -7037,7 +6793,7 @@ mod tests {
         s.drift_v6.routes = 1;
         let msg = v6_row(&s).and_then(|r| r.message).unwrap_or_default();
         assert!(
-            msg.contains("tun0") && msg.contains("last good one"),
+            msg.contains("tun0") && msg.contains("may be stale"),
             "{msg}"
         );
         assert!(!render_metrics(&s, "vpp-offload").contains("packetframe_vpp_exempt_drift_v6"));
@@ -7092,7 +6848,7 @@ mod tests {
             msg.starts_with("accepted: 2001:db8:100::/48 via tun0 (table 52)"),
             "{msg}"
         );
-        assert!(msg.contains("still dies in VPP"), "{msg}");
+        assert!(msg.contains("still drops in VPP"), "{msg}");
         assert_eq!(s.report().overall, HealthState::Healthy);
         let m = render_metrics(&s, "vpp-offload");
         assert!(m.contains("packetframe_vpp_exempt_drift_v6{module=\"vpp-offload\"} 0"));
@@ -7238,7 +6994,7 @@ mod tests {
             row.message
                 .as_deref()
                 .unwrap_or("")
-                .contains("cannot be read"),
+                .contains("bridge tables unreadable"),
             "{row:?}"
         );
     }
@@ -7482,7 +7238,7 @@ mod tests {
             .expect("the state-file subsystem must be present");
         let msg = sub.message.unwrap_or_default();
         assert!(msg.contains("read-only"), "{msg}");
-        assert!(msg.contains("refuse adoption"), "{msg}");
+        assert!(msg.contains("cycle VPP"), "{msg}");
 
         // No row at all when nothing failed, rather than a permanent
         // "state-file: fine" nobody reads.
@@ -7777,7 +7533,7 @@ mod tests {
                 },
                 FibSync::Unfit {
                     age: Duration::from_secs(30),
-                    summary: "verify INCOMPLETE".into(),
+                    summary: "verify incomplete".into(),
                     reruns,
                     // Covering the table, so `reruns` alone decides
                     // whether it is looked at again.
@@ -7798,15 +7554,11 @@ mod tests {
             );
             assert!(msg.contains("4 kernel-delivered"), "{msg}");
             assert_eq!(
-                msg.contains("re-runs on its own once the table holds no unresolvable route"),
+                msg.contains("re-runs once no route is unresolvable"),
                 reruns,
                 "{msg}"
             );
-            assert_eq!(
-                msg.contains("does not re-run in steady state"),
-                !reruns,
-                "{msg}"
-            );
+            assert_eq!(msg.contains("not re-run"), !reruns, "{msg}");
         }
 
         // Verified, then a route went unresolvable: named there too.
@@ -7923,16 +7675,15 @@ mod tests {
         assert_eq!(calm.state, HealthState::Healthy, "{:?}", calm.message);
         let msg = calm.message.unwrap();
         assert!(
-            msg.contains("eth2: keeps pinned to PF queue 0 (fallback: the driver refused"),
+            msg.contains(
+                "eth2 6,000 fps, queue 0 at 97%, no drops; keeps on queue 0 (the driver refused"
+            ),
             "{msg}"
         );
-        assert!(
-            msg.contains("queue-0 IRQ 140 placed on cpu 6 (was 0)"),
-            "{msg}"
-        );
-        assert!(msg.contains("eth3: keeps spread over RSS"), "{msg}");
+        assert!(msg.contains("queue-0 IRQ 140 on cpu 6"), "{msg}");
+        assert!(msg.contains("eth3 6,000 fps"), "{msg}");
         assert_eq!(
-            msg.matches("may not be honouring the RSS action").count(),
+            msg.matches("despite RSS keeps").count(),
             1,
             "said for the RSS port whose queue 0 takes 97% of a busy receive, and only \
              for it: {msg}"
@@ -7943,10 +7694,10 @@ mod tests {
         let bad = row(&s).expect("present");
         assert_eq!(bad.state, HealthState::Degraded);
         let msg = bad.message.unwrap();
-        assert!(msg.contains("eth2 is DROPPING 3900 frames/s"), "{msg}");
-        assert!(msg.contains("queue 0 taking 97%"), "{msg}");
-        assert!(msg.contains("grep 'eth2-rxtx-0' /proc/interrupts"), "{msg}");
-        assert!(!msg.contains("eth3 is DROPPING"), "{msg}");
+        assert!(msg.contains("eth2 dropping 3,900 frames/s"), "{msg}");
+        assert!(msg.contains("queue 0 at 97%"), "{msg}");
+        assert!(msg.contains("eth2-rxtx-0 IRQ"), "{msg}");
+        assert!(!msg.contains("eth3 dropping"), "{msg}");
         assert_eq!(s.report().overall, HealthState::Degraded);
 
         let m = render_metrics(&s, "vpp-offload");
@@ -7979,10 +7730,7 @@ mod tests {
         // An RSS port dropping gets the RSS remedy.
         s.kernel_path[0] = kernel_port("eth2", KeepForm::Rss, 3_900.0);
         let msg = row(&s).unwrap().message.unwrap();
-        assert!(
-            msg.contains("compare `ethtool -S eth2 | grep 'rxq.*frames'`"),
-            "{msg}"
-        );
+        assert!(msg.contains("`ethtool -S eth2`"), "{msg}");
     }
 
     /// Inherited keeps of unknown form, and a counter read that failed,
@@ -8018,10 +7766,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.state, HealthState::Healthy);
         let msg = r.message.unwrap();
-        assert!(
-            msg.contains("keeps inherited from a previous daemon (0 on RSS, 3 on queue 0)"),
-            "{msg}"
-        );
+        assert!(msg.contains("keeps inherited (0 RSS, 3 queue 0)"), "{msg}");
         assert!(
             msg.contains("counters unreadable (the driver exports no"),
             "{msg}"

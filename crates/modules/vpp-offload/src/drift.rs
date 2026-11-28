@@ -459,8 +459,7 @@ impl<P: RoutePrefix> std::fmt::Display for Uncovered<P> {
                 ..
             } => write!(
                 f,
-                "{} via {oif} (table {table}) applies {kind} encapsulation — VPP's mirror \
-                 carries no encap action, so steered packets would leave {oif} bare",
+                "{} via {oif} (table {table}) needs {kind} encap; VPP would send it bare",
                 prefix.cidr()
             ),
             Self::Path {
@@ -471,8 +470,7 @@ impl<P: RoutePrefix> std::fmt::Display for Uncovered<P> {
                 ..
             } => write!(
                 f,
-                "{} is delivered by the kernel on {oif} (table {table}) — an address or \
-                 broadcast VPP cannot reproduce",
+                "{} delivered by the kernel on {oif} (table {table})",
                 prefix.cidr()
             ),
             Self::Path {
@@ -484,22 +482,11 @@ impl<P: RoutePrefix> std::fmt::Display for Uncovered<P> {
             } => write!(f, "{} via {oif} (table {table})", prefix.cidr()),
             Self::Opaque(n) => write!(
                 f,
-                "{n} route(s) use nexthop objects (`ip route ... nhid`) whose devices this \
-                 scan cannot read, so it cannot tell whether VPP can take them — inspect \
-                 with `ip nexthop show` and {}",
-                // IPv6 has no exemption to add; the row names its remedies.
-                if P::EXEMPTABLE {
-                    "exempt any that leave via a tunnel"
-                } else {
-                    "treat any that leave via a tunnel as a finding"
-                }
+                "{n} route(s) via nexthop objects (nhid), unreadable here; check `ip nexthop show`"
             ),
             Self::LinkLocal { routes, examples } => write!(
                 f,
-                "{routes} route(s) leave the kernel only through link-local next hops and \
-                 VPP holds no route for the prefix ({}{}) — the feed gave VPP only link-local \
-                 next hops, which it refuses (their interface is not carried), or never \
-                 carried the prefix at all",
+                "{routes} route(s) via link-local next hops only, not in VPP ({}{})",
                 examples.join(", "),
                 if *routes > examples.len() {
                     ", …"

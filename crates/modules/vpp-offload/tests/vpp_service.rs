@@ -373,7 +373,7 @@ fn an_unpersisted_identity_degrades_health_and_is_named() {
             .any(|s| s.name == "state-file"
                 && s.message
                     .as_deref()
-                    .is_some_and(|m| m.contains("refuse adoption"))),
+                    .is_some_and(|m| m.contains("cycle VPP"))),
         "and it must name the consequence: {:?}",
         ready.report.subsystems
     );
@@ -2383,7 +2383,7 @@ fn a_lever_moved_while_vpp_is_behind_the_mirror_is_held_and_steer_off_is_not() {
     let line = steering_line(&after);
     assert!(
         line.contains("intended but not in place")
-            && line.contains("Held now because VPP has not caught up with the route mirror"),
+            && line.contains("held: VPP behind the route mirror"),
         "{line}"
     );
     assert!(
@@ -2719,7 +2719,7 @@ fn a_dark_idle_member_neither_pages_nor_pins_failure_history() {
     );
     let msg = ports.message.as_deref().unwrap_or_default();
     assert!(
-        msg.contains("eth5") && msg.contains("idle") && msg.contains("steering is unaffected"),
+        msg.contains("eth5") && msg.contains("no routes use it"),
         "the row must name the dark member and say it carries nothing: {msg}"
     );
 }

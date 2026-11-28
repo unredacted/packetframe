@@ -302,8 +302,7 @@ impl ClampStatus {
             if !self.applied.contains(c) && !self.missing.iter().any(|(v, _)| *v == c.vlan) {
                 self.missing.push((
                     c.vlan,
-                    "set by a reload; VPP is given it at the next VLAN refresh, within seconds"
-                        .into(),
+                    "set by a reload; pending the next VLAN refresh".into(),
                 ));
             }
         }

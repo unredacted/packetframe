@@ -1435,8 +1435,7 @@ fn report_from(published: Option<&service::Published>, alive: bool) -> HealthRep
             name: "supervision".into(),
             state: HealthState::Unhealthy,
             message: Some(
-                "the supervision loop is not running; VPP is unmonitored and will not be \
-                 restarted or unsteered — `packetframe detach` then re-attach"
+                "loop not running; VPP unmonitored; run: `packetframe detach`, then re-attach"
                     .into(),
             ),
             last_success_age_seconds: None,
@@ -1449,7 +1448,7 @@ fn report_from(published: Option<&service::Published>, alive: bool) -> HealthRep
         report.subsystems.push(SubsystemHealth {
             name: "supervision".into(),
             state: HealthState::Unhealthy,
-            message: Some(format!("supervision ended and will not resume: {why}")),
+            message: Some(format!("ended, will not resume: {why}")),
             last_success_age_seconds: None,
         });
     }
@@ -1462,7 +1461,7 @@ fn report_from(published: Option<&service::Published>, alive: bool) -> HealthRep
             name: "resources".into(),
             state: HealthState::Unhealthy,
             message: Some(format!(
-                "VF/hugepage resources are still held after teardown{}",
+                "VFs/hugepages still held after teardown{}",
                 if p.teardown_failures.is_empty() {
                     String::new()
                 } else {
@@ -1996,9 +1995,9 @@ impl Module for VppOffloadModule {
                     name: "resources".into(),
                     state: HealthState::Unhealthy,
                     message: Some(if settled {
-                        format!("teardown finished after detach returned; {detail}")
+                        format!("teardown finished after detach; {detail}")
                     } else {
-                        format!("teardown still running after detach returned; {detail}")
+                        format!("teardown still running after detach; {detail}")
                     }),
                     last_success_age_seconds: None,
                 }],
