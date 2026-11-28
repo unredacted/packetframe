@@ -1721,6 +1721,40 @@ impl SteerHold {
     }
 }
 
+impl SteerHold {
+    /// The hold as a status row says it: the counts and what clears it,
+    /// none of the reasoning. The refusal and its log line keep the long
+    /// form ([`std::fmt::Display`]).
+    pub fn brief(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(b) = &self.behind {
+            parts.push(if b.failing {
+                format!(
+                    "route updates to VPP failing ({} at source, {} queued)",
+                    b.backlog + b.neighbours,
+                    b.pending
+                )
+            } else {
+                format!(
+                    "VPP behind the route mirror ({} at source, {} queued, allowed {}{})",
+                    b.backlog,
+                    b.pending,
+                    b.allowance,
+                    if b.neighbours > 0 {
+                        format!("; {} neighbour change(s), allowed 0", b.neighbours)
+                    } else {
+                        String::new()
+                    }
+                )
+            });
+        }
+        if let Some(u) = &self.unvouched {
+            parts.push(u.brief());
+        }
+        parts.join("; ")
+    }
+}
+
 impl std::fmt::Display for SteerHold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut parts = Vec::new();
@@ -1915,6 +1949,23 @@ pub struct SeededDiffRefusal {
     pub additions: u64,
     /// `seeded_diff_allowance` of `adopted`: 1% of it, rounded down.
     pub allowance: u64,
+}
+
+impl SeededDiffRefusal {
+    /// The refusal as the deferral row says it ([`std::fmt::Display`] is
+    /// the long form the event and log carry).
+    pub fn brief(&self) -> String {
+        format!(
+            "seeded early diff refused: {} diff -{} ~{} +{} of {} routes, over the {} allowed; \
+             waits for the replay to go quiet",
+            self.family,
+            self.withdrawals,
+            self.replaces,
+            self.additions,
+            self.adopted,
+            self.allowance,
+        )
+    }
 }
 
 impl std::fmt::Display for SeededDiffRefusal {
@@ -2603,11 +2654,8 @@ impl Runtime {
     /// successful steer reconciles the NIC to the current target and
     /// clears this.
     pub fn note_inherited_steering(&self) {
-        self.core.borrow_mut().drift_scope_stale = Some(
-            "steering rules were inherited from a previous process and have not been \
-             reconciled with the running config yet"
-                .into(),
-        );
+        self.core.borrow_mut().drift_scope_stale =
+            Some("inherited steering rules not yet reconciled with this config".into());
     }
 
     pub fn rx_mode_kick(&self, k: Box<dyn RxModeKick>) {
@@ -3771,11 +3819,8 @@ impl Core {
     /// [`Self::drift_scope_stale`].
     fn note_partial_steer(&mut self) {
         if self.pending_drift_scope.is_some() && !self.steering.installed().is_empty() {
-            self.drift_scope_stale = Some(
-                "a steering change failed partway and left rules installed, so the \
-                 exemptions the NIC holds are neither the old set nor the new one"
-                    .into(),
-            );
+            self.drift_scope_stale =
+                Some("a steering change failed partway and left rules installed".into());
         }
     }
 

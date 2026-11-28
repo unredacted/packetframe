@@ -4924,25 +4924,20 @@ fn a_route_via_the_router_the_kernel_carries_elsewhere_is_kernel_delivered() {
     // Each named with the way the kernel answered, so the operator
     // reading `unresolvable=4` knows which of these each one is.
     let named = e.unresolvable_named(false);
-    let own = "via 198.51.100.1 (the router's own address, which VPP has no adjacency for; ";
+    let own = "via 198.51.100.1 (router's own address, no VPP adjacency; ";
     assert_eq!(
         named,
         vec![
             format!(
-                "10.66.0.0/24 {own}the kernel sends this prefix out br0, which VPP can reach (a \
-                 transit route under `next-hop-self`?))"
+                "10.66.0.0/24 {own}kernel sends it out br0, which VPP can reach (transit route \
+                 under next-hop-self?))"
             ),
             format!(
-                "10.77.0.0/24 {own}the kernel sends this prefix out eth4, which VPP can reach (a \
-                 transit route under `next-hop-self`?))"
+                "10.77.0.0/24 {own}kernel sends it out eth4, which VPP can reach (transit route \
+                 under next-hop-self?))"
             ),
-            format!(
-                "10.88.0.0/24 {own}the kernel's route for exactly this prefix drops it \
-                 (blackhole, unreachable or prohibit))"
-            ),
-            format!(
-                "10.99.0.0/24 {own}the kernel has no route of its own for exactly this prefix)"
-            ),
+            format!("10.88.0.0/24 {own}kernel route drops it)"),
+            format!("10.99.0.0/24 {own}no exact kernel route)"),
         ]
     );
     assert_eq!(
@@ -5108,7 +5103,7 @@ fn a_subnet_addressed_after_attach_stops_being_unresolvable_without_a_restart() 
     assert_eq!((e.counts().installed, e.counts().unresolvable), (1, 1));
     let named = e.unresolvable_named(false);
     assert!(
-        named.len() == 1 && named[0].contains("sends this prefix out br-ix, which VPP can reach"),
+        named.len() == 1 && named[0].contains("sends it out br-ix, which VPP can reach"),
         "{named:?}"
     );
     assert!(e.counts().blocks_first_steer());
@@ -5156,7 +5151,7 @@ fn a_subnet_addressed_after_attach_stops_being_unresolvable_without_a_restart() 
     assert_eq!(e.kernel_delivered_routes(), 0);
     let named = e.unresolvable_named(false);
     assert!(
-        named.len() == 1 && named[0].contains("sends this prefix out br-ix, which VPP can reach"),
+        named.len() == 1 && named[0].contains("sends it out br-ix, which VPP can reach"),
         "{named:?}"
     );
 }
@@ -5362,13 +5357,13 @@ fn kernel_lookups_stop_at_the_first_failure_and_at_the_walk_time_budget() {
     assert_eq!(e.counts().unresolvable, 6);
     let named = e.unresolvable_named(false);
     assert!(
-        named[0].contains("the kernel's route for this prefix could not be read (netlink recv"),
+        named[0].contains("kernel route unreadable (netlink recv"),
         "{named:?}"
     );
     assert!(
         named[1..5]
             .iter()
-            .all(|n| n.contains("the kernel's FIB could not be read")
+            .all(|n| n.contains("kernel FIB unreadable")
                 && n.contains("not asked again this walk")),
         "{named:?}"
     );

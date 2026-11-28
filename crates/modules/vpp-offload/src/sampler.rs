@@ -66,41 +66,27 @@ impl SamplerDir {
     /// into the module's overall health: forwarding does not depend on it.
     pub fn health(&self, dir: &Path) -> SubsystemHealth {
         let (state, message) = match self {
+            // Healthy says nothing: the path and size are config facts.
+            Self::Ready { stale: None, .. } => (HealthState::Healthy, None),
             Self::Ready {
-                bytes,
-                owned,
-                stale,
-            } => {
-                let ready = format!(
-                    "{}: tmpfs of {} KiB, {}",
-                    dir.display(),
-                    bytes >> 10,
-                    if *owned {
-                        "mounted by PacketFrame"
-                    } else {
-                        "an existing mount"
-                    }
-                );
-                match stale {
-                    None => (HealthState::Healthy, ready),
-                    Some(why) => (
-                        HealthState::Degraded,
-                        format!(
-                            "{ready}; a desired.conf no flow export owns is still there ({why}), \
-                             so VPP may be sampling: `packetframe sampler clear` removes it"
-                        ),
-                    ),
-                }
-            }
+                stale: Some(why), ..
+            } => (
+                HealthState::Degraded,
+                Some(format!(
+                    "unowned desired.conf in {} ({why}); VPP may be sampling; run: \
+                     `packetframe sampler clear`",
+                    dir.display()
+                )),
+            ),
             Self::Unavailable(why) => (
                 HealthState::Degraded,
-                format!("unavailable, so VPP cannot sample (forwarding is unaffected): {why}"),
+                Some(format!("unavailable: {why}; VPP cannot sample")),
             ),
         };
         SubsystemHealth {
             name: SUBSYS_SAMPLER_DIR.into(),
             state,
-            message: Some(message),
+            message,
             last_success_age_seconds: None,
         }
     }
@@ -856,13 +842,10 @@ mod tests {
         }
         .health(dir());
         assert_eq!(ok.state, HealthState::Healthy);
-        assert!(ok
-            .message
-            .unwrap()
-            .contains("18432 KiB, mounted by PacketFrame"));
+        assert_eq!(ok.message, None, "healthy says nothing");
         let bad = SamplerDir::Unavailable("why".into()).health(dir());
         assert_eq!(bad.state, HealthState::Degraded);
-        assert!(bad.message.unwrap().ends_with("why"));
+        assert!(bad.message.unwrap().contains("unavailable: why"));
         // Ready, but a desired.conf attach could not remove: the plugin may
         // be sampling with nobody owning it.
         let stale = SamplerDir::Ready {

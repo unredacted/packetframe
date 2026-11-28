@@ -1278,7 +1278,7 @@ fn a_v6_route_the_kernel_carries_elsewhere_stays_unresolvable() {
         "{named:?}"
     );
     assert!(
-        named[0].contains("IPv6 has no steer-exempt, so diverted traffic for it would be dropped"),
+        named[0].contains("in no router subnet, and IPv6 has no steer-exempt"),
         "{named:?}"
     );
 }
@@ -1413,7 +1413,7 @@ fn an_accepted_aggregate_stops_degrading_fib_v6_and_nothing_else_does() {
     let snapshot = |d: &Driver, now: Instant| {
         let rs = rt.status();
         let fib = rs.last_verify.as_ref().map_or(FibSync::NeverVerified, |v| {
-            FibSync::from_outcome(v, Duration::ZERO, rs.v6_ledger().as_ref())
+            FibSync::from_outcome(v, Duration::ZERO)
         });
         let summary = rs
             .last_verify
@@ -1454,14 +1454,14 @@ fn an_accepted_aggregate_stops_degrading_fib_v6_and_nothing_else_does() {
     );
     let (state, msg) = fib_v6(&s);
     assert_eq!(state, HealthState::Degraded, "{msg}");
-    let (impaired, note) = msg.split_once(". accepted: ").expect("an accepted clause");
+    let (impaired, note) = msg.split_once("; accepted: ").expect("an accepted clause");
     assert!(
         impaired.contains("1 unresolvable (next hop not on a VPP port): 2001:db8:0:5::/64 via"),
         "{msg}"
     );
     assert!(!impaired.contains("2001:db8::/48"), "{msg}");
     assert!(
-        note.starts_with("2001:db8::/48 via 2001:db8::1 (the router's own address"),
+        note.starts_with("2001:db8::/48 via 2001:db8::1 (router's own address"),
         "{msg}"
     );
     assert_eq!(gauge(&s, "unresolvable"), "1");
@@ -1525,15 +1525,16 @@ fn an_accepted_aggregate_stops_degrading_fib_v6_and_nothing_else_does() {
     assert!(seen[1].2.contains("2001:db8:0:5::/64 via"), "{seen:?}");
 }
 
-/// A verdict outlives the accept set it was taken under, and the two rows
-/// that name IPv6's unresolvable routes must still agree about each one.
+/// A verdict outlives the accept set it was taken under, and the rows must
+/// still agree about each IPv6 unresolvable route.
 ///
 /// An IPv4 route with no neighbour leaves the verdict INCOMPLETE, the
 /// kind that is not re-run while the table stays unclean, so `fib-synced`
-/// goes on rendering it for as long as the module runs. Accepting the
-/// aggregate by reload after that verify moves it, on `fib-synced`'s
-/// verify summary exactly as on `fib-v6`, from the unresolvable names to
-/// the accepted ones; taking the accept away moves it back. No verify
+/// goes on rendering it for as long as the module runs. That row carries
+/// the verdict's short form, which names no IPv6 route, so only `fib-v6`
+/// names them, from the live ledger: accepting the aggregate by reload
+/// after that verify moves it there from the unresolvable names to the
+/// accepted ones, and taking the accept away moves it back. No verify
 /// runs in between: the verdict itself is unchanged throughout.
 #[test]
 fn a_retained_verdict_names_a_reloaded_accept_as_fib_v6_does() {
@@ -1626,7 +1627,7 @@ fn a_retained_verdict_names_a_reloaded_accept_as_fib_v6_does() {
     let rows = || {
         let rs = rt.status();
         let verdict = rs.last_verify.clone().expect("verified");
-        let fib = FibSync::from_outcome(&verdict, Duration::ZERO, rs.v6_ledger().as_ref());
+        let fib = FibSync::from_outcome(&verdict, Duration::ZERO);
         let r = StatusSnapshot::from_runtime(d.supervisor(), rs, d.api_health(now), fib).report();
         let row = |name: &str| {
             let s = r
@@ -1638,47 +1639,31 @@ fn a_retained_verdict_names_a_reloaded_accept_as_fib_v6_does() {
         };
         (row(SUBSYS_FIB), row(SUBSYS_FIB_V6), verdict.summary())
     };
-    // The IPv6 half of the verify summary on `fib-synced`.
-    let v6_half = |msg: &str| {
-        msg.split_once("; IPv6 (")
-            .unwrap_or_else(|| panic!("no IPv6 half: {msg}"))
-            .1
-            .to_string()
-    };
-
-    // Taken with nothing accepted: the aggregate is unresolvable on both.
+    // Taken with nothing accepted: unresolvable on `fib-v6`, and never
+    // named on `fib-synced`.
     let ((fib_state, fib_msg), (v6_state, v6_msg), verdict) = rows();
     assert_eq!(fib_state, HealthState::Degraded, "{fib_msg}");
-    assert!(fib_msg.contains("INCOMPLETE"), "{fib_msg}");
-    let half = v6_half(&fib_msg);
-    assert!(half.contains("unresolvable=1 (2001:db8::/48 via"), "{half}");
-    assert!(!half.contains("accepted"), "{half}");
+    assert!(fib_msg.contains("verify incomplete"), "{fib_msg}");
+    assert!(!fib_msg.contains("2001:db8::/48"), "{fib_msg}");
     assert_eq!(v6_state, HealthState::Degraded, "{v6_msg}");
     assert!(v6_msg.contains("1 unresolvable"), "{v6_msg}");
 
-    // Accepted by reload, no verify since: accepted on both.
+    // Accepted by reload, no verify since: accepted on `fib-v6`.
     handle.publish(vec![packetframe_common::config::Ipv6Prefix {
         addr: "2001:db8::".parse().unwrap(),
         prefix_len: 48,
     }]);
     let ((_, fib_msg), (v6_state, v6_msg), unchanged) = rows();
     assert_eq!(unchanged, verdict, "no verify ran");
-    let half = v6_half(&fib_msg);
-    assert!(
-        half.contains("unresolvable=1 [1 accepted by `unresolvable-accept6`: 2001:db8::/48 via"),
-        "{half}"
-    );
-    assert!(!half.contains("unresolvable=1 (2001:db8::/48"), "{half}");
+    assert!(!fib_msg.contains("2001:db8::/48"), "{fib_msg}");
     assert_eq!(v6_state, HealthState::Healthy, "{v6_msg}");
     assert!(v6_msg.contains("accepted: 2001:db8::/48 via"), "{v6_msg}");
 
-    // The accept taken away again: unresolvable on both.
+    // The accept taken away again: unresolvable on `fib-v6` again.
     handle.publish(Vec::new());
     let ((_, fib_msg), (v6_state, v6_msg), unchanged) = rows();
     assert_eq!(unchanged, verdict, "no verify ran");
-    let half = v6_half(&fib_msg);
-    assert!(half.contains("unresolvable=1 (2001:db8::/48 via"), "{half}");
-    assert!(!half.contains("accepted"), "{half}");
+    assert!(!fib_msg.contains("2001:db8::/48"), "{fib_msg}");
     assert_eq!(v6_state, HealthState::Degraded, "{v6_msg}");
     assert!(!v6_msg.contains("accepted:"), "{v6_msg}");
 }

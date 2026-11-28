@@ -227,10 +227,10 @@ Under a healthy, fully steered offload the module-health section reads:
 module health (pid 12345, 3s old):
   vpp-offload: healthy
     vpp-process    healthy
-    api-ping       healthy (last ok 0s ago)
-    fib-synced     healthy — 1053360 routes installed; last verified on 64 probes against 1053360 routes (last ok 41s ago)
-    steering       healthy
-    ports          healthy
+    api-ping       healthy
+    fib-synced     healthy — 1053360 routes, 64/64 probes matched
+    steering       healthy — IPv4 steered
+    ports          healthy — 4 up
 ```
 
 Five rows, always. Two more — `route-feed` and `state-file` — appear
@@ -251,29 +251,28 @@ gone. The report below it is history. The dataplane may well still be
 forwarding — bpffs pins outlive the process by design (SPEC.md §8.5) —
 but nothing is supervising VPP.
 
-**`steering healthy — steer off (staging state); traffic is on the eBPF
-tier`** is *not* a fault. All
+**`steering healthy — not steered (steer off)`** is *not* a fault. All
 members up, FIB synced and verified, nothing diverted: that is every
 canary's waypoint and every rollback's landing zone. Distinguish it from
-`steering DEGRADED — steering intended but not in place — traffic is on
-the eBPF tier`, which means a steer was attempted and failed, or was torn
+`steering DEGRADED — intended but not in place, traffic on eBPF`, which
+means a steer was attempted and failed, or was torn
 down by trouble and not yet restored. From `Ready` that line also names
 the module's own retry — a refused steer is re-attempted at most every
 30 s once nothing is refusing it — so it is worth reading twice before
 reaching for `reconfigure`: if it is still there a minute later, the
 refusal is still standing and the reason is what to chase. When it goes
-on `Held now because …`, the reason is the [first-steer
+on `held: …`, the reason is the [first-steer
 hold](#the-first-steer-hold-vpp-caught-up-and-a-verify-that-covers-the-table)
-and carries its own numbers; the staging line `awaiting an operator
-lever move` says the same thing ahead of the lever (`A lever move now
-would be held …`).
+and carries its own numbers; the staging line `` `steer on` set, not yet
+steered`` says the same thing ahead of the lever (`a lever move now is
+held: …`).
 
-**`fib-synced healthy — N routes installed; last verified on 64 probes
-against M routes`** names the table the last verify drew its probes
-from. Read M against N. Within about 10% of each other, the verdict
+**`fib-synced healthy — N routes, 64/64 probes matched on M`** names the
+table the last verify drew its probes from (the `on M` is left out when
+M is N). Read M against N. Within about 10% of each other, the verdict
 covers the table. When it does not — a verify taken before the table
-loaded — the row reads `DEGRADED — N routes installed, but the last
-verify ran on P probes against M routes …`, a first steer is held, and
+loaded — the row reads `DEGRADED — N routes; last verify covered P probes
+on M routes; …`, a first steer is held, and
 verify re-runs on its own once VPP has caught up. On 2026-10-07 this row
 read `healthy — 666382 routes installed; last verified on 1 probes` and
 a lever move was admitted on it.
@@ -453,7 +452,8 @@ quickly.
 *changing*, not its value — so a daemon that started with `steer on`
 already in the file is sitting in the staging state and a reconfigure
 against that same file does nothing. `packetframe status` names this
-case: `configured "steer on", awaiting an operator lever move`. To move
+case: `` `steer on` set, not yet steered; first steer needs a lever
+move``. To move
 it, set the port `steer off`, `packetframe reconfigure`, set it back to
 `steer on`, and reconfigure again. This costs one round trip after any
 restart of an already-steered deployment, and it is deliberate: a SIGHUP
@@ -474,8 +474,8 @@ A refusal keeps the want, and the module retries on its own at most every
 `STEER_RETRY_EVERY`. It acts only at attach, on a fresh VPP or an adopted
 one that is not steering; a reload that changes it takes effect at the
 next start, and editing other lines never steers anything. The
-`steering` row then reads `steer-at-start: wanted from the start, not
-yet in place …`, followed by what it is waiting for:
+`steering` row then reads `steer-at-start: wanted, not in place; …`,
+followed by what it is waiting for:
 - **Healthy** while that clears by itself: the first convergence, verify,
   the first-steer hold, the next retry.
 - **Degraded** when waiting will not clear it: a dark member routes
@@ -915,28 +915,23 @@ has caught up and the table is clean. ...
 and `packetframe status` carries the same on two rows:
 
 ```
-fib-synced   DEGRADED — N routes installed, but the last verify ran on 1 probes against
-             1 routes, so it vouches for less than 90% of this table and a first steer
-             waits for one that does. Verify re-runs on its own once VPP has caught up
-             with the route mirror (B change(s) still at the route source, P queued for
-             VPP) and the table holds no unresolvable route
-steering     DEGRADED — steering intended but not in place — ... Held now because VPP
-             has not caught up with the route mirror: ...
+fib-synced   DEGRADED — N routes; last verify covered 1 probes on 1 routes; re-runs once
+             VPP catches up (B at source, P queued)
+steering     DEGRADED — intended but not in place, traffic on eBPF; ... held: VPP behind
+             the route mirror (B at source, P queued, allowed A); last verify covered 1
+             probe(s) on 1 routes, N now; re-runs 10s after VPP catches up
 ```
 
 With ports already steered, the steering row instead reads `DEGRADED —
-a steering change that diverts more traffic onto VPP is held because ….
-The rules already installed stay as they are and keep forwarding; …`
-— the state stays `steered`, or `ready` for a convergence's held
-re-assert — and on a mismatch every one of these
-lines says that waiting does not clear it. Each held attempt is a
+addition held: …; installed rules keep forwarding` — the state stays
+`steered`, or `ready` for a convergence's held re-assert — and on a
+mismatch every one of these lines says that waiting will not clear it. Each held attempt is a
 `steer_held` event in the event log, with the reason and whether rules
 were already steering.
 
 Before the lever moves, the staging line says it in advance:
-`configured "steer on", awaiting an operator lever move; ... A lever move
-now would be held, and steer on its own once nothing holds it, because
-…`. That is the line to read before moving it.
+`` `steer on` set, not yet steered; …; a lever move now is held: … ``.
+That is the line to read before moving it.
 
 `packetframe_vpp_source_backlog` is the number to watch fall. Once VPP
 has caught up, expect a `verify_passed` event with `rerun: true` and a
@@ -1469,13 +1464,12 @@ attested check, and an adopted one's diff takes the door unguarded ([the
 unsteered diff and a seeded
 mirror](#the-unsteered-diff-and-a-seeded-mirror)).
 
-What you see: `fib-synced DEGRADED — resync deferred ... the adopted FIB
-keeps forwarding untouched` until the diff is released: seconds after
+What you see: `fib-synced DEGRADED — resync deferred: …; adopted FIB
+forwarding` until the diff is released: seconds after
 the route source's first route over a seeded mirror, otherwise for as
 long as the feed takes to reload and go quiet (about 11 minutes for
-1.35M routes from FRR). Then briefly `resyncing the FIB the previous
-process verified and preserved (N routes installed) ...` while the diff
-lands, then healthy. `packetframe_vpp_state` stays at
+1.35M routes from FRR). Then briefly `resyncing the preserved FIB (N
+routes); verify next` while the diff lands, then healthy. `packetframe_vpp_state` stays at
 `adopted_resyncing` → `verifying` → `ready`/`steered` with steering never
 dropping. **Measured cost of a keep-vpp restart: zero unsteered time and
 no dump.** First measured on the reference router on 2026-09-27 with a
@@ -1630,9 +1624,9 @@ correctness verified, while every v6 packet still rides the eBPF tier.
 
 ```sh
 packetframe status
-#   fib-synced   healthy   N routes installed; last verified on 64 probes against N routes   <- IPv4, as before
-#   fib-v6       healthy   M IPv6 routes loaded in VPP, not steered
-#   steering     ...       (IPv6 routes are loaded in VPP by `v6 on`, but no IPv6 is steered ...)
+#   fib-synced   healthy — N routes, 64/64 probes matched   <- IPv4, as before
+#   fib-v6       healthy — M routes, not steered
+#   steering     healthy — IPv4 steered; IPv6 not steered
 
 grep packetframe_vpp_family_routes /var/lib/node_exporter/textfile/packetframe.prom
 #   ..._family_routes{module="vpp-offload",family="ipv6",state="installed"} M
@@ -1692,10 +1686,9 @@ which is what a blackhole route for it would do. Nothing is broken, but
 you announce the prefix:
 
 ```
-fib-v6: degraded — IPv6 in VPP is impaired: 248113 installed, 1 unresolvable
-  (next hop not on a VPP port): 2001:db8::/48 via 2001:db8::1 (the router's own
-  address, which VPP has no adjacency for; the prefix is in no subnet or address
-  of the router, and IPv6 has no steer-exempt, …)
+fib-v6: degraded — 248113 installed, 1 unresolvable (next hop not on a VPP port):
+  2001:db8::/48 via 2001:db8::1 (router's own address, no VPP adjacency; in no
+  router subnet, and IPv6 has no steer-exempt); not steered, nothing drops
 ```
 
 Confirm that is what it is before accepting it:
@@ -1733,10 +1726,8 @@ counted on `packetframe_vpp_family_routes{family="ipv6",state="unresolvable_acce
 instead of `state="unresolvable"`:
 
 ```
-fib-v6: healthy — 248113 IPv6 routes loaded in VPP, not steered. accepted:
-  2001:db8::/48 via 2001:db8::1 (the router's own address, …) (`unresolvable-accept6`
-  — acknowledged, not fixed: they stay out of VPP, and diverted IPv6 for them
-  still dies there)
+fib-v6: healthy — 248113 routes, not steered; accepted: 2001:db8::/48 via
+  2001:db8::1 (router's own address, …) (unresolvable-accept6; still out of VPP)
 ```
 
 With other unresolvable routes too, the row is Degraded and names only
@@ -2205,8 +2196,8 @@ Two things to get right in config:
   is not enough.
 
 ```
-fdb: degraded — bridge neighbour(s) the kernel FDB has not placed behind
-any member port: 198.51.100.6 on br3998 — VPP cannot reach them, …
+fdb: degraded — VPP cannot reach 198.51.100.6 on br3998; routes via them unresolvable;
+  declare the VLAN on each member port the bridge spans (port … vlans)
 ```
 
 `packetframe_vpp_neighbours_unplaced` counts neighbours VPP cannot
@@ -2291,10 +2282,8 @@ IPv6 routes too ([IPv6 findings](#ipv6-findings-exempt-drift-v6)
 below).
 
 ```
-exempt-drift: degraded — kernel path(s) VPP cannot take, with no
-  `steer-exempt` covering them: 203.0.113.128/25 via vti64 (table 100)
-  — steered traffic for these dies at VPP's default route instead of
-  falling back to the kernel that would deliver it.
+exempt-drift: degraded — 203.0.113.128/25 via vti64 (table 100) has no steer-exempt;
+  steered traffic to it drops in VPP
 ```
 
 The scan runs on its **own thread**, not the supervision loop: a full
@@ -2452,10 +2441,9 @@ lever, so a `v6-divert` staged behind `steer off` is already scanned
 away.
 
 ```
-exempt-drift-v6: degraded — IPv6 kernel path(s) VPP cannot take, while
-  a port diverts IPv6 (`v6-divert`): 2001:db8:100::/48 via tun0
-  (table 52) — diverted IPv6 for these dies in VPP, or leaves by a less
-  specific route VPP holds, instead of taking the kernel path. …
+exempt-drift-v6: degraded — 2001:db8:100::/48 via tun0 (table 52): VPP cannot take
+  these; diverted IPv6 to them drops; fix: the feed or port vlans, steer-keep6,
+  drop v6-divert, or drift-accept6 <prefix>
 ```
 
 It is the same judgement as v4 — a route is covered when some next hop
@@ -2544,9 +2532,8 @@ nexthop-object routes, and the link-local summary, whose accepted and
 unaccepted routes are counted and summarised separately.
 
 ```
-exempt-drift-v6: healthy — accepted: 2001:db8:ff00::/48 via tun0
-  (table 52) (`drift-accept6` — acknowledged, not fixed: diverted IPv6
-  for these still dies in VPP)
+exempt-drift-v6: healthy — accepted: 2001:db8:ff00::/48 via tun0 (table 52)
+  (drift-accept6; still drops in VPP)
 ```
 
 With unaccepted findings too, the row is Degraded and names them first,
@@ -3000,9 +2987,8 @@ vppctl show acl-plugin interface
 
 `packetframe status` names the diverted ports and VLANs on the steering
 row ("IPv6 on eth4 vlan 100,200"), read from the installed plan, and
-has a `v6-handback` row: `ready — veth up, guard ACL in place, VPP
-interface host-pfpunt0-vpp up, N router-owned /128(s) handed back`, or Degraded
-with `IPv6 diversion held back` and what is missing. The metrics add
+has a `v6-handback` row: `N /128s handed back, P packets to the kernel`,
+or Degraded with `IPv6 diversion held: …` and what is missing. The metrics add
 `packetframe_vpp_handback_ready`, `packetframe_vpp_handback_routes` and
 `packetframe_vpp_handback_tx_packets` (absent until sampled).
 
@@ -3182,15 +3168,8 @@ either: remove it by hand as above.
 **The module now detects this within 30 s and says so:**
 
 ```text
-steering  DEGRADED — 1 steering rule(s) this target asks for are missing
-                     from the NIC, no longer match what was asked for, or
-                     were never installed — that traffic is on the eBPF
-                     tier. Something changed them out of band (a UniFi
-                     provisioning push can do this), or the allowlist grew
-                     while the inherited rules stayed as they were;
-                     `packetframe reconfigure` re-applies steering, and
-                     reports its own reason if it refuses — a table too
-                     incomplete to steer into is the usual one
+steering  DEGRADED — 1 rule(s) missing from the NIC, that traffic is on eBPF;
+                     run: `packetframe reconfigure`
 ```
 
 It found the drift by asking the NIC, not by inferring it. **Measured on
@@ -3212,18 +3191,9 @@ on a box with no completeness authority it can hold indefinitely. So in
 that state the line points at the convergence instead:
 
 ```text
-steering  DEGRADED — 1 steering rule(s) ... a convergence re-applies
-                     steering only if it verifies clean — one that ends
-                     with routes withheld or unresolvable parks in the
-                     staging state and emits no steer at all, and a steer
-                     that IS emitted can still be refused by the
-                     completeness gate. Both settle in the staging state
-                     with the want remembered, and from there the module
-                     re-attempts the steer by itself once both gates
-                     permit. Until it converges there is nothing to ask:
-                     from here `packetframe reconfigure` changes no
-                     steering, and a reload that edits steering answers
-                     "not converged"
+steering  DEGRADED — 1 rule(s) missing from the NIC, that traffic is on eBPF;
+                     re-applied once a convergence verifies clean; nothing
+                     to run until it converges
 ```
 
 A reload that edits no steering input changes nothing here either, and
@@ -3272,10 +3242,9 @@ say — the rules are still in the NIC, the VF is withheld, and *no
 convergence is coming*. The line says so and points at cleanup:
 
 ```text
-steering  DEGRADED — ... supervision has stopped, so nothing will
-                     reconcile this on its own: `packetframe detach
-                     --all` retries the teardown, and `ethtool -N
-                     <iface> delete <loc>` removes a rule by hand
+steering  DEGRADED — ... supervision stopped; once the daemon has exited, run
+                     `packetframe detach --all`, or remove by hand:
+                     `ethtool -N <iface> delete <loc>`
 ```
 
 Take that one seriously: rules pointing at a VF whose VPP has been
@@ -3285,25 +3254,16 @@ killed are a blackhole, not a lost optimisation.
 as of the `SteerOutcome::NothingToSteer` fix it does repair itself:
 
 ```text
-steering  DEGRADED — ... no port is configured to steer, so a convergence
-                     that verifies without withheld or unresolvable routes
-                     reconciles the NIC to an empty target and removes
-                     these. One that ends incomplete parks in the staging
-                     state and emits no steer at all, so nothing reconciles
-                     and this line outlives the convergence — `packetframe
-                     reconfigure` is then the retry, and with no port asking
-                     to steer it removes the rules rather than reinstalling
-                     any. Do not wait for either if VPP is not forwarding:
-                     `ethtool -N <iface> delete <loc>` removes a rule now,
-                     and `packetframe detach --all` retries the whole
-                     teardown once this daemon has exited
+steering  DEGRADED — ... no port steers, so a clean convergence removes them;
+                     now: `ethtool -N <iface> delete <loc>`, or `packetframe
+                     detach --all` once this daemon has exited
 ```
 
 `steer` is a reconcile, and a target with no port is a legitimate thing
 to reconcile to: the stale-rule removal runs, the rules come out, and the
 outcome lands as `Event::NothingToSteer` — which clears `steered` *and*
-retires the want, so the module settles in `Ready` with `steer off
-(staging state)`.
+retires the want, so the module settles in `Ready` with `not steered
+(steer off)`.
 
 **Read the second sentence here too.** `Action::Steer` is what carries
 that reconcile, and a convergence ending `VerifyIncomplete` parks in
@@ -3356,10 +3316,7 @@ If the NIC will not answer the readback at all, that is reported too and
 is NOT the same line:
 
 ```text
-steering  DEGRADED — cannot verify steering: the NIC would not answer a
-                     rule readback (EIO: ...). Rules may have been removed
-                     or altered without this being visible; `ethtool -n
-                     <iface>` is the ground truth until it clears
+steering  DEGRADED — cannot verify steering: NIC readback failed (EIO: ...)
 ```
 
 An audit that cannot read keeps its previous count — an unreadable NIC
@@ -3369,13 +3326,10 @@ is not a wrong one — but it must not present that count as current.
 The audit also reports the opposite complaint, and names it first:
 
 ```text
-steering  DEGRADED — 2 location(s) the ledger names are still occupied by
-                     rules this config does not ask for — a port it leaves
-                     unsteered, or prefixes dropped from the allowlist — so
-                     traffic may still be diverted into VPP that should not
-                     be. The rules outlived the request to remove them;
-                     `ethtool -n <iface>` shows what is there, and
-                     <the remedy for the current state, as above>
+steering  DEGRADED — 2 stray rule(s) may still divert traffic this config does
+                     not steer; `packetframe reconfigure` removes them by
+                     ledger location; where it is refused, remove by hand:
+                     `ethtool -n <iface>`, then `ethtool -N <iface> delete <loc>`
 ```
 
 Two ways to arrive here: a port turned `steer off` whose reconcile has
@@ -3507,11 +3461,9 @@ the line says so, because a count read as current sends you to fix that
 many rules and stop looking:
 
 ```text
-steering  DEGRADED — 1 steering rule(s) ... reconfigure reconciles either
-                     way. That count is the last answer the NIC gave, not
-                     a current one: the NIC would not answer a rule
-                     readback (EIO: ...), so rules may be removed or
-                     altered without this being visible
+steering  DEGRADED — 1 rule(s) missing from the NIC, that traffic is on eBPF;
+                     run: `packetframe reconfigure`; counts are stale: NIC
+                     readback failed (EIO: ...)
 ```
 
 **Detection only — it does not repair**, deliberately: re-asserting rules from a
@@ -3558,8 +3510,8 @@ automatically — this reconfigure is the re-assert.
 
 ### A verified FIB is not a complete one
 
-`fib-synced healthy — N routes installed; last verified on 64 probes
-against M routes` means the probes matched what was installed when they
+`fib-synced healthy — N routes, 64/64 probes matched on M` means the
+probes matched what was installed when they
 were drawn — M routes. It does **not** mean the table is whole.
 
 Measured 2026-08-11 on a cold bring-up: `healthy` at **11.4 s with
@@ -3614,8 +3566,8 @@ takes steering down on its own. The usual cause is an FRR session drop,
 or the feed's nexthop going away. Steered packets would otherwise be
 dropped inside VPP, while the eBPF tier hands the same traffic to the
 kernel. `fib-synced` reads Unhealthy for the tick or two this takes,
-then Degraded (`0 routes installed — the route source is empty`), and
-`steering` reads "steering intended but not in place".
+then Degraded (`0 routes installed; route source empty, steer refused
+until it refills`), and `steering` reads "intended but not in place".
 
 **Steering comes back without anyone touching it.** The want is kept,
 and the ordinary steer retry reinstalls the rules once the table has
@@ -3914,8 +3866,8 @@ reason is the mapping's own decision:
 | `not a VPP port` | the neighbour is on a device that is not a member port | add the `port`, or the route is not VPP's to carry |
 | `VLAN N on P, which is not a VPP port` / `VLAN N is not declared on port P` | a VLAN device over a non-member, or a vid missing from `port … vlans` | the `port` line |
 | `bridge neighbour …` | the FDB has not placed it behind a member, or it is behind a non-member or a tagged VLAN with no BVI | see [bridge neighbours](#bridge-neighbours-placed-per-neighbour-from-the-fdb) |
-| `… and IPv6 has no steer-exempt, so diverted traffic for it would be dropped in VPP …` | a v6 route via the router outside its subnets and addresses; never left to the kernel (shape 3 is v4 only) | the feed, a `steer-keep6`, or dropping `v6-divert`; for your own announced aggregate with no kernel route, [`unresolvable-accept6`](#accepting-an-unresolvable-ipv6-route-unresolvable-accept6) |
-| `the router's own address, which VPP has no adjacency for; …` | every next hop is the router, and none of the kernel-delivered shapes held. The rest of the reason says how the kernel answered for exactly that prefix: `sends this prefix out <dev>, which VPP can reach` (a transit route under `next-hop-self`: the feed is wrong; or a subnet the router was addressed on in the last few seconds, which clears by itself, see [kernel-delivered routes](#kernel-delivered-routes-the-routers-own-never-unresolvable)), `drops it (blackhole, unreachable or prohibit)` (an aggregate the router originates; VPP would send its traffic down a less-specific route, so it is not left to the kernel), `has no route of its own for exactly this prefix`, `could not be read`, or `was not asked` (the per-walk lookup budget was spent). A trailing `the router's addresses could not be re-read (<error>)` means the 2-second address read is failing, so a subnet addressed since the last good read is not known yet | `ip route get <prefix-address> fibmatch` shows the same entry the module read; `ip -br addr` shows whether the router holds an address in the prefix |
+| `… in no router subnet, and IPv6 has no steer-exempt` | a v6 route via the router outside its subnets and addresses; never left to the kernel (shape 3 is v4 only) | the feed, a `steer-keep6`, or dropping `v6-divert`; for your own announced aggregate with no kernel route, [`unresolvable-accept6`](#accepting-an-unresolvable-ipv6-route-unresolvable-accept6) |
+| `router's own address, no VPP adjacency; …` | every next hop is the router, and none of the kernel-delivered shapes held. The rest of the reason says how the kernel answered for exactly that prefix: `kernel sends it out <dev>, which VPP can reach` (a transit route under `next-hop-self`: the feed is wrong; or a subnet the router was addressed on in the last few seconds, which clears by itself, see [kernel-delivered routes](#kernel-delivered-routes-the-routers-own-never-unresolvable)), `kernel route drops it` (a blackhole, unreachable or prohibit route: an aggregate the router originates; VPP would send its traffic down a less-specific route, so it is not left to the kernel), `no exact kernel route`, `kernel route unreadable`, `kernel FIB unreadable (…); not asked again this walk`, or `was not asked` (the per-walk lookup budget was spent). A trailing `router addresses unreadable (<error>)` means the 2-second address read is failing, so a subnet addressed since the last good read is not known yet | `ip route get <prefix-address> fibmatch` shows the same entry the module read; `ip -br addr` shows whether the router holds an address in the prefix |
 | `reachable now; …` | the neighbour arrived after the route was classified | nothing: the neighbour's arrival hands every route through it back to the drain, and the count falls as fast as VPP installs them. A count that holds still under this reason is a fault worth reporting |
 
 **A neighbour that resolves late is re-programmed, on every kind of
@@ -4590,8 +4542,8 @@ measured twice (2026-08-13, w9/w10). The status row says so while it
 holds:
 
 ```
-fib-synced   DEGRADED — fresh convergence: routes install as the
-             source loads (mirror holds N of the authority's M) ...
+fib-synced   DEGRADED — fresh convergence: N of M routes; verify waits for the
+             authority (require-table-complete)
 ```
 
 and the log brackets it with `fresh resync is idle but the route
@@ -4618,23 +4570,21 @@ tears down.
 reason, and prints the verdict's age and the live table beside it:
 
 ```
-fib-synced   DEGRADED — verify INCOMPLETE — steering refused, no
-  restart: 0/0 probes matched against 0 routes, unresolvable=0, withheld=0 (verify ran
-  1847s ago and re-runs on its own once the table holds no unresolvable
-  route and no unexempted kernel-delivered prefix; the table now holds
-  69155 installed, 0 withheld, 0 unresolvable)
+fib-synced   DEGRADED — verify incomplete: 0/0 probes matched on 0 routes (nothing to
+  probe) (30m ago); now 69155 installed, 0 withheld, 0 unresolvable; re-runs once
+  no route is unresolvable
 ```
 
 A verdict that failed only on unresolvable routes, unexempted
 kernel-delivered prefixes or an empty sample is **re-run once the table
 is clean** (see [the re-run](#the-re-run-a-stale-verdict)), so this line
 no longer outlives its cause by more than a few seconds. So is one the
-table has outgrown, whatever it failed on — the line then says `the
-table has outgrown it, so it re-runs on its own …`. One that failed for
-any other reason (a dark member carrying routes) over a table it still
-covers says `does not re-run in steady state` instead.
+table has outgrown, whatever it failed on — the line then says `table
+outgrew it; re-runs once VPP catches up`. One that failed for any other
+reason (a dark member carrying routes) over a table it still covers says
+`not re-run` instead.
 
-Read the parenthesis first. Verification is a convergence-time gate, and
+Read the `now …` counts first. Verification is a convergence-time gate, and
 the live steering gates do not take **what this verdict failed on** from
 it — they re-read the route counts, the source backlog and the authority
 on every retry. What a first steer does read off it is what no live
@@ -4722,8 +4672,7 @@ Restarting packetframe over a **steered** VPP reports:
 
 ```
 vpp-offload: DEGRADED
-  fib-synced   DEGRADED — resync deferred: ... the adopted FIB keeps
-                          forwarding untouched
+  fib-synced   DEGRADED — resync deferred: ...; adopted FIB forwarding
 ```
 
 for the length of the deferral plus the reconcile, then clears to
@@ -5514,9 +5463,10 @@ mpstat -P ALL 1 5   # or: top, then 1
 ```
 
 `packetframe status` carries a `kernel-path` row while any port has
-rules installed: per port, the keep form (and the driver's answer on a
-fallback), the queue-0 IRQ placement, and receive, queue-0 and drop
-rates sampled every 10 s from the same counters. It is **Degraded**,
+rules installed: per port, receive rate, queue 0's share and drops,
+sampled every 10 s from the same counters (`eth2 41,452 fps, queue 0 at
+0%, no drops`), then the keep form (and the driver's answer) and the
+queue-0 IRQ placement where the keeps are not on RSS. It is **Degraded**,
 port named, when a port drops 100 frames/s or more — with the remedy for
 the form its keeps are in. The `kernel_path_dropping` event records the
 start (at most once per port every ten minutes while it lasts) and the
