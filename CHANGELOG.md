@@ -28,7 +28,30 @@ section are unwrapped, because GitHub renders a release body's single
 newlines as hard breaks. `release.sh check`, which CI runs on every
 PR, refuses a section over 20,000 bytes or a line in one over 800.
 
-## [0.6.6] - UNRELEASED
+## [0.6.6] - 2026-11-28
+
+A point release on 0.6.5. VPP can now clamp TCP MSS itself, per VLAN, so a trunk whose hosts need a clamp can be steered; a steer that would bypass a fast-path clamp is refused instead of silently dropping it. `packetframe status` names the connected prefixes that make flows one-way under `packetframe-fib`, and every module health row is one short line. The completeness authority works on small tables, `detach --all` finds VPP under a non-default `state-dir`, and neigh-snoop's FRR gate keeps working while mgmtd's datastore is locked. A 0.6.5 config and route ledger carry over unchanged, except in the cases listed under Upgrading.
+
+### Upgrading from 0.6.5
+
+1. Install the 0.6.6 package or tarball, then `systemctl daemon-reload`. The .deb runs no maintainer scripts, so the running daemon is unaffected.
+2. `systemctl stop packetframe && packetframe detach --keep-vpp && systemctl start packetframe`, with or without vpp-offload, as for 0.6.5.
+
+- **A fast-path `mss-clamp` on traffic a port steers into VPP** is now refused at start and at reload, naming the clamp and the port. Before 0.6.6 the clamp silently stopped applying to that traffic. Before upgrading, check that each clamp's traffic stays on the kernel path (a `steer-exempt` for traffic to the prefix, `steer off` or another `direction`), or add `mss-clamp vlan <vid> ip4 <mss>` for its VLAN. The check is skipped while `dry-run on`. [#430](https://github.com/unredacted/packetframe/pull/430)
+
+- **Automation that reads `packetframe status` or `module-health.json` row messages:** every message is new wording. Key on row names and states, which are unchanged. The `route-ledger` row keeps `seeded <N> IPv4 + <M> IPv6`, `; applying`, `GC removed <N>` (the word `the` before it is gone) and `not used at this start`; with the ledger off it now reads `not used at this start (route-ledger off)`. [#433](https://github.com/unredacted/packetframe/pull/433)
+
+- **`fib-integrity` counts** change: the mirror side now counts only the prefixes the route source delivered, without `local-prefix` host routes or the `fallback-default`. A box that set `integrity-authority none` only because a small table read as `AuthorityMismatch` can go back to its authority. [#427](https://github.com/unredacted/packetframe/pull/427)
+
+- **A new `one-way-fast-path` row** may read Degraded after the upgrade. It reports a condition that already existed: a connected prefix with no `local-prefix` whose flows to an allowlisted `local-prefix` reach the kernel one way only. Add the `local-prefix ... via <iface>` line it names, then restart. [#432](https://github.com/unredacted/packetframe/pull/432)
+
+- **neigh-snoop's FRR gate** now writes to bgpd alone, so zebra's copies of the gate prefix-lists are no longer updated. Nothing in the gate reads them. [#424](https://github.com/unredacted/packetframe/pull/424)
+
+### Highlights
+
+- **TCP MSS clamping in VPP.** `mss-clamp vlan <vid> [ip4 <mss>] [ip6 <mss>]` clamps SYNs and SYN-ACKs both ways on a VLAN's L3 interface in VPP, using VPP's `mss_clamp` plugin. A fast-path clamp on a prefix inside a `local-route` on that VLAN then counts as covered, so its trunk can steer. It is hot-reloadable, and it survives a `--keep-vpp` restart. [#430](https://github.com/unredacted/packetframe/pull/430), [#431](https://github.com/unredacted/packetframe/pull/431)
+- **One-way fast paths reported.** A connected prefix that would split a flow between the fast path and the kernel is named in `packetframe status`, a WARN and a gauge, with the line that fixes it. [#432](https://github.com/unredacted/packetframe/pull/432)
+- **Short status.** Each module health row is one line: the facts and, when it is not healthy, what is wrong and the fix. [#433](https://github.com/unredacted/packetframe/pull/433)
 
 ### Changes
 
@@ -40,7 +63,7 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 **vpp-offload**
 
 - A steer that would carry traffic a fast-path `mss-clamp` covers through VPP, which does not apply it, is refused at start and at reload, naming the clamp and the port. Before, the clamp silently stopped applying to steered traffic. [#430](https://github.com/unredacted/packetframe/pull/430)
-- `mss-clamp vlan <vid> [ip4 <mss>] [ip6 <mss>]` clamps TCP MSS in VPP, both directions on that VLAN's L3 interface, with VPP's `mss_clamp` plugin. A fast-path `mss-clamp` on a prefix inside a `local-route` on that VLAN then counts as covered, so its trunk can steer. Hot-reloadable. Needs the plugin loaded (fd.io's `vpp-plugin-core`); while a clamp is not in place, `packetframe status` shows it and a first steer is held. One IPv4 value across all lines, because of a VPP 26.10 plugin bug. [#431](https://github.com/unredacted/packetframe/pull/431)
+- `mss-clamp vlan <vid> [ip4 <mss>] [ip6 <mss>]` clamps TCP MSS in VPP, both directions on that VLAN's L3 interface, with VPP's `mss_clamp` plugin. A fast-path `mss-clamp` on a prefix inside a `local-route` on that VLAN then counts as covered, so its trunk can steer. Hot-reloadable; needs the plugin (fd.io's `vpp-plugin-core`). A first steer is held until the clamp is in place. One IPv4 value across all lines, because of a VPP 26.10 plugin bug. ([runbook](https://github.com/unredacted/packetframe/blob/v0.6.6/docs/runbooks/mss-clamp.md#clamping-in-vpp-mss-clamp-vlan), [design](https://github.com/unredacted/packetframe/blob/v0.6.6/docs/runbooks/vpp-mss-clamp-design.md), [#429](https://github.com/unredacted/packetframe/pull/429), [#431](https://github.com/unredacted/packetframe/pull/431))
 
 **CLI and operations**
 
@@ -51,6 +74,34 @@ PR, refuses a section over 20,000 bytes or a line in one over 800.
 
 - A bridge counts as up only when it also has carrier. When it loses carrier, the kernel flushes its neighbours. The learned table is now re-seeded when carrier comes back, not only after an admin bring-up, and a bridge that comes up before its link is no longer seeded into a flush. [#423](https://github.com/unredacted/packetframe/pull/423)
 - The FRR next-hop gate talks to bgpd alone (`vtysh -d bgpd`). On FRR 10 with mgmtd running, a fanned-out prefix-list write went through mgmtd first and failed whenever mgmtd's candidate datastore was locked, so the gate lists stopped refilling. A failed vtysh call's error now includes what vtysh printed on stdout, where FRR reports command errors. [#424](https://github.com/unredacted/packetframe/pull/424)
+
+**Build and CI**
+
+- clap 4.6.9 and bytes 1.12.2 ([#426](https://github.com/unredacted/packetframe/pull/426)). A neigh-snoop test no longer flakes when the engine hears a burst in full ([#425](https://github.com/unredacted/packetframe/pull/425)). Release notes state what changed, never where it was tested ([#422](https://github.com/unredacted/packetframe/pull/422)).
+
+### Known limitations
+
+- `mss-clamp vlan` is not yet verified with traffic through a NIC into VPP.
+- `mss-clamp vlan` takes one IPv4 value across all VLANs until the VPP builds PacketFrame supports carry the upstream fix for VPP 26.10's `mss_clamp` plugin.
+- A `local-prefix` resolves only the hosts the kernel holds a neighbour entry for. A host with none still sends its replies to the kernel alone, so its flows to an allowlisted `local-prefix` stay one-way until the kernel learns it.
+- The limitations listed for 0.6.5 otherwise still apply.
+
+### Install and verify
+
+When upgrading, follow steps 1 and 2 above.
+
+```sh
+ARCH=$(dpkg --print-architecture)   # amd64 or arm64
+curl -LO "https://github.com/unredacted/packetframe/releases/download/v0.6.6/packetframe_0.6.6_${ARCH}.deb"
+curl -LO https://github.com/unredacted/packetframe/releases/download/v0.6.6/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+dpkg -i "packetframe_0.6.6_${ARCH}.deb"
+systemctl daemon-reload
+```
+
+Tarballs for `{aarch64,x86_64}-unknown-linux-{gnu,musl}` are attached below; the `aarch64-unknown-linux-gnu` tarball and the arm64 .deb also carry the VPP sampler plugin.
+
+**Full changelog:** https://github.com/unredacted/packetframe/compare/v0.6.5...v0.6.6
 
 ## [0.6.5] - 2026-11-21
 
