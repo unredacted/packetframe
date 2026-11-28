@@ -4909,43 +4909,42 @@ stop the daemon, then `packetframe detach --all`.
   and the age beside it:
 
   ```
-  $ packetframe status                     # message wrapped here; it prints on one line
+  $ packetframe status
     fast-path: healthy
-      fib-integrity  healthy — bird 1272306 prefixes, mirror 1272281 — drift 0.002%,
-                     within the 1.000% warn threshold. A steering gate reads this same
-                     comparison and would permit a steer — this is the positive evidence
-                     a rollout needs ... (last ok 41s ago)
+      fib-integrity  healthy — bird 1272306, mirror 1272281, drift 0.002% (3m ago)
   ```
 
-  **`would permit a steer` is the pass, and it is the only one.** The
-  row carries two separate facts and you want the second:
+  **A healthy row is the pass, and it is the only one.** The row is
+  healthy only when a steering gate would permit a steer from this
+  comparison. It carries two separate facts and you want the second:
 
-  - The **drift-catch diagnostic** — `drift N%, within/at or above the
-    M% warn threshold` — is fast-path's own alarm against the
+  - The **drift-catch diagnostic** — `drift N%`, with `(warn at M%)`
+    when at or above the threshold — is fast-path's own alarm against the
     configurable `drift-warn-fraction`. It is a good thing to watch and
     it is **not** the rollout verdict. At a tuned warn fraction the two
     part company by design: 3% drift is "within" a 5% warn threshold
     while the gate, on its own fixed `STEER_MAX_DRIFT`, refuses.
-  - The **rollout verdict** — `A steering gate reads this same
-    comparison and would permit a steer` / `and REFUSES: <reason>` — is
+  - The **rollout verdict** — silent when a steer would be permitted
+    (`a steer would still be permitted` on a row degraded only by the
+    warn threshold), `a steer would be refused: <reason>` otherwise — is
     produced by calling the gate's own decision function on the same
     report the gate receives, so it cannot disagree with what the steer
-    will actually do. On a refusal the reason is the refusal message
-    verbatim, remedy included.
+    will actually do. On a refusal the reason is a short form of the
+    refusal message, remedy included.
 
   | The row says | What it means |
   | --- | --- |
-  | `would permit a steer` | Agreement. Proceed. |
-  | `no comparison has completed yet` | The checker has not reached its first interval, or has only just started. **Not agreement** — wait 300 s and read it again. |
-  | `no integrity authority on this box (integrity-authority none)` | The operator declared this box is fed from elsewhere, so nothing local attests the mirror. Informational, **not** a pass and **not** an alarm — a steering gate treats the mirror as unattested, which is only valid with `require-table-complete off`. This is the shadow's correct state. |
-  | `would refuse: the route mirror holds N of the authority's M routes` | The mirror is short — usually still loading. |
-  | `... mismatch, not a drift ... would refuse: ... that is not the authority feeding this mirror` | Bird up, carrying a table that is not this one — the 23 h deferral above. If this box is *meant* to be fed from elsewhere, set `integrity-authority none` and it becomes the informational row above rather than a false alarm. |
-  | `would refuse: completeness is unknown: the authority reports zero routes` | The degenerate form of the same thing — bird answering, and answering nothing. |
-  | `would refuse: the last completeness check was Ns ago, too old to act on` | Aged past the 900 s window. Comparisons have stopped landing; with no error beside it, they are not being attempted. |
-  | `could not complete: <error>` with `HISTORY` | `birdc` or the mirror read is failing. Any numbers shown are the previous comparison, ageing. |
+  | healthy, counts and drift only | Agreement. Proceed. |
+  | `no comparison yet; the first is due within 300s` | The checker has not reached its first interval, or has only just started. **Not agreement** — wait 300 s and read it again. |
+  | `no authority configured; completeness not checked` (`integrity-authority none`) | The operator declared this box is fed from elsewhere, so nothing local attests the mirror. Informational, **not** a pass and **not** an alarm — a steering gate treats the mirror as unattested, which is only valid with `require-table-complete off`. This is the shadow's correct state. |
+  | `a steer would be refused: mirror N% short, probably still loading` | The mirror is short — usually still loading. |
+  | `a steer would be refused: the authority is not this mirror's feed; ...` | Bird up, carrying a table that is not this one — the 23 h deferral above. If this box is *meant* to be fed from elsewhere, set `integrity-authority none` and it becomes the informational row above rather than a false alarm. |
+  | `a steer would be refused: the authority reports zero routes` | The degenerate form of the same thing — bird answering, and answering nothing. |
+  | `a steer would be refused: the comparison is too old` | Aged past the 900 s window. Comparisons have stopped landing; with no error beside it, they are not being attempted. |
+  | `previous comparison: …; last check (…) failed: <error>` | `birdc` or the mirror read is failing. Any numbers shown are the previous comparison, ageing. |
   | no `fib-integrity` row at all | Nothing is checking on this box — kernel-fib mode, or a control plane with no route source. The authority will read `Absent`. |
 
-  > The verdict is **subjunctive** — "would permit" / "would refuse" —
+  > The verdict is **subjunctive** — "would be permitted" / "would be refused" —
   > because it predicts what a steer would do from this comparison, not
   > something that has happened. On a `require-table-complete off` box no
   > gate consults it at all; the row still tells you what one *would*

@@ -569,31 +569,20 @@ pub fn dry_run_health(state: &ActiveState) -> Option<packetframe_common::module:
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match &s.seed {
-            Some(seed) if seed.applied_at.is_none() => {
-                "the route-ledger seed to finish applying".to_string()
-            }
+            Some(seed) if seed.applied_at.is_none() => "the seed to finish applying".to_string(),
             _ if state.dry_run_gate.repairs_owed() > 0 => format!(
-                "{} route(s) whose FIB install failed to be repaired (retried at the next \
-                 End-of-RIB GC, or by the prefix's next update)",
+                "{} failed route install(s) to be repaired",
                 state.dry_run_gate.repairs_owed()
             ),
-            Some(seed) if seed.attested && seed.failed == 0 => {
-                "the route-ledger seed's last step".to_string()
-            }
+            Some(seed) if seed.attested && seed.failed == 0 => "the seed's last step".to_string(),
             Some(_) if state.dry_run_gate.authority() => {
-                "the completeness authority to attest the mirror (the seed was not whole: \
-                 unattested, short or with failed installs; `fib-integrity` shows the count)"
-                    .to_string()
+                "the authority to attest (seed not whole)".to_string()
             }
-            Some(_) => "the route source's first End-of-RIB (the seed was not whole: \
-                        unattested, short or with failed installs)"
-                .to_string(),
+            Some(_) => "the first End-of-RIB (seed not whole)".to_string(),
             None if state.dry_run_gate.authority() => {
-                "the completeness authority to attest the mirror (a cold start; \
-                 `fib-integrity` shows the count)"
-                    .to_string()
+                "the authority to attest (cold start)".to_string()
             }
-            None => "the route source's first End-of-RIB (a cold start)".to_string(),
+            None => "the first End-of-RIB (cold start)".to_string(),
         }
     };
     state.dry_run_gate.health(&waiting_on)
@@ -1103,7 +1092,7 @@ fn take_route_ledger(
                 StartReport::Refused {
                     code: "forwarding-mode",
                     detail: crate::fib::route_ledger::Refusal::ForwardingMode(forwarding_mode)
-                        .describe(),
+                        .brief(),
                 }
             } else {
                 StartReport::Off
@@ -1122,13 +1111,13 @@ fn take_route_ledger(
             } else {
                 Event::info(MODULE_NAME, kind::ROUTE_LEDGER_REFUSED)
             };
-            ev.field("reason", r.code()).detail(detail.clone()).emit();
+            ev.field("reason", r.code()).detail(detail).emit();
             status.start = if matches!(r, crate::fib::route_ledger::Refusal::Disabled) {
                 StartReport::Off
             } else {
                 StartReport::Refused {
                     code: r.code(),
-                    detail,
+                    detail: r.brief(),
                 }
             };
             None

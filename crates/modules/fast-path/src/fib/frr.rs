@@ -974,12 +974,14 @@ pub fn mirror_family_mismatch(
         (session_v6, AuthorityFamily::V6),
     ] {
         if present && !declared.contains(&family) {
+            // Fact and remedy before the first ` — `: the status row
+            // keeps only that much (`health_text::brief`).
             return Some(Revocation::UnsupportedExport(format!(
                 "the route feed is delivering {} routes, but no declared upstream carries \
-                 {} — the comparison would count the authority's declared families against \
-                 the whole mirror, which reads as a mismatch rather than the missing \
-                 declaration it is. Add `families` covering {} to the upstream that carries \
-                 it (restart-only)",
+                 {}: add `families` covering {} to the upstream that carries it \
+                 (restart-only) — the comparison would count the authority's declared \
+                 families against the whole mirror, which reads as a mismatch rather than \
+                 the missing declaration it is",
                 family.afi(),
                 family.afi(),
                 family.afi()
